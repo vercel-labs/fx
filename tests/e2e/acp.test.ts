@@ -11688,22 +11688,32 @@ describe("acp: model-independent", () => {
           (message: any) => message.method === "session/request_permission",
         );
         expect(permissions).toHaveLength(1);
-        expect(permissions[0]!.params.toolCall.toolCallId).toBe("child_write");
+        // The card is the child's own, named for it, so it cannot reuse one of
+        // main's cards.
+        expect(permissions[0]!.params.toolCall.toolCallId).toBe("subagent:writer:child_write");
         expect(permissions[0]!.params.toolCall.name).toBe("write_file");
         expect(permissions[0]!.params.toolCall.rawInput).toEqual({
           path: target,
           content: "ACP_PARENT_APPROVED\n",
         });
-        // The child's call is published as a pending tool call under the same
-        // id before the request, so the client can place the question on it.
+        // The child's call is published as a pending tool call under that id
+        // before the request, so the client can place the question on it.
         const pendingIndex = run.messages.findIndex(
           (message: any) =>
-            message.params?.update?.toolCallId === "child_write" &&
+            message.params?.update?.toolCallId === "subagent:writer:child_write" &&
             message.params.update.status === "pending",
         );
         const permissionIndex = run.messages.indexOf(permissions[0]!);
         expect(pendingIndex).toBeGreaterThanOrEqual(0);
         expect(pendingIndex).toBeLessThan(permissionIndex);
+        expect(String(run.messages[pendingIndex]?.params.update.title)).toContain("writer");
+        // The check's answer finishes the card, so the turn's end does not
+        // report it as a call whose completion went missing.
+        expect(run.messages.some(
+          (message: any) =>
+            message.params?.update?.toolCallId === "subagent:writer:child_write" &&
+            message.params.update.status === "completed",
+        )).toBe(true);
         expect(readFileSync(target, "utf8")).toBe("ACP_PARENT_APPROVED\n");
         expect(childBodies).toHaveLength(2);
         expect(client.stderr).toBe("");
@@ -11760,8 +11770,14 @@ describe("acp: model-independent", () => {
           (message: any) => message.method === "session/request_permission",
         );
         expect(permissions).toHaveLength(1);
-        expect(permissions[0]!.params.toolCall.toolCallId).toBe("child_write");
+        expect(permissions[0]!.params.toolCall.toolCallId).toBe("subagent:writer:child_write");
         expect(existsSync(target)).toBe(false);
+        // A refused check fails the card with its reason, not as a missing one.
+        expect(run.messages.some(
+          (message: any) =>
+            message.params?.update?.toolCallId === "subagent:writer:child_write" &&
+            message.params.update.status === "failed",
+        )).toBe(true);
         expect(childBodies).toHaveLength(2);
         // The child reads the client's refusal as its action's result.
         expect(childBodies[1]!).toContain("Permission denied by user");
@@ -12110,11 +12126,11 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // In ACP a subagent's question never goes to the client: it waits for an
-  // approval that only the terminal app's menu gives, and a cancel does not end
-  // that wait. A reload stops such a subagent, as it always did, so the session
-  // is not left with a turn that waits for ever (until #1722 closes a
-  // subagent's requests when its prompt ends).
+  // In ACP a subagent's approval request goes to main, so main gets a note
+  // turn and the fake answers it; its question still never goes to the client,
+  // and a cancel does not end the wait. A reload stops such a subagent, as it
+  // always did, so the session is not left with a turn that waits for ever
+  // (until #1722 closes a subagent's requests when its prompt ends).
   test(
     "ACP session/load stops a subagent that waits for an approval, which session/cancel leaves waiting",
     async () => {
@@ -12131,6 +12147,7 @@ describe("acp: model-independent", () => {
           // The writer's one request: its write waits for an approval.
           if (!body.includes('"name":"subagent"')) return fileToolCall("child_write", target, "blocked\n");
           if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_APPROVAL_REPORT_SEEN");
+          if (acpLatestPromptText(body).includes("I wait for your approval to run")) return finalText("ACP_RELOAD_APPROVAL_NOTE");
           if (acpLatestPromptText(body).includes("Report the writer's state")) return finalText("ACP_RELOAD_APPROVAL_NOTED");
           if (body.includes("reload_approval_call")) return finalText("ACP_RELOAD_APPROVAL_PARENT_DONE");
           return fakeGatewayToolCall("reload_approval_call", "subagent", {
@@ -12145,8 +12162,9 @@ describe("acp: model-independent", () => {
           });
           const sessionId = await startAutoSession(acp, true);
           sendPrompt(acp, 7501, "Start the writing subagent.");
-          await waitForCondition("the parent's finished turn and the writer's request", () => gateway.requests.length === 3, TIMEOUT);
+          await waitForCondition("the parent's finished turn, the writer's request, and main's note turn", () => gateway.requests.length === 3, TIMEOUT);
           await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+          await waitForCondition("main's note turn", () => gateway.requests.filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
 
           acp.send(via === "session/cancel"
             ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
@@ -12215,6 +12233,7 @@ describe("acp: model-independent", () => {
           return acpPromptText(body).includes("Write the file.") ? fileToolCall("child_write", target, "blocked\n") : holder.promise;
         }
         if (acpLatestUserIsReport(body)) return finalText("ACP_RELOAD_TWO_REPORT_SEEN");
+        if (acpLatestPromptText(body).includes("I wait for your approval to run")) return finalText("ACP_RELOAD_TWO_NOTE");
         if (acpLatestPromptText(body).includes("Confirm the reloaded session")) return finalText("ACP_RELOAD_TWO_FOLLOWUP");
         if (body.includes("reload_hold_call")) return finalText("ACP_RELOAD_TWO_PARENT_DONE");
         if (body.includes("reload_write_call")) {
@@ -12235,9 +12254,10 @@ describe("acp: model-independent", () => {
         });
         const sessionId = await startAutoSession(acp, true);
         sendPrompt(acp, 7601, "Start both subagents.");
-        // The parent's two calls and its turn after each, the writer's request, and the held one.
-        await waitForCondition("both subagents' requests", () => gateway.requests.length === 5, TIMEOUT);
+        // The parent's two calls and its turn after each, the writer's request, and main's note turn.
+        await waitForCondition("both subagents' requests and main's note turn", () => gateway.requests.length === 5, TIMEOUT);
         await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
+        await waitForCondition("main's note turn", () => gateway.requests.filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
 
         acp.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [] } });
         const reloaded = await readUntilResponses(acp, [7601, 7602], TIMEOUT);

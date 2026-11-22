@@ -2045,7 +2045,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             // what it left unanswered, so the subagents resume, report, and
             // their reports wake main again (`ParentApproval.tla` `Fallback`).
             .approvals_unanswered => {
-                _ = tree.refuseUnansweredApprovals();
+                const refused = tree.refuseUnansweredApprovals();
+                if (refused == 0) {
+                    // Nothing could be refused, so the next check would see the
+                    // same state at once: wait one poll first (RULES.md R3.8).
+                    debug_trace.eventf("mailbox", "approvals_refusal_empty", .{}, "reason=nothing_refused", .{});
+                    if (ctx.cancelFlag().load(.seq_cst)) break;
+                    _ = ctx.worker.waitForPostOrNudgeTimeout(subagent_tool_host.Runtime.cancel_poll);
+                }
                 continue;
             },
         }

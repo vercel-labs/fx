@@ -2936,6 +2936,9 @@ fn subagentProviderRefusal(
 /// this provider call keeps alive while `executeManaged` runs.
 const SubagentApprovalCheck = struct {
     runtime: Context,
+    /// The subagent whose request this check answers, for the card ACP shows
+    /// in main's session. Empty when the answer is not for a named subagent.
+    agent: []const u8 = "",
 
     fn check(raw: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 {
         const self: *SubagentApprovalCheck = @ptrCast(@alignCast(raw));
@@ -2949,12 +2952,21 @@ const SubagentApprovalCheck = struct {
         if (ctx.tool_registry.lookup(call.name) == null and
             !containsName(ctx.advertised_dynamic_tool_names, call.name))
         {
-            return try arena.dupe(u8, "main's permissions cannot check this action");
+            return try arena.dupe(u8, "your parent's permissions cannot check this action");
         }
+        // The check answers another agent's call, not one of main's, so its
+        // card gets an id of its own: main's session must not reuse a card of
+        // its own with the child's id, and ACP names the agent on the card
+        // from this prefix (`subagentCardAgent`).
+        const check_call = types.ToolCall{
+            .id = try arena.print("subagent:{s}:{s}", .{ self.agent, call.id }),
+            .name = call.name,
+            .arguments_json = call.arguments_json,
+        };
         // No selected MCP view is passed: a dynamic tool is checked as an
         // advertised name of main's, and one it does not advertise is refused
         // above, so nothing is checked through a view this path cannot supply.
-        return switch (try checkNestedCall(ctx, arena, call, null)) {
+        return switch (try checkNestedCall(ctx, arena, check_call, null)) {
             .allow => null,
             .deny => |message| message,
         };
@@ -2977,7 +2989,13 @@ fn executeSubagentProvider(
     var progress_bridge = SubagentProgressBridge.init(arena, ctx, state.call);
     // The parent's answer checks the subagent's waiting call as main's own,
     // with the permission context this call runs under.
-    var approval_check = SubagentApprovalCheck{ .runtime = ctx };
+    var approval_check = SubagentApprovalCheck{
+        .runtime = ctx,
+        .agent = switch (request.*) {
+            .approve => |value| value.agent,
+            else => "",
+        },
+    };
     const output = host.executeManaged(arena, request, .{
         .observer = ctx.observer,
         .caller_id = caller_id,
@@ -9185,4 +9203,19 @@ test "in auto mode a command's fx mcp call skips the safety check for the approv
     try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
     try std.testing.expect(try nestedBridgeStatus(&rt, &.{}, "mcp_fixture_echo") != .denied);
     try std.testing.expectEqual(@as(usize, 2), reviewer.calls);
+}
+
+test "the approve check refuses a name main cannot resolve" {
+    var rt = TestRuntime{ .interactive = false };
+    defer rt.deinit(std.testing.allocator);
+    var check = SubagentApprovalCheck{ .runtime = rt.context() };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const refused = try SubagentApprovalCheck.check(
+        &check,
+        arena.allocator(),
+        .{ .id = "call-1", .name = "not_a_main_tool", .arguments_json = "{}" },
+    );
+    try std.testing.expect(refused != null);
+    try expectContains(refused.?, "your parent's permissions cannot check this action");
 }

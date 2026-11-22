@@ -1408,9 +1408,13 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
-    if (owner.approval_note) |hook| {
-        turn.approval_note_context = hook.context;
-        turn.approval_note_fn = hook.note_fn;
+    // Only a run fx ask or ACP opens gets the note. A hosted child (the app's)
+    // keeps its approval on its own screen until Part 2 routes it.
+    if (!hosted) {
+        if (owner.approval_note) |hook| {
+            turn.approval_note_context = hook.context;
+            turn.approval_note_fn = hook.note_fn;
+        }
     }
     turn.live_metrics = &slot.metrics;
     // The interactive app runs the turn on the child's own agent. Bound before

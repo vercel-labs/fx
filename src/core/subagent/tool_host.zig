@@ -1006,7 +1006,7 @@ pub const Runtime = struct {
     }
 
     pub const TreeWake = enum { mail, quiet, stopped, approvals_unanswered };
-    const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+    pub const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
 
     /// For a runtime that finishes only once its tree is quiet, as `fx ask`
     /// does: blocks until mail is queued for `worker`, nothing in this host
@@ -1032,7 +1032,9 @@ pub const Runtime = struct {
             if (cancel) |flag| if (flag.load(.seq_cst)) return .stopped;
             if (worker.queuedPromptCount() > 0) return .mail;
             if (!self.anyWorking()) return .quiet;
-            if (refuse_unanswered and self.onlyApprovalWaits() and self.approvals.allPendingNoted(self.root_id)) return .approvals_unanswered;
+            // The registry check is cheap and the phase read loads the state
+            // store, so the cheap one decides first.
+            if (refuse_unanswered and self.approvals.allPendingNoted(self.root_id) and self.onlyApprovalWaits()) return .approvals_unanswered;
             // With the fallback on, the timed wait is the wake: the mark after
             // `PostNote` wakes nobody, and each re-check finds it
             // (`ParentApproval.tla` `Wake`).
@@ -2216,18 +2218,33 @@ pub const Runtime = struct {
                 .deny,
                 reason,
                 io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(err) });
-                return self.encodeManaged(alloc, .{
-                    .ok = false,
-                    .error_code = "approval_not_answered",
-                    .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(err) }),
-                });
+            ) catch |err| switch (err) {
+                // The request ended while the check ran: its worker is gone, so
+                // the answer has nowhere to go, and the parent must not read
+                // otherwise.
+                error.RequestNotFound => {
+                    debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                    return self.encodeManaged(alloc, .{
+                        .ok = true,
+                        .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                    });
+                },
+                else => |other| {
+                    debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                    return self.encodeManaged(alloc, .{
+                        .ok = false,
+                        .error_code = "approval_not_answered",
+                        .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                    });
+                },
             };
-            if (resolution == .rejected) return self.encodeManaged(alloc, .{
-                .ok = true,
-                .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
-            });
+            if (resolution == .rejected) {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            }
             const text = if (denial) |why|
                 try a.print("Refused {s}'s request: {s}. Your permissions did not allow it: {s}", .{ agent, label, why })
             else
@@ -2240,23 +2257,36 @@ pub const Runtime = struct {
             decision,
             feedback,
             io_mod.milliTimestamp(),
-        ) catch |err| {
-            debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(err) });
+        ) catch |err| switch (err) {
+            // The request ended before this answer: the child already stopped
+            // waiting, and the parent must not read otherwise.
+            error.RequestNotFound => {
+                debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=request_ended", .{agent});
+                return self.encodeManaged(alloc, .{
+                    .ok = true,
+                    .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
+                });
+            },
+            else => |other| {
+                debug_trace.logf("subagent", "approval answer failed agent={s} err={s}", .{ agent, @errorName(other) });
+                return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = "approval_not_answered",
+                    .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(other) }),
+                });
+            },
+        };
+        if (resolution == .rejected) {
+            debug_trace.eventf("subagent", "approval_answer_dropped", .{}, "agent={s} reason=worker_gone", .{agent});
             return self.encodeManaged(alloc, .{
-                .ok = false,
-                .error_code = "approval_not_answered",
-                .result = try a.print("fx could not answer {s}'s approval request: {s}. Call status, then try again.", .{ agent, @errorName(err) }),
+                .ok = true,
+                .result = try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
             });
-        };
-        const text = switch (resolution) {
-            .accepted => if (decision == .deny)
-                try a.print("Refused {s}'s request: {s}.", .{ agent, label })
-            else
-                try a.print("Allowed {s}'s request: {s}.", .{ agent, label }),
-            // The request ended before this answer reached it, so the child
-            // already stopped waiting and the parent must not read otherwise.
-            .rejected => try a.print("{s}'s request: {s} is no longer waiting.", .{ agent, label }),
-        };
+        }
+        const text = if (decision == .deny)
+            try a.print("Refused {s}'s request: {s}.", .{ agent, label })
+        else
+            try a.print("Allowed {s}'s request: {s}.", .{ agent, label });
         return self.encodeManaged(alloc, .{ .ok = true, .result = text });
     }
 
@@ -2555,7 +2585,7 @@ pub const Runtime = struct {
     /// Returns whether the note was posted: false means the parent was not
     /// told, and the request is refused at once by its observer.
     pub fn noteChildApproval(self: *Runtime, child_id: []const u8, name: []const u8, label: []const u8) bool {
-        if (!self.childOpen(child_id)) {
+        if (!self.childListed(child_id)) {
             debug_trace.eventf("mailbox", "approval_note_dropped", .{}, "child={s} reason=closed", .{child_id});
             return false;
         }
@@ -2599,6 +2629,26 @@ pub const Runtime = struct {
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });
         debug_trace.eventf("mailbox", "quiet_note_posted", .{}, "child={s} quiet_ms={d}", .{ child_id, crossing.quiet_ms });
+    }
+
+    /// Whether `child_id` is still one of this host's children, read from the
+    /// state store alone. A note is posted under the child's worker mutex,
+    /// which a parent's stop or close waits for while it holds
+    /// `admission_mutex`, so the note cannot use `childOpen`: taking that
+    /// mutex there would deadlock the two (E1 lock map). A child that is
+    /// closing but still listed lets its one note through, as a child's own
+    /// message does; the slot's end settles it.
+    fn childListed(self: *Runtime, child_id: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = self.managed.state_store.load(arena.allocator()) catch |err| {
+            debug_trace.logf("mailbox", "approval note check failed child={s} err={s}", .{ child_id, @errorName(err) });
+            return false;
+        };
+        for (registry.children) |child| if (std.mem.eql(u8, child.id, child_id)) return true;
+        return false;
     }
 
     /// Whether `child_id` is one of this host's children and not closing.
@@ -10404,4 +10454,124 @@ test "the waiting loop answers the fallback after a request is marked noted" {
     t.runtime.approvals.markNoted("approval-1");
     done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch return error.Timeout;
     try std.testing.expectEqual(@as(?Runtime.TreeWake, .approvals_unanswered), result);
+}
+
+/// Holds a parent's stop inside its admission section, so a test can prove the
+/// approval note never waits for that mutex.
+const AdmissionHold = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn inStop(_: []const u8) void {
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        end_test_controls.test_hold_stop = inStop;
+    }
+
+    fn clear() void {
+        end_test_controls.test_hold_stop = null;
+    }
+
+    fn release() void {
+        go.set(io_mod.getIo());
+    }
+
+    fn waitHeld() !void {
+        held.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } }) catch return error.Timeout;
+    }
+};
+
+test "an approval note posts while a stop holds admission, and never waits for it" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    const Notes = struct {
+        posts: usize = 0,
+
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (delivery) {
+                .report => return,
+                .message => self.posts += 1,
+            }
+        }
+    };
+    var notes: Notes = .{};
+    t.runtime.report_sink = .{ .context = &notes, .post_fn = Notes.post };
+
+    AdmissionHold.arm();
+    defer AdmissionHold.clear();
+    // The stop takes `admission_mutex` and keeps it until `release`.
+    const Stop = struct {
+        fn run(rt: *Runtime, arena: Allocator, done: *std.Io.Event) void {
+            // The stop's own answer is not what this test reads: it holds
+            // admission while the note is posted.
+            _ = rt.stopChild(arena, "reviewer") catch {};
+            done.set(io_mod.getIo());
+        }
+    };
+    var stop_done: std.Io.Event = .unset;
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{ t.runtime, t.arena(), &stop_done });
+    AdmissionHold.waitHeld() catch {
+        AdmissionHold.release();
+        stop_thread.join();
+        return error.TestUnexpectedResult;
+    };
+
+    // The note runs on its own thread, as it does inside a child's observation,
+    // which holds that child's worker mutex.
+    const Note = struct {
+        fn run(rt: *Runtime, out: *?bool, done: *std.Io.Event) void {
+            out.* = rt.noteChildApproval("child-1", "reviewer", "run touch marker");
+            done.set(io_mod.getIo());
+        }
+    };
+    var noted: ?bool = null;
+    var note_done: std.Io.Event = .unset;
+    const note_thread = try std.Thread.spawn(.{}, Note.run, .{ t.runtime, &noted, &note_done });
+    note_done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } }) catch {
+        // The note waited for the stop's admission mutex: the stop would now
+        // wait for the worker the note runs under.
+        AdmissionHold.release();
+        stop_thread.join();
+        note_thread.join();
+        return error.TestUnexpectedResult;
+    };
+    AdmissionHold.release();
+    stop_thread.join();
+    note_thread.join();
+    try std.testing.expectEqual(true, noted.?);
+    try std.testing.expectEqual(@as(usize, 1), notes.posts);
+}
+
+test "an answer whose request ends during the check says it is no longer waiting" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+    // The request ends while main's check runs, as a stop of that child ends it.
+    const Check = struct {
+        approvals: *approval_registry.Registry,
+
+        fn check(raw: *anyopaque, _: Allocator, _: types.ToolCall) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.approvals.withdraw("approval-1");
+            return null;
+        }
+
+        fn hook(self: *@This()) ApprovalCheck {
+            return .{ .context = self, .check_fn = check };
+        }
+    };
+    var check = Check{ .approvals = &t.runtime.approvals };
+
+    const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
+    try expectAnswerHas(result.body, "reviewer's request: run touch marker is no longer waiting.");
+    // Nothing reached the worker: the request had already ended.
+    try std.testing.expect(t.worker.decision == null);
 }
