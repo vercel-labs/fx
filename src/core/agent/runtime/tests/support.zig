@@ -482,6 +482,9 @@ pub const FakeAgentRuntimeDeps = struct {
     texts: std.ArrayList([]u8) = .empty,
     assistant_sources: std.ArrayList([]u8) = .empty,
     system_notices: std.ArrayList([]u8) = .empty,
+    /// Notices the core pushes as session notices, such as an effort the
+    /// model does not offer. The CLI shows each one as a system notice.
+    session_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
@@ -721,6 +724,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
+        freeStringList(self.alloc, &self.session_notices);
         freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
@@ -833,6 +837,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_tool_lifecycle = pushToolLifecycle,
             .push_diff_block = pushDiff,
             .push_system_notice = systemNotice,
+            .push_session_notice = sessionNotice,
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
@@ -1886,6 +1891,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.system_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("system_notice:{s}", .{text});
+    }
+
+    fn sessionNotice(raw: *anyopaque, text: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.session_notices.append(self.alloc, try self.alloc.dupe(u8, text));
     }
 
     fn interactiveNotice(raw: *anyopaque, notice: types.SemanticNotice) !void {

@@ -870,6 +870,7 @@ describe("custom connection options", () => {
       expect(f.requests).toHaveLength(2);
       expect(f.requests.every(request => request.body.reasoning_effort === undefined)).toBe(true);
       expect(occurrences(undeclared.stderr, "high is not available for local-model")).toBe(1);
+      expect(undeclared.stderr).toContain("Effort high is not available for local-model, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.");
 
       metadata(f).reasoning_efforts = { low: { reasoning_effort: "low" } };
       f.save();

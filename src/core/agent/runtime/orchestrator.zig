@@ -220,7 +220,11 @@ fn appendContinuationPrompt(
 }
 
 const ignored_effort_notice =
-    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+    "Effort {s} is not available for {s}, so it is not sent.";
+/// Only a custom connection offers a level through its settings, so only its
+/// notice says where to add one.
+const custom_effort_hint =
+    " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -8643,14 +8647,28 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it. One the person set and the model does not
-            // declare is left out, and the session says so once
+            // settings declare it, and the Gateway only when its catalog lists
+            // it. One the person set and the model does not declare is left
+            // out, and the session says so once
             // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession).
-            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
+            // that failed cannot say what it lists, so its drop stays quiet
+            // (`deps.zig` model_catalog_failure).
+            const effort_catalog_known = job.provider == .configured or
+                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+            if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
+                    const notice = if (job.provider == .configured)
+                        try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
+                    else
+                        sentence;
+                    try push(deps.ctx, notice);
                 }
             }
             // Fast drops silently when the catalog cannot confirm support.

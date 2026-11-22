@@ -1753,6 +1753,58 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask names an effort the gateway catalog does not list, and sends none", async () => {
+    const root = createFixtureRoot("ask-unlisted-effort");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("UNLISTED_EFFORT_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        [
+          "ask", "--json", "--auto", "--no-save",
+          "--model", MODEL,
+          "--effort", "xhigh",
+          "Use the unlisted effort.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "UNLISTED_EFFORT_COMPLETE",
+      );
+      const notices = result.stderr.trim().split("\n");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toBe(
+        `[notice] Effort xhigh is not available for ${MODEL}, so it is not sent.`,
+      );
+      expect(gateway.requests).toHaveLength(1);
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("reasoning");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("ask --config overrides the settings files and yields to dedicated flags", async () => {
     const root = createFixtureRoot("ask-config-overrides");
     const tracePath = join(root.root, "trace.log");
