@@ -141,6 +141,28 @@ pub fn holdBeforeCloseSettle(child_id: []const u8) void {
     }
 }
 
+/// Test builds only: an inline test sets it to hold the host after it has
+/// finished a turn that ended before its work opened, with the lock released
+/// and before it clears the child's busy flag, so a close can land in that
+/// gap. No file control sets it.
+pub var test_in_settle_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+/// Whether an inline test holds the host after a turn's end.
+pub fn inSettleArmed() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_in_settle_hold != null;
+    return false;
+}
+
+/// Called by the host for `child_id` once it has finished a turn that ended
+/// before its work opened, before it clears the child's busy flag.
+pub fn holdInSettle(child_id: []const u8) void {
+    if (comptime build_options.libfx) return;
+    if (builtin.is_test) {
+        if (test_in_settle_hold) |hold| hold(child_id);
+    }
+}
+
 /// The two paths of a hold's file controls.
 pub const HoldFiles = struct { held: []const u8, release: []const u8 };
 
@@ -202,6 +224,12 @@ test "a test build holds the host before it settles an ended work only through i
     try std.testing.expect(!settleArmed());
     holdBeforeSettle("child");
     try std.testing.expectEqual(@as(u32, 0), settle_holds.load(.seq_cst));
+}
+
+test "a test build holds the host after a turn ends and before its busy clear only through its hook" {
+    // Without a hook the host's call returns at once.
+    try std.testing.expect(!inSettleArmed());
+    holdInSettle("child");
 }
 
 test "a hold is armed only when both of its paths are absolute" {
