@@ -643,7 +643,11 @@ const CrashReportOutcome = union(enum) {
 fn saveCrashReport(comptime App: type, app: *App, err: anyerror) CrashReportOutcome {
     if (isTerminalHangUp(err)) return .skipped;
     const path: ?[]u8 = app.writeCrashReport(err) catch |save_err| return .{ .not_saved = save_err };
-    return if (path) |saved| .{ .saved = saved } else .skipped;
+    const saved = path orelse return .skipped;
+    // The full report is in place. A panic from here on, such as one during
+    // shutdown, must not replace it with the short panic record.
+    crash_panic.noteReportSaved();
+    return .{ .saved = saved };
 }
 
 /// Says where the crash report is, or that it could not be saved.
@@ -672,6 +676,7 @@ fn crashReportSaveFaultMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.AccessDenied => profile_paths.displayText("fx: crash report not saved: permission denied. Check the permissions under ~/.fx/diagnostics, then reproduce the error.\n"),
         error.ReadOnlyFileSystem => "fx: crash report not saved: the disk is read-only. Make it writable, then reproduce the error.\n",
+        error.PrivateStatePermissionsUnsupported => "fx: crash report not saved: the disk is read-only, or does not keep private file permissions. Make it writable if it is read-only, then reproduce the error.\n",
         error.NoSpaceLeft, error.DiskQuota => "fx: crash report not saved: the disk is full. Free some space, then reproduce the error.\n",
         error.DurablePathUnsafe => profile_paths.displayText("fx: crash report not saved: a file or folder in ~/.fx/diagnostics is a link, or is not a folder. Remove it, then reproduce the error.\n"),
         error.NoHomeDir => "fx: crash report not saved: HOME is not set, or is not a full path. Set HOME, then reproduce the error.\n",
@@ -1568,6 +1573,14 @@ test "app entry says the crash report was not saved when a worker thread fails t
     try std.testing.expectEqualStrings("fx: test worker start failed\nfx: crash report not saved: permission denied. Check the permissions under ~/.fx/diagnostics, then reproduce the error.\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit" });
+}
+
+test "crash report not saved names the next step for a folder that cannot be made private" {
+    var buffer: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "fx: crash report not saved: the disk is read-only, or does not keep private file permissions. Make it writable if it is read-only, then reproduce the error.\n",
+        crashReportNotSavedText(&buffer, error.PrivateStatePermissionsUnsupported),
+    );
 }
 
 test "crash report not saved names the next step for a full disk" {
