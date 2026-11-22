@@ -356,15 +356,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
         startWorkerThread(App, app, deps) catch |err| {
             // Saved before the terminal is released, as the run error path below
-            // does. A hang-up leaves no one to tell, so it saves nothing.
-            const crash_report_path: ?[]u8 = if (comptime @hasDecl(App, "writeCrashReport"))
-                (if (isTerminalHangUp(err)) null else app.writeCrashReport(err))
-            else
-                null;
-            defer if (crash_report_path) |path| app.alloc.free(path);
+            // does. What the save left to say is printed once the terminal is back.
+            const report: CrashReportOutcome = if (comptime @hasDecl(App, "writeCrashReport")) saveCrashReport(App, app, err) else .skipped;
+            defer report.deinit(app.alloc);
             app.releaseTerminal();
             reportUnexpectedInteractiveError(deps, err);
-            if (crash_report_path) |path| reportCrashReportPath(deps, path);
+            reportCrashReport(deps, report);
             return err;
         };
         if (@hasDecl(App, "launchStartupInstances")) app.launchStartupInstances();
@@ -386,11 +383,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         }
         // Saved before the terminal is released, while the renderer state the
         // report reads is still the one that failed.
-        const crash_report_path: ?[]u8 = if (comptime !cooperative and @hasDecl(App, "writeCrashReport"))
-            (if (hung_up) null else app.writeCrashReport(err))
-        else
-            null;
-        defer if (crash_report_path) |path| app.alloc.free(path);
+        const report: CrashReportOutcome = if (comptime !cooperative and @hasDecl(App, "writeCrashReport")) saveCrashReport(App, app, err) else .skipped;
+        defer report.deinit(app.alloc);
         app.releaseTerminal();
         if (hung_up) {
             app_needs_deinit = false;
@@ -407,7 +401,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return .returned;
         }
         reportUnexpectedInteractiveError(deps, err);
-        if (crash_report_path) |path| reportCrashReportPath(deps, path);
+        reportCrashReport(deps, report);
         return err;
     };
     const relaunch_request: ?auto_upgrade.RelaunchRequest = if (comptime cooperative)
@@ -630,6 +624,42 @@ fn isTerminalHangUp(err: anyerror) bool {
     return err == error.TerminalInputClosed or err == error.TerminalHungUp;
 }
 
+/// What saving the crash report left to say. `skipped` is a hang-up, when nobody
+/// is left to read a report, or an app that has no report to write.
+const CrashReportOutcome = union(enum) {
+    skipped,
+    saved: []u8,
+    not_saved: anyerror,
+
+    /// Frees the saved path, which the caller owns.
+    fn deinit(self: CrashReportOutcome, alloc: Allocator) void {
+        if (self == .saved) alloc.free(self.saved);
+    }
+};
+
+/// Saves the crash report for an unexpected error. A hang-up saves nothing. The
+/// app's save returns the saved path, null when it has nothing to save, or the
+/// error that stopped the save.
+fn saveCrashReport(comptime App: type, app: *App, err: anyerror) CrashReportOutcome {
+    if (isTerminalHangUp(err)) return .skipped;
+    const path: ?[]u8 = app.writeCrashReport(err) catch |save_err| return .{ .not_saved = save_err };
+    return if (path) |saved| .{ .saved = saved } else .skipped;
+}
+
+/// Says where the crash report is, or that it could not be saved.
+fn reportCrashReport(deps: RunDeps, outcome: CrashReportOutcome) void {
+    switch (outcome) {
+        .skipped => {},
+        .saved => |path| reportCrashReportPath(deps, path),
+        .not_saved => |err| {
+            var buffer: [512]u8 = undefined;
+            // Error names are short, so the line always fits the buffer.
+            const message = std.mem.print(&buffer, "fx: crash report not saved ({s})\n", .{@errorName(err)}) catch return;
+            writeStderr(deps, message);
+        },
+    }
+}
+
 /// Says where the crash report was saved. A path too long for the buffer is
 /// not shown; the trace log records its length instead.
 fn reportCrashReportPath(deps: RunDeps, path: []const u8) void {
@@ -803,6 +833,8 @@ const TestCapture = struct {
     record_stdout_event: bool = false,
     /// The path `TestApp.writeCrashReport` returns; null means no report is saved.
     crash_report_path: ?[]const u8 = null,
+    /// The error `TestApp.writeCrashReport` returns instead of saving, when set.
+    crash_report_error: ?anyerror = null,
     resume_handoff_id: ?[]const u8 = null,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
@@ -977,10 +1009,15 @@ const TestApp = struct {
     }
 
     /// A copy of the capture's path, owned by the caller, when the test sets one.
-    pub fn writeCrashReport(self: *TestApp, _: anyerror) ?[]u8 {
-        const path = active_capture.?.crash_report_path orelse return null;
+    pub fn writeCrashReport(self: *TestApp, _: anyerror) anyerror!?[]u8 {
+        const capture = active_capture.?;
+        if (capture.crash_report_error) |save_error| {
+            appendTestEvent("crash-report");
+            return save_error;
+        }
+        const path = capture.crash_report_path orelse return null;
         appendTestEvent("crash-report");
-        return self.alloc.dupe(u8, path) catch null;
+        return try self.alloc.dupe(u8, path);
     }
 
     fn releaseTerminal(self: *TestApp) void {
@@ -1484,6 +1521,34 @@ test "app entry saves a crash report before it releases the terminal and says wh
     try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit", "outer-defer" });
+}
+
+test "app entry says the crash report was not saved, after the error and the terminal release" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.run_error = error.TestRunFailed;
+    capture.record_stderr_event = true;
+    capture.crash_report_error = error.AccessDenied;
+
+    try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: test run failed\nfx: crash report not saved (AccessDenied)\n", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit", "outer-defer" });
+}
+
+test "app entry says the crash report was not saved when a worker thread fails to start" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.worker_error = error.TestWorkerStartFailed;
+    capture.record_stderr_event = true;
+    capture.crash_report_error = error.AccessDenied;
+
+    try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: test worker start failed\nfx: crash report not saved (AccessDenied)\n", capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 2), capture.stderr_calls);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "crash-report", "terminal-release", "stderr-attempt", "stderr-attempt", "deinit" });
 }
 
 test "app entry does not save a crash report for a hang-up" {

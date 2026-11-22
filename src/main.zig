@@ -489,7 +489,7 @@ const App = struct {
 
     /// Saves the crash report for `err`. The caller owns the path and frees it
     /// with `app.alloc`; null means the report was not saved.
-    pub fn writeCrashReport(self: *Self, err: anyerror) ?[]u8 {
+    pub fn writeCrashReport(self: *Self, err: anyerror) anyerror![]u8 {
         return trace_report.writeCrashReport(self, err);
     }
 
