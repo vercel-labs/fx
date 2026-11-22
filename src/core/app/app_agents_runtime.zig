@@ -702,7 +702,8 @@ pub fn postAndWait(handoffs: *Handoffs, post: *Post, cancel: *std.atomic.Value(b
     {
         handoffs.mutex.lockUncancelable(io_mod.getIo());
         defer handoffs.mutex.unlock(io_mod.getIo());
-        if (handoffs.closed) return error.Cancelled;
+        // A cancel that is already set never queues the post, so the main loop cannot take it.
+        if (handoffs.closed or cancel.load(.seq_cst)) return error.Cancelled;
         try handoffs.posts.append(handoff_alloc, post);
     }
     while (true) {
@@ -3589,6 +3590,17 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     cancel.store(false, .seq_cst);
     try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+}
+
+test "a hand-off whose cancel is already set is never queued for the main loop" {
+    // The list allocates on its first append, so capacity 0 shows that no post was ever queued.
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
+    var cancel = std.atomic.Value(bool).init(true);
+    var post = Post{ .turn = undefined };
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.capacity);
 }
 
 test "the cancel a run's wait repeats ends the question that run waits on" {
