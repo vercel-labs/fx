@@ -343,9 +343,9 @@ fn readRequestLine(arena: Allocator, fd: posix.socket_t, wake_read: posix.fd_t) 
             .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = wake_read, .events = posix.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, @intCast(remaining)) catch return error.ReadFailed;
+        const ready = posix.poll(&fds, @intCast(@min(remaining, wake_safety_poll_ms))) catch return error.ReadFailed;
         if (fds[1].revents != 0) return error.Canceled;
-        if (ready == 0) continue;
+        if (ready == 0 or fds[0].revents == 0) continue;
         const rc = std.c.recv(fd, &chunk, chunk.len, 0);
         if (rc < 0) {
             if (posix.errno(rc) == .INTR or posix.errno(rc) == .AGAIN) continue;
@@ -782,7 +782,7 @@ test "the bridge stops at once, and ends a silent client's connection with it" {
     };
     const started = io_mod.milliTimestamp();
     unregister(registration);
-    // Without the wake byte this stop waits for the client to send or close, which it never does.
+    // Without the wake byte this stop waits for the request poll's safety timeout (wake_safety_poll_ms).
     try std.testing.expect(io_mod.milliTimestamp() - started < 500);
     try std.testing.expectEqual(@as(u32, 0), bridge.connections);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
