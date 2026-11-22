@@ -2986,6 +2986,7 @@ fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status
         _ = try r.tools(arena, "fake", null);
         status = (try r.statuses(arena))[0];
         if ((status.tools_error != null) == want_refused) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
         std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
     }
     return status;
