@@ -2855,7 +2855,7 @@ pub fn Runtime(comptime App: type) type {
                     post.settle(.taken);
                 } else |err| {
                     debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind={s} reason={s}", .{ post.turn.child_id orelse "", kind, @errorName(err) });
-                    post.settle(.failed);
+                    post.settle(if (err == error.Cancelled) .closed else .failed);
                 }
             }
             if (held.items.len == 0) return;
@@ -2929,6 +2929,10 @@ pub fn Runtime(comptime App: type) type {
             if (child.purpose.len == 0) if (post.turn.child_purpose) |purpose| {
                 child.purpose = try app.alloc.dupe(u8, purpose);
             };
+            // The owner counts the work's unread messages until its turn
+            // begins, which is here. A stop that came first set the cancel:
+            // the turn does not begin, and the run goes back to its slot.
+            if (!post.turn.hostedTurnBegins()) return error.Cancelled;
             installChildRun(app, child, post.run.?);
             post.run = null;
             const start: Start = .{ .post = post, .child = child };

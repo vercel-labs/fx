@@ -6427,6 +6427,40 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
     }
 }
 
+test "a hosted run whose stop came first is refused when the main loop would start it" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
+    const child = try addTestChildAgent(&app, "child-0");
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const Refused = struct {
+        fn begin(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var marker: u8 = 0;
+    var turn: subagent_execution.TurnContext = undefined;
+    turn.child_id = child.id;
+    turn.child_name = null;
+    turn.child_purpose = null;
+    turn.begin_context = &marker;
+    turn.begin_fn = Refused.begin;
+    var post = app_agents_runtime.Post{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
+    defer if (post.run) |*unsent| unsent.deinit(alloc);
+    {
+        app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+        try app.child_handoffs.posts.append(std.heap.c_allocator, &post);
+    }
+    App.AgentsAppRuntime.takePosts(&app);
+    try std.testing.expectEqual(app_agents_runtime.Post.State.closed, post.state.load(.acquire));
+    try std.testing.expect(child.agent.child_run == null);
+    try std.testing.expect(post.run != null);
+}
+
 test "a handoff that gives way before it pushed any row only redraws" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
