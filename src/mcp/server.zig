@@ -507,6 +507,9 @@ pub const Server = struct {
                 try r.stepRequest(.{ .transport_lost = id });
                 try r.closeKey(id, .forgotten);
             }
+            // A listing on the dropped link fails, as a stdio one does when its
+            // process ends, so the next link lists again.
+            if (l.what == .list and r.catalog.pending != .none) try r.stepCatalog(.page_failed);
             l.used = false;
         };
         if (r.listen_key) |key| try r.closeKey(key, .forgotten);

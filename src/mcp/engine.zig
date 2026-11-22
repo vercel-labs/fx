@@ -498,8 +498,9 @@ pub const Engine = struct {
                 };
                 const done = slot.calls.orderedRemove(i);
                 free(e.gpa, done);
-                // A stdio link that loses a call has a dead process, which `down` restarts.
-                const ended: core.Event = if (c.outcome == .lost and slot.config.transport == .http) .{ .lost = done.handle } else .{ .answered = done.handle };
+                // Only a broken or ended stream counts toward a restart: a stdio loss means a dead process, which down restarts,
+                // and a reply too large to read shows the link works.
+                const ended: core.Event = if (c.outcome == .lost and !c.oversized and slot.config.transport == .http) .{ .lost = done.handle } else .{ .answered = done.handle };
                 // A lost call has no answer, so a restart's reset frees nothing `c` reads.
                 const was_ready = slot.gate.phase == .ready;
                 const protocol = s.protocolVersion();
@@ -991,6 +992,28 @@ test "two calls lost in a row restart an HTTP link, not a stdio one" {
     }
     try std.testing.expectEqual(core.Phase.ready, local.gate.phase);
     try std.testing.expectEqual(@as(u8, 0), local.gate.lost);
+}
+
+test "oversized replies do not restart an HTTP link" {
+    const servers = [_]Config{
+        .{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } },
+    };
+    var e: Engine = undefined;
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+    const web = e.slots.items[0];
+    _ = try e.ensureServer(web);
+    web.gate.phase = .ready;
+
+    for ([_]Handle{ 1, 2 }) |handle| {
+        try sendCall(&e, web, handle, 100 + handle);
+        try e.onServer(web, .{ .called = .{ .handle = 100 + handle, .outcome = .lost, .maybe_ran = true, .timed_out = false, .answer = null, .oversized = true, .lost_why = .too_large, .status = 200 } });
+        try expectLastLost(&e, .too_large, 200, false);
+        try std.testing.expectEqual(core.Phase.ready, web.gate.phase);
+        try std.testing.expectEqual(@as(u8, 0), web.gate.lost);
+    }
 }
 
 /// Checks the host event the engine emitted last: a lost call with its reason, status, and restart flag.

@@ -3826,8 +3826,8 @@ test "a lost call's trace line names the server, transport, reason, protocol, st
         lostCallLine(&buf, "web", "http", "stream_broken", "2026-07-28", 0, false),
     );
     try testing.expectEqualStrings(
-        "MCP call lost server=web transport=http why=too_large protocol=2025-11-25 status=413 restarted=false",
-        lostCallLine(&buf, "web", "http", "too_large", "2025-11-25", 413, false),
+        "MCP call lost server=web transport=http why=resume_refused protocol=2025-11-25 status=503 restarted=false",
+        lostCallLine(&buf, "web", "http", "resume_refused", "2025-11-25", 503, false),
     );
     try testing.expectEqualStrings(
         "MCP call lost server=local transport=stdio why=link_down protocol=none status=0 restarted=true",

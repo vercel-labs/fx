@@ -624,6 +624,42 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-http-lost-restart-while-listing",
+    description: "A tool list still loading when two HTTP calls are lost is failed by the restart, so the next tool request lists again on the new link, and a third call is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] }, delayMs: 3000, times: 1 },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "expect h.tools.fail 10000", "tools h", "expect h.tools.ok 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The restart: the second detection and the second tool list both go out after the second lost call.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const listings = posts.filter((m) => m.method === "tools/list");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      const relisted = listings.length === 2 && calls.length === 3 && listings[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        same(listings.length, 2, "tools/list posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        relisted ? null : "the second tool list did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
+  }),
+  engineScenario({
     name: "u12-http-initialized-timeout",
     description: "A 2025 HTTP server answers initialize but never answers notifications/initialized: after the request timeout the session fails with initialized_timed_out, and the server goes down instead of looking ready with no tools",
     http: {
