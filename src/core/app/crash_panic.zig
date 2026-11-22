@@ -11,7 +11,9 @@
 //! The handler can run on any thread and in any state, so it does not allocate
 //! or take a lock. `prepare` computes the paths at startup. The handler creates
 //! the fx folder and the `diagnostics` folder when they are missing, both private
-//! to the user. A call that fails is ignored.
+//! to the user, and writes only through folders it opened without following links.
+//! A call that fails is ignored, except that a failed save, a refused folder, and
+//! the saved path are written to stderr.
 //! The renderer event ring is not saved, because reading it needs a blocking
 //! lock that the handler does not take. Segfaults do not reach this handler:
 //! `std.debug` prints them and aborts on its own.
@@ -45,6 +47,8 @@ var path_buf: [path_max_bytes:0]u8 = undefined;
 /// process ID, so two fx processes that panic at once never share it.
 /// `prepare` sets it.
 var tmp_path_buf: [path_max_bytes:0]u8 = undefined;
+/// Where the temporary file's name starts in `tmp_path_buf`, after the folder.
+var tmp_name_offset: usize = 0;
 /// Zero means no path is set, so the handler writes no record.
 var path_len: usize = 0;
 /// Set by the first panic. A panic that finds it set skips the save.
@@ -74,6 +78,7 @@ pub fn prepare(home: []const u8) void {
         profile_paths.last_crash_report_file_name,
         std.c.getpid(),
     }) orelse return;
+    tmp_name_offset = dir.len + 1;
     path_len = file_len;
 }
 
@@ -101,21 +106,36 @@ fn claimSave() bool {
 /// then goes to `std.debug.defaultPanic`, which prints the message and aborts.
 /// A panic that comes during the save, from any thread or from this handler,
 /// skips the save, and so does one after `noteReportSaved`.
-pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
+/// Saves a panic record unless this process has already saved or noted a crash.
+fn savePanic(msg: []const u8) void {
     if (claimSave()) saveRecord(msg);
+}
+
+pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    savePanic(msg);
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
 /// Writes the record to the temporary file, then renames it over the crash file.
 /// Creates the fx folder and the diagnostics folder when they are missing. Every
-/// error is ignored, because the panic must still reach `std.debug.defaultPanic`.
+/// error is ignored, because the panic must still reach `std.debug.defaultPanic`,
+/// except that a failed save, a folder it refuses, and the saved path are written
+/// to stderr.
 fn saveRecord(msg: []const u8) void {
     if (path_len == 0) return;
     // Creates the fx folder, then the diagnostics folder, both private to the user,
     // when they are missing. The results are not checked: "already exists" is
-    // expected, and any other failure shows up in the open below.
+    // expected, and any other failure shows up in the open below. Each folder is
+    // then opened without following a link, and the rest of the save goes through
+    // those descriptors, so a link in the way is refused, never written through.
     _ = std.c.mkdir(&fx_dir_buf, 0o700);
-    _ = std.c.mkdir(&dir_buf, 0o700);
+    const fx_fd = std.c.open(&fx_dir_buf, folder_open_flags);
+    if (fx_fd < 0) return noteRefused(std.mem.sliceTo(&fx_dir_buf, 0));
+    defer _ = std.c.close(fx_fd);
+    _ = std.c.mkdirat(fx_fd, profile_paths.diagnostics_dir_name, 0o700);
+    const dir_fd = std.c.openat(fx_fd, profile_paths.diagnostics_dir_name, folder_open_flags);
+    if (dir_fd < 0) return noteRefused(std.mem.sliceTo(&dir_buf, 0));
+    defer _ = std.c.close(dir_fd);
     const record = formatRecord(
         &record_buf,
         build_options.app_version,
@@ -123,7 +143,7 @@ fn saveRecord(msg: []const u8) void {
         io_mod.milliTimestamp(),
         msg,
     );
-    if (record.len == 0) return;
+    if (record.len == 0) return noteNotSaved();
     // The record goes to the temporary file first. The rename replaces the crash
     // file in one step, and only after every byte is written, so a failed write
     // leaves the last saved record in place. Any file already at the temporary path
@@ -132,17 +152,57 @@ fn saveRecord(msg: []const u8) void {
     // The open must then create a new file, private to the user. A symbolic link, or
     // anything else still in the way, makes the open fail, and the save is skipped
     // without blocking.
-    _ = std.c.unlink(&tmp_path_buf);
-    const fd = std.c.open(&tmp_path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, @as(c_uint, 0o600));
-    if (fd < 0) return;
+    const tmp_name: [*:0]const u8 = tmp_path_buf[tmp_name_offset..].ptr;
+    _ = std.c.unlinkat(dir_fd, tmp_name, 0);
+    const fd = std.c.openat(dir_fd, tmp_name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .NONBLOCK = true }, @as(c_uint, 0o600));
+    if (fd < 0) return noteNotSaved();
     const written = writeAll(fd, record);
     // The record reaches the disk before the rename makes it the crash file. The
     // result is ignored, as with the other calls here. A failed sync still renames,
     // so the newest record replaces the old one, but it may not survive a power loss.
     if (written) _ = std.c.fsync(fd);
     _ = std.c.close(fd);
-    if (written and std.c.rename(&tmp_path_buf, &path_buf) == 0) return;
-    _ = std.c.unlink(&tmp_path_buf);
+    if (!written or std.c.renameat(dir_fd, tmp_name, dir_fd, profile_paths.last_crash_report_file_name) != 0) {
+        _ = std.c.unlinkat(dir_fd, tmp_name, 0);
+        return noteNotSaved();
+    }
+    writeNotice("fx: crash report saved to ", std.mem.sliceTo(&path_buf, 0), "\n");
+}
+
+/// The flags that open a folder without following a link at its end.
+const folder_open_flags: std.c.O = .{ .DIRECTORY = true, .NOFOLLOW = true };
+
+fn noteRefused(path: []const u8) void {
+    writeNotice("fx: crash report not saved: ", path, " could not be opened as a folder.\n");
+}
+
+/// Says on stderr that a save failed after its folders were opened: the temporary
+/// file could not be opened, written, or renamed, or the record did not format. A
+/// save skipped on purpose never reaches here. A constant, so it needs no buffer.
+fn noteNotSaved() void {
+    _ = writeAll(2, "fx: crash report not saved\n");
+}
+
+/// The longest notice: a prefix, a path up to `path_max_bytes`, and a suffix.
+const notice_bytes = path_max_bytes + 96;
+/// Holds one notice. A static buffer, so the handler needs no stack space for it.
+var notice_buf: [notice_bytes]u8 = undefined;
+
+/// Joins a notice into `buf`. Null when it does not fit, so a path is never cut short.
+fn noticeText(buf: []u8, prefix: []const u8, path: []const u8, suffix: []const u8) ?[]const u8 {
+    const len = prefix.len + path.len + suffix.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..path.len], path);
+    @memcpy(buf[prefix.len + path.len ..][0..suffix.len], suffix);
+    return buf[0..len];
+}
+
+/// Writes one notice to stderr. It allocates nothing, and a failed write is
+/// ignored: the panic that follows still prints and aborts.
+fn writeNotice(prefix: []const u8, path: []const u8, suffix: []const u8) void {
+    const line = noticeText(&notice_buf, prefix, path, suffix) orelse return;
+    _ = writeAll(2, line);
 }
 
 /// Writes all of `bytes` to `fd`. Returns false when a write fails.
@@ -467,11 +527,127 @@ test "crash panic writes the record to the prepared file" {
     try std.testing.expectEqualStrings("boom from the file test", fatal.get("message").?.string);
 }
 
-test "crash panic skips its save once a full report is noted as saved" {
+test "crash panic keeps a full report on disk once it is noted as saved" {
     defer handling.store(false, .seq_cst);
     handling.store(false, .seq_cst);
-    try std.testing.expect(claimSave());
-    handling.store(false, .seq_cst);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".fx/diagnostics/last-crash.jsonl", .data = "full report\n" });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
     noteReportSaved();
-    try std.testing.expect(!claimSave());
+    savePanic("short panic record");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("full report\n", bytes);
+}
+
+test "crash panic does not write through a link at the diagnostics folder" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const elsewhere = try std.testing.allocator.print("{s}/elsewhere", .{home});
+    defer std.testing.allocator.free(elsewhere);
+    try tmp.dir.symLink(std.testing.io, elsewhere, ".fx/diagnostics", .{});
+    defer path_len = 0;
+
+    prepare(home);
+    saveRecord("through the link");
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, "elsewhere/last-crash.jsonl", .{ .follow_symlinks = false }),
+    );
+}
+
+test "crash panic does not write through a link at the fx folder" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "elsewhere");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const elsewhere = try std.testing.allocator.print("{s}/elsewhere", .{home});
+    defer std.testing.allocator.free(elsewhere);
+    try tmp.dir.symLink(std.testing.io, elsewhere, ".fx", .{});
+    defer path_len = 0;
+
+    prepare(home);
+    saveRecord("through the link");
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, "elsewhere/diagnostics", .{ .follow_symlinks = false }),
+    );
+}
+
+/// Runs `run` with stderr written to a file in `tmp`, and returns what it wrote.
+fn stderrWhile(tmp: *std.testing.TmpDir, name: []const u8, run: *const fn () void) ![]u8 {
+    const out = try tmp.dir.createFile(std.testing.io, name, .{ .read = true });
+    defer out.close(std.testing.io);
+    const saved = std.c.dup(2);
+    if (saved < 0) return error.StderrUnavailable;
+    defer _ = std.c.close(saved);
+    _ = std.c.dup2(out.handle, 2);
+    run();
+    _ = std.c.dup2(saved, 2);
+    return tmp.dir.readFileAlloc(std.testing.io, name, std.testing.allocator, .limited(4096));
+}
+
+fn saveBlocked() void {
+    saveRecord("blocked");
+}
+
+fn panicAfterFullReport() void {
+    savePanic("short panic record");
+}
+
+fn saveWithoutPath() void {
+    path_len = 0;
+    saveRecord("no path");
+}
+
+test "crash panic says on stderr when its save fails, and says nothing when a save is skipped" {
+    defer handling.store(false, .seq_cst);
+    handling.store(false, .seq_cst);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx/diagnostics");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    defer path_len = 0;
+
+    prepare(home);
+    // A folder at the temporary file's path makes its open fail.
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0));
+    const failed = try stderrWhile(&tmp, "failed.txt", saveBlocked);
+    defer std.testing.allocator.free(failed);
+    try std.testing.expectEqualStrings("fx: crash report not saved\n", failed);
+
+    noteReportSaved();
+    const claimed = try stderrWhile(&tmp, "claimed.txt", panicAfterFullReport);
+    defer std.testing.allocator.free(claimed);
+    try std.testing.expectEqualStrings("", claimed);
+
+    const no_path = try stderrWhile(&tmp, "no-path.txt", saveWithoutPath);
+    defer std.testing.allocator.free(no_path);
+    try std.testing.expectEqualStrings("", no_path);
+}
+
+test "crash panic notices name the saved report and a folder it refuses" {
+    var buf: [notice_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "fx: crash report saved to /home/a/.fx/diagnostics/last-crash.jsonl\n",
+        noticeText(&buf, "fx: crash report saved to ", "/home/a/.fx/diagnostics/last-crash.jsonl", "\n").?,
+    );
+    try std.testing.expectEqualStrings(
+        "fx: crash report not saved: /home/a/.fx/diagnostics could not be opened as a folder.\n",
+        noticeText(&buf, "fx: crash report not saved: ", "/home/a/.fx/diagnostics", " could not be opened as a folder.\n").?,
+    );
+    var small: [8]u8 = undefined;
+    try std.testing.expect(noticeText(&small, "fx: crash report saved to ", "/x", "\n") == null);
 }

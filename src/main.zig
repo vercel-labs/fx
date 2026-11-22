@@ -489,7 +489,7 @@ const App = struct {
 
     /// Saves the crash report for `err`. The caller owns the path and frees it
     /// with `app.alloc`; an error means the report was not saved.
-    pub fn writeCrashReport(self: *Self, err: anyerror) anyerror![]u8 {
+    pub fn writeCrashReport(self: *Self, err: anyerror) anyerror!trace_report.SavedCrashReport {
         return trace_report.writeCrashReport(self, err);
     }
 
@@ -4058,6 +4058,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
+    app_entry_runtime.armCrashRecord(cfg, cli_args);
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
         .interactive => |launch| {
