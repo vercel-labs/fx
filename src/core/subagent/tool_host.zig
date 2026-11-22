@@ -1470,14 +1470,22 @@ pub const Runtime = struct {
         defer item.deinit(self.alloc);
         const messages = 1 + self.absorbPendingLocked(&item, index);
         if (start_test_controls.nextWorkFails()) return self.dropStart(&item, error.OutOfMemory, messages);
-        var lock = self.managed.state_store.acquireLock();
-        defer lock.release();
-        var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(&item, err, messages);
-        defer registry.deinit(self.alloc);
-        _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(&item, err, messages);
-        self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(&item, err, messages);
+        self.saveNextWorkLocked(&item) catch |err| return self.dropStart(&item, err, messages);
         debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
         return .{ .saved = messages };
+    }
+
+    /// Saves `item` as its child's next work. The registry lock is taken and
+    /// released here, so the caller handles a failure with that lock free:
+    /// `dropStart` asks the owner whether its tree is closed, and the owner's
+    /// lock comes before the registry's (`managed_owner.zig`, the slot's end).
+    fn saveNextWorkLocked(self: *Runtime, item: *const Pending) !void {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(self.alloc);
+        defer registry.deinit(self.alloc);
+        _ = try registry.startPersistentWork(self.alloc, item.agent, null, item.work);
+        try self.managed.state_store.save(self.alloc, registry);
     }
 
     /// The messages waiting for `head`'s child behind it join the turn it
@@ -1735,6 +1743,9 @@ pub const Runtime = struct {
             .start_messages = failed.messages,
             .start_held = failed.err == error.ChildBusy,
         });
+        // Nothing took the report. A work that was saved still owes it in the
+        // log; a message that was never saved is gone with this line.
+        if (!posted) debug_trace.logf("mailbox", "failed start not reported child={s} work_id={s} messages={d} error={s} owed={}: its messages never ran", .{ child_id, failed.work_id, failed.messages, @errorName(failed.err), failed.report_owed });
         self.forgetCall(failed.work_id);
         return posted;
     }
@@ -3414,6 +3425,43 @@ test "a message that waited for a subagent's work and could not be saved as its 
     try expectBodyHas(third, "Sent to reviewer");
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
+// A closed tree has nobody to take a report of a message that never ran, so
+// the dropped message is left to a log line.
+test "a message that could not be saved as a closed tree's next work is not reported, and a log line says so" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    runtime.closeTree();
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    start_test_controls.test_fail_next_work = false;
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    for (fixture.reports.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "could not start the work") == null);
+    }
+    try std.testing.expect(trace.has("failed start not reported"));
+    try std.testing.expect(trace.has("owed=false"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
 }
 
 test "the roster names the open subagents, and the working ones while they work" {
