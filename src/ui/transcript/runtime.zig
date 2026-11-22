@@ -3178,6 +3178,46 @@ test "only a subagent report's detail carries the report mark" {
     try std.testing.expect(!runtime.toolDetailForEntry(call_id).?.subagent_report);
 }
 
+test "a subagent message's start mark reaches its detail live and on resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}";
+    const call: types.ToolCall = .{ .id = "resumed-start", .name = "subagent", .arguments_json = arguments };
+    for ([_]bool{ true, false }) |started| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "sent to scout · map it", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .subagent, .{
+            .tool_call_id = @constCast("resumed-start"),
+            .tool_name = @constCast("subagent"),
+            .status = .success,
+            .output = @constCast("{\"ok\":true}"),
+            .output_bytes = 11,
+            .stored_output_bytes = 11,
+            .subagent_started = started,
+        });
+        try std.testing.expectEqual(started, runtime.toolDetailForEntry(entry_id).?.subagent_started);
+    }
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-start" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "subagent",
+        .activity_kind = .subagent,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(!runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "sent to scout · map it" },
+        .result = "{\"ok\":true}",
+        .result_memory = .{ .subagent_started = true },
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+}
+
 test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -4565,6 +4605,7 @@ const PendingToolDetailTerminal = struct {
     command_process_presentation: ?types.CommandProcessPresentation = null,
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
+    subagent_started: bool = false,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
@@ -6603,6 +6644,7 @@ pub const TranscriptRuntime = struct {
                 .command_output_replay = result.command_output_replay,
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
+                .subagent_started = result.subagent_started,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,
@@ -6894,6 +6936,7 @@ pub const TranscriptRuntime = struct {
             memory.command_process_presentation
         else
             null;
+        pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -6951,6 +6994,7 @@ pub const TranscriptRuntime = struct {
             pending.command_output_replay = null;
         }
         detail.command_process_presentation = pending.command_process_presentation;
+        detail.subagent_started = pending.subagent_started;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }

@@ -80,6 +80,9 @@ pub const ToolDetailRecord = struct {
     /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
     /// has no id, so only this mark tells the two apart.
     subagent_report: bool = false,
+    /// A `subagent` message that made a new subagent, as its host said
+    /// live and its session saved (D101).
+    subagent_started: bool = false,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit

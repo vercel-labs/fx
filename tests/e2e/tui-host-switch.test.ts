@@ -1285,9 +1285,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // returns. Close only once main shows the message working, which it
           // does while the message waits for the start; a close before that
           // makes the message start a new worker instead. The worker's row
-          // reads "Messaged worker" after the first message and "worker
-          // working" while the second one waits.
-          await session.waitForPane((pane) => /^[●├└] worker working$/m.test(pane), 15_000);
+          // reads "Started worker" after the first message and "Messaging
+          // worker" while the second one waits.
+          await session.waitForPane((pane) => /^[●├└] Messaging worker$/m.test(pane), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
           await session.waitForText("press delete again to close this subagent", 10_000);
@@ -3535,9 +3535,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         const working = await session.waitForText("enter switch     delete close     esc back", 10_000);
         // Behind the list is main's conversation, whose row names the
-        // reviewer it messaged, or the highlighted reviewer's, which starts
+        // reviewer it started, or the highlighted reviewer's, which starts
         // with that message; which one shows first depends on timing.
-        expect(working).toMatch(/Messaged reviewer|Review src\/parser\.zig for bugs/);
+        expect(working).toMatch(/Started reviewer|Review src\/parser\.zig for bugs/);
         expectRowOrder(working, mainRow(), subagentRow("reviewer"));
         expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
         await session.sendKeys("BSpace");

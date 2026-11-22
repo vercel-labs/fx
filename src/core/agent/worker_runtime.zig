@@ -5302,6 +5302,7 @@ fn dupeToolResultMemory(
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
