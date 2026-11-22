@@ -2813,7 +2813,10 @@ pub const Runtime = struct {
             debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=busy", .{ child_id, work_id, @errorName(err) });
             return err;
         };
-        _ = self.managed.start(child_id, 0) catch |err| {
+        // Where the app hosts the turn, the work carries the call's one message
+        // until that turn begins. Elsewhere the turn takes its own message when
+        // it starts, as `tests/tla/subagent/StopMessage.tla` models the first send.
+        _ = self.managed.start(child_id, if (self.managed.hostsTurns()) 1 else 0) catch |err| {
             debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=spawn", .{ child_id, work_id, @errorName(err) });
             self.clearBusyLocked(child_id);
             return err;
@@ -3255,10 +3258,10 @@ const MailboxFixture = struct {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         if (fixture_run_hook) |hook| hook();
         if (cancel.load(.seq_cst)) _ = self.cancelled_at_start.fetchAdd(1, .seq_cst);
-        // The app hands a hosted turn to the child's agent through `postAndWait`
-        // (`src/core/app/app_agents_runtime.zig`), which withdraws a post whose
-        // cancel is set before the main loop takes it, so no turn begins.
-        if (turn.isHosted() and cancel.load(.seq_cst)) return error.Cancelled;
+        // The app's main loop asks `hostedTurnBegins` as it starts a hosted run
+        // (`startPost`, `src/core/app/app_agents_runtime.zig`): a cancel that is
+        // already set answers no, so no turn begins.
+        if (turn.isHosted() and !turn.hostedTurnBegins()) return error.Cancelled;
         const worker = turn.workerRuntime();
         // Counted once its turn has begun, so a test that waits for the run
         // can message it. A run that takes no steering is a turn past its
@@ -10451,19 +10454,8 @@ fn accountAnswerDropped(answer: []const u8) usize {
 /// before the end is recorded with one kept, drop it silently; so do a second
 /// close, the parent's or the user's, after them, and the user's close after a
 /// user's stop that left a message. A parent's stop that follows counts what
-/// the user's left. On the hosted path, a parent's stop or close after the
-/// work's worker attached and before its turn begins withdraws the turn (the
-/// app's `postAndWait`) and counts nothing: `Slot.unstarted` is zeroed at the
-/// attach. A change that counts these takes this list as its failing tests.
-/// Every other cell holds R2.
-fn accountAsOnMain(plan: Plan, scenario: Scenario, hosted_path: bool) bool {
-    const attached = scenario == .attached_not_begun or scenario == .next_attached_not_begun;
-    if (attached and (hosted_path or scenario.hosted())) {
-        // The parent's stop owes no report, and nor does its close, unless the
-        // user's close came first: its report stays and accounts.
-        const parent_first = plan.first == .parent_stop or plan.first == .parent_close;
-        return parent_first or plan.second == .parent_stop or (plan.second == .parent_close and plan.first != .user_close);
-    }
+/// the user's left. Every other cell holds R2.
+fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
     const user_close_silent = switch (scenario) {
         .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
         else => false,
@@ -10504,7 +10496,7 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     // Every other cell of the window would wait as long, so the table stops
     // there, as it does for a cell it cannot drive.
     if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
-    const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
+    const as_on_main = accountAsOnMain(plan, scenario);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
     var buf: [160]u8 = undefined;
@@ -10531,7 +10523,7 @@ test "every message main sends has one account in every window of a subagent's s
         // Some windows run again with the slot let go inside the parent's stop or
         // close, right after the owner stopped the work, for the plans that have
         // one: the owner's count and the flag it sets are one step, so the slot's
-        // end or attach runs before it or after it, and never between.
+        // end or begin runs before it or after it, and never between.
         for ([_]bool{ false, true }) |in_stop| {
             if (in_stop and !scenario.holdsInStop()) continue;
             const paths: []const bool = if (in_stop) scenario.inStopPaths() else if (scenario.hosted()) &.{true} else &.{ false, true };
