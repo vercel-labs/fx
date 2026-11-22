@@ -156,8 +156,11 @@ run_remote() {
     fi
     rstamp="/tmp/fx-run-$$-$RANDOM"
     RSTAMP=$rstamp
+    # The command starts one clock tick after the stamp, so every file it writes
+    # is newer than the stamp, while the files pushed before it are not. 50 ms
+    # covers the coarsest Linux file clock (10 ms).
     RUN_ID=$(sb exec --detach --timeout "$CTIMEOUT" --workdir "$(remote_path "$CWD")" \
-        ${envflags[@]+"${envflags[@]}"} "$NAME" -- sh -c 'touch "$1"; exec sh -c "$2"' _ "$rstamp" "$COMMAND" 2>"$TMPD/start.err")
+        ${envflags[@]+"${envflags[@]}"} "$NAME" -- sh -c 'touch "$1" && sleep 0.05; exec sh -c "$2"' _ "$rstamp" "$COMMAND" 2>"$TMPD/start.err")
     [ -n "$RUN_ID" ] || did_not_run "the sandbox did not start it: $(last_line "$(cat "$TMPD/start.err")")"
     sb2 commands logs "$NAME" "$RUN_ID" &
     LOGS=$!
