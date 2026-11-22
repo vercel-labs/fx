@@ -6811,9 +6811,10 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
-    // The repository as the turn found it, before any request or tool
-    // (D98). The prompt reaches the session first: the capture can take
-    // seconds, and a process killed during it must keep the prompt.
+    // The repository as the turn found it, before any tool (D98). The
+    // prompt reaches the session first, so a process killed during the
+    // capture keeps it; the capture then runs beside the first request, and
+    // `executeToolCall` waits for it before any tool acts.
     if (deps.start_workspace_capture) |start| {
         const fresh = !job.delivery.isSteering();
         start(deps.ctx, fresh, .begin);
@@ -6822,6 +6823,11 @@ fn processQueuedPromptInner(
         }
         start(deps.ctx, fresh, .capture);
     }
+    // The turn owns the start capture's thread: however it ends, failed or
+    // paused before any tool and before any end capture included, the
+    // capture is saved before the turn returns, never after its session
+    // closes.
+    defer if (deps.start_workspace_capture) |start| start(deps.ctx, false, .settle);
 
     const current_user_message: ChatMessage = .{
         .role = .user,

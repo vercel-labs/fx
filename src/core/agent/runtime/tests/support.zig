@@ -671,6 +671,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Wire `start_workspace_capture` and log each of its steps, and each
+    /// tool the turn executes, in order in `capture_log`.
+    record_workspace_capture: bool = false,
+    capture_log: std.ArrayList([]u8) = .empty,
     /// Keeps the recovery module's record, as a host that resumes requests
     /// does.
     enable_recovery_record: bool = false,
@@ -712,6 +716,7 @@ pub const FakeAgentRuntimeDeps = struct {
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
         self.recorded_usages.deinit(self.alloc);
+        freeStringList(self.alloc, &self.capture_log);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
@@ -812,6 +817,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .describe_tool_action_denied = describeDenied,
             .permission_target_for_call = permissionTarget,
             .execute_tool_call = execute,
+            .start_workspace_capture = if (self.record_workspace_capture) startWorkspaceCapture else null,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
             .commit_context_compaction = .{ .commit = commitCompaction },
@@ -1092,6 +1098,20 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
+    }
+
+    fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: AgentRuntimeDeps.WorkspaceCaptureStep) void {
+        _ = fresh;
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recordCaptureLog("capture:{s}", .{@tagName(step)});
+    }
+
+    fn recordCaptureLog(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) void {
+        self.execute_mutex.lockUncancelable(io_mod.getIo());
+        defer self.execute_mutex.unlock(io_mod.getIo());
+        // A line lost to a failed allocation fails the test's length check.
+        const line = self.alloc.print(fmt, args) catch return;
+        self.capture_log.append(self.alloc, line) catch return self.alloc.free(line);
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
@@ -1493,6 +1513,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         const execute_delegate = self.execute_delegate;
         const call = request.call;
+        if (self.record_workspace_capture) self.recordCaptureLog("execute:{s}", .{call.name});
         var plan: FakeExecPlan = undefined;
         var should_cancel = false;
         var should_return_ordinary_cancel = false;

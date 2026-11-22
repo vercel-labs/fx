@@ -199,7 +199,7 @@ pub const RefreshedGatewayCredential = struct {
 
 pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
-    pub const WorkspaceCaptureStep = enum { begin, capture };
+    pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -295,13 +295,16 @@ pub const AgentRuntimeDeps = struct {
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
     /// Captures the repository the session works in as the turn starts,
-    /// before any request or tool, when `experimental.workspace_capture` is
-    /// on (D98, `src/core/workspace/turn_capture.zig`). The runtime calls it
-    /// twice: `.begin` takes the turn's capture token, then, once the
-    /// user's prompt is saved through `append_turn_piece`, `.capture` takes
-    /// the start capture, which can take seconds, so a kill during it keeps
-    /// the prompt. `fresh` is false for a steering message inside the turn,
-    /// which keeps the turn's capture. It never fails the turn.
+    /// before any tool acts, when `experimental.workspace_capture` is on
+    /// (D98, `src/core/workspace/turn_capture.zig`). `.begin` takes the
+    /// turn's capture token; once the user's prompt is saved through
+    /// `append_turn_piece`, so a kill during the capture keeps it,
+    /// `.capture` starts the start capture, which runs beside the turn's
+    /// first request; and `.settle`, which `executeToolCall` sends before
+    /// every tool and the turn sends as it returns, however it ends, waits
+    /// until it is saved. `fresh` is false for a steering
+    /// message inside the turn, which keeps the turn's capture. It never
+    /// fails the turn.
     start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
     /// An admitted tool is about to act in `dir`: a command's working folder
     /// or the folder of the file a mutation writes. Captures a repository the
@@ -377,6 +380,8 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        // No tool acts before the turn's start capture is saved (D98).
+        if (self.start_workspace_capture) |capture| capture(self.ctx, false, .settle);
         if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;
