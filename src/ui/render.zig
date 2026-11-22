@@ -229,6 +229,9 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
+/// Room for one 4-byte code point per title cell, plus the cut marker.
+const max_session_title_bytes = max_session_title_cells * 4 + title_cut_marker.len;
+
 /// A model id as the status line names it: without its provider, and
 /// a Claude model as "opus 4-7". May use `out`.
 pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
@@ -427,7 +430,9 @@ fn appendSessionStatusSegments(
         appendStatusSegment(out, end, "⚡︎");
     }
     if (statusline.session_title) |title| {
-        appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
+        var title_buffer: [max_session_title_bytes]u8 = undefined;
+        const sanitized = appendSanitizedTitle(title, &title_buffer);
+        appendStatusSegment(out, end, display_width.prefixByWidth(sanitized, max_session_title_cells));
     }
     if (statusline.context_used > 0) {
         if (statusline.context_total) |total| {
@@ -715,9 +720,24 @@ fn titleOutput(raw: ?*anyopaque) std.Io.File {
 const terminal_title_osc_prefix = "\x1b]2;";
 const terminal_title_max_content_bytes: usize = 128;
 const terminal_title_max_label_bytes = terminal_title_max_content_bytes;
+const title_cut_marker = "...";
 
-fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_label_bytes]u8) []const u8 {
-    const marker = "...";
+/// Code points a session title must not draw: C0, DEL and C1 controls, the
+/// line and paragraph separators, and the bidi embeddings, overrides and
+/// isolates. Joins, direction marks and format characters stay, because they
+/// are part of names and joined emoji.
+fn droppedFromTitle(codepoint: u21) bool {
+    return codepoint < 0x20 or
+        (codepoint >= 0x7f and codepoint <= 0x9f) or
+        codepoint == 0x2028 or
+        codepoint == 0x2029 or
+        (codepoint >= 0x202a and codepoint <= 0x202e) or
+        (codepoint >= 0x2066 and codepoint <= 0x2069);
+}
+
+/// Copies `raw` into `buffer` without what `droppedFromTitle` refuses and
+/// without invalid UTF-8, ending in the cut marker when `raw` does not fit.
+fn appendSanitizedTitle(raw: []const u8, buffer: []u8) []const u8 {
     var source_index: usize = 0;
     var written: usize = 0;
     while (source_index < raw.len) {
@@ -732,17 +752,21 @@ fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_lab
             continue;
         };
         source_index += sequence_len;
-        if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) continue;
+        if (droppedFromTitle(codepoint)) continue;
         if (written + sequence_len > buffer.len) {
-            written = text_utils.utf8BackwardBoundary(buffer[0..written], buffer.len - marker.len);
-            @memcpy(buffer[written .. written + marker.len], marker);
-            written += marker.len;
+            written = text_utils.utf8BackwardBoundary(buffer[0..written], buffer.len - title_cut_marker.len);
+            @memcpy(buffer[written .. written + title_cut_marker.len], title_cut_marker);
+            written += title_cut_marker.len;
             break;
         }
         @memcpy(buffer[written .. written + sequence_len], sequence);
         written += sequence_len;
     }
     return buffer[0..written];
+}
+
+fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_label_bytes]u8) []const u8 {
+    return appendSanitizedTitle(raw, buffer);
 }
 
 fn setTerminalTitleLabel(raw: ?*anyopaque, label: []const u8) void {
@@ -799,6 +823,29 @@ test "terminal title sanitizes and bounds untrusted labels" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
     try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);
     try std.testing.expect(std.mem.find(u8, written, "\xc2\x9b") == null);
+}
+
+test "terminal title keeps joins and direction marks but drops bidi controls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-bidi.log", .{});
+    defer sink.close(io_mod.getIo());
+
+    // U+202E and U+2066 are bidi controls and U+0085 a C1 control. U+200D joins
+    // the emoji and U+200C joins the Persian word; both stay byte-identical.
+    const joined = "\u{1F469}\u{200D}\u{1F4BB}";
+    const persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+    terminalTitleFor(&sink).set("rtl\u{202e}x\u{2066}y\u{0085}z team " ++ joined ++ " " ++ persian);
+
+    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-bidi.log", .{});
+    defer written_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &written_file, 256);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings(
+        "\x1b]2;rtlxyz team " ++ joined ++ " " ++ persian ++ "\x07",
+        written,
+    );
 }
 
 test "terminal title clear restores a predictable empty state" {
@@ -1257,4 +1304,24 @@ test "buildSessionStatusLine reuses model effort and context formatting" {
         &buf,
     );
     try std.testing.expectEqualStrings("gemini-3.8-flash · high · 12k/100k 12%", line);
+}
+
+test "buildSessionStatusLine drops bidi controls from the session title and keeps joins" {
+    var buf: [256]u8 = undefined;
+    const joined = "\u{1F469}\u{200D}\u{1F4BB}";
+    const persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+    const line = buildSessionStatusLine(
+        "openai/gpt-5",
+        types.ReasoningEffort.literal("high"),
+        false,
+        .{ .session_title = "rtl\u{202e}x\u{2066}y\u{0085}z team " ++ joined ++ " " ++ persian },
+        200,
+        &buf,
+    );
+    try std.testing.expectEqualStrings("gpt-5 · rtlxyz team " ++ joined ++ " " ++ persian, line);
+    try std.testing.expect(std.mem.find(u8, line, "\u{202e}") == null);
+    try std.testing.expect(std.mem.find(u8, line, "\u{2066}") == null);
+    try std.testing.expect(std.mem.find(u8, line, "\u{0085}") == null);
+    try std.testing.expect(std.mem.find(u8, line, joined) != null);
+    try std.testing.expect(std.mem.find(u8, line, persian) != null);
 }

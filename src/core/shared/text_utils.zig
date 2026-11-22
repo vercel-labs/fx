@@ -467,29 +467,6 @@ pub fn appendTerminalSafeLine(
     }
 }
 
-/// Appends `raw` without the parts `encodeTerminalSafe` would escape:
-/// control bytes, C1 controls, invisible format characters, and invalid
-/// UTF-8. For text such as a terminal tab title, where an escape would read
-/// as noise.
-pub fn appendPrintable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), raw: []const u8) error{OutOfMemory}!void {
-    var index: usize = 0;
-    while (index < raw.len) {
-        var token_buf: [12]u8 = undefined;
-        const token = terminalSafeToken(raw, index, &token_buf);
-        const source = raw[index .. index + token.source_len];
-        if (std.mem.eql(u8, source, token.bytes)) try out.appendSlice(alloc, source);
-        index += token.source_len;
-    }
-}
-
-test "appendPrintable drops controls, invisible marks and invalid UTF-8" {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(std.testing.allocator);
-
-    try appendPrintable(std.testing.allocator, &out, "a\x1b]2;x\x07b\u{0085}c\u{202e}d\u{061c}e\u{180e}f\u{200b}g\xffh");
-    try std.testing.expectEqualStrings("a]2;xbcdefgh", out.items);
-}
-
 /// A copy of `raw` that is valid UTF-8. Each byte outside a valid sequence
 /// becomes the `\xNN` escape `encodeTerminalSafe` writes for it; everything
 /// else, control bytes included, is kept for the renderer to handle. Caller
