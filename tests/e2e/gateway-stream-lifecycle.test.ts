@@ -3475,6 +3475,9 @@ describe("gateway stream lifecycle", () => {
       const scrollback = await tui.captureFullScrollback();
       expect(scrollback).toContain(`Opened ${skillName}`);
       expect(scrollback).toContain("Read skill resource references/rules.md");
+      // The group's header counts what the calls opened as skills.
+      expect(scrollback).toContain("● Opened skills");
+      expect(scrollback).not.toContain("pened tools");
       expect(scrollback).not.toContain("Loaded skill skill");
       expect(scrollback).not.toContain("Loaded skill different-directory");
       for (const name of additionalSkills) expect(scrollback).toContain(`Opened ${name}`);

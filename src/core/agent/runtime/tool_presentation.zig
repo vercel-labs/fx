@@ -60,6 +60,16 @@ pub fn providerToolOnlyReads(
     return spec.provider_executed and spec.activity_kind == .read;
 }
 
+/// `arguments_json` when it is one complete JSON object. A streaming call's
+/// arguments are that only once the provider has sent all of them, since no
+/// valid text can follow a complete object. Null otherwise.
+fn wholeArguments(scratch: Allocator, arguments_json: ?[]const u8) Allocator.Error!?[]const u8 {
+    const json = arguments_json orelse return null;
+    const start = std.mem.trimStart(u8, json, " \t\r\n");
+    if (start.len == 0 or start[0] != '{') return null;
+    return if (try std.json.validate(scratch, json)) json else null;
+}
+
 fn fallbackToolDisplay(
     registry: tool_dispatch.Registry,
     tool_name: []const u8,
@@ -232,6 +242,7 @@ pub const ProvisionalToolStatuses = struct {
                 .presentation_group_id = self.presentation_group_id,
                 .tool_name = shown_tool_name,
                 .activity_kind = observed_kind,
+                .arguments_json = try wholeArguments(scratch.allocator(), arguments_json),
             },
         }) catch |err| {
             if (recorded) self.forget(alloc, tool_id);
@@ -2263,6 +2274,26 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
         .progress => |event| try std.testing.expectEqualStrings("● Matching\x1b[0m", event.text),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "a provisional row carries its call's arguments once all of them have arrived" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "read_file");
+    const whole = "{\"path\":\"a.md\",\"start_line\":3}";
+
+    // While they stream in, the row has none.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), null, "{\"path\":\"a.md\",\"start_li");
+    // The provider's finished call has them all.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", kind, eligibleActionLabel("read_file"), "a.md", whole);
+
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expect(capture.events.items[0].provisional.arguments_json == null);
+    try std.testing.expectEqualStrings(whole, capture.events.items[2].provisional.arguments_json.?);
 }
 
 test "provisional toolbox labels read as what the call opens, runs, or searches" {

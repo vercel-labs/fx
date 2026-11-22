@@ -27,6 +27,8 @@ import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
+// How the compact view names that tool: its server, then the tool.
+const TOOL_ROW = "fixture echo";
 const MODERN_RESULT = "MODERN_MCP_TOOL_RESULT";
 const LEGACY_RESULT = "LEGACY_MCP_TOOL_RESULT";
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
@@ -482,10 +484,10 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the MCP fixture three times.");
-      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
+      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(TOOL_ROW));
       // The held call's arguments name its tool and nothing more: it waits
       // in that tool's row, which says it runs, and shows no row of its own.
-      await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running MCP ${TOOL_NAME} ×3`), 20_000);
+      await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running ${TOOL_ROW} ×3`), 20_000);
       for (let sample = 0; sample < 6; sample += 1) {
         const pane = await tui.capturePane();
         expect(pane).not.toMatch(/^[●├└] Using\b/m);
@@ -495,7 +497,8 @@ describe("modern MCP stdio compatibility", () => {
 
       sendRest?.();
       const done = await tui.waitForText("MCP_STREAMED_RUN_DONE", 20_000);
-      expect(toolRows(done)).toEqual([expect.stringContaining(`Ran MCP ${TOOL_NAME} ×3`)]);
+      expect(toolRows(done)).toEqual([expect.stringContaining(`Ran ${TOOL_ROW} ×3`)]);
+      expect(done).not.toContain(`MCP ${TOOL_NAME}`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await tui.kill();
@@ -2611,7 +2614,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForText("Modern MCP TUI complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`Ran MCP ${TOOL_NAME}`);
+      expect(scrollback).toContain(`Ran ${TOOL_ROW}`);
       expect(activeGateway.requests).toHaveLength(3);
       expect(activeGateway.requests[2]?.body).toContain(`${MODERN_RESULT}:hello`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5207,9 +5210,10 @@ describe("fx mcp call", () => {
       // The calls of one tool share a row that counts them, in the
       // command's group.
       expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
-      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
-      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
-      expect(scrollback).not.toContain("Running MCP");
+      expect(scrollback.split(`Ran ${TOOL_ROW}`)).toHaveLength(2);
+      expect(scrollback).toContain(`└ Ran ${TOOL_ROW} ×3`);
+      expect(scrollback).not.toContain(`Running ${TOOL_ROW}`);
+      expect(scrollback).not.toContain(`MCP ${TOOL_NAME}`);
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.
       expect(seen).not.toContain("Ran MCP");
@@ -5236,7 +5240,7 @@ describe("fx mcp call", () => {
       await tui.sendText("Page through the list.");
       await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
       await tui.waitForComposer(10_000);
-      expect(await tui.captureFullScrollback()).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(await tui.captureFullScrollback()).toContain(`└ Ran ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
@@ -5258,9 +5262,10 @@ describe("fx mcp call", () => {
       await tui.waitForText("BRIDGE_ROWS_SAVED", 15_000);
       const resumed = await tui.captureFullScrollback();
       expect(resumed).toContain("● Used MCP tools, ran a command ✓");
-      expect(resumed.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
-      expect(resumed).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
-      expect(resumed).not.toContain("Running MCP");
+      expect(resumed.split(`Ran ${TOOL_ROW}`)).toHaveLength(2);
+      expect(resumed).toContain(`└ Ran ${TOOL_ROW} ×3`);
+      expect(resumed).not.toContain(`Running ${TOOL_ROW}`);
+      expect(resumed).not.toContain(`MCP ${TOOL_NAME}`);
 
       // Ctrl+O shows each call's row, and neither the arguments the
       // command sent nor the pages the tool returned.
@@ -5303,13 +5308,13 @@ describe("fx mcp call", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Save the list to a file.");
-      await tui.waitForText(`Running MCP ${TOOL_NAME}`, 20_000);
+      await tui.waitForText(`Running ${TOOL_ROW}`, 20_000);
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
       await tui.waitForStableComposer(10_000);
       const liveScreen = await tui.captureFullScrollback();
-      expect(liveScreen).not.toContain("Running MCP");
+      expect(liveScreen).not.toContain(`Running ${TOOL_ROW}`);
       // The compact rows of the cancelled turn: its command by its short
       // name, in one group with the call.
       const compactRows = (screen: string) =>
@@ -5359,7 +5364,7 @@ describe("fx mcp call", () => {
       expect(resumedRows).toEqual(live);
       expect(resumedRows.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
       expect(resumedRows.join("\n")).not.toContain("> out.txt");
-      expect(resumed).not.toContain("Running MCP");
+      expect(resumed).not.toContain(`Running ${TOOL_ROW}`);
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);

@@ -7400,7 +7400,7 @@ test "a resumed fx mcp call row joins its shell call's group with no arguments o
         .override => |override| try text.appendSlice(alloc, override.bytes),
         else => {},
     };
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran fixture echo"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
     try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
 }
