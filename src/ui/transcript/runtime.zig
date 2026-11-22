@@ -7299,7 +7299,7 @@ pub const TranscriptRuntime = struct {
         window.pending_drops.shrinkRetainingCapacity(still_pending);
 
         _ = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
-            // Only entries still in the notebook go back: the store can remove some before it fails.
+            // Only ids still in the notebook go back, and since a failed drop leaves the notebook as it was, that is every id that left the list.
             var restored: usize = 0;
             for (self.notebook.entries.items) |entry| {
                 if (!going.contains(entry.id())) continue;
@@ -8043,7 +8043,8 @@ pub const TranscriptRuntime = struct {
         const ids = try held.alloc.alloc(u32, drop_count);
         defer held.alloc.free(ids);
         for (entries[0..drop_count], ids) |entry, *id| id.* = entry.id();
-        _ = try transcript_store.dropEntriesAtomic(held.runtime, held.alloc, ids);
+        // The caller discards the archive when the trim fails, so the drop needs no copy.
+        _ = try transcript_store.dropEntries(held.runtime, held.alloc, ids);
         // Indexes count the whole cycle, so what stays must be its newest
         // entries; a kept pin would leave a gap.
         const after = held.runtime.notebook.entries.items;
