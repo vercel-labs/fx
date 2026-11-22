@@ -1175,6 +1175,73 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // In the app a subagent's turn runs on its own agent. The start hold keeps
+  // its first work before that turn begins. Main's stop or close there must
+  // count the call's one message, and the turn must never begin: no run
+  // starts, and the worker sends no request.
+  for (const action of ["stop", "close"] as const) {
+    test(
+      `main's ${action} of a subagent's first work before its turn begins counts its message`,
+      async () => {
+        const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-hosted-stop-")));
+        const startHeld = join(dir, "start-held");
+        const startRelease = join(dir, "start-release");
+        const tracePath = join(dir, "trace.log");
+        const run = { answer: "", childCalls: 0, stage: 0, trace: "" };
+        try {
+          await withFx(
+            async (body) => {
+              if (!isMainRequest(body)) {
+                run.childCalls += 1;
+                return text("child_answer", "SWITCH_CHILD_RAN");
+              }
+              run.stage += 1;
+              if (run.stage === 1) {
+                return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_TASK first" } });
+              }
+              if (run.stage === 2) {
+                await until("the held start", () => existsSync(`${startHeld}.1`), 20_000);
+                return toolCall("main_end", "subagent", { request: { action, agent: "worker" } });
+              }
+              if (run.stage === 3) {
+                run.answer = toolResultText(body, "main_end");
+                writeFileSync(startRelease, "");
+              }
+              return text("main_done", "SWITCH_MAIN_DONE");
+            },
+            async (session) => {
+              await session.sendText("SWITCH_USER");
+              await session.waitForText("SWITCH_MAIN_DONE", 60_000);
+              // The work has ended as cancelled, so its turn can no longer begin.
+              await until(
+                "the work's cancelled end in the trace",
+                () => existsSync(tracePath) && /event=child_end child=\S+ work_id=\S+ outcome=cancelled/.test(readFileSync(tracePath, "utf8")),
+                20_000,
+              );
+              run.trace = readFileSync(tracePath, "utf8");
+            },
+            () => {},
+            false,
+            {
+              FX_TEST_SUBAGENT_START_HELD: startHeld,
+              FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+              FX_TRACE: "1",
+              FX_TRACE_LOG: tracePath,
+            },
+          );
+        } finally {
+          writeFileSync(startRelease, "");
+          rmSync(dir, { recursive: true, force: true });
+        }
+        expect(run.answer).toContain("worker");
+        expect(run.answer).toContain("message waiting for it was dropped");
+        expect(run.trace).not.toContain("event=child_run_started");
+        expect(run.childCalls).toBe(0);
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "a subagent's work that /quit cuts short reports after a resume, saying fx quit",
     async () => {

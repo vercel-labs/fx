@@ -6083,6 +6083,8 @@ test "a run handed to a hidden agent waits while a scrollback handoff is pending
     var turn: subagent_execution.TurnContext = undefined;
     turn.child_id = child.id;
     turn.child_name = null;
+    turn.begin_context = null;
+    turn.begin_fn = null;
     var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
     var post: app_agents_runtime.Post = .{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
     // A held run stays the post's own.
@@ -6325,7 +6327,11 @@ test "runs handed to hidden agents during a pending handoff stay held in their o
     var turns: [2]subagent_execution.TurnContext = undefined;
     turns[0].child_id = first.id;
     turns[1].child_id = second.id;
-    for (&turns) |*turn| turn.child_name = null;
+    for (&turns) |*turn| {
+        turn.child_name = null;
+        turn.begin_context = null;
+        turn.begin_fn = null;
+    }
     var posts: [2]app_agents_runtime.Post = undefined;
     var made: usize = 0;
     defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
@@ -6386,6 +6392,8 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
         for (0..count) |index| {
             turns[index].child_id = children[index].id;
             turns[index].child_name = null;
+            turns[index].begin_context = null;
+            turns[index].begin_fn = null;
             posts[index] = .{ .turn = &turns[index], .run = try testChildRun(alloc, &resolver, false, null) };
             made += 1;
             cancels[index] = .init(false);
@@ -6429,6 +6437,17 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
 
 test "a hosted run whose stop came first is refused when the main loop would start it" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "hosted-refused.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "host");
+
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
@@ -6459,6 +6478,13 @@ test "a hosted run whose stop came first is refused when the main loop would sta
     try std.testing.expectEqual(app_agents_runtime.Post.State.closed, post.state.load(.acquire));
     try std.testing.expect(child.agent.child_run == null);
     try std.testing.expect(post.run != null);
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "child run refused") != null);
 }
 
 test "a handoff that gives way before it pushed any row only redraws" {

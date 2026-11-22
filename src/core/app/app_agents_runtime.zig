@@ -2932,7 +2932,10 @@ pub fn Runtime(comptime App: type) type {
             // The owner counts the work's unread messages until its turn
             // begins, which is here. A stop that came first set the cancel:
             // the turn does not begin, and the run goes back to its slot.
-            if (!post.turn.hostedTurnBegins()) return error.Cancelled;
+            if (!post.turn.hostedTurnBegins()) {
+                debug_trace.logf("host", "child run refused agent={s} work_id={s}: its stop came first, so its turn does not begin and the stop counted its messages", .{ child.id, post.run.?.work_id });
+                return error.Cancelled;
+            }
             installChildRun(app, child, post.run.?);
             post.run = null;
             const start: Start = .{ .post = post, .child = child };

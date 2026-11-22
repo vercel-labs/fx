@@ -1408,7 +1408,7 @@ fn runOne(slot: *Slot) OneOutcome {
     // In the interactive app the child's own agent holds its session and
     // saves its turns, as main does; only fx ask and ACP open it for a
     // run.
-    const hosted = owner.services.bind_fn != null;
+    const hosted = owner.hostsTurns();
     var child: ?OpenChild = if (hosted) null else OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
     defer if (child) |*value| value.close(owner.alloc);

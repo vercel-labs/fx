@@ -10293,8 +10293,7 @@ fn accountAnswerDropped(answer: []const u8) usize {
 /// close, the parent's or the user's, after them, and the user's close after a
 /// user's stop that left a message. A parent's stop that follows counts what
 /// the user's left. Every other cell holds R2.
-fn accountAsOnMain(plan: Plan, scenario: Scenario, hosted_path: bool) bool {
-    _ = hosted_path;
+fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
     const user_close_silent = switch (scenario) {
         .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
         else => false,
@@ -10335,7 +10334,7 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     // Every other cell of the window would wait as long, so the table stops
     // there, as it does for a cell it cannot drive.
     if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
-    const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
+    const as_on_main = accountAsOnMain(plan, scenario);
     const ledger = cell.tally();
     const verdict = accountVerdict(ledger, as_on_main);
     var buf: [160]u8 = undefined;
