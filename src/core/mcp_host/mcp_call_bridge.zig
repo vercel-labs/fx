@@ -191,6 +191,8 @@ fn startLocked(io: std.Io) !void {
     const address = try std.Io.net.UnixAddress.init(socket_path);
     var listener = try address.listen(io, .{});
     errdefer listener.deinit(io);
+    // Errdefers run in reverse, so this runs before the directory's errdefer above it, which needs the directory empty.
+    errdefer std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     // Close-on-exec, so the commands fx starts do not inherit the wake pipe.
     const wake = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     errdefer closeWake(wake);
@@ -202,7 +204,6 @@ fn startLocked(io: std.Io) !void {
     bridge.accept_task = std.Io.concurrent(io, acceptLoop, .{}) catch |err| {
         bridge.listener = null;
         bridge.wake = null;
-        std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
         return err;
     };
     bridge.dir_path = dir_path;
@@ -392,6 +393,8 @@ const Watch = struct {
     /// The pipe that ends `run`: read end, then write end. `serve` closes it.
     wake: [2]posix.fd_t,
     done: std.atomic.Value(bool) = .init(false),
+    /// Set once the watch has logged bytes the client sent after its request line.
+    extra_logged: bool = false,
 
     fn run(self: *Watch) void {
         const io = io_mod.getIo();
@@ -400,7 +403,10 @@ const Watch = struct {
                 .{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 },
             };
-            const ready = posix.poll(&fds, wake_safety_poll_ms) catch return;
+            const ready = posix.poll(&fds, wake_safety_poll_ms) catch |err| {
+                debug_trace.logf("mcp-call", "request={d} disconnect watch ended: poll failed err={s}", .{ @backingInt(self.id), @errorName(err) });
+                return;
+            };
             if (fds[1].revents != 0) return;
             if (ready == 0) continue;
             var probe: [1]u8 = undefined;
@@ -412,10 +418,17 @@ const Watch = struct {
                 bridge.mutex.unlock(io);
                 return;
             }
-            // The client sent more than its one line: not ours to read. Wait on the
-            // wake byte alone, so the unread bytes do not spin this loop.
+            // The client sent more than its one line: not ours to read. Log it once,
+            // then wait on the wake byte alone, so the unread bytes do not spin this loop.
+            if (!self.extra_logged) {
+                self.extra_logged = true;
+                debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)});
+            }
             var wake_only = [_]posix.pollfd{.{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 }};
-            _ = posix.poll(&wake_only, poll_ms) catch return;
+            _ = posix.poll(&wake_only, poll_ms) catch |err| {
+                debug_trace.logf("mcp-call", "request={d} disconnect watch ended: poll failed err={s}", .{ @backingInt(self.id), @errorName(err) });
+                return;
+            };
             if (wake_only[0].revents != 0) return;
         }
     }
