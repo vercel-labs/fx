@@ -157,7 +157,7 @@ pub fn handleNewLibfxSession(
     const model = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = session_runtime.SessionRuntime.init(state.host.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
 
@@ -206,7 +206,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = session_runtime.SessionRuntime.init(state.host.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     const revision = js_host_session_store.commit(alloc, durable, null) catch
@@ -339,9 +339,12 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
     Host.stored_ultrafast = false;
     Host.expected_revision_matched = false;
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    test_host.cfg = acpSessionTestConfig();
     var state = server.ServerState{
         .alloc = alloc,
-        .cfg = acpSessionTestConfig(),
+        .host = &test_host,
         .writer = jsonrpc.Writer.init(),
         .configured_model = @constCast("openai/test"),
         .configured_ultrafast_mode = true,
@@ -365,6 +368,7 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
         .cancel_flag = .init(false),
         .pending_prompt_id = null,
     };
+    active.client_writer = jsonrpc.Writer.initCallback(&active, server.forwardToMain);
     defer active.session_rt.deinit(alloc);
     defer active.wasm_state.?.deinit(alloc);
     defer if (active.wasm_revision) |revision| alloc.free(revision);
@@ -437,13 +441,13 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
+    if (!state.host.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "MCP servers are unavailable in this runtime",
         });
     }
-    if (state.cfg.allow_acp_mcp) {
+    if (state.host.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
@@ -465,7 +469,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     const session_host = mcp_preparation.takeHost();
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
-    const v2_store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{
+    const v2_store = server.sessionsStore(state.host) orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.internal_error,
         .message = "Session store not available",
     });
@@ -533,7 +537,7 @@ fn startV2Session(
     const model_copy = try alloc.dupe(u8, state.selected_model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = session_runtime.SessionRuntime.init(state.host.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
@@ -577,8 +581,8 @@ fn writeNewSessionResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     {
-        server.lockCatalog(state);
-        defer server.unlockCatalog(state);
+        server.lockCatalog(state.host);
+        defer server.unlockCatalog(state.host);
         try server.refreshModelCatalogForOptionsLocked(state, session);
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(session_id, &out.writer);
@@ -590,12 +594,12 @@ fn writeNewSessionResponse(
         try writeModelConfigOption(
             &out.writer,
             session.model,
-            state.capability_resolver.catalogEntries(),
+            state.host.capability_resolver.catalogEntries(),
         );
         try out.writer.writeAll(",");
         try writeModeConfigOption(
             &out.writer,
-            state.cfg.mode_registry,
+            state.host.cfg.mode_registry,
             session.mode,
             state.extensions.contains(.permission_mode),
         );
@@ -615,7 +619,7 @@ fn writeNewSessionResponse(
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(session.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
-    try writeModesArray(&out.writer, state.cfg.mode_registry);
+    try writeModesArray(&out.writer, state.host.cfg.mode_registry);
     try out.writer.writeByte('}');
     try out.writer.writeByte('}');
 
@@ -669,7 +673,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = session_runtime.SessionRuntime.init(state.host.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -790,7 +794,7 @@ fn followSharedSession(
 ) !bool {
     // A follow exists only where `server.follow_supported` holds.
     if (comptime !server.follow_supported) return false;
-    const shared = state.shared orelse return false;
+    const shared = &state.host.shared;
     shared.mutex.lockUncancelable(io_mod.getIo());
     defer shared.mutex.unlock(io_mod.getIo());
     const session = shared.findLocked(session_id) orelse {
@@ -936,7 +940,7 @@ fn handleRestoreSession(
         defer alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
     }
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
+    if (!state.host.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "MCP servers are unavailable in this runtime",
@@ -945,7 +949,7 @@ fn handleRestoreSession(
     if (open_session) |open| {
         return reuseOpenSession(state, alloc, msg, open, kind, &mcp_configs, observer_hooks, &requested_system_prompt);
     }
-    if (state.cfg.allow_acp_mcp) {
+    if (state.host.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
@@ -973,7 +977,7 @@ fn handleRestoreSession(
     defer if (v2_owned) if (v2) |value| value.close();
     var v2_resumed: ?session_adapter.Resumed = null;
     defer if (v2_resumed) |*value| value.deinit(alloc);
-    const v2_store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{
+    const v2_store = server.sessionsStore(state.host) orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.internal_error,
         .message = "Session store not available",
     });
@@ -1019,7 +1023,7 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
+    var session_rt = session_runtime.SessionRuntime.init(state.host.cfg.max_history_turns);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -1189,7 +1193,7 @@ fn reuseOpenSession(
             debug_trace.logf("acp", "event=reload_interrupted_approval_waits session={s} count={d} reason=approval_reaches_no_client", .{ session.session_id, interrupted });
         }
     }
-    if (state.cfg.allow_acp_mcp) {
+    if (state.host.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, mcp_configs);
         try appendProjectMcpConfigs(state, alloc, session.workspace_root, mcp_configs);
     }
@@ -1222,8 +1226,8 @@ fn reuseOpenSession(
         }
         if (preparation.takeHost()) |first| {
             // A subagent's turn reads the session's host under this lock when it starts.
-            state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-            defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+            state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+            defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
             session.mcp_host = first;
         }
     }
@@ -1249,8 +1253,8 @@ fn setObserverHooks(session: *server.ActiveSessionState, observer_hooks: ?libfx_
     defer session.waiting_prompts.unlock();
     // The session's subagents read them under the authority lock.
     const state = session.server;
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
     session.observer_hooks = observer_hooks;
 }
 
@@ -1265,7 +1269,7 @@ fn appendProfileMcpConfigsIfRequested(
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
     if (!profileMcpRequested(alloc, params_raw)) return;
-    const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
+    const home = state.host.cfg.home_override orelse io_mod.homeDir() orelse {
         debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
         return;
     };
@@ -1298,7 +1302,7 @@ fn appendProjectMcpConfigs(
     workspace_root: []const u8,
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
-    var choices = if (state.cfg.home_override) |home|
+    var choices = if (state.host.cfg.home_override) |home|
         config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
@@ -1385,8 +1389,8 @@ fn buildSessionAnswer(
         // orders this read against those writes.
         session.settings_mutex.lockUncancelable(io_mod.getIo());
         defer session.settings_mutex.unlock(io_mod.getIo());
-        server.lockCatalog(state);
-        defer server.unlockCatalog(state);
+        server.lockCatalog(state.host);
+        defer server.unlockCatalog(state.host);
         try server.refreshModelCatalogForOptionsLocked(state, session);
         try out.writer.writeAll("{\"configOptions\":[");
         if (comptime !host_target.is_wasm) {
@@ -1396,12 +1400,12 @@ fn buildSessionAnswer(
         try writeModelConfigOption(
             &out.writer,
             session.model,
-            state.capability_resolver.catalogEntries(),
+            state.host.capability_resolver.catalogEntries(),
         );
         try out.writer.writeAll(",");
         try writeModeConfigOption(
             &out.writer,
-            state.cfg.mode_registry,
+            state.host.cfg.mode_registry,
             session.mode,
             state.extensions.contains(.permission_mode),
         );
@@ -1421,7 +1425,7 @@ fn buildSessionAnswer(
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(session.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
-    try writeModesArray(&out.writer, state.cfg.mode_registry);
+    try writeModesArray(&out.writer, state.host.cfg.mode_registry);
     try out.writer.writeByte('}');
     if (folder) |path| {
         try out.writer.writeAll(",\"_meta\":{\"sh.fx/cwd\":");
@@ -1626,7 +1630,7 @@ fn handleLoadFailure(
         .{@errorName(err)},
     );
     // v2 names a storage fault (D29); v1 keeps its messages below.
-    if (server.sessionsStore(state) != null) {
+    if (server.sessionsStore(state.host) != null) {
         if (v2StorageFaultMessage("Session could not be loaded", err)) |message| {
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
         }
@@ -1666,7 +1670,7 @@ fn handleLoadFailure(
         err == error.DurablePathUnsafe)
     {
         // A v1 session that can't be converted says why (D61).
-        if (server.sessionsStore(state)) |store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
+        if (server.sessionsStore(state.host)) |store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
             const message = try alloc.print("Session could not be loaded (InvalidSessionFormat): {s}", .{problem});
             defer alloc.free(message);
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
@@ -1688,7 +1692,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .message = "Invalid params",
         });
     // No store lists as no sessions.
-    const v2_store = server.sessionsStore(state) orelse return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
+    const v2_store = server.sessionsStore(state.host) orelse return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
     return listV2Sessions(state, alloc, msg, v2_store, params);
 }
 
@@ -2413,11 +2417,11 @@ fn sessionUsageUpdate(
 ) !?[]u8 {
     const used = active.context_used.load(.acquire);
     if (used == 0) return null;
-    const provider_bundle = owner.cfg.provider_set.select(provider);
+    const provider_bundle = owner.host.cfg.provider_set.select(provider);
     const capabilities = capabilities: {
-        server.lockCatalog(owner);
-        defer server.unlockCatalog(owner);
-        break :capabilities owner.capability_resolver.available(
+        server.lockCatalog(owner.host);
+        defer server.unlockCatalog(owner.host);
+        break :capabilities owner.host.capability_resolver.available(
             model,
             provider_bundle.fallbackModelCapabilities(model),
         );
@@ -2567,8 +2571,8 @@ pub const EffortConfigState = struct {
 /// the effort picker for those models).
 /// Call with `catalog_mutex` held.
 pub fn effortConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?EffortConfigState {
-    const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const bundle = state.host.cfg.provider_set.select(active.provider);
+    const capabilities = state.host.capability_resolver.available(
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
@@ -2580,8 +2584,8 @@ pub fn effortConfigState(state: *server.ServerState, active: *const server.Activ
 /// is exposed only when the active model offers a Fast lane.
 /// Call with `catalog_mutex` held.
 pub fn fastConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?bool {
-    const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const bundle = state.host.cfg.provider_set.select(active.provider);
+    const capabilities = state.host.capability_resolver.available(
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
@@ -2616,8 +2620,8 @@ test "writeFastConfigOption produces an off/on select with the current value" {
 /// Call with `catalog_mutex` held.
 pub fn ultrafastConfigState(state: *server.ServerState, active: *const server.ActiveSessionState) ?bool {
     if (active.provider != .gateway) return null;
-    const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const bundle = state.host.cfg.provider_set.select(active.provider);
+    const capabilities = state.host.capability_resolver.available(
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
@@ -2825,6 +2829,8 @@ test "ACP load of the active session keeps its subagent host and the session it 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -2837,9 +2843,9 @@ test "ACP load of the active session keeps its subagent host and the session it 
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
 
     var new_msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
@@ -2848,7 +2854,7 @@ test "ACP load of the active session keeps its subagent host and the session it 
     };
     try handleNewSession(&state, arena, &new_msg);
     const active = server.firstSession(&state).?;
-    _ = server.applySessionMode(state.cfg.mode_registry, active, "review");
+    _ = server.applySessionMode(state.host.cfg.mode_registry, active, "review");
     const subagents = active.subagent_host.?;
     const children = active.subagent_v2_children.?;
     const parent = active.v2.?;
@@ -2908,11 +2914,13 @@ test "ACP history excludes typed summaries without filtering original user text"
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
 
     try sendTestHistoryTurn(&state, arena, "session-1", .{ .compacted_summary = .{
@@ -2943,11 +2951,13 @@ test "ACP history replays a saved compaction as one completed update, without it
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
     state.client_compaction = true;
 
@@ -2971,6 +2981,8 @@ test "ACP interrupted history replay hides model-only abort context" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -2982,7 +2994,7 @@ test "ACP interrupted history replay hides model-only abort context" {
     defer capture.close(io_mod.getIo());
 
     {
-        var state = try initAcpSessionTestState(arena, workspace, capture);
+        var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
         defer state.deinit();
         var completed_tool_names = [_][]u8{@constCast("read_file")};
         try sendTestHistoryTurn(&state, arena, "session-1", .{ .interrupted = .{
@@ -3012,6 +3024,8 @@ test "ACP history replays a resumed request as its line, not fx's note" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -3019,7 +3033,7 @@ test "ACP history replays a resumed request as its line, not fx's note" {
     defer capture.close(io_mod.getIo());
 
     {
-        var state = try initAcpSessionTestState(arena, workspace, capture);
+        var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
         defer state.deinit();
         try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
             .user = .{ .text = try arena.dupe(u8, session_runtime.resumed_request_prompt) },
@@ -3047,11 +3061,13 @@ test "ACP history replay emits structured tool call frames" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
 
     var calls = [_]types.ToolCall{
@@ -3118,11 +3134,13 @@ test "ACP history replay leaves resultless tool calls pending" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
 
     var calls = [_]types.ToolCall{
@@ -3148,11 +3166,13 @@ test "ACP history replay redacts sensitive tool arguments" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
 
     var calls = [_]types.ToolCall{
@@ -3236,6 +3256,7 @@ test "execution replay plan interleaves assistant text and orphan results" {
 /// A session to replay history for in tests that open none.
 fn testReplaySession(state: *server.ServerState, session_id: []const u8) server.ActiveSessionState {
     var session: server.ActiveSessionState = undefined;
+    session.client_writer = jsonrpc.Writer.initCallback(&session, server.forwardToMain);
     session.server = state;
     session.session_id = @constCast(session_id);
     session.workspace = &state.launch;
@@ -3312,11 +3333,13 @@ test "ACP load titles a read with the call from an earlier turn" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
     defer state.deinit();
 
     const replay = "fx-command-replay-0123.bin";
@@ -3364,6 +3387,8 @@ test "ACP load maps one-off child denial to invalid params" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
@@ -3374,7 +3399,7 @@ test "ACP load maps one-off child denial to invalid params" {
     );
     defer capture.close(io_mod.getIo());
     {
-        var state = try initAcpSessionTestState(arena, workspace, capture);
+        var state = try initAcpSessionTestState(&test_host, arena, workspace, capture);
         defer state.deinit();
         var msg = jsonrpc.Message{
             .id = .{ .integer = 1 },
@@ -3483,10 +3508,12 @@ fn acpSessionTestConfig() server.Config {
 }
 
 fn initAcpSessionTestState(
+    proc: *server.Host,
     alloc: Allocator,
     workspace_root: []const u8,
     capture: std.Io.File,
 ) !server.ServerState {
+    proc.cfg = acpSessionTestConfig();
     const workspace = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(workspace);
     const api_key = try alloc.dupe(u8, "test-key");
@@ -3498,7 +3525,7 @@ fn initAcpSessionTestState(
 
     return .{
         .alloc = alloc,
-        .cfg = acpSessionTestConfig(),
+        .host = proc,
         .writer = .{ .stdout = capture },
         .launch = .{ .root = workspace },
         .api_key = api_key,
@@ -3569,17 +3596,19 @@ test "ACP ultrafast new load and resume preserve configured baselines" {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            var state = try initAcpSessionTestState(arena, workspace_path, capture);
+            var test_host = server.testHost(arena);
+            defer test_host.deinit();
+            var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
             defer state.deinit();
-            state.cfg.auth_mode = .host_managed;
+            state.host.cfg.auth_mode = .host_managed;
             state.credential_source = .host_managed;
-            state.cfg.minimal_kernel = true;
-            state.cfg.allow_acp_mcp = false;
-            state.cfg.home_override = home_path;
+            state.host.cfg.minimal_kernel = true;
+            state.host.cfg.allow_acp_mcp = false;
+            state.host.cfg.home_override = home_path;
             state.configured_ultrafast_mode = baseline;
             state.process_ultrafast_override = process;
             state.ultrafast_mode = process orelse baseline;
-            state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+            state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
             var msg = jsonrpc.Message{
                 .id = .{ .integer = 1 },
                 .method = "session/new",
@@ -3616,6 +3645,8 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -3654,10 +3685,10 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .{ .read = true },
     );
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
-    state.cfg.allow_acp_mcp = false;
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
+    state.host.cfg.allow_acp_mcp = false;
 
     var new_msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
@@ -3748,6 +3779,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -3769,9 +3802,9 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     );
     defer capture.close(io_mod.getIo());
     {
-        var state = try initAcpSessionTestState(arena, workspace_path, capture);
+        var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
         defer state.deinit();
-        state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+        state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
 
         var new_msg = jsonrpc.Message{
             .id = .{ .integer = 1 },
@@ -3787,7 +3820,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             new_active.mode,
         );
         _ = server.applySessionMode(
-            state.cfg.mode_registry,
+            state.host.cfg.mode_registry,
             new_active,
             "review",
         );
@@ -3849,6 +3882,8 @@ test "a switch away from a session drops the reports its host queued and closes 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -3861,9 +3896,9 @@ test "a switch away from a session drops the reports its host queued and closes 
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
 
     var new_msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
@@ -3899,6 +3934,8 @@ test "a reload under another cwd is refused and keeps the queue, and a libfx/new
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
@@ -3911,9 +3948,9 @@ test "a reload under another cwd is refused and keeps the queue, and a libfx/new
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
 
     var new_msg = jsonrpc.Message{
         .id = .{ .integer = 1 },
@@ -3963,7 +4000,7 @@ test "a reload under another cwd is refused and keeps the queue, and a libfx/new
 
     // Where the connection holds one session, as the libfx kernel does, a libfx/new session
     // replaces a session whose host queued reports, and drops all the mail, a message too.
-    state.cfg.minimal_kernel = true;
+    state.host.cfg.minimal_kernel = true;
     var libfx_msg = jsonrpc.Message{
         .id = .{ .integer = 4 },
         .method = "libfx/new",
@@ -4022,13 +4059,13 @@ const JoinFrames = struct {
 };
 
 /// A connection of the join tests: its writer keeps its frames, and it shares `shared`.
-fn joinTestState(alloc: Allocator, shared: *server.SharedSessions, frames: *JoinFrames, root: []const u8) !server.ServerState {
+fn joinTestState(alloc: Allocator, proc: *server.Host, frames: *JoinFrames, root: []const u8) !server.ServerState {
+    proc.cfg = acpSessionTestConfig();
     return .{
         .alloc = alloc,
-        .cfg = acpSessionTestConfig(),
+        .host = proc,
         .writer = jsonrpc.Writer.initCallback(frames, JoinFrames.write),
         .launch = .{ .root = try alloc.dupe(u8, root) },
-        .shared = shared,
     };
 }
 
@@ -4090,19 +4127,19 @@ fn expectOccurrences(bytes: []const u8, needle: []const u8, expected: usize) !vo
 
 test "a second connection of the process follows a loaded session: the saved turns, the running copy, the answer, then live updates" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
     try deliverOwnerThought(alloc, session, "thought before join");
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
@@ -4129,19 +4166,19 @@ test "a second connection of the process follows a loaded session: the saved tur
 
 test "a resume joins a session another connection has open, with no replay" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
     try deliverOwnerThought(alloc, session, "thought before join");
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var resume_msg = jsonrpc.Message{
         .id = .{ .integer = 3 },
@@ -4162,17 +4199,17 @@ test "a resume joins a session another connection has open, with no replay" {
 
 test "a follower's session/close detaches it, the session stays open for its owner, and later updates reach only the owner" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
@@ -4200,17 +4237,17 @@ test "a follower's session/close detaches it, the session stays open for its own
 
 test "a follower connection that ends detaches from the session it followed" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
         .method = "session/load",
@@ -4229,13 +4266,13 @@ test "a follower connection that ends detaches from the session it followed" {
 }
 
 /// A connection whose writer the test chooses, for the tests that need more than a capture.
-fn joinTestStateOn(alloc: Allocator, shared: *server.SharedSessions, writer: jsonrpc.Writer, root: []const u8) !server.ServerState {
+fn joinTestStateOn(alloc: Allocator, proc: *server.Host, writer: jsonrpc.Writer, root: []const u8) !server.ServerState {
+    proc.cfg = acpSessionTestConfig();
     return .{
         .alloc = alloc,
-        .cfg = acpSessionTestConfig(),
+        .host = proc,
         .writer = writer,
         .launch = .{ .root = try alloc.dupe(u8, root) },
-        .shared = shared,
     };
 }
 
@@ -4275,13 +4312,13 @@ const SendOnAnswer = struct {
 
 test "a joiner of a running turn whose copy dropped part of its output gets the kept start, the notice, then the answer" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
@@ -4304,7 +4341,7 @@ test "a joiner of a running turn whose copy dropped part of its output gets the 
     try std.testing.expectEqual(@as(usize, 1), session.running_copy.entries.items.len);
     try std.testing.expect(session.running_copy.dropped > 0);
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
@@ -4324,19 +4361,19 @@ test "a joiner of a running turn whose copy dropped part of its output gets the 
 
 test "a joiner's answer comes before an owner update sent right after the join" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
 
     var send = SendOnAnswer{ .alloc = alloc, .frames = &joiner_frames, .session = session };
-    var joiner = try joinTestStateOn(alloc, &shared, jsonrpc.Writer.initCallback(&send, SendOnAnswer.write), "/tmp/elsewhere");
+    var joiner = try joinTestStateOn(alloc, &test_host, jsonrpc.Writer.initCallback(&send, SendOnAnswer.write), "/tmp/elsewhere");
     defer joiner.deinit();
     // Declared after the joiner, so the thread finishes before the joiner is freed.
     defer if (send.thread) |thread| thread.join();
@@ -4360,19 +4397,19 @@ test "a joiner's answer comes before an owner update sent right after the join" 
 
 test "a repeat session/load of a followed session replays again and adds no second follower" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
     try deliverOwnerThought(alloc, session, "thought before join");
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
@@ -4403,17 +4440,17 @@ test "a repeat session/load of a followed session replays again and adds no seco
 
 test "a follower's set_mode and set_config_option get -32600, and the owner's session is unchanged" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
@@ -4459,13 +4496,13 @@ test "a follower's set_mode and set_config_option get -32600, and the owner's se
 
 test "a client that joins while a prompt's turn runs gets the prompt once, in the replay" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     owner.connection_id = 1;
     const session = try openJoinSession(&owner);
@@ -4474,7 +4511,7 @@ test "a client that joins while a prompt's turn runs gets the prompt once, in th
     try server.announcePromptTurn(session, owner.connection_id, alloc, "joined-prompt", "JOINED_PROMPT", &.{});
     try expectOccurrences(owner_frames.bytes.items, "JOINED_PROMPT", 0);
 
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     joiner.connection_id = 2;
     var load_msg = jsonrpc.Message{
@@ -4520,6 +4557,8 @@ test "the owner's load with a new system prompt during a turn is answered, and t
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -4530,9 +4569,9 @@ test "the owner's load with a new system prompt during a turn is answered, and t
     defer test_home.deinit();
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
     var frames = JoinFrames{ .alloc = alloc };
     defer frames.deinit();
     state.writer = jsonrpc.Writer.initCallback(&frames, JoinFrames.write);
@@ -4575,6 +4614,8 @@ test "a joined client's load with a new system prompt during the owner's turn is
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -4586,12 +4627,9 @@ test "a joined client's load with a new system prompt during the owner's turn is
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     // The owner's state grows the table with its arena, so the table frees with it.
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(arena);
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.shared = &shared;
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
     state.writer = jsonrpc.Writer.initCallback(&owner_frames, JoinFrames.write);
@@ -4610,7 +4648,7 @@ test "a joined client's load with a new system prompt during the owner's turn is
     // A second connection loads the session with a new prompt while the owner's turn runs.
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, workspace_path);
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, workspace_path);
     defer joiner.deinit();
     joiner.connection_id = 2;
     const load_params = try loadParamsWithPrompt(alloc, active.session_id, "NEW_CLIENT_PROMPT");
@@ -4633,6 +4671,8 @@ test "a changed client system prompt is saved with its session, and a restore re
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var test_host = server.testHost(arena);
+    defer test_host.deinit();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -4643,9 +4683,9 @@ test "a changed client system prompt is saved with its session, and a restore re
     defer test_home.deinit();
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    var state = try initAcpSessionTestState(&test_host, arena, workspace_path, capture);
     defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    state.host.store = try session_adapter.Store.open(state.host.alloc, home_path);
     var frames = JoinFrames{ .alloc = alloc };
     defer frames.deinit();
     state.writer = jsonrpc.Writer.initCallback(&frames, JoinFrames.write);
@@ -4671,6 +4711,8 @@ test "a changed client system prompt is saved with its session, and a restore re
 
 test "a joined client's hooks are traced and not applied, while its system prompt applies" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const folder = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -4681,18 +4723,16 @@ test "a joined client's hooks are traced and not applied, while its system promp
     try debug_trace.configureForTest(alloc, trace_path);
     defer debug_trace.resetForTest();
 
-    var shared: server.SharedSessions = .{};
-    defer shared.deinit(alloc);
     var owner_frames = JoinFrames{ .alloc = alloc };
     defer owner_frames.deinit();
-    var owner = try joinTestState(alloc, &shared, &owner_frames, "/tmp/workspace");
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
     defer owner.deinit();
     owner.connection_id = 1;
     const session = try openJoinSession(&owner);
 
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
-    var joiner = try joinTestState(alloc, &shared, &joiner_frames, "/tmp/elsewhere");
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
     defer joiner.deinit();
     joiner.connection_id = 2;
     joiner.extensions = sh_fx.Set.initMany(&.{.hooks});

@@ -138,6 +138,18 @@ pub fn noteJoinPassed() void {
     }
 }
 
+/// Set by a unit test. An outbound request's wait marks `outbound_waiting` while it
+/// holds the session's lock, just before it waits. An answer the test sends after that
+/// mark can only be taken once the wait has released the lock, so the answer always
+/// reaches a waiter that is already blocked. Null outside a test.
+pub var outbound_waiting: ?*Gate = null;
+
+pub fn noteOutboundWaiting() void {
+    if (comptime builtin.is_test) {
+        if (outbound_waiting) |gate| gate.mark();
+    }
+}
+
 /// Set by a unit test. The next worker spawn fails once, as the system does when it
 /// refuses a thread, so a test can see what a claim leaves behind when its worker never
 /// starts. `takeSpawnFailure` clears it. Only a test build sets it.

@@ -350,6 +350,20 @@ pub const Writer = struct {
         const slice = try out.toOwnedSlice();
         defer alloc.free(slice);
 
+        try self.writeSlice(slice, notification);
+    }
+
+    /// Writes one finished frame. A session's client writer forwards its frames
+    /// here, so the connection's own writer keeps its lock and its rule for a closed
+    /// client. A dropped notification comes back as `BrokenPipe`, and the caller
+    /// decides whether that is an error.
+    pub fn writeBytes(self: *Writer, slice: []const u8) !void {
+        try self.writeSlice(slice, false);
+    }
+
+    /// The one place a finished frame reaches the client. It holds the writer's lock
+    /// and applies the closed-client rule (R1.8).
+    fn writeSlice(self: *Writer, slice: []const u8, notification: bool) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);

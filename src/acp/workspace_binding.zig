@@ -79,10 +79,10 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 /// The workspace root a session request names, as `prepare` stages it,
 /// owned by the caller; null for the libfx kernel.
 pub fn resolveRoot(state: *const server.ServerState, alloc: Allocator, params_raw: ?[]const u8) PrepareError!?[]u8 {
-    if (state.cfg.minimal_kernel) return null;
+    if (state.host.cfg.minimal_kernel) return null;
     const cwd = try requestedCwd(alloc, params_raw);
     defer if (cwd) |path| alloc.free(path);
-    if (state.cfg.workspace_root_override != null or cwd == null) return try alloc.dupe(u8, state.launch.root);
+    if (state.host.cfg.workspace_root_override != null or cwd == null) return try alloc.dupe(u8, state.launch.root);
     return io_mod.realpathAlloc(alloc, cwd.?) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.CwdUnavailable,
@@ -109,7 +109,7 @@ fn requestedCwd(alloc: Allocator, params_raw: ?[]const u8) PrepareError!?[]u8 {
 /// Saved directories come from the profile entry for the new root; command
 /// line directories and suppression apply to every session.
 fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const u8) PrepareError!workspace_access.WorkspaceAccess {
-    var detailed = (if (state.cfg.home_override) |home|
+    var detailed = (if (state.host.cfg.home_override) |home|
         config_runtime.loadMergedSettingsDetailedFromHome(alloc, home, root)
     else
         config_runtime.loadMergedSettingsDetailed(alloc, root)) catch |err| switch (err) {
@@ -125,8 +125,8 @@ fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const 
         alloc,
         root,
         saved,
-        state.cfg.additional_directories,
-        state.cfg.saved_directories_suppressed,
+        state.host.cfg.additional_directories,
+        state.host.cfg.saved_directories_suppressed,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
