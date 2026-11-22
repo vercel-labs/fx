@@ -1722,6 +1722,9 @@ pub const Runtime = struct {
         /// How many of the parent's messages the work carried: the count the
         /// slot was started with.
         messages: usize,
+        /// Whether the work was saved in the registry, and so in the log: a
+        /// message that could not be saved has no log entry to post it again.
+        saved: bool,
 
         fn deinit(self: FailedStart, alloc: Allocator) void {
             alloc.free(self.work_id);
@@ -1743,9 +1746,10 @@ pub const Runtime = struct {
             .start_messages = failed.messages,
             .start_held = failed.err == error.ChildBusy,
         });
-        // Nothing took the report. A work that was saved still owes it in the
-        // log; a message that was never saved is gone with this line.
-        if (!posted) debug_trace.logf("mailbox", "failed start not reported child={s} work_id={s} messages={d} error={s} owed={}: its messages never ran", .{ child_id, failed.work_id, failed.messages, @errorName(failed.err), failed.report_owed });
+        // No report of it went out: nothing took one, or none was owed. A
+        // work that was saved keeps an owed report in the log; a message that
+        // was never saved is gone with this line.
+        if (!posted or !failed.report_owed) debug_trace.logf("mailbox", "failed start not reported child={s} work_id={s} messages={d} error={s} owed={} saved={}: its messages never ran", .{ child_id, failed.work_id, failed.messages, @errorName(failed.err), failed.report_owed, failed.saved });
         self.forgetCall(failed.work_id);
         return posted;
     }
@@ -1788,7 +1792,7 @@ pub const Runtime = struct {
                 return null;
             };
             // Busy stays set: the next waiting message, if any, starts now.
-            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err, .messages = messages };
+            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err, .messages = messages, .saved = true };
         };
         return null;
     }
@@ -1826,6 +1830,7 @@ pub const Runtime = struct {
             .end = .{ .started_by = item.work.started_by },
             .err = err,
             .messages = messages,
+            .saved = false,
         } };
     }
 
@@ -3461,7 +3466,68 @@ test "a message that could not be saved as a closed tree's next work is not repo
     }
     try std.testing.expect(trace.has("failed start not reported"));
     try std.testing.expect(trace.has("owed=false"));
+    try std.testing.expect(trace.has("saved=false"));
     try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+}
+
+const UserDropHook = struct {
+    var runtime: ?*Runtime = null;
+    var calls: usize = 0;
+
+    // The user's stop lands where the failed start is ended, before its report is built.
+    fn hook(child_id: []const u8) void {
+        calls += 1;
+        runtime.?.userStopped(child_id, 1);
+    }
+};
+
+// A user's stop left a drop for the closed tree's child, so the notice is the only
+// report that goes out, and no report names the failed start: the log line says so.
+test "a message that could not be saved is logged when only the notice of a user's drop goes out" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try expectBodyHas(queued, "is busy");
+    const before = fixture.reportCount();
+    runtime.closeTree();
+    UserDropHook.runtime = runtime;
+    defer UserDropHook.runtime = null;
+    UserDropHook.calls = 0;
+    start_test_controls.test_failed_start_ended = UserDropHook.hook;
+    defer start_test_controls.test_failed_start_ended = null;
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_next_work = false;
+    try waitUntilQuiet(runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), UserDropHook.calls);
+    var notice = false;
+    for (fixture.reports.items[before..]) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "could not start the work") == null);
+        if (std.mem.find(u8, line, "dropped=") != null) notice = true;
+    }
+    try std.testing.expect(notice);
+    try std.testing.expect(trace.has("failed start not reported"));
+    try std.testing.expect(trace.has("owed=false"));
 }
 
 test "the roster names the open subagents, and the working ones while they work" {
