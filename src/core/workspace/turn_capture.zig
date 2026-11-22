@@ -5,10 +5,10 @@
 //!
 //! A host keeps one `TurnCapture` per session. `begin` runs where the turn
 //! starts, beside the prompt's images, then the host saves the user's
-//! prompt, then `start` takes the start capture on its own thread, beside
-//! the turn's first request, and `settle` waits for it before the turn's
+//! prompt, then `start` takes the start capture as its own `std.Io` task,
+//! beside the turn's first request, and `settle` awaits it before the turn's
 //! first tool acts and again as the turn returns; `reach`, `end`, a fresh
-//! `begin`, and `deinit` settle first too, so the thread never outlives its
+//! `begin`, and `deinit` settle first too, so the task never outlives its
 //! turn or the session it writes to. `end` runs on the turn's thread before the turn's commit and
 //! returns the token that commit uses; a host that commits on that thread
 //! may ask `token` instead. A failed commit keeps both the token and the end capture,
@@ -64,6 +64,7 @@ const capture_policy = @import("workspace_capture.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const repo_root = @import("repo_root.zig");
+const test_controls = @import("turn_capture_test_controls.zig");
 
 const Allocator = std.mem.Allocator;
 const Session = session_adapter.Session;
@@ -150,11 +151,11 @@ pub const TurnCapture = struct {
     current: ?Session.CaptureTurn = null,
     /// `begin` ran and the turn's own start capture has not.
     start_pending: bool = false,
-    /// The thread taking the turn's own start capture beside its first
-    /// request (`start`), until `settle` joins it.
-    start_thread: ?std.Thread = null,
+    /// The task taking the turn's own start capture beside its first
+    /// request (`start`), until `settle` awaits it.
+    start_task: ?std.Io.Future(void) = null,
     /// The start capture runs; `settle` callers that did not take
-    /// `start_thread` wait on `settled` until it clears.
+    /// `start_task` wait on `settled` until it clears.
     start_running: bool = false,
     /// Whether this turn's end capture is taken, so a retried commit does
     /// not take a second one.
@@ -209,11 +210,11 @@ pub const TurnCapture = struct {
         self.start_pending = true;
     }
 
-    /// Starts the start capture of the turn `begin` began, once, on its own
-    /// thread, and returns: the capture runs beside the turn's first
-    /// request, and `settle` waits for it before the turn's first tool acts,
-    /// before `reach` and `end`, and before the next turn. When no thread
-    /// can start, the capture runs here.
+    /// Starts the start capture of the turn `begin` began, once, as a
+    /// `std.Io` task, and returns: the capture runs beside the turn's first
+    /// request, and `settle` awaits it before the turn's first tool acts,
+    /// before `reach` and `end`, and before the next turn. When no task can
+    /// start, the capture runs here.
     pub fn start(self: *TurnCapture, context: Context, lock: *std.Io.Mutex) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -235,30 +236,34 @@ pub const TurnCapture = struct {
         self.mutex.unlock(io);
         if (private) debug_trace.logf("workspace", "event=workspace_capture_private session={s} reason=private_root", .{context.session.id()});
         const skip: ?capture_policy.Reason = if (private) .private_root else null;
-        const job = StartJob.init(self, context, turn, lock, skip) orelse return self.capture(context, turn, .start, lock, null, skip);
+        const job = StartJob.init(self, context, turn, lock, skip) orelse {
+            traceStartInPlace(context, "OutOfMemory");
+            return self.capture(context, turn, .start, lock, null, skip);
+        };
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const thread = std.Thread.spawn(.{}, StartJob.run, .{job}) catch {
+        self.start_task = io.concurrent(StartJob.run, .{job}) catch |err| {
             self.mutex.unlock(io);
+            traceStartInPlace(context, @errorName(err));
             job.run();
             self.mutex.lockUncancelable(io);
             return;
         };
-        self.start_thread = thread;
         self.start_running = true;
     }
 
     /// Waits until the turn's start capture is saved, when `start` left it
     /// running. Safe from any thread, and from several at once, such as tool
-    /// calls running in parallel: one joins the thread and the others wait.
+    /// calls running in parallel: one awaits the task and the others wait.
     pub fn settle(self: *TurnCapture) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.start_thread) |thread| {
-            self.start_thread = null;
+        if (self.start_task) |task| {
+            var running = task;
+            self.start_task = null;
             self.mutex.unlock(io);
-            thread.join();
+            running.await(io);
             self.mutex.lockUncancelable(io);
             self.start_running = false;
             self.settled.broadcast(io);
@@ -442,7 +447,7 @@ pub const TurnCapture = struct {
     }
 };
 
-/// A turn's own start capture on its thread (`TurnCapture.start`). It owns
+/// A turn's own start capture as its task (`TurnCapture.start`). It owns
 /// copies of the context's paths, since the host's strings may change once
 /// `start` returns; the session, lock and cancel flag outlive it because
 /// every way past the turn settles it first.
@@ -469,9 +474,16 @@ const StartJob = struct {
     fn run(job: StartJob) void {
         defer std.heap.c_allocator.free(job.context.home);
         defer std.heap.c_allocator.free(job.context.path);
+        test_controls.holdStartCapture();
         job.turn_capture.capture(job.context, job.turn, .start, job.lock, null, job.skip);
     }
 };
+
+/// The start capture runs on the turn's own thread, before the first
+/// request, because no task could take it.
+fn traceStartInPlace(context: Context, reason: []const u8) void {
+    debug_trace.logf("workspace", "event=workspace_capture_start_in_place session={s} reason={s}", .{ context.session.id(), reason });
+}
 
 fn traceReachSkipped(context: Context, tool: []const u8, reason: []const u8) void {
     debug_trace.logf("workspace", "event=workspace_capture_reach_skipped session={s} tool={s} reason={s}", .{ context.session.id(), tool, reason });
@@ -1128,7 +1140,7 @@ const GateRecorder = struct {
     }
 
     /// Opens the gate; a test defers it so a failure never leaves the
-    /// start capture's thread waiting.
+    /// start capture's task waiting.
     fn release() void {
         open.set(std.testing.io);
     }
@@ -1192,7 +1204,7 @@ test "the start capture runs beside the turn, and each tool's settle waits until
     const saved = GateRecorder.start_at.load(.seq_cst);
     try std.testing.expect(saved > 0);
     for (&Settlers.returned_at) |*at| try std.testing.expect(at.load(.seq_cst) > saved);
-    try std.testing.expect(captures.start_thread == null and !captures.start_running);
+    try std.testing.expect(captures.start_task == null and !captures.start_running);
     // Settling again, as every later tool does, returns at once.
     captures.settle();
 }
@@ -1247,11 +1259,70 @@ test "the next turn and teardown wait for a start capture a turn never settled" 
         captures.start(context, &lock);
         const opener = try std.Thread.spawn(.{}, releaseOnceCalling, .{});
         defer opener.join();
-        // The host tearing down mid-turn leaves no thread behind.
+        // The host tearing down mid-turn leaves no task behind.
         GateRecorder.calling.set(std.testing.io);
         captures.deinit();
         try std.testing.expectEqual(@as(u32, 1), GateRecorder.start_at.load(.seq_cst));
     }
+}
+
+/// A start capture that takes `SlowCapture`'s 10 s through `runCapture` and
+/// the turn's cancel flag, the way `record` takes a real one.
+const CancellableRecorder = struct {
+    var began: std.Io.Event = .unset;
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    fn reset() void {
+        began = .unset;
+        cancelled.store(false, .seq_cst);
+        SlowCapture.saw_cancel.store(false, .seq_cst);
+    }
+
+    fn record(context: Context, turn: Session.CaptureTurn, phase: capture_store.Phase, lock: *std.Io.Mutex, trigger_tool: ?[]const u8, skip: ?capture_policy.Reason) void {
+        _ = .{ turn, lock, trigger_tool, skip };
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        // An allocation failure leaves `cancelled` false, which fails the test.
+        const outcome = runCapture(arena_state.allocator(), context.cancel, .{
+            .profile_root = "/p",
+            .path = context.path,
+            .session_id = "s",
+            .phase = phase,
+            .unix_seconds = 1,
+            .deadline = .fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(deadline_ms) }),
+            .scan_allocator = std.testing.allocator,
+        }, &capture) catch return;
+        cancelled.store(outcome.status == .unavailable and outcome.reason == .cancelled, .seq_cst);
+    }
+
+    fn capture(arena: Allocator, request: capture_store.Request) Allocator.Error!capture_store.Outcome {
+        began.set(std.testing.io);
+        return SlowCapture.capture(arena, request);
+    }
+};
+
+test "a cancel ends a start capture still running beside the turn's first request" {
+    if (!supported) return error.SkipZigTest;
+    var t: TestSession = undefined;
+    try t.init();
+    defer t.deinit();
+    CancellableRecorder.reset();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var context = t.context();
+    context.cancel = &cancel;
+    var lock: std.Io.Mutex = .init;
+    var captures: TurnCapture = .{ .recorder = &CancellableRecorder.record };
+    defer captures.deinit();
+    captures.begin(context, true);
+    // `start` returns while the capture runs, then the person cancels the
+    // turn; a capture taken in place would still hold `start` here.
+    captures.start(context, &lock);
+    CancellableRecorder.began.waitUncancelable(std.testing.io);
+    cancel.store(true, .seq_cst);
+    captures.settle();
+    try std.testing.expect(SlowCapture.saw_cancel.load(.seq_cst));
+    try std.testing.expect(CancellableRecorder.cancelled.load(.seq_cst));
+    try std.testing.expect(captures.start_task == null and !captures.start_running);
 }
 
 fn reachIn(captures: *TurnCapture, context: Context, dir: []const u8, lock: *std.Io.Mutex) void {
