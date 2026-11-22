@@ -236,11 +236,15 @@ pub const TurnCapture = struct {
         self.mutex.unlock(io);
         if (private) debug_trace.logf("workspace", "event=workspace_capture_private session={s} reason=private_root", .{context.session.id()});
         const skip: ?capture_policy.Reason = if (private) .private_root else null;
-        const job = StartJob.init(self, context, turn, lock, skip) orelse return self.capture(context, turn, .start, lock, null, skip);
+        const job = StartJob.init(self, context, turn, lock, skip) orelse {
+            traceStartInPlace(context, "OutOfMemory");
+            return self.capture(context, turn, .start, lock, null, skip);
+        };
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.start_task = io.concurrent(StartJob.run, .{job}) catch {
+        self.start_task = io.concurrent(StartJob.run, .{job}) catch |err| {
             self.mutex.unlock(io);
+            traceStartInPlace(context, @errorName(err));
             job.run();
             self.mutex.lockUncancelable(io);
             return;
@@ -474,6 +478,12 @@ const StartJob = struct {
         job.turn_capture.capture(job.context, job.turn, .start, job.lock, null, job.skip);
     }
 };
+
+/// The start capture runs on the turn's own thread, before the first
+/// request, because no task could take it.
+fn traceStartInPlace(context: Context, reason: []const u8) void {
+    debug_trace.logf("workspace", "event=workspace_capture_start_in_place session={s} reason={s}", .{ context.session.id(), reason });
+}
 
 fn traceReachSkipped(context: Context, tool: []const u8, reason: []const u8) void {
     debug_trace.logf("workspace", "event=workspace_capture_reach_skipped session={s} tool={s} reason={s}", .{ context.session.id(), tool, reason });
@@ -1130,7 +1140,7 @@ const GateRecorder = struct {
     }
 
     /// Opens the gate; a test defers it so a failure never leaves the
-    /// start capture's thread waiting.
+    /// start capture's task waiting.
     fn release() void {
         open.set(std.testing.io);
     }

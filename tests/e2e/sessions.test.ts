@@ -568,6 +568,51 @@ test("fx ask sends the turn's request while its start capture runs, and saves th
   }
 }, TIMEOUT);
 
+test("fx ask killed while its start capture is held keeps the prompt, and the resumed turn records its own captures, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-kill-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The release never comes, so the start capture is still held at the kill.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  let requested!: () => void;
+  const turnRequested = new Promise<void>((resolve) => {
+    requested = resolve;
+  });
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("After the kill.")) return fakeGatewayFinalText("AFTER_KILL");
+    requested();
+    return new Promise<Response>(() => {});
+  });
+  try {
+    const child = spawn(FX_BIN, ["ask", "--json", "--auto", "Before the kill."], {
+      cwd: fixture.workspace,
+      env: { ...process.env, ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release } as Record<string, string>,
+      stdio: "ignore",
+    });
+    const exited = new Promise((resolve) => child.on("exit", resolve));
+    await turnRequested;
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(held) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(held)).toBe(true);
+    child.kill("SIGKILL");
+    await exited;
+
+    const id = onlySessionId(fixture.home);
+    expect(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8")).toContain("Before the kill.");
+    expect(workspaceCaptures(fixture, id)).toEqual([]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the kill."]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_KILL");
+    expect(workspaceCaptures(fixture, id).map((record) => record.phase)).toEqual(["start", "end"]);
+    expect(logLines(fixture.home, id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask never captures a repository at the home folder that a tool writes in, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-home-");
   makeCaptureRepository(fixture);
