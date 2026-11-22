@@ -1090,6 +1090,7 @@ pub const Runtime = struct {
     /// returns before it settles the child, so the caller reports it first.
     fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool, drops: *LeftoverDrops) SlotNext {
         if (self.endClosingWork(end)) {
+            if (self.deliverClosingDrop(end.child_id)) posted.* = true;
             _ = self.settleClose(end.child_id);
             return .idle;
         }
@@ -1315,8 +1316,32 @@ pub const Runtime = struct {
         const dropped = self.takeUserDropped(end.child_id);
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
-        if (dropped.count > 0) return self.postReportWith(.{ .child_id = end.child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
+        if (dropped.count > 0) return self.postDropNotice(end.child_id, dropped);
         return false;
+    }
+
+    /// Posts the notice that the user's stop or close of `child_id` dropped
+    /// `dropped` messages. True when the sink took it. A notice nothing took is
+    /// gone, since no log entry posts it again, so a log line says so.
+    fn postDropNotice(self: *Runtime, child_id: []const u8, dropped: Dropped) bool {
+        const posted = self.postReportWith(.{ .child_id = child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
+        if (!posted) debug_trace.logf("mailbox", "drop notice not delivered child={s} dropped={d} closed={}: nothing took it", .{ child_id, dropped.count, dropped.closed });
+        return posted;
+    }
+
+    /// A closing child takes no next work, so no later end delivers what a
+    /// user's close noted after the child's last end was told to the owner:
+    /// the note goes now, as the notice. Call with no lock held, before the
+    /// close is written. True when the sink took it.
+    fn deliverClosingDrop(self: *Runtime, child_id: []const u8) bool {
+        {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            if (self.closingIndexLocked(child_id) == null) return false;
+        }
+        const dropped = self.takeUserDropped(child_id);
+        if (dropped.count == 0) return false;
+        return self.postDropNotice(child_id, dropped);
     }
 
     /// Posts the reports `session`'s log still owes its owner, oldest first,
@@ -1731,7 +1756,7 @@ pub const Runtime = struct {
             break :blk self.turn_works.swapRemove(index);
         };
         defer work.deinit(self.alloc);
-        const posted = self.finishTurnWork(work, outcome, reply);
+        var posted = self.finishTurnWork(work, outcome, reply);
         if (end_test_controls.settleArmed()) end_test_controls.holdBeforeSettle(child_id);
         // Runs after the lock below is released: a closing child's close is
         // written, then the owner's `wait` is nudged, so the child's busy
@@ -1744,6 +1769,8 @@ pub const Runtime = struct {
             start_test_controls.failedStartEnded(child_id);
             _ = self.reportFailedStart(child_id, failed);
         }
+        // A user's close after this turn's report left a note that nothing else delivers.
+        if (self.deliverClosingDrop(child_id)) posted = true;
     }
 
     /// The last step of a user's turn's end: writes the child's close when
@@ -4663,6 +4690,79 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expect(std.mem.find(u8, report, "The user closed it before it finished.") != null);
     try std.testing.expect(std.mem.endsWith(u8, report, " dropped=1"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+/// Whether a report the fixture took says `needle`.
+fn reportSays(fixture: *MailboxFixture, needle: []const u8) bool {
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
+test "a user's close that lands after a subagent's report still tells main what it dropped" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+
+    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
+    try waitForRuns(&gap.fixture, 1);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    const child_id = try reviewerId(gap.runtime, gap.arena());
+
+    // The hold sits after the work's report is posted and before the child
+    // settles, so the user's close lands in that window.
+    gap.arm();
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[0], "DONE first") != null);
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    try waitUntilQuiet(gap.runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.runs.load(.seq_cst));
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 0), gap.runtime.user_dropped.items.len);
+}
+
+test "a user's close that lands after a user's turn's report still tells main what it dropped" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .armed = false });
+    defer gap.deinit();
+
+    const child_id = try gap.finishFirstWork();
+    // The user's turn ends failed, which owes a report, so the report is out
+    // before the hold.
+    const work_id = gap.runtime.beginUserWork(std.testing.allocator, child_id, null).?;
+    defer std.testing.allocator.free(work_id);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+
+    gap.arm();
+    const ender = try std.Thread.spawn(.{}, endUserWorkOnThread, .{ gap.runtime, child_id, work_id, child_state.Outcome.failed });
+    var ender_joined = false;
+    defer if (!ender_joined) {
+        SettleGap.go.set(io_mod.getIo());
+        ender.join();
+    };
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 2), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[1], "failed") != null);
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    ender.join();
+    ender_joined = true;
+    try waitUntilQuiet(gap.runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.runs.load(.seq_cst));
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 0), gap.runtime.user_dropped.items.len);
 }
 
 /// `body` must hold `needle`; a miss shows the needle beside the body, since a
