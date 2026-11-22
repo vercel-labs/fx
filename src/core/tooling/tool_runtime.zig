@@ -289,6 +289,7 @@ pub const Context = struct {
         const observer = self.observer orelse if (self.permission_review_turn) |review| review.observer else null;
         var input: tool_admission.Input = .{
             .workspace_root = self.workspace_root,
+            .bash_start_folder = if (self.bash_session) |session| session.startFolder() else null,
             .access_scope = self.access_scope,
             .permission_review_turn = self.permission_review_turn,
             .permission_grants = self.permission_grants,

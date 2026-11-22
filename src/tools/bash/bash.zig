@@ -72,6 +72,7 @@ pub const program_yield_ms: u32 = managed_contract.default_yield_time_ms;
 const still_running_text = "A program is still running. " ++ wait_hint;
 const nothing_running_text = "Nothing is running.";
 const unavailable_text = "bash is not available in this host.";
+const folder_changed_text = "The bash session's start folder changed after this program was approved, because the last program ended in another folder. Send the program again.";
 
 /// The action a call gets, decided by its command: `wait` when the command is
 /// the wait request, else `run`. This is fx's own field, so an `action` the
@@ -184,6 +185,14 @@ pub fn call(
     };
 }
 
+/// The fingerprint an approval was given for, whichever kind of approval it is.
+fn approvedFingerprint(authority: command_admission.CommandExecutionAuthority) command_admission.AdmissionFingerprint {
+    return switch (authority) {
+        .direct_only => |fingerprint| fingerprint,
+        .shell_allowed => |allowed| allowed.fingerprint,
+    };
+}
+
 /// Starts `command` as this session's program and waits up to `yield_ms` for its
 /// result. A session whose program is still running starts no other.
 fn callRun(
@@ -203,13 +212,26 @@ fn callRun(
         .run_command => |value| value,
         else => return unavailableResult(ctx),
     };
-    session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
+    const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
+    if (swept > 0) debug_trace.logf("bash", "removed {d} bash session folders that ended processes left", .{swept});
+    // A background program may have ended since the approval and left another folder.
+    session.refreshStartFolder(io_mod.getIo());
+    const folder = session.startFolder() orelse ctx.workspace_root;
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     // The environment admission approved, built the same way, so the run is the
     // one that was approved.
     const environment = try shell_resolver.bashToolEnvironment(request_arena);
+    // The approval must cover the folder the program starts in. Checked before
+    // the program is set, so a refused call leaves no program behind.
+    const starts_in = command_admission.CommandContext{
+        .command = command,
+        .resolved_cwd = folder,
+        .target_os = builtin.target.os.tag,
+        .environment = environment,
+    };
+    if (!approvedFingerprint(authority).matches(starts_in)) return failureText(ctx, folder_changed_text);
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err| return runtimeFailure(ctx, err);
     // Set before the start, so a failed start never leaves an untracked program.
@@ -231,7 +253,7 @@ fn callRun(
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
-        .cwd = ctx.workspace_root,
+        .cwd = folder,
         .environment = environment,
         .authority = authority,
         .extra_environment = variables.items,
@@ -302,6 +324,10 @@ fn finish(
         };
         return failureText(ctx, "bash result commit failed");
     };
+    // The program has ended, so the next program starts where it left off.
+    if (ctx.bash_session) |session| {
+        if (std.meta.activeTag(prepared.snapshot.state) != .running) session.refreshStartFolder(io_mod.getIo());
+    }
     return if (prepared.snapshot.failed())
         .{ .failure = body }
     else
@@ -333,10 +359,12 @@ fn cancelRequested(ctx: tool_dispatch.DispatchContext) bool {
 }
 
 /// The folder the session's files go in: `$TMPDIR` without trailing slashes, or
-/// `/tmp`.
+/// `/tmp` when it is unset or holds `$`, a backquote, or a backslash, which bash
+/// would expand from `BASH_ENV`.
 fn tmpRoot() []const u8 {
     const raw = io_mod.getenv("TMPDIR") orelse "/tmp";
     const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.findAny(u8, trimmed, "$`\\") != null) return "/tmp";
     return if (trimmed.len == 0) "/" else trimmed;
 }
 
@@ -722,6 +750,8 @@ const TestBash = struct {
     runtime: managed_execution.Runtime,
     session: bash_session.Session,
     arena_state: std.heap.ArenaAllocator,
+    /// The gate's fd, held read-write so opening it never waits; see `makeGate`.
+    gate: ?std.Io.File = null,
 
     fn init(alloc: Allocator) !TestBash {
         const io = std.testing.io;
@@ -743,6 +773,7 @@ const TestBash = struct {
         self.arena_state.deinit();
         self.session.deinit(self.io);
         self.runtime.deinit();
+        if (self.gate) |file| file.close(self.io);
         self.alloc.free(self.workspace);
         self.tmp.cleanup();
     }
@@ -762,51 +793,51 @@ const TestBash = struct {
         try authorizeRun(ctx, self.arena_state.allocator(), command);
     }
 
-    /// Makes the gate, a fifo in the workspace. A program that reads it runs until
-    /// the test calls `release`, so the test never depends on how long a program takes.
+    /// Writes `folder` into the session's folder file, as the end of a program does.
+    fn writeSessionFolder(self: *TestBash, folder: []const u8) !void {
+        var dir = try std.Io.Dir.cwd().openDir(self.io, self.session.dir.?, .{});
+        defer dir.close(self.io);
+        try dir.writeFile(self.io, .{ .sub_path = "folder", .data = folder });
+    }
+
+    /// Makes the gate: a fifo in the workspace, held open read-write and nonblocking.
+    /// That fd is a reader and a writer, so the open never waits, and a program's
+    /// `read` finds a writer. The program blocks on its read until `release`.
     fn makeGate(self: *TestBash) !void {
         var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = try std.mem.printSentinel(&path_buffer, "{s}/gate", .{self.workspace}, 0);
         if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+        const fd = try std.posix.openat(self.tmp.dir.handle, "gate", .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0);
+        self.gate = .{ .handle = fd, .flags = .{ .nonblocking = true } };
     }
 
-    /// How long `release` waits for a program to open the gate, and how often it looks.
-    const gate_deadline_ms: i64 = 10_000;
-    const gate_poll_ns: u64 = 10 * std.time.ns_per_ms;
-
-    /// Writes one line to the gate, which lets a program that reads it finish.
-    /// It polls for a reader, since a blocking open waits forever when the
-    /// program never reaches its read.
+    /// Writes one line to the gate, which lets the program blocked on its read finish.
+    /// The line waits in the pipe until bash opens the gate, so nothing waits on time.
     fn release(self: *TestBash) !void {
-        const deadline = io_mod.milliTimestamp() + gate_deadline_ms;
-        var fd: std.posix.fd_t = undefined;
-        while (true) {
-            fd = std.posix.openat(self.tmp.dir.handle, "gate", .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0) catch |err| switch (err) {
-                // ENXIO: no program has the gate open for reading yet.
-                error.NoDevice => {
-                    if (io_mod.milliTimestamp() >= deadline) return error.GateNeverOpened;
-                    io_mod.sleep(gate_poll_ns);
-                    continue;
-                },
-                else => return err,
-            };
-            break;
-        }
-        var file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
-        defer file.close(self.io);
-        try file.writeStreamingAll(self.io, "go\n");
+        const gate = self.gate orelse return error.GateNotMade;
+        try gate.writeStreamingAll(self.io, "go\n");
     }
 };
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
+/// The folder a call approved now starts in: the session's start folder, else
+/// the workspace root.
+fn startFolderOf(ctx: tool_dispatch.DispatchContext) []const u8 {
+    const session = ctx.bash_session orelse return ctx.workspace_root;
+    return session.startFolder() orelse ctx.workspace_root;
+}
+
 /// Gives `ctx` the authority a yolo-approved run of `command` gets: a fingerprint
 /// of the same command, cwd, and environment the call computes. Built the way
 /// `shell.zig`'s integration test builds its authority.
 fn authorizeRun(ctx: *tool_dispatch.DispatchContext, arena: Allocator, command: []const u8) !void {
+    // The approval keeps this slice, and the session frees its start folder on
+    // refresh, so the approval gets its own copy.
+    const folder = try arena.dupe(u8, startFolderOf(ctx.*));
     const command_ctx = command_admission.CommandContext{
         .command = command,
-        .resolved_cwd = ctx.workspace_root,
+        .resolved_cwd = folder,
         .target_os = builtin.target.os.tag,
         .environment = try shell_resolver.bashToolEnvironment(arena),
     };
@@ -833,12 +864,12 @@ test "bash state carries from one program to the next" {
     var ctx = bash.context();
 
     try bash.authorize(&ctx, "x=41");
-    const first = try callRun(ctx, "x=41", test_yield_ms);
+    const first = try callRun(ctx, "x=41", program_yield_ms);
     defer first.deinit(alloc);
     try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
 
     try bash.authorize(&ctx, "echo $((x+1))");
-    const second = try callRun(ctx, "echo $((x+1))", test_yield_ms);
+    const second = try callRun(ctx, "echo $((x+1))", program_yield_ms);
     defer second.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
 }
@@ -850,12 +881,12 @@ test "bash working folder carries from one program to the next" {
     var ctx = bash.context();
 
     try bash.authorize(&ctx, "cd /");
-    const moved = try callRun(ctx, "cd /", test_yield_ms);
+    const moved = try callRun(ctx, "cd /", program_yield_ms);
     defer moved.deinit(alloc);
     try std.testing.expectEqualStrings("[done, no output]", try outcomeText(moved, true));
 
     try bash.authorize(&ctx, "pwd");
-    const pwd = try callRun(ctx, "pwd", test_yield_ms);
+    const pwd = try callRun(ctx, "pwd", program_yield_ms);
     defer pwd.deinit(alloc);
     try std.testing.expectEqualStrings("/\n", try outcomeText(pwd, true));
 }
@@ -867,7 +898,7 @@ test "bash reports a failing program with its exit status" {
     var ctx = bash.context();
 
     try bash.authorize(&ctx, "false");
-    const failed = try callRun(ctx, "false", test_yield_ms);
+    const failed = try callRun(ctx, "false", program_yield_ms);
     defer failed.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(failed, false), "[exit 1]") != null);
 }
@@ -878,7 +909,7 @@ test "bash waits with nothing running and says so" {
     defer bash.deinit();
     const ctx = bash.context();
 
-    const waited = try callWait(ctx, test_yield_ms);
+    const waited = try callWait(ctx, program_yield_ms);
     defer waited.deinit(alloc);
     try std.testing.expectEqualStrings(nothing_running_text, try outcomeText(waited, true));
 }
@@ -902,7 +933,7 @@ test "bash refuses a second program while one is running" {
     try std.testing.expectEqualStrings(still_running_text, try outcomeText(refused, false));
 
     try bash.release();
-    const finished = try callWait(ctx, 5000);
+    const finished = try callWait(ctx, program_yield_ms);
     defer finished.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(finished, true), "done") != null);
 }
@@ -920,11 +951,11 @@ test "bash waits for a running program, then says nothing is running" {
     try std.testing.expect(std.mem.find(u8, try outcomeText(started, true), "[still running") != null);
 
     try bash.release();
-    const waited = try callWait(ctx, 5000);
+    const waited = try callWait(ctx, program_yield_ms);
     defer waited.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(waited, true), "done") != null);
 
-    const after = try callWait(ctx, test_yield_ms);
+    const after = try callWait(ctx, program_yield_ms);
     defer after.deinit(alloc);
     try std.testing.expectEqualStrings(nothing_running_text, try outcomeText(after, true));
 }
@@ -936,11 +967,51 @@ test "bash refuses to run or wait without a session" {
     var ctx = bash.context();
     ctx.bash_session = null;
 
-    const run = try callRun(ctx, "echo hi", test_yield_ms);
+    const run = try callRun(ctx, "echo hi", program_yield_ms);
     defer run.deinit(alloc);
     try std.testing.expectEqualStrings(unavailable_text, try outcomeText(run, false));
 
-    const waited = try callWait(ctx, test_yield_ms);
+    const waited = try callWait(ctx, program_yield_ms);
     defer waited.deinit(alloc);
     try std.testing.expectEqualStrings(unavailable_text, try outcomeText(waited, false));
+}
+
+test "bash refuses a program whose start folder changed after its approval" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+
+    // Approved while the session starts in the workspace root.
+    try bash.authorize(&ctx, "echo moved");
+    // A background program ends in another folder, and its end writes the folder.
+    try bash.writeSessionFolder("/");
+    const refused = try callRun(ctx, "echo moved", test_yield_ms);
+    defer refused.deinit(alloc);
+    try std.testing.expectEqualStrings(folder_changed_text, try outcomeText(refused, false));
+    try std.testing.expect(bash.session.program() == null);
+}
+
+test "a program starts in the folder the session holds, not one the saved state remembers" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+
+    try bash.authorize(&ctx, "cd /");
+    const moved = try callRun(ctx, "cd /", program_yield_ms);
+    defer moved.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(moved, true));
+
+    // fx moves the start folder back to the workspace, as a program's end would.
+    try bash.writeSessionFolder(bash.workspace);
+    bash.session.refreshStartFolder(bash.io);
+    try bash.authorize(&ctx, "pwd");
+    const pwd = try callRun(ctx, "pwd", program_yield_ms);
+    defer pwd.deinit(alloc);
+    const expected = try alloc.print("{s}\n", .{bash.workspace});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, try outcomeText(pwd, true));
 }

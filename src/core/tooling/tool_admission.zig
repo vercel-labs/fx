@@ -74,6 +74,9 @@ pub const SessionPermissionStateProvider = struct {
 /// owns, persists, or extends any referenced runtime state.
 pub const Input = struct {
     workspace_root: []const u8,
+    /// The folder the bash session's next program starts in (`bash_session.Session.startFolder`),
+    /// borrowed for this request. Null means the workspace root.
+    bash_start_folder: ?[]const u8 = null,
     access_scope: ?workspace_access.AccessScope = null,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     permission_grants: []const PermissionGrant,
@@ -2330,7 +2333,10 @@ pub fn runCommandContext(
         if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
     const tool = registeredTool(input, call.name) orelse return error.NotRunCommand;
     const cwd = switch (tool.captured_command_host) {
-        .workspace_clean, .bash_session => try arena.dupe(u8, input.workspace_root),
+        .workspace_clean => try arena.dupe(u8, input.workspace_root),
+        // Copied, because the approval's fingerprint keeps this slice and the
+        // session frees its buffer at its next refresh.
+        .bash_session => try arena.dupe(u8, input.bash_start_folder orelse input.workspace_root),
         .native => blk: {
             const cwd_arg = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
             break :blk if (std.mem.eql(u8, cwd_arg, "."))
@@ -4854,6 +4860,31 @@ test "bash tool command calls run in the workspace root" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"cwd\":\"sub\"}",
     });
     try std.testing.expectEqualStrings("/tmp/workspace", with_cwd.resolved_cwd);
+}
+
+test "bash tool command calls start in the session's folder, in the approval and the review" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = bash_registry;
+    input.bash_start_folder = "/tmp/elsewhere";
+
+    const run_call = ToolCall{
+        .id = "bash-run",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\"}",
+    };
+    const run = try runCommandContext(input, arena, run_call);
+    try std.testing.expectEqualStrings("/tmp/elsewhere", run.resolved_cwd);
+
+    const request = try reviewRequestForCall(input, arena, run_call, &.{}, false, null);
+    switch (request.action) {
+        .command => |command| try std.testing.expectEqualStrings("/tmp/elsewhere", command.resolved_cwd),
+        else => return error.TestUnexpectedAction,
+    }
 }
 
 test "bash tool command calls use the bash environment" {

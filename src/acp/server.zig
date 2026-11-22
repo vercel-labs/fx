@@ -922,8 +922,17 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
     state.report_calls.shrinkRetainingCapacity(kept);
 }
 
+/// Whether the server's bash session's last program is still running. Only the
+/// trace line that says what a reset drops reads it.
+fn bashProgramRunning(state: *ServerState) bool {
+    const id = state.bash_session.program() orelse return false;
+    const program_state = state.managed_executions.stateFor(id) orelse return false;
+    return std.meta.activeTag(program_state) == .running;
+}
+
 fn destroyActiveSession(state: *ServerState) void {
     // One bash state serves the whole server: a switch or close ends it here, and exit ends it in deinit.
+    debug_trace.logf("bash", "bash state reset for a session switch or close had_program={}", .{bashProgramRunning(state)});
     state.bash_session.deinit(io_mod.getIo());
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {

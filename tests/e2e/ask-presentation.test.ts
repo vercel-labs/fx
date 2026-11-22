@@ -1347,6 +1347,30 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[2]!.body, "bash-pwd")).toContain(`${root.workspace}/sub`);
   }, TIMEOUT);
 
+  test("in auto mode the review sees the folder a bash program starts in", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-cd", "bash", { command: "mkdir -p sub && cd sub" }),
+        fakeGatewayToolCall("bash-touch", "bash", { command: "touch made" }),
+        fakeGatewayFinalText("Review saw the folder.\n"),
+      ],
+      { classifierResponses: [fakeGatewayPermissionDecision(), fakeGatewayPermissionDecision()] },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Make a file in a folder."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const touchReview = gateway.classifierRequests.find(({ body }) => body.includes("touch made"));
+    expect(touchReview).toBeDefined();
+    expect(touchReview!.body).toContain(`${root.workspace}/sub`);
+    expect(existsSync(join(root.workspace, "sub", "made"))).toBe(true);
+  }, TIMEOUT);
+
   test("wait_more with nothing running says so", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
