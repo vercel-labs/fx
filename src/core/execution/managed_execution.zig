@@ -63,6 +63,13 @@ pub fn steerYieldDue(
     return now_ms - started_ms >= grace_ms;
 }
 
+/// A variable added to a managed command's environment
+/// (`StartCapturedInput.extra_environment`).
+pub const EnvironmentVariable = command_runner.EnvironmentVariable;
+
+/// The variable every command gets, naming fx as the agent.
+pub const agent_variable = command_runner.ai_agent_env;
+
 pub const StartCapturedInput = struct {
     execution_id: []const u8,
     command: []const u8,
@@ -159,6 +166,20 @@ pub const Snapshot = struct {
         if (self.output_file) |value| alloc.free(value);
         if (self.error_name) |value| alloc.free(value);
         self.* = undefined;
+    }
+
+    /// Whether the command failed: a nonzero exit, a signal, an unknown end, a stop, a loss, or incomplete output.
+    pub fn failed(self: Snapshot) bool {
+        if (self.output_incomplete) return true;
+        return switch (self.state) {
+            .running => false,
+            .completed => |status| switch (status) {
+                .exit_code => |code| code != 0,
+                .signal, .indeterminate => true,
+                .finished => false,
+            },
+            .stopped, .lost => true,
+        };
     }
 };
 

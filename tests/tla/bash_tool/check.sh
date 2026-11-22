@@ -10,8 +10,11 @@
 #   rerun-on-wait     wait_more starts the program again                       RunOnce
 #   torn-save         a killed program leaves the bash state half-written      StateNeverTorn
 #   exit-skips-save   a program that ends with exit does not save its state    EndedSaves
+#   silent-refusal    a state over the size cap is not saved, with no notice   RefusalNoticed
+#   big-save-torn     a refused save leaves the bash state half-written        StateNeverTorn
 #
-# A Bun driver that runs the built fx along this model lands with the code.
+# No Bun driver runs the built fx along this model yet; the bash tool's unit
+# and e2e tests cover the session part that has landed.
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
 # Usage:
@@ -30,4 +33,6 @@ ResultStore result-store-mutation-skip-index IndexMatchesStore
 ResultStore result-store-mutation-rerun-on-wait RunOnce
 ResultStore result-store-mutation-torn-save StateNeverTorn
 ResultStore result-store-mutation-exit-skips-save EndedSaves
+ResultStore result-store-mutation-silent-refusal RefusalNoticed
+ResultStore result-store-mutation-big-save-torn StateNeverTorn
 VERDICTS

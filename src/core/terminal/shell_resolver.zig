@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -140,6 +141,17 @@ pub fn environment(
         .clean => .{ .clean = try alloc.dupe(u8, path) },
         .user => .{ .user = try alloc.dupe(u8, path) },
     };
+}
+
+/// The command environment of a bash tool program: a `user` environment
+/// whose shell is the login shell when that is bash, else the default
+/// bash (`bash_session.bashPath`). Permission admission and the bash tool
+/// both call this, so the environment that was approved is the one that
+/// runs. The path lives in `arena`.
+pub fn bashToolEnvironment(arena: Allocator) !command_environment.Environment {
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = configuredLoginShellInto(&login_shell_buffer);
+    return .{ .user = try arena.dupe(u8, bash_session.bashPath(configured)) };
 }
 
 pub fn environmentForShellSpec(

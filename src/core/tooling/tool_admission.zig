@@ -23,13 +23,16 @@ const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
-const bash_session = @import("../bash_session/bash_session.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
+else
+    struct {};
+const test_bash_tools = if (builtin.is_test)
+    @import("../../builtins/bash_tools.zig")
 else
     struct {};
 const types = @import("../shared/types.zig");
@@ -2338,7 +2341,7 @@ pub fn runCommandContext(
     };
     const environment_value: command_environment.Environment = switch (tool.captured_command_host) {
         .workspace_clean => .workspace_clean,
-        .bash_session => try bashSessionEnvironment(arena),
+        .bash_session => try shell_resolver.bashToolEnvironment(arena),
         .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
     return .{
@@ -2369,14 +2372,6 @@ fn nativeCommandEnvironment(
     else
         null;
     return shell_resolver.environment(arena, configured, profile);
-}
-
-/// The bash tool's command environment. The bash tool computes the same value
-/// when it runs the program, so approval and execution agree.
-fn bashSessionEnvironment(arena: Allocator) !command_environment.Environment {
-    var login_shell_buffer: [4096]u8 = undefined;
-    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return .{ .user = try arena.dupe(u8, bash_session.bashPath(configured)) };
 }
 
 fn explicitTtyShell(
@@ -4831,16 +4826,8 @@ test "shell admission reuses terminal rules and command authority" {
     try std.testing.expectEqual(@as(usize, 1), classifier.calls);
 }
 
-/// The shell spec as a bash tool, for the bash host tests below. Test builds only.
-const bash_test_tool = blk: {
-    var tool = test_builtin_tools.shell;
-    tool.name = "bash";
-    tool.model_schema.name = "bash";
-    tool.executor_kind = .terminal;
-    tool.captured_command_action = "run";
-    tool.captured_command_host = .bash_session;
-    break :blk tool;
-};
+/// The bash tool set, as a host with `experimental.bash_tool` offers it, for the bash host tests below.
+const bash_registry = test_bash_tools.select(true, test_builtin_tools.advertisement_set).registry;
 
 test "bash tool command calls run in the workspace root" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4849,7 +4836,7 @@ test "bash tool command calls run in the workspace root" {
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+    input.tool_registry = bash_registry;
 
     const run_call = ToolCall{
         .id = "bash-run",
@@ -4876,10 +4863,13 @@ test "bash tool command calls use the bash environment" {
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+    input.tool_registry = bash_registry;
 
-    var login_shell_buffer: [4096]u8 = undefined;
-    const expected_shell = bash_session.bashPath(shell_resolver.configuredLoginShellInto(&login_shell_buffer));
+    const expected_environment = try shell_resolver.bashToolEnvironment(arena);
+    const expected_shell = switch (expected_environment) {
+        .user => |path| path,
+        else => return error.TestExpectedUserEnvironment,
+    };
     try std.testing.expect(std.mem.endsWith(u8, expected_shell, "bash"));
 
     const run = try runCommandContext(input, arena, .{
@@ -4912,7 +4902,7 @@ test "bash tool wait calls are terminal calls, not commands" {
     var worker: WorkerRuntime = .{};
     defer worker.deinit(std.testing.allocator);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+    input.tool_registry = bash_registry;
 
     const wait_call = ToolCall{
         .id = "bash-wait",

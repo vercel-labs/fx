@@ -5,16 +5,21 @@ const std = @import("std");
 const build_options = @import("build_options");
 const builtin_tools = @import("tools.zig");
 const bash_impl = @import("../tools/bash/bash.zig");
-const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
+const bash_session = @import("../core/bash_session/bash_session.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const terminal_contracts = @import("../core/terminal/contracts.zig");
 const tool_set = @import("../core/tooling/tool_set.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 
-const bash_description =
-    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), edit files (python3, or a heredoc that writes the whole file), run tests and builds, and use git. A call waits up to 30 s. When the program is still running, send wait_more as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Long output keeps its start and end.";
+/// The one name of this tool: its spec, its model schema, and its advertised order.
+const tool_name = "bash";
 
-const command_description =
-    "The bash program to run. Send wait_more alone to wait for a program that is still running.";
+const bash_description = std.fmt.comptimePrint(
+    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), edit files (python3, or a heredoc that writes the whole file), run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Long output keeps its start and end.",
+    .{ bash_impl.program_yield_ms / 1000, bash_session.wait_word },
+);
+
+const command_description = "The bash program to run. Send " ++ bash_session.wait_word ++ " alone to wait for a program that is still running.";
 
 comptime {
     // A longer description is cut before it reaches the model.
@@ -23,16 +28,16 @@ comptime {
 }
 
 const bash = tool_dispatch.Tool{
-    .name = "bash",
+    .name = tool_name,
     .description = bash_description,
     .model_schema = .{
-        .name = "bash",
+        .name = tool_name,
         .description = bash_description,
         .input_schema = .{
             .properties = &.{.{
                 .name = "command",
                 .json_type = .string,
-                .bounds = &.{ .max_length = bash_impl.max_command_bytes },
+                .bounds = &.{ .max_length = @intCast(terminal_contracts.max_command_bytes) },
                 .description = command_description,
             }},
             .required = &.{"command"},
@@ -52,7 +57,7 @@ const bash = tool_dispatch.Tool{
     .call = bash_impl.call,
     .runtime_provider = .run_command,
     .captured_command_host = .bash_session,
-    .captured_command_action = "run",
+    .captured_command_action = @tagName(bash_impl.Action.run),
     .captured_command_fn = bash_impl.isCapturedCommand,
     .infer_action_fn = bash_impl.inferAction,
     .process_local_fn = bash_impl.isProcessLocal,
@@ -66,42 +71,9 @@ const all = [_]tool_dispatch.Tool{ bash, builtin_tools.subagent, builtin_tools.t
 // answers Unsupported tool, so it does not link the bash tool's code.
 const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_tools) all[0..] else names_only[0..] };
 
-const names_only = blk: {
-    var tools: [all.len]tool_dispatch.Tool = undefined;
-    for (&tools, all) |*tool, real| tool.* = .{
-        .name = real.name,
-        .description = "",
-        .model_schema = .{ .name = real.name, .description = "" },
-        .model_visible = false,
-        .decode = unavailableDecode,
-        .call = unavailableCall,
-        .reads_only_fn = unavailableReadsOnly,
-        .irreversible_fn = unavailableIrreversible,
-    };
-    break :blk tools;
-};
+const names_only = builtin_tools.namesOnly(&all);
 
-fn unavailableDecode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    return .{ .failure = try unsupported(ctx) };
-}
-
-fn unavailableCall(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try unsupported(ctx) };
-}
-
-fn unsupported(ctx: tool_dispatch.DispatchContext) error{OutOfMemory}![]u8 {
-    return ctx.allocator.print("Unsupported tool: {f}", .{model_context_encoding.scalar(ctx.tool_call_name)});
-}
-
-fn unavailableReadsOnly(_: tool_dispatch.ToolInput) bool {
-    return false;
-}
-
-fn unavailableIrreversible(_: tool_dispatch.ToolInput) bool {
-    return true;
-}
-
-const advertisement_order = [_][]const u8{ "bash", "subagent", "toolbox" };
+const advertisement_order = [_][]const u8{ tool_name, "subagent", "toolbox" };
 
 const advertisement_set = tool_set.ToolSet{
     .registry = registry,

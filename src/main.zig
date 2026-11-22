@@ -1008,6 +1008,9 @@ const App = struct {
         // The worker mutates session state, so it stops before persistence.
         if (main_agent.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // The main worker is joined, so no bash call can start. This exit path
+        // never runs `App.deinit`, so the session folder is freed here (R3.9).
+        main_agent.bash_session.deinit(io_mod.getIo());
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self, main_agent) catch |err| {
             SessionAppRuntime.recordShutdownFailure(main_agent, err);
         };

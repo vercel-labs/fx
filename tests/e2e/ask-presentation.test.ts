@@ -15,6 +15,7 @@ import {
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { latestTraceReportPath, readTraceReport } from "./trace-report";
+import { requestToolNames, toolResultText } from "./fixtures/request-body";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
@@ -1308,6 +1309,26 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[2]!.body, "bash-add")).toContain("42");
   }, TIMEOUT);
 
+  test("a bash state over the size cap is not saved, and the result says so", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-set", "bash", { command: "x=1" }),
+      fakeGatewayToolCall("bash-big", "bash", { command: "big=$(head -c 1100000 /dev/zero | tr '\\0' a); echo set" }),
+      fakeGatewayToolCall("bash-read", "bash", { command: "echo \"x=$x big=${#big}\"" }),
+      fakeGatewayFinalText("Cap checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Save a large state."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[2]!.body, "bash-big")).toContain("over the 1048576-byte limit");
+    expect(toolResultText(gateway.requests[3]!.body, "bash-read")).toContain("x=1 big=0");
+  }, TIMEOUT);
+
   test("the working folder carries from one program to the next", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -1409,20 +1430,3 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(gateway.classifierRequests).toHaveLength(0);
   }, TIMEOUT);
 });
-
-function requestToolNames(raw: string): string[] {
-  const request = JSON.parse(raw) as { tools?: Array<{ name?: unknown }> };
-  return (request.tools ?? []).map((tool) => String(tool.name));
-}
-
-// The output the model reads back for call `callId`, as JSON text.
-function toolResultText(raw: string, callId: string): string {
-  const request = JSON.parse(raw) as { prompt: Array<{ role: string; content?: unknown }> };
-  for (const message of request.prompt) {
-    if (message.role !== "tool" || !Array.isArray(message.content)) continue;
-    for (const part of message.content as Array<Record<string, unknown>>) {
-      if (part.toolCallId === callId) return JSON.stringify(part.output ?? part.result ?? part);
-    }
-  }
-  return "";
-}

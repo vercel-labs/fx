@@ -1322,7 +1322,7 @@ async function askForReviewerFromSessionWorkspace(root: ReturnType<typeof create
   const childBodies: string[] = [];
   const parentBodies: string[] = [];
   const gateway = startDynamicFakeGateway((body) => {
-    if (!body.includes('"name":"subagent"')) {
+    if (!acpOfferedTools(body).includes("subagent")) {
       childBodies.push(body);
       return finalText("session review done");
     }
@@ -11665,6 +11665,59 @@ describe("acp: model-independent", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "ACP sessions start with a fresh bash state: a new session does not see the last one's variables",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-fresh-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { bash_tool: true } }));
+      const gateway = startDynamicFakeGateway((body) => {
+        if (body.includes('"toolCallId":"acp_read_x"')) return finalText("ACP_READ_DONE");
+        if (body.includes("Read x in the new session.")) {
+          return fakeGatewayToolCall("acp_read_x", "bash", { command: 'echo "${x:-unset}"' });
+        }
+        if (body.includes('"toolCallId":"acp_set_x"')) return finalText("ACP_SET_DONE");
+        if (body.includes("Set x for this session.")) {
+          return fakeGatewayToolCall("acp_set_x", "bash", { command: "x=41" });
+        }
+        return finalText("ACP_OTHER");
+      });
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const first = await runPrompt(client, "Set x for this session.", 60_000);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+
+        await client.request("session/new", { mcpServers: [] }, 4);
+        await client.readLine(); // consume session/update notification
+        await client.request("session/set_mode", { modeId: "auto" }, 5);
+        const second = await runPrompt(client, "Read x in the new session.", 60_000);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+
+        const readRequest = gateway.requests.find((request) => request.body.includes('"toolCallId":"acp_read_x"'));
+        expect(readRequest).toBeDefined();
+        const readOutput = acpToolResultText(readRequest!.body, "acp_read_x");
+        expect(readOutput).toContain("unset");
+        expect(readOutput).not.toContain("41");
+
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 
   test(

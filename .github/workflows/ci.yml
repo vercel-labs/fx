@@ -89,6 +89,9 @@ jobs:
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
+      - name: Model-check the bash tool's session
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/bash_tool/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

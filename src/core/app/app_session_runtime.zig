@@ -1153,6 +1153,9 @@ pub fn Runtime(comptime App: type) type {
             app.terminal_input_runtime.resetEscapeDecoder();
             app_permission_runtime.Runtime(App).clearSessionGrants(app, agent);
             app.clearPendingImages(agent);
+            // A new conversation starts with a fresh bash state; a program the
+            // last one started keeps running, as shell commands do.
+            if (comptime agents.hasAgentField(App, "bash_session")) agent.bash_session.deinit(io_mod.getIo());
             agent.change_tracker.clear(std.heap.c_allocator);
             diagnostics.resetSession();
             _ = background_policy;

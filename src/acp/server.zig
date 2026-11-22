@@ -923,6 +923,8 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
 }
 
 fn destroyActiveSession(state: *ServerState) void {
+    // One bash state serves the whole server: a switch or close ends it here, and exit ends it in deinit.
+    state.bash_session.deinit(io_mod.getIo());
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});

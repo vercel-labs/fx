@@ -50,7 +50,8 @@ pub const EnvironmentVariable = struct {
     value: []const u8,
 };
 
-const ai_agent_env = "AI_AGENT";
+/// The variable every command gets, naming fx as the agent.
+pub const ai_agent_env = "AI_AGENT";
 const ai_agent_name = "fx";
 
 pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {

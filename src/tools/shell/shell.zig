@@ -7,6 +7,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
@@ -1931,7 +1932,7 @@ fn finishPreparedWithAccepted(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return runtimeFailure(ctx, err);
     };
-    handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch
+    managed_delivery.handoff(ctx, runtime, prepared.reservation_id) catch
         return runtimeFailure(ctx, error.ResultCommitFailed);
     return .{ .success = body };
 }
@@ -2049,11 +2050,11 @@ fn finishPrepared(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return runtimeFailure(ctx, err);
     };
-    handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
+    managed_delivery.handoff(ctx, runtime, prepared.reservation_id) catch {
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
     const failed = switch (action) {
-        .run, .command => snapshotFailed(prepared.snapshot),
+        .run, .command => prepared.snapshot.failed(),
         .stop => stop_result_failed(prepared.snapshot.state),
     };
     return if (failed)
@@ -2155,38 +2156,6 @@ fn publishQuietCrossing(
         .command = command,
         .quiet_ms = snapshot.quiet_ms orelse 0,
     } });
-}
-
-fn handoffPreparedDelivery(
-    ctx: tool_dispatch.DispatchContext,
-    runtime: *managed_execution.Runtime,
-    reservation_id: u64,
-) !void {
-    if (ctx.result_commit_sink == null) {
-        return runtime.commitReservation(reservation_id);
-    }
-    tool_dispatch.reportResultCommit(ctx, result_commit.Token{
-        .context = runtime,
-        .identity = reservation_id,
-        .commit_fn = commitManagedDelivery,
-        .cancel_fn = cancelManagedDelivery,
-    });
-}
-
-fn commitManagedDelivery(raw: *anyopaque, reservation_id: u64) !void {
-    const runtime: *managed_execution.Runtime = @ptrCast(@alignCast(raw));
-    return runtime.commitReservation(reservation_id);
-}
-
-fn cancelManagedDelivery(raw: *anyopaque, reservation_id: u64) void {
-    const runtime: *managed_execution.Runtime = @ptrCast(@alignCast(raw));
-    runtime.cancelReservation(reservation_id) catch |err| {
-        debug_trace.logf(
-            "shell",
-            "managed delivery cancellation failed reservation={d} err={s}",
-            .{ reservation_id, @errorName(err) },
-        );
-    };
 }
 
 fn formatSnapshot(
@@ -2509,19 +2478,6 @@ fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
         .completed => "completed",
         .stopped => "stopped",
         .lost => "lost",
-    };
-}
-
-fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
-    if (snapshot.output_incomplete) return true;
-    return switch (snapshot.state) {
-        .running => false,
-        .completed => |status| switch (status) {
-            .exit_code => |code| code != 0,
-            .signal, .indeterminate => true,
-            .finished => false,
-        },
-        .stopped, .lost => true,
     };
 }
 

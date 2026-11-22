@@ -1,8 +1,11 @@
 ---------------------------- MODULE ResultStore ----------------------------
 (***************************************************************************)
 (* One agent's bash session and its result store, for the one bash tool    *)
-(* design. This models code that has not landed: the bash tool behind the  *)
-(* experimental.bash_tool setting.                                         *)
+(* design behind the experimental.bash_tool setting. The session part has  *)
+(* landed (src/core/bash_session/bash_session.zig and                      *)
+(* src/tools/bash/bash.zig): one program at a time, wait_more, and the     *)
+(* saved bash state. The result store, the numbered result files and their *)
+(* index, has not landed yet.                                              *)
 (*                                                                         *)
 (* The model sends programs. One runs at a time; a program sent while      *)
 (* another runs is refused and never starts. Every result is saved as the  *)
@@ -16,7 +19,9 @@
 (* Each program is its own process. It loads the bash state the last       *)
 (* program saved, and its EXIT trap saves the state again with an atomic   *)
 (* rename when it ends normally or with exit. A killed program saves       *)
-(* nothing, so the last complete state stays.                              *)
+(* nothing, so the last complete state stays. A state over the size cap is *)
+(* not saved either: the last complete state stays, and the program's      *)
+(* output says so.                                                         *)
 (*                                                                         *)
 (* The server ends a program in three steps, as the code does: it saves    *)
 (* the output, makes the result ready, and then clears its running marker. *)
@@ -44,9 +49,11 @@ VARIABLES
     torn,      \* the saved bash state is half-written
     how,       \* how each program ended: "none", "ok", "exit", or "killed"
     savedBy,   \* programs whose end saved the bash state
+    refused,   \* programs whose end did not save a state over the size cap
+    noticed,   \* programs whose output says their state was not saved
     fxSaved    \* fx command results the current program saved
 
-stateVars == <<saves, torn, how, savedBy>>
+stateVars == <<saves, torn, how, savedBy, refused, noticed>>
 vars == <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved, stateVars>>
 
 \* The running marker the client reads: the program until the server clears it.
@@ -66,6 +73,8 @@ Init ==
     /\ torn = FALSE
     /\ how = [p \in Programs |-> "none"]
     /\ savedBy = {}
+    /\ refused = {}
+    /\ noticed = {}
     /\ fxSaved = 0
 
 \* Saving a result appends it and its index line.
@@ -99,8 +108,10 @@ SaveFx ==
 \* ("killed"), for example by a cancel or its timeout. fx saves its output in
 \* every case, and then its result is ready. Its EXIT trap saves the bash
 \* state unless it is killed. The state file is replaced with an atomic
-\* rename, so a kill never leaves it half-written.
-Finish(kind) ==
+\* rename, so a kill never leaves it half-written. When the new state is
+\* over the size cap (big), the trap keeps the last complete state and
+\* writes a notice into the program's output.
+Finish(kind, big) ==
     /\ phase = "run"
     /\ Save("output", current)
     /\ phase' = "saved"
@@ -110,9 +121,17 @@ Finish(kind) ==
        THEN /\ saves' = saves
             /\ savedBy' = savedBy
             /\ torn' = (torn \/ (kind = "killed" /\ Mutation = "torn-save"))
+            /\ UNCHANGED <<refused, noticed>>
+       ELSE IF big
+       THEN /\ saves' = saves
+            /\ savedBy' = savedBy
+            /\ torn' = (torn \/ Mutation = "big-save-torn")
+            /\ refused' = refused \cup {current}
+            /\ noticed' = IF Mutation = "silent-refusal" THEN noticed ELSE noticed \cup {current}
        ELSE /\ saves' = saves + 1
             /\ savedBy' = savedBy \cup {current}
             /\ torn' = FALSE
+            /\ UNCHANGED <<refused, noticed>>
     /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved>>
 
 \* The server clears its running marker.
@@ -150,9 +169,8 @@ WaitMore ==
 Next ==
     \/ \E p \in Programs : Send(p)
     \/ SaveFx
-    \/ Finish("ok")
-    \/ Finish("exit")
-    \/ Finish("killed")
+    \/ \E big \in BOOLEAN : Finish("ok", big) \/ Finish("exit", big)
+    \/ Finish("killed", FALSE)
     \/ Clear
     \/ Show
     \/ GiveUp
@@ -160,7 +178,7 @@ Next ==
 
 Spec ==
     /\ Init /\ [][Next]_vars
-    /\ WF_vars(Finish("ok")) /\ WF_vars(Clear) /\ WF_vars(Show) /\ WF_vars(WaitMore)
+    /\ WF_vars(Finish("ok", FALSE)) /\ WF_vars(Clear) /\ WF_vars(Show) /\ WF_vars(WaitMore)
 
 -----------------------------------------------------------------------------
 \* Rules.
@@ -176,6 +194,8 @@ TypeOK ==
     /\ torn \in BOOLEAN
     /\ how \in [Programs -> {"none", "ok", "exit", "killed"}]
     /\ savedBy \subseteq sent
+    /\ refused \subseteq sent
+    /\ noticed \subseteq sent
     /\ fxSaved \in 0..MaxFx
 
 \* A program runs at most once, whatever the client and the model do.
@@ -200,8 +220,13 @@ IndexMatchesStore ==
 \* loads a complete one.
 StateNeverTorn == ~torn
 
-\* A program that ended normally or with exit saved the bash state.
-EndedSaves == \A p \in Programs : how[p] \in {"ok", "exit"} => p \in savedBy
+\* A program that ended normally or with exit saved the bash state, or its
+\* state was over the size cap.
+EndedSaves == \A p \in Programs : how[p] \in {"ok", "exit"} => p \in savedBy \cup refused
+
+\* A state that was not saved for its size is never dropped silently: the
+\* program's output says so (RULES.md R3.8).
+RefusalNoticed == refused \subseteq noticed
 
 \* A saved result is never changed or removed.
 StoreAppendOnly == [][SubSeq(store', 1, Len(store)) = store]_vars

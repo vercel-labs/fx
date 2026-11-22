@@ -8,20 +8,16 @@ const mem_utils = @import("../../core/shared/mem_utils.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
-const command_environment = @import("../../core/execution/command_environment.zig");
-const command_runner = @import("../../core/execution/command_runner.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
-const result_commit = @import("../../core/tooling/result_commit.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
-
-/// The most bytes one program may carry in `command`.
-pub const max_command_bytes = 65536;
 
 /// The output is kept whole only while it plus this many bytes fits in
 /// `max_bytes`. The reserve holds the status line, the flags, and their line ends.
@@ -35,7 +31,7 @@ const cut_marker_reserve_bytes = 64;
 const min_result_bytes = 1024;
 
 /// How a call acts: `run` sends a program, `wait` waits for the running one.
-const Action = enum { run, wait };
+pub const Action = enum { run, wait };
 
 const Input = struct {
     command: []const u8,
@@ -59,15 +55,21 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 }
 
 const needs_command_text = "bash needs {\"command\": \"<bash program>\"}.";
-const action_text = "bash action must be \"run\" or \"wait\".";
+const action_text = "bash action must be \"" ++ @tagName(Action.run) ++ "\" or \"" ++ @tagName(Action.wait) ++ "\".";
 const empty_command_text = "bash needs a program in \"command\".";
-const too_long_text = "bash programs are at most 65536 bytes; save a longer script to a file and run that file.";
-const wait_needs_text = "bash action \"wait\" needs the command wait_more.";
-const send_without_action_text = "send wait_more without an action.";
+const too_long_text = std.fmt.comptimePrint("bash programs are at most {d} bytes; save a longer script to a file and run that file.", .{terminal_contracts.max_command_bytes});
+/// The sentence that tells the model how to wait for a running program.
+const wait_hint = "Send " ++ bash_session.wait_word ++ " as the whole program to wait for it.";
+const wait_needs_text = "bash action \"" ++ @tagName(Action.wait) ++ "\" needs the command " ++ bash_session.wait_word ++ ".";
+const send_without_action_text = "send " ++ bash_session.wait_word ++ " without an action.";
+
+/// The variables fx adds to every bash program. The saved state never holds
+/// them, so the session skips them by these names.
+const fx_variables = [_][]const u8{managed_execution.agent_variable} ++ mcp_call_bridge.variable_names;
 
 /// How long a call waits before it reports that the program is still running.
-const program_yield_ms: u32 = managed_contract.default_yield_time_ms;
-const still_running_text = "A program is still running. Send wait_more as the whole program to wait for it.";
+pub const program_yield_ms: u32 = managed_contract.default_yield_time_ms;
+const still_running_text = "A program is still running. " ++ wait_hint;
 const nothing_running_text = "Nothing is running.";
 const unavailable_text = "bash is not available in this host.";
 
@@ -77,7 +79,7 @@ const unavailable_text = "bash is not available in this host.";
 pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
     const command = object.get("command") orelse return null;
     if (command != .string) return null;
-    return if (bash_session.isWaitMore(command.string)) "wait" else "run";
+    return if (bash_session.isWaitMore(command.string)) @tagName(Action.wait) else @tagName(Action.run);
 }
 
 /// What decoding one call's arguments found: the typed input, or the plain text
@@ -110,7 +112,7 @@ fn parseArguments(arena: Allocator, args_json: []const u8) Allocator.Error!Decod
         break :explicit std.meta.stringToEnum(Action, value.string) orelse return .{ .failure = action_text };
     } else inferred: {
         const text = inferAction(object) orelse return .{ .failure = needs_command_text };
-        break :inferred if (std.mem.eql(u8, text, "wait")) .wait else .run;
+        break :inferred if (std.mem.eql(u8, text, @tagName(Action.wait))) .wait else .run;
     };
     return .{ .input = .{ .command = command.string, .action = action } };
 }
@@ -142,7 +144,7 @@ pub fn validate(
     const input = erased.as(OwnedInput).value;
     const text = if (input.command.len == 0)
         empty_command_text
-    else if (input.command.len > max_command_bytes)
+    else if (input.command.len > terminal_contracts.max_command_bytes)
         too_long_text
     else if (input.action == .wait and !bash_session.isWaitMore(input.command))
         wait_needs_text
@@ -201,13 +203,13 @@ fn callRun(
         .run_command => |value| value,
         else => return unavailableResult(ctx),
     };
-    session.prepare(io_mod.getIo(), tmpRoot()) catch |err| return runtimeFailure(ctx, err);
+    session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     // The environment admission approved, built the same way, so the run is the
     // one that was approved.
-    const environment = try bashEnvironment(request_arena);
+    const environment = try shell_resolver.bashToolEnvironment(request_arena);
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err| return runtimeFailure(ctx, err);
     // Set before the start, so a failed start never leaves an untracked program.
@@ -222,10 +224,10 @@ fn callRun(
         };
     } else null;
     defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
-    var variables: std.ArrayList(command_runner.EnvironmentVariable) = .empty;
+    var variables: std.ArrayList(managed_execution.EnvironmentVariable) = .empty;
     if (bridge_registration) |registration| try variables.appendSlice(request_arena, registration.environment());
     const bash_env = session.bashEnv() orelse return runtimeFailure(ctx, error.SessionNotPrepared);
-    try variables.append(request_arena, .{ .name = "BASH_ENV", .value = bash_env });
+    try variables.append(request_arena, .{ .name = bash_session.env_var, .value = bash_env });
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -292,14 +294,15 @@ fn finish(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return failureText(ctx, "bash result is unavailable");
     };
-    handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
+    managed_delivery.handoff(ctx, runtime, prepared.reservation_id) catch |err| {
+        debug_trace.logf("bash", "result commit failed err={s}", .{@errorName(err)});
         ctx.allocator.free(body);
-        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |err| {
-            debug_trace.logf("bash", "delivery cancel failed after a commit failure err={s}", .{@errorName(err)});
+        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
+            debug_trace.logf("bash", "delivery cancel failed after a commit failure err={s}", .{@errorName(cancel_err)});
         };
         return failureText(ctx, "bash result commit failed");
     };
-    return if (snapshotFailed(prepared.snapshot))
+    return if (prepared.snapshot.failed())
         .{ .failure = body }
     else
         .{ .success = body };
@@ -335,59 +338,6 @@ fn tmpRoot() []const u8 {
     const raw = io_mod.getenv("TMPDIR") orelse "/tmp";
     const trimmed = std.mem.trimEnd(u8, raw, "/");
     return if (trimmed.len == 0) "/" else trimmed;
-}
-
-/// The command environment of a bash program: the login shell when it is bash,
-/// else /bin/bash. Admission builds the same value for the same call.
-fn bashEnvironment(arena: Allocator) !command_environment.Environment {
-    var login_shell_buffer: [4096]u8 = undefined;
-    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-    return .{ .user = try arena.dupe(u8, bash_session.bashPath(configured)) };
-}
-
-fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
-    if (snapshot.output_incomplete) return true;
-    return switch (snapshot.state) {
-        .running => false,
-        .completed => |status| switch (status) {
-            .exit_code => |code| code != 0,
-            .signal, .indeterminate => true,
-            .finished => false,
-        },
-        .stopped, .lost => true,
-    };
-}
-
-fn handoffPreparedDelivery(
-    ctx: tool_dispatch.DispatchContext,
-    runtime: *managed_execution.Runtime,
-    reservation_id: u64,
-) !void {
-    if (ctx.result_commit_sink == null) {
-        return runtime.commitReservation(reservation_id);
-    }
-    tool_dispatch.reportResultCommit(ctx, result_commit.Token{
-        .context = runtime,
-        .identity = reservation_id,
-        .commit_fn = commitManagedDelivery,
-        .cancel_fn = cancelManagedDelivery,
-    });
-}
-
-fn commitManagedDelivery(raw: *anyopaque, reservation_id: u64) !void {
-    const runtime: *managed_execution.Runtime = @ptrCast(@alignCast(raw));
-    return runtime.commitReservation(reservation_id);
-}
-
-fn cancelManagedDelivery(raw: *anyopaque, reservation_id: u64) void {
-    const runtime: *managed_execution.Runtime = @ptrCast(@alignCast(raw));
-    runtime.cancelReservation(reservation_id) catch |err| {
-        debug_trace.logf(
-            "bash",
-            "managed delivery cancellation failed reservation={d} err={s}",
-            .{ reservation_id, @errorName(err) },
-        );
-    };
 }
 
 /// The text the model sees for one snapshot of a bash program: its output, cut
@@ -441,9 +391,9 @@ fn statusLine(alloc: Allocator, snapshot: managed_execution.Snapshot) Allocator.
     const no_output = snapshot.output_delta.len == 0;
     return switch (snapshot.state) {
         .running => if (snapshot.running_ms) |ms|
-            try alloc.print("[still running after {d} s. Send wait_more as the whole program to wait for it.]", .{ms / 1000})
+            try alloc.print("[still running after {d} s. " ++ wait_hint ++ "]", .{ms / 1000})
         else
-            try alloc.dupe(u8, "[still running. Send wait_more as the whole program to wait for it.]"),
+            try alloc.dupe(u8, "[still running. " ++ wait_hint ++ "]"),
         .completed => |status| switch (status) {
             .exit_code => |code| if (code != 0)
                 try alloc.print("[exit {d}]", .{code})
@@ -576,6 +526,89 @@ test "bash decode names a bad argument in plain text" {
     try expectDecodeFailure("{\"command\":\"ls\",\"action\":3}", action_text);
 }
 
+const max_fuzz_call_text_bytes: usize = 16 * 1024;
+
+/// What a call's bytes must decode to, read by std.json with the rules written
+/// out a second time, so the fuzz property can compare the decoder with them.
+const CallReading = struct {
+    command: []const u8,
+    /// Null when the call has no `action` key.
+    action: ?[]const u8,
+};
+
+/// Null means the bytes must be refused: not a JSON object, no string
+/// `command`, a key other than `command` and `action`, or an `action` that is
+/// not "run" or "wait".
+fn readCallText(arena: Allocator, text: []const u8) error{OutOfMemory}!?CallReading {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (value != .object) return null;
+    const object = value.object;
+    const command = object.get("command") orelse return null;
+    if (command != .string) return null;
+    var keys = object.iterator();
+    while (keys.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "command") and !std.mem.eql(u8, key, "action")) return null;
+    }
+    const action: ?[]const u8 = if (object.get("action")) |stated| blk: {
+        if (stated != .string) return null;
+        if (!std.mem.eql(u8, stated.string, "run") and !std.mem.eql(u8, stated.string, "wait")) return null;
+        break :blk stated.string;
+    } else null;
+    return .{ .command = command.string, .action = action };
+}
+
+fn fuzzBashCallText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_call_text_bytes]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const reading = try readCallText(arena_state.allocator(), text);
+
+    // Any error other than OutOfMemory is a decoder defect, not a refusal.
+    const result = decode(.{ .allocator = alloc }, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TestDecodeReturnedAnError,
+    };
+    switch (result) {
+        .input => |erased| {
+            defer erased.deinit(alloc);
+            const want = reading orelse return error.TestDecodedRefusedBytes;
+            const input = erased.as(OwnedInput).value;
+            try std.testing.expectEqualStrings(want.command, input.command);
+            if (want.action) |stated| {
+                try std.testing.expectEqualStrings(stated, @tagName(input.action));
+            } else {
+                const inferred: Action = if (bash_session.isWaitMore(want.command)) .wait else .run;
+                try std.testing.expectEqual(inferred, input.action);
+            }
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            if (reading != null) return error.TestRefusedAcceptedBytes;
+            try std.testing.expect(failure.len > 0);
+        },
+    }
+}
+
+test "bash calls sent as JSON text decode or are refused on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzBashCallText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"command\":\"echo hi\"}",
+            "{\"command\":\"wait_more\"}",
+            "{\"command\":\"ls\",\"action\":\"run\"}",
+            "{\"command\":\"wait_more\",\"action\":\"run\"}",
+            "{\"request\":{\"command\":\"pwd\"}}",
+            "{\"command\":\"x\",\"cwd\":\"/\"}",
+        }) ++ @import("fuzz_corpus").bash_call_text.*),
+    });
+}
+
 test "bash validate refuses an empty, oversized, or mismatched program with its text" {
     const alloc = std.testing.allocator;
     try expectValidation("{\"command\":\"\"}", empty_command_text);
@@ -584,10 +617,10 @@ test "bash validate refuses an empty, oversized, or mismatched program with its 
     try expectValidation("{\"command\":\"ls\"}", null);
     try expectValidation("{\"command\":\"wait_more\"}", null);
 
-    const at_limit = try argsWithCommand(alloc, max_command_bytes);
+    const at_limit = try argsWithCommand(alloc, terminal_contracts.max_command_bytes);
     defer alloc.free(at_limit);
     try expectValidation(at_limit, null);
-    const over_limit = try argsWithCommand(alloc, max_command_bytes + 1);
+    const over_limit = try argsWithCommand(alloc, terminal_contracts.max_command_bytes + 1);
     defer alloc.free(over_limit);
     try expectValidation(over_limit, too_long_text);
 }
@@ -676,19 +709,96 @@ test "formatResult refuses a budget too small for its reserves" {
 /// How long the tests' calls wait before they report a running program.
 const test_yield_ms: u32 = 200;
 
-fn testContext(
+/// One test's bash world: a workspace folder, the runtime that runs programs,
+/// the session that keeps their state, and the arena that holds call authority.
+/// Pair `init` with `defer deinit`. `context` reads the fields at each call, so
+/// a context never points at a copy of this struct.
+const TestBash = struct {
     alloc: Allocator,
-    runtime: *managed_execution.Runtime,
-    session: ?*bash_session.Session,
-    workspace: []const u8,
-) tool_dispatch.DispatchContext {
-    return .{
-        .allocator = alloc,
-        .workspace_root = workspace,
-        .managed_executions = runtime,
-        .bash_session = session,
-    };
-}
+    io: std.Io,
+    tmp: std.testing.TmpDir,
+    /// Sentinel-terminated, as `realPathFileAlloc` returns it: `free` needs the allocation's length.
+    workspace: [:0]u8,
+    runtime: managed_execution.Runtime,
+    session: bash_session.Session,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn init(alloc: Allocator) !TestBash {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        return .{
+            .alloc = alloc,
+            .io = io,
+            .tmp = tmp,
+            .workspace = workspace,
+            .runtime = managed_execution.Runtime.init(alloc),
+            .session = bash_session.Session.init(alloc),
+            .arena_state = std.heap.ArenaAllocator.init(alloc),
+        };
+    }
+
+    fn deinit(self: *TestBash) void {
+        self.arena_state.deinit();
+        self.session.deinit(self.io);
+        self.runtime.deinit();
+        self.alloc.free(self.workspace);
+        self.tmp.cleanup();
+    }
+
+    /// The context a call runs with: this test's runtime and session, in its workspace.
+    fn context(self: *TestBash) tool_dispatch.DispatchContext {
+        return .{
+            .allocator = self.alloc,
+            .workspace_root = self.workspace,
+            .managed_executions = &self.runtime,
+            .bash_session = &self.session,
+        };
+    }
+
+    /// Gives `ctx` the authority of a yolo-approved run of `command`.
+    fn authorize(self: *TestBash, ctx: *tool_dispatch.DispatchContext, command: []const u8) !void {
+        try authorizeRun(ctx, self.arena_state.allocator(), command);
+    }
+
+    /// Makes the gate, a fifo in the workspace. A program that reads it runs until
+    /// the test calls `release`, so the test never depends on how long a program takes.
+    fn makeGate(self: *TestBash) !void {
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.mem.printSentinel(&path_buffer, "{s}/gate", .{self.workspace}, 0);
+        if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+    }
+
+    /// How long `release` waits for a program to open the gate, and how often it looks.
+    const gate_deadline_ms: i64 = 10_000;
+    const gate_poll_ns: u64 = 10 * std.time.ns_per_ms;
+
+    /// Writes one line to the gate, which lets a program that reads it finish.
+    /// It polls for a reader, since a blocking open waits forever when the
+    /// program never reaches its read.
+    fn release(self: *TestBash) !void {
+        const deadline = io_mod.milliTimestamp() + gate_deadline_ms;
+        var fd: std.posix.fd_t = undefined;
+        while (true) {
+            fd = std.posix.openat(self.tmp.dir.handle, "gate", .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0) catch |err| switch (err) {
+                // ENXIO: no program has the gate open for reading yet.
+                error.NoDevice => {
+                    if (io_mod.milliTimestamp() >= deadline) return error.GateNeverOpened;
+                    io_mod.sleep(gate_poll_ns);
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+        var file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, "go\n");
+    }
+};
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// Gives `ctx` the authority a yolo-approved run of `command` gets: a fingerprint
 /// of the same command, cwd, and environment the call computes. Built the way
@@ -698,7 +808,7 @@ fn authorizeRun(ctx: *tool_dispatch.DispatchContext, arena: Allocator, command: 
         .command = command,
         .resolved_cwd = ctx.workspace_root,
         .target_os = builtin.target.os.tag,
-        .environment = try bashEnvironment(arena),
+        .environment = try shell_resolver.bashToolEnvironment(arena),
     };
     ctx.execution_authority = .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .init(command_ctx),
@@ -718,25 +828,16 @@ fn outcomeText(result: tool_dispatch.ToolResult, success: bool) ![]const u8 {
 
 test "bash state carries from one program to the next" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
 
-    try authorizeRun(&ctx, arena_state.allocator(), "x=41");
+    try bash.authorize(&ctx, "x=41");
     const first = try callRun(ctx, "x=41", test_yield_ms);
     defer first.deinit(alloc);
     try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
 
-    try authorizeRun(&ctx, arena_state.allocator(), "echo $((x+1))");
+    try bash.authorize(&ctx, "echo $((x+1))");
     const second = try callRun(ctx, "echo $((x+1))", test_yield_ms);
     defer second.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
@@ -744,25 +845,16 @@ test "bash state carries from one program to the next" {
 
 test "bash working folder carries from one program to the next" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
 
-    try authorizeRun(&ctx, arena_state.allocator(), "cd /");
+    try bash.authorize(&ctx, "cd /");
     const moved = try callRun(ctx, "cd /", test_yield_ms);
     defer moved.deinit(alloc);
     try std.testing.expectEqualStrings("[done, no output]", try outcomeText(moved, true));
 
-    try authorizeRun(&ctx, arena_state.allocator(), "pwd");
+    try bash.authorize(&ctx, "pwd");
     const pwd = try callRun(ctx, "pwd", test_yield_ms);
     defer pwd.deinit(alloc);
     try std.testing.expectEqualStrings("/\n", try outcomeText(pwd, true));
@@ -770,20 +862,11 @@ test "bash working folder carries from one program to the next" {
 
 test "bash reports a failing program with its exit status" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
 
-    try authorizeRun(&ctx, arena_state.allocator(), "false");
+    try bash.authorize(&ctx, "false");
     const failed = try callRun(ctx, "false", test_yield_ms);
     defer failed.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(failed, false), "[exit 1]") != null);
@@ -791,16 +874,9 @@ test "bash reports a failing program with its exit status" {
 
 test "bash waits with nothing running and says so" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    const ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    const ctx = bash.context();
 
     const waited = try callWait(ctx, test_yield_ms);
     defer waited.deinit(alloc);
@@ -809,50 +885,41 @@ test "bash waits with nothing running and says so" {
 
 test "bash refuses a second program while one is running" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    try bash.makeGate();
 
-    try authorizeRun(&ctx, arena_state.allocator(), "sleep 1; echo done");
-    const started = try callRun(ctx, "sleep 1; echo done", test_yield_ms);
+    // The program reads the gate, so it runs until the test writes to the gate.
+    try bash.authorize(&ctx, "read go < gate; echo done");
+    const started = try callRun(ctx, "read go < gate; echo done", test_yield_ms);
     defer started.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(started, true), "[still running") != null);
 
-    try authorizeRun(&ctx, arena_state.allocator(), "echo again");
+    try bash.authorize(&ctx, "echo again");
     const refused = try callRun(ctx, "echo again", test_yield_ms);
     defer refused.deinit(alloc);
     try std.testing.expectEqualStrings(still_running_text, try outcomeText(refused, false));
+
+    try bash.release();
+    const finished = try callWait(ctx, 5000);
+    defer finished.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(finished, true), "done") != null);
 }
 
 test "bash waits for a running program, then says nothing is running" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    var session = bash_session.Session.init(alloc);
-    defer session.deinit(io);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var ctx = testContext(alloc, &runtime, &session, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    try bash.makeGate();
 
-    try authorizeRun(&ctx, arena_state.allocator(), "sleep 1; echo done");
-    const started = try callRun(ctx, "sleep 1; echo done", test_yield_ms);
+    try bash.authorize(&ctx, "read go < gate; echo done");
+    const started = try callRun(ctx, "read go < gate; echo done", test_yield_ms);
     defer started.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(started, true), "[still running") != null);
 
+    try bash.release();
     const waited = try callWait(ctx, 5000);
     defer waited.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, try outcomeText(waited, true), "done") != null);
@@ -864,14 +931,10 @@ test "bash waits for a running program, then says nothing is running" {
 
 test "bash refuses to run or wait without a session" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(workspace);
-    var runtime = managed_execution.Runtime.init(alloc);
-    defer runtime.deinit();
-    const ctx = testContext(alloc, &runtime, null, workspace);
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    ctx.bash_session = null;
 
     const run = try callRun(ctx, "echo hi", test_yield_ms);
     defer run.deinit(alloc);
