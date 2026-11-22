@@ -7453,6 +7453,115 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "searches of a saved file cancelled while they stream in name the file and each search, not the handle",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-saved-search-cancel-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(workspace, "notes"), { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const notes = join(workspace, "notes", "reference-notes.md");
+      // Large enough that fx saves the read behind a handle.
+      writeFileSync(notes, `${Array.from({ length: 3000 }, (_, index) => `note ${String(index).padStart(5, "0")} of the reference text for the cancelled search rows`).join("\n")}\n`);
+      const words = ["alpha", "beta"];
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+
+      const searchGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        ) as Array<Record<string, unknown>>;
+        const read = parts.find((part) => part.type === "tool-result" && part.toolCallId === "read_notes");
+        if (!read) {
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "read_notes", toolName: "read_file", input: { path: notes } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        const handle = contentText(read.output).match(/result-[A-Za-z0-9_.-]+?\.txt/)?.[0];
+        if (!handle) return new Response("missing saved read handle", { status: 500 });
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              send({ type: "text-delta", id: "answer_1", delta: "Searching the notes." });
+              for (const word of words) {
+                const input = { handle, query: word };
+                send({ type: "tool-input-start", id: `search_${word}`, toolName: "read_tool_result" });
+                send({ type: "tool-input-delta", id: `search_${word}`, delta: JSON.stringify(input) });
+                send({ type: "tool-input-end", id: `search_${word}` });
+                send({ type: "tool-call", toolCallId: `search_${word}`, toolName: "read_tool_result", input });
+              }
+              // The stream never ends, so the calls wait with their
+              // arguments whole until the user cancels the turn.
+              timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+            },
+            cancel() {
+              clearInterval(timer);
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }, { classifierDecision: "clear" });
+      gateway = searchGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-saved-search-cancel-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: searchGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, width: 140, height: 35, stderrPath, env });
+      const compactRows = (pane: string) =>
+        pane.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
+      const cancelled = words.map((word) => `Cancelled reference-notes.md output for "${word}"`);
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read the notes, then search them.");
+      await session.waitForText('Searching reference-notes.md output for "alpha", "beta"', TIMEOUT);
+      await session.sendInterruptEscapePair(TIMEOUT);
+      await session.waitForText(cancelled[1], TIMEOUT);
+      await session.waitForStableComposer(TIMEOUT);
+      // Each cancelled search keeps its own row, and its notice names it as
+      // the row does: by the file's name and the search, never the handle.
+      const live = compactRows(await session.captureFullScrollback());
+      expect(live.filter((row) => row.includes("Cancelled"))).toEqual([
+        `├ ${cancelled[0]}`,
+        `└ ${cancelled[1]}`,
+        `▪ ${cancelled[0]} · What can fx do differently?`,
+        `▪ ${cancelled[1]} · What can fx do differently?`,
+      ]);
+      expect(live.filter((row) => row.includes("result-") || row.includes("/reference-notes.md"))).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // The searches never started, so the saved session keeps no row for
+      // them after a resume, only the turn's own notice, and nothing names
+      // the handle there either.
+      const resumedStderr = join(root, "resumed-stderr.log");
+      session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, width: 140, height: 35, stderrPath: resumedStderr, env });
+      await session.waitForComposer(TIMEOUT);
+      await session.waitForText("Searching the notes.", TIMEOUT);
+      const resumed = compactRows(await session.captureFullScrollback());
+      expect(resumed.filter((row) => row.includes("Cancelled"))).toEqual(["▪ Cancelled · What can fx do differently?"]);
+      expect(resumed.filter((row) => row.includes("result-") || row.includes("/reference-notes.md"))).toEqual([]);
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "separate provider messages render as separate paragraphs",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-message-phases-")));

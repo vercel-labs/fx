@@ -4160,7 +4160,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       ).toBe(true);
 
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
+      await tui.waitForText(`Cancelled ${TOOL_ROW}`, 10_000);
       await tui.waitForText("▪ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
@@ -5311,25 +5311,26 @@ describe("fx mcp call", () => {
       await tui.waitForText(`Running ${TOOL_ROW}`, 20_000);
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForText(`Cancelled ${TOOL_ROW}`, 10_000);
       await tui.waitForStableComposer(10_000);
       const liveScreen = await tui.captureFullScrollback();
       expect(liveScreen).not.toContain(`Running ${TOOL_ROW}`);
       // The compact rows of the cancelled turn: its command by its short
-      // name, in one group with the call.
+      // name, in one group with the call, which goes by its server and tool.
       const compactRows = (screen: string) =>
         screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●├└▪] /.test(line));
       const live = compactRows(liveScreen);
-      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
-      expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
+      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME) && !line.includes(TOOL_ROW))).toBe(true);
+      expect(live).toContain(`└ Cancelled ${TOOL_ROW}`);
       // The command's notice names no command, so no row holds the command
       // line, its fx path, or its arguments; the call's own notice names its
-      // tool, as before.
+      // server and tool, as its row does.
       const cancelledNotices = [
         "▪ Cancelled · What can fx do differently?",
-        `▪ Cancelled ${TOOL_NAME} · What can fx do differently?`,
+        `▪ Cancelled ${TOOL_ROW} · What can fx do differently?`,
       ];
       expect(live.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
+      expect(live.filter((line) => line.includes(TOOL_NAME))).toEqual([]);
       expect(live.join("\n")).not.toContain("> out.txt");
       expect(live.join("\n")).not.toContain(FX_BIN);
 

@@ -25,6 +25,7 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 const cancellation_follow_up = " · What can fx do differently?";
+const cancelled_label = "Cancelled";
 
 // The small helpers marked `noinline` below are called from many places in
 // the rows and headers. LLVM would copy each into every caller, and those
@@ -446,14 +447,14 @@ fn normalizeCanonicalStatus(
     return if (phrase.len == 0) null else phrase;
 }
 
-/// The cancellation notice of a cancelled shell command's status line `raw`,
-/// such as `▪ Cancelled touch .ready && sleep 60 · What can fx do
-/// differently?`, with no command: `▪ Cancelled · What can fx do
-/// differently?`, the notice a cancelled turn shows. The row above names the
-/// command by its short form and Ctrl+O by its full line, so the notice
-/// repeats neither. The line keeps its styles. Null when `raw` doesn't read
-/// `Cancelled …` after its mark.
-fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+/// The cancellation notice of a cancelled call's status line `raw`, such as
+/// `▪ Cancelled touch .ready && sleep 60 · What can fx do differently?`,
+/// with `name` in place of what core named. A shell command's notice has no
+/// name: `▪ Cancelled · What can fx do differently?`, the notice a cancelled
+/// turn shows, since the row above names the command by its short form and
+/// Ctrl+O by its full line. The line keeps its styles. Null when `raw`
+/// doesn't read `Cancelled …` after its mark.
+fn cancelledNotice(scratch: std.mem.Allocator, raw: []const u8, name: []const u8) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(raw, &index)) {}
     const marker = for (status_markers) |candidate| {
@@ -468,18 +469,18 @@ fn cancelledCommandNotice(scratch: std.mem.Allocator, raw: []const u8) !?[]const
         }
         break;
     }
-    const label = "Cancelled";
-    if (!std.mem.startsWith(u8, raw[index..], label)) return null;
-    const kept_end = index + label.len;
-    // The command ends at the follow-up, or at the line's end on a line
-    // saved without one.
+    if (!std.mem.startsWith(u8, raw[index..], cancelled_label)) return null;
+    const kept_end = index + cancelled_label.len;
+    // The name ends at the follow-up, or at the line's end on a line saved
+    // without one.
     const tail_at = std.mem.findLast(u8, raw[kept_end..], cancellation_follow_up) orelse
         std.mem.trimEnd(u8, raw[kept_end..], "\r\n").len;
     var out: std.Io.Writer.Allocating = .init(scratch);
     errdefer out.deinit();
     try out.writer.writeAll(raw[0..kept_end]);
-    // The command's text goes, and its style codes stay, so every style the
-    // line opens still closes.
+    if (name.len > 0) try out.writer.print(" {s}", .{name});
+    // Core's name goes, and its style codes stay, so every style the line
+    // opens still closes.
     var cursor = kept_end;
     while (cursor < kept_end + tail_at) {
         const start = cursor;
@@ -1630,6 +1631,9 @@ const StoryRowKind = enum {
 
 const StoryIdentity = struct {
     kind: StoryRowKind = .single,
+    /// What the calls that share a row have in common. A `.single` row has
+    /// none, so its key is empty, except for a cancelled read of saved
+    /// output, whose key is what it read (`savedOutputIdentity`).
     key: []const u8 = "",
 };
 
@@ -1886,6 +1890,11 @@ fn withoutSuffix(text: []const u8, suffix: []const u8) ?[]const u8 {
     return text[0 .. text.len - suffix.len];
 }
 
+fn withoutPrefix(text: []const u8, prefix: []const u8) ?[]const u8 {
+    if (text.len <= prefix.len or !std.mem.startsWith(u8, text, prefix)) return null;
+    return text[prefix.len..];
+}
+
 /// One way core words a subagent row, and the story's words for it. A lead
 /// that starts with `match`, for a `match` that ends with a space, or ends
 /// with it, for one that starts with a space, reads as `reads` with the rest
@@ -2074,7 +2083,9 @@ fn searchedOutputSource(phrase: []const u8, noun: []const u8, quoted_query: []co
 /// name. Each key starts with the source in full and a 0 byte, so two files
 /// of the same name in two folders stay apart. A call still streaming in
 /// joins its row once its arguments are whole. A read that failed, was
-/// denied, or was cancelled keeps its own row, as a file read does.
+/// denied, or was cancelled keeps its own row, as a file read does, and a
+/// cancelled one's key is what it read, as the row it would have joined
+/// names it.
 fn savedOutputIdentity(
     scratch: std.mem.Allocator,
     entry: TranscriptEntry,
@@ -2085,15 +2096,30 @@ fn savedOutputIdentity(
 ) !StoryIdentity {
     const record = detail orelse return inner;
     if (storyCallFailed(detail)) return inner;
-    if (record.outcome) |outcome| if (outcome != .completed) return inner;
+    const cancelled = record.outcome == .cancelled;
+    if (record.outcome) |outcome| if (outcome != .completed and !cancelled) return inner;
     if (!std.mem.eql(u8, record.tool_name, "read_tool_result")) return inner;
     const arguments_json = record.arguments_json orelse return inner;
-    const phrase = try entryStatus(scratch, entry) orelse "";
+    const shared = try sharedSavedOutputIdentity(scratch, try entryStatus(scratch, entry) orelse "", arguments_json, details, output_sources) orelse return inner;
+    if (cancelled) return .{ .key = try savedOutputRowTarget(scratch, shared) };
+    return shared;
+}
+
+/// The row a read of saved output shares with the group's other reads of
+/// it, from core's row `phrase` and the call's arguments. Null for a read of
+/// anything else, such as a record.
+fn sharedSavedOutputIdentity(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    arguments_json: []const u8,
+    details: []const ToolDetailRecord,
+    output_sources: *const OutputSources,
+) !?StoryIdentity {
     if (try read_tool_result_presentation.rangeReadHandle(scratch, arguments_json)) |handle| {
-        const name = try savedOutputName(scratch, handle, moreOutputSource(phrase), details, output_sources) orelse return inner;
+        const name = try savedOutputName(scratch, handle, moreOutputSource(phrase), details, output_sources) orelse return null;
         return .{ .kind = .more_output, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short }) };
     }
-    const search = try read_tool_result_presentation.outputSearch(scratch, arguments_json) orelse return inner;
+    const search = try read_tool_result_presentation.outputSearch(scratch, arguments_json) orelse return null;
     const noun = read_tool_result_presentation.savedOutputNoun(search.handle);
     // An output no call names goes by core's noun for it, and by its handle
     // in full, so two such outputs stay apart.
@@ -2127,23 +2153,30 @@ fn outputSearchQuery(key: []const u8) []const u8 {
 const SavedReadWords = struct { verb: []const u8, target: []const u8 };
 
 /// The words core names a read of saved output with, from its arguments: its
-/// verb for whether it still runs, such as "Searching" or "Searched", and
-/// what it reads when no call names the output, such as "more output". Null
-/// for a call that failed, was denied, or was cancelled, whose row core
+/// verb for whether it still runs, such as "Searching", "Searched", or
+/// "Cancelled", and what it reads when no call names the output, such as
+/// "more output". Null for a call that failed or was denied, whose row core
 /// words, and for arguments that name no request.
 fn savedReadWords(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?SavedReadWords {
     if (!std.mem.eql(u8, record.tool_name, "read_tool_result") or storyCallFailed(record)) return null;
-    const done = if (record.outcome) |outcome| switch (outcome) {
-        .completed => true,
+    const State = enum { running, done, cancelled };
+    const state: State = if (record.outcome) |outcome| switch (outcome) {
+        .completed => .done,
+        .cancelled => .cancelled,
         else => return null,
-    } else false;
+    } else .running;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch, record.arguments_json orelse return null, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
     if (parsed != .object) return null;
     const words = read_tool_result_presentation.presentation(parsed.object) orelse return null;
-    return .{ .verb = if (done) words.completed_action_label else words.action_label, .target = words.label_arg_default };
+    const verb = switch (state) {
+        .running => words.action_label,
+        .done => words.completed_action_label,
+        .cancelled => cancelled_label,
+    };
+    return .{ .verb = verb, .target = words.label_arg_default };
 }
 
 /// The verb a row of reads of saved output leads with: its newest call's,
@@ -2160,26 +2193,35 @@ fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u
     return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), searched_output_marker });
 }
 
+/// What a row of reads of saved output names after its verb, such as
+/// "github.com output for "npx"" or "more output from SKILL.md".
+fn savedOutputRowTarget(scratch: std.mem.Allocator, identity: StoryIdentity) ![]const u8 {
+    const source = try terminalSafeText(scratch, moreOutputShortName(identity.key));
+    return switch (identity.kind) {
+        .output_search => std.mem.concat(scratch, u8, &.{ source, searched_output_marker, outputSearchQuery(identity.key) }),
+        else => std.mem.concat(scratch, u8, &.{ more_output_marker, source }),
+    };
+}
+
 /// A read of saved output in its finished row's words from the moment its
 /// arguments arrive: its verb for whether it still runs, then what it reads,
 /// with the source by its short name, such as "Searching github.com output
-/// for "npx"", "Read more output from SKILL.md", or "Opened tool call T5".
-/// Core's row names the call's handle while the call streams in, and says
-/// "earlier" before a record, which the compact row leaves out. Null for
-/// any other row.
+/// for "npx"", "Read more output from SKILL.md", "Opened tool call T5", or
+/// "Cancelled github.com output for "npx"". Core's row names the call's
+/// handle while the call streams in, and says "earlier" before a record,
+/// which the compact row leaves out. Null for any other row.
 fn savedReadRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     const words = try savedReadWords(scratch, record) orelse return null;
-    return switch (row.identity.kind) {
-        .more_output => try std.mem.concat(scratch, u8, &.{ words.verb, " ", more_output_marker, try terminalSafeText(scratch, moreOutputShortName(row.identity.key)) }),
-        .output_search => try std.mem.concat(scratch, u8, &.{ try outputSearchHead(scratch, words.verb, row.identity.key), outputSearchQuery(row.identity.key) }),
-        .single => try std.mem.concat(scratch, u8, &.{
-            words.verb,
-            " ",
+    const target = switch (row.identity.kind) {
+        .more_output, .output_search => try savedOutputRowTarget(scratch, row.identity),
+        .single => if (row.identity.key.len > 0)
+            row.identity.key
+        else
             try read_tool_result_presentation.openedRecordName(scratch, record.arguments_json.?) orelse words.target,
-        }),
-        else => null,
+        else => return null,
     };
+    return try std.mem.concat(scratch, u8, &.{ words.verb, " ", target });
 }
 
 /// A web page an earlier turn fetched and saved behind a handle, which the
@@ -2298,6 +2340,55 @@ test "a look into saved output has its finished row's words and name from the mo
         defer alloc.free(row);
         errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, row });
         try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, row, "\n"));
+    }
+}
+
+test "a cancelled look into saved output names what it read as its running row does" {
+    const alloc = std.testing.allocator;
+    // Escape while the model streamed the first call in, when core's row
+    // names its handle, and after the second started, when core names the
+    // page in full.
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled result-14acc.txt" ++ cancellation_follow_up, .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled https://github.com/example/project output for \"terminal\"" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    var streamed = savedSearchForTest(1, "npx", .cancelled);
+    streamed.streaming = true;
+    const details = [_]ToolDetailRecord{ saved_page_for_test, streamed, savedSearchForTest(2, "terminal", .cancelled) };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{text});
+    // Each keeps its own row, and its notice names it as the row does.
+    try std.testing.expect(std.mem.find(u8, text, "├ Cancelled github.com output for \"npx\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled github.com output for \"terminal\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled github.com output for \"npx\"" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled github.com output for \"terminal\"" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "result-14acc") == null);
+    try std.testing.expect(std.mem.find(u8, text, "https://") == null);
+
+    // A read of more output and a record, each cancelled as it streamed in.
+    const Case = struct { handle: []const u8, arguments: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .handle = "result-14acc.txt", .arguments = "{\"handle\":\"result-14acc.txt\",\"start_byte\":4096}", .row = "Cancelled more output from github.com" },
+        .{ .handle = "T5", .arguments = "{\"handle\":\"T5\"}", .row = "Cancelled tool call T5" },
+    };
+    for (cases) |case| {
+        const phrase = try std.mem.concat(alloc, u8, &.{ "▪ Cancelled ", case.handle, cancellation_follow_up });
+        defer alloc.free(phrase);
+        const one = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = phrase, .class = .tool_status } }};
+        const one_details = [_]ToolDetailRecord{
+            saved_page_for_test,
+            .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(case.arguments), .outcome = .cancelled, .streaming = true },
+        };
+        const row = try groupTextForTest(alloc, &one, &one_details);
+        defer alloc.free(row);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.arguments, row });
+        const header = try std.mem.concat(alloc, u8, &.{ "● ", case.row, "\n" });
+        defer alloc.free(header);
+        const notice = try std.mem.concat(alloc, u8, &.{ "▪ ", case.row, cancellation_follow_up });
+        defer alloc.free(notice);
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, "\n"), header));
+        try std.testing.expect(std.mem.find(u8, row, notice) != null);
     }
 }
 
@@ -2650,6 +2741,7 @@ const mcp_row_labels = [_]struct { core: []const u8, shown: []const u8 }{
     .{ .core = tooling_presentation.mcp_ran_label ++ " ", .shown = "Ran " },
     .{ .core = tooling_presentation.mcp_running_label ++ " ", .shown = "Running " },
     .{ .core = "Failed ", .shown = "Failed " },
+    .{ .core = cancelled_label ++ " ", .shown = cancelled_label ++ " " },
 };
 
 /// An MCP tool's row by its server and then the tool, such as "Ran slack
@@ -2697,13 +2789,14 @@ test "MCP rows name the server, then its tool" {
 
     // A call still running takes the server a finished call of its tool
     // names, and a failed `fx mcp call`, which keeps no result, still names
-    // its server and tool.
+    // its server and tool, as a cancelled call and its notice do.
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_team_notes_search\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_team_notes_search\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Failed mcp_fixture_echo\n", .class = .tool_status } },
         // Another program's MCP name, which fx never gives a tool, keeps it.
         .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed mcp__filesystem__read_text_file\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "▪ Cancelled mcp_bloop_get_account" ++ cancellation_follow_up, .class = .tool_status } },
     };
     const run = "{\"run\":\"mcp_team_notes_search\",\"arguments\":{}}";
     const details = [_]ToolDetailRecord{
@@ -2711,13 +2804,17 @@ test "MCP rows name the server, then its tool" {
         .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run) },
         .{ .entry_id = 3, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .failed },
         .{ .entry_id = 4, .tool_name = @constCast("mcp__filesystem__read_text_file"), .activity_kind = .mcp, .outcome = .failed },
+        .{ .entry_id = 5, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_bloop_get_account\",\"arguments\":{}}"), .outcome = .cancelled },
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("rows:\n{s}\n", .{text});
     try std.testing.expect(std.mem.find(u8, text, "├ Running team_notes search ×2\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run fixture echo\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "└ Couldn't run mcp__filesystem__read_text_file") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run mcp__filesystem__read_text_file\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled bloop get_account\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled bloop get_account" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "mcp_bloop") == null);
     try std.testing.expect(std.mem.find(u8, text, "mcp_team") == null);
     try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
     try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
@@ -3676,11 +3773,14 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        // A cancelled command's notice names no command; its row does.
+        // A cancelled command's notice names no command; its row does. A
+        // call whose row names it in the compact row's words, such as a read
+        // of saved output or an MCP call, has a notice that names it so too.
         var shown = entry;
-        if (isShellCommandCall(scratch, detail)) {
-            if (try cancelledCommandNotice(scratch, entry.raw_bytes.bytes)) |notice| shown.raw_bytes.bytes = notice;
-        }
+        const name = if (isShellCommandCall(scratch, detail)) "" else try cancelledCallName(scratch, rows.items, entry_id);
+        if (name) |shown_name| if (try cancelledNotice(scratch, entry.raw_bytes.bytes, shown_name)) |notice| {
+            shown.raw_bytes.bytes = notice;
+        };
         const terminal = try transcript_blocks.renderEntryToBlock(scratch, shown, cols, styles);
         if (terminal.bytes.len > 0) {
             try lines.append(alloc, .block_separator);
@@ -3692,6 +3792,19 @@ fn writeGroupBlock(
         terminal.deinit(scratch);
     }
     return header;
+}
+
+/// What the row of the cancelled call `entry_id` names it by in the compact
+/// row's words, such as "github.com output for "npx"" or "fixture echo".
+/// Null for a call whose row keeps core's name.
+fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_id: u32) !?[]const u8 {
+    const row = for (rows) |*candidate| {
+        if (candidate.entry_id == entry_id) break candidate;
+    } else return null;
+    const phrase = try savedReadRowPhrase(scratch, row) orelse
+        try mcpRowPhrase(scratch, try entryStatus(scratch, row.entry) orelse return null, row) orelse
+        return null;
+    return withoutPrefix(phrase, cancelled_label ++ " ");
 }
 
 /// A row clipped to `cols` behind `lead`, such as "● " or "├ ", with `mark`
@@ -7138,20 +7251,25 @@ test "a cancelled command's notice drops only the command and keeps the line's s
     // The line a cancelled terminal writes, and the turn's own notice.
     try std.testing.expectEqualStrings(
         try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled", reset, follow_up }),
-        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }))).?,
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled touch .ready && sleep 60", reset, follow_up }), "")).?,
     );
     // A summary with styles of its own keeps them, with no text between.
     try std.testing.expectEqualStrings(
         try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m\x1b[38;5;245m\x1b[0m", reset, follow_up }),
-        (try cancelledCommandNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }))).?,
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, hint, " Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m", reset, follow_up }), "")).?,
+    );
+    // A name in place of core's sits in the line's styles.
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled fixture echo", reset, follow_up }),
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled mcp_fixture_echo", reset, follow_up }), "fixture echo")).?,
     );
     // A line already without a command, and one an older fx saved with no
     // follow-up.
-    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledCommandNotice(a, "▪ Cancelled · What can fx do differently?")).?);
-    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledCommandNotice(a, "■ Cancelled sleep 30\n")).?);
+    try std.testing.expectEqualStrings("▪ Cancelled · What can fx do differently?", (try cancelledNotice(a, "▪ Cancelled · What can fx do differently?", "")).?);
+    try std.testing.expectEqualStrings("■ Cancelled\n", (try cancelledNotice(a, "■ Cancelled sleep 30\n", "")).?);
     // A line that doesn't read `Cancelled …` after its mark stays as it is.
-    try std.testing.expect(try cancelledCommandNotice(a, "▪ Stopped sleep 30") == null);
-    try std.testing.expect(try cancelledCommandNotice(a, "cancelled") == null);
+    try std.testing.expect(try cancelledNotice(a, "▪ Stopped sleep 30", "") == null);
+    try std.testing.expect(try cancelledNotice(a, "cancelled", "") == null);
 }
 
 test "only a cancelled command's notice leaves out its text, in a group with an MCP call" {
@@ -7172,9 +7290,10 @@ test "only a cancelled command's notice leaves out its text, in a group with an 
     const bytes = projection.entry_actions.items[0].override.bytes;
 
     // Each command's notice names no command, and the MCP call's names its
-    // tool, as before.
+    // server and tool, as its row does.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled mcp_fixture_echo · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled fixture echo · What can fx do differently?"));
+    try std.testing.expect(std.mem.find(u8, bytes, "Cancelled mcp_fixture_echo") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
 }
