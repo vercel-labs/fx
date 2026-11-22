@@ -4203,6 +4203,57 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
   }
 }, TIMEOUT * 3);
 
+test("fx ask: a subagent's question goes back to it with how to ask its parent", async () => {
+  const fixture = createFixture("fx-v2-subagent-question-");
+  // The profile names the tool on purpose: a subagent still never sees it.
+  writeRepositoryProfile(fixture.workspace, "questioner", {
+    description: "Asks about a choice",
+    tools: ["read_file", "ask_user_question"],
+  });
+  const childBodies: string[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      childBodies.push(body);
+      // Two calls in a row, each of which has to come back with the sentinel.
+      if (childBodies.length === 1) {
+        return fakeGatewayToolCall("child_ask_1", "ask_user_question", {
+          questions: [{ question: "Pick ONE", options: [{ label: "ALPHA" }, { label: "BETA" }] }],
+        });
+      }
+      if (childBodies.length === 2) {
+        return fakeGatewayToolCall("child_ask_2", "ask_user_question", {
+          questions: [{ question: "Pick TWO", options: [{ label: "GAMMA" }, { label: "DELTA" }] }],
+        });
+      }
+      return fakeGatewayFinalText("CHILD_ASKED_PARENT");
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("PARENT_READ_REPORT");
+    if (body.includes("delegate-question")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-question", "subagent", {
+      request: { action: "message", agent: "asker", message: "Ask about the choice.", profile: "questioner" },
+    });
+  }, { classifierDecision: "clear" });
+  try {
+    // A question that reached the user would hold this run until its timeout.
+    const result = await ask(fixture, gateway, ["Delegate the question."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    expect(JSON.parse(result.stdout).output).toContain("PARENT_READ_REPORT");
+
+    expect(childBodies).toHaveLength(3);
+    // The profile allows the tool, and the child is still not offered it.
+    expect(offeredTools(childBodies[0]!)).toContain("read_file");
+    expect(offeredTools(childBodies[0]!)).not.toContain("ask_user_question");
+    // Both calls are refused, and each refusal says how to ask the parent.
+    expect(childBodies[1]).toContain("Subagents never ask the user");
+    expect(childBodies[2]).toContain("Subagents never ask the user");
+    expectWholeLog(fixture, JSON.parse(result.stdout).session_id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 // -- fx sessions, fx session and doctor ----------------------------------------
 
 /// Every file under `dir`, as paths relative to it with their modes.

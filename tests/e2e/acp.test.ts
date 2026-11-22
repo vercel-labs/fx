@@ -11582,6 +11582,52 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP: a subagent's question goes back to it with how to ask its parent",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-question-");
+      const createId = "acp_question_child";
+      const childBodies: string[] = [];
+      const route = (body: string) => {
+        if (!body.includes('"name":"subagent"')) {
+          childBodies.push(body);
+          if (childBodies.length === 1) {
+            return fakeGatewayToolCall("acp_child_ask", "ask_user_question", {
+              questions: [{ question: "Pick a side", options: [{ label: "LEFT" }, { label: "RIGHT" }] }],
+            });
+          }
+          return finalText("ACP_CHILD_ASKED_PARENT");
+        }
+        if (acpLatestUserIsReport(body)) return finalText("ACP_PARENT_READ_REPORT");
+        if (body.includes(createId)) return finalText("ACP_PARENT_TURN_DONE");
+        return fakeGatewayToolCall(createId, "subagent", {
+          request: { action: "message", agent: "asker", message: "Ask about the side." },
+        });
+      };
+      const gateway = startFakeGateway([route, route, route, route, route]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client, true);
+        const result = await runPrompt(client, "Delegate the question.", TIMEOUT);
+        // A question that reached a client would hold the turn, not end it.
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(childBodies).toHaveLength(2);
+        expect(childBodies[0]).not.toContain('"name":"ask_user_question"');
+        expect(childBodies[1]).toContain("Subagents never ask the user");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        client = undefined;
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP starts a subagent in the profile its session's workspace has, not the one in the directory fx acp started in",
     async () => {
       const root = createIsolatedRoot("fx-acp-session-profile-");
