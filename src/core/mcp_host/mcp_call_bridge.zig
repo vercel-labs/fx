@@ -189,10 +189,11 @@ fn startLocked(io: std.Io) !void {
     try std.Io.Dir.cwd().createDir(io, dir_path, .fromMode(0o700));
     errdefer std.Io.Dir.cwd().deleteDir(io, dir_path) catch {};
     const address = try std.Io.net.UnixAddress.init(socket_path);
+    // Ignored: listen may fail before the file exists, and the start already fails with its own error.
+    errdefer std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     var listener = try address.listen(io, .{});
     errdefer listener.deinit(io);
-    // Errdefers run in reverse, so this runs before the directory's errdefer above it, which needs the directory empty.
-    errdefer std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    // Errdefers run in reverse: the listener closes, then the socket file goes, then the directory, which needs to be empty.
     // Close-on-exec, so the commands fx starts do not inherit the wake pipe.
     const wake = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     errdefer closeWake(wake);
