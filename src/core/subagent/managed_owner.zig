@@ -152,6 +152,11 @@ pub const WorkEnd = struct {
     /// the child's next work.
     /// Borrowed for the call.
     leftovers: []const child_state.ActiveWork = &.{},
+    /// How many of the parent's messages the turn never took this end
+    /// dropped because the user stopped or closed the child, which no stop or
+    /// close had counted. The host adds them to what the user's stop or close
+    /// dropped, for the work's report or a notice.
+    dropped_by_user: usize = 0,
     /// Why the work never began, for one that failed because its slot could
     /// not start: its report says the message never ran. A static string.
     start_failure: ?[]const u8 = null,
@@ -696,7 +701,8 @@ pub const Owner = struct {
 
     /// The user closed the child from the agent list: ends its running turn
     /// as the user's own stop does, and its report says the user closed it.
-    /// False when nothing runs.
+    /// False when nothing runs. The kept and unread messages the turn's end
+    /// drops are counted at the slot's end (`WorkEnd.dropped_by_user`), not here.
     pub fn closeByUser(self: *Owner, child_id: []const u8) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -753,8 +759,8 @@ pub const Owner = struct {
         return null;
     }
 
-    /// How many of the parent's messages the parent's stop or close of
-    /// `child_id` drops when `stop` found the work ended, so it set no flag and
+    /// How many of the parent's messages a stop or close of `child_id` drops
+    /// when the work had ended, so `stop` or `closeByUser` set no flag and
     /// counted nothing: the messages the ended turn never took, which the slot
     /// keeps until the host's end hook queues them
     /// (`tests/tla/subagent/StopMessage.tla` NoSilentLoss). The end sets no
@@ -1350,7 +1356,11 @@ fn slotMain(slot: *Slot) void {
         slot.unstarted = 0;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
+        var dropped_by_user: usize = 0;
         if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
+            // The parent was told these joined the turn. The user's stop or close
+            // drops them here, and no stop of the parent's counted them.
+            if (slot.stopped_by_user) dropped_by_user = slot.leftovers.items.len - slot.leftovers_counted;
             dropLeftovers(owner.alloc, slot, "stopped");
         }
         owner.mutex.unlock(io_mod.getIo());
@@ -1363,6 +1373,7 @@ fn slotMain(slot: *Slot) void {
             .report_owed = finished.report_owed,
             .end = end,
             .leftovers = slot.leftovers.items,
+            .dropped_by_user = dropped_by_user,
         }) else false;
         publish_test_controls.holdPublish(slot.child_id);
         owner.mutex.lockUncancelable(io_mod.getIo());

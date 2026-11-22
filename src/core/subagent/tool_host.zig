@@ -1313,7 +1313,11 @@ pub const Runtime = struct {
     /// clear (`nudgeWaiter`).
     fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) bool {
         debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
-        const dropped = self.takeUserDropped(end.child_id);
+        var dropped = self.takeUserDropped(end.child_id);
+        // The slot's end counted the messages a user's stop or close dropped
+        // from the turn, which no stop or close had counted.
+        dropped.count += end.dropped_by_user;
+        if (end.dropped_by_user > 0 and end.end.cause == .user_close) dropped.closed = true;
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
         if (dropped.count > 0) return self.postDropNotice(end.child_id, dropped);
@@ -2364,16 +2368,12 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
-            // A user's close tells the parent what it dropped, as a stop does,
-            // and keeps the name for main's status and its next message to it.
-            if (by == .user) {
-                self.noteUserDropLocked(child_id, dropped, true);
-                if (name) |value| self.noteUserClosedLocked(value);
-            }
             // The parent's close drops the closed turn's unread messages and
             // the ones its slot keeps or carries into the next work, and counts
-            // them in the owner's one step, as its stop does. The user's close
-            // counts none of them.
+            // them in the owner's one step, as its stop does. A user's close that
+            // ends a running work counts none of them here: the slot's end counts
+            // them for the work's report (`WorkEnd.dropped_by_user`). A close that
+            // finds the work ended counts what the slot keeps (`takeDropped`).
             var unread: usize = 0;
             var ended_turn = false;
             const stopped = switch (by) {
@@ -2382,11 +2382,18 @@ pub const Runtime = struct {
                     ended_turn = true;
                     break :ended true;
                 } else false,
-                .user => self.managed.closeByUser(child_id),
+                .user => user: {
+                    ended_turn = self.managed.closeByUser(child_id);
+                    break :user ended_turn;
+                },
             } or self.stopTurnWorkLocked(child_id);
-            if (by == .parent) {
-                end_test_controls.holdInStop(child_id);
-                if (!ended_turn) unread += self.managed.takeDropped(child_id);
+            if (by == .parent) end_test_controls.holdInStop(child_id);
+            if (!ended_turn) unread += self.managed.takeDropped(child_id);
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped + unread, true);
+                if (name) |value| self.noteUserClosedLocked(value);
             }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
@@ -9793,7 +9800,8 @@ test "a stop after the next work began does not count its message" {
 // The rule, for each message `m` that main sent to a subagent
 // (`tests/tla/subagent/StopMessage.tla` NoSilentLoss and CountedNeverRead).
 // An account of `m` is one of: (i) `m`'s turn began; (ii) a count includes `m`,
-// the N of a stop's or close's answer or of a user's note; (iii) the report of
+// the N of a stop's or close's answer or of a user's note the host delivered;
+// (iii) the report of
 // `m`'s own work says the work failed or was cancelled.
 //
 //   R1, never false: if (ii) or (iii) holds for `m`, its turn never begins.
@@ -10469,7 +10477,8 @@ const AccountCell = struct {
         }
         for (self.answers.items) |answer| ledger.counted += accountAnswerDropped(answer);
         for (fixture.reports.items) |line| ledger.counted += accountReportDropped(line);
-        for (self.runtime.user_dropped.items) |drop| ledger.counted += drop.count;
+        // A note the host still holds at the cell's end never reached the owner,
+        // so it accounts for nothing; the printout names it.
         return ledger;
     }
 
@@ -10509,16 +10518,14 @@ const AccountVerdict = enum {
     over_counted,
     /// R3: a count beside the report of a work that failed.
     count_beside_failed_report,
-    /// The case says it breaks R2 as `main` does, and it does not.
-    wrongly_marked,
 };
 
-fn accountVerdict(ledger: AccountLedger, as_on_main: bool) AccountVerdict {
+fn accountVerdict(ledger: AccountLedger) AccountVerdict {
     if (ledger.count_beside_failed_report) return .count_beside_failed_report;
     const accounted = ledger.by_report + ledger.counted;
     if (accounted > ledger.never_began) return .over_counted;
-    if (accounted < ledger.never_began) return if (as_on_main) .ok else .silent;
-    return if (as_on_main) .wrongly_marked else .ok;
+    if (accounted < ledger.never_began) return .silent;
+    return .ok;
 }
 
 const AccountReportFields = struct { call: []const u8, outcome: []const u8 };
@@ -10549,37 +10556,14 @@ fn accountAnswerDropped(answer: []const u8) usize {
     return std.fmt.parseInt(usize, answer[start..at], 10) catch 0;
 }
 
-/// Cells that break R2 as `main` does: no count names a message that was dropped.
-/// A user's close of a turn with a message unread or kept, and the user's stop
-/// before the end is recorded with one kept, drop it silently; so do a second
-/// close, the parent's or the user's, after them, and the user's close after a
-/// user's stop that left a message. A parent's stop that follows counts what
-/// the user's left. Every other cell holds R2.
-fn accountAsOnMain(plan: Plan, scenario: Scenario) bool {
-    const user_close_silent = switch (scenario) {
-        .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
-        else => false,
-    };
-    return switch (plan.first) {
-        .user_close => user_close_silent and (plan.second == null or plan.second == .parent_close or plan.second == .user_close),
-        .user_stop => if (plan.second) |second| switch (second) {
-            // The app's Esc on a running turn counts the unread message.
-            .user_close => user_close_silent and scenario != .running_unread,
-            else => false,
-        } else scenario == .returned_kept,
-        else => false,
-    };
-}
-
-fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan, as_on_main: bool) []const u8 {
-    return std.mem.print(buf, "{s}{s}{s} / {s}{s}{s}{s}", .{
+fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan) []const u8 {
+    return std.mem.print(buf, "{s}{s}{s} / {s}{s}{s}", .{
         @tagName(scenario),
         if (hosted_path and !scenario.hosted()) " (hosted)" else "",
         if (in_stop) " (the slot let go inside the stop)" else "",
         @tagName(plan.first),
         if (plan.second != null) " then " else "",
         if (plan.second) |second| @tagName(second) else "",
-        if (as_on_main) " (as on main: R2)" else "",
     }) catch "?";
 }
 
@@ -10596,11 +10580,10 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     // Every other cell of the window would wait as long, so the table stops
     // there, as it does for a cell it cannot drive.
     if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
-    const as_on_main = accountAsOnMain(plan, scenario);
     const ledger = cell.tally();
-    const verdict = accountVerdict(ledger, as_on_main);
+    const verdict = accountVerdict(ledger);
     var buf: [160]u8 = undefined;
-    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan, as_on_main);
+    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan);
     // A stop that read on before the slot went on proves nothing about the
     // order the cell is there for, whatever the verdict says.
     const slot_went_on = !in_stop or cell.stopHeld(plan);
@@ -10633,7 +10616,7 @@ test "every message main sends has one account in every window of a subagent's s
                     cells += 1;
                     const held = runAccountCell(scenario, hosted_path, in_stop, plan) catch |err| {
                         var buf: [160]u8 = undefined;
-                        std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, in_stop, plan, false), @errorName(err) });
+                        std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, in_stop, plan), @errorName(err) });
                         broken += 1;
                         break;
                     };
