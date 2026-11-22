@@ -51,7 +51,10 @@ pub const Client = struct {
     /// Whole frames, owned here until the runtime takes them.
     queue: std.ArrayList([]u8) = .empty,
     stream: ?std.Io.net.Stream = null,
-    reader: ?std.Thread = null,
+    /// The task that reads this connection. Closing cancels it and waits:
+    /// a read blocked on the socket ends with `error.Canceled`, so the
+    /// descriptor is never closed under it.
+    reader: ?std.Io.Future(std.Io.Cancelable!void) = null,
     closed: bool = false,
     last_spawn_ms: i64 = 0,
 
@@ -141,11 +144,11 @@ pub const Client = struct {
         try sent;
         // The welcome names the owner, and its version must match ours.
         var header: [wire.header_bytes]u8 = undefined;
-        readExact(c.io, stream.socket.handle, &header) catch return error.SharingUnavailable;
+        readExact(c.io, stream, &header) catch return error.SharingUnavailable;
         const length = wire.readLength(&header) catch return error.SharingUnavailable;
         var buffer: [1024]u8 = undefined;
         if (length > buffer.len) return error.SharingUnavailable;
-        readExact(c.io, stream.socket.handle, buffer[0..length]) catch return error.SharingUnavailable;
+        readExact(c.io, stream, buffer[0..length]) catch return error.SharingUnavailable;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const message = wire.decode(arena.allocator(), buffer[0..length]) catch return error.SharingUnavailable;
@@ -158,7 +161,14 @@ pub const Client = struct {
         }
         c.stream = stream;
         c.closed = false;
-        c.reader = std.Thread.spawn(.{}, readerLoop, .{c}) catch null;
+        c.reader = c.io.concurrent(readerTask, .{c}) catch |err| {
+            // A connection with no reader could only wait for frames that
+            // never come: say so, and let the session run every server itself.
+            debug_trace.logf("mcp-owner", "owner reader not started socket={s} err={s}", .{ c.socket_path, @errorName(err) });
+            c.stream = null;
+            c.closed = true;
+            return error.SharingUnavailable;
+        };
         debug_trace.logf("mcp-owner", "owner connected socket={s}", .{c.socket_path});
     }
 
@@ -176,7 +186,13 @@ pub const Client = struct {
             error.TooLarge => return error.SharingUnavailable,
         };
         defer c.gpa.free(frame);
-        writeAll(c.io, stream.socket.handle, frame) catch {
+        var buffer: [4096]u8 = undefined;
+        var writer = stream.writer(c.io, &buffer);
+        writer.interface.writeAll(frame) catch {
+            c.markClosed();
+            return error.Closed;
+        };
+        writer.interface.flush() catch {
             c.markClosed();
             return error.Closed;
         };
@@ -210,27 +226,31 @@ pub const Client = struct {
         c.stream = null;
         c.closed = true;
         c.mutex.unlock(c.io);
-        if (stream) |open| {
-            // A read blocked in the reader thread is not woken by closing the
-            // descriptor under it, so shut the socket down first: the read then
-            // returns zero, the thread ends, and only then is the fd closed.
-            open.shutdown(c.io, .both) catch {};
-            if (c.reader) |thread| thread.join();
+        if (c.reader) |*reader| {
+            // Cancel ends a read blocked on this socket and waits for the
+            // task, so the descriptor is never closed under the read.
+            reader.cancel(c.io) catch {};
             c.reader = null;
-            open.close(c.io);
         }
+        if (stream) |open| open.close(c.io);
     }
 };
 
-fn readerLoop(c: *Client) void {
+/// The connection's reader, as a task. A read blocked on the socket ends with
+/// `error.Canceled` when the client closes, with no need to shut it down.
+fn readerTask(c: *Client) std.Io.Cancelable!void {
     const stream = c.stream orelse return;
     var header: [wire.header_bytes]u8 = undefined;
     while (true) {
-        readExact(c.io, stream.socket.handle, &header) catch return c.markClosed();
+        readExact(c.io, stream, &header) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return c.markClosed(),
+        };
         const length = wire.readLength(&header) catch return c.markClosed();
         const payload = c.gpa.alloc(u8, length) catch return c.markClosed();
-        readExact(c.io, stream.socket.handle, payload) catch {
+        readExact(c.io, stream, payload) catch |err| {
             c.gpa.free(payload);
+            if (err == error.Canceled) return error.Canceled;
             return c.markClosed();
         };
         c.mutex.lockUncancelable(c.io);
@@ -244,17 +264,14 @@ fn readerLoop(c: *Client) void {
     }
 }
 
-fn readExact(io: std.Io, fd: std.posix.socket_t, buffer: []u8) !void {
+fn readExact(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !void {
     var read: usize = 0;
     while (read < buffer.len) {
-        const n = std.posix.read(fd, buffer[read..]) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        if (n == 0) return error.Closed;
-        read += n;
+        var data = [_][]u8{buffer[read..]};
+        const result = try stream.readWithControl(io, &data, &.{});
+        if (result.data_len == 0) return error.Closed;
+        read += result.data_len;
     }
-    _ = io;
 }
 
 fn writeAll(io: std.Io, fd: std.posix.socket_t, bytes: []const u8) !void {

@@ -3,9 +3,9 @@
 //! JSON frames.
 //!
 //! A frame is a 4-byte big-endian length, then one JSON object with `"v"` for
-//! the wire version and `"t"` naming its type. A frame is capped at the
-//! engine's message limit plus room for the envelope, so anything a server can
-//! answer fits.
+//! the wire version and `"t"` naming its type. Server-provided JSON travels
+//! inside it as a JSON string, so a message a server may legally send can
+//! double in the escaping and still fit (see `max_frame_bytes`).
 //!
 //! Pure: encoding and decoding work on bytes, with no I/O. The socket shells
 //! (`owner.zig`, `owner_client.zig`) read and write the frames.
@@ -13,6 +13,7 @@ const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");
 const share_key = @import("share_key.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_depth = @import("../shared/json_depth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,9 +22,12 @@ const Allocator = std.mem.Allocator;
 /// Version 2 carries server-provided JSON as JSON strings, not values.
 pub const version: u32 = 2;
 
-/// A frame is at most the engine's message limit plus 64 KiB for the envelope
-/// and its fields.
-pub const max_frame_bytes: usize = 16 * 1024 * 1024 + 64 * 1024;
+/// A frame is at most twice the engine's message limit plus 64 KiB for the
+/// envelope and its fields. Server JSON travels as a JSON string, and the
+/// only bytes `std.json.Stringify` escapes in one are `"`, `\`, and the
+/// control characters, which a JSON string may not hold raw, so the escaped
+/// text is at most double the server's message. UTF-8 text is not escaped.
+pub const max_frame_bytes: usize = 2 * mcp.limits.max_message_bytes + 64 * 1024;
 
 /// The big-endian length in front of every frame.
 pub const header_bytes: usize = 4;
@@ -98,7 +102,6 @@ pub const OwnerMessage = union(enum) {
     /// The server completed, or withdrew, the 2025 question in `slot`.
     elicitation_complete: struct { key: share_key.Key, slot: u8 },
     elicit_withdrawn: struct { key: share_key.Key, slot: u8 },
-    declined: struct { id: u32, why: []const u8 },
     stopped_idle: struct { key: share_key.Key },
     status: struct { key: share_key.Key, phase: mcp.engine.Phase, version: ?[]const u8 = null, last_error: ?[]const u8 = null, stderr_tail: ?[]const u8 = null, instructions: ?[]const u8 = null, exit_code: ?u8 = null, exit_signal: ?u8 = null, stray_line: ?[]const u8 = null },
 };
@@ -140,8 +143,12 @@ pub fn encode(alloc: Allocator, message: anytype) (Allocator.Error || error{TooL
 }
 
 /// A frame's JSON object, without its length header. Bounds are checked
-/// against the arena; every text borrows from it.
+/// against the arena; every text borrows from it. A frame deeper than the
+/// nesting limit is refused before it is parsed: the owner reads bytes from a
+/// socket any same-user process can reach, and `std.json` would walk them on
+/// the owner's stack (`json_depth.zig`).
 pub fn decode(arena: Allocator, json: []const u8) DecodeError!Message {
+    if (json_depth.exceeds(json)) return error.Malformed;
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Malformed,
@@ -265,10 +272,6 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             try bytes(writer, "key", &m.key);
             try uint(writer, "slot", m.slot);
         },
-        .declined => {
-            try uint(writer, "id", m.id);
-            try textField(writer, "why", m.why);
-        },
         .stopped_idle => try bytes(writer, "key", &m.key),
         .status => {
             try bytes(writer, "key", &m.key);
@@ -332,7 +335,7 @@ fn clientMessage(arena: Allocator, object: std.json.ObjectMap, tag: std.meta.Tag
         .respond => .{ .respond = .{ .id = try u32Field(object, "id"), .values = try rawField(object, "values") } },
         .answer => .{ .answer = .{
             .key = try keyField(object, "key"),
-            .slot = @intCast(try u32Field(object, "slot")),
+            .slot = try u8Field(object, "slot"),
             .n = try u32Field(object, "n"),
             .action = std.meta.stringToEnum(mcp.elicitation.Action, try text(object, "action")) orelse return error.Malformed,
             .content = try optionalRaw(object, "content"),
@@ -371,7 +374,7 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
         .input => .{ .input = .{ .id = try u32Field(object, "id"), .requests = try rawField(object, "requests") } },
         .question => .{ .question = .{
             .key = try keyField(object, "key"),
-            .slot = @intCast(try u32Field(object, "slot")),
+            .slot = try u8Field(object, "slot"),
             .n = try u32Field(object, "n"),
             .params = try rawField(object, "params"),
             .version = try optionalText(object, "version"),
@@ -379,13 +382,12 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
         } },
         .elicitation_complete => .{ .elicitation_complete = .{
             .key = try keyField(object, "key"),
-            .slot = @intCast(try u32Field(object, "slot")),
+            .slot = try u8Field(object, "slot"),
         } },
         .elicit_withdrawn => .{ .elicit_withdrawn = .{
             .key = try keyField(object, "key"),
-            .slot = @intCast(try u32Field(object, "slot")),
+            .slot = try u8Field(object, "slot"),
         } },
-        .declined => .{ .declined = .{ .id = try u32Field(object, "id"), .why = try text(object, "why") } },
         .stopped_idle => .{ .stopped_idle = .{ .key = try keyField(object, "key") } },
         .status => .{ .status = .{
             .key = try keyField(object, "key"),
@@ -467,6 +469,12 @@ fn optionalU8(object: std.json.ObjectMap, key: []const u8) DecodeError!?u8 {
     const value = object.get(key) orelse return null;
     if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u8)) return error.Malformed;
     return @intCast(value.integer);
+}
+
+/// A `u8` field, refused above 255 rather than cast: the value comes from
+/// another process.
+fn u8Field(object: std.json.ObjectMap, key: []const u8) DecodeError!u8 {
+    return (try optionalU8(object, key)) orelse error.Malformed;
 }
 
 fn u32Field(object: std.json.ObjectMap, key: []const u8) DecodeError!u32 {
@@ -643,7 +651,6 @@ test "every owner message round-trips" {
     try testing.expectEqualStrings("2025-11-25", question.question.version.?);
     try testing.expect(question.question.required);
 
-    try testing.expectEqualStrings("two callers", (try expectOwner(a, .{ .declined = .{ .id = 2, .why = "two callers" } })).declined.why);
     try testing.expectEqual(key, (try expectOwner(a, .{ .stopped_idle = .{ .key = key } })).stopped_idle.key);
     const complete = try expectOwner(a, .{ .elicitation_complete = .{ .key = key, .slot = 3 } });
     try testing.expectEqual(@as(u8, 3), complete.elicitation_complete.slot);
@@ -709,4 +716,93 @@ test "a truncated frame, an overlong length, bad JSON, an unknown type, and anot
     try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"call\",\"key\":\"short\",\"id\":1,\"tool\":\"t\"}}", .{version})));
     try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"call\",\"key\":\"00112233445566778899aabbccddeeff\",\"id\":-1,\"tool\":\"t\"}}", .{version})));
     try testing.expectError(error.Malformed, decode(a, try a.print("{{\"v\":{d},\"t\":\"phase\",\"key\":\"00112233445566778899aabbccddeeff\",\"phase\":\"sleeping\"}}", .{version})));
+}
+
+test "a slot above 255 is refused on every message that carries one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = "00112233445566778899aabbccddeeff";
+    // A same-user process can write any frame to the socket. The slot is a
+    // `u8`, so one above 255 is a malformed frame, never a cast.
+    for (256..258) |slot| {
+        const frames = [_][]const u8{
+            try a.print("{{\"v\":{d},\"t\":\"answer\",\"key\":\"{s}\",\"slot\":{d},\"n\":1,\"action\":\"accept\"}}", .{ version, key, slot }),
+            try a.print("{{\"v\":{d},\"t\":\"question\",\"key\":\"{s}\",\"slot\":{d},\"n\":1,\"params\":\"{{}}\"}}", .{ version, key, slot }),
+            try a.print("{{\"v\":{d},\"t\":\"elicitation_complete\",\"key\":\"{s}\",\"slot\":{d}}}", .{ version, key, slot }),
+            try a.print("{{\"v\":{d},\"t\":\"elicit_withdrawn\",\"key\":\"{s}\",\"slot\":{d}}}", .{ version, key, slot }),
+        };
+        for (frames) |frame| try testing.expectError(error.Malformed, decode(a, frame));
+    }
+    // 255 is the last slot a frame may name.
+    try testing.expect((try decode(a, try a.print("{{\"v\":{d},\"t\":\"elicitation_complete\",\"key\":\"{s}\",\"slot\":255}}", .{ version, key }))) == .owner);
+}
+
+test "a frame nested past the limit is refused before it is parsed" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 100,000 levels is 200 KB, far under the frame cap, and would overflow
+    // the owner's stack in `std.json` if it were parsed.
+    const nested = text_utils.repeat("[", 100_000) ++ text_utils.repeat("]", 100_000);
+    const frame = try a.print("{{\"v\":{d},\"t\":\"bye\",\"x\":{s}}}", .{ version, nested[0..] });
+    try testing.expectError(error.Malformed, decode(a, frame));
+    // One level under the limit still reads.
+    const at_limit = text_utils.repeat("[", json_depth.max_depth - 2) ++ text_utils.repeat("]", json_depth.max_depth - 2);
+    try testing.expect((try decode(a, try a.print("{{\"v\":{d},\"t\":\"bye\",\"x\":{s}}}", .{ version, at_limit[0..] }))) == .client);
+}
+
+test "a tool page of nearly the message limit, dense in quotes, fits the frame cap" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: share_key.Key = "00112233445566778899aabbccddeeff".*;
+    // The server's JSON is at most the engine's message limit, and every one
+    // of these quotes is escaped again in the frame.
+    const escaped_quotes = mcp.limits.max_message_bytes / 2 - 8 * 1024;
+    var page: std.ArrayList(u8) = .empty;
+    try page.appendSlice(a, "[\"");
+    for (0..escaped_quotes) |_| try page.appendSlice(a, "\\\"");
+    try page.appendSlice(a, "\"]");
+    try testing.expect(page.items.len <= mcp.limits.max_message_bytes);
+
+    const frame = try encode(a, OwnerMessage{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = page.items } });
+    try testing.expect(frame.len > mcp.limits.max_message_bytes);
+    const back = try decode(a, frame[header_bytes..]);
+    try testing.expectEqualStrings(page.items, back.owner.tools.tools);
+}
+
+test "an owner wire frame decodes or is refused on fuzzed bytes, and what decodes writes back the same" {
+    try std.testing.fuzz({}, fuzzDecode, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"v\":2,\"t\":\"hello\",\"pid\":42}",
+            "{\"v\":2,\"t\":\"call\",\"key\":\"00112233445566778899aabbccddeeff\",\"id\":7,\"tool\":\"echo\",\"arguments\":\"{\\\"x\\\":1}\"}",
+            "{\"v\":2,\"t\":\"welcome\",\"owner\":5}",
+            "{\"v\":2,\"t\":\"tools\",\"key\":\"00112233445566778899aabbccddeeff\",\"ok\":true,\"fresh\":false,\"needs_auth\":false,\"tools\":\"[{\\\"name\\\":\\\"echo\\\"}]\"}",
+            "{\"v\":2,\"t\":\"called\",\"id\":4,\"outcome\":\"result\",\"maybe_ran\":false,\"timed_out\":false,\"oversized\":false}",
+            "{\"v\":2,\"t\":\"question\",\"key\":\"00112233445566778899aabbccddeeff\",\"slot\":256,\"n\":1,\"params\":\"{}\"}",
+            "{\"v\":2,\"t\":\"status\",\"key\":\"00112233445566778899aabbccddeeff\",\"phase\":\"ready\",\"exit_code\":256}",
+            "[]",
+        }) ++ @import("fuzz_corpus").mcp_owner_wire.*),
+    });
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [64 * 1024]u8 = undefined;
+    const frame_bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const message = decode(arena, frame_bytes) catch return;
+    // A frame that decodes is one this build writes: it encodes again and
+    // reads back as the same kind of message.
+    const reencoded = switch (message) {
+        .client => |m| try encode(arena, m),
+        .owner => |m| try encode(arena, m),
+    };
+    const again = try decode(arena, reencoded[header_bytes..]);
+    switch (again) {
+        .client => |m| try testing.expect(message == .client and std.meta.activeTag(message.client) == std.meta.activeTag(m)),
+        .owner => |m| try testing.expect(message == .owner and std.meta.activeTag(message.owner) == std.meta.activeTag(m)),
+    }
 }

@@ -23,6 +23,10 @@ const wire = owner_wire;
 /// The list for a server this adapter does not have, as `Engine.toolList` returns.
 const empty_list: tools.List = .{};
 
+/// How long a session waits for an owner to start and accept it. The owner's
+/// own start is all this covers; the server's start is the engine's later wait.
+const owner_start_wait_ms: u32 = 3_000;
+
 /// The bit that keeps a shared call's handle away from the engine's.
 const handle_base: engine.Handle = 0x8000_0000;
 
@@ -73,7 +77,7 @@ pub const Shared = struct {
     client: owner_client.Client,
     slots: std.ArrayList(Slot) = .empty,
     /// The owner's id for a call, to its server.
-    calls: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    calls: std.array_hash_map.Auto(u32, usize) = .empty,
     next_id: u32 = 1,
     /// Events built from the frame being taken; they share `arena`.
     pending: std.ArrayList(engine.Event) = .empty,
@@ -147,7 +151,7 @@ pub const Shared = struct {
                 break;
             };
             const id = found orelse break;
-            _ = s.calls.remove(id);
+            _ = s.calls.swapRemove(id);
             s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
                 .call = handle_base | id,
                 .outcome = .cancelled,
@@ -168,8 +172,7 @@ pub const Shared = struct {
         if (slot.stray_line) |v| s.gpa.free(v);
         _ = s.slots.orderedRemove(i);
         // The calls left point at slots after this one, which moved back.
-        var rest = s.calls.valueIterator();
-        while (rest.next()) |v| if (v.* > i) {
+        for (s.calls.values()) |*v| if (v.* > i) {
             v.* -= 1;
         };
     }
@@ -191,13 +194,12 @@ pub const Shared = struct {
         return &s.slots.items[i];
     }
 
-    /// Connects and registers the server, on the caller's thread. 3 s covers
-    /// the owner's own start; the server's start is the engine's later wait.
+    /// Connects and registers the server, on the caller's thread.
     fn ensure(s: *Shared, name: []const u8) Error!*Slot {
         const i = s.index(name) orelse return error.SharingUnavailable;
         const slot = &s.slots.items[i];
         if (slot.registered and !s.disconnected) return slot;
-        s.client.ensureReady(3_000) catch |err| switch (err) {
+        s.client.ensureReady(owner_start_wait_ms) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 debug_trace.logf("mcp", "shared server unavailable server={s} reason={s}", .{ name, @errorName(err) });
@@ -256,11 +258,11 @@ pub const Shared = struct {
         const id = s.next_id;
         s.next_id += 1;
         try s.calls.put(s.gpa, id, s.index(name).?);
-        errdefer _ = s.calls.remove(id);
+        errdefer _ = s.calls.swapRemove(id);
         s.client.send(.{ .call = .{ .key = slot.key, .id = id, .tool = tool, .arguments = arguments } }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                _ = s.calls.remove(id);
+                _ = s.calls.swapRemove(id);
                 return error.SharingUnavailable;
             },
         };
@@ -369,13 +371,22 @@ pub const Shared = struct {
                     .timed_out = false,
                     .answer = null,
                 } },
-            }) catch return;
+            }) catch |err| {
+                // The call's end is gone: its session waits out the deadline.
+                debug_trace.logf("mcp", "shared lost call dropped server={s} id={d} reason=out of memory err={s}", .{ s.slots.items[entry.value_ptr.*].name, entry.key_ptr.*, @errorName(err) });
+                continue;
+            };
         }
         s.calls.clearRetainingCapacity();
         for (s.slots.items) |*slot| {
             if (!slot.needing) continue;
             slot.needing = false;
-            s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = false, .fresh = false } } } }) catch return;
+            s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = false, .fresh = false } } } }) catch |err| {
+                // The failed listing never reaches the session, so its request
+                // for tools waits for the next list instead.
+                debug_trace.logf("mcp", "shared failed listing dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                continue;
+            };
         }
     }
 
@@ -451,18 +462,25 @@ pub const Shared = struct {
                     debug_trace.logf("mcp", "shared server frame dropped kind=called reason=unknown call id={d}", .{called.id});
                     return;
                 };
-                _ = s.calls.remove(called.id);
+                _ = s.calls.swapRemove(called.id);
                 const slot = &s.slots.items[i];
                 var answer: ?tools.Call = null;
+                var unreadable = false;
                 if (called.answer) |text| {
                     if (json_decode.parseFromSlice(tools.Call, a, text, .{})) |parsed| {
                         answer = parsed.value;
-                    } else |_| {}
+                    } else |err| {
+                        // The owner's answer is this build's own JSON, so this
+                        // is a broken frame: the call ends as malformed now
+                        // rather than waiting out its deadline.
+                        debug_trace.logf("mcp", "shared call answer dropped server={s} reason=malformed answer err={s}", .{ slot.name, @errorName(err) });
+                        unreadable = true;
+                    }
                 }
                 s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
                     .call = handle_base | called.id,
-                    .outcome = called.outcome,
-                    .maybe_ran = called.maybe_ran,
+                    .outcome = if (unreadable) .malformed else called.outcome,
+                    .maybe_ran = if (unreadable) true else called.maybe_ran,
                     .timed_out = called.timed_out,
                     .answer = answer,
                     .oversized = called.oversized,
@@ -521,7 +539,6 @@ pub const Shared = struct {
                 };
                 s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit_withdrawn = gone.slot } } }) catch return;
             },
-            .declined => {},
             .stopped_idle => |stopped| {
                 const i = s.indexByKey(stopped.key) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=stopped_idle reason=unknown key", .{});

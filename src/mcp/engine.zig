@@ -744,8 +744,9 @@ fn sameEnv(a: ?*const std.process.Environ.Map, b: ?*const std.process.Environ.Ma
 
 /// Whether two servers launch the same way: the same name, transport, argv,
 /// environment, directory, auth, and limits. A reload keeps the running one
-/// when this holds (`keeps`), and `src/core/mcp_host/share_key.zig` hashes the
-/// same fields, without the name, so two sessions agree on what one copy is.
+/// when this holds (`keeps`), and `src/core/mcp_host/share_key.zig` hashes
+/// exactly those fields, the name included, so two sessions agree on what one
+/// copy is.
 pub fn same(a: Config, b: Config) bool {
     if (!std.mem.eql(u8, a.name, b.name) or std.meta.activeTag(a.transport) != std.meta.activeTag(b.transport)) return false;
     switch (a.transport) {

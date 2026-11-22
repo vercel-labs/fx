@@ -33,6 +33,11 @@ pub const lock_name = "mcp-owner-v1.lock";
 pub const exit_grace_ms: i64 = 500;
 const poll_ms = 20;
 
+/// The most shell events waiting for the owner loop. A session that sends
+/// frames faster than the loop takes them loses its own connection rather
+/// than growing this list without a limit.
+const max_pending_events: usize = 4096;
+
 pub fn isModeRaw(raw_args: []const [*:0]const u8) bool {
     return raw_args.len == 3 and std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), mode);
 }
@@ -103,18 +108,26 @@ const Connection = struct {
     owner: *Owner,
     id: core.ClientId,
     stream: std.Io.net.Stream,
+    /// This connection's reader and writer, as tasks of its own group: the
+    /// owner cancels and awaits both to end a connection, and a task that
+    /// cannot start lets the one that did end the same way.
+    tasks: std.Io.Group = .init,
+    /// How many of its tasks still run. The owner frees the connection, and
+    /// lets its id be used again, at zero.
+    running: std.atomic.Value(u8) = .init(0),
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     queue: std.ArrayList([]u8) = .empty,
     queued_bytes: usize = 0,
     closed: bool = false,
-    /// The descriptor is closed: its writer closed it, so it must not be
-    /// shut down or closed again.
-    socket_closed: bool = false,
     /// Set once, so the route table hears about the close once.
     gone: bool = false,
-    writer: ?std.Thread = null,
-    reader: ?std.Thread = null,
+    /// The route table applied this client's leave; the owner loop sets it.
+    left_applied: bool = false,
+
+    fn endTask(c: *Connection) void {
+        _ = c.running.fetchSub(1, .acq_rel);
+    }
 };
 
 const Owner = struct {
@@ -124,14 +137,13 @@ const Owner = struct {
     mutex: std.Io.Mutex = .init,
     events: std.ArrayList(ShellEvent) = .empty,
     connections: [core.max_clients]?*Connection = @splat(null),
-    next_client: u32 = 1,
     open: u32 = 0,
     last_open_ms: i64 = 0,
     /// Each registered key's config, owned here until the owner exits.
     /// Readers add one from their own threads, so `configs_mutex` guards
     /// every look and change; the owner loop reads under it too, since a put
     /// may rehash and move the entries.
-    configs: std.StringHashMapUnmanaged(OwnedConfig) = .empty,
+    configs: std.array_hash_map.String(OwnedConfig) = .empty,
     configs_mutex: std.Io.Mutex = .init,
     /// The engine's configs, in slot order. Their strings live in
     /// `engine_arena`, because the scratch arena that builds one is reset
@@ -149,12 +161,48 @@ const Owner = struct {
     }
 
     fn push(o: *Owner, event: ShellEvent) void {
+        var dropped = event;
         o.mutex.lockUncancelable(o.io);
-        defer o.mutex.unlock(o.io);
-        o.events.append(o.gpa, event) catch {
-            var dropped = event;
-            dropped.deinit(o.gpa);
-            debug_trace.logf("mcp-owner", "owner event dropped reason=out of memory", .{});
+        if (o.events.items.len < max_pending_events) {
+            o.events.append(o.gpa, event) catch |err| {
+                o.mutex.unlock(o.io);
+                dropped.deinit(o.gpa);
+                debug_trace.logf("mcp-owner", "owner event dropped reason=out of memory client={?d} err={s}", .{ if (clientOf(event)) |id| @backingInt(id) else null, @errorName(err) });
+                return;
+            };
+            o.mutex.unlock(o.io);
+            return;
+        }
+        const pending = o.events.items.len;
+        o.mutex.unlock(o.io);
+        // The list is at its cap: this frame's session is sending faster than
+        // the owner loop takes its events, so that one connection goes and its
+        // session runs every server itself from now on.
+        const client = clientOf(dropped);
+        dropped.deinit(o.gpa);
+        debug_trace.logf("mcp-owner", "owner event dropped reason=pending events at their cap client={?d} pending={d}", .{ if (client) |id| @backingInt(id) else null, pending });
+        if (client) |id| if (o.connectionOf(id)) |conn| o.disconnect(conn);
+    }
+
+    /// The client a shell event came from, for a trace line when it is dropped.
+    fn clientOf(event: ShellEvent) ?core.ClientId {
+        return switch (event) {
+            .call => |c| c.client,
+            .respond => |r| r.client,
+            .answer => |a| a.client,
+            .core => |e| switch (e) {
+                .hello => |id| id,
+                .registered => |r| r.client,
+                .unregister => |u| u.client,
+                .gone => |id| id,
+                .bye => |id| id,
+                .need => |n| n.client,
+                .call => |c| c.client,
+                .cancel => |c| c.client,
+                .respond => |r| r.client,
+                .answer => |a| a.client,
+                else => null,
+            },
         };
     }
 
@@ -175,27 +223,79 @@ const Owner = struct {
     }
 
     fn addConnection(o: *Owner, stream: std.Io.net.Stream) !void {
+        // Before any lock: an out-of-memory return must not leave one held.
+        // The connection owns the stream from here, so every later failure
+        // closes it through the connection itself.
+        const conn = o.gpa.create(Connection) catch |err| {
+            stream.close(o.io);
+            return err;
+        };
+        errdefer o.gpa.destroy(conn);
+        conn.* = .{ .owner = o, .id = undefined, .stream = stream };
+
         o.mutex.lockUncancelable(o.io);
-        if (o.next_client > core.max_clients) {
+        const slot = o.freeSlotLocked() orelse {
             o.mutex.unlock(o.io);
+            stream.close(o.io);
             return error.TooManyClients;
-        }
-        const id: core.ClientId = @fromBackingInt(o.next_client);
-        o.next_client += 1;
-        const conn = try o.gpa.create(Connection);
-        conn.* = .{ .owner = o, .id = id, .stream = stream };
-        o.connections[@backingInt(id) - 1] = conn;
+        };
+        conn.id = @fromBackingInt(@intCast(slot + 1));
+        o.connections[slot] = conn;
         o.open += 1;
         o.last_open_ms = o.now();
         o.mutex.unlock(o.io);
+
         // A client checks the wire version before it says anything else, so
         // the owner names itself first.
         if (wire.encode(o.gpa, wire.OwnerMessage{ .welcome = .{ .owner = @intCast(std.c.getpid()) } })) |frame| {
-            o.enqueue(conn, frame);
+            o.enqueue(conn, frame, "welcome");
         } else |_| {}
-        errdefer o.disconnect(conn);
-        conn.reader = try std.Thread.spawn(.{}, readerLoop, .{conn});
-        conn.writer = try std.Thread.spawn(.{}, writerLoop, .{conn});
+
+        // Both tasks go in the connection's own group. If the second cannot
+        // start, the group is cancelled and awaited, which ends the first even
+        // when it is blocked in a read: the socket is never closed under it.
+        conn.running.store(2, .release);
+        conn.tasks.concurrent(o.io, readerTask, .{conn}) catch |err| {
+            _ = conn.running.fetchSub(1, .acq_rel);
+            debug_trace.logf("mcp-owner", "owner connection task not started client={d} which=reader err={s}", .{ @backingInt(conn.id), @errorName(err) });
+            o.disconnect(conn);
+            return error.TooManyClients;
+        };
+        conn.tasks.concurrent(o.io, writerTask, .{conn}) catch |err| {
+            _ = conn.running.fetchSub(1, .acq_rel);
+            debug_trace.logf("mcp-owner", "owner connection task not started client={d} which=writer err={s}", .{ @backingInt(conn.id), @errorName(err) });
+            o.disconnect(conn);
+            // The reader is blocked in the socket: cancel ends it there.
+            conn.tasks.cancel(o.io);
+            return error.TooManyClients;
+        };
+    }
+
+    /// An id nothing holds any more: its connection's tasks ended and the
+    /// route table applied its leave, so no route, call, or question can still
+    /// name it.
+    fn freeSlotLocked(o: *Owner) ?usize {
+        for (o.connections, 0..) |maybe, index| if (maybe == null) return index;
+        return null;
+    }
+
+    /// Frees every connection whose tasks ended and whose leave the route
+    /// table applied, and lets its id be used again.
+    fn reapConnections(o: *Owner) void {
+        var index: usize = 0;
+        while (index < o.connections.len) : (index += 1) {
+            const conn = o.connections[index] orelse continue;
+            if (!conn.left_applied or conn.running.load(.acquire) != 0) continue;
+            o.mutex.lockUncancelable(o.io);
+            o.connections[index] = null;
+            o.mutex.unlock(o.io);
+            // Both tasks ran: the group has nothing left to wait for.
+            conn.tasks.await(o.io) catch {};
+            for (conn.queue.items) |frame| o.gpa.free(frame);
+            conn.queue.deinit(o.gpa);
+            conn.stream.close(o.io);
+            o.gpa.destroy(conn);
+        }
     }
 
     /// Marks the connection closed, tells the route table once, and wakes its
@@ -218,11 +318,13 @@ const Owner = struct {
         o.mutex.unlock(o.io);
     }
 
-    fn enqueue(o: *Owner, conn: *Connection, frame: []u8) void {
+    fn enqueue(o: *Owner, conn: *Connection, frame: []u8, what: []const u8) void {
         conn.mutex.lockUncancelable(o.io);
+        // Two frames of the largest size a server can produce, so a reader
+        // that falls behind gets one whole frame rather than a cut one.
         const over = conn.queued_bytes + frame.len > 2 * wire.max_frame_bytes;
         if (conn.closed or over) {
-            if (!conn.closed and over) debug_trace.logf("mcp-owner", "owner client disconnected reason=write queue over its cap", .{});
+            if (!conn.closed and over) debug_trace.logf("mcp-owner", "owner client disconnected reason=write queue over its cap client={d} frame={s} bytes={d}", .{ @backingInt(conn.id), what, frame.len });
             conn.closed = true;
             conn.changed.broadcast(o.io);
             conn.mutex.unlock(o.io);
@@ -230,9 +332,12 @@ const Owner = struct {
             if (over and !conn.gone) o.disconnect(conn);
             return;
         }
-        conn.queue.append(o.gpa, frame) catch {
+        conn.queue.append(o.gpa, frame) catch |err| {
             conn.mutex.unlock(o.io);
             o.gpa.free(frame);
+            // What this frame carried (a call's end, a status, a tool page) is
+            // gone with it; the session hears nothing more for it.
+            debug_trace.logf("mcp-owner", "owner frame dropped reason=queue append err={s} client={d} frame={s} bytes={d}", .{ @errorName(err), @backingInt(conn.id), what, frame.len });
             return;
         };
         conn.queued_bytes += frame.len;
@@ -243,36 +348,16 @@ const Owner = struct {
     fn closeAll(o: *Owner) void {
         for (o.connections) |maybe| {
             const conn = maybe orelse continue;
-            conn.mutex.lockUncancelable(o.io);
-            const open = !conn.socket_closed;
-            conn.socket_closed = true;
-            conn.closed = true;
-            conn.changed.broadcast(o.io);
-            conn.mutex.unlock(o.io);
-            // The peer may have closed its end already, and there is nothing
-            // left to shut down then.
-            if (open) conn.stream.shutdown(o.io, .both) catch {};
-            if (conn.reader) |thread| thread.join();
-            if (conn.writer) |thread| thread.join();
+            // Cancel ends a reader blocked in the socket and a writer waiting
+            // for a frame, and waits for both, so the socket is never closed
+            // under a read.
+            conn.tasks.cancel(o.io);
             for (conn.queue.items) |frame| o.gpa.free(frame);
             conn.queue.deinit(o.gpa);
+            conn.stream.close(o.io);
             o.gpa.destroy(conn);
         }
         o.connections = @splat(null);
-    }
-
-    /// Stops every connection's socket, so a reader blocked in `read` returns
-    /// and a writer's next write fails: the threads can then be joined.
-    fn shutdownAll(o: *Owner) void {
-        for (o.connections) |maybe| {
-            const conn = maybe orelse continue;
-            conn.mutex.lockUncancelable(o.io);
-            const open = !conn.socket_closed;
-            if (open) conn.socket_closed = true;
-            conn.mutex.unlock(o.io);
-            // As in `closeAll`: the peer may have closed its end already.
-            if (open) conn.stream.shutdown(o.io, .both) catch {};
-        }
     }
 };
 
@@ -355,12 +440,6 @@ fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) All
         .auth = auth,
         .timeouts = timeouts,
     };
-}
-
-fn gate() @FieldType(engine.Options, "gate") {
-    var config: @FieldType(engine.Options, "gate") = .{ .idle_ms = idle_control.idleMs() };
-    if (config.idle_ms != 0) config.stable_ms = @min(config.stable_ms, config.idle_ms);
-    return config;
 }
 
 fn allowAll(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
@@ -449,7 +528,7 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .engine_arena = .init(gpa) };
     defer owner.engine_arena.deinit();
     owner.last_open_ms = owner.now();
-    const loop = std.Thread.spawn(.{}, ownerLoop, .{&owner}) catch |err| {
+    var loop = io.concurrent(ownerLoopTask, .{&owner}) catch |err| {
         listener.deinit(io);
         listening = false;
         // The socket this start just made may exist to remove; nothing depends
@@ -467,22 +546,21 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
             debug_trace.logf("mcp-owner", "owner accept failed err={s}", .{@errorName(err)});
             continue;
         };
+        // The connection owns the stream once it is taken, and closes it on
+        // any failure of its own.
         owner.addConnection(stream) catch |err| {
             debug_trace.logf("mcp-owner", "owner connection refused err={s}", .{@errorName(err)});
-            stream.close(io);
         };
     }
 
-    // The order is fixed: the listening socket closes, every connection's
-    // socket is shut down so its reader returns and its writer stops, their
-    // threads are joined, the owner loop ends (and with it the engine, which
-    // stops every server), the socket file goes, and the lock is released as
-    // this function returns.
+    // The order is fixed: the listening socket closes, the owner loop ends
+    // (and with it the engine, which stops every server), each connection's
+    // tasks are cancelled and awaited, its socket closes, the socket file
+    // goes, and the lock is released as this function returns.
     listener.deinit(io);
     listening = false;
-    owner.shutdownAll();
     owner.stop.store(true, .release);
-    loop.join();
+    loop.await(io) catch {}; // It ends on the stop flag; a cancel of it lands here, with nothing left to do.
     owner.closeAll();
     // The owner is stopping: the socket it served may already be gone, and the
     // next owner deletes any file left here before it listens.
@@ -497,13 +575,17 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     owner.events.deinit(gpa);
 }
 
+fn ownerLoopTask(owner: *Owner) std.Io.Cancelable!void {
+    ownerLoop(owner);
+}
+
 fn ownerLoop(owner: *Owner) void {
     const io = owner.io;
     const gpa = owner.gpa;
     var engine_value: engine.Engine = undefined;
     engine_value.init(io, gpa, .{ .context = owner, .allow = allowAll, .log = logStderr }, .{
         .client = .{ .info = .{ .name = "fx", .version = "owner" }, .capabilities = "{\"elicitation\":{\"form\":{},\"url\":{}}}" },
-        .gate = gate(),
+        .gate = mcp.core.engine.limitsFor(idle_control.idleMs()),
     }, &.{}) catch |err| {
         debug_trace.logf("mcp-owner", "owner engine did not start err={s}", .{@errorName(err)});
         owner.stop.store(true, .release);
@@ -524,6 +606,11 @@ fn ownerLoop(owner: *Owner) void {
             if (taken.items.len == 0) break;
             for (taken.items) |*shell_event| {
                 const event = shell_event.event();
+                // The route table applied this client's leave: its id can be
+                // used again once its tasks have ended too.
+                if (event == .gone) {
+                    if (owner.connectionOf(event.gone)) |conn| conn.left_applied = true;
+                }
                 var output: core.Output = .{};
                 core.step(&state, event, &output);
                 _ = scratch.reset(.retain_capacity);
@@ -538,12 +625,63 @@ fn ownerLoop(owner: *Owner) void {
         } else |err| {
             debug_trace.logf("mcp-owner", "owner engine step failed err={s}", .{@errorName(err)});
         }
+        owner.reapConnections();
         owner.mutex.lockUncancelable(io);
         const open = owner.open;
         const last = owner.last_open_ms;
         owner.mutex.unlock(io);
         if (open == 0 and owner.now() - last >= exit_grace_ms) owner.stop.store(true, .release);
     }
+}
+
+/// What a frame that could not be built was about, for its trace line.
+fn frameAbout(a: Allocator, message: wire.OwnerMessage) Allocator.Error![]const u8 {
+    return switch (message) {
+        .welcome => |m| a.print("owner={d}", .{m.owner}),
+        .phase => |m| a.print("key={s}", .{m.key[0..]}),
+        .tools => |m| a.print("key={s}", .{m.key[0..]}),
+        .question => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
+        .elicitation_complete => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
+        .elicit_withdrawn => |m| a.print("key={s} slot={d}", .{ m.key[0..], m.slot }),
+        .stopped_idle => |m| a.print("key={s}", .{m.key[0..]}),
+        .status => |m| a.print("key={s}", .{m.key[0..]}),
+        .called => |m| a.print("call={d}", .{m.id}),
+        .progress => |m| a.print("call={d}", .{m.id}),
+        .input => |m| a.print("call={d}", .{m.id}),
+    };
+}
+
+/// A frame to send in place of one that can't be built: a call's end as a
+/// small failure, so its session ends the call rather than waiting out its
+/// deadline. Null when nothing can stand in.
+fn frameThatEndsTheCall(message: wire.OwnerMessage) ?wire.OwnerMessage {
+    return switch (message) {
+        .called => |m| .{
+            .called = .{
+                .id = m.id,
+                .outcome = .malformed,
+                // The answer existed, so the call ran unless the owner said it
+                // didn't.
+                .maybe_ran = m.maybe_ran or m.outcome == .result or m.outcome == .failure,
+                .timed_out = false,
+            },
+        },
+        else => null,
+    };
+}
+
+/// Sends one frame. A frame that can't be built is logged with what it was
+/// about, and a call's end is replaced by one the session can read.
+fn sendFrame(owner: *Owner, conn: *Connection, message: wire.OwnerMessage, a: Allocator) void {
+    const what = @tagName(std.meta.activeTag(message));
+    const frame = wire.encode(owner.gpa, message) catch |err| {
+        debug_trace.logf("mcp-owner", "owner frame dropped kind={s} {s} err={s}", .{ what, frameAbout(a, message) catch "?", @errorName(err) });
+        const end = frameThatEndsTheCall(message) orelse return;
+        const small = wire.encode(owner.gpa, end) catch return;
+        owner.enqueue(conn, small, "called");
+        return;
+    };
+    owner.enqueue(conn, frame, what);
 }
 
 fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, effects: []const core.Effect) void {
@@ -553,11 +691,7 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             const conn = owner.connectionOf(send.to) orelse {
                 continue;
             };
-            const frame = wire.encode(owner.gpa, send.message) catch |err| {
-                debug_trace.logf("mcp-owner", "owner frame not built err={s}", .{@errorName(err)});
-                continue;
-            };
-            owner.enqueue(conn, frame);
+            sendFrame(owner, conn, send.message, a);
         },
         .broadcast => |broadcast| {
             const clients = core.clientsOf(state, broadcast.key) orelse continue;
@@ -567,8 +701,7 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
                 const id: core.ClientId = @fromBackingInt(@as(u32, @intCast(index + 1)));
                 const conn = owner.connectionOf(id) orelse continue;
                 const message = broadcastMessage(owner, engine_value, a, broadcast.key, broadcast.what) orelse continue;
-                const frame = wire.encode(owner.gpa, message) catch continue;
-                owner.enqueue(conn, frame);
+                sendFrame(owner, conn, message, a);
             }
         },
         .register_slot => |slot| {
@@ -614,7 +747,16 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             };
         },
         .respond => |respond| {
-            const values = std.json.parseFromSliceLeaky([]const []const u8, a, respond.values, .{}) catch continue;
+            const values = std.json.parseFromSliceLeaky([]const []const u8, a, respond.values, .{}) catch |err| {
+                // The session's answer to a 2026 input request can't be read:
+                // end the call instead of leaving it waiting for input it will
+                // never get.
+                debug_trace.logf("mcp-owner", "owner respond dropped reason=malformed values handle={d} err={s}", .{ respond.handle, @errorName(err) });
+                engine_value.cancel(respond.handle) catch |cancel_err| {
+                    debug_trace.logf("mcp-owner", "owner cancel not sent handle={d} err={s}", .{ respond.handle, @errorName(cancel_err) });
+                };
+                continue;
+            };
             // A session's answer to a 2026 input request, dropped when the
             // engine doesn't take it: the call then ends as unsupported input.
             engine_value.respond(respond.handle, values) catch |err| {
@@ -771,18 +913,29 @@ fn requestsJson(a: Allocator, requests: []const mcp.mrtr.Request) []const u8 {
     return out.written();
 }
 
-fn readerLoop(conn: *Connection) void {
+/// One connection's reader, as a task: a read blocked on its socket ends with
+/// `error.Canceled` when the owner cancels it, with no need to close the
+/// socket under it.
+fn readerTask(conn: *Connection) std.Io.Cancelable!void {
+    defer conn.endTask();
+    readerLoop(conn) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        conn.owner.disconnect(conn);
+    };
+}
+
+fn readerLoop(conn: *Connection) !void {
     const owner = conn.owner;
     var header: [wire.header_bytes]u8 = undefined;
     while (true) {
-        readExact(conn, &header) catch return owner.disconnect(conn);
-        const length = wire.readLength(&header) catch return owner.disconnect(conn);
-        const payload = owner.gpa.alloc(u8, length) catch return owner.disconnect(conn);
+        try readExact(conn, &header);
+        const length = wire.readLength(&header) catch return error.Malformed;
+        const payload = owner.gpa.alloc(u8, length) catch return error.OutOfMemory;
         defer owner.gpa.free(payload);
-        readExact(conn, payload) catch return owner.disconnect(conn);
+        try readExact(conn, payload);
         var arena = std.heap.ArenaAllocator.init(owner.gpa);
         defer arena.deinit();
-        const message = wire.decode(arena.allocator(), payload) catch return owner.disconnect(conn);
+        const message = wire.decode(arena.allocator(), payload) catch return error.Malformed;
         switch (message) {
             .client => |client| switch (client) {
                 .hello => owner.push(.{ .core = .{ .hello = conn.id } }),
@@ -793,83 +946,82 @@ fn readerLoop(conn: *Connection) void {
                 .need => |need| owner.push(.{ .core = .{ .need = .{ .client = conn.id, .key = need.key } } }),
                 .unregister => |left| owner.push(.{ .core = .{ .unregister = .{ .client = conn.id, .key = left.key } } }),
                 .call => |call| {
-                    const tool = owner.gpa.dupe(u8, call.tool) catch return owner.disconnect(conn);
+                    const tool = owner.gpa.dupe(u8, call.tool) catch return error.OutOfMemory;
                     const arguments = if (call.arguments) |args| owner.gpa.dupe(u8, args) catch {
                         owner.gpa.free(tool);
-                        return owner.disconnect(conn);
+                        return error.OutOfMemory;
                     } else null;
                     owner.push(.{ .call = .{ .client = conn.id, .id = call.id, .key = call.key, .tool = tool, .arguments = arguments } });
                 },
                 .cancel => |cancel| owner.push(.{ .core = .{ .cancel = .{ .client = conn.id, .id = cancel.id } } }),
                 .respond => |respond| {
-                    const values = owner.gpa.dupe(u8, respond.values) catch return owner.disconnect(conn);
+                    const values = owner.gpa.dupe(u8, respond.values) catch return error.OutOfMemory;
                     owner.push(.{ .respond = .{ .client = conn.id, .id = respond.id, .values = values } });
                 },
                 .answer => |answer| {
-                    const content = if (answer.content) |text| owner.gpa.dupe(u8, text) catch return owner.disconnect(conn) else null;
+                    const content = if (answer.content) |text| owner.gpa.dupe(u8, text) catch return error.OutOfMemory else null;
                     owner.push(.{ .answer = .{ .client = conn.id, .key = answer.key, .slot = answer.slot, .n = answer.n, .action = answer.action, .content = content } });
                 },
                 .bye => {
                     owner.push(.{ .core = .{ .bye = conn.id } });
-                    return owner.disconnect(conn);
+                    return error.Left;
                 },
             },
             // The owner's messages are not for it.
-            .owner => return owner.disconnect(conn),
+            .owner => return error.WrongDirection,
         }
     }
 }
 
-fn writerLoop(conn: *Connection) void {
+/// One connection's writer, as a task. It waits for a frame or for the
+/// connection to close, and both that wait and a write can be cancelled.
+fn writerTask(conn: *Connection) std.Io.Cancelable!void {
+    defer conn.endTask();
     const owner = conn.owner;
     const io = owner.io;
+    var buffer: [4096]u8 = undefined;
     while (true) {
         conn.mutex.lockUncancelable(io);
-        while (conn.queue.items.len == 0 and !conn.closed) conn.changed.waitUncancelable(io, &conn.mutex);
+        while (conn.queue.items.len == 0 and !conn.closed) {
+            conn.changed.wait(io, &conn.mutex) catch |err| {
+                conn.mutex.unlock(io);
+                return err;
+            };
+        }
         if (conn.queue.items.len == 0 and conn.closed) {
             conn.mutex.unlock(io);
-            break;
+            return;
         }
         const frame = conn.queue.orderedRemove(0);
         conn.queued_bytes -= frame.len;
         conn.mutex.unlock(io);
         defer owner.gpa.free(frame);
-        writeAll(conn, frame) catch {
+        var writer = conn.stream.writer(io, &buffer);
+        writer.interface.writeAll(frame) catch {
+            const cause = writer.err orelse error.WriteFailed;
+            if (cause == error.Canceled) return error.Canceled;
+            debug_trace.logf("mcp-owner", "owner write failed client={d} err={s}", .{ @backingInt(conn.id), @errorName(cause) });
             owner.disconnect(conn);
-            break;
+            return;
+        };
+        writer.interface.flush() catch {
+            const cause = writer.err orelse error.WriteFailed;
+            if (cause == error.Canceled) return error.Canceled;
+            debug_trace.logf("mcp-owner", "owner write failed client={d} err={s}", .{ @backingInt(conn.id), @errorName(cause) });
+            owner.disconnect(conn);
+            return;
         };
     }
-    conn.mutex.lockUncancelable(io);
-    conn.socket_closed = true;
-    conn.mutex.unlock(io);
-    conn.stream.close(io);
 }
 
 fn readExact(conn: *Connection, buffer: []u8) !void {
     const io = conn.owner.io;
     var read: usize = 0;
     while (read < buffer.len) {
-        const n = std.posix.read(conn.stream.socket.handle, buffer[read..]) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        if (n == 0) return error.Closed;
-        read += n;
-    }
-    _ = io;
-}
-
-fn writeAll(conn: *Connection, bytes: []const u8) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const rc = std.c.write(conn.stream.socket.handle, bytes[written..].ptr, bytes.len - written);
-        if (rc < 0) {
-            const errno = std.posix.errno(rc);
-            if (errno == .INTR or errno == .AGAIN) continue;
-            return error.WriteFailed;
-        }
-        if (rc == 0) return error.Closed;
-        written += @intCast(rc);
+        var data = [_][]u8{buffer[read..]};
+        const result = try conn.stream.readWithControl(io, &data, &.{});
+        if (result.data_len == 0) return error.Closed;
+        read += result.data_len;
     }
 }
 
@@ -1032,6 +1184,126 @@ fn registerFor(c: *TestClient, server: []const u8) !void {
         .ask_form = true,
         .ask_url = true,
     } });
+}
+
+test "cancelling a connection's reader ends it without closing the socket" {
+    // The owner relies on this: a reader blocked in a socket read ends when
+    // its task is cancelled, so a socket is never closed under the read.
+    const io = testing.io;
+    const path = "/tmp/fx-owner-cancel-test.sock";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {}; // A file an earlier run left; often there is none.
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {}; // Cleanup only: nothing is asserted on it.
+    var address = try std.Io.net.UnixAddress.init(path);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    const peer = try address.connect(io);
+    defer peer.close(io);
+    const stream = try listener.accept(io);
+    var closed = false;
+    defer if (!closed) stream.close(io);
+
+    const Attempt = struct {
+        err: ?anyerror = null,
+        in_read: std.atomic.Value(bool) = .init(false),
+
+        fn run(s: std.Io.net.Stream, attempt: *@This()) void {
+            var buffer: [64]u8 = undefined;
+            var data = [_][]u8{buffer[0..]};
+            attempt.in_read.store(true, .release);
+            _ = s.readWithControl(testing.io, &data, &.{}) catch |err| {
+                attempt.err = err;
+                return;
+            };
+        }
+    };
+    var attempt: Attempt = .{};
+    var task = try io.concurrent(Attempt.run, .{ stream, &attempt });
+    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5_000;
+    while (!attempt.in_read.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).toMilliseconds() > deadline) return error.ReaderNeverStarted;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    task.cancel(io);
+    try testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started < 2_000);
+    try testing.expect(attempt.err != null and attempt.err.? == error.Canceled);
+    // The descriptor is still open: the peer's bytes still arrive.
+    try testing.expect(std.c.write(peer.socket.handle, "hi".ptr, 2) == 2);
+    var buffer: [8]u8 = undefined;
+    var data = [_][]u8{buffer[0..]};
+    const result = try stream.readWithControl(io, &data, &.{});
+    try testing.expectEqualStrings("hi", buffer[0..result.data_len]);
+    closed = true;
+    stream.close(io);
+}
+
+test "an owner takes 300 connections in turn and still serves a new one" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    // More connections than the table holds: each one's state is freed and
+    // its id used again once both its tasks ended and the leave was applied.
+    for (0..300) |_| {
+        var client = try TestClient.connect(path);
+        defer client.close();
+        try registerFor(&client, fixture.server);
+        try client.send(.bye);
+        // The owner loop ends the tasks and applies the leave on its next turn.
+        try testing.io.sleep(.fromMilliseconds(30), .awake);
+    }
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try registerFor(&client, fixture.server);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try client.send(.{ .call = .{ .key = test_key, .id = 1, .tool = "echo", .arguments = "{\"text\":\"pid\"}" } });
+    const called = try client.called(a, 1, 10_000);
+    try testing.expectEqual(engine.Outcome.result, called.called.outcome);
+
+    client.close();
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+test "the event list's cap drops the frame and closes the connection that sent it" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .engine_arena = .init(alloc) };
+    defer owner.engine_arena.deinit();
+    defer {
+        for (owner.events.items) |*event| event.deinit(alloc);
+        owner.events.deinit(alloc);
+    }
+    var conn: Connection = .{ .owner = &owner, .id = @fromBackingInt(1), .stream = undefined };
+    owner.connections[0] = &conn;
+
+    for (0..max_pending_events) |_| owner.push(.{ .core = .{ .hello = conn.id } });
+    try testing.expectEqual(max_pending_events, owner.events.items.len);
+    try testing.expect(!conn.gone);
+    // One more from this client: the list stays at its cap and the connection
+    // that overran it goes, so its session runs every server itself.
+    owner.push(.{ .core = .{ .hello = conn.id } });
+    try testing.expectEqual(max_pending_events, owner.events.items.len);
+    try testing.expect(conn.gone and conn.closed);
+    owner.connections[0] = null;
 }
 
 test "two clients registered for one key share one server process" {
@@ -1272,6 +1544,21 @@ test "a registered client hears connecting and ready before the tool list" {
         }
     }
     return error.NoToolsFrame;
+}
+
+test "a call's end that cannot be built is replaced by one that ends the call" {
+    // The answer did not fit a frame, so the session gets a small end instead
+    // of waiting out the call's deadline.
+    const end = frameThatEndsTheCall(.{ .called = .{ .id = 9, .outcome = .result, .maybe_ran = false, .timed_out = false, .answer = "{}" } }).?;
+    try testing.expectEqual(@as(u32, 9), end.called.id);
+    try testing.expectEqual(engine.Outcome.malformed, end.called.outcome);
+    try testing.expect(end.called.maybe_ran);
+    try testing.expect(end.called.answer == null);
+    const frame = try wire.encode(testing.allocator, end);
+    defer testing.allocator.free(frame);
+    try testing.expect(frame.len < 1024);
+    // A message that names no call has nothing to stand in.
+    try testing.expect(frameThatEndsTheCall(.{ .progress = .{ .id = 9, .progress = 0.5 } }) == null);
 }
 
 test "a failing server's status reaches a client before the phase frame that ends its wait" {

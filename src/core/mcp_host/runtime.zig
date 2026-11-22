@@ -244,12 +244,6 @@ pub const Share = struct {
 /// The gate's limits for an idle limit: a server quiet for that long has
 /// stayed up, so a limit below `stable_ms` lowers it too, and an idle stop
 /// never waits on it (`tests/tla/mcp/Engine.tla` IdleFire).
-fn gateFor(idle_ms: u32) @FieldType(mcp.engine.Options, "gate") {
-    var gate: @FieldType(mcp.engine.Options, "gate") = .{ .idle_ms = idle_ms };
-    if (idle_ms != 0) gate.stable_ms = @min(gate.stable_ms, idle_ms);
-    return gate;
-}
-
 pub const Error = Allocator.Error || error{
     UnknownServer,
     /// Only HTTP servers sign in.
@@ -652,7 +646,7 @@ pub const Runtime = struct {
         }
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
-            .gate = gateFor(options.idle_ms),
+            .gate = mcp.core.engine.limitsFor(options.idle_ms),
         }, local_engine.items);
         errdefer r.engine.deinit();
         try r.publish();
@@ -2600,11 +2594,6 @@ pub const Runtime = struct {
     fn reconnectOf(r: *Runtime, name: []const u8) (engine.Error || shared_servers.Error)!void {
         if (r.shared) |*s| if (s.has(name)) return s.reconnect(name);
         return r.engine.reconnect(name);
-    }
-
-    fn disconnectOf(r: *Runtime, name: []const u8) engine.Error!void {
-        if (r.shared) |*s| if (s.has(name)) return s.disconnect(name);
-        return r.engine.disconnect(name);
     }
 
     /// The owner cannot run server `name` after all: it moves into this

@@ -63,8 +63,6 @@ pub const Client = struct {
 pub const Slot = struct {
     key: Key,
     clients: std.bit_set.Static(max_clients) = .empty,
-    calls: u16 = 0,
-    in_flight: u16 = 0,
 };
 
 pub const Call = struct {
@@ -384,7 +382,6 @@ fn onCall(state: *State, request: CallRequest, out: *Output) void {
     const id: CallId = @fromBackingInt(state.next_call);
     state.next_call += 1;
     state.calls[index] = .{ .id = id, .client = request.client, .client_call = request.id, .key = request.key };
-    if (slotForMut(state, request.key)) |slot| slot.calls += 1;
     out.push(.{ .call = .{ .call = id, .key = request.key, .tool = request.tool, .arguments = request.arguments } });
 }
 
@@ -419,7 +416,6 @@ fn onIssued(state: *State, id: CallId, handle: engine.Handle, out: *Output) void
     const call = callById(state, id) orelse return out.push(.{ .log = .{ .what = .late } });
     if (call.handle != null) return out.push(.{ .log = .{ .what = .late, .client = call.client } });
     call.handle = handle;
-    if (slotForMut(state, call.key)) |slot| slot.in_flight += 1;
     if (call.cancel_held) out.push(.{ .cancel = .{ .handle = handle } });
 }
 
@@ -554,10 +550,6 @@ fn singleCaller(state: *const State, key: Key, kind: QuestionKind) ?ClientId {
 }
 
 fn endCall(state: *State, call: *Call) void {
-    if (call.handle != null) {
-        if (slotForMut(state, call.key)) |slot| slot.in_flight -|= 1;
-    }
-    if (slotForMut(state, call.key)) |slot| slot.calls -|= 1;
     for (state.calls, 0..) |maybe, index| {
         const stored = maybe orelse continue;
         if (stored.id == call.id) {
@@ -1024,14 +1016,14 @@ const Pending = struct { client: u32, key: Key };
 
 const Model = struct {
     state: State = .{},
-    client_of: std.AutoHashMapUnmanaged(CallId, u32) = .empty,
-    key_of: std.AutoHashMapUnmanaged(CallId, Key) = .empty,
-    pending: std.AutoHashMapUnmanaged(CallId, Pending) = .empty,
-    live: std.AutoHashMapUnmanaged(engine.Handle, Live) = .empty,
-    handle_of: std.AutoHashMapUnmanaged(CallId, engine.Handle) = .empty,
-    seen_call: std.AutoHashMapUnmanaged(CallId, void) = .empty,
-    ended: std.AutoHashMapUnmanaged(CallId, void) = .empty,
-    questions: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    client_of: std.array_hash_map.Auto(CallId, u32) = .empty,
+    key_of: std.array_hash_map.Auto(CallId, Key) = .empty,
+    pending: std.array_hash_map.Auto(CallId, Pending) = .empty,
+    live: std.array_hash_map.Auto(engine.Handle, Live) = .empty,
+    handle_of: std.array_hash_map.Auto(CallId, engine.Handle) = .empty,
+    seen_call: std.array_hash_map.Auto(CallId, void) = .empty,
+    ended: std.array_hash_map.Auto(CallId, void) = .empty,
+    questions: std.array_hash_map.Auto(u64, u32) = .empty,
     gone: [4]bool = @splat(false),
 
     fn deinit(m: *Model, gpa: std.mem.Allocator) void {
@@ -1068,8 +1060,7 @@ const Model = struct {
                         // flight on the key hears it.
                         var callers: [4]bool = @splat(false);
                         var count: usize = 0;
-                        var it = m.live.valueIterator();
-                        while (it.next()) |live| {
+                        for (m.live.values()) |live| {
                             if (!std.mem.eql(u8, &live.key, &question.key)) continue;
                             // A call whose client left is no caller.
                             if (m.gone[live.client]) continue;
@@ -1088,18 +1079,18 @@ const Model = struct {
         };
         switch (event) {
             .issued => |issued| {
-                const waiting = m.pending.fetchRemove(issued.call) orelse return error.NoSuchCall;
+                const waiting = m.pending.fetchSwapRemove(issued.call) orelse return error.NoSuchCall;
                 try testing.expect(!m.live.contains(issued.handle));
                 try testing.expect(!m.handle_of.contains(issued.call));
                 try m.live.put(testing.allocator, issued.handle, .{ .call = issued.call, .client = waiting.value.client, .key = waiting.value.key });
                 try m.handle_of.put(testing.allocator, issued.call, issued.handle);
             },
             .issue_failed => |failed| {
-                _ = m.pending.fetchRemove(failed.call) orelse return error.NoSuchCall;
+                _ = m.pending.fetchSwapRemove(failed.call) orelse return error.NoSuchCall;
                 try m.ended.put(testing.allocator, failed.call, {});
             },
             .engine_called => |called| {
-                const live = m.live.fetchRemove(called.handle) orelse return error.NoSuchCall;
+                const live = m.live.fetchSwapRemove(called.handle) orelse return error.NoSuchCall;
                 try m.ended.put(testing.allocator, live.value.call, {});
                 // NothingToNonCaller: whatever the event sends goes to the caller.
                 try expectSendsTo(output.effects(), live.value.client);
@@ -1122,8 +1113,7 @@ const Model = struct {
                 };
                 var callers: [4]bool = @splat(false);
                 var count: usize = 0;
-                var it = m.live.valueIterator();
-                while (it.next()) |live| {
+                for (m.live.values()) |live| {
                     if (!std.mem.eql(u8, &live.key, &question.key)) continue;
                     if (m.gone[live.client]) continue;
                     if (!callers[live.client]) {
@@ -1136,8 +1126,7 @@ const Model = struct {
                     .send => |sent| {
                         sends += 1;
                         try testing.expectEqual(@as(usize, 1), count);
-                        var it2 = m.live.valueIterator();
-                        while (it2.next()) |live| {
+                        for (m.live.values()) |live| {
                             if (!std.mem.eql(u8, &live.key, &question.key) or m.gone[live.client]) continue;
                             try testing.expectEqual(@backingInt(sent.to), live.client);
                         }
@@ -1156,7 +1145,7 @@ const Model = struct {
                 };
                 if (answered) {
                     try testing.expectEqual(@backingInt(answer.client), holder orelse return error.NoSuchQuestion);
-                    _ = m.questions.remove(questionId(answer.key, answer.n));
+                    _ = m.questions.fetchSwapRemove(questionId(answer.key, answer.n));
                 }
             },
             .unregister => |left| {
@@ -1193,13 +1182,20 @@ const Model = struct {
                     answers += 1;
                 };
                 try testing.expectEqual(held, answers);
+                var doomed: [64]u64 = undefined;
+                var doomed_len: usize = 0;
                 var it = m.questions.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* != client) continue;
                     const which: Key = if (entry.key_ptr.* >= 1000) key_b else key_a;
                     if (!std.mem.eql(u8, &which, &left.key)) continue;
-                    _ = m.questions.remove(entry.key_ptr.*);
+                    if (doomed_len == doomed.len) break;
+                    doomed[doomed_len] = entry.key_ptr.*;
+                    doomed_len += 1;
                 }
+                // Removed after the walk: one swap-remove inside it can move
+                // the entry the walk has not reached yet.
+                for (doomed[0..doomed_len]) |id| _ = m.questions.fetchSwapRemove(id);
             },
             .gone, .bye => |client| {
                 // QuestionToCaller: a client that leaves answers the questions
@@ -1214,10 +1210,18 @@ const Model = struct {
                     if (entry.value_ptr.* == @backingInt(client)) held += 1;
                 }
                 try testing.expectEqual(held, answers);
+                var doomed: [64]u64 = undefined;
+                var doomed_len: usize = 0;
                 var it2 = m.questions.iterator();
                 while (it2.next()) |entry| {
-                    if (entry.value_ptr.* == @backingInt(client)) _ = m.questions.remove(entry.key_ptr.*);
+                    if (entry.value_ptr.* != @backingInt(client)) continue;
+                    if (doomed_len == doomed.len) break;
+                    doomed[doomed_len] = entry.key_ptr.*;
+                    doomed_len += 1;
                 }
+                // Removed after the walk: one swap-remove inside it can move
+                // the entry the walk has not reached yet.
+                for (doomed[0..doomed_len]) |id| _ = m.questions.fetchSwapRemove(id);
                 // ExitEndsOwnOnly: a leaving client cancels its own calls only.
                 for (output.effects()) |effect| switch (effect) {
                     .cancel => |cancel| {
@@ -1244,9 +1248,8 @@ fn pickPending(model: *Model, random: std.Random) ?CallId {
     const count = model.pending.count();
     if (count == 0) return null;
     var want = random.uintLessThan(usize, count);
-    var it = model.pending.keyIterator();
-    while (it.next()) |id| {
-        if (want == 0) return id.*;
+    for (model.pending.keys()) |id| {
+        if (want == 0) return id;
         want -= 1;
     }
     return null;
@@ -1256,9 +1259,8 @@ fn pickLive(model: *Model, random: std.Random) ?engine.Handle {
     const count = model.live.count();
     if (count == 0) return null;
     var want = random.uintLessThan(usize, count);
-    var it = model.live.keyIterator();
-    while (it.next()) |handle| {
-        if (want == 0) return handle.*;
+    for (model.live.keys()) |handle| {
+        if (want == 0) return handle;
         want -= 1;
     }
     return null;

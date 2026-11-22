@@ -30,6 +30,15 @@ pub const Config = struct {
     idle_ms: u32 = 0,
 };
 
+/// The gate's limits from the idle limit, the only one a host sets. A server
+/// that may stop while idle must first stay up no longer than that, so its
+/// tries start over before the stop: a shorter idle limit lowers `stable_ms`.
+pub fn limitsFor(idle_ms: u32) Config {
+    var config: Config = .{ .idle_ms = idle_ms };
+    if (idle_ms != 0) config.stable_ms = @min(config.stable_ms, idle_ms);
+    return config;
+}
+
 pub const Event = union(enum) {
     /// The host called; `allowed` is its permission's answer.
     asked: struct { call: Handle, allowed: bool },
@@ -701,4 +710,15 @@ test "a server that stopped by idle lists its tools again when the next call sta
     const out = try run(&s, .up);
     try testing.expectEqualSlices(Effect, &.{ .list, .{ .send = 1 }, .{ .arm_stable = 60_000 } }, out.effects());
     try testing.expect(!s.kept);
+}
+
+test "the gate's limits lower stable_ms only for a shorter idle limit" {
+    // No idle stop: the default stay-up time is kept.
+    try testing.expectEqual(@as(u32, 0), limitsFor(0).idle_ms);
+    try testing.expectEqual(@as(u32, 60_000), limitsFor(0).stable_ms);
+    // A longer idle limit leaves it alone, and a shorter one lowers it.
+    try testing.expectEqual(@as(u32, 60_000), limitsFor(600_000).stable_ms);
+    try testing.expectEqual(@as(u32, 30_000), limitsFor(30_000).stable_ms);
+    try testing.expectEqual(@as(u32, 1_000), limitsFor(1_000).stable_ms);
+    try testing.expectEqual(@as(u8, 8), limitsFor(1_000).max_attempts);
 }
