@@ -50,6 +50,8 @@ pub const Client = struct {
     write_mutex: std.Io.Mutex = .init,
     /// Whole frames, owned here until the runtime takes them.
     queue: std.ArrayList([]u8) = .empty,
+    /// The bytes those frames take, for the cap below.
+    queued_bytes: usize = 0,
     stream: ?std.Io.net.Stream = null,
     /// The task that reads this connection. Closing cancels it and waits:
     /// a read blocked on the socket ends with `error.Canceled`, so the
@@ -73,8 +75,15 @@ pub const Client = struct {
     pub fn deinit(c: *Client) void {
         c.close();
         c.gpa.free(c.socket_path);
+        if (c.queue.items.len != 0) {
+            // The session ended with frames it had not read: a call's end or a
+            // tool page is gone with them, and the next call is the one that
+            // asks again.
+            debug_trace.logf("mcp-owner", "owner frames dropped reason=client ended frames={d} bytes={d}", .{ c.queue.items.len, c.queued_bytes });
+        }
         for (c.queue.items) |frame| c.gpa.free(frame);
         c.queue.deinit(c.gpa);
+        c.queued_bytes = 0;
     }
 
     fn now(c: *const Client) i64 {
@@ -161,7 +170,7 @@ pub const Client = struct {
         }
         c.stream = stream;
         c.closed = false;
-        c.reader = c.io.concurrent(readerTask, .{c}) catch |err| {
+        c.reader = c.io.concurrent(readerTask, .{ c, stream }) catch |err| {
             // A connection with no reader could only wait for frames that
             // never come: say so, and let the session run every server itself.
             debug_trace.logf("mcp-owner", "owner reader not started socket={s} err={s}", .{ c.socket_path, @errorName(err) });
@@ -205,6 +214,7 @@ pub const Client = struct {
         const taken = c.queue;
         c.queue = out.*;
         out.* = taken;
+        c.queued_bytes = 0;
     }
 
     pub fn isClosed(c: *Client) bool {
@@ -236,10 +246,11 @@ pub const Client = struct {
     }
 };
 
-/// The connection's reader, as a task. A read blocked on the socket ends with
-/// `error.Canceled` when the client closes, with no need to shut it down.
-fn readerTask(c: *Client) std.Io.Cancelable!void {
-    const stream = c.stream orelse return;
+/// The connection's reader, as a task, with its own copy of the stream: a read
+/// blocked on the socket ends with `error.Canceled` when the client closes,
+/// with no need to shut it down, and the task never reads `Client.stream`,
+/// which `close` clears under the client's lock.
+fn readerTask(c: *Client, stream: std.Io.net.Stream) std.Io.Cancelable!void {
     var header: [wire.header_bytes]u8 = undefined;
     while (true) {
         readExact(c.io, stream, &header) catch |err| switch (err) {
@@ -254,11 +265,25 @@ fn readerTask(c: *Client) std.Io.Cancelable!void {
             return c.markClosed();
         };
         c.mutex.lockUncancelable(c.io);
-        c.queue.append(c.gpa, payload) catch {
+        // Past the cap the session is not taking what the owner sends, so it
+        // stops sharing: closing ends its calls the way an owner that went
+        // away does, and the next need starts an owner or runs the server here.
+        if (c.queued_bytes + payload.len > max_queue_bytes) {
+            const queued = c.queued_bytes;
             c.mutex.unlock(c.io);
             c.gpa.free(payload);
+            debug_trace.logf("mcp-owner", "owner frame dropped reason=queue over its cap bytes={d} queued={d}", .{ length, queued });
+            return c.markClosed();
+        }
+        c.queue.append(c.gpa, payload) catch |err| {
+            c.mutex.unlock(c.io);
+            c.gpa.free(payload);
+            // What this frame carried (a call's end, a tool page) is gone with
+            // it, and the session hears nothing more for it.
+            debug_trace.logf("mcp-owner", "owner frame dropped reason=queue append bytes={d} err={s}", .{ length, @errorName(err) });
             return c.markClosed();
         };
+        c.queued_bytes += payload.len;
         c.mutex.unlock(c.io);
         c.wake.wake(c.wake.context);
     }
@@ -274,22 +299,13 @@ fn readExact(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !void {
     }
 }
 
-fn writeAll(io: std.Io, fd: std.posix.socket_t, bytes: []const u8) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const rc = std.c.write(fd, bytes[written..].ptr, bytes.len - written);
-        if (rc < 0) {
-            const errno = std.posix.errno(rc);
-            if (errno == .INTR or errno == .AGAIN) continue;
-            return error.WriteFailed;
-        }
-        if (rc == 0) return error.Closed;
-        written += @intCast(rc);
-    }
-    _ = io;
-}
-
 const testing = std.testing;
+
+/// The most a session queues from the owner: two frames of the largest size
+/// the owner can send, as the owner's own per-connection queue holds. Past it
+/// the session stops sharing and runs every server itself, so one that stops
+/// taking frames (in a permission question, say) is not grown without end.
+const max_queue_bytes = 2 * wire.max_frame_bytes;
 
 /// Removes a test's folder. Cleanup only: a folder that won't go leaves
 /// nothing the test asserts on, and the system clears /tmp.
@@ -338,14 +354,55 @@ fn writeRaw(io: std.Io, fd: std.posix.socket_t, bytes: []const u8) void {
     }
 }
 
+/// Welcomes the client, then sends two frames of `size` bytes each.
+fn floodFrames(io: std.Io, path: []const u8, size: usize) void {
+    const address = std.Io.net.UnixAddress.init(path) catch return;
+    var server = address.listen(io, .{}) catch return;
+    defer server.deinit(io);
+    const probe = server.accept(io) catch return;
+    probe.close(io);
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    const welcome = "{\"t\":\"welcome\",\"v\":2,\"owner\":1}";
+    var buf: [4 + 32]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], @intCast(welcome.len), .big);
+    @memcpy(buf[4 .. 4 + welcome.len], welcome);
+    writeRaw(io, stream.socket.handle, buf[0 .. 4 + welcome.len]);
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @intCast(size), .big);
+    writeRaw(io, stream.socket.handle, &header);
+    // A reader takes the bytes and queues them: it reads no JSON.
+    var chunk: [4096]u8 = @splat(0);
+    var left = size;
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        writeRaw(io, stream.socket.handle, chunk[0..n]);
+        left -= n;
+    }
+    std.mem.writeInt(u32, &header, @intCast(size), .big);
+    writeRaw(io, stream.socket.handle, &header);
+    left = size;
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        writeRaw(io, stream.socket.handle, chunk[0..n]);
+        left -= n;
+    }
+}
+
 /// Answers one connection with a welcome from another wire version.
 fn staleWelcome(io: std.Io, path: []const u8) void {
     const address = std.Io.net.UnixAddress.init(path) catch return;
     var server = address.listen(io, .{}) catch return;
     defer server.deinit(io);
+    // The first connection is `waitForSocket`'s probe for the socket: it sends
+    // nothing and is closed here, so the next one is the client's.
+    const probe = server.accept(io) catch return;
+    probe.close(io);
     const stream = server.accept(io) catch return;
     defer stream.close(io);
-    const json = "{\"t\":\"welcome\",\"v\":2,\"owner\":1}";
+    // Version 1 is another wire version, so a client of this build refuses the
+    // owner that answers it.
+    const json = "{\"t\":\"welcome\",\"v\":1,\"owner\":1}";
     var framed: [4 + 32]u8 = undefined;
     std.mem.writeInt(u32, framed[0..4], @intCast(json.len), .big);
     @memcpy(framed[4 .. 4 + json.len], json);
@@ -414,6 +471,47 @@ test "a welcome from another wire version is sharing unavailable" {
     var client = try Client.init(testing.io, alloc, home, false, wake);
     defer client.deinit();
     try testing.expectError(error.SharingUnavailable, client.ensureReady(1_000));
+}
+
+test "a session that stops taking frames caps its queue and stops sharing" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "cap");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run);
+    try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
+    defer alloc.free(path);
+    // Two frames, each over half the cap: the second one trips it.
+    const thread = try std.Thread.spawn(.{}, floodFrames, .{ testing.io, path, max_queue_bytes / 2 + 1 });
+    defer thread.join();
+    try waitForSocket(path);
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, false, wake);
+    defer client.deinit();
+    try client.ensureReady(1_000);
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (!client.isClosed()) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.ClientNeverClosed;
+        // Polls for the reader to take the frame that trips the cap.
+        testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    // What it did take is under the cap, and the rest was dropped: a session
+    // that cannot keep up runs every server itself instead.
+    var frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (frames.items) |frame| alloc.free(frame);
+        frames.deinit(alloc);
+    }
+    client.takeFrames(&frames);
+    var bytes: usize = 0;
+    for (frames.items) |frame| bytes += frame.len;
+    try testing.expect(bytes <= max_queue_bytes);
 }
 
 test "an fx home whose socket path is too long cannot share" {

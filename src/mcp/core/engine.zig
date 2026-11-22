@@ -57,6 +57,9 @@ pub const Event = union(enum) {
     stable,
     /// The idle timer fired.
     idle_over,
+    /// A tool list ended, or its failure did; `ok` says which. Until then the
+    /// server is busy with the list and its idle timer waits.
+    listed: bool,
     /// The server ended a call in flight, however it ended.
     answered: Handle,
 };
@@ -97,6 +100,8 @@ pub const Projection = struct {
     /// The state of the step's call: 0 none, 1 waiting, 2 sent, 3 done.
     state: u8,
     retry: bool,
+    /// A tool list is in flight: the server is busy until it ends.
+    listing: bool,
 };
 
 pub const Output = struct {
@@ -136,6 +141,9 @@ pub const Gate = struct {
     retry: bool = false,
     /// Stopped by idle: its last tool list still answers a need.
     kept: bool = false,
+    /// A tool list is in flight: the server is busy until it ends, so an idle
+    /// timer that fires meanwhile stops nothing.
+    listing: bool = false,
     calls: [max_calls]Call = @splat(.{}),
     /// The number of the last call asked.
     last: u32 = 0,
@@ -164,8 +172,14 @@ pub const Gate = struct {
                 out.action = "need";
                 if (s.phase == .idle and s.kept) return ignoreWith(out, .list_kept);
                 switch (s.phase) {
-                    // The model's Need isn't enabled here: nothing changes.
-                    .ready => return ignoreWith(out, .list),
+                    // The model's Need isn't enabled here; its Relist is: a
+                    // list on a ready server goes out now, and the server is
+                    // busy until it ends (see `quiet`).
+                    .ready => {
+                        s.listing = true;
+                        out.emit(.list);
+                        return;
+                    },
                     .failed => return ignoreWith(out, .refuse_need),
                     else => if (s.need) return ignore(out),
                 }
@@ -195,6 +209,8 @@ pub const Gate = struct {
                 s.need = s.need and d.keep;
                 s.retry = false;
                 s.kept = false;
+                // The link the list was on is gone.
+                s.listing = false;
                 s.connect(out);
             },
             .up => {
@@ -206,7 +222,10 @@ pub const Gate = struct {
                 // changed while it was stopped reaches the catalog.
                 const relist = s.kept;
                 s.kept = false;
-                if (s.need or relist) out.emit(.list);
+                if (s.need or relist) {
+                    out.emit(.list);
+                    s.listing = true;
+                }
                 s.need = false;
                 for (&s.calls) |*c| if (c.used and !c.sent) {
                     c.sent = true;
@@ -222,6 +241,8 @@ pub const Gate = struct {
                 const gave_up = s.attempts >= s.config.max_attempts;
                 s.retry = !gave_up;
                 s.kept = false;
+                // The list went down with the link.
+                s.listing = false;
                 // A call waits for one start: it fails with this one, and
                 // later tries are for later calls.
                 for (&s.calls) |*c| if (c.used) {
@@ -269,11 +290,21 @@ pub const Gate = struct {
                 c.* = .{};
                 if (s.phase == .ready) s.armIdle(out);
             },
+            .listed => {
+                out.action = "listed";
+                if (!s.listing) return ignore(out);
+                s.listing = false;
+                // The timer arms from the end of the list, not from before it.
+                if (s.phase == .ready) s.armIdle(out);
+            },
         }
     }
 
     fn quiet(s: *const Gate) bool {
-        if (s.need) return false;
+        // A list in flight is work like a call: stopping the server under it
+        // would lose the list, and the host's tool waiter would wait until its
+        // deadline.
+        if (s.need or s.listing) return false;
         for (s.calls) |c| if (c.used) return false;
         return true;
     }
@@ -304,7 +335,7 @@ pub const Gate = struct {
     }
 
     pub fn project(s: *const Gate, n: u32) Projection {
-        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3, .retry = s.retry };
+        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3, .retry = s.retry, .listing = s.listing };
         for (s.calls) |c| if (c.used) {
             if (c.sent) p.sent += 1 else p.waiting += 1;
             if (c.n == n) p.state = if (c.sent) 2 else 1;
@@ -353,6 +384,7 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
             .{ .name = "sent", .value = .{ .int = p.sent } },
             .{ .name = "state", .value = .{ .int = p.state } },
             .{ .name = "retry", .value = .{ .boolean = p.retry } },
+            .{ .name = "listing", .value = .{ .boolean = p.listing } },
             .{ .name = "max", .value = .{ .int = s.config.max_attempts } },
         },
     });
@@ -410,6 +442,10 @@ const World = struct {
         const p = s.project(0);
         if (p.sent > 0) try testing.expectEqual(Phase.ready, s.phase);
         if (s.phase == .failed or s.phase == .ready) try testing.expect(!s.need and p.waiting == 0);
+        // A list runs on a ready server only, and an idle fire never stops one
+        // with a list in flight (IdleStopsNoList).
+        if (s.listing) try testing.expectEqual(Phase.ready, s.phase);
+        if (event == .idle_over and !out.ignored) try testing.expect(!before.listing);
         // WaitsForOneStart: a failed start leaves no call waiting.
         if ((before.phase == .connecting or before.phase == .ready) and (s.phase == .backoff or s.phase == .failed)) try testing.expectEqual(@as(u32, 0), p.waiting);
         // Where the model has no choice, the core must act: Connect is enabled.
@@ -472,6 +508,8 @@ const alphabet = [_]Event{
     .backoff_over,
     .stable,
     .idle_over,
+    .{ .listed = true },
+    .{ .listed = false },
     .{ .answered = 1 },
     .{ .answered = 2 },
 };
@@ -507,7 +545,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
         var w: World = .{};
         var handle: Handle = 1;
         for (0..300) |_| {
-            const event: Event = switch (random.uintLessThan(u8, 11)) {
+            const event: Event = switch (random.uintLessThan(u8, 12)) {
                 0 => blk: {
                     handle += 1;
                     break :blk .{ .asked = .{ .call = handle, .allowed = random.boolean() } };
@@ -520,6 +558,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
                 6 => .backoff_over,
                 7 => .stable,
                 8 => .idle_over,
+                9 => .{ .listed = random.boolean() },
                 else => .{ .answered = random.uintAtMost(Handle, handle) },
             };
             const before = s;
@@ -559,8 +598,12 @@ test "a call waits for its server, which starts for it, and goes out when it is 
     out = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
     try testing.expectEqualSlices(Effect, &.{.{ .send = 2 }}, out.effects());
     out = try run(&s, .need);
-    try testing.expect(out.ignored);
+    // From the model's view this is Relist: the list goes out on a ready
+    // server, which is then busy until it ends.
+    try testing.expect(!out.ignored);
     try testing.expectEqualSlices(Effect, &.{.list}, out.effects());
+    try testing.expect(s.listing);
+    _ = try run(&s, .{ .listed = true });
 }
 
 test "a call fails with the start it waited for; the server backs off, then gives up" {
@@ -682,6 +725,8 @@ test "an idle stop returns the server to idle with its list kept, and a need ans
     var s: Gate = .init(.{ .idle_ms = 1000 });
     _ = try run(&s, .need);
     _ = try run(&s, .up);
+    // The list ends before the timer can stop the server.
+    _ = try run(&s, .{ .listed = true });
     // Only a server that stayed up stops, so its tries start over first.
     _ = try run(&s, .stable);
     var out = try run(&s, .idle_over);
@@ -700,6 +745,7 @@ test "a server that stopped by idle lists its tools again when the next call sta
     var s: Gate = .init(.{ .idle_ms = 1000 });
     _ = try run(&s, .need);
     _ = try run(&s, .up);
+    _ = try run(&s, .{ .listed = true });
     _ = try run(&s, .stable);
     _ = try run(&s, .idle_over);
     // The need comes from the kept list, and starts nothing.
@@ -710,6 +756,41 @@ test "a server that stopped by idle lists its tools again when the next call sta
     const out = try run(&s, .up);
     try testing.expectEqualSlices(Effect, &.{ .list, .{ .send = 1 }, .{ .arm_stable = 60_000 } }, out.effects());
     try testing.expect(!s.kept);
+}
+
+test "a tool list in flight keeps a ready server up past its idle limit" {
+    // The timer arms when the server is quiet; a list on it is work, so a fire
+    // during the list stops nothing, and the timer arms again from the list's
+    // end (`tests/tla/mcp/Engine.tla` IdleStopsNoList).
+    var s: Gate = .init(.{ .idle_ms = 100, .stable_ms = 10 });
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    try testing.expect(s.listing);
+    // Its tries start over, but nothing arms the timer while the list is out.
+    var out = try run(&s, .stable);
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    out = try run(&s, .idle_over);
+    try testing.expect(out.ignored);
+    try testing.expectEqual(Phase.ready, s.phase);
+    try testing.expect(s.listing);
+
+    // The list ends: now the timer arms, and the next fire stops it.
+    out = try run(&s, .{ .listed = true });
+    try testing.expect(!s.listing);
+    try testing.expectEqualSlices(Effect, &.{.{ .arm_idle = 100 }}, out.effects());
+    out = try run(&s, .idle_over);
+    try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());
+    try testing.expectEqual(Phase.idle, s.phase);
+    try testing.expect(s.kept);
+
+    // A list that fails also ends: the timer arms from its end, not its start.
+    var t: Gate = .init(.{ .idle_ms = 100, .stable_ms = 10 });
+    _ = try run(&t, .need);
+    _ = try run(&t, .up);
+    _ = try run(&t, .stable);
+    out = try run(&t, .{ .listed = false });
+    try testing.expect(!t.listing);
+    try testing.expectEqualSlices(Effect, &.{.{ .arm_idle = 100 }}, out.effects());
 }
 
 test "the gate's limits lower stable_ms only for a shorter idle limit" {

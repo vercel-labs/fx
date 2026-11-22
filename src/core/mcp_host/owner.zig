@@ -106,15 +106,19 @@ const ShellEvent = union(enum) {
 
 const Connection = struct {
     owner: *Owner,
+    /// Set before the connection is in the table, so a reader that finds it
+    /// there sees it whole.
     id: core.ClientId,
     stream: std.Io.net.Stream,
     /// This connection's reader and writer, as tasks of its own group: the
     /// owner cancels and awaits both to end a connection, and a task that
     /// cannot start lets the one that did end the same way.
     tasks: std.Io.Group = .init,
-    /// How many of its tasks still run. The owner frees the connection, and
-    /// lets its id be used again, at zero.
+    /// How many of its tasks still run. Atomic, and the only lifetime field
+    /// read off `o.mutex`: each task drops it as it ends.
     running: std.atomic.Value(u8) = .init(0),
+    /// Guards everything below on this connection: the queue, its byte count,
+    /// `closed`, and `gone`. Every thread that touches them holds it.
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     queue: std.ArrayList([]u8) = .empty,
@@ -122,7 +126,9 @@ const Connection = struct {
     closed: bool = false,
     /// Set once, so the route table hears about the close once.
     gone: bool = false,
-    /// The route table applied this client's leave; the owner loop sets it.
+    /// The route table applied this client's leave. Only the owner loop writes
+    /// it, and only while it holds `Owner.mutex`, which is also how the reaper
+    /// reads it.
     left_applied: bool = false,
 
     fn endTask(c: *Connection) void {
@@ -137,6 +143,10 @@ const Owner = struct {
     /// The fx version every server this owner runs is told, the one a session
     /// that runs its own copy sends, so sharing changes nothing a server sees.
     client_version: []const u8,
+    /// Test seam: makes the next connection's reader or writer task fail to
+    /// start, so the path that hands the connection to the reaper runs. Null
+    /// in the owner.
+    fail_task_start: ?Task = null,
     mutex: std.Io.Mutex = .init,
     events: std.ArrayList(ShellEvent) = .empty,
     connections: [core.max_clients]?*Connection = @splat(null),
@@ -165,8 +175,22 @@ const Owner = struct {
 
     fn push(o: *Owner, event: ShellEvent) void {
         var dropped = event;
+        // A leave is never dropped for the cap: without it the connection's id
+        // is never freed, its calls stay in the route table, and the reaper
+        // waits for a leave that never comes. At most one leave per client
+        // waits here, so the list holds at most one per connection past its
+        // cap and no more.
+        const leave = leaveOf(event);
         o.mutex.lockUncancelable(o.io);
-        if (o.events.items.len < max_pending_events) {
+        if (leave) |id| {
+            for (o.events.items) |pending| if (leaveOf(pending)) |held| if (held == id) {
+                // The list already holds this client's leave.
+                o.mutex.unlock(o.io);
+                dropped.deinit(o.gpa);
+                return;
+            };
+        }
+        if (o.events.items.len < max_pending_events or leave != null) {
             o.events.append(o.gpa, event) catch |err| {
                 o.mutex.unlock(o.io);
                 dropped.deinit(o.gpa);
@@ -185,6 +209,17 @@ const Owner = struct {
         dropped.deinit(o.gpa);
         debug_trace.logf("mcp-owner", "owner event dropped reason=pending events at their cap client={?d} pending={d}", .{ if (client) |id| @backingInt(id) else null, pending });
         if (client) |id| if (o.connectionOf(id)) |conn| o.disconnect(conn);
+    }
+
+    /// The client a leave event is for.
+    fn leaveOf(event: ShellEvent) ?core.ClientId {
+        return switch (event) {
+            .core => |e| switch (e) {
+                .gone => |id| id,
+                else => null,
+            },
+            else => null,
+        };
     }
 
     /// The client a shell event came from, for a trace line when it is dropped.
@@ -217,6 +252,10 @@ const Owner = struct {
         into.* = taken;
     }
 
+    /// The connection `id` names, or null. The caller may keep the pointer
+    /// after the lock is released: the owner frees a connection only once its
+    /// leave is applied and both its tasks have ended, and a caller still
+    /// using it is one of those tasks or the loop that applies the leave.
     fn connectionOf(o: *Owner, id: core.ClientId) ?*Connection {
         const index = @backingInt(id);
         if (index == 0 or index > core.max_clients) return null;
@@ -233,7 +272,11 @@ const Owner = struct {
             stream.close(o.io);
             return err;
         };
-        errdefer o.gpa.destroy(conn);
+        // This function frees it only until the table holds it. After that the
+        // reaper alone frees it, so no failure path can free a connection the
+        // table or a task still names.
+        var mine = true;
+        errdefer if (mine) o.gpa.destroy(conn);
         conn.* = .{ .owner = o, .id = undefined, .stream = stream };
 
         o.mutex.lockUncancelable(o.io);
@@ -247,6 +290,7 @@ const Owner = struct {
         o.open += 1;
         o.last_open_ms = o.now();
         o.mutex.unlock(o.io);
+        mine = false;
 
         // A client checks the wire version before it says anything else, so
         // the owner names itself first.
@@ -254,24 +298,49 @@ const Owner = struct {
             o.enqueue(conn, frame, "welcome");
         } else |_| {}
 
-        // Both tasks go in the connection's own group. If the second cannot
-        // start, the group is cancelled and awaited, which ends the first even
-        // when it is blocked in a read: the socket is never closed under it.
+        o.startTasks(conn);
+    }
+
+    const Task = enum { reader, writer };
+
+    /// Both of a connection's tasks go in its own group. If the second cannot
+    /// start, the group is cancelled and awaited, which ends the first even
+    /// when it is blocked in a read: the socket is never closed under it.
+    fn startTasks(o: *Owner, conn: *Connection) void {
         conn.running.store(2, .release);
-        conn.tasks.concurrent(o.io, readerTask, .{conn}) catch |err| {
-            _ = conn.running.fetchSub(1, .acq_rel);
-            debug_trace.logf("mcp-owner", "owner connection task not started client={d} which=reader err={s}", .{ @backingInt(conn.id), @errorName(err) });
-            o.disconnect(conn);
-            return error.TooManyClients;
-        };
-        conn.tasks.concurrent(o.io, writerTask, .{conn}) catch |err| {
-            _ = conn.running.fetchSub(1, .acq_rel);
-            debug_trace.logf("mcp-owner", "owner connection task not started client={d} which=writer err={s}", .{ @backingInt(conn.id), @errorName(err) });
-            o.disconnect(conn);
-            // The reader is blocked in the socket: cancel ends it there.
-            conn.tasks.cancel(o.io);
-            return error.TooManyClients;
-        };
+        if (o.fail_task_start == .reader) {
+            o.fail_task_start = null;
+            return o.taskStartFailed(conn, .reader, "test");
+        }
+        conn.tasks.concurrent(o.io, readerTask, .{conn}) catch |err| return o.taskStartFailed(conn, .reader, @errorName(err));
+        if (o.fail_task_start == .writer) {
+            o.fail_task_start = null;
+            return o.taskStartFailed(conn, .writer, "test");
+        }
+        conn.tasks.concurrent(o.io, writerTask, .{conn}) catch |err| return o.taskStartFailed(conn, .writer, @errorName(err));
+    }
+
+    /// A connection whose tasks could not both start: no task owns the one
+    /// that did not, so it goes the way a closed connection goes. `running`
+    /// drops to the tasks that really started, its leave is told once, and the
+    /// reaper cancels the group, closes the stream, and frees it.
+    fn taskStartFailed(o: *Owner, conn: *Connection, which: Task, why: []const u8) void {
+        debug_trace.logf("mcp-owner", "owner connection task not started client={d} which={s} err={s}", .{ @backingInt(conn.id), @tagName(which), why });
+        switch (which) {
+            .reader => {
+                // Neither task started: nothing to cancel, and the reaper
+                // frees it once its leave is applied.
+                _ = conn.running.fetchSub(2, .acq_rel);
+                o.disconnect(conn);
+            },
+            .writer => {
+                _ = conn.running.fetchSub(1, .acq_rel);
+                o.disconnect(conn);
+                // The reader is blocked in the socket: cancel ends it there,
+                // and its own end drops `running` to 0.
+                conn.tasks.cancel(o.io);
+            },
+        }
     }
 
     /// An id nothing holds any more: its connection's tasks ended and the
@@ -283,15 +352,23 @@ const Owner = struct {
     }
 
     /// Frees every connection whose tasks ended and whose leave the route
-    /// table applied, and lets its id be used again.
+    /// table applied, and lets its id be used again. The table and each
+    /// connection's lifetime are read, and the slot cleared, under `o.mutex`;
+    /// the group's await, the socket close, and the free run after it, where
+    /// no thread can find the connection any more.
     fn reapConnections(o: *Owner) void {
-        var index: usize = 0;
-        while (index < o.connections.len) : (index += 1) {
-            const conn = o.connections[index] orelse continue;
+        var reaped: [core.max_clients]*Connection = undefined;
+        var count: usize = 0;
+        o.mutex.lockUncancelable(o.io);
+        for (o.connections, 0..) |maybe, index| {
+            const conn = maybe orelse continue;
             if (!conn.left_applied or conn.running.load(.acquire) != 0) continue;
-            o.mutex.lockUncancelable(o.io);
             o.connections[index] = null;
-            o.mutex.unlock(o.io);
+            reaped[count] = conn;
+            count += 1;
+        }
+        o.mutex.unlock(o.io);
+        for (reaped[0..count]) |conn| {
             // Both tasks ran: the group has nothing left to wait for.
             conn.tasks.await(o.io) catch {};
             for (conn.queue.items) |frame| o.gpa.free(frame);
@@ -299,6 +376,17 @@ const Owner = struct {
             conn.stream.close(o.io);
             o.gpa.destroy(conn);
         }
+    }
+
+    /// Marks the route table's part of this client's leave as applied. Only the
+    /// owner loop calls it, under `o.mutex`, which is the same rule the reaper
+    /// reads `left_applied` by.
+    fn markLeft(o: *Owner, id: core.ClientId) void {
+        o.mutex.lockUncancelable(o.io);
+        defer o.mutex.unlock(o.io);
+        const index = @backingInt(id);
+        if (index == 0 or index > core.max_clients) return;
+        if (o.connections[index - 1]) |conn| conn.left_applied = true;
     }
 
     /// Marks the connection closed, tells the route table once, and wakes its
@@ -349,8 +437,19 @@ const Owner = struct {
     }
 
     fn closeAll(o: *Owner) void {
+        // The table is read under the same lock that fills it; the work below
+        // runs after, where nothing can add a connection any more.
+        var conns: [core.max_clients]*Connection = undefined;
+        var count: usize = 0;
+        o.mutex.lockUncancelable(o.io);
         for (o.connections) |maybe| {
             const conn = maybe orelse continue;
+            conns[count] = conn;
+            count += 1;
+        }
+        o.connections = @splat(null);
+        o.mutex.unlock(o.io);
+        for (conns[0..count]) |conn| {
             // Cancel ends a reader blocked in the socket and a writer waiting
             // for a frame, and waits for both, so the socket is never closed
             // under a read.
@@ -360,7 +459,6 @@ const Owner = struct {
             conn.stream.close(o.io);
             o.gpa.destroy(conn);
         }
-        o.connections = @splat(null);
     }
 };
 
@@ -611,9 +709,7 @@ fn ownerLoop(owner: *Owner) void {
                 const event = shell_event.event();
                 // The route table applied this client's leave: its id can be
                 // used again once its tasks have ended too.
-                if (event == .gone) {
-                    if (owner.connectionOf(event.gone)) |conn| conn.left_applied = true;
-                }
+                if (event == .gone) owner.markLeft(event.gone);
                 var output: core.Output = .{};
                 core.step(&state, event, &output);
                 _ = scratch.reset(.retain_capacity);
@@ -1133,6 +1229,32 @@ fn writeAllFd(fd: std.posix.socket_t, bytes: []const u8) !void {
 
 var home_count = std.atomic.Value(u32).init(0);
 
+var socket_count = std.atomic.Value(u32).init(0);
+
+/// A connected pair of Unix sockets: the accepted end for a connection the
+/// owner may close, and the peer the caller keeps open and closes itself. The
+/// listening socket is closed before this returns.
+fn testSocketPair(tag: []const u8) !struct { server: std.Io.net.Stream, peer: std.Io.net.Stream } {
+    const io = testing.io;
+    const n = socket_count.fetchAdd(1, .monotonic);
+    var buffer: [129]u8 = undefined;
+    const path = try std.fmt.bufPrint(buffer[0..128], "/tmp/fx-owner-{s}-{d}-{d}.sock", .{ tag, std.c.getpid(), n });
+    buffer[path.len] = 0;
+    const path_z = buffer[0..path.len :0];
+    // A file an earlier run left; there need not be one.
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {}; // Cleanup only: nothing is asserted on it.
+    var address = try std.Io.net.UnixAddress.init(path_z);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    const peer = try address.connect(io);
+    const server = listener.accept(io) catch |err| {
+        peer.close(io);
+        return err;
+    };
+    return .{ .server = server, .peer = peer };
+}
+
 /// A short fx home, because a Unix socket path is limited to 103 bytes and a
 /// test's tmpDir path is longer than that.
 fn shortHome(alloc: Allocator) ![]u8 {
@@ -1288,7 +1410,7 @@ test "an owner takes 300 connections in turn and still serves a new one" {
     joined = true;
 }
 
-test "the event list's cap drops the frame and closes the connection that sent it" {
+test "the event list's cap drops the frame and still takes the connection's leave" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
     var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
@@ -1297,18 +1419,86 @@ test "the event list's cap drops the frame and closes the connection that sent i
         for (owner.events.items) |*event| event.deinit(alloc);
         owner.events.deinit(alloc);
     }
-    var conn: Connection = .{ .owner = &owner, .id = @fromBackingInt(1), .stream = undefined };
-    owner.connections[0] = &conn;
+    const pair = try testSocketPair("cap");
+    defer pair.peer.close(testing.io);
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .owner = &owner, .id = @fromBackingInt(1), .stream = pair.server };
+    owner.connections[0] = conn;
 
     for (0..max_pending_events) |_| owner.push(.{ .core = .{ .hello = conn.id } });
     try testing.expectEqual(max_pending_events, owner.events.items.len);
     try testing.expect(!conn.gone);
-    // One more from this client: the list stays at its cap and the connection
-    // that overran it goes, so its session runs every server itself.
+    // One more from this client: the frame is dropped and the connection that
+    // overran the cap goes, so its session runs every server itself.
     owner.push(.{ .core = .{ .hello = conn.id } });
-    try testing.expectEqual(max_pending_events, owner.events.items.len);
     try testing.expect(conn.gone and conn.closed);
-    owner.connections[0] = null;
+    // Its leave is the one event the cap never drops: without it the id would
+    // never be freed and the connection never reaped.
+    try testing.expectEqual(max_pending_events + 1, owner.events.items.len);
+    try testing.expectEqual(conn.id, switch (owner.events.items[max_pending_events]) {
+        .core => |e| switch (e) {
+            .gone => |id| id,
+            else => return error.NotALeave,
+        },
+        else => return error.NotALeave,
+    });
+    owner.push(.{ .core = .{ .gone = conn.id } });
+    try testing.expectEqual(max_pending_events + 1, owner.events.items.len);
+
+    // The loop stepped the leave and both tasks are gone: the reaper frees it
+    // and lets its id be used again.
+    owner.markLeft(conn.id);
+    conn.running.store(0, .release);
+    owner.reapConnections();
+    try testing.expect(owner.connections[0] == null);
+}
+
+test "a connection whose reader cannot start is reaped, not freed under the table" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    owner.fail_task_start = .reader;
+    defer owner.engine_arena.deinit();
+    defer {
+        for (owner.events.items) |*event| event.deinit(alloc);
+        owner.events.deinit(alloc);
+    }
+    const pair = try testSocketPair("no-reader");
+    defer pair.peer.close(testing.io);
+
+    try owner.addConnection(pair.server);
+    // It is still in the table, alive, with no task running and its leave
+    // waiting: the reaper owns it from here.
+    const conn = owner.connections[0] orelse return error.ConnectionGone;
+    try testing.expect(conn.gone and conn.closed);
+    try testing.expectEqual(@as(u8, 0), conn.running.load(.acquire));
+    owner.markLeft(conn.id);
+    owner.reapConnections();
+    try testing.expect(owner.connections[0] == null);
+}
+
+test "a connection whose writer cannot start ends its reader and is reaped" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    owner.fail_task_start = .writer;
+    defer owner.engine_arena.deinit();
+    defer {
+        for (owner.events.items) |*event| event.deinit(alloc);
+        owner.events.deinit(alloc);
+    }
+    const pair = try testSocketPair("no-writer");
+    defer pair.peer.close(testing.io);
+
+    try owner.addConnection(pair.server);
+    const conn = owner.connections[0] orelse return error.ConnectionGone;
+    try testing.expect(conn.gone and conn.closed);
+    // The reader task ended by the group's cancel: no task runs, and the
+    // reader never read from the stream after it was freed.
+    try testing.expectEqual(@as(u8, 0), conn.running.load(.acquire));
+    owner.markLeft(conn.id);
+    owner.reapConnections();
+    try testing.expect(owner.connections[0] == null);
 }
 
 test "two clients registered for one key share one server process" {

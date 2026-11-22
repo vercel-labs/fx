@@ -491,6 +491,12 @@ pub const Engine = struct {
                 slot.last_error = if (slot.server.?.spawnError()) |err| @errorName(err) else "process";
                 try e.step(slot, .down);
             },
+            .tools => |result| {
+                // The gate waits for the list too: until it ends the server is
+                // busy and its idle timer stops nothing (Engine.tla).
+                try e.step(slot, .{ .listed = result.ok });
+                e.emit(slot, .{ .server = event });
+            },
             .called => |c| {
                 const i = for (slot.calls.items, 0..) |x, i| {
                     if (x.sent != null and x.sent.? == c.handle) break i;

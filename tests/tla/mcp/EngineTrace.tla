@@ -4,12 +4,14 @@
 \*
 \* Mapping from the Zig core (src/mcp/core/engine.zig):
 \*   - Records ask, need, cancel, drop, connect, up, down, backoff_over,
-\*     stable, idle, and answer are the model's actions for the one server. Calls are numbered
-\*     from 1 in the order asked, and n is the model's c.
+\*     stable, idle, listed, and answer are the model's actions for the one
+\*     server. Calls are numbered from 1 in the order asked, and n is the
+\*     model's c. A need on a ready server is the model's Relist.
 \*   - Each record carries the server's state after the step: phase (0 idle,
 \*     1 connecting, 2 ready, 3 backoff, 4 failed), attempts, need, how many
 \*     calls wait and how many are in flight, n's state (0 none,
-\*     1 waiting, 2 sent, 3 done), and whether it starts again by itself.
+\*     1 waiting, 2 sent, 3 done), whether it starts again by itself, and
+\*     whether a tool list is in flight.
 \*   - A record marked ignored is accepted only where nothing changes.
 \*   - Arming the idle timer is hidden state: the code arms it inside up,
 \*     answer, and stable, so a trace shows no arming step and the model may
@@ -35,7 +37,7 @@ StateName(k) == CASE k = 0 -> "none" [] k = 1 -> "waiting" [] k = 2 -> "sent" []
 Step(r) ==
     LET n == r.data.n
     IN CASE r.event = "ask" -> Ask(n, r.data.allowed)
-         [] r.event = "need" -> Need(1)
+         [] r.event = "need" -> Need(1) \/ Relist(1)
          [] r.event = "cancel" -> Cancel(n)
          [] r.event = "drop" -> Drop(1, r.data.keep)
          [] r.event = "connect" -> Connect(1)
@@ -44,6 +46,7 @@ Step(r) ==
          [] r.event = "backoff_over" -> BackoffOver(1)
          [] r.event = "stable" -> Stable(1)
          [] r.event = "idle" -> IdleFire(1)
+         [] r.event = "listed" -> Listed(1)
          [] r.event = "answer" -> Answer(n)
          [] OTHER -> FALSE
 
@@ -55,6 +58,7 @@ Matches(r) ==
     /\ Cardinality({c \in Calls : call'[c] = "sent"}) = r.data.sent
     /\ r.data.n # 0 => call'[r.data.n] = StateName(r.data.state)
     /\ retry'[1] = r.data.retry
+    /\ listing'[1] = r.data.listing
 
 TraceInit ==
     /\ Init
