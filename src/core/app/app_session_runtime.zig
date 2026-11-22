@@ -14,6 +14,7 @@ const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const app_loop_runtime = @import("app_loop_runtime.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_capability = @import("../hosts/host.zig");
@@ -800,6 +801,8 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.pending_live_session_wait = null;
                 releaseLiveSessionTransitionHold(app, agent);
             }
+            // A loop's prompt belongs to the conversation it ran in.
+            if (comptime agents.hasAgentField(App, "loops")) try app_loop_runtime.Runtime(App).endForConversationChange(app, agent);
             const previous_policy = agent.session_persistence.pending_live_session_policy;
             const processing = agent.worker.isProcessing();
             const decision = decideLiveSessionTransition(
@@ -1012,6 +1015,7 @@ pub fn Runtime(comptime App: type) type {
             if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
             try noteStoppedSubagentTasks(app, agent);
+            if (comptime agents.hasAgentField(App, "loops")) try app_loop_runtime.Runtime(App).noteEndedLoops(app, agent);
         }
 
         fn stopSubagentsForSwitch(app: *App, agent: *AppAgent) !usize {
@@ -1456,6 +1460,7 @@ pub fn Runtime(comptime App: type) type {
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
+            if (comptime agents.hasAgentField(App, "loops")) try app_loop_runtime.Runtime(App).noteEndedLoops(app, agent);
             startPendingResume(app, agent);
             return true;
         }
@@ -1558,6 +1563,7 @@ pub fn Runtime(comptime App: type) type {
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
+            if (comptime agents.hasAgentField(App, "loops")) try app_loop_runtime.Runtime(App).noteEndedLoops(app, agent);
             return prompt;
         }
 
@@ -1566,6 +1572,9 @@ pub fn Runtime(comptime App: type) type {
         fn installResumedV2Session(app: *App, agent: *AppAgent, v2: *session_adapter.Session, notice: ResumeNotice) !void {
             var v2_owned = true;
             errdefer if (v2_owned) v2.close();
+            // `/resume` and `/fork` both land here; a loop's prompt belongs to
+            // the conversation it ran in.
+            if (comptime agents.hasAgentField(App, "loops")) try app_loop_runtime.Runtime(App).endForConversationChange(app, agent);
             var resumed = try v2.durableState(app.alloc, app.workspace_root);
             defer resumed.deinit(app.alloc);
             var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|

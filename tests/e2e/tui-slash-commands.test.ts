@@ -337,3 +337,271 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
     TIMEOUT,
   );
 });
+
+describe.skipIf(TMUX_SKIP)("tui: loop", () => {
+  /// Starts fx on the fake gateway in auto mode, wide enough that a loop's
+  /// notices and list rows stay on one line each.
+  async function launchLoopTerminal(name: string, env: Record<string, string> = {}): Promise<{ stderrPath: string }> {
+    const root = mkdtempSync(join(tmpdir(), `fx-loop-${name}-`));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    tempDirs.push(root);
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      isolated: true,
+      width: 160,
+      height: 40,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "loop-key",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway!.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway!.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway!.baseUrl}/coding-agent/v1/models`,
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_PERMISSION_MODE: "auto",
+        VERCEL_OIDC_TOKEN: undefined,
+        NO_COLOR: "1",
+        ...env,
+      },
+    });
+    await session.waitForComposer(10_000);
+    return { stderrPath };
+  }
+
+  test(
+    "loop arms, lists, and removes",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LOOP_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("arm");
+
+      await session!.sendText("/loop");
+      await session!.waitForText("No active loops. Start one with /loop <interval> <prompt>.", 5_000);
+      // Enter with the menu open after "/loop " lists loops; it does not
+      // submit the highlighted interval, which still needs a prompt.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/10m +run a prompt now, then every 10 minutes/, 5_000);
+      await session!.sendKeys("Enter");
+      await waitForCount("No active loops. Start one with /loop <interval> <prompt>.", 2, 5_000);
+      expect(await session!.captureFullScrollback()).not.toContain("Usage: /loop <interval> <prompt>");
+      await session!.sendText("/loop 1h say LOOP_OK");
+      await session!.waitForText("Loop 1 runs now, then every 1h until you remove it or fx exits: say LOOP_OK", 5_000);
+      // The first run starts right away, not one interval later.
+      await waitForCount("loop 1 · every 1h · say LOOP_OK", 1, 5_000);
+      await waitForCount("LOOP_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
+      // The footer counts the loops the agent on screen holds.
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
+      await session!.sendText("/loop");
+      await session!.waitForText(/1 +every 1h +next in \d+m +runs 1 +failures 0\/3 +say LOOP_OK/, 5_000);
+      await session!.sendText("/loop 2h second");
+      await waitForCount("LOOP_REPLY", 2, 10_000);
+      await session!.waitForComposer(5_000);
+      await session!.waitForText(/gpt-5 · 2 loops\s*$/m, 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("No loop 1. /loop lists active loops.", 5_000);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 2.", 5_000);
+      await session!.waitForText(/gpt-5\s*$/m, 5_000);
+      await session!.sendText("/loop 30s ping");
+      await session!.waitForText("30s is shorter than the 1m minimum.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  /// How many times `text` appears in the whole scrollback.
+  async function countInScrollback(text: string): Promise<number> {
+    return (await session!.captureFullScrollback()).split(text).length - 1;
+  }
+
+  /// Polls until `text` appears at least `count` times in the scrollback.
+  async function waitForCount(text: string, count: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (await countInScrollback(text) < count) {
+      if (Date.now() > deadline) throw new Error(`expected ${count}x ${JSON.stringify(text)}, saw ${await countInScrollback(text)}`);
+      await Bun.sleep(100);
+    }
+  }
+
+  test(
+    "loop runs its prompt on the interval as a marked run",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LOOP_OK"));
+      const { stderrPath } = await launchLoopTerminal("run", { FX_TEST_LOOP_INTERVAL_MS: "500" });
+
+      await session!.sendText("/loop 1m say LOOP_OK");
+      await session!.waitForText("Loop 1 runs now, then every 1m", 5_000);
+      // A draft in the composer does not hold a run back, and survives it.
+      await session!.sendLiteral("draft stays");
+      await waitForCount("loop 1 · every 1m · say LOOP_OK", 2, 10_000);
+      await waitForCount("LOOP_OK", 4, 10_000);
+      expect(await session!.capturePane()).toContain("draft stays");
+
+      await session!.sendKeys("C-u");
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
+
+      // A builtin command in a loop prompt is text for the model, never run.
+      await session!.sendText("/loop 1m /status");
+      await waitForCount("loop 2 · every 1m · /status", 1, 10_000);
+      await session!.waitForComposer(5_000);
+      expect(showsStatusPanel((await session!.capturePane()).split("\n"))).toBe(false);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 2.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop waits for a running turn and runs once",
+    async () => {
+      const held = heldFakeGatewayFinalText();
+      let first = true;
+      gateway = startDynamicFakeGateway(() => {
+        if (!first) return fakeGatewayFinalText("ONCE_DONE");
+        first = false;
+        return held.response;
+      });
+      await launchLoopTerminal("busy", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m say ONCE");
+      await waitForCount("loop 1 · every 1m · say ONCE", 1, 10_000);
+      // Four intervals pass while the first run's turn is still going.
+      await Bun.sleep(1_200);
+      expect(await countInScrollback("loop 1 · every 1m · say ONCE")).toBe(1);
+      held.release("FIRST_DONE");
+      await session!.waitForText("FIRST_DONE", 5_000);
+      // The missed intervals collapse into one run, not a burst.
+      await waitForCount("loop 1 · every 1m · say ONCE", 2, 5_000);
+      expect(await countInScrollback("loop 1 · every 1m · say ONCE")).toBe(2);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop holds while a rejected run waits for the user, then carries on",
+    async () => {
+      // A rejected request (HTTP 400) does not end the turn: fx asks the user
+      // to act, so the loop holds at one run instead of counting failures.
+      let failing = true;
+      gateway = startDynamicFakeGateway(() =>
+        failing ? new Response("bad request", { status: 400 }) : fakeGatewayFinalText("BACK"));
+      await launchLoopTerminal("held", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m ping");
+      await session!.waitForText("The provider rejected this request", 10_000);
+      await Bun.sleep(1_500);
+      expect(await countInScrollback("loop 1 · every 1m · ping")).toBe(1);
+      await session!.sendText("/loop resume 1");
+      await session!.waitForText("Loop 1 is not paused.", 5_000);
+
+      failing = false;
+      await session!.sendText("hello");
+      await waitForCount("BACK", 1, 10_000);
+      await waitForCount("loop 1 · every 1m · ping", 2, 10_000);
+      await session!.sendText("/loop remove 1");
+      await session!.waitForText("Removed loop 1.", 5_000);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop menu offers intervals, then pause and remove with each loop",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("MENU_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("menu");
+
+      // With no loops, the menu offers only ways to start one.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/1h +run a prompt now, then every hour/, 5_000);
+      expect(await session!.capturePane()).not.toContain("delete a loop, or all of them");
+      await session!.sendKeys("C-u");
+
+      await session!.sendText("/loop 1h say MENU");
+      await waitForCount("MENU_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
+
+      // A live loop adds pause and remove; nothing is paused, so resume stays hidden.
+      await session!.sendLiteral("/loop ");
+      await session!.waitForText(/pause +pause a loop, or all of them/, 5_000);
+      await session!.waitForText(/remove +delete a loop, or all of them/, 5_000);
+      expect(await session!.capturePane()).not.toContain("restart a paused loop");
+      // Choosing remove types a space and lists the loops it can delete.
+      await session!.sendLiteral("rem");
+      await session!.sendKeys("Tab");
+      await session!.waitForText(/remove 1 +every 1h · say MENU/, 5_000);
+      await session!.waitForText(/remove all +delete every loop/, 5_000);
+      await session!.sendLiteral("1");
+      await session!.sendKeys("Enter");
+      await session!.waitForText("Removed loop 1.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "loop pause keeps the loop until resume runs it again",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("PAUSE_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("pause", { FX_TEST_LOOP_INTERVAL_MS: "300" });
+
+      await session!.sendText("/loop 1m say PAUSE");
+      await waitForCount("PAUSE_REPLY", 1, 10_000);
+      await session!.sendText("/loop pause 1");
+      await session!.waitForText("Paused loop 1. /loop resume 1 restarts it.", 5_000);
+      await session!.waitForComposer(5_000);
+      const runsWhenPaused = await countInScrollback("loop 1 · every 1m · say PAUSE");
+      // Several intervals pass and no run starts, but the loop stays listed and counted.
+      await Bun.sleep(1_200);
+      expect(await countInScrollback("loop 1 · every 1m · say PAUSE")).toBe(runsWhenPaused);
+      await session!.sendText("/loop");
+      await session!.waitForText(/1 +every 1m +paused by you · \/loop resume 1/, 5_000);
+      await session!.waitForText(/gpt-5 · 1 loop\s*$/m, 5_000);
+
+      await session!.sendText("/loop resume 1");
+      await session!.waitForText("Resumed loop 1. It runs now, then every 1m.", 5_000);
+      await waitForCount("loop 1 · every 1m · say PAUSE", runsWhenPaused + 1, 10_000);
+      await session!.sendText("/loop remove all");
+      await session!.waitForText("Removed loop 1.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "clear ends active loops with a notice",
+    async () => {
+      gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("CLEAR_REPLY"));
+      const { stderrPath } = await launchLoopTerminal("clear");
+
+      await session!.sendText("/loop 1h first");
+      await session!.waitForText("Loop 1 runs now, then every 1h", 5_000);
+      await waitForCount("CLEAR_REPLY", 1, 10_000);
+      await session!.waitForComposer(5_000);
+      await session!.sendText("/loop 2h second");
+      await session!.waitForText("Loop 2 runs now, then every 2h", 5_000);
+      await waitForCount("CLEAR_REPLY", 2, 10_000);
+      await session!.waitForComposer(5_000);
+      await session!.sendText("/clear");
+      await session!.waitForText("Ended loops 1, 2 because the conversation changed.", 5_000);
+      await session!.waitForComposer(5_000);
+      await session!.sendText("/loop");
+      await session!.waitForText("No active loops.", 5_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+});
