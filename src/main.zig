@@ -12,6 +12,13 @@ pub const version = "0.0.17";
 /// Panics save a crash record for `/trace`, except in tests, which keep the
 /// default handler.
 pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
+/// Zig's segfault handler calls this override. It saves the crash record and then
+/// calls Zig's default handler, which prints the signal and its address, adds a
+/// stack trace only in builds with debug info, and aborts. Test builds keep that
+/// default handler.
+pub const debug = struct {
+    pub const handleSegfault = if (builtin.is_test) std.debug.defaultHandleSegfault else crash_panic.handleSegfault;
+};
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -3889,6 +3896,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 }
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    // fx exports its own C main, so Zig's start code does not set up the signal stack or the segfault handler.
+    std.Thread.maybeAttachSignalStack();
+    std.debug.maybeEnableSegfaultHandler();
     io_mod.reserveClosedStandardStreams();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;

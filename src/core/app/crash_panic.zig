@@ -1,12 +1,12 @@
-//! Saves a crash record when fx panics, so `/trace` can show it as `last_crash`.
+//! Saves a crash record when fx panics or takes a segfault, so `/trace` can show it as `last_crash`.
 //!
-//! When a panic starts, the handler writes two JSON lines to
+//! When a panic or a segfault starts, the handler writes two JSON lines to
 //! `~/.fx/diagnostics/last-crash.jsonl.<pid>.tmp`, syncs it to disk, and renames
-//! it over `last-crash.jsonl`, so a failed write keeps the last saved record. The lines
-//! are the `fx_trace` header and a
-//! `fatal_error` record whose error is `panic`. `trace_report.zig` reads that
-//! file. The handler then calls `std.debug.defaultPanic`, so stderr and the
-//! abort stay as they were.
+//! it over `last-crash.jsonl`, so a failed write keeps the last saved record. The
+//! lines are the `fx_trace` header and a `fatal_error` record. Its error is
+//! `panic` for a panic and `signal` for a segfault. `trace_report.zig` reads that
+//! file. The handler then calls `std.debug.defaultPanic` or
+//! `std.debug.defaultHandleSegfault`, so stderr and the abort stay as they were.
 //!
 //! The handler can run on any thread and in any state, so it does not allocate
 //! or take a lock. `prepare` computes the paths at startup. The handler creates
@@ -15,8 +15,12 @@
 //! A call that fails is ignored, except that a failed save, a refused folder, and
 //! the saved path are written to stderr.
 //! The renderer event ring is not saved, because reading it needs a blocking
-//! lock that the handler does not take. Segfaults do not reach this handler:
-//! `std.debug` prints them and aborts on its own.
+//! lock that the handler does not take. fx's `main` attaches Zig's segfault
+//! handler first, because fx exports its own C `main` and Zig's start code does
+//! not attach it. That handler calls `root.debug.handleSegfault`, which
+//! `main.zig` sets to `handleSegfault` here. It covers SIGSEGV, SIGBUS, SIGILL,
+//! and SIGFPE, and ends in `std.debug.defaultHandleSegfault`, which prints the
+//! signal and its address, then a stack trace only in builds with debug info.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -27,7 +31,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const trace_report = @import("trace_report.zig");
 const writeJsonStr = @import("../../acp/jsonrpc.zig").writeJsonStr;
 
-/// The most bytes of a panic message that the record keeps. Escaping can make
+/// The most bytes of a message that the record keeps. Escaping can make
 /// the kept text up to six times longer, which still fits `record_buf_bytes`.
 const max_message_bytes = 512;
 /// Holds both lines at the longest kept message, with room for long version
@@ -51,7 +55,7 @@ var tmp_path_buf: [path_max_bytes:0]u8 = undefined;
 var tmp_name_offset: usize = 0;
 /// Zero means no path is set, so the handler writes no record.
 var path_len: usize = 0;
-/// Set by the first panic. A panic that finds it set skips the save.
+/// Set by the first crash, panic or segfault. A crash that finds it set skips the save.
 var handling: std.atomic.Value(bool) = .init(false);
 /// Storage for the record, so the handler needs no stack space for it.
 var record_buf: [record_buf_bytes]u8 = undefined;
@@ -90,14 +94,14 @@ fn printPath(buf: *[path_max_bytes:0]u8, comptime fmt: []const u8, args: anytype
     return text.len;
 }
 
-/// Called once a full crash report is saved. A panic that comes later in this
+/// Called once a full crash report is saved. A crash that comes later in this
 /// process, such as one during shutdown, then skips its save, so it does not
-/// replace the full report with the short panic record. It still prints and aborts.
+/// replace the full report with the short crash record. It still prints and aborts.
 pub fn noteReportSaved() void {
     handling.store(true, .seq_cst);
 }
 
-/// Whether this panic may save its record: only the first one may.
+/// Whether this crash may save its record: only the first one may.
 fn claimSave() bool {
     return !handling.swap(true, .seq_cst);
 }
@@ -106,22 +110,73 @@ fn claimSave() bool {
 /// then goes to `std.debug.defaultPanic`, which prints the message and aborts.
 /// A panic that comes during the save, from any thread or from this handler,
 /// skips the save, and so does one after `noteReportSaved`.
-/// Saves a panic record unless this process has already saved or noted a crash.
-fn savePanic(msg: []const u8) void {
-    if (claimSave()) saveRecord(msg);
+/// Saves a crash record unless this process has already saved or noted a crash.
+/// Panics and segfaults both save through here, so one gate covers both.
+fn saveOnce(error_name: []const u8, msg: []const u8) void {
+    if (claimSave()) saveRecord(error_name, msg);
 }
 
 pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    savePanic(msg);
+    saveOnce("panic", msg);
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
+/// Zig's segfault handler calls this through `root.debug.handleSegfault`, which
+/// `main.zig` sets to this function. It shares `handling` with `handle`, so the
+/// first crash of either kind saves its record, and a later one skips the save.
+/// Then it calls Zig's default handler, which prints the signal's name and its
+/// address, then a stack trace only in builds with debug info, and aborts.
+pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
+    saveOnce("signal", segfaultMessage(&segfault_msg_buf, addr, name, opt_ctx));
+    std.debug.defaultHandleSegfault(addr, name, opt_ctx);
+}
+
+/// The message of a segfault record: the words Zig's default handler prints, then
+/// the program counter when the handler has the CPU context. The counter is an
+/// offset from `handleSegfault`, so an unstripped build of the same commit maps
+/// it to a line. Formats into `buf`, so the handler does not allocate.
+fn segfaultMessage(buf: []u8, addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) []const u8 {
+    return formatSegfault(buf, addr, name, contextPc(opt_ctx)) catch name;
+}
+
+/// Zig's `CpuContextPtr` is `noreturn` where it has no CPU context, so the
+/// program counter is read only where that type exists.
+const has_cpu_context = std.debug.CpuContextPtr != noreturn;
+
+fn contextPc(opt_ctx: ?std.debug.CpuContextPtr) ?usize {
+    if (comptime !has_cpu_context) return null;
+    const ctx = opt_ctx orelse return null;
+    return ctx.getPc();
+}
+
+/// Formats a segfault message into `buf`. `addr` and `pc` may each be null.
+fn formatSegfault(buf: []u8, addr: ?usize, name: []const u8, pc: ?usize) ![]const u8 {
+    // A signal that `kill` sent has no fault address. Zig reads `si_addr` for
+    // every `si_code` and does not pass `si_code`, so for such a signal the
+    // address printed here is not a fault address: the sender's pid and uid on
+    // Linux, and zero on macOS.
+    const base = @intFromPtr(&handleSegfault);
+    if (pc) |p| {
+        const forward = p >= base;
+        const distance = if (forward) p - base else base - p;
+        const sign: []const u8 = if (forward) "+" else "-";
+        if (addr) |a| return std.mem.print(buf, "{s} at address 0x{x} (pc 0x{x}, handleSegfault{s}0x{x})", .{ name, a, p, sign, distance });
+        return std.mem.print(buf, "{s} (no address available, pc 0x{x}, handleSegfault{s}0x{x})", .{ name, p, sign, distance });
+    }
+    if (addr) |a| return std.mem.print(buf, "{s} at address 0x{x}", .{ name, a });
+    return std.mem.print(buf, "{s} (no address available)", .{name});
+}
+
+/// Holds a segfault message. Its longest name is "General protection exception".
+const segfault_msg_bytes = 128;
+var segfault_msg_buf: [segfault_msg_bytes]u8 = undefined;
+
 /// Writes the record to the temporary file, then renames it over the crash file.
 /// Creates the fx folder and the diagnostics folder when they are missing. Every
-/// error is ignored, because the panic must still reach `std.debug.defaultPanic`,
-/// except that a failed save, a folder it refuses, and the saved path are written
-/// to stderr.
-fn saveRecord(msg: []const u8) void {
+/// error is ignored, because the panic or segfault must still reach Zig's default
+/// handler, except that a failed save, a folder it refuses, and the saved path are
+/// written to stderr.
+fn saveRecord(error_name: []const u8, msg: []const u8) void {
     if (path_len == 0) return;
     // Creates the fx folder, then the diagnostics folder, both private to the user,
     // when they are missing. The results are not checked: "already exists" is
@@ -141,6 +196,7 @@ fn saveRecord(msg: []const u8) void {
         build_options.app_version,
         build_options.git_commit,
         io_mod.milliTimestamp(),
+        error_name,
         msg,
     );
     if (record.len == 0) return noteNotSaved();
@@ -218,15 +274,15 @@ fn writeAll(fd: c_int, bytes: []const u8) bool {
 
 /// Writes the record's two lines into `buf` and returns them. The first line is
 /// the `fx_trace` header that `trace_report.zig` writes, and the second is a
-/// `fatal_error` record whose error is `panic`. Returns an empty slice when
+/// `fatal_error` record whose error is `error_name`. Returns an empty slice when
 /// `buf` is too small, so a partial record is never saved.
-pub fn formatRecord(buf: []u8, fx_version: []const u8, git_commit: []const u8, now_ms: i64, msg: []const u8) []const u8 {
+pub fn formatRecord(buf: []u8, fx_version: []const u8, git_commit: []const u8, now_ms: i64, error_name: []const u8, msg: []const u8) []const u8 {
     var writer: std.Io.Writer = .fixed(buf);
-    writeLines(&writer, fx_version, git_commit, now_ms, msg) catch return buf[0..0];
+    writeLines(&writer, fx_version, git_commit, now_ms, error_name, msg) catch return buf[0..0];
     return writer.buffered();
 }
 
-fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8, now_ms: i64, msg: []const u8) !void {
+fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8, now_ms: i64, error_name: []const u8, msg: []const u8) !void {
     // Like `trace_report.zig`, leave out a time that is unknown or outside the
     // years 1970 to 9999.
     var utc_buf: [40]u8 = undefined;
@@ -246,7 +302,9 @@ fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8,
     try writeJsonStr(trace_report.notice_text, w);
     try w.writeAll("}\n");
 
-    try w.writeAll("{\"type\":\"fatal_error\",\"error\":\"panic\",\"message\":");
+    try w.writeAll("{\"type\":\"fatal_error\",\"error\":");
+    try writeJsonStr(error_name, w);
+    try w.writeAll(",\"message\":");
     try writeJsonStr(keptMessage(msg), w);
     if (utc) |text| try writeTime(w, "at", text, now_ms);
     try w.writeAll("}\n");
@@ -277,7 +335,7 @@ fn parseRecordLine(arena: std.mem.Allocator, line: []const u8) !std.json.ObjectM
 
 test "crash panic record is two JSON lines the reader takes" {
     var buf: [record_buf_bytes]u8 = undefined;
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "boom");
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", "boom");
     try std.testing.expect(record.len > 0);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -307,7 +365,7 @@ test "crash panic record escapes a long message and cuts it to fit" {
     const head = "say \"hi\"\nline";
     @memcpy(message[0..head.len], head);
     var buf: [4096]u8 = undefined;
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &message);
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &message);
     try std.testing.expect(record.len > 0);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -324,7 +382,7 @@ test "crash panic record fits a message made of control bytes" {
     // Each control byte escapes to six bytes, so the kept text grows to 3072.
     const controls: [max_message_bytes + 88]u8 = @splat(0x01);
     var buf: [4096]u8 = undefined;
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &controls);
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &controls);
     try std.testing.expect(record.len > 0);
     try std.testing.expect(record.len <= buf.len);
 }
@@ -346,7 +404,7 @@ test "crash panic cut at 512 bytes drops a character that the cut splits" {
     msg[512] = 0xa9;
     msg[513] = 't';
     var buf: [record_buf_bytes]u8 = undefined;
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &msg);
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &msg);
     try std.testing.expectEqualSlices(u8, msg[0..511], try fatalMessage(arena.allocator(), record));
 }
 
@@ -356,14 +414,14 @@ test "crash panic keeps a message of exactly 512 bytes, and a character that end
     var buf: [record_buf_bytes]u8 = undefined;
 
     const ascii: [512]u8 = @splat('x');
-    const kept_ascii = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &ascii));
+    const kept_ascii = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &ascii));
     try std.testing.expectEqualSlices(u8, &ascii, kept_ascii);
 
     // The two bytes of the character end at 512, so the whole character is kept.
     var ending: [512]u8 = @splat('x');
     ending[510] = 0xc3;
     ending[511] = 0xa9;
-    const kept_ending = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, &ending));
+    const kept_ending = try fatalMessage(arena.allocator(), formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &ending));
     try std.testing.expectEqualSlices(u8, &ending, kept_ending);
 }
 
@@ -371,7 +429,7 @@ test "crash panic keeps a note instead of a message that is not UTF-8" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buf: [record_buf_bytes]u8 = undefined;
-    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "bad \xff byte");
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", "bad \xff byte");
     try std.testing.expectEqualStrings(not_utf8_note, try fatalMessage(arena.allocator(), record));
 }
 
@@ -384,7 +442,7 @@ test "crash panic writes the record when only the fx folder exists" {
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("no folder yet");
+    saveRecord("panic", "no folder yet");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "no folder yet") != null);
@@ -399,7 +457,7 @@ test "crash panic renames the temporary file over the crash file and leaves none
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("renamed into place");
+    saveRecord("panic", "renamed into place");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "renamed into place") != null);
@@ -418,10 +476,77 @@ test "crash panic keeps the last record when the temporary file cannot be writte
     prepare(home);
     // A folder at the temporary file's path makes the open of that path fail.
     try std.Io.Dir.cwd().createDirPath(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0));
-    saveRecord("not saved");
+    saveRecord("panic", "not saved");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("last saved record\n", bytes);
+}
+
+/// Formats a signal record for `name` at `addr`, or with no address when `addr` is
+/// null, and returns its `fatal_error` line. The record's buffers come from `arena`,
+/// so the returned object stays valid while the arena lives.
+fn signalFatal(arena: std.mem.Allocator, addr: ?usize, name: []const u8) !std.json.ObjectMap {
+    const msg_buf = try arena.alloc(u8, segfault_msg_bytes);
+    const buf = try arena.alloc(u8, record_buf_bytes);
+    const record = formatRecord(buf, "0.0.17", "abc1234", 1_700_000_000_123, "signal", segfaultMessage(msg_buf, addr, name, null));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, record, "\n"), '\n');
+    _ = try parseRecordLine(arena, lines.next().?);
+    return parseRecordLine(arena, lines.next().?);
+}
+
+test "crash panic record for a signal has error signal and the address in its message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fatal = try signalFatal(arena.allocator(), 0x1234, "Segmentation fault");
+    try std.testing.expectEqualStrings("signal", fatal.get("error").?.string);
+    try std.testing.expectEqualStrings("Segmentation fault at address 0x1234", fatal.get("message").?.string);
+}
+
+test "crash panic record for a signal without an address says so" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fatal = try signalFatal(arena.allocator(), null, "General protection exception");
+    try std.testing.expectEqualStrings("signal", fatal.get("error").?.string);
+    try std.testing.expectEqualStrings("General protection exception (no address available)", fatal.get("message").?.string);
+}
+
+test "crash panic segfault message names the program counter when the handler has the CPU context" {
+    if (comptime !has_cpu_context) return error.SkipZigTest;
+    const Context = @typeInfo(std.debug.CpuContextPtr).pointer.child;
+    const ctx: Context = std.mem.zeroes(Context);
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const message = segfaultMessage(&buf, 0x1234, "Segmentation fault", &ctx);
+    var expected_buf: [segfault_msg_bytes]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "Segmentation fault at address 0x1234 (pc 0x0, handleSegfault-0x{x})",
+        .{@intFromPtr(&handleSegfault)},
+    );
+    try std.testing.expectEqualStrings(expected, message);
+}
+
+test "crash panic segfault message without a CPU context has no program counter" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Segmentation fault at address 0x1234",
+        segfaultMessage(&buf, 0x1234, "Segmentation fault", null),
+    );
+}
+
+test "crash panic segfault message gives the program counter as a signed offset from handleSegfault" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const base = @intFromPtr(&handleSegfault);
+    const after = try formatSegfault(&buf, null, "Segmentation fault", base + 0x40);
+    try std.testing.expect(std.mem.endsWith(u8, after, "handleSegfault+0x40)"));
+    const before = try formatSegfault(&buf, null, "Segmentation fault", base - 0x20);
+    try std.testing.expect(std.mem.endsWith(u8, before, "handleSegfault-0x20)"));
+}
+
+test "crash panic segfault message fits the longest name and two full addresses" {
+    var buf: [segfault_msg_bytes]u8 = undefined;
+    const message = try formatSegfault(&buf, std.math.maxInt(usize), "General protection exception", std.math.maxInt(usize));
+    try std.testing.expect(std.mem.startsWith(u8, message, "General protection exception at address 0xffffffffffffffff"));
+    try std.testing.expect(std.mem.indexOf(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
 }
 
 test "crash panic saves the record when a FIFO sits at the temporary path" {
@@ -438,7 +563,7 @@ test "crash panic saves the record when a FIFO sits at the temporary path" {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
     };
     try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(&tmp_path_buf, 0o600));
-    saveRecord("saved past a fifo");
+    saveRecord("panic", "saved past a fifo");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "saved past a fifo") != null);
@@ -463,7 +588,7 @@ test "crash panic saves a private file over a leftover file of another mode" {
     const before = try std.Io.Dir.cwd().statFile(std.testing.io, std.mem.sliceTo(&tmp_path_buf, 0), .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), before.permissions.toMode() & 0o777);
 
-    saveRecord("saved over a leftover file");
+    saveRecord("panic", "saved over a leftover file");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "saved over a leftover file") != null);
@@ -479,7 +604,7 @@ test "crash panic creates the fx folder and the diagnostics folder when both are
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("no fx folder at all");
+    saveRecord("panic", "no fx folder at all");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "no fx folder at all") != null);
@@ -515,7 +640,7 @@ test "crash panic writes the record to the prepared file" {
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("boom from the file test");
+    saveRecord("panic", "boom from the file test");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
 
@@ -540,7 +665,7 @@ test "crash panic keeps a full report on disk once it is noted as saved" {
 
     prepare(home);
     noteReportSaved();
-    savePanic("short panic record");
+    saveOnce("panic", "short panic record");
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path_buf[0..path_len], std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("full report\n", bytes);
@@ -559,7 +684,7 @@ test "crash panic does not write through a link at the diagnostics folder" {
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("through the link");
+    saveRecord("panic", "through the link");
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.statFile(std.testing.io, "elsewhere/last-crash.jsonl", .{ .follow_symlinks = false }),
@@ -578,7 +703,7 @@ test "crash panic does not write through a link at the fx folder" {
     defer path_len = 0;
 
     prepare(home);
-    saveRecord("through the link");
+    saveRecord("panic", "through the link");
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.statFile(std.testing.io, "elsewhere/diagnostics", .{ .follow_symlinks = false }),
@@ -599,16 +724,16 @@ fn stderrWhile(tmp: *std.testing.TmpDir, name: []const u8, run: *const fn () voi
 }
 
 fn saveBlocked() void {
-    saveRecord("blocked");
+    saveRecord("panic", "blocked");
 }
 
 fn panicAfterFullReport() void {
-    savePanic("short panic record");
+    saveOnce("panic", "short panic record");
 }
 
 fn saveWithoutPath() void {
     path_len = 0;
-    saveRecord("no path");
+    saveRecord("panic", "no path");
 }
 
 test "crash panic says on stderr when its save fails, and says nothing when a save is skipped" {
