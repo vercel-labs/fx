@@ -1059,7 +1059,9 @@ pub const Runtime = struct {
     /// returns whether its slot has a next work. `posted` is set when a turn
     /// work finished here posts to the owner too. A waiting message that could
     /// not be saved as a work, and a leftover of `end` that could not be queued
-    /// again, are reported here too, and the child is settled again.
+    /// again, are reported here too, and the child is settled again. A turn
+    /// that ended before its work opened is finished here too, with the lock
+    /// released, and the child is settled again by the next pass.
     fn settleEnd(self: *Runtime, first: managed_owner.WorkEnd, posted: *bool) bool {
         var end = first;
         while (true) {
@@ -1069,6 +1071,13 @@ pub const Runtime = struct {
                 .next => return true,
                 .leftovers_dropped => {
                     if (self.reportDroppedLeftovers(end, drops)) posted.* = true;
+                    end.leftovers = &.{};
+                    continue;
+                },
+                .again => {
+                    // The first pass queued the leftovers; the turn was finished with
+                    // the lock released, so the child is settled again by the one hold,
+                    // which sees a close or a turn that came meanwhile.
                     end.leftovers = &.{};
                     continue;
                 },
@@ -1089,7 +1098,9 @@ pub const Runtime = struct {
     /// `end` that could not be queued again is noted in `drops`, and the pass
     /// returns before it settles the child, so the caller reports it first. A
     /// closing child takes no next work; its close is written here once its
-    /// work is settled.
+    /// work is settled. A turn that ended before its work opened is finished
+    /// with the lock released, and the pass returns `.again`, so `settleEnd`
+    /// settles the child again under one hold of the lock.
     fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool, drops: *LeftoverDrops) SlotNext {
         var ended = (blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -1113,20 +1124,14 @@ pub const Runtime = struct {
                 .ended => |work| break :blk work,
             }
         }) orelse return self.settleClosing(end.child_id, posted);
-        // Its turn ended before the work could open: finish it now, and let
-        // this slot take the parent's next message.
+        // Its turn ended before the work could open: finish it now, with the
+        // lock released. The next pass settles the child again, and then the
+        // slot takes the parent's next message.
         defer ended.deinit(self.alloc);
         const reply = ended.ended.?.reply;
         if (self.finishTurnWork(ended, ended.ended.?.outcome, reply)) posted.* = true;
         if (end_test_controls.inSettleArmed()) end_test_controls.holdInSettle(end.child_id);
-        {
-            self.admission_mutex.lockUncancelable(io_mod.getIo());
-            defer self.admission_mutex.unlock(io_mod.getIo());
-            // The turn was finished with the lock released: a close that landed
-            // meanwhile found the child busy too.
-            if (!self.endClosingWorkLocked(end)) return self.nextOrIdleLocked(end.child_id);
-        }
-        return self.settleClosing(end.child_id, posted);
+        return .again;
     }
 
     /// A closing child's work has ended (`endClosingWorkLocked`): what a user's
@@ -1138,7 +1143,7 @@ pub const Runtime = struct {
         return .idle;
     }
 
-    /// What `nextOrIdleLocked` did for a child whose work ended.
+    /// What one pass of `settleEnd` did for a child whose work ended.
     const SlotNext = union(enum) {
         /// Nothing waits: the child is idle and its slot ends.
         idle,
@@ -1152,6 +1157,9 @@ pub const Runtime = struct {
         /// `LeftoverDrops` records. The child stays busy: the caller reports
         /// them with the lock released, then settles the child again.
         leftovers_dropped,
+        /// A turn that ended before its work opened was finished with the lock
+        /// released. The caller settles the child again.
+        again,
     };
 
     /// The leftovers of an ended work that could not be queued again, by
@@ -4746,6 +4754,7 @@ test "a user's close that lands after a subagent's report still tells main what 
     try std.testing.expectEqual(@as(usize, 1), closed.dropped);
     SettleGap.go.set(io_mod.getIo());
     try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
 
     try std.testing.expectEqual(@as(usize, 1), gap.fixture.runs.load(.seq_cst));
     try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
@@ -4753,10 +4762,10 @@ test "a user's close that lands after a subagent's report still tells main what 
 }
 
 // The hold sits after the host finishes a turn that ended before its work
-// opened, with the lock released, and before it clears the child's busy flag.
-// A close that lands there sees the child busy. The host checks for a closing
-// child under the same hold that clears the flag, and writes the close then,
-// so the close must still be written once the work has settled.
+// opened, with the lock released, and before it settles the child again. A
+// close that lands there sees the child busy. The next pass checks for a
+// closing child under the same hold that clears the flag, and writes the close
+// then, so the close must still be written once the work has settled.
 test "a close that lands while a subagent's ended work is settled is still written" {
     var gap: GapFixture = undefined;
     try gap.init(.{ .hold = true, .armed = false });
@@ -4782,6 +4791,7 @@ test "a close that lands while a subagent's ended work is settled is still writt
     _ = (try gap.runtime.closeChild(child_id, .parent)).?;
     SettleGap.go.set(io_mod.getIo());
     try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
 
     {
         gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -4823,6 +4833,7 @@ test "a close that lands while a subagent's ended work is settled is still writt
     try std.testing.expectEqual(@as(usize, 1), closed.dropped);
     SettleGap.go.set(io_mod.getIo());
     try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
 
     {
         gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -4837,6 +4848,49 @@ test "a close that lands while a subagent's ended work is settled is still writt
     try waitUntilQuiet(gap.runtime);
     const new_id = try reviewerId(gap.runtime, gap.arena());
     try std.testing.expect(!std.mem.eql(u8, child_id, new_id));
+}
+
+// The hold sits after the host finishes a turn that ended before its work
+// opened. A second user's turn that begins there waits, as the child is busy,
+// and the host must open it before it lets the child go idle.
+test "a user's turn that begins while the host finishes an earlier one is opened" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+    SettleGap.armInSettle();
+    defer SettleGap.disarmInSettle();
+
+    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
+    try waitForRuns(&gap.fixture, 1);
+    const child_id = try reviewerId(gap.runtime, gap.arena());
+    const turn = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
+    defer std.testing.allocator.free(turn);
+    gap.runtime.endUserWork(child_id, turn, .failed, "");
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+
+    // The child is busy while the host settles, so this turn waits, unopened.
+    const second = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
+    defer std.testing.allocator.free(second);
+    SettleGap.go.set(io_mod.getIo());
+    try waitForSlotEnd(gap.runtime, child_id);
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        const index = gap.runtime.findTurnWorkLocked(child_id) orelse return error.SecondTurnGone;
+        try std.testing.expect(gap.runtime.turn_works.items[index].opened);
+    }
+
+    // Its end posts its own report, after the two the first pass made.
+    gap.runtime.endUserWork(child_id, second, .failed, "");
+    try waitUntilQuiet(gap.runtime);
+    try std.testing.expectEqual(@as(usize, 3), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[2], " failed ") != null);
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        try std.testing.expect(gap.runtime.findTurnWorkLocked(child_id) == null);
+    }
 }
 
 test "a user's close that lands after a user's turn's report still tells main what it dropped" {
@@ -6489,7 +6543,8 @@ const SettleGap = struct {
     }
 
     /// The hold after the host finishes a turn that ended before its work
-    /// opened, and before its busy clear, with the same two events as `arm`.
+    /// opened, with the lock released and before it settles the child again,
+    /// with the same two events as `arm`.
     fn armInSettle() void {
         entered = .unset;
         go = .unset;
