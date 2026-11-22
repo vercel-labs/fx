@@ -340,8 +340,9 @@ DoSend(c) ==
 \* A stop drops the waiting messages now and counts the stopped turn's unread
 \* ones with them. fx drops the unread ones at the stop too
 \* (WorkerRuntime.dropParentSteering). Here they stay in unread until the
-\* turn ends, which no step can tell apart: none reads them after the stop
-\* (CountedNeverRead), and UserStop needs a running turn.
+\* turn ends. In the design configs no step can tell the two apart: none
+\* reads them after the stop (CountedNeverRead), and UserStop needs a running
+\* turn. The planted defect "recount" counts them again from there.
 DoStop(c) ==
     LET s == c.sub
         waiting == Range(waitq[s])
