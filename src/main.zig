@@ -5514,6 +5514,7 @@ test {
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
+    _ = @import("core/auth/subscription_logout.zig");
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
