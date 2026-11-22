@@ -5046,8 +5046,11 @@ pub const TranscriptRuntime = struct {
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
     /// Set when a resume flow is released before the transcript's first
-    /// paint. Until that paint, the transcript keeps the window drops that
-    /// the flow would have kept.
+    /// paint. The transcript keeps the window drops that the flow would have
+    /// kept until that paint, or until the transcript is cleared. The design
+    /// rule, in `tests/tla/transcript_window/design/DESIGN.md`: "A resumed
+    /// transcript holds every entry until a frame has repainted it from the
+    /// entries".
     unpainted_resume_hold: bool = false,
     /// The last stable frame handed a resumed transcript's flow to the commit
     /// anchor and invalidated it, so the rows it painted are on screen with
@@ -5268,7 +5271,6 @@ pub const TranscriptRuntime = struct {
     pub fn resetPaintedTranscriptView(self: *TranscriptRuntime, top_row: ?u16) void {
         self.pending_scroll_compact = false;
         self.has_painted_transcript = false;
-        self.unpainted_resume_hold = false;
         self.last_visible_transcript_top_row = top_row orelse self.owned_top_row;
         self.last_visible_transcript_start_line = 0;
         self.last_visible_transcript_partial_skip_rows = 0;

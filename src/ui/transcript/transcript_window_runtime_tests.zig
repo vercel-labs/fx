@@ -1288,3 +1288,38 @@ test "a resumed transcript released before its first paint keeps the cycle befor
     try std.testing.expect(holds(&runtime, "NEXT_TURN"));
     try expectWindowMatchesEntries(&runtime);
 }
+
+test "a resumed transcript released before its first paint keeps the cycle before the newest compaction through a visual epoch reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The child is hidden, so its flow is released before any frame paints it.
+    try std.testing.expect(runtime.releaseUnpaintedResumeSource(alloc) > 0);
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // Ctrl+L runs a visual epoch reset before the first paint, and it must not end the hold.
+    try runtime.resetVisualEpoch(alloc, "welcome\n");
+    try std.testing.expect(runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The first paint ends the hold, and the next sync drops the cycle.
+    var first_paint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer first_paint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &first_paint, committedFrameResult());
+    try std.testing.expect(!runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}

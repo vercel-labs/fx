@@ -3243,8 +3243,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           if (latestUserText(body).includes("FOLLOWUP_TASK")) {
             if (body.includes('"follow_slow"')) return text("follow_done", "FOLLOWUP_DONE");
             slowCallServed = true;
+            // The loop stops after 1200 checks, so a failed test cannot leave the call running.
             return toolCall("follow_slow", "shell", {
-              request: { action: "run", command: `while [ ! -e '${gateFile}' ]; do sleep 0.1; done; echo SLOW-DONE`, yield_time_ms: 120_000 },
+              request: { action: "run", command: `i=0; while [ ! -e '${gateFile}' ] && [ "$i" -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done; echo SLOW-DONE`, yield_time_ms: 150_000 },
             });
           }
           return text("row_done", rowReply);

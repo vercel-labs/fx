@@ -8585,26 +8585,35 @@ test "a subagent's view is rebuilt from its saved conversation without touching 
     try std.testing.expectEqualStrings("SCREEN_DIM", app.shell.command_output_render.styles.dim_style);
 }
 
-test "a hidden subagent's first run builds its view without a stale resume flow" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer child.agent.session.agent.history.deinit(alloc);
+/// Adds a child with one saved turn and main text in the transcript, then builds
+/// its first-run view. The child is on screen when `on_screen` is true.
+fn buildFirstRunChild(alloc: std.mem.Allocator, app: *App, on_screen: bool) !*app_agents_runtime.ChildAgent {
+    const child = try addTestChildAgent(app, "child-1");
+    errdefer child.agent.session.agent.history.deinit(alloc);
     try child.agent.session.agent.history.append(alloc, .{ .interrupted = .{
         .user = .{ .text = @constCast("EARLIER_TASK") },
         .assistant = @constCast("EARLIER_ANSWER"),
     } });
     try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
+    if (on_screen) app.agent_on_screen = child;
 
     const Body = struct {
         fn run(target: *app_agents_runtime.ChildAgent, a: *App, agent: *agents.Agent) anyerror!void {
             try App.AgentsAppRuntime.buildFirstRunView(a, agent, target);
         }
     };
-    try App.AgentsAppRuntime.visit(&app, child, child, Body.run);
+    try App.AgentsAppRuntime.visit(app, child, child, Body.run);
+    return child;
+}
+
+test "a hidden subagent's first run builds its view without a stale resume flow" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try buildFirstRunChild(alloc, &app, false);
+    defer child.agent.session.agent.history.deinit(alloc);
 
     const view = &child.screen.transcript.notebook;
     var saw_task = false;
@@ -8624,21 +8633,8 @@ test "a subagent on screen keeps its resume flow for its first paint" {
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
+    const child = try buildFirstRunChild(alloc, &app, true);
     defer child.agent.session.agent.history.deinit(alloc);
-    try child.agent.session.agent.history.append(alloc, .{ .interrupted = .{
-        .user = .{ .text = @constCast("EARLIER_TASK") },
-        .assistant = @constCast("EARLIER_ANSWER"),
-    } });
-    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
-    app.agent_on_screen = child;
-
-    const Body = struct {
-        fn run(target: *app_agents_runtime.ChildAgent, a: *App, agent: *agents.Agent) anyerror!void {
-            try App.AgentsAppRuntime.buildFirstRunView(a, agent, target);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, child, Body.run);
 
     const view = &child.screen.transcript.notebook;
     try std.testing.expect(view.pending_resume_source != null);

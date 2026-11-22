@@ -2953,9 +2953,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "child_session_opened", .{}, "agent={s} turns={d}", .{ child.id, agent.session.agent.history.items.len });
         }
 
-        /// Builds the view of a subagent's first run in this process from its
-        /// saved conversation. Its frozen resume flow goes in
-        /// `releaseHiddenResumeFlow`.
+        /// Builds a subagent's first-run view from its saved conversation.
         pub fn buildFirstRunView(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {
             const history = agent.session.agent.history.items;
             try buildView(app, agent, history);
