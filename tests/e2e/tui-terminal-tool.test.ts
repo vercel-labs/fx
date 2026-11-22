@@ -35,7 +35,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function createFixture(prefix: string) {
+function createFixture(prefix: string, settings: Record<string, unknown> = {}) {
   const root = realpathSync(mkdtempSync(join("/tmp", prefix)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -50,6 +50,7 @@ function createFixture(prefix: string) {
       sandbox: "os",
       yolo_acknowledged: true,
       permission: {},
+      ...settings,
     }) + "\n",
   );
   writeFileSync(tracePath, "");
@@ -144,6 +145,11 @@ function schemaFromRequest(body: string): Record<string, unknown> {
   const shell = tools.find((tool) => tool.name === "shell");
   if (!shell) throw new Error("missing shell schema");
   return shell.inputSchema as Record<string, unknown>;
+}
+
+function requestToolNames(body: string): string[] {
+  const parsed = JSON.parse(body) as { tools?: Array<{ name?: unknown }> };
+  return (parsed.tools ?? []).map((tool) => String(tool.name));
 }
 
 /// Every hosted terminal's record; their state lives under `~/.fx/terminal`
@@ -1348,3 +1354,23 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
   );
   expect(records.every((record) => record.lifecycle === "lost")).toBe(true);
 }, 150_000);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI with experimental.bash_tool offers the bash tool and not shell",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-tool-", { experimental: { bash_tool: true } });
+    const gateway = startFakeGateway([fakeGatewayFinalText("BASH_TOOL_TUI_OK")]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("List the tools.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_TOOL_TUI_OK", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(1);
+    const names = requestToolNames(gateway.requests[0]!.body);
+    expect(names).toContain("bash");
+    expect(names).not.toContain("shell");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);

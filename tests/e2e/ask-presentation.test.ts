@@ -1245,3 +1245,184 @@ describe("fx ask shell startup files", () => {
     TIMEOUT,
   );
 });
+
+describe("fx ask with experimental.bash_tool", () => {
+  // Fx's built-in tools that the bash tool set replaces. None may reach the model.
+  const REPLACED_TOOLS = [
+    "shell",
+    "read_file",
+    "glob_files",
+    "grep_files",
+    "edit_file",
+    "write_file",
+    "web_fetch",
+    "web_search",
+    "exa_search",
+    "ask_user_question",
+    "install_skill",
+    "read_tool_result",
+  ];
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("offers the bash tool set in place of fx's other built-in tools", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([fakeGatewayFinalText("Tools listed.\n")]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "List the tools."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const names = requestToolNames(gateway.requests[0]!.body);
+    expect(names).toEqual(["bash", "toolbox", "vision"]);
+    for (const name of REPLACED_TOOLS) expect(names).not.toContain(name);
+  }, TIMEOUT);
+
+  test("a bash variable carries from one program to the next", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-set", "bash", { command: "x=41" }),
+      fakeGatewayToolCall("bash-add", "bash", { command: "echo $((x+1))" }),
+      fakeGatewayFinalText("State carried over.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Carry a variable."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toBe("State carried over.\n");
+    expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
+      { name: "bash", status: "success" },
+      { name: "bash", status: "success" },
+    ]);
+    expect(gateway.requests).toHaveLength(3);
+    expect(toolResultText(gateway.requests[2]!.body, "bash-add")).toContain("42");
+  }, TIMEOUT);
+
+  test("the working folder carries from one program to the next", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-cd", "bash", { command: "mkdir -p sub && cd sub" }),
+      fakeGatewayToolCall("bash-pwd", "bash", { command: "pwd" }),
+      fakeGatewayFinalText("Folder carried over.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Change folder."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[2]!.body, "bash-pwd")).toContain(`${root.workspace}/sub`);
+  }, TIMEOUT);
+
+  test("wait_more with nothing running says so", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-wait", "bash", { command: "wait_more" }),
+      fakeGatewayFinalText("Waited.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Wait for it."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[1]!.body, "bash-wait")).toContain("Nothing is running.");
+  }, TIMEOUT);
+
+  test("in auto mode a program gets one review and a wait gets none", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-echo", "bash", { command: "echo hi" }),
+        fakeGatewayToolCall("bash-wait", "bash", { command: "wait_more" }),
+        fakeGatewayFinalText("Review counted.\n"),
+      ],
+      { classifierResponses: [fakeGatewayPermissionDecision()] },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Run a program and wait."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.classifierRequests).toHaveLength(1);
+    expect(gateway.classifierRequests[0]!.body).toContain("echo hi");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-echo")).toContain("hi");
+    expect(toolResultText(gateway.requests[2]!.body, "bash-wait")).toContain("Nothing is running.");
+  }, TIMEOUT);
+
+  test("without the setting the same run offers shell and not bash", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([fakeGatewayFinalText("Tools listed.\n")]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "List the tools."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const names = requestToolNames(gateway.requests[0]!.body);
+    expect(names).toContain("shell");
+    expect(names).not.toContain("bash");
+  }, TIMEOUT);
+
+  test("a model-sent action does not change what bash does", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-wait-sent-action", "bash", { command: "wait_more", action: "run" }),
+      fakeGatewayFinalText("Waited.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Wait for it."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
+      { name: "bash", status: "success" },
+    ]);
+    const waitResult = toolResultText(gateway.requests[1]!.body, "bash-wait-sent-action");
+    expect(waitResult).toContain("Nothing is running.");
+    expect(waitResult).not.toContain("send wait_more");
+    expect(gateway.classifierRequests).toHaveLength(0);
+  }, TIMEOUT);
+});
+
+function requestToolNames(raw: string): string[] {
+  const request = JSON.parse(raw) as { tools?: Array<{ name?: unknown }> };
+  return (request.tools ?? []).map((tool) => String(tool.name));
+}
+
+// The output the model reads back for call `callId`, as JSON text.
+function toolResultText(raw: string, callId: string): string {
+  const request = JSON.parse(raw) as { prompt: Array<{ role: string; content?: unknown }> };
+  for (const message of request.prompt) {
+    if (message.role !== "tool" || !Array.isArray(message.content)) continue;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part.toolCallId === callId) return JSON.stringify(part.output ?? part.result ?? part);
+    }
+  }
+  return "";
+}

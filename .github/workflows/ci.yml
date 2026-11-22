@@ -66,6 +66,9 @@ jobs:
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
+      - name: Check bash session boundary
+        run: ./scripts/check-bash-session-boundary.sh
+
       - name: Model-check request recovery
         run: |
           set -euo pipefail
@@ -1059,6 +1062,7 @@ jobs:
           scripts=(
             benchmarks/startup.sh
             scripts/check-agents-boundary.sh
+            scripts/check-bash-session-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh

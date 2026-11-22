@@ -23,6 +23,7 @@ const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
@@ -165,7 +166,14 @@ fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]cons
     if (call.toolbox_lookup) |lookup| return lookup.permission;
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
-    return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
+    // Shell's other calls, and every other terminal tool's, such as the bash
+    // tool's wait, share the "terminal" rule. A command call already
+    // returned "run_command" above.
+    if (std.mem.eql(u8, call.name, "shell")) return "terminal";
+    if (registeredTool(input, call.name)) |tool| {
+        if (tool.executor_kind == .terminal) return "terminal";
+    }
+    return call.name;
 }
 
 fn permissionTargetKindForCall(
@@ -2319,7 +2327,7 @@ pub fn runCommandContext(
         if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
     const tool = registeredTool(input, call.name) orelse return error.NotRunCommand;
     const cwd = switch (tool.captured_command_host) {
-        .workspace_clean => try arena.dupe(u8, input.workspace_root),
+        .workspace_clean, .bash_session => try arena.dupe(u8, input.workspace_root),
         .native => blk: {
             const cwd_arg = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
             break :blk if (std.mem.eql(u8, cwd_arg, "."))
@@ -2330,6 +2338,7 @@ pub fn runCommandContext(
     };
     const environment_value: command_environment.Environment = switch (tool.captured_command_host) {
         .workspace_clean => .workspace_clean,
+        .bash_session => try bashSessionEnvironment(arena),
         .native => try nativeCommandEnvironment(arena, args, execution_mode),
     };
     return .{
@@ -2360,6 +2369,14 @@ fn nativeCommandEnvironment(
     else
         null;
     return shell_resolver.environment(arena, configured, profile);
+}
+
+/// The bash tool's command environment. The bash tool computes the same value
+/// when it runs the program, so approval and execution agree.
+fn bashSessionEnvironment(arena: Allocator) !command_environment.Environment {
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    return .{ .user = try arena.dupe(u8, bash_session.bashPath(configured)) };
 }
 
 fn explicitTtyShell(
@@ -4812,6 +4829,99 @@ test "shell admission reuses terminal rules and command authority" {
     try std.testing.expectEqual(ToolPermissionDecision.once, run.decision);
     try std.testing.expect(run.execution_authority != null);
     try std.testing.expectEqual(@as(usize, 1), classifier.calls);
+}
+
+/// The shell spec as a bash tool, for the bash host tests below. Test builds only.
+const bash_test_tool = blk: {
+    var tool = test_builtin_tools.shell;
+    tool.name = "bash";
+    tool.model_schema.name = "bash";
+    tool.executor_kind = .terminal;
+    tool.captured_command_action = "run";
+    tool.captured_command_host = .bash_session;
+    break :blk tool;
+};
+
+test "bash tool command calls run in the workspace root" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+
+    const run_call = ToolCall{
+        .id = "bash-run",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\"}",
+    };
+    const run = try runCommandContext(input, arena, run_call);
+    try std.testing.expectEqualStrings("/tmp/workspace", run.resolved_cwd);
+    try std.testing.expectEqualStrings("run_command", try permissionNameForCall(input, arena, run_call));
+
+    // The bash folder ignores a cwd argument, which only a native shell reads.
+    const with_cwd = try runCommandContext(input, arena, .{
+        .id = "bash-run-cwd",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"cwd\":\"sub\"}",
+    });
+    try std.testing.expectEqualStrings("/tmp/workspace", with_cwd.resolved_cwd);
+}
+
+test "bash tool command calls use the bash environment" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+
+    var login_shell_buffer: [4096]u8 = undefined;
+    const expected_shell = bash_session.bashPath(shell_resolver.configuredLoginShellInto(&login_shell_buffer));
+    try std.testing.expect(std.mem.endsWith(u8, expected_shell, "bash"));
+
+    const run = try runCommandContext(input, arena, .{
+        .id = "bash-run",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\"}",
+    });
+    switch (run.environment) {
+        .user => |path| try std.testing.expectEqualStrings(expected_shell, path),
+        else => return error.TestExpectedUserEnvironment,
+    }
+
+    // The bash environment ignores a native profile argument, which would
+    // otherwise select a clean shell.
+    const with_profile = try runCommandContext(input, arena, .{
+        .id = "bash-run-profile",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"echo hi\",\"profile\":\"clean\"}",
+    });
+    switch (with_profile.environment) {
+        .user => |path| try std.testing.expectEqualStrings(expected_shell, path),
+        else => return error.TestExpectedUserEnvironment,
+    }
+}
+
+test "bash tool wait calls are terminal calls, not commands" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{bash_test_tool} };
+
+    const wait_call = ToolCall{
+        .id = "bash-wait",
+        .name = "bash",
+        .arguments_json = "{\"action\":\"wait\",\"command\":\"wait_more\"}",
+    };
+    try std.testing.expect(!(try isRunCommandCall(input, arena, wait_call)));
+    try std.testing.expectError(error.NotRunCommand, runCommandContext(input, arena, wait_call));
+    try std.testing.expectEqualStrings("terminal", try permissionNameForCall(input, arena, wait_call));
 }
 
 test "existing tool approval policies retain the standard default" {

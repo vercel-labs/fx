@@ -96,6 +96,7 @@ const Context = struct {
         var result = self.config.tool_context;
         result.worker = self.turn.workerRuntime();
         result.session = self.turn.sessionRuntime();
+        result.bash_session = &self.turn.bash_session;
         result.cancel_flag = self.cancel;
         result.permission_mode = self.admission.permission_mode;
         result.permission_grants = self.admission.grants;

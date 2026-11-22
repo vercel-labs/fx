@@ -36,6 +36,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
 const result_commit = @import("result_commit.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -275,6 +276,9 @@ pub const DispatchContext = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     command_artifact_dir: ?[]const u8 = null,
     managed_executions: ?*managed_execution.Runtime = null,
+    /// This agent's saved bash state for the bash tool
+    /// (`src/core/bash_session/bash_session.zig`); null where the host has none.
+    bash_session: ?*bash_session.Session = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
@@ -449,8 +453,10 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
-/// Names the action a model call without one means, or null when it is not
-/// exactly one. See `Tool.infer_action_fn`.
+/// Names the action a model call gets. The orchestrator adds it to a call that
+/// leaves it out, or replaces the one the model sent. A tool that lets the
+/// model choose its action returns null when `action` is present, and null
+/// keeps the call as it was sent. See `Tool.infer_action_fn`.
 pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
@@ -566,8 +572,10 @@ pub const Tool = struct {
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
     /// The orchestrator adds the inferred action to a model call that leaves
-    /// it out before the call is stored or admitted, so admission and decode
-    /// read the same arguments.
+    /// it out, or replaces the action the model sent, before the call is stored
+    /// or admitted, so admission and decode read the same arguments. A tool
+    /// that lets the model choose its action returns null when `action` is
+    /// present.
     infer_action_fn: ?InferActionFn = null,
     process_local_fn: ?ProcessLocalFn = null,
     cancel_if_requested_after_call: bool = false,

@@ -1320,11 +1320,13 @@ function acpOfferedTools(body: string): string[] {
 async function askForReviewerFromSessionWorkspace(root: ReturnType<typeof createIsolatedRoot>) {
   const createId = "acp_session_profile_child";
   const childBodies: string[] = [];
+  const parentBodies: string[] = [];
   const gateway = startDynamicFakeGateway((body) => {
     if (!body.includes('"name":"subagent"')) {
       childBodies.push(body);
       return finalText("session review done");
     }
+    parentBodies.push(body);
     if (acpLatestUserIsReport(body)) return finalText("ACP_SESSION_PROFILE_DONE");
     if (body.includes(createId)) return finalText("ACP_SESSION_PROFILE_TURN_DONE");
     return fakeGatewayToolCall(createId, "subagent", {
@@ -1341,7 +1343,7 @@ async function askForReviewerFromSessionWorkspace(root: ReturnType<typeof create
     const result = await runPrompt(acp, "Delegate a review.", TIMEOUT);
     expect(result.promptResult.result.stopReason).toBe("end_turn");
     const afterCall = gateway.requests.find((request) => request.body.includes(createId))!;
-    return { childBodies, delegated: acpToolResultText(afterCall.body, createId), stderr: acp.stderr };
+    return { childBodies, parentBodies, delegated: acpToolResultText(afterCall.body, createId), stderr: acp.stderr };
   } finally {
     await acp?.close();
     gateway.stop();
@@ -11625,6 +11627,38 @@ describe("acp: model-independent", () => {
         expect(run.delegated).toContain("Sent to reviewer");
         expect(run.childBodies).toHaveLength(1);
         expect(acpOfferedTools(run.childBodies[0]!)).toContain("read_file");
+        expect(run.stderr).toBe("");
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP with experimental.bash_tool offers the bash set to the session and its subagent child",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-bash-tool-");
+      try {
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({ experimental: { bash_tool: true } }),
+        );
+        // No `tools` key, so the child is not narrowed.
+        writeAcpProfile(root.external, "reviewer", { description: "Reviews the session workspace" });
+        const run = await askForReviewerFromSessionWorkspace(root);
+        expect(run.delegated).toContain("Sent to reviewer");
+
+        const offered = acpOfferedTools(run.parentBodies[0]!);
+        expect(offered).toContain("bash");
+        for (const name of ["shell", "read_file", "edit_file", "write_file", "glob_files", "grep_files"]) {
+          expect(offered).not.toContain(name);
+        }
+
+        expect(run.childBodies).toHaveLength(1);
+        const childOffered = acpOfferedTools(run.childBodies[0]!);
+        expect(childOffered).toContain("bash");
+        expect(childOffered).not.toContain("shell");
         expect(run.stderr).toBe("");
       } finally {
         rmSync(root.root, { recursive: true, force: true });

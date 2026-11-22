@@ -16,6 +16,7 @@ const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const workspace_diagnostics = @import("../workspace/diagnostics.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -89,6 +90,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
+const bash_tools = @import("../../builtins/bash_tools.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -661,6 +663,8 @@ const AskContext = struct {
     use_process_interrupt_flag: bool = false,
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime,
+    /// This run's saved bash state for the bash tool.
+    bash_session: bash_session.Session,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     loaded_skills: app_runtime_setup.LoadedSkills = .{},
@@ -750,6 +754,7 @@ const AskContext = struct {
                 cfg.process_provider,
             ),
             .managed_executions = managed_execution.Runtime.init(alloc),
+            .bash_session = bash_session.Session.init(alloc),
             .ephemeral_command_replay = command_replay_store.EphemeralStore.init(alloc),
             .lifecycle_runtime = lifecycle_runtime,
             .lifecycle_view = hooks.RuntimeView.empty(),
@@ -846,6 +851,7 @@ const AskContext = struct {
         }
         self.v2_children = null;
         self.managed_executions.deinit();
+        self.bash_session.deinit(io_mod.getIo());
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
@@ -1183,6 +1189,7 @@ const AskContext = struct {
             .ephemeral_command_replay = self.managed_executions.replayStore(),
             .terminal_client = &self.terminal_client,
             .managed_executions = &self.managed_executions,
+            .bash_session = &self.bash_session,
             .command_timeout_ms = self.command_timeout_ms,
             .web_fetch_runtime = &self.web_fetch_runtime,
             .web_fetch_artifact_store = self.session.webFetchArtifactStore(),
@@ -1710,7 +1717,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    // The bash tool set depends on the startup state, so the context gets a
+    // copy of deps that carries the set chosen here.
+    var run_deps = options.deps;
+    run_deps.tool_set = bash_tools.select(startup.bash_tool, options.deps.tool_set);
+    var ctx = AskContext.init(alloc, cfg, run_deps, startup.workspace_root);
     defer ctx.deinit();
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
@@ -1950,7 +1961,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
     try ctx.checkCancellation();
     const session_child_capability = ctx.sessionChildCapability();
-    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
+    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, ctx.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,

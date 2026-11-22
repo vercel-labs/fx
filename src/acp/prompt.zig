@@ -89,6 +89,7 @@ const tool_call_presentation = @import("tool_call_presentation.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
+const bash_tools = @import("../builtins/bash_tools.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../builtins/gateway.zig")
@@ -724,6 +725,7 @@ const AcpContext = struct {
             .session_child_capability = sessionChildCapability(session),
             .terminal_client = &self.state.terminal_client,
             .managed_executions = &self.state.managed_executions,
+            .bash_session = &self.state.bash_session,
             .ephemeral_command_replay = self.state.managed_executions.replayStore(),
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
@@ -1655,7 +1657,7 @@ pub fn runSubagentChild(
     }
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
-        builtin_tools.advertisement_set,
+        bash_tools.select(state.bash_tool, builtin_tools.advertisement_set),
         captured_mode,
         .{
             .permission_mode = admission.permission_mode,

@@ -129,6 +129,9 @@ pub fn formatApprovalCommand(
 pub const Host = enum {
     native,
     workspace_clean,
+    /// The bash tool: the workspace folder, and a user environment whose
+    /// shell is bash (`src/core/bash_session/bash_session.zig`).
+    bash_session,
 };
 
 test "command environment equality includes explicit shell identity" {
