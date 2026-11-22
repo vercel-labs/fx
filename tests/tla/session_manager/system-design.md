@@ -1973,7 +1973,7 @@ as it was sent):
     with the others.
   - **Host order:** the runtime begins the turn's token, then saves the
     user's prompt through `append_turn_piece`, then starts the start
-    capture on its own thread, beside the turn's first request, and waits
+    capture as its own `std.Io` task, beside the turn's first request, and waits
     for it to be saved before any tool acts (`AgentRuntimeDeps.executeToolCall`
     sends `.settle`), before a reached repository's start, before the end
     capture, before the turn returns however it ends, failed or paused

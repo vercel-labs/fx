@@ -6823,7 +6823,7 @@ fn processQueuedPromptInner(
         }
         start(deps.ctx, fresh, .capture);
     }
-    // The turn owns the start capture's thread: however it ends, failed or
+    // The turn owns the start capture's task: however it ends, failed or
     // paused before any tool and before any end capture included, the
     // capture is saved before the turn returns, never after its session
     // closes.

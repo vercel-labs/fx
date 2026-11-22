@@ -330,6 +330,17 @@ function workspaceCaptures(fixture: Fixture, id: string): any[] {
     .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
 }
 
+/// Whether any session in the fixture's profile has saved a
+/// `workspace_capture` item yet, read while its fx still runs.
+function anyWorkspaceCaptureSaved(fixture: Fixture): boolean {
+  const root = storeRoot(fixture.home);
+  if (!existsSync(root)) return false;
+  return readdirSync(root).some((id) => {
+    const log = join(root, id, "log.jsonl");
+    return existsSync(log) && readFileSync(log, "utf8").includes('"type":"workspace_capture"');
+  });
+}
+
 /// The one repository store under `~/.fx/captures`, beside retention's files.
 function captureStore(fixture: Fixture): string {
   const captures = join(fixture.home, ".fx", "captures");
@@ -510,6 +521,47 @@ test("fx ask captures another repository a tool writes in before the write, with
     const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
     expect(names(otherRecords[0].tree)).toEqual(["base.txt"]);
     expect(names(otherRecords[1].tree).sort()).toEqual(["base.txt", "made.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask sends the turn's request while its start capture runs, and saves that capture before the tool writes, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-beside-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The start capture waits at its hold until the turn's request arrives,
+  // so the request never follows a saved start capture by chance.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const target = join(fixture.workspace, "made.txt");
+  const savedAtRequest: boolean[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("beside-write")) return fakeGatewayFinalText("WROTE");
+    savedAtRequest.push(anyWorkspaceCaptureSaved(fixture));
+    writeFileSync(release, "");
+    return fakeGatewayToolCall("beside-write", "write_file", { path: target, content: "made\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Write the file."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("WROTE");
+    expect(readFileSync(target, "utf8")).toBe("made\n");
+    // The turn's first request left before its start capture was saved.
+    expect(savedAtRequest).toEqual([false]);
+    expect(existsSync(held)).toBe(true);
+    // The tool waited for the start capture: only the end tree has its file.
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+    const store = captureStore(fixture);
+    const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
+    expect(names(records[0].tree)).not.toContain("made.txt");
+    expect(names(records[1].tree)).toContain("made.txt");
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
