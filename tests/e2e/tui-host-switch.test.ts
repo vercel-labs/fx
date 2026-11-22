@@ -842,6 +842,82 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // main was told its second message joined the subagent's turn. The user's
+  // close ends that turn before it reads the message, so main must hear the
+  // count with the report that says the user closed the subagent.
+  test(
+    "the user's close of a working subagent drops the message main sent it while it worked, and its report counts it",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      let report = "";
+      const first = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's first turn waits here until the user closes it.
+          if (childCalls === 1) await first.promise;
+          return text("child_answer", "SWITCH_CHILD_RAN");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_CLOSE_TASK work slowly" },
+          });
+        }
+        if (mainCalls === 2) {
+          // Sent once the subagent's request is out, so the message waits in
+          // its turn, as in the Esc test above.
+          await until("the subagent's turn", () => childCalls >= 1);
+          return toolCall("main_more", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
+          });
+        }
+        // The report says the user closed the subagent; its count is checked below.
+        if (body.includes('\\"cause\\":\\"user_close\\"')) {
+          report = body;
+          return text("main_saw", "SWITCH_MAIN_SAW_CLOSE");
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        expect(childCalls).toBe(1);
+        // The close keys of the test above: Down opens the list on main's row,
+        // Down selects the subagent, Delete arms, Up keeps it, then Down, the
+        // forward Delete key arms, and Delete closes it.
+        await session.sendKeys("Down");
+        await session.waitForText("esc back", 10_000);
+        await session.sendKeys("BSpace");
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     delete close     esc back", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
+          && mainRow().test(pane) && !pane.includes("delete close"), 10_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("DC");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("DC");
+        await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForText("SWITCH_MAIN_SAW_CLOSE", 30_000);
+        // Main's report says the user closed the subagent and counts the message.
+        expect(report).toContain('\\"cause\\":\\"user_close\\"');
+        expect(report).toContain('\\"dropped\\":1');
+        // One request: the first turn. The joined message is not a request,
+        // and the close ended the turn before it could start another.
+        expect(childCalls).toBe(1);
+        first.release();
+        // The message main sent while it worked never ran.
+        expect(childCalls).toBe(1);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "a subagent whose request waits for a follow-up tells main, and main's message sends it again",
     async () => {
