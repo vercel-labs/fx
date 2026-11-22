@@ -2655,17 +2655,12 @@ pub fn Runtime(comptime App: type) type {
             syncTerminalTitle(app, agent);
         }
 
-        /// Drops C0 and DEL bytes before the cached title reaches the statusline.
+        /// Drops control bytes, invisible format characters and invalid UTF-8
+        /// before the cached title reaches the statusline and the tab title.
         /// Derived titles come from untrusted prompt text and display sidecars;
         /// `/rename` input is already rejected by `validateSessionTitle`.
         fn appendTitleWithoutControlBytes(app: *App, agent: *AppAgent, title: []const u8) !void {
-            var start: usize = 0;
-            for (title, 0..) |byte, index| {
-                if (byte >= 0x20 and byte != 0x7f) continue;
-                try agent.session_title.appendSlice(app.alloc, title[start..index]);
-                start = index + 1;
-            }
-            try agent.session_title.appendSlice(app.alloc, title[start..]);
+            try text_utils.appendPrintable(app.alloc, &agent.session_title, title);
         }
 
         fn terminalTitle(app: *App) host_capability.TerminalTitle {
@@ -11996,6 +11991,13 @@ test "cached session title drops control bytes before they reach the terminal" {
         Runtime(TestApp).cachedSessionTitle((&app).agent()).?,
     );
     try std.testing.expectEqualStrings("safe]2;ownedtail", app.terminalTitleLabelText());
+
+    try Runtime(TestApp).setCachedSessionTitle(&app, (&app).agent(), "rtl\u{202e}mark\u{061c}sep\u{180e}c1\u{0085}end");
+    try std.testing.expectEqualStrings(
+        "rtlmarksepc1end",
+        Runtime(TestApp).cachedSessionTitle((&app).agent()).?,
+    );
+    try std.testing.expectEqualStrings("rtlmarksepc1end", app.terminalTitleLabelText());
 }
 
 test "terminal title uses the workspace basename and handles unnamed roots" {

@@ -674,6 +674,20 @@ test "an agent's row shows its name's and title's control bytes as escapes" {
     try std.testing.expect(text_utils.isTerminalSafe(row.text));
 }
 
+test "an agent's row escapes invisible characters that would shift its columns" {
+    const rows = [_]AgentsMenuRow{.{
+        .name = "review",
+        .subagent = true,
+        .title = "fix\u{061c}\u{180e} parser",
+        .state = "idle",
+    }};
+    const row = try testRow(.{ .rows = &rows }, 0, 120, 1);
+    defer std.testing.allocator.free(row.text);
+    try std.testing.expect(text_utils.isTerminalSafe(row.text));
+    try std.testing.expect(std.mem.find(u8, row.text, "\\u{061c}") != null);
+    try std.testing.expect(std.mem.find(u8, row.text, "\\u{180e}") != null);
+}
+
 test "the agent list scrolls to keep the selected agent in view, and a branch that goes on below the last row stays open" {
     const names = "abcdef";
     var rows: [names.len]AgentsMenuRow = undefined;
