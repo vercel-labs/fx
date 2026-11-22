@@ -156,6 +156,10 @@ pub const WorkEnd = struct {
     /// How many of the parent's messages that work carried, for the report of
     /// one that failed because its slot could not start.
     start_messages: usize = 1,
+    /// With `start_failure`: the registry still held an earlier work for the
+    /// child when the work could not begin, so another message to it may be
+    /// refused. The report then points the owner to `status`.
+    start_held: bool = false,
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -539,6 +543,14 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.tree_closed = true;
+    }
+
+    /// Whether `closeTree` closed this owner's tree: a work that ends after
+    /// that owes no report.
+    pub fn treeClosed(self: *Owner) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.tree_closed;
     }
 
     /// How a turn its parent didn't start ended: whether it owes the parent
