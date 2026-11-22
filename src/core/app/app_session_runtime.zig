@@ -3990,6 +3990,19 @@ pub fn Runtime(comptime App: type) type {
             return holds_previous;
         }
 
+        /// A stored or sidecar title is outside text, so a notice draws its
+        /// escapes as text: an escape byte in a saved title never reaches the
+        /// terminal. Caller keeps ownership of nothing; the notice copies.
+        fn appendStoredTitleNotice(app: *App, sink: anytype, topic: []const u8, title: []const u8) !void {
+            var encoded = try text_utils.encodeTerminalSafe(app.alloc, title, std.math.maxInt(usize));
+            defer encoded.deinit(app.alloc);
+            try sink.appendNotice(.{
+                .topic = topic,
+                .tone = .neutral,
+                .body = encoded.bytes,
+            });
+        }
+
         fn writeResumeNotice(
             app: *App,
             sink: anytype,
@@ -3997,11 +4010,7 @@ pub fn Runtime(comptime App: type) type {
             notice: ResumeNotice,
         ) !void {
             switch (notice) {
-                .session => try sink.appendNotice(.{
-                    .topic = "session resumed",
-                    .tone = .neutral,
-                    .body = display.title,
-                }),
+                .session => try appendStoredTitleNotice(app, sink, "session resumed", display.title),
                 .upgrade => |upgrade| {
                     var body: std.Io.Writer.Allocating = .init(app.alloc);
                     defer body.deinit();
@@ -4015,11 +4024,7 @@ pub fn Runtime(comptime App: type) type {
                     });
                 },
                 .fork => |source_id| {
-                    try sink.appendNotice(.{
-                        .topic = "session forked",
-                        .tone = .neutral,
-                        .body = display.title,
-                    });
+                    try appendStoredTitleNotice(app, sink, "session forked", display.title);
                     // Plain lines, and the command alone on its own, so
                     // selecting that line copies only the command. The blank
                     // line keeps a row between it and the input box while it
@@ -9244,6 +9249,46 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expect(!app.agent().session_persistence.session_picker.active);
 
     try std.testing.expect(app.agent().session_persistence.subagent_host != null);
+}
+
+test "a resumed session's notice shows a stored title's escapes as text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("fix\x1b]2;owned\x07 the \u{202e} parser\u{0085} now") },
+        .assistant = @constCast("saved response"),
+    } }};
+    const saved_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(saved_session_id);
+    try Runtime(TestApp).beginFresh(&app, (&app).agent(), .later, null);
+    try Runtime(TestApp).openSessionPicker(&app, (&app).agent());
+    try waitForSessionPickerLoad(&app);
+
+    try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app, (&app).agent()));
+
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    const body = app.notices.items[0];
+    // A stored title is outside text: its escape bytes never reach the screen.
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
+    try std.testing.expect(text_utils.isTerminalSafe(body));
+    try std.testing.expect(std.mem.find(u8, body, "fix") != null);
+    try std.testing.expect(std.mem.find(u8, body, "parser") != null);
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {
