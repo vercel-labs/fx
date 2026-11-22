@@ -57,8 +57,10 @@ const Slot = struct {
     ended: bool = false,
     /// How many of the parent's messages the slot's work carries that no turn
     /// has begun on: set when the host chooses the work (`markNext`) or starts
-    /// the slot with it, and zero once its worker attaches. The parent's stop or
-    /// close before that drops them and counts them (`stop`,
+    /// the slot with it, and zero once its turn begins: at the attach of a
+    /// plain turn, or when the child's own agent begins a hosted one
+    /// (`hostedTurnBegins`). The parent's stop or close before that drops them
+    /// and counts them (`stop`,
     /// `tests/tla/subagent/StopMessage.tla` NoSilentLoss).
     unstarted: usize = 0,
     /// Set by the host once it has no next work for the slot, which then
@@ -150,12 +152,21 @@ pub const WorkEnd = struct {
     /// the child's next work.
     /// Borrowed for the call.
     leftovers: []const child_state.ActiveWork = &.{},
+    /// How many of the parent's messages the turn never took this end
+    /// dropped because the user stopped or closed the child, which no stop or
+    /// close had counted. The host adds them to what the user's stop or close
+    /// dropped, for the work's report or a notice.
+    dropped_by_user: usize = 0,
     /// Why the work never began, for one that failed because its slot could
     /// not start: its report says the message never ran. A static string.
     start_failure: ?[]const u8 = null,
     /// How many of the parent's messages that work carried, for the report of
     /// one that failed because its slot could not start.
     start_messages: usize = 1,
+    /// With `start_failure`: the registry still held an earlier work for the
+    /// child when the work could not begin, so another message to it may be
+    /// refused. The report then points the owner to `status`.
+    start_held: bool = false,
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -414,7 +425,9 @@ pub const Owner = struct {
     }
 
     /// Starts child `child_id`'s slot. `unstarted` is how many of the parent's
-    /// waiting messages its first work carries.
+    /// messages its work carries that no turn has begun on: the one message of
+    /// the call that made it where the app hosts the turn (`hostsTurns`), or the
+    /// waiting ones a next work takes.
     pub fn start(self: *Owner, child_id: []const u8, unstarted: usize) StartError!StartResult {
         // A single-threaded build, such as the WebAssembly terminal, has no
         // slot threads, and its subagent tool is off, so no child is started.
@@ -539,6 +552,22 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.tree_closed = true;
+    }
+
+    /// Whether `closeTree` closed this owner's tree: a work that ends after
+    /// that owes no report.
+    pub fn treeClosed(self: *Owner) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.tree_closed;
+    }
+
+    /// Whether this owner's turns run on each child's own agent (the
+    /// interactive app binds them, `execution.Services.bind`). There a turn
+    /// begins only when the app starts it, so a work's unread count stays
+    /// until then (`hostedTurnBegins`).
+    pub fn hostsTurns(self: *const Owner) bool {
+        return self.services.bind_fn != null;
     }
 
     /// How a turn its parent didn't start ended: whether it owes the parent
@@ -672,7 +701,8 @@ pub const Owner = struct {
 
     /// The user closed the child from the agent list: ends its running turn
     /// as the user's own stop does, and its report says the user closed it.
-    /// False when nothing runs.
+    /// False when nothing runs. The kept and unread messages the turn's end
+    /// drops are counted at the slot's end (`WorkEnd.dropped_by_user`), not here.
     pub fn closeByUser(self: *Owner, child_id: []const u8) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -701,8 +731,9 @@ pub const Owner = struct {
     /// chose starts stopped and its messages never run. They are all counted in
     /// the section that sets `stopped_by_parent`: the slot's end drops the kept
     /// messages once the flag is set and zeroes the count of a work that ends
-    /// before it attaches, and its attach zeroes that count too, so each runs
-    /// before the whole stop or after it.
+    /// before it attaches, and its turn's begin zeroes that count too (the
+    /// attach of a plain turn, `hostedTurnBegins` for a hosted one), so each
+    /// runs before the whole stop or after it.
     pub fn stop(self: *Owner, child_id: []const u8) ?usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -728,8 +759,8 @@ pub const Owner = struct {
         return null;
     }
 
-    /// How many of the parent's messages the parent's stop or close of
-    /// `child_id` drops when `stop` found the work ended, so it set no flag and
+    /// How many of the parent's messages a stop or close of `child_id` drops
+    /// when the work had ended, so `stop` or `closeByUser` set no flag and
     /// counted nothing: the messages the ended turn never took, which the slot
     /// keeps until the host's end hook queues them
     /// (`tests/tla/subagent/StopMessage.tla` NoSilentLoss). The end sets no
@@ -1325,7 +1356,11 @@ fn slotMain(slot: *Slot) void {
         slot.unstarted = 0;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
+        var dropped_by_user: usize = 0;
         if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
+            // The parent was told these joined the turn. The user's stop or close
+            // drops them here, and no stop of the parent's counted them.
+            if (slot.stopped_by_user) dropped_by_user = slot.leftovers.items.len - slot.leftovers_counted;
             dropLeftovers(owner.alloc, slot, "stopped");
         }
         owner.mutex.unlock(io_mod.getIo());
@@ -1338,6 +1373,7 @@ fn slotMain(slot: *Slot) void {
             .report_owed = finished.report_owed,
             .end = end,
             .leftovers = slot.leftovers.items,
+            .dropped_by_user = dropped_by_user,
         }) else false;
         publish_test_controls.holdPublish(slot.child_id);
         owner.mutex.lockUncancelable(io_mod.getIo());
@@ -1383,7 +1419,7 @@ fn runOne(slot: *Slot) OneOutcome {
     // In the interactive app the child's own agent holds its session and
     // saves its turns, as main does; only fx ask and ACP open it for a
     // run.
-    const hosted = owner.services.bind_fn != null;
+    const hosted = owner.hostsTurns();
     var child: ?OpenChild = if (hosted) null else OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
     defer if (child) |*value| value.close(owner.alloc);
@@ -1403,6 +1439,8 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.active_work_id = snapshot.active.id;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
+    turn.begin_context = slot;
+    turn.begin_fn = hostedTurnBegins;
     turn.live_metrics = &slot.metrics;
     // The interactive app runs the turn on the child's own agent. Bound before
     // `slot.worker` is read, so cancel, steering, and approvals reach it.
@@ -1415,8 +1453,10 @@ fn runOne(slot: *Slot) OneOutcome {
     if (start_test_controls.armed()) start_test_controls.holdStart(slot.child_id, &slot.cancel);
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
-    slot.unstarted = 0;
     slot.hosted = turn.hosted_worker != null;
+    // A hosted turn begins later, on the child's own agent, which asks
+    // `hostedTurnBegins` then: until it does, the count stays for a stop.
+    if (!slot.hosted) slot.unstarted = 0;
     slot.work_id = turn.active_work_id;
     if (slot.cancel.load(.seq_cst)) stopTurn(slot, .shutdown);
     owner.mutex.unlock(io_mod.getIo());
@@ -1729,6 +1769,21 @@ fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
     slot.hosted = false;
     slot.work_id = null;
     owner.mutex.unlock(io_mod.getIo());
+}
+
+/// A hosted turn is about to begin on the child's own agent
+/// (`execution.TurnContext.hostedTurnBegins`). The work's unread messages
+/// stay counted until here: a stop or close that came first has counted them
+/// and set the cancel, so the turn must not begin; otherwise the turn takes
+/// them from now on, and a later stop counts none of them.
+fn hostedTurnBegins(raw: *anyopaque) bool {
+    const slot: *Slot = @ptrCast(@alignCast(raw));
+    const owner = slot.owner;
+    owner.mutex.lockUncancelable(io_mod.getIo());
+    defer owner.mutex.unlock(io_mod.getIo());
+    if (slot.cancel.load(.seq_cst)) return false;
+    slot.unstarted = 0;
+    return true;
 }
 
 /// Stops the slot's turn: `.cancel` interrupts it, and `.shutdown` also ends

@@ -9,6 +9,10 @@ const env_settings = @import("core/config/env_settings.zig");
 
 pub const version = "0.0.17";
 
+/// Panics save a crash record for `/trace`, except in tests, which keep the
+/// default handler.
+pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
+
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -26,6 +30,7 @@ const token_pass_check = @import("core/app/token_pass_check.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const crash_panic = @import("core/app/crash_panic.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
@@ -52,6 +57,7 @@ const profiles = @import("core/profiles/profiles.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const trace_report = @import("core/app/trace_report.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const statusline_identity = @import("core/workspace/statusline_identity.zig");
@@ -479,6 +485,12 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    /// Saves the crash report for `err`. The caller owns the path and frees it
+    /// with `app.alloc`; an error means the report was not saved.
+    pub fn writeCrashReport(self: *Self, err: anyerror) anyerror!trace_report.SavedCrashReport {
+        return trace_report.writeCrashReport(self, err);
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
@@ -4046,6 +4058,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
+    app_entry_runtime.armCrashRecord(cfg, cli_args);
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
         .interactive => |launch| {
@@ -6083,6 +6096,8 @@ test "a run handed to a hidden agent waits while a scrollback handoff is pending
     var turn: subagent_execution.TurnContext = undefined;
     turn.child_id = child.id;
     turn.child_name = null;
+    turn.begin_context = null;
+    turn.begin_fn = null;
     var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
     var post: app_agents_runtime.Post = .{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
     // A held run stays the post's own.
@@ -6325,7 +6340,11 @@ test "runs handed to hidden agents during a pending handoff stay held in their o
     var turns: [2]subagent_execution.TurnContext = undefined;
     turns[0].child_id = first.id;
     turns[1].child_id = second.id;
-    for (&turns) |*turn| turn.child_name = null;
+    for (&turns) |*turn| {
+        turn.child_name = null;
+        turn.begin_context = null;
+        turn.begin_fn = null;
+    }
     var posts: [2]app_agents_runtime.Post = undefined;
     var made: usize = 0;
     defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
@@ -6386,6 +6405,8 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
         for (0..count) |index| {
             turns[index].child_id = children[index].id;
             turns[index].child_name = null;
+            turns[index].begin_context = null;
+            turns[index].begin_fn = null;
             posts[index] = .{ .turn = &turns[index], .run = try testChildRun(alloc, &resolver, false, null) };
             made += 1;
             cancels[index] = .init(false);
@@ -6425,6 +6446,58 @@ test "slot threads that cancel runs held by a pending handoff get them back" {
         for (children) |child| try std.testing.expect(child.agent.child_run == null);
         try std.testing.expectEqual(@as(usize, 0), app.child_handoffs.posts.items.len);
     }
+}
+
+test "a hosted run whose stop came first is refused when the main loop would start it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "hosted-refused.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "host");
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
+    const child = try addTestChildAgent(&app, "child-0");
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const Refused = struct {
+        fn begin(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var marker: u8 = 0;
+    var turn: subagent_execution.TurnContext = undefined;
+    turn.child_id = child.id;
+    turn.child_name = null;
+    turn.child_purpose = null;
+    turn.begin_context = &marker;
+    turn.begin_fn = Refused.begin;
+    var post = app_agents_runtime.Post{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
+    defer if (post.run) |*unsent| unsent.deinit(alloc);
+    {
+        app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+        try app.child_handoffs.posts.append(std.heap.c_allocator, &post);
+    }
+    App.AgentsAppRuntime.takePosts(&app);
+    try std.testing.expectEqual(app_agents_runtime.Post.State.closed, post.state.load(.acquire));
+    try std.testing.expect(child.agent.child_run == null);
+    try std.testing.expect(post.run != null);
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "child run refused") != null);
 }
 
 test "a handoff that gives way before it pushed any row only redraws" {
@@ -8583,6 +8656,62 @@ test "a subagent's view is rebuilt from its saved conversation without touching 
     try std.testing.expect(view.pending_resume_source != null);
     try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
     try std.testing.expectEqualStrings("SCREEN_DIM", app.shell.command_output_render.styles.dim_style);
+}
+
+/// Adds a child with one saved turn and main text in the transcript, then builds
+/// its first-run view. The child is on screen when `on_screen` is true.
+fn buildFirstRunChild(alloc: std.mem.Allocator, app: *App, on_screen: bool) !*app_agents_runtime.ChildAgent {
+    const child = try addTestChildAgent(app, "child-1");
+    errdefer child.agent.session.agent.history.deinit(alloc);
+    try child.agent.session.agent.history.append(alloc, .{ .interrupted = .{
+        .user = .{ .text = @constCast("EARLIER_TASK") },
+        .assistant = @constCast("EARLIER_ANSWER"),
+    } });
+    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
+    if (on_screen) app.agent_on_screen = child;
+
+    const Body = struct {
+        fn run(target: *app_agents_runtime.ChildAgent, a: *App, agent: *agents.Agent) anyerror!void {
+            try App.AgentsAppRuntime.buildFirstRunView(a, agent, target);
+        }
+    };
+    try App.AgentsAppRuntime.visit(app, child, child, Body.run);
+    return child;
+}
+
+test "a hidden subagent's first run builds its view without a stale resume flow" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try buildFirstRunChild(alloc, &app, false);
+    defer child.agent.session.agent.history.deinit(alloc);
+
+    const view = &child.screen.transcript.notebook;
+    var saw_task = false;
+    for (view.entries.items) |entry| switch (entry) {
+        .user_turn => |user| saw_task = saw_task or std.mem.eql(u8, user.turn.text, "EARLIER_TASK"),
+        else => {},
+    };
+    try std.testing.expect(saw_task);
+    try std.testing.expect(view.pending_resume_source == null);
+    try std.testing.expect(child.view_built);
+    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
+}
+
+test "a subagent on screen keeps its resume flow for its first paint" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try buildFirstRunChild(alloc, &app, true);
+    defer child.agent.session.agent.history.deinit(alloc);
+
+    const view = &child.screen.transcript.notebook;
+    try std.testing.expect(view.pending_resume_source != null);
+    try std.testing.expect(child.view_built);
 }
 
 test "a theme change rewrites hidden agents' transcripts and paced text" {

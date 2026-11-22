@@ -54,6 +54,31 @@ pub fn spawnFails() bool {
     return failed_starts.fetchAdd(1, .seq_cst) < limit;
 }
 
+/// Test builds only: while an inline test sets it, the host cannot save a
+/// waiting message as its subagent's next work, as when the registry cannot be
+/// written. No file control sets it.
+pub var test_fail_next_work: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// Whether the waiting message that is about to be saved as a subagent's next
+/// work fails to be saved instead.
+pub fn nextWorkFails() bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return test_fail_next_work;
+    return false;
+}
+
+/// Test builds only: an inline test sets it to the index of a leftover message
+/// that the host cannot queue again, as when it runs out of memory. No file
+/// control sets it.
+pub var test_fail_leftover_at: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {};
+
+/// Whether the leftover at `index` of an ended work fails to be queued again.
+pub fn leftoverInsertFails(index: usize) bool {
+    if (comptime build_options.libfx) return false;
+    if (builtin.is_test) return if (test_fail_leftover_at) |at| at == index else false;
+    return false;
+}
+
 /// Test builds only: an inline test sets it to run code where a waiting
 /// message's failed start has been ended and its report is not yet built, as a
 /// close of the child can land there.
@@ -141,4 +166,21 @@ test "a test build holds a work's start and sets the wait limit only through its
     test_fail_spawn = true;
     defer test_fail_spawn = false;
     try std.testing.expect(spawnFails());
+}
+
+test "a test build fails the save of a waiting message's work only through its hook" {
+    // Without a hook the save is not failed.
+    try std.testing.expect(!nextWorkFails());
+    test_fail_next_work = true;
+    defer test_fail_next_work = false;
+    try std.testing.expect(nextWorkFails());
+}
+
+test "a test build fails the queueing of a leftover message only through its hook" {
+    // Without a hook no leftover fails to be queued, and the hook names one index.
+    try std.testing.expect(!leftoverInsertFails(0));
+    test_fail_leftover_at = 1;
+    defer test_fail_leftover_at = null;
+    try std.testing.expect(!leftoverInsertFails(0));
+    try std.testing.expect(leftoverInsertFails(1));
 }

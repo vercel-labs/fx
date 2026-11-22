@@ -2234,6 +2234,49 @@ test "cached compact transcript preserves pending resume flow" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "full resume history") != null);
 }
 
+test "an unpainted resume flow is released, and a painted transcript keeps its flow" {
+    const alloc = std.testing.allocator;
+    const flow = "resume row\n";
+
+    var painted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    painted.layout.cols = 40;
+    defer painted.deinit(alloc);
+    painted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &painted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    painted.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, flow),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 1,
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 1, .partial_skip_rows = 0, .line_count = 1 },
+        .cursor_row = 2,
+        .cursor_col = 1,
+        .occupied_last_row = 1,
+        .occupied_last_row_blank = false,
+        .layout_id = 1,
+        .flow_boundaries = .{ .replay = .{ .offset = 0, .cols = 40, .cursor_col = 1, .pending_wrap = false } },
+    } };
+    try std.testing.expectEqual(@as(usize, 0), painted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(painted.notebook.pending_resume_source != null);
+    try std.testing.expect(!painted.unpainted_resume_hold);
+
+    var unpainted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    unpainted.layout.cols = 40;
+    defer unpainted.deinit(alloc);
+    unpainted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &unpainted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    try std.testing.expect(unpainted.transcript_commit_state == .invalid);
+    try std.testing.expectEqual(@as(usize, flow.len), unpainted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(unpainted.notebook.pending_resume_source == null);
+    try std.testing.expect(unpainted.unpainted_resume_hold);
+}
+
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -4740,6 +4783,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
+    "unpainted_resume_hold",
     "resume_handoff_repaint_pending",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
@@ -5001,6 +5045,13 @@ pub const TranscriptRuntime = struct {
     /// shell rows before the renderer has had a chance to respect
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
+    /// Set when a resume flow is released before the transcript's first
+    /// paint. The transcript keeps the window drops that the flow would have
+    /// kept until that paint, or until the transcript is cleared. The design
+    /// rule, in `tests/tla/transcript_window/design/DESIGN.md`: "A resumed
+    /// transcript holds every entry until a frame has repainted it from the
+    /// entries".
+    unpainted_resume_hold: bool = false,
     /// The last stable frame handed a resumed transcript's flow to the commit
     /// anchor and invalidated it, so the rows it painted are on screen with
     /// no anchor until the next stable frame. The transcript window holds
@@ -5141,6 +5192,19 @@ pub const TranscriptRuntime = struct {
         source.deinit(alloc);
         self.notebook.pending_resume_source = null;
         return released_bytes;
+    }
+
+    /// A resume flow installed into a transcript that is not on screen goes
+    /// stale when the transcript gets new entries before its first show, so
+    /// its owner releases it and the first show paints from the entries. A
+    /// transcript that has painted keeps its flow. A release of bytes sets
+    /// `unpainted_resume_hold`, which keeps the window's drops until the
+    /// first paint.
+    pub fn releaseUnpaintedResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
+        if (self.transcript_commit_state != .invalid) return 0;
+        const released = self.releasePendingResumeSource(alloc);
+        if (released > 0) self.unpainted_resume_hold = true;
+        return released;
     }
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {
@@ -7203,10 +7267,11 @@ pub const TranscriptRuntime = struct {
     /// and removes the entries it drops.
     pub fn syncTranscriptWindow(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
-        var drops: std.ArrayList(u32) = .empty;
-        defer drops.deinit(alloc);
-        try window.sync(alloc, self.notebook.entries.items, &drops);
-        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+        // The window lists its drops in its own pending list, so a later failure
+        // loses none and the next sync tries them again.
+        const held = window.pending_drops.items.len;
+        try window.sync(alloc, self.notebook.entries.items, &window.pending_drops);
+        try self.applyTranscriptWindowDrops(alloc, window, window.pending_drops.items.len > held, "sync");
     }
 
     /// Sets whether the session writes a session log, enabling the window
@@ -7239,10 +7304,9 @@ pub const TranscriptRuntime = struct {
         // now two back.
         self.invalidateTranscriptArchive("compacted");
         const window = if (self.transcript_window) |*value| value else return;
-        var drops: std.ArrayList(u32) = .empty;
-        defer drops.deinit(alloc);
-        try window.compacted(alloc, self.notebook.entries.items, &drops);
-        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+        const held = window.pending_drops.items.len;
+        try window.compacted(alloc, self.notebook.entries.items, &window.pending_drops);
+        try self.applyTranscriptWindowDrops(alloc, window, window.pending_drops.items.len > held, "compacted");
     }
 
     /// Removes the dropped entries that are off screen. The main screen
@@ -7253,30 +7317,63 @@ pub const TranscriptRuntime = struct {
         self: *TranscriptRuntime,
         alloc: Allocator,
         window: *transcript_window_shell.Shell,
-        drops: []const u32,
+        dropped: bool,
+        kind: []const u8,
     ) !void {
         // The previous cycle left memory: "one back" now means it, not the
         // cycle before it.
-        if (drops.len > 0) self.invalidateTranscriptArchive("previous_cycle_dropped");
-        try window.pending_drops.appendSlice(alloc, drops);
+        if (dropped) self.invalidateTranscriptArchive("previous_cycle_dropped");
         if (window.pending_drops.items.len == 0) return;
         var hold = try self.transcriptWindowDropHold(alloc);
         defer hold.deinit(alloc);
+        _ = try self.dropPendingEntries(alloc, window, &hold, kind);
+    }
+
+    /// Drops the pending entries that `hold` does not hold. Every step that can
+    /// fail runs before `pending_drops` changes, and a failed drop puts back the
+    /// entries still in the notebook.
+    fn dropPendingEntries(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        window: *transcript_window_shell.Shell,
+        hold: *const TranscriptWindowDropHold,
+        kind: []const u8,
+    ) !usize {
         var ready: std.ArrayList(u32) = .empty;
         defer ready.deinit(alloc);
-        var kept: usize = 0;
         for (window.pending_drops.items) |id| {
-            if (hold.holds(id)) {
-                window.pending_drops.items[kept] = id;
-                kept += 1;
-            } else {
-                try ready.append(alloc, id);
-            }
+            if (!hold.holds(id)) try ready.append(alloc, id);
         }
-        window.pending_drops.shrinkRetainingCapacity(kept);
-        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
+        const kept = window.pending_drops.items.len - ready.items.len;
         if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
-        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+        try self.keepTurnsOfStayingSummaries(alloc, &ready);
+        if (ready.items.len == 0) return 0;
+
+        var going: transcript_store.EntryIdSet = .empty;
+        defer going.deinit(alloc);
+        try going.ensureTotalCapacity(alloc, @intCast(ready.items.len));
+        for (ready.items) |id| going.putAssumeCapacity(id, {});
+
+        var still_pending: usize = 0;
+        for (window.pending_drops.items) |id| {
+            if (going.contains(id)) continue;
+            window.pending_drops.items[still_pending] = id;
+            still_pending += 1;
+        }
+        window.pending_drops.shrinkRetainingCapacity(still_pending);
+
+        _ = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
+            // Only ids still in the notebook go back, and since a failed drop leaves the notebook as it was, that is every id that left the list.
+            var restored: usize = 0;
+            for (self.notebook.entries.items) |entry| {
+                if (!going.contains(entry.id())) continue;
+                window.pending_drops.appendAssumeCapacity(entry.id());
+                restored += 1;
+            }
+            debug_trace.logf("transcript_window", "drop failed: kind={s} kept entries={d} pending reason={s}", .{ kind, restored, @errorName(err) });
+            return err;
+        };
+        return ready.items.len;
     }
 
     /// The screen is about to be cleared and replayed from the entries: the
@@ -7284,6 +7381,9 @@ pub const TranscriptRuntime = struct {
     /// held cycle. A resumed transcript not painted yet is the exception: the
     /// clear replays its prepared flow, which still shows the cycle before
     /// the newest compaction, so those entries stay until they scroll off.
+    /// A transcript whose resume flow was released before its first paint is
+    /// the same exception until that paint: its replay runs from the entries,
+    /// which still hold the cycle.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
         if (window.pending_drops.items.len == 0) return;
@@ -7291,12 +7391,13 @@ pub const TranscriptRuntime = struct {
             debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
             return;
         }
-        var ready = window.pending_drops;
-        window.pending_drops = .empty;
-        defer ready.deinit(alloc);
-        try self.keepTurnsOfStayingSummaries(alloc, window, &ready);
-        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{ready.items.len});
-        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+        if (self.unpainted_resume_hold) {
+            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=unpainted_resume", .{window.pending_drops.items.len});
+            return;
+        }
+        const hold: TranscriptWindowDropHold = .none;
+        const released = try self.dropPendingEntries(alloc, window, &hold, "screen_cleared");
+        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{released});
     }
 
     const TranscriptWindowDropHold = union(enum) {
@@ -7325,8 +7426,9 @@ pub const TranscriptRuntime = struct {
         if (self.fullTranscriptActive()) return .all;
         // A resumed transcript not painted yet, or painted and handed off
         // with no anchor yet: everything it holds is on screen or about to
-        // be.
-        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending) return .all;
+        // be. A resume flow released before the first paint holds the same
+        // drops until that paint (`unpainted_resume_hold`).
+        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending or self.unpainted_resume_hold) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,
@@ -7348,14 +7450,13 @@ pub const TranscriptRuntime = struct {
         return .{ .entries = set };
     }
 
-    /// Keeps pending, out of `ready`, every entry of each turn whose summary
-    /// stays, back to the turn's prompt. A turn summary recaps its turn from
-    /// the turn's entries (`tool_group_projection.recapTurnSummary`), so a
-    /// turn leaves only together with its summary.
+    /// Takes out of `ready` every entry of each turn whose summary stays, back
+    /// to the turn's prompt. A turn summary recaps its turn from the turn's
+    /// entries (`tool_group_projection.recapTurnSummary`), so a turn leaves only
+    /// together with its summary. The kept entries stay pending.
     fn keepTurnsOfStayingSummaries(
         self: *TranscriptRuntime,
         alloc: Allocator,
-        window: *transcript_window_shell.Shell,
         ready: *std.ArrayList(u32),
     ) !void {
         if (ready.items.len == 0) return;
@@ -7378,15 +7479,11 @@ pub const TranscriptRuntime = struct {
             }
         }
         if (keep.count() == 0) return;
-        try window.pending_drops.ensureUnusedCapacity(alloc, keep.count());
         var still: usize = 0;
         for (ready.items) |id| {
-            if (keep.contains(id)) {
-                window.pending_drops.appendAssumeCapacity(id);
-            } else {
-                ready.items[still] = id;
-                still += 1;
-            }
+            if (keep.contains(id)) continue;
+            ready.items[still] = id;
+            still += 1;
         }
         ready.shrinkRetainingCapacity(still);
         debug_trace.logf("transcript_window", "drop kept turn entries={d} for their summary", .{keep.count()});
@@ -8018,7 +8115,8 @@ pub const TranscriptRuntime = struct {
         const ids = try held.alloc.alloc(u32, drop_count);
         defer held.alloc.free(ids);
         for (entries[0..drop_count], ids) |entry, *id| id.* = entry.id();
-        _ = try transcript_store.dropEntriesAtomic(held.runtime, held.alloc, ids);
+        // The caller discards the archive when the trim fails, so the drop needs no copy.
+        _ = try transcript_store.dropEntries(held.runtime, held.alloc, ids);
         // Indexes count the whole cycle, so what stays must be its newest
         // entries; a kept pin would leave a gap.
         const after = held.runtime.notebook.entries.items;
@@ -9517,7 +9615,10 @@ pub const TranscriptRuntime = struct {
             self.resize_history_row_delta == null and
             !destructive_invalidation and
             target.visual_offset >= target.history_visual_offset and
-            scroll_facts.target_visual_offset < anchor.visual_offset;
+            // Rows between the history offset and the logical offset are on no
+            // screen, so a target at or after the history offset does not rewind
+            // what the terminal shows.
+            scroll_facts.target_visual_offset < committedProjectionVisualOffset(anchor);
     }
 
     fn semanticProgressNeedsStaging(
@@ -10379,6 +10480,18 @@ pub const TranscriptRuntime = struct {
                     scroll_facts.target_visual_offset,
                 },
             );
+            diagnostics.recordRenderEvent(
+                .transition,
+                "target_failed err={s} compatible={} geometry={} recovery={} restore={} target={d}",
+                .{
+                    @errorName(err),
+                    scroll_facts.source_compatible,
+                    scroll_facts.geometry_rebase,
+                    scroll_facts.recovery_rebase,
+                    normal_buffer_recovery_pending,
+                    scroll_facts.target_visual_offset,
+                },
+            );
             return err;
         };
         if (!projection_area.isEmpty() and
@@ -11164,6 +11277,7 @@ pub const TranscriptRuntime = struct {
             if (target_has_content and !self.has_painted_transcript) {
                 self.has_painted_transcript = true;
             }
+            if (target_has_content) self.unpainted_resume_hold = false;
 
             previous_state.deinit(alloc);
             previous_cache.deinit(alloc);
@@ -15433,6 +15547,107 @@ test "preserved source rewrite holds the normal buffer at committed history" {
         },
         .invalid, .recovering => return error.TestExpectedStableTranscript,
     }
+}
+
+test "a target between the on-screen history offset and the logical offset is not a rewind" {
+    const runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+    };
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 2,
+        .partial_skip_rows = 0,
+        .line_count = 6,
+        .last_visible_row = 4,
+    };
+    // The footer shrank during a long turn: the logical offset is 30, and the
+    // screen shows the history offset, 27.
+    const anchor: CommittedTranscriptAnchor = .{
+        .selection = selection,
+        .visual_offset = 30,
+        .history_visual_offset = 27,
+        .total_visual_rows = 40,
+        .flow = &.{},
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .occupied_last_row = 4,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+        .normal_buffer_recovery_pending = true,
+    };
+    const target: TranscriptRuntime.TransitionTarget = .{
+        .selection = selection,
+        .visual_offset = 28,
+        .history_visual_offset = 27,
+        .source_endpoint_visual_offset = 28,
+        .total_visual_rows = 40,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .measured_history_origin = null,
+    };
+    const facts: TranscriptScrollFacts = .{
+        .source_compatible = true,
+        .geometry_rebase = false,
+        .target_visual_offset = 28,
+    };
+
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(target, anchor, facts, false));
+
+    // The boundaries: a target at the on-screen history offset stays where the
+    // screen is, and a target at the logical offset is the projection itself.
+    // Neither moves back.
+    var on_history = target;
+    on_history.visual_offset = 27;
+    on_history.history_visual_offset = 27;
+    on_history.source_endpoint_visual_offset = 27;
+    var on_history_facts = facts;
+    on_history_facts.target_visual_offset = 27;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_history, anchor, on_history_facts, false));
+
+    var on_logical = target;
+    on_logical.visual_offset = 30;
+    on_logical.history_visual_offset = 30;
+    on_logical.source_endpoint_visual_offset = 30;
+    var on_logical_facts = facts;
+    on_logical_facts.target_visual_offset = 30;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_logical, anchor, on_logical_facts, false));
+
+    // A target behind the on-screen offset is still a rewind. Its history
+    // offset matches its visual offset, as TransitionTarget.init sets them.
+    var behind = target;
+    behind.visual_offset = 26;
+    behind.history_visual_offset = 26;
+    behind.source_endpoint_visual_offset = 26;
+    var behind_facts = facts;
+    behind_facts.target_visual_offset = 26;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(behind, anchor, behind_facts, false));
+
+    // Without pending recovery, the logical offset 30 is the projection, so 28
+    // still rewinds.
+    var settled = anchor;
+    settled.normal_buffer_recovery_pending = false;
+    settled.history_visual_offset = 30;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(target, settled, facts, false));
 }
 
 test "frame scroll commit consumption releases rows before transition advancement" {

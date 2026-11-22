@@ -2,6 +2,17 @@
 
 Names the maintainers already settled. Reuse them; don't add another spelling. "Planned" means not built yet: design toward it, but don't tell users to run it.
 
+## Groups and verbs
+
+| Concept | Name | Status |
+|---|---|---|
+| List verb | `list`, with `ls` in every group | Partly built |
+| Remove verb | `remove`, with `rm` in every group | `remove` built, `rm` planned |
+| Sessions | One `fx session` group with `list`, `last`, `resume`, `recover`, and `convert`, also reached as `fx sessions`. `fx session <last\|id>` reads one session | Planned as one group |
+| Models | `fx model list`, also reached as `fx models` | Planned |
+
+SKILL.md's table "Built today and planned" says what works today.
+
 ## Resume
 
 | Spelling | Opens | Status |

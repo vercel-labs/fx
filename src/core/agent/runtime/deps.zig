@@ -64,8 +64,10 @@ pub const CompactionActivityEffect = struct {
     begin: *const fn (ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId,
     running: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void,
     settle: *const fn (ctx: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void,
-    /// How much of the summary the model has written, from 1 to 99.
+    /// How much of the summary the model has written, from 1 to 100. The row holds it below 100% until fx saves.
     written: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId, percent: u8) void = null,
+    /// A summary request is about to be sent; the row counts its wait.
+    asked: ?*const fn (ctx: *anyopaque, id: compaction_activity.OperationId) void = null,
 };
 
 pub const ContextCompactionCommitEffect = struct {
@@ -197,7 +199,7 @@ pub const RefreshedGatewayCredential = struct {
 
 pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
-    pub const WorkspaceCaptureStep = enum { begin, capture };
+    pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -236,9 +238,10 @@ pub const AgentRuntimeDeps = struct {
     turn_ends_by_explicit_cancel: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
     /// Stops the commands that steering moved to the background during turn
     /// `turn_id`, after the user cancelled it (`turn_ends_by_explicit_cancel`).
-    /// Called once the turn is reported, so a command that ignores SIGTERM
-    /// and takes seconds to stop does not hold the turn's end. Hosts without
-    /// steering leave it unset.
+    /// Called once the turn is reported. It starts the stops and returns
+    /// without waiting for them, so a command that ignores SIGTERM and takes
+    /// seconds to stop holds neither the turn's end nor the next prompt.
+    /// Hosts without steering leave it unset.
     stop_steering_detached_commands: ?*const fn (ctx: *anyopaque, turn_id: u64) anyerror!void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
@@ -293,13 +296,16 @@ pub const AgentRuntimeDeps = struct {
     /// inline and gets no path.
     save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
     /// Captures the repository the session works in as the turn starts,
-    /// before any request or tool, when `experimental.workspace_capture` is
-    /// on (D98, `src/core/workspace/turn_capture.zig`). The runtime calls it
-    /// twice: `.begin` takes the turn's capture token, then, once the
-    /// user's prompt is saved through `append_turn_piece`, `.capture` takes
-    /// the start capture, which can take seconds, so a kill during it keeps
-    /// the prompt. `fresh` is false for a steering message inside the turn,
-    /// which keeps the turn's capture. It never fails the turn.
+    /// before any tool acts, when `experimental.workspace_capture` is on
+    /// (D98, `src/core/workspace/turn_capture.zig`). `.begin` takes the
+    /// turn's capture token; once the user's prompt is saved through
+    /// `append_turn_piece`, so a kill during the capture keeps it,
+    /// `.capture` starts the start capture, which runs beside the turn's
+    /// first request; and `.settle`, which `executeToolCall` sends before
+    /// every tool and the turn sends as it returns, however it ends, waits
+    /// until it is saved. `fresh` is false for a steering
+    /// message inside the turn, which keeps the turn's capture. It never
+    /// fails the turn.
     start_workspace_capture: ?*const fn (ctx: *anyopaque, fresh: bool, step: WorkspaceCaptureStep) void = null,
     /// An admitted tool is about to act in `dir`: a command's working folder
     /// or the folder of the file a mutation writes. Captures a repository the
@@ -327,6 +333,11 @@ pub const AgentRuntimeDeps = struct {
     /// no session to remember it in, and the notice is not shown.
     push_session_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// Saves a recovery status in the session log's open turn, as a
+    /// `model_recovery` item. `RequestRecovery` calls it when the status's
+    /// kind or attempt changes, and for the request's outcome. Null: the host
+    /// keeps no session log.
+    save_route_recovery_status: ?*const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = null,
     /// A new model request starts. A host that reports the last request's
     /// recovery, as `fx ask --json` does, forgets the previous request's
     /// here. Null: the host keeps no per-request report.
@@ -370,6 +381,8 @@ pub const AgentRuntimeDeps = struct {
     }
 
     pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        // No tool acts before the turn's start capture is saved (D98).
+        if (self.start_workspace_capture) |capture| capture(self.ctx, false, .settle);
         if (self.reach_workspace) |reach| if (reachedDirectory(request.authority)) |dir| reach(self.ctx, dir, request.call.name);
         if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
         var observed_request = request;

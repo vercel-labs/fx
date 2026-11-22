@@ -1017,24 +1017,55 @@ pub fn renderTableForTranscript(
 /// A wrapped column keeps at least this many cells, or its natural width when
 /// narrower, so its text stays legible and every two-cell rune still fits.
 pub const table_min_column_width: usize = 3;
+/// A token at least this many cells wide reads as a path, URL, or hash.
+const table_long_token_width: usize = 20;
+/// Token-heavy columns shrink to this many cells before other columns give
+/// up room, and no column's kept word is capped below it.
+const table_soft_floor_width: usize = 16;
 
 const TableColumnMeasure = struct {
     /// Width of the widest cell laid out on one line.
     natural: usize = 0,
     /// Width of the widest run between spaces.
     word: usize = 0,
+    /// Words in body cells, and how many of them are at least `table_long_token_width` wide.
+    body_words: usize = 0,
+    long_words: usize = 0,
+
+    /// Paths, URLs, and hashes make up at least half of the body words.
+    fn tokenHeavy(measure: TableColumnMeasure) bool {
+        return measure.long_words > 0 and measure.long_words * 2 >= measure.body_words;
+    }
 };
 
 fn measureTableColumns(table: assistant_presentation.TablePayload, measures: []TableColumnMeasure) void {
     @memset(measures, .{});
-    for (table.rows) |row| for (row.cells, 0..) |cell, col| {
+    for (table.rows, 0..) |row, row_index| for (row.cells, 0..) |cell, col| {
+        const words = tableCellWords(cell);
         measures[col].natural = @max(measures[col].natural, display_width.visibleWidthIgnoringAnsi(cell));
-        measures[col].word = @max(measures[col].word, longestTableWordWidth(cell));
+        measures[col].word = @max(measures[col].word, words.longest);
+        if (row_index > 0) {
+            measures[col].body_words += words.count;
+            measures[col].long_words += words.long;
+        }
     };
 }
 
-fn longestTableWordWidth(text: []const u8) usize {
-    var longest: usize = 0;
+const TableCellWords = struct {
+    longest: usize = 0,
+    count: usize = 0,
+    long: usize = 0,
+
+    fn add(words: *TableCellWords, width: usize) void {
+        if (width == 0) return;
+        words.longest = @max(words.longest, width);
+        words.count += 1;
+        words.long += @intFromBool(width >= table_long_token_width);
+    }
+};
+
+fn tableCellWords(text: []const u8) TableCellWords {
+    var words: TableCellWords = .{};
     var current: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
@@ -1043,7 +1074,7 @@ fn longestTableWordWidth(text: []const u8) usize {
             continue;
         }
         if (text[index] == ' ' or text[index] == '\t') {
-            longest = @max(longest, current);
+            words.add(current);
             current = 0;
             index += 1;
             continue;
@@ -1052,7 +1083,8 @@ fn longestTableWordWidth(text: []const u8) usize {
         current += unit.cell_width;
         index += unit.byte_len;
     }
-    return @max(longest, current);
+    words.add(current);
+    return words;
 }
 
 /// Marks a column whose wrapped width is still being chosen.
@@ -1061,11 +1093,12 @@ const table_column_open = std.math.maxInt(usize);
 /// Fractional bits of the shared scale applied to natural widths.
 const table_scale_bits = 16;
 
-/// Chooses content widths so the boxed grid fits within `cols`. Columns that
-/// fit within an even share keep their natural width. The remaining columns
-/// wrap and grow by one shared factor of their natural width, keeping whole
-/// words when every column can. Returns false when the minimum legible widths
-/// do not fit.
+/// Chooses content widths so the boxed grid fits within `cols`. Token-heavy
+/// columns give up room first, down to their soft floor. Columns that fit
+/// within an even share keep their natural width. The remaining columns grow by
+/// one shared factor of their natural width. A longest word stays whole up to an
+/// even share of the open width, never below the soft floor. Returns false when
+/// the minimum legible widths do not fit.
 fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, widths: []usize) bool {
     std.debug.assert(measures.len == widths.len);
     const border_width = measures.len * 3 + 1;
@@ -1080,32 +1113,22 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
         floor_total += @min(measure.natural, table_min_column_width);
     }
     if (natural_total <= available) return true;
-    // This is the only reason to stack. A column settles below only while its
-    // natural width fits an even share, so the open floors always fit.
+    // This is the only reason to stack. Columns settle only while the remaining
+    // minimum widths still fit, so the open floors always fit.
     if (floor_total > available) return false;
 
-    // Settle every column that fits on one line within an even share of what
-    // remains. A settled column takes no more than that share, so the share
-    // only grows for the columns still open.
     @memset(widths, table_column_open);
     var settled_total: usize = 0;
     var open_count = measures.len;
-    var settled_any = true;
-    while (settled_any and open_count > 0) {
-        settled_any = false;
-        const share = (available - settled_total) / open_count;
-        for (measures, widths) |measure, *width| {
-            if (width.* != table_column_open or measure.natural > share) continue;
-            width.* = measure.natural;
-            settled_total += measure.natural;
-            open_count -= 1;
-            settled_any = true;
-        }
-    }
+    const heavy_settled = settleTokenHeavyColumns(measures, available, widths, &settled_total, &open_count);
+    settleColumnsWithinShare(measures, available, widths, &settled_total, &open_count);
+    // A column keeps its longest word whole only up to an even share of the open
+    // width, and never less than the soft floor.
+    const word_cap = @max(table_soft_floor_width, (available - settled_total) / @max(open_count, 1));
 
     var word_total = settled_total;
     for (measures, widths) |measure, width| {
-        if (width == table_column_open) word_total += wrappedColumnSpan(measure, false).base;
+        if (width == table_column_open) word_total += wrappedColumnSpan(measure, false, word_cap).base;
     }
     const break_words = word_total > available;
 
@@ -1115,7 +1138,7 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
     var high: u64 = (@as(u64, available) + 1) << table_scale_bits;
     while (high - low > 1) {
         const middle = low + (high - low) / 2;
-        if (settled_total + openColumnsWidth(measures, widths, break_words, middle) <= available) {
+        if (settled_total + openColumnsWidth(measures, widths, break_words, middle, word_cap) <= available) {
             low = middle;
         } else {
             high = middle;
@@ -1124,15 +1147,16 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
     var assigned = settled_total;
     for (measures, widths) |measure, *width| {
         if (width.* != table_column_open) continue;
-        width.* = scaledColumnWidth(measure, break_words, low);
+        width.* = scaledColumnWidth(measure, break_words, low, word_cap);
         assigned += width.*;
     }
-    // Settled columns already sit at or above their span target, and the open
+    // Settled columns sit at their natural width or their soft floor, and the open
     // targets sum above `available`, so every pass finds room.
     while (assigned < available) {
         for (measures, widths) |measure, *width| {
             if (assigned == available) break;
-            if (width.* >= wrappedColumnSpan(measure, break_words).target) continue;
+            if (heavy_settled and measure.tokenHeavy()) continue;
+            if (width.* >= wrappedColumnSpan(measure, break_words, word_cap).target) continue;
             width.* += 1;
             assigned += 1;
         }
@@ -1140,16 +1164,77 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
     return true;
 }
 
-fn openColumnsWidth(measures: []const TableColumnMeasure, widths: []const usize, break_words: bool, scale: u64) usize {
+/// Token-heavy columns give up room before the others. When every other column
+/// fits on one line beside token-heavy columns at their soft floor, the others
+/// settle at their natural width; otherwise token-heavy columns settle at their
+/// soft floor while the others' minimums still fit. Returns whether the
+/// token-heavy columns were settled at their soft floor.
+fn settleTokenHeavyColumns(
+    measures: []const TableColumnMeasure,
+    available: usize,
+    widths: []usize,
+    settled_total: *usize,
+    open_count: *usize,
+) bool {
+    var heavy_count: usize = 0;
+    var heavy_floor_total: usize = 0;
+    var other_natural_total: usize = 0;
+    var other_floor_total: usize = 0;
+    for (measures) |measure| {
+        if (measure.tokenHeavy()) {
+            heavy_count += 1;
+            heavy_floor_total += @min(measure.natural, table_soft_floor_width);
+        } else {
+            other_natural_total += measure.natural;
+            other_floor_total += @min(measure.natural, table_min_column_width);
+        }
+    }
+    if (heavy_count == 0 or heavy_count == measures.len) return false;
+    const settle_heavy = heavy_floor_total + other_natural_total > available;
+    if (settle_heavy and heavy_floor_total + other_floor_total > available) return false;
+    for (measures, widths) |measure, *width| {
+        if (measure.tokenHeavy() != settle_heavy) continue;
+        width.* = if (settle_heavy) @min(measure.natural, table_soft_floor_width) else measure.natural;
+        settled_total.* += width.*;
+        open_count.* -= 1;
+    }
+    return settle_heavy;
+}
+
+/// Settles every column that fits on one line within an even share of what
+/// remains. A settled column takes no more than that share, so the share only
+/// grows for the columns still open.
+fn settleColumnsWithinShare(
+    measures: []const TableColumnMeasure,
+    available: usize,
+    widths: []usize,
+    settled_total: *usize,
+    open_count: *usize,
+) void {
+    var settled_any = true;
+    while (settled_any and open_count.* > 0) {
+        settled_any = false;
+        const share = (available - settled_total.*) / open_count.*;
+        for (measures, widths) |measure, *width| {
+            if (width.* != table_column_open or measure.natural > share) continue;
+            width.* = measure.natural;
+            settled_total.* += measure.natural;
+            open_count.* -= 1;
+            settled_any = true;
+        }
+    }
+}
+
+fn openColumnsWidth(measures: []const TableColumnMeasure, widths: []const usize, break_words: bool, scale: u64, word_cap: usize) usize {
     var total: usize = 0;
     for (measures, widths) |measure, width| {
-        if (width == table_column_open) total += scaledColumnWidth(measure, break_words, scale);
+        if (width == table_column_open) total += scaledColumnWidth(measure, break_words, scale, word_cap);
     }
     return total;
 }
 
-fn scaledColumnWidth(measure: TableColumnMeasure, break_words: bool, scale: u64) usize {
-    const span = wrappedColumnSpan(measure, break_words);
+fn scaledColumnWidth(measure: TableColumnMeasure, break_words: bool, scale: u64, word_cap: usize) usize {
+    const span = wrappedColumnSpan(measure, break_words, word_cap);
     const scaled = (@as(u128, measure.natural) * scale) >> table_scale_bits;
     if (scaled >= span.target) return span.target;
     return @max(span.base, @as(usize, @intCast(scaled)));
@@ -1158,15 +1243,16 @@ fn scaledColumnWidth(measure: TableColumnMeasure, break_words: bool, scale: u64)
 const TableColumnSpan = struct { base: usize, target: usize };
 
 /// The width a wrapped column starts from and the width it grows toward.
-/// Columns first keep their longest word and grow toward one line; when
-/// words must break, they start at the legible minimum and grow toward it.
-fn wrappedColumnSpan(measure: TableColumnMeasure, break_words: bool) TableColumnSpan {
+/// Columns first keep their longest word, up to `word_cap`, and grow toward
+/// one line; when words must break, they start at the legible minimum and grow
+/// toward it.
+fn wrappedColumnSpan(measure: TableColumnMeasure, break_words: bool, word_cap: usize) TableColumnSpan {
     const floor = @min(measure.natural, table_min_column_width);
     const word = @max(floor, @min(measure.word, measure.natural));
     return if (break_words)
         .{ .base = floor, .target = word }
     else
-        .{ .base = word, .target = measure.natural };
+        .{ .base = @min(word, word_cap), .target = measure.natural };
 }
 
 pub fn renderCodeBlockForTranscript(
@@ -5289,6 +5375,98 @@ test "renderTableForTranscript keeps a grid at every width that fits minimum col
             }
         }
     }
+}
+
+const token_breaks_table_source =
+    "| Check | Status | Notes |\n" ++
+    "|---|---|---|\n" ++
+    "| node tsec/scripts/seed.ts update && node tsec/scripts/seed.ts check | Pass (exit 0) | 63 .js files, byte-for-byte stage1 == stage2 == seed fixpoint |\n" ++
+    "| TSE_BUILD_JOBS=4 node tsec/scripts/native.ts | Pass (exit 0) | 58 C units compiled and linked cleanly into native tsec (8.0 MB) |\n" ++
+    "| TSE_BUILD_JOBS=4 node tsec/test/run.ts --only native-const-prim-arrays,native-cow-clone,native-export-inline,cache-gc,native-stats-line,native-fast-split,build-run305,d307 | Pass (exit 0) | All 8 sections passed (O2 -Werror, ASan+UBSan live 0, 8-thread TSan 0 races, --c-dir, nm -u inline proof, cache-gc 28/28, native-stats-line 213 checks) |\n" ++
+    "| node tsec/test/run.ts --only query | Pass (exit 0) | All query and query layout checks passed (nullable own + --cow-reachable) |\n";
+
+test "fitTableColumnWidths breaks a long token instead of widening its column" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, token_breaks_table_source);
+    defer table.deinit(alloc);
+
+    var measures: [3]TableColumnMeasure = undefined;
+    measureTableColumns(table, &measures);
+    var widths: [3]usize = undefined;
+    try std.testing.expect(fitTableColumnWidths(&measures, 160, &widths));
+
+    // Check and Notes share the open width in proportion to their natural widths, and the long token breaks.
+    try std.testing.expectEqualSlices(usize, &.{ 73, 13, 64 }, &widths);
+
+    const out = try renderTableForTranscript(alloc, table, 160);
+    defer alloc.free(out);
+    _ = try expectGridLines(out, 160);
+    try std.testing.expect(std.mem.find(u8, out, "Pass (exit 0)") != null);
+}
+
+const token_heavy_table_source =
+    "| Path | Why |\n" ++
+    "|---|---|\n" ++
+    "| src/ui/render_engine/transcript_blocks.zig | Lays out assistant tables and wraps each cell inside the grid so long text stays readable |\n" ++
+    "| src/core/shared/display_width.zig | Measures display width while skipping escape sequences and keeps every grapheme whole |\n";
+
+test "fitTableColumnWidths shrinks token-heavy columns before prose" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, token_heavy_table_source);
+    defer table.deinit(alloc);
+
+    var measures: [2]TableColumnMeasure = undefined;
+    measureTableColumns(table, &measures);
+    var widths: [2]usize = undefined;
+
+    // Path drops to its 16-cell soft floor, and Why takes the rest.
+    try std.testing.expect(fitTableColumnWidths(&measures, 60, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 37 }, &widths);
+
+    // Why cannot fit on one line beside Path, so Path stays at its soft floor.
+    try std.testing.expect(fitTableColumnWidths(&measures, 100, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 77 }, &widths);
+
+    // Why fits on one line, so it keeps its natural width and Path takes the rest.
+    try std.testing.expect(fitTableColumnWidths(&measures, 120, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 24, 89 }, &widths);
+}
+
+test "fitTableColumnWidths keeps leftover cells off a token-heavy column at its soft floor" {
+    // The rounding leftover goes to the open prose column, not to the settled token-heavy column.
+    const measures = [_]TableColumnMeasure{
+        .{ .natural = 102, .word = 44, .body_words = 2, .long_words = 2 },
+        .{ .natural = 60, .word = 57 },
+        .{ .natural = 24, .word = 22 },
+    };
+    var widths: [3]usize = undefined;
+    try std.testing.expect(fitTableColumnWidths(&measures, 39, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 10, 3 }, &widths);
+}
+
+test "tableCellWords counts long tokens by display width" {
+    const nineteen = tableCellWords("aaaaaaaaaaaaaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 19), nineteen.longest);
+    try std.testing.expectEqual(@as(usize, 0), nineteen.long);
+
+    const twenty = tableCellWords("aaaaaaaaaaaaaaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 20), twenty.longest);
+    try std.testing.expectEqual(@as(usize, 1), twenty.count);
+    try std.testing.expectEqual(@as(usize, 1), twenty.long);
+
+    const wide = tableCellWords("表表表表表表表表表表");
+    try std.testing.expectEqual(@as(usize, 20), wide.longest);
+    try std.testing.expectEqual(@as(usize, 1), wide.long);
+
+    const zero_width = tableCellWords("a \u{200B} b");
+    try std.testing.expectEqual(@as(usize, 2), zero_width.count);
+    try std.testing.expectEqual(@as(usize, 1), zero_width.longest);
+
+    try std.testing.expectEqual(@as(usize, 2), tableCellWords("  a  b  ").count);
+
+    const styled = tableCellWords("\x1b[1m" ++ "aaaaaaaaaaaaaaaaaaaa" ++ "\x1b[0m");
+    try std.testing.expectEqual(@as(usize, 20), styled.longest);
+    try std.testing.expectEqual(@as(usize, 1), styled.long);
 }
 
 test "Unicode display units remain atomic in three-column vertical tables" {

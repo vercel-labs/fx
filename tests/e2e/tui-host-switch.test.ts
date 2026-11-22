@@ -842,6 +842,82 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // main was told its second message joined the subagent's turn. The user's
+  // close ends that turn before it reads the message, so main must hear the
+  // count with the report that says the user closed the subagent.
+  test(
+    "the user's close of a working subagent drops the message main sent it while it worked, and its report counts it",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      let report = "";
+      const first = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's first turn waits here until the user closes it.
+          if (childCalls === 1) await first.promise;
+          return text("child_answer", "SWITCH_CHILD_RAN");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_CLOSE_TASK work slowly" },
+          });
+        }
+        if (mainCalls === 2) {
+          // Sent once the subagent's request is out, so the message waits in
+          // its turn, as in the Esc test above.
+          await until("the subagent's turn", () => childCalls >= 1);
+          return toolCall("main_more", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
+          });
+        }
+        // The report says the user closed the subagent; its count is checked below.
+        if (body.includes('\\"cause\\":\\"user_close\\"')) {
+          report = body;
+          return text("main_saw", "SWITCH_MAIN_SAW_CLOSE");
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        expect(childCalls).toBe(1);
+        // The close keys of the test above: Down opens the list on main's row,
+        // Down selects the subagent, Delete arms, Up keeps it, then Down, the
+        // forward Delete key arms, and Delete closes it.
+        await session.sendKeys("Down");
+        await session.waitForText("esc back", 10_000);
+        await session.sendKeys("BSpace");
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     delete close     esc back", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
+          && mainRow().test(pane) && !pane.includes("delete close"), 10_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("DC");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("DC");
+        await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForText("SWITCH_MAIN_SAW_CLOSE", 30_000);
+        // Main's report says the user closed the subagent and counts the message.
+        expect(report).toContain('\\"cause\\":\\"user_close\\"');
+        expect(report).toContain('\\"dropped\\":1');
+        // One request: the first turn. The joined message is not a request,
+        // and the close ended the turn before it could start another.
+        expect(childCalls).toBe(1);
+        first.release();
+        // The message main sent while it worked never ran.
+        expect(childCalls).toBe(1);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "a subagent whose request waits for a follow-up tells main, and main's message sends it again",
     async () => {
@@ -1071,6 +1147,68 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
+  // The settle hold stops fx after it has told main that the subagent's work
+  // ended, and before it settles the subagent. Main's next message waits for
+  // the subagent in that window. The user's close drops that message after
+  // the subagent's last report, so main must still get the notice.
+  test(
+    "the user's close of a subagent whose report is already out still tells main what it dropped",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-close-gap-")));
+      const settleHeld = join(dir, "settle-held");
+      const settleRelease = join(dir, "settle-release");
+      let childCalls = 0;
+      let moreResult = "";
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            return text("child_answer", "CLOSEGAP_CHILD_DONE");
+          }
+          if (body.includes("The user closed it, and 1 of your messages waiting for it were dropped.")) {
+            return text("main_saw", "CLOSEGAP_MAIN_SAW_NOTICE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEGAP_TASK" } });
+          }
+          if (!body.includes('"main_more"')) {
+            // The worker's work has ended and its report is out; fx is held before it settles.
+            await until("the held end", () => existsSync(`${settleHeld}.1`), 30_000);
+            return toolCall("main_more", "subagent", { request: { action: "message", agent: "worker", message: "CLOSEGAP_MORE" } });
+          }
+          moreResult ||= toolResultText(body, "main_more");
+          return text("main_wait", "CLOSEGAP_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("CLOSEGAP_MAIN_WAITING", 60_000);
+          expect(moreResult).toContain("is busy");
+          // Down opens the agent list on main's row, and the next Down selects worker.
+          await session.sendKeys("Down");
+          await session.waitForText("esc back", 10_000);
+          await session.sendKeys("Down");
+          await session.waitForText("enter switch     delete close     esc back", 10_000);
+          await session.sendKeys("DC");
+          await session.waitForText("press delete again to close this subagent", 10_000);
+          await session.sendKeys("DC");
+          await session.waitForPane((pane) => !subagentRow("worker").test(pane) && pane.includes("esc back"), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          writeFileSync(settleRelease, "");
+          await session.waitForText("CLOSEGAP_MAIN_SAW_NOTICE", 30_000);
+          // The waiting message never ran: the worker made its one request.
+          expect(childCalls).toBe(1);
+        }, () => {}, false, {
+          FX_TEST_SUBAGENT_SETTLE_HELD: settleHeld,
+          FX_TEST_SUBAGENT_SETTLE_RELEASE: settleRelease,
+        });
+      } finally {
+        writeFileSync(settleRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   // Main starts subagent `worker`, whose first turn the start hold
   // (src/core/subagent/start_test_controls.zig) stops before its worker
   // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
@@ -1174,6 +1312,73 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     },
     TIMEOUT,
   );
+
+  // In the app a subagent's turn runs on its own agent. The start hold keeps
+  // its first work before that turn begins. Main's stop or close there must
+  // count the call's one message, and the turn must never begin: no run
+  // starts, and the worker sends no request.
+  for (const action of ["stop", "close"] as const) {
+    test(
+      `main's ${action} of a subagent's first work before its turn begins counts its message`,
+      async () => {
+        const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-hosted-stop-")));
+        const startHeld = join(dir, "start-held");
+        const startRelease = join(dir, "start-release");
+        const tracePath = join(dir, "trace.log");
+        const run = { answer: "", childCalls: 0, stage: 0, trace: "" };
+        try {
+          await withFx(
+            async (body) => {
+              if (!isMainRequest(body)) {
+                run.childCalls += 1;
+                return text("child_answer", "SWITCH_CHILD_RAN");
+              }
+              run.stage += 1;
+              if (run.stage === 1) {
+                return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_TASK first" } });
+              }
+              if (run.stage === 2) {
+                await until("the held start", () => existsSync(`${startHeld}.1`), 20_000);
+                return toolCall("main_end", "subagent", { request: { action, agent: "worker" } });
+              }
+              if (run.stage === 3) {
+                run.answer = toolResultText(body, "main_end");
+                writeFileSync(startRelease, "");
+              }
+              return text("main_done", "SWITCH_MAIN_DONE");
+            },
+            async (session) => {
+              await session.sendText("SWITCH_USER");
+              await session.waitForText("SWITCH_MAIN_DONE", 60_000);
+              // The work has ended as cancelled, so its turn can no longer begin.
+              await until(
+                "the work's cancelled end in the trace",
+                () => existsSync(tracePath) && /event=child_end child=\S+ work_id=\S+ outcome=cancelled/.test(readFileSync(tracePath, "utf8")),
+                20_000,
+              );
+              run.trace = readFileSync(tracePath, "utf8");
+            },
+            () => {},
+            false,
+            {
+              FX_TEST_SUBAGENT_START_HELD: startHeld,
+              FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+              FX_TRACE: "1",
+              FX_TRACE_LOG: tracePath,
+            },
+          );
+        } finally {
+          writeFileSync(startRelease, "");
+          rmSync(dir, { recursive: true, force: true });
+        }
+        expect(run.answer).toContain("worker");
+        expect(run.answer).toContain("message waiting for it was dropped");
+        expect(run.trace).not.toContain("event=child_run_started");
+        expect(run.childCalls).toBe(0);
+      },
+      TIMEOUT,
+    );
+  }
 
   test(
     "a subagent's work that /quit cuts short reports after a resume, saying fx quit",
@@ -3218,6 +3423,82 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         gates.reviewer.release();
         gates.tester.release();
       }
+    },
+    TIMEOUT,
+  );
+
+  // A subagent resumed in this process builds its view while main is on
+  // screen. Its first show, while the follow-up's shell call still runs, must
+  // keep every row in scrollback.
+  test(
+    "a resumed subagent shown for the first time keeps every row in scrollback",
+    async () => {
+      const rowMarkers = Array.from({ length: 300 }, (_, index) => `ROW-${String(index + 1).padStart(4, "0")}`);
+      const followMarkers = Array.from({ length: 12 }, (_, index) => `FOLLOW-L${String(index + 1).padStart(2, "0")}`);
+      const rowReply = rowMarkers
+        .map((marker, index) => `${marker} reviewer row ${index + 1}: a final-reply line kept for the scrollback check.`)
+        .join("\n\n");
+      const followUp = followMarkers
+        .map((marker, index) => `${marker} ${index === 0 ? "FOLLOWUP_TASK keep the second batch running." : "follow-up line."}`)
+        .join("\n");
+      let slowCallServed = false;
+      let gateFile = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("FOLLOWUP_TASK")) {
+            if (body.includes('"follow_slow"')) return text("follow_done", "FOLLOWUP_DONE");
+            slowCallServed = true;
+            // The loop stops after 1200 checks, so a failed test cannot leave the call running.
+            return toolCall("follow_slow", "shell", {
+              request: { action: "run", command: `i=0; while [ ! -e '${gateFile}' ] && [ "$i" -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done; echo SLOW-DONE`, yield_time_ms: 150_000 },
+            });
+          }
+          return text("row_done", rowReply);
+        }
+        if (latestUserText(body).includes("ROW_FOLLOWUP")) {
+          if (!body.includes('"main_followup"')) {
+            return toolCall("main_followup", "subagent", {
+              request: { action: "message", agent: "reviewer", message: followUp, report: "never" },
+            });
+          }
+          return text("main_two", "SWITCH_MAIN_TWO");
+        }
+        if (!body.includes('"main_start_row"')) {
+          return toolCall("main_start_row", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "ROW_TASK write the transcript rows", report: "never" },
+          });
+        }
+        return text("main_one", "SWITCH_MAIN_ONE");
+      }, async (session, { home, launch, workspace }) => {
+        gateFile = join(workspace, "reviewer-slow-gate");
+        await session.sendText("SWITCH_USER ROW_START start the reviewer");
+        await session.waitForText("SWITCH_MAIN_ONE", 60_000);
+        // The resume must see the whole first turn, so wait until its last row is saved.
+        await until("the reviewer's first turn to be saved", () => sessionsHolding(home, "ROW-0300").length > 0, 60_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        const parents = sessionsHolding(home, "SWITCH_MAIN_ONE");
+        expect(parents).toHaveLength(1);
+
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("SWITCH_MAIN_ONE", 30_000);
+        await resumed.sendText("SWITCH_USER ROW_FOLLOWUP send the reviewer a follow-up");
+        await resumed.waitForText("SWITCH_MAIN_TWO", 60_000);
+        await until("the follow-up's shell call to be served", () => slowCallServed, 90_000);
+        await showAgent(resumed, "reviewer");
+        await resumed.waitForPane((pane) => pane.includes("\u2503 FOLLOW-L01") && !pane.includes(LIST_HINT), 20_000);
+        // The follow-up's answer comes only after its shell call returns. The call
+        // waits for a gate file that this test creates after this check, so the
+        // pane shows the switch made while the call still ran. The call's command
+        // text contains SLOW-DONE, so that marker cannot show absence.
+        expect(await resumed.capturePane()).not.toContain("FOLLOWUP_DONE");
+        writeFileSync(gateFile, "");
+        await resumed.waitForStableScrollback((scrollback) => scrollback.includes("FOLLOW-L12"), 30_000);
+
+        const scrollback = await resumed.captureFullScrollback();
+        const lost = [...rowMarkers, ...followMarkers].filter((marker) => !scrollback.includes(marker));
+        expect({ lost: lost.join(" ") }).toEqual({ lost: "" });
+      });
     },
     TIMEOUT,
   );

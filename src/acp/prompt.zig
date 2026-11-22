@@ -2324,6 +2324,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_text = pushText,
         .push_reasoning_delta = pushReasoningDelta,
         .push_route_recovery_status = pushRouteRecoveryStatus,
+        .save_route_recovery_status = saveRouteRecoveryStatus,
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
@@ -3196,6 +3197,17 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
     try v2.recordUsage(usage);
 }
 
+/// `AgentRuntimeDeps.save_route_recovery_status` on v2: a recovery status
+/// reaches the session log as a `model_recovery` item.
+fn saveRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    try v2.saveModelRecovery(status);
+}
+
 /// Where a subagent's captures go: the store's home and the active
 /// session's folder, while captures are on.
 fn childCaptureTarget(state: *server.ServerState) ?turn_capture.Target {
@@ -3244,10 +3256,12 @@ test "an ACP session's workspace captures watch its turn cancel, not the flag a 
 fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return;
+    if (step == .settle) return session.turn_capture.settle();
     const context = workspaceCaptureContext(session) orelse return;
     switch (step) {
         .begin => session.turn_capture.begin(context, fresh),
         .capture => session.turn_capture.start(context, &session.session_write_mutex),
+        .settle => unreachable,
     }
 }
 
