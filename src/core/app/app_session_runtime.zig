@@ -3990,16 +3990,18 @@ pub fn Runtime(comptime App: type) type {
             return holds_previous;
         }
 
-        /// A stored or sidecar title is outside text, so a notice draws its
-        /// escapes as text: an escape byte in a saved title never reaches the
-        /// terminal. Caller keeps ownership of nothing; the notice copies.
+        /// A stored or sidecar title is outside text, so the notice shows it
+        /// as the transcript shows prose: a control byte or invalid UTF-8
+        /// shows as its escape, and emoji joiners stay. The sink copies the
+        /// body.
         fn appendStoredTitleNotice(app: *App, sink: anytype, topic: []const u8, title: []const u8) !void {
-            var encoded = try text_utils.encodeTerminalSafe(app.alloc, title, std.math.maxInt(usize));
-            defer encoded.deinit(app.alloc);
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(app.alloc);
+            try text_utils.appendTerminalSafeText(app.alloc, &body, title);
             try sink.appendNotice(.{
                 .topic = topic,
                 .tone = .neutral,
-                .body = encoded.bytes,
+                .body = body.items,
             });
         }
 
@@ -9270,7 +9272,7 @@ test "a resumed session's notice shows a stored title's escapes as text" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
     const history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("fix\x1b]2;owned\x07 the \u{202e} parser\u{0085} now") },
+        .user = .{ .text = @constCast("fix\x1b]2;owned\x07 the \u{202e} parser\u{0085} now team \u{1f469}\u{200d}\u{1f4bb}") },
         .assistant = @constCast("saved response"),
     } }};
     const saved_session_id = try writeSessionFixture(&app, &history);
@@ -9286,7 +9288,11 @@ test "a resumed session's notice shows a stored title's escapes as text" {
     // A stored title is outside text: its escape bytes never reach the screen.
     try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
     try std.testing.expect(std.mem.findScalar(u8, body, 0x07) == null);
-    try std.testing.expect(text_utils.isTerminalSafe(body));
+    try std.testing.expect(text_utils.isTerminalSafeText(body));
+    // The escape shows as its visible text, and the emoji keeps its joiner.
+    try std.testing.expect(std.mem.find(u8, body, "\\x1b]2;owned\\x07") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\u{1f469}\u{200d}\u{1f4bb}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\\u{200d}") == null);
     try std.testing.expect(std.mem.find(u8, body, "fix") != null);
     try std.testing.expect(std.mem.find(u8, body, "parser") != null);
 }
