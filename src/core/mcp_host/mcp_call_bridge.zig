@@ -393,7 +393,7 @@ const Watch = struct {
     /// The pipe that ends `run`: read end, then write end. `serve` closes it.
     wake: [2]posix.fd_t,
     done: std.atomic.Value(bool) = .init(false),
-    /// Set once the watch has logged bytes the client sent after its request line.
+    /// Set once the watch has logged why it cannot watch its client: bytes sent after the request line, or a failed peek. Each watch logs one such line.
     extra_logged: bool = false,
 
     fn run(self: *Watch) void {
@@ -422,7 +422,11 @@ const Watch = struct {
             // then wait on the wake byte alone, so the unread bytes do not spin this loop.
             if (!self.extra_logged) {
                 self.extra_logged = true;
-                debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)});
+                if (rc < 0) {
+                    debug_trace.logf("mcp-call", "request={d} disconnect watch could not peek the client err={s}; it checks again every 100 ms", .{ @backingInt(self.id), @tagName(posix.errno(rc)) });
+                } else {
+                    debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)});
+                }
             }
             var wake_only = [_]posix.pollfd{.{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 }};
             _ = posix.poll(&wake_only, poll_ms) catch |err| {
