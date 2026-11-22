@@ -2631,13 +2631,14 @@ fn mcpAliasSegment(scratch: std.mem.Allocator, server: []const u8) ![]const u8 {
 /// A tool name that repeats its server's name, as many do, leaves it out.
 /// `server` is the server the call's result names, or "" when none does,
 /// and then the alias up to its first "_" names the server. Null for a name
-/// that is no alias.
+/// that is no alias, such as another program's "mcp__server__tool".
 fn mcpToolName(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?[]const u8 {
     if (!types.isMcpToolName(alias)) return null;
     const rest = alias[types.mcp_tool_prefix.len..];
     const named = try mcpAliasSegment(scratch, server);
     const known = startsWithSegment(rest, named);
     const server_segment = if (known) named else rest[0 .. findByte(rest, '_') orelse return null];
+    if (server_segment.len == 0) return null;
     var tool = rest[server_segment.len + 1 ..];
     if (startsWithSegment(tool, server_segment)) tool = tool[server_segment.len + 1 ..];
     if (tool.len == 0) return null;
@@ -2701,19 +2702,23 @@ test "MCP rows name the server, then its tool" {
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_team_notes_search\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_team_notes_search\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Failed mcp_fixture_echo\n", .class = .tool_status } },
+        // Another program's MCP name, which fx never gives a tool, keeps it.
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed mcp__filesystem__read_text_file\n", .class = .tool_status } },
     };
     const run = "{\"run\":\"mcp_team_notes_search\",\"arguments\":{}}";
     const details = [_]ToolDetailRecord{
         .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .result = @constCast("{\"server\":\"team_notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}"), .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run) },
         .{ .entry_id = 3, .tool_name = @constCast("mcp_fixture_echo"), .activity_kind = .mcp, .outcome = .failed },
+        .{ .entry_id = 4, .tool_name = @constCast("mcp__filesystem__read_text_file"), .activity_kind = .mcp, .outcome = .failed },
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("rows:\n{s}\n", .{text});
     try std.testing.expect(std.mem.find(u8, text, "├ Running team_notes search ×2\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "└ Couldn't run fixture echo") != null);
-    try std.testing.expect(std.mem.find(u8, text, "mcp_") == null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run fixture echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Couldn't run mcp__filesystem__read_text_file") != null);
+    try std.testing.expect(std.mem.find(u8, text, "mcp_team") == null);
     try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
     try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
 }
