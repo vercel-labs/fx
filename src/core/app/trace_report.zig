@@ -42,7 +42,8 @@
 //!   `effort`, `input_tokens`, `output_tokens`, `web_search_requests`; `auth`
 //!   {`source`, `refreshable`, `gateway_team`}; `process` {`pid`, `open_fds`,
 //!   and `memory` {`pid`, `ppid`, `rss_kib`, `vsz_kib`, `elapsed`, `stat`}, or
-//!   `memory_lines` with the `ps` output when it has another shape}; `worker`
+//!   `memory_lines` with the `ps` output when it has another shape. A crash
+//!   report writes `memory` as the text `skipped` and runs no `ps`}; `worker`
 //!   {`processing`, `queued`, `cancel_requested`, `pending_permission`
 //!   (masked)}; `pending_questions` {`count`, `questions`: the first 3 as
 //!   {`question` (masked), `options`, a count}}; `pending_images` {`count`,
@@ -559,7 +560,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeHeader(r, App.app_version, io_mod.milliTimestamp());
     if (fatal) |err| try writeFatalError(r, err);
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
-    try writeCurrentState(r, app);
+    try writeCurrentState(r, app, fatal != null);
     try writeProblems(r, app);
     try writeLastShutdownRead(r, app_lifecycle.readLastShutdownReport(arena));
     // A crash report never embeds an older crash report, so the file cannot grow on each crash.
@@ -637,7 +638,7 @@ fn writeSummary(r: *Records, app: anytype, permission_mode: []const u8) !void {
     try r.end();
 }
 
-noinline fn writeCurrentState(r: *Records, app: anytype) !void {
+noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !void {
     const App = @TypeOf(app.*);
     const agent = agents.screenAgentOf(app);
     try r.begin("current_state");
@@ -656,7 +657,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype) !void {
         try r.number("web_search_requests", agents.loadTotal(&agent.total_web_search_requests));
     }
     try writeAuthState(r, app);
-    try writeProcess(r);
+    try writeProcess(r, crash_report);
     if (comptime agents.hasAgentField(App, "worker")) {
         if (agent.worker.snapshotState(r.arena) catch null) |state| {
             defer state.deinit(r.arena);
@@ -757,12 +758,18 @@ fn writeAuthState(r: *Records, app: anytype) !void {
     try r.endObject();
 }
 
-fn writeProcess(r: *Records) !void {
+fn writeProcess(r: *Records, crash_report: bool) !void {
     const pid = std.c.getpid();
     try r.beginObject("process");
     try r.number("pid", pid);
     if (countOpenFileDescriptors()) |fd_count| try r.number("open_fds", fd_count);
-    if (processMemorySnapshot(r.arena, pid) catch null) |ps_output| try writeProcessMemory(r, ps_output);
+    // A crash report saves while the terminal is still raw, and nothing bounds
+    // `ps`, so it runs no `ps` and records the memory as skipped.
+    if (crash_report) {
+        try r.text("memory", "skipped");
+    } else if (processMemorySnapshot(r.arena, pid) catch null) |ps_output| {
+        try writeProcessMemory(r, ps_output);
+    }
     try r.endObject();
 }
 
@@ -2766,8 +2773,23 @@ fn writeCrashReportInner(app: anytype, err: anyerror) ![]u8 {
     defer fx_dir.close();
     var diagnostics_dir = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
     defer diagnostics_dir.close();
-    try io_mod.durableReplaceVerified(alloc, &diagnostics_dir, profile_paths.last_crash_report_file_name, report);
+    try replaceCrashReport(alloc, &diagnostics_dir, report, .{});
     return path;
+}
+
+/// Replaces the saved crash report in `diagnostics_dir`. A failure before the
+/// rename returns the error that stopped it, so the person sees its real cause
+/// (for example `NoSpaceLeft`), not the wrapper `DurableReplacePreRenameFailed`.
+fn replaceCrashReport(alloc: std.mem.Allocator, diagnostics_dir: *io_mod.VerifiedDir, report: []const u8, ops: io_mod.DurableOps) !void {
+    var cause: ?anyerror = null;
+    var with_cause = ops;
+    with_cause.pre_rename_cause = &cause;
+    io_mod.durableReplaceVerifiedWithOps(alloc, diagnostics_dir, profile_paths.last_crash_report_file_name, report, with_cause) catch |err| {
+        if (err == error.DurableReplacePreRenameFailed) {
+            if (cause) |real| return real;
+        }
+        return err;
+    };
 }
 
 // Tests read the records back the way a program would: each line on its own,
@@ -3161,6 +3183,21 @@ test "trace last crash read refuses a FIFO and reads a regular file" {
     try std.testing.expectEqualStrings("recorded", try testString(try recorded_trace.one("last_crash"), "status"));
 }
 
+fn failTempSyncWithNoSpace(_: ?*anyopaque, _: std.Io.File) anyerror!void {
+    return error.NoSpaceLeft;
+}
+
+test "trace crash save returns the cause of a failure before the rename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+    try std.testing.expectError(
+        error.NoSpaceLeft,
+        replaceCrashReport(std.testing.allocator, &dir, "report\n", .{ .sync_file = failTempSyncWithNoSpace }),
+    );
+}
+
 test "trace time to the minute reads as a UTC clock time" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("2026-11-18 01:42 UTC", try formatUtcMinute(&buf, 1_794_966_120_000));
@@ -3360,6 +3397,30 @@ test "trace process memory reads ps output and keeps other shapes as lines" {
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqualStrings("UID PID", lines[0].string);
     try expectAbsent(process, "memory");
+}
+
+test "trace crash report marks process memory as skipped instead of running ps" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try w.records.begin("current_state");
+    try writeProcess(&w.records, true);
+    try w.records.end();
+    var trace = try w.trace();
+    defer trace.deinit();
+    const process = try testObject(try trace.one("current_state"), "process");
+    try std.testing.expectEqualStrings("skipped", try testString(process, "memory"));
+}
+
+test "trace process memory still runs ps outside a crash report" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try w.records.begin("current_state");
+    try writeProcess(&w.records, false);
+    try w.records.end();
+    var trace = try w.trace();
+    defer trace.deinit();
+    const process = try testObject(try trace.one("current_state"), "process");
+    if (process.get("memory")) |memory| try std.testing.expect(memory != .string);
 }
 
 test "trace renderer events are available without opt-in file logging" {

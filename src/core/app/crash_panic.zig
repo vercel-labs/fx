@@ -89,12 +89,24 @@ fn printPath(buf: *[path_max_bytes:0]u8, comptime fmt: []const u8, args: anytype
     return text.len;
 }
 
+/// Called once a full crash report is saved. A panic that comes later in this
+/// process, such as one during shutdown, then skips its save, so it does not
+/// replace the full report with the short panic record. It still prints and aborts.
+pub fn noteReportSaved() void {
+    handling.store(true, .seq_cst);
+}
+
+/// Whether this panic may save its record: only the first one may.
+fn claimSave() bool {
+    return !handling.swap(true, .seq_cst);
+}
+
 /// The root panic handler. The first panic saves its record, and every panic
 /// then goes to `std.debug.defaultPanic`, which prints the message and aborts.
 /// A panic that comes during the save, from any thread or from this handler,
-/// skips the save.
+/// skips the save, and so does one after `noteReportSaved`.
 pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    if (!handling.swap(true, .seq_cst)) saveRecord("panic", msg);
+    if (claimSave()) saveRecord("panic", msg);
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 
@@ -104,7 +116,7 @@ pub fn handle(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// Then it calls Zig's default handler, which prints the signal's name and its
 /// address, then a stack trace only in builds with debug info, and aborts.
 pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
-    if (!handling.swap(true, .seq_cst)) saveRecord("signal", segfaultMessage(&segfault_msg_buf, addr, name));
+    if (claimSave()) saveRecord("signal", segfaultMessage(&segfault_msg_buf, addr, name));
     std.debug.defaultHandleSegfault(addr, name, opt_ctx);
 }
 
@@ -510,4 +522,13 @@ test "crash panic writes the record to the prepared file" {
     _ = try parseRecordLine(arena.allocator(), lines.next().?);
     const fatal = try parseRecordLine(arena.allocator(), lines.next().?);
     try std.testing.expectEqualStrings("boom from the file test", fatal.get("message").?.string);
+}
+
+test "crash panic skips its save once a full report is noted as saved" {
+    defer handling.store(false, .seq_cst);
+    handling.store(false, .seq_cst);
+    try std.testing.expect(claimSave());
+    handling.store(false, .seq_cst);
+    noteReportSaved();
+    try std.testing.expect(!claimSave());
 }
