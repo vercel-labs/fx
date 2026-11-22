@@ -330,19 +330,19 @@ function expectReportCarriesFirstTurn(body: string, answer: string, toolCalls: s
   expect(body).toContain(answer);
 }
 
-// Main starts a writer and a helper that finishes. The writer's approval is
-// open when main's first turn ends, so the helper's
+// Main starts a writer and a helper that finishes. The writer's approval, or
+// its out-of-credits picker, is open when main's first turn ends, so the helper's
 // report waits for that turn's commit, and the prompt is answered while it
 // waits. The report's request has to carry the first turn, which the loop
 // committed after the report was posted.
-async function reportBehindAnsweredPrompt(prompt: "approval") {
+async function reportBehindAnsweredPrompt(prompt: "approval" | "out_of_credits") {
   const promptShown = held();
   const mainTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
   let tracePath = "";
   const env: Record<string, string> = {};
-  const promptText = "Subagent writer needs permission";
+  const promptText = prompt === "approval" ? "Subagent writer needs permission" : "Out of credits. What should fx do?";
   await withFx((body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
@@ -352,7 +352,9 @@ async function reportBehindAnsweredPrompt(prompt: "approval") {
     if (latest.includes("SWITCH_WRITE_TASK")) {
       writerCalls += 1;
       if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
-      return toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" });
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : outOfCredits();
     }
     if (latest.includes("SWITCH_HELPER_TASK")) return mainTurnEnded.promise.then(() => text("helper_done", "SWITCH_HELPER_DONE"));
     if (!body.includes('"main_w"')) {
@@ -370,7 +372,8 @@ async function reportBehindAnsweredPrompt(prompt: "approval") {
     mainTurnEnded.release();
     // The report is posted and waits for the first turn's commit, which the open
     // prompt keeps back. Answer the prompt once the worker holds the report, or
-    // the report started anyway.
+    // the report started anyway. The approval's first option and the picker's
+    // retry are both "1".
     await until("the report to wait for the first turn", () => traceHas(tracePath, "event=commit_gate_held") || reports.length >= 1);
     await session.sendKeys("1");
     await until("main's request for the helper's report", () => reports.length >= 1);
@@ -379,6 +382,7 @@ async function reportBehindAnsweredPrompt(prompt: "approval") {
   }, (home) => {
     tracePath = join(home, "fx-trace.log");
     env.FX_TRACE_LOG = tracePath;
+    if (prompt !== "approval") return;
     const folder = join(home, ".fx", "agents", "writer");
     mkdirSync(folder, { recursive: true });
     writeFileSync(join(folder, "profile.json"), JSON.stringify({
@@ -474,8 +478,8 @@ async function withFx(
   }
 }
 
-// Main starts a writer and a helper that finishes. The writer's approval
-// stays open on main's screen. The gateway holds main's
+// Main starts a writer and a helper that finishes. The writer's approval, or
+// its out-of-credits picker, stays open on main's screen. The gateway holds main's
 // reply that ends its first turn until the prompt is on the screen, and the
 // helper's reply until main's worker has ended that turn, so the helper's
 // report waits for main's next turn while the pacer still holds the first turn
@@ -490,16 +494,17 @@ async function withFx(
 // once the writer's request arrived. Whichever the case, the report's request
 // has to carry the turns main finished before it: the report was posted before
 // the loop committed them.
-async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDelayMs = 0, secondReport = false) {
+async function reportWhilePromptStaysOpen(prompt: "approval" | "out_of_credits" | "none", reportDelayMs = 0, secondReport = false) {
   const promptShown = held();
   const writerReleased = held();
   const mainTurnEnded = held();
   const reportTurnEnded = held();
   const reports: string[] = [];
   let writerCalls = 0;
+  let mainTurns = 0;
   let tracePath = "";
   const env: Record<string, string> = {};
-  const promptText = "Subagent writer needs permission";
+  const promptText = prompt === "out_of_credits" ? "Out of credits. What should fx do?" : "Subagent writer needs permission";
   await withFx((body) => {
     const latest = latestUserText(body);
     if (latest.startsWith(REPORT_HEADER)) {
@@ -510,7 +515,9 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDel
       writerCalls += 1;
       if (writerCalls > 1) return text("child_done", "SWITCH_WRITER_DONE");
       if (prompt === "none") return writerReleased.promise.then(() => text("child_done", "SWITCH_WRITER_DONE"));
-      return toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" });
+      return prompt === "approval"
+        ? toolCall("child_write", "write_file", { path: "switch-child.txt", content: "SWITCH_WROTE\n" })
+        : outOfCredits();
     }
     if (latest.includes("SWITCH_HELPER_TASK")) {
       return mainTurnEnded.promise.then(() => Bun.sleep(reportDelayMs)).then(() => text("helper_done", "SWITCH_HELPER_DONE"));
@@ -525,6 +532,10 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDel
         ...(secondReport ? [{ id: "main_s", agent: "scout", message: "SWITCH_SCOUT_TASK" }] : []),
       ]);
     }
+    // A lent out-of-credits picker tells main that the writer waits, and that
+    // turn answers with its own text so the first turn stays shown once.
+    mainTurns += 1;
+    if (prompt === "out_of_credits" && mainTurns > 1) return text("main_recovery", "SWITCH_MAIN_RECOVERY");
     return promptShown.promise.then(() => text("main_one", "SWITCH_MAIN_ONE"));
   }, async (session, { home }) => {
     const trace = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
@@ -551,7 +562,9 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDel
       const open = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && pane.includes(promptText), 15_000);
 
       // The first turn shows above the open prompt, once, and the prompt stays.
-      // The report turn's answer waits behind the prompt.
+      // The report turn's answer waits behind the prompt. A lent out-of-credits
+      // picker also tells main that the writer waits ("Message from writer"),
+      // and that turn answers SWITCH_MAIN_RECOVERY, never the first turn again.
       expect(open).not.toContain("SWITCH_MAIN_REPORT_1");
       expect((await session.captureFullScrollback()).split("SWITCH_MAIN_ONE").length - 1).toBe(1);
     }
@@ -588,7 +601,11 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDel
 
     // Nothing of a turn is shown twice.
     const after = await session.captureFullScrollback();
-    const markers = ["SWITCH_MAIN_ONE", ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`)];
+    const markers = [
+      "SWITCH_MAIN_ONE",
+      ...(prompt === "out_of_credits" ? ["SWITCH_MAIN_RECOVERY"] : []),
+      ...Array.from({ length: reportTurns }, (_, i) => `SWITCH_MAIN_REPORT_${i + 1}`),
+    ];
     for (const marker of markers) {
       expect(after.split(marker).length - 1).toBe(1);
     }
@@ -617,7 +634,7 @@ async function reportWhilePromptStaysOpen(prompt: "approval" | "none", reportDel
 
 describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
-  for (const prompt of ["approval"] as const) {
+  for (const prompt of ["approval", "out_of_credits"] as const) {
     test(
       `a report that waited for main's turn while a subagent's ${prompt} was open carries that turn once the prompt is answered`,
       async () => {
@@ -2169,6 +2186,57 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       // The next turn's list is built again, and has no wait in it.
       expect(rows.next).toContain("- writer: working.");
       expect(rows.next).not.toContain("waiting for");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop ends a subagent's open out-of-credits prompt and the turn that asked it",
+    async () => {
+      let stopResult = "";
+      let statusAfter = "";
+      let childCalls = 0;
+      let stage = 0;
+      const promptShows = held();
+      let promptPane = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) return outOfCredits();
+          return text("child_after", "SWITCH_PAYER_STOPPED");
+        }
+        stage += 1;
+        if (stage === 1) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "payer", message: "SWITCH_PAY_TASK" } });
+        }
+        if (stage === 2) {
+          // Main's next step waits for the picker on its screen.
+          await promptShows.promise;
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "payer" } });
+        }
+        if (stage === 3) stopResult = toolResultText(body, "main_stop");
+        else statusAfter = toolResultText(body, `main_status_${stage - 1}`);
+        // The subagent's turn ends a moment after the stop, so main asks
+        // again until `status` stops saying it works.
+        if (stage < 63 && (stage === 3 || statusAfter.includes("working"))) {
+          await Bun.sleep(100);
+          return toolCall(`main_status_${stage}`, "subagent", { request: { action: "status" } });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        promptPane = await session.waitForPane((pane) =>
+          pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"), 30_000);
+        expect(promptPane).toContain("payer asks");
+        promptShows.release();
+        // The picker leaves main's screen with the subagent's turn.
+        const main = await session.waitForPane((pane) =>
+          pane.includes("SWITCH_MAIN_DONE") && !pane.includes("Out of credits. What should fx do?"), 30_000);
+        expect(main).not.toContain("payer asks");
+      });
+      expect(stopResult).toContain("Stopped payer: its turn ended");
+      expect(statusAfter).toContain("payer: idle");
+      expect(statusAfter).not.toContain("working");
     },
     TIMEOUT,
   );
@@ -4622,7 +4690,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
 
-  for (const prompt of ["approval"] as const) {
+  for (const prompt of ["approval", "out_of_credits"] as const) {
     test(
       `a report for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {
@@ -4634,7 +4702,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
   // A person leaves a prompt open for longer than the gate's limit, and the
   // subagent reports after that.
-  for (const [prompt, seconds] of [["approval", 6], ["approval", 10]] as const) {
+  for (const [prompt, seconds] of [["approval", 6], ["approval", 10], ["out_of_credits", 6]] as const) {
     test(
       `a report ${seconds} s late for main starts its next turn while a subagent's ${prompt} stays open`,
       async () => {
