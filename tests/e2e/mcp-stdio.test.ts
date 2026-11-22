@@ -2667,7 +2667,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`└ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
+      expect(scrollback).toContain(`└ Couldn't run ${TOOL_ROW} · Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2714,7 +2714,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       // The row names the failed call, and the cause follows it on its line.
       await tui.waitForText(cause, 20_000);
       await tui.waitForText("Rejected arguments complete.", 20_000);
-      expect(await tui.captureFullScrollback()).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+      expect(await tui.captureFullScrollback()).toContain(`Couldn't run ${TOOL_ROW} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
 
@@ -2902,7 +2902,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // no other field of it: the cause is the server's message's and nothing of the data.
         expect({ kind, found: logged.logs.includes(marker) }).toEqual({ kind, found: false });
         expect({ kind, found: logged.screen.includes(marker) }).toEqual({ kind, found: false });
-        expect(logged.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`);
+        expect(logged.screen).toContain(`Couldn't run ${TOOL_ROW} · ${cause ?? `MCP protocol error -32603: ${message}`}`);
         expect({ kind, shown: logged.screen.includes("data=") }).toEqual({ kind, shown: false });
         const reportFields: string[] = [];
         const walk = (value: unknown, path: string) => {
@@ -2944,7 +2944,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         const call = await refusedCall(`tui-invalid-params-cap-${kind}`, { ...options, resultCapBytes: 2000 }, `Cap ${kind} complete.`);
         // The cap stored the text, so the case is not passing for want of the block.
         expect({ kind, stored: call.body?.includes("<tool_result_preview handle=") }).toEqual({ kind, stored: true });
-        expect(call.screen).toContain(`Couldn't run ${TOOL_NAME} · ${cause}`);
+        expect(call.screen).toContain(`Couldn't run ${TOOL_ROW} · ${cause}`);
         expect({ kind, shown: call.screen.includes("tool_result_preview") }).toEqual({ kind, shown: false });
         expect({ kind, shown: call.screen.includes("data=") }).toEqual({ kind, shown: false });
         expect({ kind, found: call.screen.includes(marker) || call.logs.includes(marker) }).toEqual({ kind, found: false });

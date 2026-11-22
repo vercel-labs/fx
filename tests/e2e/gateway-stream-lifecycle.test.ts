@@ -8921,8 +8921,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
-          // The read names the command whose saved output it searches.
-          expect(pane).toContain("cat source.txt output for \"RETRIEVAL_MATCH\"");
+          // The read names the command whose saved output it searches, by the
+          // short form the command's own row shows.
+          expect(pane).toContain("├ Ran printf, cat\n");
+          expect(pane).toContain("Searched printf, cat output for \"RETRIEVAL_MATCH\"");
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
           }
