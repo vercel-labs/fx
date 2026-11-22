@@ -681,14 +681,6 @@ fn statusGeometryUnchanged(cols: u16, previous: []const u8, next: []const u8) bo
     return next_lines.next() == null;
 }
 
-fn hasCommittedRetentionSource(self: anytype) bool {
-    if (comptime @hasDecl(@TypeOf(self.*), "committedRetentionIdentity")) {
-        const identity = self.committedRetentionIdentity() orelse return false;
-        return identity.lines.len > 0 and self.retentionSourceCols() != null;
-    }
-    return false;
-}
-
 /// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
 /// with the same cleanup the byte-cap retention runs after it prunes. Ids no
 /// longer present are skipped; a pinned entry is never removed.
@@ -2461,28 +2453,16 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     return entry_id;
 }
 
-/// Takes ownership of `table` only when it returns successfully.
-pub fn appendAssistantTableOwned(
+/// Changes the runtime in place, so a failed allocation can leave the transcript
+/// showing an entry the notebook no longer holds. Only `appendAssistantBlockAtomic` calls it, on a copy.
+fn appendAssistantBlockInPlace(
     self: anytype,
     alloc: Allocator,
-    table: assistant_presentation.TablePayload,
+    entry: TranscriptEntry,
+    rebuild_reason: []const u8,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantTableOwned(&shadow, alloc, table);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_table_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_table = .{
-        .id = entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .table = table,
-    } });
+    const entry_id = entry.id();
+    try self.notebook.entries.append(alloc, entry);
     errdefer {
         _ = self.notebook.entries.pop();
     }
@@ -2494,11 +2474,48 @@ pub fn appendAssistantTableOwned(
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_table");
+    try rebuildTranscriptFromRendered(self, alloc, rendered, rebuild_reason);
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.notebook.next_entry_id +%= 1;
     return entry_id;
+}
+
+/// Appends on a copy and commits only when every step succeeds, so a failed allocation leaves
+/// the transcript and its entries as they were, and the caller keeps the payload on error.
+fn appendAssistantBlockAtomic(
+    self: anytype,
+    alloc: Allocator,
+    entry: TranscriptEntry,
+    commit_reason: []const u8,
+    rebuild_reason: []const u8,
+) !u32 {
+    if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const id = try appendAssistantBlockInPlace(&shadow, alloc, entry, rebuild_reason);
+        errdefer {
+            // The caller still owns the payload when the commit fails, so the copy must drop the entry before it is freed.
+            _ = shadow.notebook.entries.pop();
+        }
+        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, commit_reason, .preserve_same_epoch);
+        return id;
+    }
+    return appendAssistantBlockInPlace(self, alloc, entry, rebuild_reason);
+}
+
+/// Takes ownership of `table` only when it returns successfully.
+pub fn appendAssistantTableOwned(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+) !u32 {
+    const entry: TranscriptEntry = .{ .assistant_table = .{
+        .id = self.notebook.next_entry_id,
+        .created_at_ms = io_mod.milliTimestamp(),
+        .table = table,
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_table_append", "append_assistant_table");
 }
 
 /// Takes ownership of `block` only when it returns successfully.
@@ -2507,69 +2524,20 @@ pub fn appendAssistantCodeBlockOwned(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantCodeBlockOwned(&shadow, alloc, block);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_code_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_code_block = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_code_block = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_code_block");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_code_append", "append_assistant_code_block");
 }
 
 pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantThematicRule(&shadow, alloc);
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_rule_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_thematic_rule = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_thematic_rule = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_thematic_rule");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_rule_append", "append_assistant_thematic_rule");
 }
 
 pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {

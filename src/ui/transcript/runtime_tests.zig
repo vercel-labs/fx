@@ -16686,6 +16686,153 @@ test "retint rewrites inline code and links inside table cells" {
     try std.testing.expect(std.mem.find(u8, retinted, "129;161;193") == null);
 }
 
+test "a table append that runs out of memory before a frame commits leaves the transcript as it was" {
+    // Pins that a failed allocation on the uncommitted append path leaves the transcript and its entries as they were.
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(80, 14, 10),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "KEPT_ROW\n", .unknown_raw);
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(backing);
+        for (runtime.notebook.entries.items) |entry| try ids.append(backing, entry.id());
+        const transcript_before = try backing.dupe(u8, runtime.notebook.transcript.items);
+        defer backing.free(transcript_before);
+        const next_before = runtime.notebook.next_entry_id;
+
+        var table = try assistant_presentation.parseTablePayload(
+            backing,
+            "| Command | Docs |\n|---------|------|\n| `zig build` | guide |\n",
+        );
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.appendAssistantTableOwned(alloc, table);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) induced_failures += 1;
+        if (result) |id| {
+            try std.testing.expect(!induced);
+            try std.testing.expectEqual(id, runtime.notebook.entries.items[runtime.notebook.entries.items.len - 1].id());
+            try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "zig build") != null);
+            break;
+        } else |err| {
+            table.deinit(backing);
+            try std.testing.expect(induced);
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
+            try std.testing.expectEqual(ids.items.len, runtime.notebook.entries.items.len);
+            for (ids.items, runtime.notebook.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
+            try std.testing.expectEqual(next_before, runtime.notebook.next_entry_id);
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
+test "a code block append that runs out of memory before a frame commits leaves the transcript as it was" {
+    // Pins that a failed allocation on the uncommitted append path leaves the transcript and its entries as they were.
+    const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(80, 14, 10),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "KEPT_ROW\n", .unknown_raw);
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(backing);
+        for (runtime.notebook.entries.items) |entry| try ids.append(backing, entry.id());
+        const transcript_before = try backing.dupe(u8, runtime.notebook.transcript.items);
+        defer backing.free(transcript_before);
+        const next_before = runtime.notebook.next_entry_id;
+
+        var block = assistant_presentation.CodeBlockPayload{
+            .language = try backing.dupe(u8, ""),
+            .code = try backing.dupe(u8, "CODE_BODY_MARK\n"),
+        };
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.appendAssistantCodeBlockOwned(alloc, block);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) induced_failures += 1;
+        if (result) |id| {
+            try std.testing.expect(!induced);
+            try std.testing.expectEqual(id, runtime.notebook.entries.items[runtime.notebook.entries.items.len - 1].id());
+            try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "CODE_BODY_MARK") != null);
+            break;
+        } else |err| {
+            block.deinit(backing);
+            try std.testing.expect(induced);
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
+            try std.testing.expectEqual(ids.items.len, runtime.notebook.entries.items.len);
+            for (ids.items, runtime.notebook.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
+            try std.testing.expectEqual(next_before, runtime.notebook.next_entry_id);
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
+test "a rule append that runs out of memory before a frame commits leaves the transcript as it was" {
+    // Pins that a failed allocation on the uncommitted append path leaves the transcript and its entries as they were.
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = TranscriptRuntime{
+            .layout = transcriptTestLayout(80, 14, 10),
+            .owned_top_row = 1,
+        };
+        defer runtime.deinit(alloc);
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "KEPT_ROW\n", .unknown_raw);
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(backing);
+        for (runtime.notebook.entries.items) |entry| try ids.append(backing, entry.id());
+        const transcript_before = try backing.dupe(u8, runtime.notebook.transcript.items);
+        defer backing.free(transcript_before);
+        const next_before = runtime.notebook.next_entry_id;
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = runtime.appendAssistantThematicRule(alloc);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) induced_failures += 1;
+        if (result) |id| {
+            try std.testing.expect(!induced);
+            try std.testing.expectEqual(id, runtime.notebook.entries.items[runtime.notebook.entries.items.len - 1].id());
+            try std.testing.expect(runtime.notebook.transcript.items.len > transcript_before.len);
+            break;
+        } else |err| {
+            try std.testing.expect(induced);
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
+            try std.testing.expectEqual(ids.items.len, runtime.notebook.entries.items.len);
+            for (ids.items, runtime.notebook.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
+            try std.testing.expectEqual(next_before, runtime.notebook.next_entry_id);
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
 test "rewrite publication keeps the frozen prefix when a finished turn holds a hidden notice" {
     const alloc = std.testing.allocator;
     const source_preparation = @import("source_preparation.zig");
