@@ -7277,7 +7277,7 @@ fn fuzzAgentsMenu(_: void, smith: *std.testing.Smith) !void {
             5 => if (app.child_agents.items.len < 6) {
                 var buf: [16]u8 = undefined;
                 ids += 1;
-                _ = try addTestChildAgent(&app, try std.fmt.bufPrint(&buf, "agent-{d}", .{ids}));
+                _ = try addTestChildAgent(&app, try std.mem.print(&buf, "agent-{d}", .{ids}));
             },
             6 => if (app.child_agents.items.len > 0) {
                 const child = app.child_agents.items[pickIndex(bytes, &at, app.child_agents.items.len)];
