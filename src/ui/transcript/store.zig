@@ -705,7 +705,9 @@ pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !boo
     return dropEntries(self, alloc, ids);
 }
 
-fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
+/// Drops in place, so a failed allocation can leave the runtime half changed.
+/// Only a caller that discards the runtime on failure may use it; every other caller uses `dropEntriesAtomic`.
+pub fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
     try rebuildEntryIdSet(self, alloc, &entry_ids);

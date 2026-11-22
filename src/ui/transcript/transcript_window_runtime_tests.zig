@@ -1101,8 +1101,8 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
 }
 
 test "a transcript window drop that runs out of memory before a frame commits leaves the transcript as it was" {
-    // No frame has committed, so the drop edits the live runtime in place.
-    // A failed allocation must still leave the transcript and its entries as they were.
+    // No frame has committed, so there is no committed source to rebase onto, and a
+    // failed allocation must still leave the transcript and its entries as they were.
     const backing = testing_allocator.no_resize;
     var induced_failures: usize = 0;
     var fail_after: usize = 0;
