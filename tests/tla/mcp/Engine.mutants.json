@@ -112,5 +112,24 @@
     "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF gaveUp /\\ c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
     "property": "WaitsForOneStart"
+  },
+  {
+    "description": "The engine restarts a link after one lost call",
+    "old": "    /\\ lost[s] = LostLimit\n    /\\ Sent(s) = {}",
+    "new": "    /\\ lost[s] >= 1\n    /\\ Sent(s) = {}",
+    "property": "RestartOnlyAfterLosses"
+  },
+  {
+    "description": "The engine restarts a link with a call in flight",
+    "old": "    /\\ Sent(s) = {}\n    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "new": "    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "config": "Engine.lost.cfg",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "The engine never restarts a link that loses calls",
+    "old": "    /\\ phase[s] = \"ready\"\n    /\\ lost[s] = LostLimit",
+    "new": "    /\\ phase[s] = \"ready\" /\\ need[s]\n    /\\ lost[s] = LostLimit",
+    "property": "LossesRestart"
   }
 ]

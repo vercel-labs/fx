@@ -113,6 +113,24 @@ pub const Failure = union(enum) {
 /// How a call ended: the exchange's outcomes, and a chain's.
 pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable };
 
+/// Why a call ended lost: the ending that lost it, or the process going away.
+pub const LostWhy = enum {
+    /// The stream broke before the answer.
+    stream_broken,
+    /// The stream ended without the answer.
+    stream_ended,
+    /// The answer was over the message limit.
+    too_large,
+    /// A resumed stream was refused.
+    resume_refused,
+    /// The session expired while the call was resuming.
+    session_expired,
+    /// The session changed, or was not ready, when the call was to resume.
+    session_changed,
+    /// The stdio process went away.
+    link_down,
+};
+
 pub const Event = union(enum) {
     /// Detection finished; requests carry this version.
     ready: []const u8,
@@ -131,7 +149,9 @@ pub const Event = union(enum) {
     /// `refused_body` says which it was: a 2xx HTTP body that is no JSON-RPC message, or, when
     /// it is false, the last line with no readable id that the server wrote before the call's
     /// grace ran out (see `request.Timeouts.refused_ms`). Both are 0 and false for any other call.
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
+    /// `lost_why` and `status` are null and 0 unless the outcome is `lost`: why it was lost, and the
+    /// HTTP status of the ending that lost it (0 when none).
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false, lost_why: ?LostWhy = null, status: u16 = 0 },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
     /// next `next`.
@@ -211,6 +231,10 @@ const Logical = struct {
     /// (see `Event.called`).
     refused_bytes: u32 = 0,
     refused_body: bool = false,
+    /// Why the call was lost, set where the call is decided to be lost.
+    lost_why: ?LostWhy = null,
+    /// The HTTP status of the ending that lost the call; 0 when none.
+    lost_status: u16 = 0,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -917,6 +941,8 @@ pub const Server = struct {
     /// A stdio request ended in the request table: its logical request ends.
     fn stdioDelivered(r: *Server, id: request.Id, outcome: request.Outcome) Error!void {
         const l = r.logicalFor(id) orelse return;
+        // A stdio call that ends without its answer lost its process (`onProcessChanged`).
+        if (outcome == .none or outcome == .lost or outcome == .ended) l.lost_why = .link_down;
         const answered = outcome == .result or outcome == .peer_error;
         if (r.legacyEra() and (l.what == .call or l.what == .list)) return r.legacyDelivered(id, switch (outcome) {
             .result, .peer_error => .result,
@@ -1316,8 +1342,12 @@ pub const Server = struct {
         if (how == .too_large) {
             r.losing_oversized = true;
             defer r.losing_oversized = false;
+            l.lost_why = .too_large;
+            l.lost_status = status;
             return r.stepExchange(l, .too_large);
         }
+        l.lost_why = if (how == .broken) .stream_broken else .stream_ended;
+        l.lost_status = status;
         try r.stepExchange(l, .stream_broken);
     }
 
@@ -1412,6 +1442,8 @@ pub const Server = struct {
                         .oversized = o == .lost and r.losing_oversized,
                         .refused_bytes = l.refused_bytes,
                         .refused_body = l.refused_body,
+                        .lost_why = if (o == .lost) l.lost_why else null,
+                        .status = if (o == .lost) l.lost_status else 0,
                     },
                 });
                 l.used = false;
@@ -1573,7 +1605,14 @@ pub const Server = struct {
         try http_headers.sessionHeaders(arena.allocator(), method == .get, version, r.session_id, last_event_id, &headers);
         r.send(key, method, body, headers.items) catch |err| switch (err) {
             // Nothing could go out: the same as a stream that broke at once.
-            error.TooManyInFlight, error.ConcurrencyUnavailable => if (key < aux_base) try r.stepLegacy(.{ .broke = key }),
+            error.TooManyInFlight, error.ConcurrencyUnavailable => if (key < aux_base) {
+                // Nothing went out, so a call this ends lost is reported as a broken stream.
+                if (r.logicalFor(key)) |l| {
+                    l.lost_why = .stream_broken;
+                    l.lost_status = 0;
+                }
+                try r.stepLegacy(.{ .broke = key });
+            },
             else => return err,
         };
     }
@@ -1714,7 +1753,6 @@ pub const Server = struct {
     }
 
     fn onLegacyEnded(r: *Server, l: *Logical, key: u64, status: u16, how: http.Ending) Error!void {
-        _ = l;
         const s = &r.legacy.?;
         const req = s.find(key) orelse return;
         if (req.state != .posted and req.state != .resuming) return;
@@ -1731,6 +1769,14 @@ pub const Server = struct {
             .too_large => .{ .too_large = key },
             .http_failure, .rejected, .unreadable => .{ .refused = key },
         };
+        // The same branches as `event` above, so a call that this ending loses carries the reason.
+        l.lost_why = if (status == 404) .session_expired else if (status >= 300) .resume_refused else switch (how) {
+            .complete, .accepted => .stream_ended,
+            .broken => .stream_broken,
+            .too_large => .too_large,
+            .http_failure, .rejected, .unreadable => .resume_refused,
+        };
+        l.lost_status = status;
         r.losing_oversized = event == .too_large;
         defer r.losing_oversized = false;
         try r.stepLegacy(event);
@@ -1779,6 +1825,8 @@ pub const Server = struct {
                 .oversized = outcome == .lost and r.losing_oversized,
                 .refused_bytes = l.refused_bytes,
                 .refused_body = l.refused_body,
+                .lost_why = if (outcome == .lost) l.lost_why else null,
+                .status = if (outcome == .lost) l.lost_status else 0,
             },
         });
         if (l.what == .list and outcome != .result) {
@@ -2247,7 +2295,11 @@ pub const Server = struct {
                 .request => |timer| try r.stepRequest(.{ .timer_fired = timer }),
                 .probe => |probe| try r.stepEra(.{ .probe_timer_fired = probe }),
                 .expiry => |generation| try r.stepCatalog(.{ .expired = generation }),
-                .resume_stream => |id| try r.stepLegacy(.{ .resume_due = id }),
+                .resume_stream => |id| {
+                    // A resume that finds the session changed, or not ready, ends the call lost.
+                    if (r.logicalFor(id)) |l| l.lost_why = .session_changed;
+                    try r.stepLegacy(.{ .resume_due = id });
+                },
                 .listen => try r.stepLegacy(.listen_due),
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
