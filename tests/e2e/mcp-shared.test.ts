@@ -158,6 +158,7 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 20_0
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
+    // Polls the state the predicate reads, bounded by the deadline.
     await Bun.sleep(25);
   }
   throw new Error(`timed out waiting for ${label}`);
@@ -203,6 +204,7 @@ async function expectExited(pids: Iterable<number>, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (unique.every((pid) => !isRunning(pid))) return;
+    // Polls each process's exit, bounded by the deadline.
     await Bun.sleep(25);
   }
   throw new Error(`processes did not exit: ${unique.filter(isRunning).join(", ")}`);

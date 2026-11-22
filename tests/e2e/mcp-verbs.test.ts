@@ -848,6 +848,7 @@ describe("/mcp in the shell", () => {
       expect(Date.now() - start).toBeLessThan(1_000);
       // The owner stops the server, which ignores its closed stdin, with
       // SIGTERM within its grace; the session itself does not wait for it.
+      // Polls that process's exit, bounded at 5 s.
       for (let i = 0; i < 250 && isRunning(pid); i++) await Bun.sleep(20);
       expect(isRunning(pid)).toBe(false);
     } finally {

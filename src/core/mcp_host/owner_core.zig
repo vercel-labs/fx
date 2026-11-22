@@ -1114,6 +1114,9 @@ const Model = struct {
             },
             .engine_question => |question| {
                 defer for (output.effects()) |effect| switch (effect) {
+                    // Records the session a question went to. A put that fails
+                    // only by out of memory records none, and the step that
+                    // reads it fails with NoSuchCall.
                     .send => |sent| if (sent.message == .question) m.questions.put(testing.allocator, questionId(question.key, question.n), @backingInt(sent.to)) catch {},
                     else => {},
                 };

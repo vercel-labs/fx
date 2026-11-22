@@ -89,6 +89,8 @@ pub const Client = struct {
         }
         const deadline = c.now() + startup_timeout_ms;
         while (true) {
+            // A refused or missing socket is expected here: the loop below
+            // starts an owner when it may, and tries again until the deadline.
             c.connect() catch {};
             if (c.stream != null) return;
             if (c.spawn_owner and c.now() - c.last_spawn_ms >= spawn_retry_ms) {
@@ -99,6 +101,9 @@ pub const Client = struct {
                 debug_trace.logf("mcp-owner", "sharing unavailable reason=no owner within {d} ms", .{startup_timeout_ms});
                 return error.SharingUnavailable;
             }
+            // The owner is another process: its socket appears when that
+            // process is ready, and no signal crosses the boundary, so the
+            // client polls every `retry_ms` until the deadline above.
             io_mod.sleep(retry_ms * std.time.ns_per_ms);
         }
     }
@@ -269,16 +274,24 @@ fn writeAll(io: std.Io, fd: std.posix.socket_t, bytes: []const u8) !void {
 
 const testing = std.testing;
 
+/// Removes a test's folder. Cleanup only: a folder that won't go leaves
+/// nothing the test asserts on, and the system clears /tmp.
+fn removeTestDir(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {}; // Cleanup only: nothing the test asserts on depends on the folder.
+}
+
 /// A short fx home under `/tmp`: a Unix socket path stops at 103 bytes and a
 /// test's tmpDir real path is longer than that.
 fn shortHome(alloc: Allocator, tag: []const u8) ![]u8 {
     const path = try alloc.print("/tmp/fx-owner-{s}-{d}", .{ tag, std.c.getpid() });
-    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    removeTestDir(path);
     try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
     return path;
 }
 
 fn serveOnThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    // An owner that ends with an error is what a test's stop asks for; the
+    // test fails on the state it checks, not on this thread.
     owner.serve(io, gpa, home, stop) catch {};
 }
 
@@ -290,6 +303,7 @@ fn waitForSocket(path: []const u8) !void {
             stream.close(testing.io);
             return;
         } else |_| {
+            // Polls for the socket the test's owner thread is opening.
             testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
         }
     }
@@ -319,6 +333,8 @@ fn staleWelcome(io: std.Io, path: []const u8) void {
     std.mem.writeInt(u32, framed[0..4], @intCast(json.len), .big);
     @memcpy(framed[4 .. 4 + json.len], json);
     writeRaw(io, stream.socket.handle, framed[0 .. 4 + json.len]);
+    // Keeps this connection open while the client reads the welcome; closing
+    // under it would make the read a close instead of a version answer.
     io.sleep(.fromMilliseconds(500), .awake) catch {};
 }
 
@@ -328,7 +344,7 @@ test "closing a client whose reader waits for a frame returns at once" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc, "close");
     defer {
-        std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+        removeTestDir(home);
         alloc.free(home);
     }
     var stop = std.atomic.Value(bool).init(false);
@@ -347,6 +363,8 @@ test "closing a client whose reader waits for a frame returns at once" {
     var client = try Client.init(testing.io, alloc, home, false, wake);
     try client.ensureReady(5_000);
     // The reader blocks in its read; close has to end it without that frame.
+    // A fixed wait is what puts the reader in that read, and no signal says
+    // it is there.
     testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
     const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
     client.close();
@@ -362,7 +380,7 @@ test "a welcome from another wire version is sharing unavailable" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc, "version");
     defer {
-        std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+        removeTestDir(home);
         alloc.free(home);
     }
     const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });

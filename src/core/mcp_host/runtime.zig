@@ -1157,7 +1157,12 @@ pub const Runtime = struct {
                             debug_trace.logf("mcp", "MCP answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         } else {
                             if (r.calls.get(input.call)) |asking| asking.declined = true;
-                            r.cancelCall(input.call) catch {};
+                            // The input request was declined, and this call
+                            // should end now; say when the engine didn't take
+                            // the cancel, since the call then waits its deadline.
+                            r.cancelCall(input.call) catch |err| {
+                                debug_trace.logf("mcp", "MCP declined input cancel not sent server={s} err={s}", .{ name, @errorName(err) });
+                            };
                         }
                     },
                     .elicit => |id| {
@@ -1519,7 +1524,15 @@ pub const Runtime = struct {
     }
 
     fn onEvent(r: *Runtime, event: engine.Event) !void {
-        const i = r.serverIndex(event.server) orelse return;
+        const found = r.serverIndex(event.server);
+        const i = found orelse {
+            // A call's end still ends the call when the server it named is
+            // already gone: a reload that dropped the server ran first, and
+            // the shared adapter made this end as it dropped the slot
+            // (`shared_servers.zig` `remove`). Nothing else reaches here.
+            if (event.kind == .called) return r.onCalled(event.kind.called, null);
+            return;
+        };
         switch (event.kind) {
             // A failed attempt ends the waits for tools with its reason; the
             // engine keeps trying, so a later request may still get them.
@@ -1529,38 +1542,7 @@ pub const Runtime = struct {
                 // unless the server's 401 stands (`checkFailed`).
                 try r.checkFailed(i);
             },
-            .called => |c| {
-                const entry = r.calls.fetchRemove(c.call) orelse return r.releaseRequired(i);
-                const req = entry.value;
-                var result = copyCall(r.gpa, req.alloc, c) catch |err| {
-                    r.releaseRequired(i);
-                    return r.finish(req, .{ .failed = err });
-                };
-                if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
-                // fx dropped the reply, and a stdio server with it: the
-                // server didn't go away by itself.
-                if (c.oversized and result == .ended) {
-                    const s = r.resolved.servers[i];
-                    debug_trace.logf("mcp", "MCP call reply dropped server={s} transport={s} reason=too_large", .{ s.name, @tagName(s.transport) });
-                    result.ended.why = if (s.transport == .stdio)
-                        "its reply was larger than fx reads in one message, so fx restarted the server"
-                    else
-                        "its reply was larger than fx reads in one message, so fx dropped it";
-                }
-                if (result == .ended and result.ended.outcome == .transport_failed) {
-                    const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
-                    if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
-                }
-                // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
-                // or a line that no request named, whose grace ran out. Nothing of it is logged,
-                // only its length.
-                if (result == .ended and result.ended.outcome == .malformed and (c.refused_body or c.refused_bytes > 0)) {
-                    const s = r.resolved.servers[i];
-                    debug_trace.logf("mcp", "MCP call ended server={s} transport={s} code=malformed reason={s} bytes={d}", .{ s.name, @tagName(s.transport), if (c.refused_body) "unreadable_body" else "unreadable_line", c.refused_bytes });
-                }
-                if (r.holdForUrls(i, req, result)) return;
-                r.finish(req, .{ .call = result });
-            },
+            .called => |c| try r.onCalled(c, i),
             .progress => |p| {
                 const req = r.calls.get(p.call) orelse return;
                 if (req.progress == null) return;
@@ -1597,6 +1579,47 @@ pub const Runtime = struct {
             .server => |s| try r.onServer(i, event.server, s),
             .stopped_idle => debug_trace.logf("mcp", "MCP server stopped while idle server={s} idle_ms={d}", .{ event.server, r.options.idle_ms }),
         }
+    }
+
+    /// Ends one call. `i` is its server's index, or null when a reload removed
+    /// the server before this end arrived: the call still ends, without the
+    /// words the server's own state would have added.
+    fn onCalled(r: *Runtime, c: anytype, i: ?usize) !void {
+        const entry = r.calls.fetchRemove(c.call) orelse {
+            if (i) |index| r.releaseRequired(index);
+            return;
+        };
+        const req = entry.value;
+        var result = copyCall(r.gpa, req.alloc, c) catch |err| {
+            if (i) |index| r.releaseRequired(index);
+            return r.finish(req, .{ .failed = err });
+        };
+        if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
+        if (i) |index| {
+            // fx dropped the reply, and a stdio server with it: the
+            // server didn't go away by itself.
+            if (c.oversized and result == .ended) {
+                const s = r.resolved.servers[index];
+                debug_trace.logf("mcp", "MCP call reply dropped server={s} transport={s} reason=too_large", .{ s.name, @tagName(s.transport) });
+                result.ended.why = if (s.transport == .stdio)
+                    "its reply was larger than fx reads in one message, so fx restarted the server"
+                else
+                    "its reply was larger than fx reads in one message, so fx dropped it";
+            }
+            if (result == .ended and result.ended.outcome == .transport_failed) {
+                const down = if (r.enginePhase(index)) |p| p == .backoff or p == .failed else false;
+                if (down) result.ended.why = r.failureText(req.alloc, index) catch null;
+            }
+            // The server sent something fx could not read: a 2xx body that is no JSON-RPC message,
+            // or a line that no request named, whose grace ran out. Nothing of it is logged,
+            // only its length.
+            if (result == .ended and result.ended.outcome == .malformed and (c.refused_body or c.refused_bytes > 0)) {
+                const s = r.resolved.servers[index];
+                debug_trace.logf("mcp", "MCP call ended server={s} transport={s} code=malformed reason={s} bytes={d}", .{ s.name, @tagName(s.transport), if (c.refused_body) "unreadable_body" else "unreadable_line", c.refused_bytes });
+            }
+            if (r.holdForUrls(index, req, result)) return;
+        }
+        r.finish(req, .{ .call = result });
     }
 
     fn onServer(r: *Runtime, i: usize, name: []const u8, event: mcp.server.Event) !void {
@@ -1944,7 +1967,12 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.required.orderedRemove(k);
-            r.answerOn(r.resolved.servers[i].name, q.need.id, .{ .action = .cancel }) catch {};
+            // A question this session can no longer show is answered with a
+            // cancel; say when that answer didn't go, since the server keeps
+            // the slot until it is.
+            r.answerOn(r.resolved.servers[i].name, q.need.id, .{ .action = .cancel }) catch |err| {
+                debug_trace.logf("mcp", "MCP required question cancel not sent server={s} err={s}", .{ r.resolved.servers[i].name, @errorName(err) });
+            };
             r.gpa.free(q.need.params);
         }
     }
@@ -3208,17 +3236,25 @@ const owner = @import("owner.zig");
 /// a Unix address.
 fn sharedHome(tag: []const u8) ![]u8 {
     const path = try testing.allocator.print("/tmp/fx-rt-shared-{s}-{d}", .{ tag, std.c.getpid() });
-    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    removeTestDir(path);
     try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
     return path;
 }
 
+/// Removes a test's folder. Cleanup only: a folder that won't go leaves
+/// nothing the test asserts on, and the system clears /tmp.
+fn removeTestDir(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {}; // Cleanup only: nothing the test asserts on depends on the folder.
+}
+
 fn freeSharedHome(home: []u8) void {
-    std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+    removeTestDir(home);
     testing.allocator.free(home);
 }
 
 fn serveOwner(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    // An owner that ends with an error is what a test's stop asks for; the
+    // test fails on the state it checks, not on this thread.
     owner.serve(io, gpa, home, stop) catch {};
 }
 
@@ -3233,6 +3269,7 @@ fn waitForOwner(home: []const u8) !void {
             stream.close(testing.io);
             return;
         } else |_| {
+            // Polls for the socket the test's owner thread is opening.
             try testing.io.sleep(.fromMilliseconds(20), .awake);
         }
     }
@@ -3502,6 +3539,7 @@ test "an idle server stops, a tool list comes from the kept list, and the next c
     const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
     while (try running(first)) {
         if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.IdleServerStillRunning;
+        // Polls the server process's exit, bounded by the deadline above.
         try testing.io.sleep(.fromMilliseconds(20), .awake);
     }
     try testing.expectEqual(State.idle, (try r.statuses(a))[0].state);
@@ -3544,7 +3582,9 @@ test "a call in flight keeps an idle server up" {
     var cancel: std.atomic.Value(bool) = .init(false);
     var outcome: ?engine.Outcome = null;
     const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &cancel, &outcome });
-    // Well past the idle limit, with the call in flight the whole time.
+    // Well past the idle limit, with the call in flight the whole time. A
+    // fixed window is the point: the test proves the server did NOT stop in
+    // it, which no event announces.
     try testing.io.sleep(.fromMilliseconds(1500), .awake);
     try testing.expect(try running(pid));
     try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
@@ -4523,7 +4563,8 @@ test "a reload that changes a shared server's env ends this session's call on it
     };
     var first: ?CallResult = null;
     const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &first });
-    // The owner has the call: it went out after the listing.
+    // The owner has the call: it went out after the listing. A fixed window is
+    // needed because nothing tells the session its call reached the owner.
     try testing.io.sleep(.fromMilliseconds(300), .awake);
 
     const after = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server, .env = &two }};
@@ -4537,6 +4578,53 @@ test "a reload that changes a shared server's env ends this session's call on it
     const pid = try pidOf(&r, a, "fake");
     try testing.expect(pid.len > 0);
     try testing.expectEqual(State.ready, (try r.statuses(a))[0].state);
+}
+
+test "a reload that removes a shared server ends this session's call on it, and says a server was dropped" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("removed");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    const before = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+
+    const Caller = struct {
+        fn run(runtime: *Runtime, out: *?CallResult) void {
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            out.* = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"slow\"}", null, null) catch null;
+        }
+    };
+    var first: ?CallResult = null;
+    const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &first });
+    // The owner has the call: it went out after the listing. A fixed window is
+    // needed because nothing tells the session its call reached the owner.
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    const done = try r.reload(&.{}, &f.inherited);
+    caller.join();
+    const ended = first orelse return error.NoCallResult;
+    try testing.expect(ended == .ended and ended.ended.outcome == .cancelled);
+    // A subagent's view from before must stop matching, so the catalog bumps.
+    try testing.expect(done.dropped);
+    try testing.expectEqual(@as(usize, 0), r.resolved.servers.len);
 }
 
 test "a shared server runs in this session when no owner can start" {
@@ -4594,6 +4682,7 @@ fn waitReady(r: *Runtime, a: Allocator) !void {
     const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 2_000;
     while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
         if ((try r.statuses(a))[0].state == .ready) return;
+        // Polls the status the other session publishes, bounded above.
         try testing.io.sleep(.fromMilliseconds(20), .awake);
     }
     return error.ServerNeverReady;
@@ -4643,6 +4732,8 @@ test "two runtimes share one server through one owner, and one leaving keeps the
     var cancel = std.atomic.Value(bool).init(false);
     var outcome: ?engine.Outcome = null;
     const caller = try std.Thread.spawn(.{}, Caller.run, .{ &second, &cancel, &outcome });
+    // The second session's call must be in flight before the first leaves; a
+    // fixed window is needed because nothing tells the session that it is.
     try testing.io.sleep(.fromMilliseconds(300), .awake);
 
     // The second session hears where the server already is when it joins.
@@ -4693,6 +4784,8 @@ test "an owner that dies ends a call in flight as lost, and the next call starts
     };
     var in_flight: ?CallResult = null;
     const caller = try std.Thread.spawn(.{}, Caller.run, .{ &r, &in_flight });
+    // The call must be in flight when the owner dies; a fixed window is needed
+    // because nothing tells the session that the owner took it.
     try testing.io.sleep(.fromMilliseconds(300), .awake);
 
     // The owner dies under the call: what it was running may have run.
@@ -4750,6 +4843,8 @@ test "deinit while a shared call waits ends it and returns" {
     var err_out: ?Error = null;
     var outcome: ?engine.Outcome = null;
     const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &r, &err_out, &outcome });
+    // The call must be waiting when the runtime is torn down; a fixed window
+    // is needed because nothing tells the session that the owner took it.
     try testing.io.sleep(.fromMilliseconds(300), .awake);
 
     const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();

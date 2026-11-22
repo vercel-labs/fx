@@ -128,7 +128,11 @@ const Owner = struct {
     open: u32 = 0,
     last_open_ms: i64 = 0,
     /// Each registered key's config, owned here until the owner exits.
+    /// Readers add one from their own threads, so `configs_mutex` guards
+    /// every look and change; the owner loop reads under it too, since a put
+    /// may rehash and move the entries.
     configs: std.StringHashMapUnmanaged(OwnedConfig) = .empty,
+    configs_mutex: std.Io.Mutex = .init,
     /// The engine's configs, in slot order. Their strings live in
     /// `engine_arena`, because the scratch arena that builds one is reset
     /// before the next event.
@@ -245,6 +249,8 @@ const Owner = struct {
             conn.closed = true;
             conn.changed.broadcast(o.io);
             conn.mutex.unlock(o.io);
+            // The peer may have closed its end already, and there is nothing
+            // left to shut down then.
             if (open) conn.stream.shutdown(o.io, .both) catch {};
             if (conn.reader) |thread| thread.join();
             if (conn.writer) |thread| thread.join();
@@ -264,6 +270,7 @@ const Owner = struct {
             const open = !conn.socket_closed;
             if (open) conn.socket_closed = true;
             conn.mutex.unlock(o.io);
+            // As in `closeAll`: the peer may have closed its end already.
             if (open) conn.stream.shutdown(o.io, .both) catch {};
         }
     }
@@ -381,7 +388,8 @@ fn slotOf(owner: *Owner, key: core.Key) ?usize {
 }
 
 fn rememberConfig(owner: *Owner, key: core.Key, config: wire.ServerConfig) void {
-    if (owner.configs.contains(&key)) return;
+    // A reader thread of each connection registers here, so two clients may
+    // arrive at once; the map and its entries are shared with the owner loop.
     const owned = ownConfig(owner.gpa, config) catch {
         debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory", .{});
         return;
@@ -391,6 +399,14 @@ fn rememberConfig(owner: *Owner, key: core.Key, config: wire.ServerConfig) void 
         copy.deinit(owner.gpa);
         return;
     };
+    owner.configs_mutex.lockUncancelable(owner.io);
+    defer owner.configs_mutex.unlock(owner.io);
+    if (owner.configs.contains(&key)) {
+        owner.gpa.free(name);
+        var copy = owned;
+        copy.deinit(owner.gpa);
+        return;
+    }
     owner.configs.put(owner.gpa, name, owned) catch {
         owner.gpa.free(name);
         var copy = owned;
@@ -417,12 +433,18 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
 
     const socket_path = try std.Io.Dir.path.join(gpa, &.{ run_dir, socket_name });
     defer gpa.free(socket_path);
+    // A socket file an owner that was killed left behind; often there is none.
     std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     var address = try std.Io.net.UnixAddress.init(socket_path);
     var listener = try address.listen(io, .{});
     var listening = true;
     defer if (listening) listener.deinit(io);
-    std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch {};
+    // Another user must not connect to this socket. A run directory the owner
+    // made 0700 still keeps them out when this mode can't be set, so the
+    // failure is logged rather than ignored or fatal.
+    std.Io.Dir.cwd().setFilePermissions(io, socket_path, .fromMode(0o600), .{ .follow_symlinks = false }) catch |err| {
+        debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
+    };
 
     var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .engine_arena = .init(gpa) };
     defer owner.engine_arena.deinit();
@@ -430,6 +452,8 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     const loop = std.Thread.spawn(.{}, ownerLoop, .{&owner}) catch |err| {
         listener.deinit(io);
         listening = false;
+        // The socket this start just made may exist to remove; nothing depends
+        // on the removal, since the lock is released as this returns.
         std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
         return err;
     };
@@ -460,6 +484,8 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     owner.stop.store(true, .release);
     loop.join();
     owner.closeAll();
+    // The owner is stopping: the socket it served may already be gone, and the
+    // next owner deletes any file left here before it listens.
     std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     var iterator = owner.configs.iterator();
     while (iterator.next()) |entry| {
@@ -546,9 +572,22 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             }
         },
         .register_slot => |slot| {
-            const config = owner.configs.getPtr(&slot.key) orelse continue;
-            if (slotOf(owner, slot.key) != null) continue;
-            const built = engineConfig(owner.engine_arena.allocator(), slot.key, config) catch continue;
+            // Under the map's lock until the engine config is built: a reader
+            // may add another key meanwhile, and a put may move the entries.
+            owner.configs_mutex.lockUncancelable(owner.io);
+            const config = owner.configs.getPtr(&slot.key) orelse {
+                owner.configs_mutex.unlock(owner.io);
+                continue;
+            };
+            if (slotOf(owner, slot.key) != null) {
+                owner.configs_mutex.unlock(owner.io);
+                continue;
+            }
+            const built = engineConfig(owner.engine_arena.allocator(), slot.key, config) catch {
+                owner.configs_mutex.unlock(owner.io);
+                continue;
+            };
+            owner.configs_mutex.unlock(owner.io);
             owner.engine_configs.append(owner.gpa, built) catch continue;
             engine_value.reload(owner.engine_configs.items) catch |err| {
                 debug_trace.logf("mcp-owner", "owner server not registered err={s}", .{@errorName(err)});
@@ -568,11 +607,19 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             owner.push(.{ .core = .{ .issued = .{ .call = call.call, .handle = handle } } });
         },
         .cancel => |cancel| {
-            engine_value.cancel(cancel.handle) catch {};
+            // A session asked to end its call: say when the engine didn't take
+            // the cancel, since the call then runs on for its deadline.
+            engine_value.cancel(cancel.handle) catch |err| {
+                debug_trace.logf("mcp-owner", "owner cancel not sent err={s}", .{@errorName(err)});
+            };
         },
         .respond => |respond| {
             const values = std.json.parseFromSliceLeaky([]const []const u8, a, respond.values, .{}) catch continue;
-            engine_value.respond(respond.handle, values) catch {};
+            // A session's answer to a 2026 input request, dropped when the
+            // engine doesn't take it: the call then ends as unsupported input.
+            engine_value.respond(respond.handle, values) catch |err| {
+                debug_trace.logf("mcp-owner", "owner respond not sent err={s}", .{@errorName(err)});
+            };
         },
         .answer => |answer| engine_value.answerElicitation(&answer.key, .{ .slot = answer.slot, .n = answer.n }, .{ .action = answer.action, .content = answer.content }) catch |err| {
             debug_trace.logf("mcp-owner", "owner answer not sent err={s}", .{@errorName(err)});
@@ -664,9 +711,12 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
         .called => |called| {
             var answer: ?[]const u8 = null;
             if (called.answer) |call| {
-                var out: std.Io.Writer.Allocating = .init(a);
-                std.json.Stringify.value(call, .{}, &out.writer) catch {};
-                answer = out.written();
+                // Only out of memory fails here. The call still ends, without
+                // its answer's detail, and this line says why none came.
+                answer = std.json.Stringify.valueAlloc(a, call, .{}) catch |err| blk: {
+                    debug_trace.logf("mcp-owner", "owner call answer dropped reason=out of memory err={s}", .{@errorName(err)});
+                    break :blk null;
+                };
             }
             core_event = .{ .engine_called = .{
                 .handle = called.call,
@@ -931,12 +981,15 @@ var home_count = std.atomic.Value(u32).init(0);
 fn shortHome(alloc: Allocator) ![]u8 {
     const n = home_count.fetchAdd(1, .monotonic);
     const path = try alloc.print("/tmp/fx-owner-test-{d}-{d}", .{ std.c.getpid(), n });
+    // A folder left by an earlier run of this test; there need not be one.
     std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
     try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
     return path;
 }
 
 fn removeHome(alloc: Allocator, path: []u8) void {
+    // Cleanup only: a folder that won't go leaves nothing the test asserts on,
+    // and /tmp clears it.
     std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
     alloc.free(path);
 }
@@ -949,6 +1002,7 @@ fn waitForSocket(path: []const u8) !void {
             stream.close(testing.io);
             return;
         } else |_| {
+            // Polls for the socket the test's owner thread is opening.
             testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
         }
     }
@@ -1008,6 +1062,8 @@ test "two clients registered for one key share one server process" {
     defer arena.deinit();
     const a = arena.allocator();
     // Let both registrations arrive before the calls, so they share the slot.
+    // A registration has no answer to wait for, so a fixed window is the only
+    // way to know the owner has both.
     testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
     try first.send(.{ .call = .{ .key = test_key, .id = first.next, .tool = "echo", .arguments = "{\"text\":\"pid\"}" } });
     const one = try first.called(a, first.next, 10_000);
@@ -1048,9 +1104,13 @@ test "a client that leaves during a slow call does not end the other client's ca
     var leaving = try TestClient.connect(path);
     try registerFor(&caller, fixture.server);
     try registerFor(&leaving, fixture.server);
+    // Both registrations must reach the owner before a call goes out; a
+    // registration has no answer to wait for.
     testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
     // The fake never answers a call that mentions "slow".
     try caller.send(.{ .call = .{ .key = test_key, .id = 1, .tool = "echo", .arguments = "{\"text\":\"slow\"}" } });
+    // The call must be in flight when the other client leaves, and the owner
+    // tells the session nothing when it takes the call.
     testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
     leaving.close();
     var arena: std.heap.ArenaAllocator = .init(alloc);
@@ -1098,6 +1158,7 @@ test "a server stops when its last client leaves, and the owner returns" {
     const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
     while (try running(pid)) {
         if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.ServerStillRunning;
+        // Polls the server process's exit, bounded by the deadline above.
         testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     const before = std.Io.Clock.awake.now(testing.io).toMilliseconds();

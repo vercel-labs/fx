@@ -1,9 +1,13 @@
-//! The key that says two fx sessions launch one stdio MCP server the same
-//! way, so one owner process can run a single copy for both
-//! (`tests/tla/mcp_host/SharedServers.tla`). It hashes exactly the fields
-//! `mcp.engine.same()` compares, without the display name: two sessions that
-//! resolve a server the same way share it even under different names, and a
-//! config that differs in any compared field gets another copy.
+//! The key that says two fx sessions launch the same stdio MCP server the
+//! same way, so one owner process can run a single copy for both
+//! (`tests/tla/mcp_host/SharedServers.tla`). It hashes the display name and
+//! exactly the fields `mcp.engine.same()` compares: sessions that resolve the
+//! same entry share it, and an entry whose name, transport, environment,
+//! directory, auth, or timeouts differ in any way gets another copy.
+//!
+//! The name is part of the key so one entry is one key. Two entries with
+//! different names are two servers even when they launch the same command,
+//! which `fx doctor` relies on when it checks each entry on its own.
 //!
 //! Pure: no I/O, no clock, no allocation. Every field is length-prefixed, so
 //! no two different configs hash the same bytes by concatenation.
@@ -18,6 +22,7 @@ pub const Key = [32]u8;
 
 pub fn of(config: mcp.engine.Config) Key {
     var hasher = Sha256.init(.{});
+    feedText(&hasher, config.name);
     switch (config.transport) {
         .stdio => |p| {
             feedByte(&hasher, 0);
@@ -119,7 +124,7 @@ fn envMap(a: std.mem.Allocator, pairs: []const [2][]const u8) !*const std.proces
     return map;
 }
 
-test "the same launch config gives the same key under another name" {
+test "another name gives another key" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const map = try envMap(arena.allocator(), &.{.{ "A", "1" }});
@@ -127,7 +132,7 @@ test "the same launch config gives the same key under another name" {
     const a: engine.Config = .{ .name = "one", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = map, .cwd = "/w" } } };
     var b = a;
     b.name = "two";
-    try testing.expectEqual(of(a), of(b));
+    try testing.expect(!std.mem.eql(u8, &of(a), &of(b)));
 }
 
 test "the environment's order does not change the key" {

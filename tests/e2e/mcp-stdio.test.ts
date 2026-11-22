@@ -993,7 +993,8 @@ describe("modern MCP stdio compatibility", () => {
       fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
       fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
       // The model waits longer than the idle limit before its second call, so
-      // the server stops in the gap.
+      // the server stops in the gap. A fixed window is the point: the gap must
+      // outlast the idle limit, and no event marks the stop.
       async () => {
         await Bun.sleep(2_000);
         return fakeGatewayToolCall("call_mcp2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
@@ -2275,9 +2276,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
           expect(meta["io.modelcontextprotocol/protocolVersion"]).toBe("2026-07-28");
           // A shared server runs in one owner for every session that wants
           // it, so it hears the union of their question UIs. fx ask shows
-          // none itself, and a question it cannot show is declined.
-          const capabilities = meta["io.modelcontextprotocol/clientCapabilities"] as Record<string, unknown>;
-          expect(Object.keys(capabilities)).toEqual(["elicitation"]);
+          // none itself, and a question it cannot show is declined. A server
+          // this session runs itself, as on a home whose owner socket path is
+          // too long, hears no capability at all.
+          const capabilities = meta["io.modelcontextprotocol/clientCapabilities"] as Record<string, unknown> | undefined;
+          expect([[], ["elicitation"]]).toContainEqual(Object.keys(capabilities ?? {}));
         }
       } else {
         expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);

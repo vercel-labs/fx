@@ -132,7 +132,11 @@ pub const Shared = struct {
         const slot = &s.slots.items[i];
         // It stops using the key: the owner cancels this session's calls there
         // and stops the server once no session is left on it.
-        if (slot.registered and !s.disconnected) s.client.send(.{ .unregister = .{ .key = slot.key } }) catch {};
+        if (slot.registered and !s.disconnected) s.client.send(.{ .unregister = .{ .key = slot.key } }) catch |err| {
+            // The owner stops the server when this connection closes; say the
+            // unregister that would have stopped it sooner didn't go.
+            debug_trace.logf("mcp", "shared unregister not sent server={s} err={s}", .{ name, @errorName(err) });
+        };
         // A call that still waits ends as cancelled for `take`, and any late
         // answer from the owner names a call the adapter no longer has.
         while (true) {
@@ -150,7 +154,11 @@ pub const Shared = struct {
                 .maybe_ran = true,
                 .timed_out = false,
                 .answer = null,
-            } } }) catch {};
+            } } }) catch |err| {
+                // This session's call on the slot would have ended here;
+                // without the event its caller waits for its deadline.
+                debug_trace.logf("mcp", "shared call end dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+            };
         }
         slot.tools_store.deinit(s.gpa);
         if (slot.version) |v| s.gpa.free(v);
@@ -268,7 +276,11 @@ pub const Shared = struct {
 
     pub fn cancel(s: *Shared, handle: engine.Handle) void {
         const id = sharedId(handle) orelse return;
-        s.client.send(.{ .cancel = .{ .id = id } }) catch {};
+        // The session asked to end this call: say when the owner didn't hear,
+        // since the call then runs on for its deadline.
+        s.client.send(.{ .cancel = .{ .id = id } }) catch |err| {
+            debug_trace.logf("mcp", "shared cancel not sent id={d} err={s}", .{ id, @errorName(err) });
+        };
     }
 
     pub fn respond(s: *Shared, alloc: Allocator, handle: engine.Handle, values: []const []const u8) Allocator.Error!void {
@@ -276,12 +288,20 @@ pub const Shared = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         std.json.Stringify.value(values, .{}, &out.writer) catch return error.OutOfMemory;
-        s.client.send(.{ .respond = .{ .id = id, .values = out.written() } }) catch {};
+        // The session's answer to a 2026 input request: say when the owner
+        // didn't hear, since the call then ends as unsupported input.
+        s.client.send(.{ .respond = .{ .id = id, .values = out.written() } }) catch |err| {
+            debug_trace.logf("mcp", "shared respond not sent id={d} err={s}", .{ id, @errorName(err) });
+        };
     }
 
     pub fn answerElicitation(s: *Shared, name: []const u8, id: mcp.core.elicitation.Id, answer: mcp.elicitation.Answer) void {
         const slot = s.slotOf(name) orelse return;
-        s.client.send(.{ .answer = .{ .key = slot.key, .slot = id.slot, .n = id.n, .action = answer.action, .content = answer.content } }) catch {};
+        // The user's answer to a 2025 question: say when the owner didn't hear,
+        // since the server waits for it until the question is withdrawn.
+        s.client.send(.{ .answer = .{ .key = slot.key, .slot = id.slot, .n = id.n, .action = answer.action, .content = answer.content } }) catch |err| {
+            debug_trace.logf("mcp", "shared answer not sent server={s} err={s}", .{ name, @errorName(err) });
+        };
     }
 
     pub fn status(s: *Shared, name: []const u8) engine.Status {
@@ -415,7 +435,11 @@ pub const Shared = struct {
                     const result = a.print("{{\"tools\":{s}}}", .{page.tools}) catch null;
                     const parsed = if (result) |text| tools.parsePage(text) catch null else null;
                     if (parsed) |parsed_page| {
-                        _ = slot.tools_store.addPage(s.gpa, parsed_page) catch {};
+                        // Only out of memory fails here; the session then sees
+                        // the list this frame could not replace.
+                        _ = slot.tools_store.addPage(s.gpa, parsed_page) catch |err| {
+                            debug_trace.logf("mcp", "shared tool list dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                        };
                     }
                     slot.tools_store.publish();
                 }
@@ -583,14 +607,22 @@ const testing = std.testing;
 const owner = @import("owner.zig");
 const fake_server = @import("fake_server.zig");
 
+/// Removes a test's folder. Cleanup only: a folder that won't go leaves
+/// nothing the test asserts on, and the system clears /tmp.
+fn removeTestDir(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {}; // Cleanup only: nothing the test asserts on depends on the folder.
+}
+
 fn shortHome(alloc: Allocator, tag: []const u8) ![]u8 {
     const path = try alloc.print("/tmp/fx-shared-{s}-{d}", .{ tag, std.c.getpid() });
-    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {};
+    removeTestDir(path);
     try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
     return path;
 }
 
 fn serveOnThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    // An owner that ends with an error is what a test's stop asks for; the
+    // test fails on the state it checks, not on this thread.
     owner.serve(io, gpa, home, stop) catch {};
 }
 
@@ -603,6 +635,7 @@ fn waitForSocket(alloc: Allocator, home: []const u8) ![]u8 {
             stream.close(testing.io);
             return path;
         } else |_| {
+            // Polls for the socket the test's owner thread is opening.
             testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
         }
     }
@@ -628,6 +661,7 @@ fn takeFor(s: *Shared, name: []const u8, deadline_ms: i64) ?engine.Event {
         if (s.take()) |event| {
             if (std.mem.eql(u8, event.server, name)) return event;
         } else {
+            // Polls for the next event from the owner, bounded above.
             testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
         }
     }
@@ -679,7 +713,7 @@ test "a shared server lists its tools through the owner" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc, "tools");
     defer {
-        std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+        removeTestDir(home);
         alloc.free(home);
     }
     var fixture: fake_server.Fixture = undefined;
@@ -717,7 +751,7 @@ test "a call through the owner answers, and two sessions get one process" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc, "call");
     defer {
-        std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+        removeTestDir(home);
         alloc.free(home);
     }
     var fixture: fake_server.Fixture = undefined;
@@ -757,7 +791,7 @@ test "an owner that goes away ends a call in flight as lost" {
     const alloc = testing.allocator;
     const home = try shortHome(alloc, "lost");
     defer {
-        std.Io.Dir.cwd().deleteTree(testing.io, home) catch {};
+        removeTestDir(home);
         alloc.free(home);
     }
     var fixture: fake_server.Fixture = undefined;
@@ -774,6 +808,8 @@ test "an owner that goes away ends a call in flight as lost" {
     const argv = [_][]const u8{fixture.server};
     try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
     const handle = try shared.call("fake", "echo", "{\"text\":\"slow\"}");
+    // The call must be in flight when the owner stops, and the owner tells the
+    // session nothing when it takes the call.
     testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
     stop.store(true, .release);
     thread.join();
@@ -791,6 +827,7 @@ test "an owner that goes away ends a call in flight as lost" {
             }
             if (lost) break;
         } else {
+            // Polls for the lost call's event, bounded by the deadline above.
             testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
         }
     }
