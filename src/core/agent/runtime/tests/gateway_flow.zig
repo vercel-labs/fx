@@ -4805,6 +4805,27 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expectEqual(@as(usize, 0), fast_notice_count);
 }
 
+test "processQueuedPrompt shows control characters in the model name as escapes in the effort notice" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/\x1b[31mevil");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    const notice = hooks.session_notices.items[0];
+    try std.testing.expect(std.mem.find(u8, notice, "provider/\\x1b[31mevil") != null);
+    try std.testing.expect(std.mem.findScalar(u8, notice, 0x1b) == null);
+}
+
 test "processQueuedPrompt keeps an effort drop quiet when the Gateway catalog failed" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};

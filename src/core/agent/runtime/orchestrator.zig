@@ -8659,7 +8659,11 @@ fn processQueuedPromptLoop(
             if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model });
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
                     const notice = if (job.provider == .configured)
                         try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
                     else
