@@ -337,8 +337,11 @@ DoSend(c) ==
           /\ UNCHANGED namedWrong
           /\ SendToBusy(s, m)
 
-\* A stop drops the waiting messages now, and the stopped turn's unread ones
-\* when it ends; its answer counts both.
+\* A stop drops the waiting messages now and counts the stopped turn's unread
+\* ones with them. fx drops the unread ones at the stop too
+\* (WorkerRuntime.dropParentSteering). Here they stay in unread until the
+\* turn ends, which no step can tell apart: none reads them after the stop
+\* (CountedNeverRead), and UserStop needs a running turn.
 DoStop(c) ==
     LET s == c.sub
         waiting == Range(waitq[s])
