@@ -224,16 +224,42 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
             return title(alloc, "Needs attention", try arena.print("{d}", .{rows.len - first}), width);
         }
         const i = if (line > first) line - heading else line;
-        return serverListRow(alloc, arena, rows[i], i == selected, width);
+        return serverListRow(alloc, arena, rows[i], i == selected, width, try statusWidth(arena, rows, width));
     }
-    return serverListRow(alloc, arena, rows[line], line == selected, width);
+    return serverListRow(alloc, arena, rows[line], line == selected, width, try statusWidth(arena, rows, width));
 }
 
-fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16) !Row {
+/// The width of a row's name column.
+fn nameWidth(width: u16) usize {
+    return std.math.clamp(@as(usize, width) / 4, 12, 22);
+}
+
+/// Where a row's status starts.
+fn statusStart(width: u16) usize {
+    return 2 + nameWidth(width) + 2;
+}
+
+/// The width of the status column. It is 22, wide enough for every status but a refused tool list, whose words
+/// are longer: a view with such a row widens the column, for every row, to the longest of those, as far as the
+/// source column after it still fits. Under 64 columns there is no source column, and the status takes the rest.
+fn statusWidth(arena: Allocator, rows: []const menu.Row, width: u16) !usize {
+    const start = statusStart(width);
+    if (width < 64) return @as(usize, width) -| start;
+    var want: usize = 22;
+    for (rows) |r| {
+        if (r.status.tools_error == null) continue;
+        want = @max(want, (try verbs.statusText(arena, runState(r.status))).len);
+    }
+    // The source column keeps its 7 columns and the 2 before them.
+    const room = @as(usize, width) -| start -| (2 + 7);
+    return @min(want, @max(room, 22));
+}
+
+fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16, status_width: usize) !Row {
     const show_source = width >= 64;
-    const name_width: usize = std.math.clamp(@as(usize, width) / 4, 12, 22);
-    const status_col = 2 + name_width + 2;
-    const source_col = status_col + 22 + 2;
+    const name_width = nameWidth(width);
+    const status_col = statusStart(width);
+    const source_col = status_col + status_width + 2;
     var row: Row = .empty;
     errdefer row.deinit(alloc);
     // Like fx's other pickers: dim rows, the selected one bright.
@@ -248,8 +274,11 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     };
     // What needs the user stays bright so it stands out among dim rows.
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
-    const status_width = if (show_source) 22 else @as(usize, width) -| status_col;
-    try row_text.appendTerminalSafeSingleLine(alloc, &row, try verbs.statusText(arena, runState(r.status)), status_width);
+    // A refused tool list says so whole where the row has room, and in its short words where it has not, so the
+    // cut never takes the word that says it.
+    const text = try verbs.statusText(arena, runState(r.status));
+    const shown = if (r.status.tools_error != null and text.len > status_width) verbs.refusedShort(r.status) else text;
+    try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
     if (show_source) {
         try row_text.appendSpacesToColumn(alloc, &row, source_col);
@@ -677,6 +706,56 @@ test "the list says how a server runs; its login shows on its screen" {
     try testing.expectEqualStrings("ready, 3 tools, newer list refused", try statusFact(arena.allocator(), .{ .status = ready }));
     ready.tools = 0;
     try testing.expectEqualStrings("ready, tool list refused", try statusFact(arena.allocator(), .{ .status = ready }));
+}
+
+test "a refused tool list shows whole in the list where the row has room, and in short words where it has not" {
+    var none = testStatus("none", .ready);
+    none.tools_error = "a field is written twice";
+    var older = testStatus("older", .ready);
+    older.tools = 3;
+    older.tools_error = "a field is written twice";
+    const plain = testStatus("plain", .idle);
+    const rows = [_]menu.Row{ .{ .status = none }, .{ .status = older }, .{ .status = plain } };
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+
+    // From 64 columns the status column widens to the longest of them, for every row, and the source column follows.
+    for ([_]u16{ 64, 80, 88 }) |width| {
+        const text = try render(p, width);
+        defer testing.allocator.free(text);
+        try testing.expect(std.mem.find(u8, text, "ready, tool list refused") != null);
+        try testing.expect(std.mem.find(u8, text, "ready, 3 tools, newer list refused") != null);
+        try testing.expect(std.mem.find(u8, text, "\u{2026}") == null);
+        var source_at: ?usize = null;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const at = std.mem.find(u8, line, "profile") orelse continue;
+            const column = try std.unicode.utf8CountCodepoints(line[0..at]);
+            try testing.expectEqual(source_at orelse column, column);
+            source_at = column;
+        }
+        try testing.expect(source_at != null);
+    }
+
+    // Where the row has no room for the whole status, the short words stay, and the cut never takes them.
+    const narrow = try render(p, 40);
+    defer testing.allocator.free(narrow);
+    try testing.expect(std.mem.find(u8, narrow, "ready, tool list refused") != null);
+    try testing.expect(std.mem.find(u8, narrow, "ready, 3 tools") == null);
+    try testing.expect(std.mem.find(u8, narrow, "newer list refused") != null);
+    try testing.expect(std.mem.find(u8, narrow, "\u{2026}") == null);
+
+    // A view with no refused row keeps its 22 columns.
+    const quiet = [_]menu.Row{.{ .status = plain }};
+    var q: Projection = .{ .rows = &quiet };
+    menu.open(&q.state);
+    const unchanged = try render(q, 88);
+    defer testing.allocator.free(unchanged);
+    try testing.expectEqualStrings(
+        \\  MCP servers  1
+        \\› plain                   not started             profile
+        \\
+    , unchanged);
 }
 
 test "a server's screen: facts, choices with their commands, then tools" {

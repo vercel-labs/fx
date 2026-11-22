@@ -22,10 +22,11 @@
 \* not here.
 \*
 \* A page that the server answered but fx could not use (an error, input_required,
-\* a malformed page) is refused, and `refused` says so until a list is published
-\* or a new process starts: `fx mcp show` tells the person fx refused the list.
-\* A page the server never answered (a timeout, a lost connection) says nothing
-\* about the list, so it leaves `refused` as it was. `lastAnswer` is a ghost: how
+\* a malformed page, over HTTP a status with no JSON-RPC message or a body that is
+\* no JSON) is refused, and `refused` says so until a list is published or a new
+\* process starts: `fx mcp show` tells the person fx refused the list.
+\* A page the server never answered (a timeout, a lost connection, a cancel, a
+\* sign-in needed first) says nothing about the list, so it leaves `refused` as it was. `lastAnswer` is a ghost: how
 \* the last listing that the server answered ended since the last process.
 EXTENDS Naturals
 
@@ -212,7 +213,8 @@ PageRefused ==
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
-\* A page request that ended with no answer: a timeout, or a lost connection.
+\* A page request that ended with no answer: a timeout, a lost connection, a cancel,
+\* or a sign-in needed first.
 \* The listing fails as above, and says nothing about whether the server would
 \* refuse the list, so what was known stays.
 PageFailed ==

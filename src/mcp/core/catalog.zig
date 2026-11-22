@@ -35,11 +35,14 @@ pub const Event = union(enum) {
     /// -32602 for a continuation page.
     invalid_cursor,
     /// The server answered the page request, and the answer was no page fx
-    /// could use: an error, `input_required`, or a malformed page. The
-    /// listing fails, and `refused` says so until the next list or process.
+    /// could use: an error, `input_required`, a malformed page, or an HTTP
+    /// answer with no JSON-RPC message (a status, or a body that is no JSON)
+    /// that no other flow reads. The listing fails, and `refused` says so
+    /// until the next list or process.
     page_refused,
-    /// Any other end of the page request: a timeout, or a lost connection.
-    /// The server gave no answer, so `refused` stays as it was.
+    /// Any other end of the page request: a timeout, a lost connection, a
+    /// cancel, or a sign-in needed first. The server gave no answer fx could
+    /// judge, so `refused` stays as it was.
     page_failed,
     /// `notifications/tools/list_changed`, a call answer that suggests
     /// the list changed, or the host.

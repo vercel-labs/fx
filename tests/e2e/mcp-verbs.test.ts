@@ -300,6 +300,30 @@ describe("fx mcp", () => {
     }
   }, 30_000);
 
+  // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
+  // that is no JSON. That is an answer fx refuses, not a server that gave none.
+  const httpAnswers = [
+    ["list_http_500", "the server answered the list with HTTP 500"],
+    ["list_http_429", "the server answered the list with HTTP 429"],
+    ["list_html_200", "the list is not valid JSON"],
+  ] as const;
+  for (const [mode, why] of httpAnswers) {
+    test(`show says when an HTTP server answered the tool list with ${mode.replace("list_", "").replaceAll("_", " ")}`, async () => {
+      const upstream = startModernMcpHttpFixture(mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, tool list refused\n  tool list  refused: ${why}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: why, tools: [] });
+      } finally {
+        upstream.stop();
+      }
+    }, 30_000);
+  }
+
   test("list --json carries tools_error, null for a server fx has not asked for its tools", async () => {
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: refusedLists[0][1] } }), off: { command: "never-run", enabled: false } } });
     const listed = await mcp(root, "list", "--json");

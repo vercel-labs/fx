@@ -138,10 +138,13 @@ pub const Refusal = enum {
     repeated_field,
     /// `tools` is no array.
     tools_not_a_list,
-    /// The list is nested past what fx reads.
-    too_deep,
     /// Anything else that is no tool list.
     unreadable,
+    /// An HTTP status that no other flow reads (not a sign-in, nor a session's end) and a body with no
+    /// JSON-RPC message. `text` puts the status number in the words.
+    http_status,
+    /// A 2xx answer sent with a content type that is not JSON.
+    not_json,
 
     pub fn words(refusal: Refusal) []const u8 {
         return switch (refusal) {
@@ -149,18 +152,28 @@ pub const Refusal = enum {
             .not_complete => "the server's answer was not a finished list",
             .repeated_field => "a field is written twice",
             .tools_not_a_list => "\"tools\" is not a list",
-            .too_deep => "the list is nested too deeply",
             .unreadable => "the answer is not a readable tool list",
+            .http_status => "the server answered the list with an HTTP error",
+            .not_json => "the list is not valid JSON",
         };
     }
+
+    /// The words of a refusal, with the status number for `http_status` (a number fx read, never server text).
+    /// They fit `text_max` bytes.
+    pub fn text(refusal: Refusal, status: u16, buf: *[text_max]u8) []const u8 {
+        if (refusal != .http_status or status == 0) return refusal.words();
+        return std.fmt.bufPrint(buf, "the server answered the list with HTTP {d}", .{status}) catch refusal.words();
+    }
 };
+
+/// The most bytes `Refusal.text` writes.
+pub const text_max = 64;
 
 /// The refusal for a page that `parsePage` or `Store.addPage` could not read.
 pub fn refusalOf(err: wire.DecodeError) Refusal {
     return switch (err) {
         error.DuplicateField => .repeated_field,
         error.NotAnArray => .tools_not_a_list,
-        error.TooDeep => .too_deep,
         else => .unreadable,
     };
 }
@@ -349,7 +362,25 @@ test "a page fx refuses has one of the fixed reasons, whatever the server wrote"
         try testing.expect(words.len > 0 and words.len < 64);
         for (words) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
     }
-    try testing.expectEqual(Refusal.too_deep, refusalOf(error.TooDeep));
+    // A decode error with no words of its own gets the general ones: a list nested too deeply never gets this far,
+    // because the line that carries it fails to decode first.
+    try testing.expectEqual(Refusal.unreadable, refusalOf(error.TooDeep));
+}
+
+test "an HTTP status goes into the words as a number, and nothing else does" {
+    var buf: [text_max]u8 = undefined;
+    try testing.expectEqualStrings("the server answered the list with HTTP 500", Refusal.http_status.text(500, &buf));
+    try testing.expectEqualStrings("the server answered the list with HTTP 65535", Refusal.http_status.text(65535, &buf));
+    // No status, no number; every other reason keeps its fixed words whatever the status.
+    try testing.expectEqualStrings(Refusal.http_status.words(), Refusal.http_status.text(0, &buf));
+    for (std.enums.values(Refusal)) |refusal| {
+        if (refusal == .http_status) continue;
+        try testing.expectEqualStrings(refusal.words(), refusal.text(500, &buf));
+    }
+    // The longest words fit the buffer, and are plain ASCII.
+    const longest = Refusal.http_status.text(65535, &buf);
+    try testing.expect(longest.len <= text_max);
+    for (longest) |byte| try testing.expect(byte >= ' ' and byte < 0x7f);
 }
 
 test "reads a page: tools, an opaque cursor, and the TTL" {

@@ -642,7 +642,7 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
             .ready => if (s.tools_error == null)
                 try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" })
             else if (s.tools == 0)
-                "ready, tool list refused"
+                "ready, " ++ tool_list_refused
             else
                 try arena.print("ready, {d} tool{s}, " ++ newer_list_refused, .{ s.tools, if (s.tools == 1) "" else "s" }),
             .connecting => "connecting",
@@ -654,8 +654,15 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
     };
 }
 
-/// What a server's status says when fx refused its newest tool list and still serves an older one it accepted.
+/// What a server's status says when fx refused its tool list and has none, and when it refused its newest one
+/// and still serves an older one it accepted.
+const tool_list_refused = "tool list refused";
 const newer_list_refused = "newer list refused";
+
+/// The same two facts without the rest of the status, for a place too narrow for it.
+pub fn refusedShort(s: Status) []const u8 {
+    return if (s.tools == 0) tool_list_refused else newer_list_refused;
+}
 
 /// The line `show` adds after the status when fx refused the server's tool list: the fixed reason, and, when
 /// an older accepted list is still served, that it is. Nothing for a list fx accepted.

@@ -655,6 +655,7 @@ pub const Runtime = struct {
             o.name = try alloc.dupe(u8, s.name);
             if (s.version) |v| o.version = try alloc.dupe(u8, v);
             if (s.last_error) |e| o.last_error = try alloc.dupe(u8, e);
+            if (s.tools_error) |t| o.tools_error = try alloc.dupe(u8, t);
             if (s.missing) |m| o.missing = try alloc.dupe(u8, m);
             if (s.instructions) |t| o.instructions = try alloc.dupe(u8, t);
             o.reason = try login_words.copy(alloc, s.reason);
@@ -2225,7 +2226,8 @@ pub const Runtime = struct {
                 // A refused login is what `last_error` says, for every surface that shows it.
                 if (try login_words.errorText(a, s.name, o.reason)) |text| o.last_error = text;
             }
-            if (o.state == .ready and !o.needs_login) o.tools_error = st.list_refusal;
+            // The engine lends the words until its next refusal.
+            if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2998,10 +3000,11 @@ const refusing_server_script =
     \\
 ;
 
-/// Asks for server `fake`'s tools until its status says `want`, for up to ten seconds: the snapshot follows the engine a moment later.
+/// Asks for server `fake`'s tools until its status says `want`, for up to thirty seconds: the snapshot follows the engine a moment later,
+/// and a loaded machine can take longer. It stops as soon as the status is right.
 fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status {
     var status: Status = undefined;
-    for (0..200) |_| {
+    for (0..600) |_| {
         _ = try r.tools(arena, "fake", null);
         status = (try r.statuses(arena))[0];
         if ((status.tools_error != null) == want_refused) break;
@@ -3037,6 +3040,16 @@ test "a refused tool list shows in the status beside the older list still served
     try testing.expectEqual(@as(usize, 1), status.tools);
     // The server is not down, so nothing says so.
     try testing.expect(status.last_error == null);
+    // The words are the caller's own copy. The snapshot's words go with its arena at the next publish, so a copy that
+    // pointed into them would read freed memory. Overwriting them here stands in for that, every time.
+    {
+        const own = try r.statusesNow(a);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        const held = r.snapshot[0].tools_error orelse return error.TestExpectedRefusal;
+        @memset(@constCast(held), 'U');
+        try testing.expectEqualStrings("\"tools\" is not a list", own[0].tools_error orelse return error.TestExpectedRefusal);
+    }
     try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
 
     // The server lists well again: the refused list left the older one stale, so the next need lists again, and the refusal is gone.
