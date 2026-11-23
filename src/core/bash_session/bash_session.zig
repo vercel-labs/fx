@@ -41,6 +41,11 @@ const env_header =
 /// ended in. The state never holds a folder: fx starts each program there.
 const folder_file = "folder";
 
+/// The files, next to the state, that the program's shell loads or the script
+/// writes. `heal` writes or removes them again when a program damages them.
+const env_file = "env.sh";
+const state_file = "state.sh";
+
 /// The files, next to the state, where the script records the startup
 /// definitions. `prepare` makes them owner-only, and the script fills them with
 /// `>`, which keeps that mode.
@@ -141,22 +146,6 @@ fn parseSaveStatus(text: []const u8) ?SaveStatus {
     return .{ .over_cap = bytes };
 }
 
-/// The startup records the script writes with `>|` at load. A program's own shell
-/// would wait on one that is a FIFO, so `replaceIrregularStartupRecord` replaces
-/// it before each program.
-pub const StartupRecord = enum {
-    functions,
-    aliases,
-
-    /// The record's name in the session folder.
-    pub fn fileName(self: StartupRecord) []const u8 {
-        return switch (self) {
-            .functions => startup_functions_file,
-            .aliases => startup_aliases_file,
-        };
-    }
-};
-
 /// Why the session keeps the start folder it keeps, or drops the one the last
 /// saved program wrote. Only `kept` keeps a folder. `no_record` is a session
 /// with no folder file yet, the normal case of a fresh session. `gone` is a
@@ -181,6 +170,9 @@ pub const Session = struct {
     /// The folder the next program starts in, as the last saved state left it.
     /// Null means the workspace root. Owned.
     start_folder: ?[]u8 = null,
+    /// Set when a refresh dropped the start folder. `takeFolderDropped` reads and
+    /// clears it, so the next call reports the drop once.
+    folder_dropped: bool = false,
 
     pub fn init(alloc: std.mem.Allocator) Session {
         return .{ .alloc = alloc };
@@ -211,19 +203,9 @@ pub const Session = struct {
         const hex = std.fmt.bytesToHex(suffix, .lower);
         const dir = try alloc.print("{s}/{s}{d}-{s}", .{ tmp_root, folder_prefix, processId(), &hex });
         errdefer alloc.free(dir);
-        const env_path = try alloc.print("{s}/env.sh", .{dir});
+        const env_path = try alloc.print("{s}/{s}", .{ dir, env_file });
         defer alloc.free(env_path);
-        const state_path = try alloc.print("{s}/state.sh", .{dir});
-        defer alloc.free(state_path);
-        const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
-        defer alloc.free(folder_path);
-        const startup_functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
-        defer alloc.free(startup_functions_path);
-        const startup_aliases_path = try alloc.print("{s}/{s}", .{ dir, startup_aliases_file });
-        defer alloc.free(startup_aliases_path);
-        const status_path = try alloc.print("{s}/{s}", .{ dir, save_status_file });
-        defer alloc.free(status_path);
-        const script = try envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, status_path, fx_variables);
+        const script = try sessionEnvScript(alloc, dir, fx_variables);
         defer alloc.free(script);
         const after_startup = try startupTextFor(alloc, env_path);
         errdefer alloc.free(after_startup);
@@ -305,10 +287,22 @@ pub const Session = struct {
     /// a link, or any other kind is a bad record, and the read never waits on it.
     /// Only `.kept` keeps a folder, so anything else means the workspace root.
     pub fn refreshStartFolder(self: *Session, io: std.Io) StartFolderStatus {
+        const status = self.readStartFolder(io);
+        switch (status) {
+            .gone, .bad_record => self.folder_dropped = true,
+            .kept, .no_record => {},
+        }
+        return status;
+    }
+
+    /// Reads the folder file and keeps the folder it names, as `refreshStartFolder`
+    /// says. The session folder itself may be gone, which leaves no folder file to
+    /// report, so that is `.no_record`; `heal` makes a new folder and reports it.
+    fn readStartFolder(self: *Session, io: std.Io) StartFolderStatus {
         if (self.start_folder) |old| self.alloc.free(old);
         self.start_folder = null;
         const dir_path = self.dir orelse return .no_record;
-        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return .bad_record;
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return .no_record;
         defer dir.close(io);
         var file = openRegularFile(io, dir, folder_file, .read_only) catch |err| switch (err) {
             error.FileNotFound => return .no_record,
@@ -337,21 +331,91 @@ pub const Session = struct {
         return .kept;
     }
 
-    /// Makes the startup record `record` a regular file when it is not one, as
-    /// `prepare` makes it, so the program's shell, which writes it with `>|`, never
-    /// waits on it. Returns whether the record was replaced. A link is unlinked, not
-    /// followed. A record that is missing or already a regular file is left alone.
-    pub fn replaceIrregularStartupRecord(self: *Session, io: std.Io, record: StartupRecord) !bool {
-        const dir_path = self.dir orelse return false;
-        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return false;
-        defer dir.close(io);
-        const name = record.fileName();
-        var file = openRegularFile(io, dir, name, .read_only) catch |err| switch (err) {
-            error.NotRegularFile, error.SymLinkLoop => return replaceRecordEntry(io, dir, dir_path, name),
-            else => return false,
-        };
-        file.close(io);
-        return false;
+    /// Returns whether a refresh dropped the start folder since the last call, and
+    /// clears the flag. The next call reports a drop that the last program's end made.
+    pub fn takeFolderDropped(self: *Session) bool {
+        const dropped = self.folder_dropped;
+        self.folder_dropped = false;
+        return dropped;
+    }
+
+    /// Checks the session folder before a program starts and repairs what a
+    /// program, or a stray entry, put in its place. Nothing here follows a link.
+    /// A folder that is gone, or is not a directory, is made again as `prepare`
+    /// makes one, and the state it held is lost. `env.sh` is written again when it
+    /// is missing or not a regular file. A `state.sh` that is not a regular file is
+    /// removed, which loses the state. A `folder` file that is not a regular file is
+    /// removed, and the start folder it named is reported as dropped. A directory
+    /// at the save record is removed, and an empty record is made. A file, link, or
+    /// FIFO there stays for `takeSaveStatus`, which reports it once. Each startup
+    /// record that is not a regular file is replaced, a directory included. Call it
+    /// after `prepare`. Returns the repairs, in the order they were made.
+    pub fn heal(self: *Session, io: std.Io, fx_variables: []const []const u8) !Healed {
+        const dir_path = self.dir orelse return error.SessionNotPrepared;
+        var healed: Healed = .{};
+        if (!try isFolder(io, dir_path)) {
+            const root = try self.alloc.dupe(u8, std.Io.Dir.path.dirname(dir_path) orelse return error.SessionNotPrepared);
+            defer self.alloc.free(root);
+            // A file or a link at the old path is unlinked, and its target is not touched.
+            if (try entryKind(io, std.Io.Dir.cwd(), dir_path)) |kind| {
+                if (kind != .directory) std.Io.Dir.cwd().deleteFile(io, dir_path) catch {}; // Best effort: the new folder has another name, so this entry is harmless.
+            }
+            self.forgetFolder();
+            healed.swept = try self.prepare(io, root, fx_variables);
+            healed.add(.state_lost, "session");
+            return healed;
+        }
+        var folder = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        defer folder.close(io);
+        const env_kind = try entryKind(io, folder, env_file);
+        if (env_kind) |kind| {
+            if (kind != .file) try removeEntry(io, folder, env_file, kind);
+        }
+        if (env_kind == null or env_kind.? != .file) {
+            try self.writeEnv(io, dir_path, fx_variables);
+            healed.add(.env_rewritten, env_file);
+        }
+        if (try entryKind(io, folder, state_file)) |kind| {
+            if (kind != .file) {
+                try removeEntry(io, folder, state_file, kind);
+                healed.add(.state_lost, state_file);
+            }
+        }
+        if (try entryKind(io, folder, folder_file)) |kind| {
+            if (kind != .file) {
+                // The start folder the file named is dropped, and the next call reports that once.
+                self.folder_dropped = true;
+                if (removeEntry(io, folder, folder_file, kind)) |_| healed.add(.record_replaced, folder_file) else |_| {} // A folder file that stays is refused by refresh, and reported again.
+            }
+        }
+        if (try entryKind(io, folder, save_status_file)) |kind| {
+            if (kind == .directory) {
+                if (try replaceRecordEntry(io, folder, dir_path, save_status_file)) healed.add(.record_replaced, save_status_file);
+            }
+        }
+        for ([_][]const u8{ startup_functions_file, startup_aliases_file }) |name| {
+            if (try replaceRecordEntry(io, folder, dir_path, name)) healed.add(.record_replaced, name);
+        }
+        return healed;
+    }
+
+    /// Frees the session's folder and what `prepare` made for it, so the next
+    /// `prepare` makes a new one. The folder's state is gone with it.
+    fn forgetFolder(self: *Session) void {
+        if (self.dir) |dir| self.alloc.free(dir);
+        if (self.after_startup) |text| self.alloc.free(text);
+        if (self.start_folder) |folder| self.alloc.free(folder);
+        self.dir = null;
+        self.after_startup = null;
+        self.start_folder = null;
+        self.folder_dropped = false;
+    }
+
+    /// Writes the session's env.sh again, as `prepare` writes it.
+    fn writeEnv(self: *Session, io: std.Io, dir: []const u8, fx_variables: []const []const u8) !void {
+        const script = try sessionEnvScript(self.alloc, dir, fx_variables);
+        defer self.alloc.free(script);
+        try writeScript(io, dir, script);
     }
 
     /// Deletes the session folder and frees what the session holds. The session is
@@ -442,14 +506,99 @@ fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Unlinks `name` in the session folder, then makes it again as an empty owner-only
-/// regular file, as `prepare` does. The unlink never follows a link, so a link is
-/// removed and its target is not touched. Returns false, and leaves the entry, when
-/// the entry cannot be unlinked, as a directory cannot.
+/// Replaces the entry `name` of the session folder with an empty owner-only regular
+/// file, as `prepare` makes it, when the entry is not a regular file. The entry is
+/// removed without following a link, so a link is removed and its target is not
+/// touched, and a directory is removed with its contents. A missing entry and a
+/// regular file are left alone. Returns false, and leaves the entry, when it cannot
+/// be removed.
 fn replaceRecordEntry(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, name: []const u8) !bool {
-    dir.deleteFile(io, name) catch return false;
+    const kind = (try entryKind(io, dir, name)) orelse return false;
+    if (kind == .file) return false;
+    removeEntry(io, dir, name, kind) catch return false;
     try makeOwnerFile(io, dir_path, name);
     return true;
+}
+
+/// The kinds of repair `heal` makes.
+const RepairKind = enum { state_lost, env_rewritten, record_replaced };
+
+/// One repair `heal` made. `name` is a constant file name, or `session` for the
+/// folder. It is never a path.
+const Repair = struct {
+    what: RepairKind,
+    name: []const u8,
+};
+
+/// The repairs one `heal` made, in order, and the dead folders its sweep removed
+/// when it made a new folder.
+const Healed = struct {
+    repairs: [max_repairs]Repair = undefined,
+    len: usize = 0,
+    swept: usize = 0,
+
+    /// One repair for each of env.sh, state.sh, the folder file, the save record, and
+    /// the two startup records. A folder that is made again is its only repair, so
+    /// six is the most.
+    const max_repairs = 6;
+
+    fn add(self: *Healed, what: RepairKind, name: []const u8) void {
+        std.debug.assert(self.len < max_repairs);
+        self.repairs[self.len] = .{ .what = what, .name = name };
+        self.len += 1;
+    }
+
+    /// The repairs, in the order they were made.
+    pub fn items(self: *const Healed) []const Repair {
+        return self.repairs[0..self.len];
+    }
+
+    /// Whether a repair lost the saved state.
+    pub fn stateLost(self: *const Healed) bool {
+        for (self.items()) |repair| {
+            if (repair.what == .state_lost) return true;
+        }
+        return false;
+    }
+};
+
+/// The env.sh text for the session folder `dir`: the paths of its files, and the
+/// names fx adds to every program. `prepare` and `heal` write it.
+fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []const []const u8) ![]u8 {
+    const state_path = try alloc.print("{s}/{s}", .{ dir, state_file });
+    defer alloc.free(state_path);
+    const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
+    defer alloc.free(folder_path);
+    const startup_functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
+    defer alloc.free(startup_functions_path);
+    const startup_aliases_path = try alloc.print("{s}/{s}", .{ dir, startup_aliases_file });
+    defer alloc.free(startup_aliases_path);
+    const status_path = try alloc.print("{s}/{s}", .{ dir, save_status_file });
+    defer alloc.free(status_path);
+    return envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, status_path, fx_variables);
+}
+
+/// The kind of the entry `name` in `folder`, without following a link, or null
+/// when there is no entry.
+fn entryKind(io: std.Io, folder: std.Io.Dir, name: []const u8) !?std.Io.File.Kind {
+    const stat = folder.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return stat.kind;
+}
+
+/// Whether `path` names a directory, without following a link.
+fn isFolder(io: std.Io, path: []const u8) !bool {
+    const kind = (try entryKind(io, std.Io.Dir.cwd(), path)) orelse return false;
+    return kind == .directory;
+}
+
+/// Removes the entry `name` of the given kind, a directory with its contents. A
+/// link is removed, not followed.
+fn removeEntry(io: std.Io, folder: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !void {
+    if (kind == .directory) return folder.deleteTree(io, name);
+    return folder.deleteFile(io, name);
 }
 
 /// Makes an empty, owner-only file in the session folder. The script fills the
@@ -541,6 +690,10 @@ fn readOpenedFile(alloc: std.mem.Allocator, file: std.Io.File, limit: usize) ![]
 /// which no function can replace, so a function or alias the program defined with
 /// a word's name cannot run in its place. A program that redefines `builtin` or
 /// `command` is out of scope.
+///
+/// The program can replace the save record with a FIFO or a link, so
+/// `__fx_status_fresh` makes it an empty owner-only regular file before each write
+/// of it. A write then never waits, and the next write keeps the owner-only mode.
 const body_before_skip =
     \\\builtin shopt -u expand_aliases
     \\__fx_snapshot_env() {
@@ -552,9 +705,16 @@ const body_before_skip =
     \\    __fx_env_n=$((__fx_env_n + 1))
     \\  done
     \\}
+    \\__fx_status_fresh() {
+    \\  if [[ -e "$__fx_status" || -L "$__fx_status" ]] && { [[ ! -f "$__fx_status" ]] || [[ -L "$__fx_status" ]]; }; then
+    \\    command -p rm -rf -- "$__fx_status" 2>/dev/null
+    \\    ( builtin umask 077; builtin printf '' >|"$__fx_status" ) 2>/dev/null
+    \\  fi
+    \\}
     \\__fx_snapshot_env
     \\builtin declare -f 2>/dev/null >|"$__fx_startup_functions"
     \\builtin alias -p 2>/dev/null >|"$__fx_startup_aliases"
+    \\__fx_status_fresh
     \\builtin printf 'pending\n' 2>/dev/null >|"$__fx_status"
     \\__fx_inherited() {
     \\  builtin local __fx_i=0
@@ -629,11 +789,12 @@ const body_after_skip =
     \\    __fx_size=$(( $(\command -p wc -c <"$__fx_tmp") ))
     \\    if [[ "$__fx_size" -gt "$__fx_max" ]]; then
     \\      command -p rm -f "$__fx_tmp" 2>/dev/null
-    \\      ( builtin umask 077; builtin printf 'cap %s\n' "$__fx_size" >|"$__fx_status" ) 2>/dev/null
+    \\      ( builtin umask 077; __fx_status_fresh; builtin printf 'cap %s\n' "$__fx_size" >|"$__fx_status" ) 2>/dev/null
     \\      __fx_saved=1
     \\    elif ( builtin umask 077; builtin printf '%s' "$PWD" >|"$__fx_folder.$$.tmp" ) 2>/dev/null &&
     \\      command -p mv -f "$__fx_tmp" "$__fx_state" && command -p mv -f "$__fx_folder.$$.tmp" "$__fx_folder"; then
     \\      __fx_saved=1
+    \\      __fx_status_fresh
     \\      builtin printf '' 2>/dev/null >|"$__fx_status"
     \\    fi
     \\  fi
@@ -641,7 +802,7 @@ const body_after_skip =
     \\  if [[ "$__fx_saved" -eq 0 ]]; then
     \\    command -p rm -f "$__fx_tmp" "$__fx_folder.$$.tmp" 2>/dev/null
     \\    if [[ -d "${__fx_state%/*}" ]]; then
-    \\      ( builtin umask 077; builtin printf 'failed\n' >|"$__fx_status" ) 2>/dev/null
+    \\      ( builtin umask 077; __fx_status_fresh; builtin printf 'failed\n' >|"$__fx_status" ) 2>/dev/null
     \\    fi
     \\  fi
     \\  if [[ "$__fx_nocase" -eq 1 ]]; then builtin shopt -s nocasematch; fi
@@ -662,7 +823,7 @@ const body_after_skip =
     \\  builtin trap "{ __fx_save; } 2>/dev/null
     \\$3" EXIT
     \\}
-    \\if [[ -r "$__fx_state" ]]; then builtin . "$__fx_state" >/dev/null 2>&1; fi
+    \\if [[ -f "$__fx_state" && ! -L "$__fx_state" ]]; then builtin . "$__fx_state" >/dev/null 2>&1; fi
     \\\builtin shopt -s expand_aliases
     \\\builtin trap '{ __fx_save; } 2>/dev/null' EXIT
     \\
@@ -705,7 +866,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("52b93423f5c602a8661e55c3046f1063901fd4df7ecb98fb31eb56c7a57be3b1", &hex);
+    try std.testing.expectEqualStrings("ecc04c2ca29023f7c0e6f769d9b6aa2dcf95aa0cd06a76ab6da0c79f133b1b57", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -2248,19 +2409,24 @@ test "a startup record that is a FIFO or a link is replaced, and a regular one i
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
     defer folder.close(io);
 
-    // A regular record is left alone.
-    try std.testing.expect(!try session.replaceIrregularStartupRecord(io, .functions));
+    // A regular record is left alone: nothing is repaired.
+    const quiet = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 0), quiet.items().len);
 
     // A FIFO where the functions record is: replaced, once.
     try folder.deleteFile(io, startup_functions_file);
     const functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
     defer alloc.free(functions_path);
     try makeFifo(alloc, io, functions_path);
-    try std.testing.expect(try session.replaceIrregularStartupRecord(io, .functions));
+    const replaced = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 1), replaced.items().len);
+    try std.testing.expectEqual(RepairKind.record_replaced, replaced.items()[0].what);
+    try std.testing.expectEqualStrings(startup_functions_file, replaced.items()[0].name);
     const functions = try folder.statFile(io, startup_functions_file, .{});
     try std.testing.expectEqual(std.Io.File.Kind.file, functions.kind);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), functions.permissions.toMode() & 0o777);
-    try std.testing.expect(!try session.replaceIrregularStartupRecord(io, .functions));
+    const again = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 0), again.items().len);
 
     // A link where the aliases record is: unlinked, and its target is not written.
     try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere", .data = "keep\n" });
@@ -2268,12 +2434,277 @@ test "a startup record that is a FIFO or a link is replaced, and a regular one i
     defer alloc.free(target);
     try folder.deleteFile(io, startup_aliases_file);
     try folder.symLink(io, target, startup_aliases_file, .{});
-    try std.testing.expect(try session.replaceIrregularStartupRecord(io, .aliases));
+    const linked = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 1), linked.items().len);
+    try std.testing.expectEqualStrings(startup_aliases_file, linked.items()[0].name);
     const aliases = try folder.statFile(io, startup_aliases_file, .{});
     try std.testing.expectEqual(std.Io.File.Kind.file, aliases.kind);
     const kept = try tmp.dir.readFileAlloc(io, "elsewhere", alloc, .limited(64));
     defer alloc.free(kept);
     try std.testing.expectEqualStrings("keep\n", kept);
+}
+
+test "heal makes a session folder that a program removed again, and the state it held is lost" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const old_dir = try alloc.dupe(u8, session.dir.?);
+    defer alloc.free(old_dir);
+    const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, saved);
+    try expectExit(saved, 0);
+
+    // A program removes its session folder, as in review r30.
+    try std.Io.Dir.cwd().deleteTree(io, old_dir);
+    try std.testing.expectEqual(StartFolderStatus.no_record, session.refreshStartFolder(io));
+    const healed = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 1), healed.items().len);
+    try std.testing.expectEqual(RepairKind.state_lost, healed.items()[0].what);
+    try std.testing.expect(!std.mem.eql(u8, old_dir, session.dir.?));
+
+    // The next program starts with no state, in the new folder.
+    const next = try runProgram(alloc, io, &session, root, "t2", "echo \"x=${x-unset}\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=unset\n", next.stdout);
+}
+
+test "heal removes a state file that is not a regular file, and the state is lost" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, saved);
+    try expectExit(saved, 0);
+
+    // A FIFO where the saved state was, as a program can leave it. The next program's shell would wait on it.
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, state_file);
+    const state_path = try alloc.print("{s}/{s}", .{ dir, state_file });
+    defer alloc.free(state_path);
+    try makeFifo(alloc, io, state_path);
+
+    const healed = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 1), healed.items().len);
+    try std.testing.expectEqual(RepairKind.state_lost, healed.items()[0].what);
+    try std.testing.expectEqualStrings(state_file, healed.items()[0].name);
+    try std.testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(io, folder, state_file));
+
+    // A healthy folder has nothing to repair.
+    const again = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 0), again.items().len);
+}
+
+test "heal writes env.sh again when a program replaced it, and the saved state still loads" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, saved);
+    try expectExit(saved, 0);
+
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, env_file);
+    const env_path = try alloc.print("{s}/{s}", .{ dir, env_file });
+    defer alloc.free(env_path);
+    try makeFifo(alloc, io, env_path);
+
+    const healed = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 1), healed.items().len);
+    try std.testing.expectEqual(RepairKind.env_rewritten, healed.items()[0].what);
+    try std.testing.expectEqual(std.Io.File.Kind.file, (try folder.statFile(io, env_file, .{ .follow_symlinks = false })).kind);
+
+    const next = try runProgram(alloc, io, &session, root, "t2", "echo \"x=$x\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=1\n", next.stdout);
+}
+
+test "heal replaces a directory at the folder file, the save record, or a startup record, and leaves a FIFO at the save record for takeSaveStatus" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, saved);
+    try expectExit(saved, 0);
+
+    // A directory with a file inside it where each of three records is, as a stray program can leave one.
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    for ([_][]const u8{ folder_file, save_status_file, startup_aliases_file }) |name| {
+        try folder.deleteFile(io, name);
+        try folder.createDirPath(io, name);
+        var inside = try folder.openDir(io, name, .{});
+        defer inside.close(io);
+        try inside.writeFile(io, .{ .sub_path = "inside", .data = "keep\n" });
+    }
+
+    const healed = try session.heal(io, &test_fx_variables);
+    const items = healed.items();
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqualStrings(folder_file, items[0].name);
+    try std.testing.expectEqualStrings(save_status_file, items[1].name);
+    try std.testing.expectEqualStrings(startup_aliases_file, items[2].name);
+    for (items) |repair| try std.testing.expectEqual(RepairKind.record_replaced, repair.what);
+
+    // The folder file is gone, and the start folder it named is reported once.
+    try std.testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(io, folder, folder_file));
+    try std.testing.expect(session.takeFolderDropped());
+    try std.testing.expect(!session.takeFolderDropped());
+
+    // The save record and the startup record are empty owner-only regular files again.
+    for ([_][]const u8{ save_status_file, startup_aliases_file }) |name| {
+        const stat = try folder.statFile(io, name, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+    const again = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 0), again.items().len);
+
+    // A FIFO at the save record is left for takeSaveStatus, which reports it as a failed record.
+    try folder.deleteFile(io, save_status_file);
+    const status_path = try alloc.print("{s}/{s}", .{ session.dir.?, save_status_file });
+    defer alloc.free(status_path);
+    try makeFifo(alloc, io, status_path);
+    const fifo = try session.heal(io, &test_fx_variables);
+    try std.testing.expectEqual(@as(usize, 0), fifo.items().len);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+
+    // The saved state is still there for the next program.
+    const next = try runProgram(alloc, io, &session, root, "t2", "echo \"x=$x\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=1\n", next.stdout);
+}
+
+test "a refresh that drops the start folder sets the flag, which is read once" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
+    defer alloc.free(folder_path);
+    try makeFifo(alloc, io, folder_path);
+
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
+    try std.testing.expect(session.takeFolderDropped());
+    try std.testing.expect(!session.takeFolderDropped());
+
+    // With no folder file, a refresh drops nothing.
+    try std.testing.expectEqual(StartFolderStatus.no_record, session.refreshStartFolder(io));
+    try std.testing.expect(!session.takeFolderDropped());
+}
+
+test "a program that puts a FIFO where its save record is still saves its state, and the record gives no notice" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+
+    // The program replaces its own save record with a FIFO, then sets x. Its save must not wait on the FIFO.
+    const replaced = try runProgram(alloc, io, &session, root, "t1", "rm -f -- \"$__fx_status\"; /usr/bin/mkfifo \"$__fx_status\"; x=1");
+    defer freeRun(alloc, replaced);
+    try expectExit(replaced, 0);
+    try std.testing.expectEqualStrings("", replaced.stdout);
+
+    // The save kept the state, so the record is again an empty owner-only regular file, and it says nothing.
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    const record = try folder.statFile(io, save_status_file, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, record.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record.permissions.toMode() & 0o777);
+    const status = session.takeSaveStatus(io);
+    try std.testing.expect(status == null);
+
+    // The next program sees x=1.
+    const next = try runProgram(alloc, io, &session, root, "t2", "echo \"x=$x\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=1\n", next.stdout);
+}
+
+test "a program that puts a link at its save record to a directory saves its state, and the directory is left whole" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+
+    // A directory with a file in it, outside the session folder, which the link names.
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.writeFile(io, .{ .sub_path = "target/keep", .data = "keep\n" });
+    const target = try alloc.print("{s}/target", .{root});
+    defer alloc.free(target);
+    const program = try alloc.print("rm -f -- \"$__fx_status\"; ln -s '{s}' \"$__fx_status\"; x=1", .{target});
+    defer alloc.free(program);
+    const saved = try runProgram(alloc, io, &session, root, "t1", program);
+    defer freeRun(alloc, saved);
+    try expectExit(saved, 0);
+
+    // The record is an empty owner-only regular file, and the directory the link named is whole.
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    const record = try folder.statFile(io, save_status_file, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, record.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), record.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u64, 0), record.size);
+    const kept = try tmp.dir.readFileAlloc(io, "target/keep", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
 }
 
 test "a save record too long to read is reported once, and then emptied" {
