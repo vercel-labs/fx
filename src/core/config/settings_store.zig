@@ -442,14 +442,14 @@ pub const Store = struct {
             return error.PrivateStatePermissionsUnsupported;
         }
         var tightened_home = false;
-        if (mode == .read_only and tighten and durableModeWritableByGroupOrOther(durable_mode)) {
-            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(durable_mode))) catch {
+        if (mode == .read_only and tighten and io_mod.othersCanWrite(.fromMode(durable_mode))) {
+            durable_home.setPermissions(zio, io_mod.withoutOthersWrite(.fromMode(durable_mode))) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
             durable_mode = (try durable_home.stat(zio)).permissions.toMode() & 0o777;
             tightened_home = true;
         }
-        if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
+        if (mode == .read_only and io_mod.othersCanWrite(.fromMode(durable_mode))) {
             return error.PrivateStatePermissionsUnsupported;
         }
 
@@ -814,14 +814,14 @@ pub const Store = struct {
         if (self.mode == .writable and primary_mode != 0o600) {
             return error.PrivateStatePermissionsUnsupported;
         }
-        if (self.mode == .read_only and self.tighten_loose_modes and durableModeWritableByGroupOrOther(primary_mode)) {
-            file.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(primary_mode))) catch {
+        if (self.mode == .read_only and self.tighten_loose_modes and io_mod.othersCanWrite(.fromMode(primary_mode))) {
+            file.setPermissions(zio, io_mod.withoutOthersWrite(.fromMode(primary_mode))) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
             primary_mode = (try file.stat(zio)).permissions.toMode() & 0o777;
             self.tightened.settings = true;
         }
-        if (self.mode == .read_only and durableModeWritableByGroupOrOther(primary_mode)) {
+        if (self.mode == .read_only and io_mod.othersCanWrite(.fromMode(primary_mode))) {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (verified_stat.size > max_settings_bytes) return .oversized;
@@ -838,14 +838,6 @@ pub const Store = struct {
         self.createSequencedCopy(alloc, "corrupt", bytes, corrupt_keep_count) catch |err| {
             debug_trace.logf("config", "settings corrupt copy skipped err={s}", .{@errorName(err)});
         };
-    }
-
-    fn durableModeWritableByGroupOrOther(mode: std.posix.mode_t) bool {
-        return mode & 0o022 != 0;
-    }
-
-    fn withoutGroupOrOtherWrite(mode: std.posix.mode_t) std.posix.mode_t {
-        return mode & ~@as(std.posix.mode_t, 0o022);
     }
 
     fn createSequencedCopy(
@@ -3753,6 +3745,54 @@ test "tightening read-only open removes group and other write access and records
     var reloaded = try again.loadPrimary(alloc);
     defer reloaded.deinit(alloc);
     try std.testing.expect(!again.tightened.any());
+}
+
+test "read-only settings refuse a group or an other write bit alone, and tightening clears it" {
+    const alloc = std.testing.allocator;
+    // The home and file modes, and the modes tightening leaves.
+    const cases = [_]struct { home: std.posix.mode_t, file: std.posix.mode_t, tight_home: std.posix.mode_t, tight_file: std.posix.mode_t }{
+        .{ .home = 0o725, .file = 0o644, .tight_home = 0o705, .tight_file = 0o644 },
+        .{ .home = 0o707, .file = 0o644, .tight_home = 0o705, .tight_file = 0o644 },
+        .{ .home = 0o755, .file = 0o624, .tight_home = 0o755, .tight_file = 0o604 },
+        .{ .home = 0o755, .file = 0o646, .tight_home = 0o755, .tight_file = 0o644 },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"auto\"}\n");
+        var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+        defer root_dir.close(io_mod.getIo());
+        var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
+        file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(case.file)) catch {
+            file.close(io_mod.getIo());
+            return error.SkipZigTest;
+        };
+        file.close(io_mod.getIo());
+        root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(case.home)) catch return error.SkipZigTest;
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+
+        if (case.home != case.tight_home) {
+            try std.testing.expectError(error.PrivateStatePermissionsUnsupported, Store.initFromHome(alloc, home, .read_only));
+        } else {
+            var store = try Store.initFromHome(alloc, home, .read_only);
+            defer store.deinit(alloc);
+            try std.testing.expectError(error.PrivateStatePermissionsUnsupported, store.loadPrimary(alloc));
+        }
+
+        {
+            var store = try Store.initFromHomeTighteningReadOnly(alloc, home);
+            defer store.deinit(alloc);
+            var primary = try store.loadPrimary(alloc);
+            defer primary.deinit(alloc);
+            try std.testing.expect(primary == .valid);
+        }
+        const home_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{});
+        try std.testing.expectEqual(case.tight_home, home_stat.permissions.toMode() & 0o777);
+        const file_stat = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+        try std.testing.expectEqual(case.tight_file, file_stat.permissions.toMode() & 0o777);
+    }
 }
 
 test "three fingerprint conflicts return SettingsConcurrentModification" {

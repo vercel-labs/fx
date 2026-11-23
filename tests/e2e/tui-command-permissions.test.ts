@@ -2935,6 +2935,151 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace carries the crash report fx saved when it last ended on an error",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "trace-crash-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // The file `writeCrashReport` saves when fx ends on an error: the trace
+      // header, the fatal error, and one record from the session. It is dated an
+      // hour ago, because `/trace` shows a crash report only within 24 hours of it.
+      const crashAtMs = Date.now() - 60 * 60 * 1000;
+      const crashAt = new Date(crashAtMs).toISOString();
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
+        [
+          JSON.stringify({
+            type: "fx_trace",
+            format_version: 1,
+            fx_version: "9.9.9",
+            git_commit: "abc1234",
+            written_at: crashAt,
+            written_at_ms: crashAtMs,
+            notice: "private",
+          }),
+          JSON.stringify({
+            type: "fatal_error",
+            error: "InvalidTranscriptTransition",
+            message: "invalid transcript transition",
+            at: crashAt,
+            at_ms: crashAtMs,
+          }),
+          JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
+        ].map((line) => `${line}\n`).join(""),
+      );
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "InvalidTranscriptTransition",
+        message: "invalid transcript transition",
+        fx_version: "9.9.9",
+        git_commit: "abc1234",
+        records: 3,
+        skipped: 0,
+      });
+      expect(
+        report.all("last_crash_record").map((record) => (record.record as { type: string }).type),
+      ).toEqual(["fx_trace", "fatal_error", "renderer_event"]);
+      // The live report is not a crash report, so it has no fatal_error record of its own.
+      expect(report.all("fatal_error")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a segfault as a crash report that the next /trace shows",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "segfault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+      const start = () =>
+        TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root), TMPDIR: tmpDir }),
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+      // The signal goes to the one process the tmux pane runs, found the way the
+      // other terminal tests find it. The check first confirms that process is fx.
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      const fxPid = activeSession.processPid();
+      expect(
+        execFileSync("ps", ["-ww", "-o", "args=", "-p", String(fxPid)], { encoding: "utf8" }),
+      ).toContain(FX_BIN);
+      process.kill(fxPid, "SIGSEGV");
+      expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      // Zig's handler ends in abort(), so fx exits with 128 + SIGABRT (6).
+      expect(activeSession.recordedExitStatus()).toBe(134);
+      await activeSession.kill();
+      activeSession = null;
+
+      // Zig's default output still names the signal before the process aborts.
+      expect(readFileSync(stderrPath, "utf8")).toContain("Segmentation fault");
+      const crashPath = join(root.home, ".fx", "diagnostics", "last-crash.jsonl");
+      expect(statSync(crashPath).mode & 0o777).toBe(0o600);
+      const lines = readFileSync(crashPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines[0]).toMatchObject({ type: "fx_trace" });
+      expect(lines[1]).toMatchObject({
+        type: "fatal_error",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();

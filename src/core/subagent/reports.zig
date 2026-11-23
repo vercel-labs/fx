@@ -152,8 +152,9 @@ pub const Report = struct {
     /// The child's last reply for the work, as it wrote it.
     output: []const u8,
     /// How many of the parent's messages waiting for the child the user's
-    /// stop dropped. A report with no `work_id` is the notice
-    /// of that drop when the stopped work owed no report.
+    /// stop dropped. A cancelled report with no `work_id` is the notice of
+    /// that drop when the stopped work owed no report. A failed report with
+    /// no `work_id` tells of messages fx lost and cannot name.
     dropped: usize = 0,
     /// Who started the work and why it was cancelled, so the parent
     /// needn't guess.

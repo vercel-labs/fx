@@ -638,9 +638,10 @@ test.skipIf(!tmuxAvailable())(
     await session.waitForText("Waiting for cat, sleep, printf", TIMEOUT);
     await session.waitForText("The session saved the notes.", TIMEOUT);
     const expectNames = (lines: string[]) => {
-      // Core folds the launch command into one line for the session's row;
-      // its document's text still never shows.
-      expect(lines.some((line) => line.startsWith("● Observed cat, sleep, printf · 2 calls"))).toBe(true);
+      // The session's row names the programs of its launch command, and says
+      // it ran once the check found the command ended; the document's text
+      // never shows.
+      expect(lines.some((line) => line.startsWith("● Ran cat, sleep, printf · 2 calls"))).toBe(true);
       expect(lines.some((line) => /model's|<<|EOF/.test(line))).toBe(false);
     };
     expectNames(paneLines(await session.waitForComposer(TIMEOUT)));

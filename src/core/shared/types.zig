@@ -269,6 +269,12 @@ pub const ToolLifecycleEvent = union(enum) {
         result: ?[]const u8 = null,
         result_memory: ?ToolResultMemory = null,
         command_artifact_handle: ?[]const u8 = null,
+        /// Whether the call, a shell check, found its session's command
+        /// ended, which its status does not say when the command passed
+        /// (`checkFoundCommandEnded` in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        check_found_command_ended: bool = false,
     },
     turn_finished: TurnFinished,
 };

@@ -725,6 +725,10 @@ pub const WorkerRuntime = struct {
     /// The feedback `hands_back_leftover_feedback` set aside, oldest first,
     /// until the owner takes it.
     held_back_feedback: std.ArrayList(QueuedPrompt) = .empty,
+    /// Parent steering this worker lost to an allocation failure, one per
+    /// message, since no list holds it any more. A message fx cannot keep is
+    /// counted here, and `takeLostSteering` takes it.
+    lost_parent_steering: usize = 0,
     /// What the user typed in turn `typed_turn_id`: its prompt when the user
     /// wrote it, then each of the user's lines that joined it, newest last.
     /// A subagent's message to its parent carries them (`typedThisTurn`), so
@@ -2095,8 +2099,9 @@ pub const WorkerRuntime = struct {
     /// A user's stop on this subagent's own screen: drops the
     /// other agents' messages still waiting in its queue, also the parent's
     /// waiting to join the turn the stop ends, whose receipt then reads not
-    /// applied. Reports stay, since they are owed, and so do the user's own
-    /// prompts, as on main. `alloc` is the queue's.
+    /// applied, and the parent's messages fx could not keep, which are counted
+    /// in `lost_parent_steering`. Reports stay, since they are owed, and so do
+    /// the user's own prompts, as on main. `alloc` is the queue's.
     pub fn dropAgentMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) MessageDrop {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -2125,23 +2130,55 @@ pub const WorkerRuntime = struct {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
             self.queued_history = &.{};
         }
+        drop.from_parent += self.lost_parent_steering;
+        drop.total += self.lost_parent_steering;
+        self.lost_parent_steering = 0;
         return drop;
     }
 
-    /// How many of the parent's messages still wait to join the running
-    /// turn. Counted after a stop's cancel, it is what the stop drops: the
-    /// cancelled turn reads no more of them.
-    pub fn queuedParentSteering(self: *WorkerRuntime) usize {
+    /// Drops the parent's messages that still wait to join the running
+    /// turn and returns how many, counting the ones fx could not keep in
+    /// `lost_parent_steering`. A stop calls it after its cancel, so the
+    /// cancelled turn reads none of them. It removes them in the hold of the
+    /// lock that counts them, so a user's stop that comes later
+    /// (`dropAgentMessages`) finds none to count again. Their receipts read
+    /// not_applied. `alloc` is the queue's.
+    pub fn dropParentSteering(self: *WorkerRuntime, alloc: std.mem.Allocator) usize {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        var count: usize = 0;
-        for (self.held_back_feedback.items) |prompt| {
-            if (prompt.author == .parent) count += 1;
+        var dropped: usize = 0;
+        var held_index: usize = 0;
+        while (held_index < self.held_back_feedback.items.len) {
+            if (self.held_back_feedback.items[held_index].author != .parent) {
+                held_index += 1;
+                continue;
+            }
+            const prompt = self.held_back_feedback.orderedRemove(held_index);
+            debug_trace.eventf("worker", "agent_message_dropped", .{ .turn_id = prompt.turn_id }, "author={s} reason=stopped_by_parent", .{@tagName(prompt.author)});
+            dropped += 1;
+            freeQueuedPrompt(alloc, prompt);
         }
-        for (self.queued_prompts.items) |prompt| {
-            if (prompt.author == .parent and prompt.steering_receipt != null) count += 1;
+        var index: usize = 0;
+        var removed = false;
+        while (index < self.queued_prompts.items.len) {
+            const queued = self.queued_prompts.items[index];
+            if (queued.author != .parent or queued.steering_receipt == null) {
+                index += 1;
+                continue;
+            }
+            const prompt = self.queued_prompts.orderedRemove(index);
+            debug_trace.eventf("worker", "agent_message_dropped", .{ .turn_id = prompt.turn_id }, "author={s} reason=stopped_by_parent", .{@tagName(prompt.author)});
+            dropped += 1;
+            removed = true;
+            freeQueuedPrompt(alloc, prompt);
         }
-        return count;
+        if (removed and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        const lost = self.lost_parent_steering;
+        self.lost_parent_steering = 0;
+        return dropped + lost;
     }
 
     /// A message main steered into a turn that the turn never took.
@@ -2155,17 +2192,26 @@ pub const WorkerRuntime = struct {
         }
     };
 
+    /// Takes the count of parent steering this worker lost, and sets it to 0.
+    pub fn takeLostSteering(self: *WorkerRuntime) usize {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const lost = self.lost_parent_steering;
+        self.lost_parent_steering = 0;
+        return lost;
+    }
+
     /// Takes the feedback main steered into the turn that just ended and the
     /// turn never took, oldest first: what `hands_back_leftover_feedback` set
     /// aside, then what still waits in the queue. Their receipts read
-    /// not_applied. A message it can't copy is dropped and traced. Caller
-    /// owns the result.
+    /// not_applied. A message it can't copy is dropped, traced, and counted in
+    /// `lost_parent_steering`. Caller owns the result.
     pub fn takeLeftoverMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) []LeftoverMessage {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         var taken: std.ArrayList(LeftoverMessage) = .empty;
         for (self.held_back_feedback.items) |prompt| {
-            keepLeftover(alloc, &taken, prompt);
+            if (!keepLeftover(alloc, &taken, prompt)) self.lost_parent_steering += 1;
             freeQueuedPrompt(alloc, prompt);
         }
         self.held_back_feedback.clearRetainingCapacity();
@@ -2177,7 +2223,7 @@ pub const WorkerRuntime = struct {
                 index += 1;
                 continue;
             }
-            keepLeftover(alloc, &taken, prompt);
+            if (!keepLeftover(alloc, &taken, prompt)) self.lost_parent_steering += 1;
             freeQueuedPrompt(alloc, self.queued_prompts.orderedRemove(index));
             removed = true;
         }
@@ -2186,6 +2232,7 @@ pub const WorkerRuntime = struct {
             self.queued_history = &.{};
         }
         return taken.toOwnedSlice(alloc) catch {
+            self.lost_parent_steering += taken.items.len;
             for (taken.items) |item| {
                 debug_trace.eventf("worker", "leftover_steering_dropped", .{}, "operation={s} reason=out_of_memory", .{item.operation_id});
                 item.deinit(alloc);
@@ -2331,7 +2378,8 @@ pub const WorkerRuntime = struct {
     /// its steering boundaries, so feedback still queued when a turn is about
     /// to start or a run's prompt is queued outlived its own. Dropping it
     /// settles its receipt as not applied, and the host sends it again as new
-    /// work. Steering without a receipt stays, to run as the next turn.
+    /// work. A message it cannot hold is counted in `lost_parent_steering`.
+    /// Steering without a receipt stays, to run as the next turn.
     fn handBackLeftoverFeedbackLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         var index: usize = 0;
         var dropped = false;
@@ -2345,6 +2393,7 @@ pub const WorkerRuntime = struct {
             dropped = true;
             self.held_back_feedback.append(alloc, held) catch {
                 debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = held.turn_id }, "bytes={d} reason=out_of_memory", .{held.prompt.len});
+                self.lost_parent_steering += 1;
                 freeQueuedPrompt(alloc, held);
                 continue;
             };
@@ -3781,8 +3830,9 @@ fn appendHistoryTurnProjection(
 
 /// Copies one leftover steered message into `taken`, marking its receipt
 /// not_applied, as a discarded one's is; it drops and traces the message
-/// when it can't.
-fn keepLeftover(alloc: std.mem.Allocator, taken: *std.ArrayList(WorkerRuntime.LeftoverMessage), prompt: QueuedPrompt) void {
+/// when it can't and returns false, so the caller counts it in
+/// `lost_parent_steering`. Returns true when the message was kept.
+fn keepLeftover(alloc: std.mem.Allocator, taken: *std.ArrayList(WorkerRuntime.LeftoverMessage), prompt: QueuedPrompt) bool {
     const receipt = prompt.steering_receipt.?;
     const kept = blk: {
         const item = copyLeftover(alloc, receipt.operation_id, prompt.prompt) catch break :blk false;
@@ -3796,6 +3846,7 @@ fn keepLeftover(alloc: std.mem.Allocator, taken: *std.ArrayList(WorkerRuntime.Le
     if (receipt.state.cmpxchgStrong(.queued, .not_applied, .seq_cst, .seq_cst) == null) {
         debug_trace.eventf("subagent", "feedback_not_applied", .{}, "operation={s} reason={s}", .{ receipt.operation_id, if (kept) "handed_back" else "out_of_memory" });
     }
+    return kept;
 }
 
 fn copyLeftover(alloc: std.mem.Allocator, operation_id: []const u8, text: []const u8) !WorkerRuntime.LeftoverMessage {
@@ -5227,6 +5278,7 @@ pub fn dupeToolLifecycleEvent(
                 .result = result,
                 .result_memory = result_memory,
                 .command_artifact_handle = command_artifact_handle,
+                .check_found_command_ended = terminal.check_found_command_ended,
             } };
         },
         .turn_finished => |finished| .{ .turn_finished = finished },
@@ -9542,6 +9594,141 @@ test "the user's stop drops main's feedback a subagent's worker set aside" {
     defer alloc.free(taken);
     try std.testing.expectEqual(@as(usize, 0), taken.len);
     try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+}
+
+// A stop drops the parent's unread steering in the same hold that counts it, so
+// a user's stop after it finds none to count again, and the receipt of the
+// dropped message reads not_applied.
+test "a parent's stop drops the parent's unread steering once, and a user's stop after it counts none" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{ .operation_id = "op-4" };
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    var steering = try makePrompt(alloc, "from the parent", "model");
+    steering.steering_receipt = &receipt;
+    steering.author = .parent;
+    try std.testing.expect(try runtime.admitActiveSteering(alloc, steering));
+    var report = try makePrompt(alloc, "a report", "model");
+    report.author = .child;
+    report.mail = .report;
+    try runtime.postMail(alloc, report);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.dropParentSteering(alloc));
+    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    try std.testing.expectEqualStrings("a report", runtime.queued_prompts.items[0].prompt);
+    const drop = runtime.dropAgentMessages(alloc);
+    try std.testing.expectEqual(@as(usize, 0), drop.from_parent);
+    try std.testing.expectEqual(@as(usize, 0), runtime.dropParentSteering(alloc));
+}
+
+// Steering that a turn left is set aside for its owner to take back. A stop
+// drops it through the same count, so the owner's second take finds none.
+test "a parent's stop drops the parent's steering that was set aside too" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{ .operation_id = "op-5" };
+    var runtime = WorkerRuntime{ .hands_back_leftover_feedback = true };
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    var feedback = try makePrompt(alloc, "from the parent", "model");
+    feedback.steering_receipt = &receipt;
+    feedback.author = .parent;
+    try runtime.admitInteractivePrompt(alloc, feedback);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(?QueuedPrompt, null), try runtime.tryTakeNextPrompt(alloc));
+    try std.testing.expectEqual(@as(usize, 1), runtime.held_back_feedback.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.dropParentSteering(alloc));
+    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), runtime.held_back_feedback.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.dropParentSteering(alloc));
+}
+
+// A parent's steering the worker set aside is kept or counted, whichever
+// allocation fails. The sweep fails each allocation in turn, in the worker's
+// next take and in the owner's take of the leftovers. A copy that fails leaves
+// no list holding the message, so the lost count is what is left.
+test "a parent's steering message the worker cannot set aside is kept or counted as lost" {
+    const alloc = testing_allocator.no_resize;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var receipt = SteeringReceipt{ .operation_id = "op-5" };
+        var runtime = WorkerRuntime{ .hands_back_leftover_feedback = true };
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        runtime.active_turn_id = 9;
+        var feedback = try makePrompt(alloc, "from the parent", "model");
+        feedback.steering_receipt = &receipt;
+        feedback.author = .parent;
+        try runtime.admitInteractivePrompt(alloc, feedback);
+        runtime.finishProcessing();
+
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        if (runtime.tryTakeNextPrompt(failing.allocator())) |maybe_prompt| {
+            if (maybe_prompt) |prompt| freeQueuedPrompt(failing.allocator(), prompt);
+        } else |_| {}
+        {
+            const taken = runtime.takeLeftoverMessages(failing.allocator());
+            defer {
+                for (taken) |item| item.deinit(failing.allocator());
+                failing.allocator().free(taken);
+            }
+            try std.testing.expectEqual(@as(usize, 1), taken.len + runtime.takeLostSteering());
+        }
+        if (!failing.has_induced_failure) break;
+    }
+}
+
+// Two steering messages the worker cannot copy are each kept or counted as lost,
+// whichever copy fails: the messages taken and the lost count make both.
+test "leftover steering the worker cannot copy is counted as lost" {
+    const alloc = testing_allocator.no_resize;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var first_receipt = SteeringReceipt{ .operation_id = "op-7a" };
+        var second_receipt = SteeringReceipt{ .operation_id = "op-7b" };
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        runtime.active_turn_id = 9;
+        for ([_]*SteeringReceipt{ &first_receipt, &second_receipt }) |receipt| {
+            var feedback = try makePrompt(alloc, "from the parent", "model");
+            feedback.steering_receipt = receipt;
+            feedback.author = .parent;
+            try std.testing.expect(try runtime.admitActiveSteering(alloc, feedback));
+        }
+        runtime.finishProcessing();
+
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        {
+            const taken = runtime.takeLeftoverMessages(failing.allocator());
+            defer {
+                for (taken) |item| item.deinit(failing.allocator());
+                failing.allocator().free(taken);
+            }
+            try std.testing.expectEqual(@as(usize, 2), taken.len + runtime.takeLostSteering());
+        }
+        if (!failing.has_induced_failure) break;
+    }
+}
+
+test "a stop counts the parent's steering the worker lost" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.lost_parent_steering = 1;
+    try std.testing.expectEqual(@as(usize, 1), runtime.dropParentSteering(alloc));
+    try std.testing.expectEqual(@as(usize, 0), runtime.takeLostSteering());
+
+    var second = WorkerRuntime{};
+    defer second.deinit(alloc);
+    second.lost_parent_steering = 1;
+    const drop = second.dropAgentMessages(alloc);
+    try std.testing.expectEqual(@as(usize, 1), drop.from_parent);
 }
 
 test "a subagent's worker runs the user's steering its turn left as the next turn, as main does" {

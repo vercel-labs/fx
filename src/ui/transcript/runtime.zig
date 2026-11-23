@@ -4,6 +4,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const transcript_window_shell = @import("transcript_window_shell.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
+const agent_tool_presentation = @import("../../core/agent/runtime/tool_presentation.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -3178,6 +3179,31 @@ test "only a subagent report's detail carries the report mark" {
     try std.testing.expect(!runtime.toolDetailForEntry(call_id).?.subagent_report);
 }
 
+test "a resumed shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const check: types.ToolCall = .{ .id = "check", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const outputs = [_]struct { output: []const u8, ended: bool }{
+        .{ .output = "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"done\"}", .ended = true },
+        .{ .output = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", .ended = false },
+    };
+    for (outputs) |case| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Observed sleep 30", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, check, .command, .{
+            .tool_call_id = @constCast("check"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(case.output),
+            .output_bytes = case.output.len,
+            .stored_output_bytes = case.output.len,
+        });
+        try std.testing.expectEqual(case.ended, runtime.toolDetailForEntry(entry_id).?.check_found_command_ended);
+    }
+}
+
 test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -3808,6 +3834,8 @@ test "command output consolidation preserves current compact ownership" {
         .activity_kind = .command,
         .arguments_json = "{\"command\":\"stream\"}",
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running stream" } });
     const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
 
     var metrics: Metrics = .{};
@@ -3836,7 +3864,7 @@ test "command output consolidation preserves current compact ownership" {
     try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
     // The running command is still its compact group's header.
     try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "run_command") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Running") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
@@ -5446,6 +5474,7 @@ pub const TranscriptRuntime = struct {
                 terminal.result,
                 terminal.result_memory,
                 terminal.command_artifact_handle,
+                terminal.check_found_command_ended,
             ),
             .turn_finished => |finished| self.applyTurnFinishedLifecycle(
                 alloc,
@@ -6129,6 +6158,7 @@ pub const TranscriptRuntime = struct {
         result: ?[]const u8,
         result_memory: ?types.ToolResultMemory,
         command_artifact_handle: ?[]const u8,
+        check_found_command_ended: bool,
     ) !?types.ToolActivityKind {
         const record = self.notebook.lifecycle_state.recordPtr(id) orelse {
             if (self.notebook.lifecycle_state.isFenced(id.turn_id)) {
@@ -6208,6 +6238,7 @@ pub const TranscriptRuntime = struct {
             outcome.kind,
             &detail_update,
         );
+        if (self.toolDetailPtr(record.entry_id)) |detail| detail.check_found_command_ended = check_found_command_ended;
         return null;
     }
 
@@ -6567,6 +6598,10 @@ pub const TranscriptRuntime = struct {
             null;
         defer if (projected_shell_result) |value| alloc.free(value);
         const presentation_result = projected_shell_result orelse result.output;
+        var check_arena = std.heap.ArenaAllocator.init(alloc);
+        defer check_arena.deinit();
+        const check_found_command_ended = shell_command and
+            try agent_tool_presentation.checkFoundCommandEnded(check_arena.allocator(), call, result.output);
         const command_artifact_handle = if (!deferred and
             !permission_denied and
             activity_kind == .command and
@@ -6610,6 +6645,7 @@ pub const TranscriptRuntime = struct {
         if (self.toolDetailPtr(entry_id)) |detail| {
             detail.created_at_ms = result.created_at_ms;
             detail.origin = .recorded;
+            detail.check_found_command_ended = check_found_command_ended;
         }
     }
 
@@ -10477,6 +10513,18 @@ pub const TranscriptRuntime = struct {
                     if (scroll_facts.geometry_rebase) "true" else "false",
                     if (scroll_facts.recovery_rebase) "true" else "false",
                     if (normal_buffer_recovery_pending) "true" else "false",
+                    scroll_facts.target_visual_offset,
+                },
+            );
+            diagnostics.recordRenderEvent(
+                .transition,
+                "target_failed err={s} compatible={} geometry={} recovery={} restore={} target={d}",
+                .{
+                    @errorName(err),
+                    scroll_facts.source_compatible,
+                    scroll_facts.geometry_rebase,
+                    scroll_facts.recovery_rebase,
+                    normal_buffer_recovery_pending,
                     scroll_facts.target_visual_offset,
                 },
             );
