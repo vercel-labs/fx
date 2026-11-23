@@ -8051,6 +8051,7 @@ test "ACP legacy URL state requires consent and completion" {
         .host = &test_host,
         .writer = jsonrpc.Writer.init(),
     };
+    defer state.deinit();
     const origin = tool_mcp_runtime.InputOrigin{
         .wire = .legacy_mcp_2025_11,
         .server_name = "fixture",
