@@ -40,6 +40,12 @@ const poll_ms = 20;
 /// than growing this list without a limit.
 const max_pending_events: usize = 4096;
 
+/// Test seam: where the owner loop reports how many engine configs it holds,
+/// so a test can see that a freed key's config left the list. A test sets it
+/// before it starts a served owner and clears it after the thread joins;
+/// empty in the owner itself.
+var held_configs: ?*std.atomic.Value(usize) = null;
+
 pub fn isModeRaw(raw_args: []const [*:0]const u8) bool {
     return raw_args.len == 3 and std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), mode);
 }
@@ -185,11 +191,11 @@ const Owner = struct {
     /// may rehash and move the entries.
     configs: std.array_hash_map.String(OwnedConfig) = .empty,
     configs_mutex: std.Io.Mutex = .init,
-    /// The engine's configs, in slot order. Their strings live in
-    /// `engine_arena`, because the scratch arena that builds one is reset
-    /// before the next event.
-    engine_configs: std.ArrayList(engine.Config) = .empty,
-    engine_arena: std.heap.ArenaAllocator,
+    /// The engine's configs, in slot order: one entry per key the owner runs,
+    /// each with its own arena. A key's entry goes when its last client
+    /// leaves, so a long-lived owner holds only the keys in use, and the
+    /// engine is reloaded with the shorter list.
+    engine_configs: std.ArrayList(EngineEntry) = .empty,
 
     fn stopping(o: *Owner) bool {
         return o.stop.load(.acquire) or signal_stop.load(.acquire);
@@ -518,6 +524,7 @@ const Owner = struct {
     /// waiting.
     fn deinit(o: *Owner) void {
         const gpa = o.gpa;
+        for (o.engine_configs.items) |*entry| entry.deinit();
         o.engine_configs.deinit(gpa);
         for (o.events.items) |*event| event.deinit(gpa);
         o.events.deinit(gpa);
@@ -527,6 +534,20 @@ const Owner = struct {
             entry.value_ptr.deinit(gpa);
         }
         o.configs.deinit(gpa);
+    }
+};
+
+/// One key's engine config, with the arena that owns its strings: freed when
+/// the key's last client leaves, so the owner never holds a key it stopped
+/// running. The engine copies what it keeps, so an entry can go once the
+/// reload took it.
+const EngineEntry = struct {
+    config: engine.Config,
+    arena: std.heap.ArenaAllocator,
+
+    fn deinit(entry: *EngineEntry) void {
+        entry.arena.deinit();
+        entry.* = undefined;
     }
 };
 
@@ -640,10 +661,55 @@ fn keyFromName(name: []const u8) ?core.Key {
 }
 
 fn slotOf(owner: *Owner, key: core.Key) ?usize {
-    for (owner.engine_configs.items, 0..) |config, index| {
-        if (std.mem.eql(u8, config.name, &key)) return index;
+    for (owner.engine_configs.items, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.config.name, &key)) return index;
     }
     return null;
+}
+
+/// The engine's index for `key`, when the engine really has it: a reload that
+/// failed can leave the list and the engine one step apart, and this refuses
+/// to read a slot the engine does not have.
+fn liveSlotOf(owner: *Owner, engine_value: *const engine.Engine, key: core.Key) ?usize {
+    const index = slotOf(owner, key) orelse return null;
+    if (index >= engine_value.len()) return null;
+    return index;
+}
+
+/// Reloads the engine with the configs the owner holds, in the list's order.
+/// Kept slots end up in that order, so an index read from `engine_configs`
+/// after this names the same slot the engine has.
+fn reloadEngine(owner: *Owner, engine_value: *engine.Engine, a: Allocator) void {
+    const configs = a.alloc(engine.Config, owner.engine_configs.items.len) catch {
+        debug_trace.logf("mcp-owner", "owner engine not reloaded reason=out of memory configs={d}", .{owner.engine_configs.items.len});
+        return;
+    };
+    for (owner.engine_configs.items, configs) |entry, *config| config.* = entry.config;
+    engine_value.reload(configs) catch |err| {
+        debug_trace.logf("mcp-owner", "owner engine not reloaded reason={s} configs={d}", .{ @errorName(err), configs.len });
+    };
+}
+
+/// Drops a key's engine config and reloads, so the engine retires that key's
+/// slot and stops its server. False when the key had no entry, or the reload
+/// could not take the shorter list: then the entry stays, and the list still
+/// names every slot the engine has.
+fn removeEngineConfig(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) bool {
+    const index = slotOf(owner, key) orelse return false;
+    const configs = a.alloc(engine.Config, owner.engine_configs.items.len - 1) catch return false;
+    var at: usize = 0;
+    for (owner.engine_configs.items, 0..) |entry, i| {
+        if (i == index) continue;
+        configs[at] = entry.config;
+        at += 1;
+    }
+    engine_value.reload(configs) catch |err| {
+        debug_trace.logf("mcp-owner", "owner engine slot not dropped reason={s} key={s}", .{ @errorName(err), key[0..] });
+        return false;
+    };
+    var removed = owner.engine_configs.orderedRemove(index);
+    removed.deinit();
+    return true;
 }
 
 /// Stores a config whose key the route table accepted, taking ownership of its
@@ -672,8 +738,9 @@ fn storeConfig(owner: *Owner, key: core.Key, config: OwnedConfig) void {
         debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
     };
 }
-/// Drops a key's config once no session is left on it. The engine keeps the
-/// key's own config, so a later registration stores this one again.
+/// Drops a key's config once no session is left on it. A session that
+/// registers the key again stores a fresh one before its engine config is
+/// looked up.
 fn forgetConfig(owner: *Owner, key: core.Key) void {
     owner.configs_mutex.lockUncancelable(owner.io);
     defer owner.configs_mutex.unlock(owner.io);
@@ -719,8 +786,7 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
         debug_trace.logf("mcp-owner", "owner socket not private reason=set mode err={s}", .{@errorName(err)});
     };
 
-    var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version, .engine_arena = .init(gpa) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = io, .gpa = gpa, .stop = stop, .client_version = client_version };
     owner.last_open_ms = owner.now();
     var loop = io.concurrent(ownerLoopTask, .{&owner}) catch |err| {
         listener.deinit(io);
@@ -766,6 +832,55 @@ fn ownerLoopTask(owner: *Owner) std.Io.Cancelable!void {
     ownerLoop(owner);
 }
 
+/// The key of a shell event that could start a server, or null: a dropped
+/// server whose process still stops must not get a second copy beside it.
+fn startKey(event: *const ShellEvent) ?core.Key {
+    return switch (event.*) {
+        .register => |r| r.registered.key,
+        .call => |c| c.key,
+        .core => |e| switch (e) {
+            .need => |n| n.key,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Steps one shell event: the route table, the config it may carry, and the
+/// effects. False when it must wait — a server this owner dropped under its
+/// key is still stopping, and running it now could start a second copy of that
+/// name (`runtime.zig` holds the same requests for the same reason).
+fn stepShellEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratch: *std.heap.ArenaAllocator, shell_event: *ShellEvent) bool {
+    if (startKey(shell_event)) |key| if (engine_value.stopping(&key)) return false;
+    const event = shell_event.event();
+    // The route table applied this client's leave: its id can be used again
+    // once its tasks have ended too.
+    if (event == .gone) owner.markLeft(event.gone);
+    var output: core.Output = .{};
+    core.step(state, event, &output);
+    // A key the route table took stores its config now, before the engine
+    // config is built from it; a refused key stores none.
+    if (shell_event.acceptedConfig(output.effects())) |config| storeConfig(owner, shell_event.register.registered.key, config.take());
+    _ = scratch.reset(.retain_capacity);
+    apply(owner, state, engine_value, scratch, output.effects());
+    return true;
+}
+
+/// Keeps an event for a later pass, taking it from its caller. A full list
+/// drops it, as the event list itself does, and says so.
+fn holdEvent(owner: *Owner, held: *std.ArrayList(ShellEvent), event: ShellEvent) void {
+    var dropped = event;
+    if (held.items.len < max_pending_events) {
+        held.append(owner.gpa, event) catch |err| {
+            dropped.deinit(owner.gpa);
+            debug_trace.logf("mcp-owner", "owner event dropped reason=out of memory waiting={d} err={s}", .{ held.items.len, @errorName(err) });
+        };
+        return;
+    }
+    dropped.deinit(owner.gpa);
+    debug_trace.logf("mcp-owner", "owner event dropped reason=pending events at their cap waiting={d}", .{held.items.len});
+}
+
 fn ownerLoop(owner: *Owner) void {
     const io = owner.io;
     const gpa = owner.gpa;
@@ -782,9 +897,29 @@ fn ownerLoop(owner: *Owner) void {
     var state: core.State = .{};
     var taken: std.ArrayList(ShellEvent) = .empty;
     defer taken.deinit(gpa);
+    // Events waiting for a server this owner dropped to finish stopping. They
+    // are tried again after each pass of the engine, which sweeps what it
+    // dropped, and they stay in the order they were sent.
+    var held: std.ArrayList(ShellEvent) = .empty;
+    defer {
+        for (held.items) |*event| event.deinit(gpa);
+        held.deinit(gpa);
+    }
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     while (!owner.stopping()) {
+        // The held events go first: they were sent before whatever the list
+        // has now, and the engine has had a pass to sweep since.
+        var retry = held;
+        held = .empty;
+        for (retry.items) |*shell_event| {
+            if (stepShellEvent(owner, &state, &engine_value, &scratch, shell_event)) {
+                shell_event.deinit(gpa);
+                continue;
+            }
+            holdEvent(owner, &held, shell_event.*);
+        }
+        retry.deinit(gpa);
         // Effects can push events too (`issued`, `issue_failed`); they are
         // stepped before the engine is read, so a call never looks orphaned.
         while (true) {
@@ -792,18 +927,11 @@ fn ownerLoop(owner: *Owner) void {
             owner.takeEvents(&taken);
             if (taken.items.len == 0) break;
             for (taken.items) |*shell_event| {
-                const event = shell_event.event();
-                // The route table applied this client's leave: its id can be
-                // used again once its tasks have ended too.
-                if (event == .gone) owner.markLeft(event.gone);
-                var output: core.Output = .{};
-                core.step(&state, event, &output);
-                // A key the route table took stores its config now, before the
-                // engine config is built from it; a refused key stores none.
-                if (shell_event.acceptedConfig(output.effects())) |config| storeConfig(owner, shell_event.register.registered.key, config.take());
-                _ = scratch.reset(.retain_capacity);
-                apply(owner, &state, &engine_value, &scratch, output.effects());
-                shell_event.deinit(gpa);
+                if (stepShellEvent(owner, &state, &engine_value, &scratch, shell_event)) {
+                    shell_event.deinit(gpa);
+                    continue;
+                }
+                holdEvent(owner, &held, shell_event.*);
             }
         }
         if (engine_value.next(poll_ms)) |maybe| {
@@ -814,6 +942,9 @@ fn ownerLoop(owner: *Owner) void {
             debug_trace.logf("mcp-owner", "owner engine step failed err={s}", .{@errorName(err)});
         }
         owner.reapConnections();
+        // A test that watches the list reads it between iterations, after the
+        // step that changed it.
+        if (held_configs) |watch| watch.store(owner.engine_configs.items.len, .release);
         owner.mutex.lockUncancelable(io);
         const open = owner.open;
         const last = owner.last_open_ms;
@@ -896,24 +1027,27 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
         .register_slot => |slot| {
             // Under the map's lock until the engine config is built: a reader
             // may add another key meanwhile, and a put may move the entries.
+            if (slotOf(owner, slot.key) != null) continue;
             owner.configs_mutex.lockUncancelable(owner.io);
             const config = owner.configs.getPtr(&slot.key) orelse {
                 owner.configs_mutex.unlock(owner.io);
                 continue;
             };
-            if (slotOf(owner, slot.key) != null) {
+            var entry: EngineEntry = .{ .config = undefined, .arena = .init(owner.gpa) };
+            entry.config = engineConfig(entry.arena.allocator(), slot.key, config) catch {
+                entry.arena.deinit();
                 owner.configs_mutex.unlock(owner.io);
-                continue;
-            }
-            const built = engineConfig(owner.engine_arena.allocator(), slot.key, config) catch {
-                owner.configs_mutex.unlock(owner.io);
+                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory key={s}", .{slot.key[0..]});
                 continue;
             };
             owner.configs_mutex.unlock(owner.io);
-            owner.engine_configs.append(owner.gpa, built) catch continue;
-            engine_value.reload(owner.engine_configs.items) catch |err| {
-                debug_trace.logf("mcp-owner", "owner server not registered err={s}", .{@errorName(err)});
+            owner.engine_configs.append(owner.gpa, entry) catch {
+                var copy = entry;
+                copy.deinit();
+                debug_trace.logf("mcp-owner", "owner server not registered reason=out of memory key={s}", .{slot.key[0..]});
+                continue;
             };
+            reloadEngine(owner, engine_value, a);
         },
         .need => |need| {
             engine_value.needTools(&need.key) catch |err| {
@@ -956,13 +1090,15 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             debug_trace.logf("mcp-owner", "owner answer not sent err={s}", .{@errorName(err)});
         },
         .disconnect => |disconnect| {
+            // No session is left on the key: its config and its engine slot go
+            // with it, so a long-lived owner holds only the keys in use. The
+            // reload stops the server and retires the slot; a key the list does
+            // not hold is disconnected here instead.
+            forgetConfig(owner, disconnect.key);
+            if (removeEngineConfig(owner, engine_value, a, disconnect.key)) continue;
             engine_value.disconnect(&disconnect.key) catch |err| {
                 debug_trace.logf("mcp-owner", "owner server not disconnected err={s}", .{@errorName(err)});
             };
-            // No session is left on the key: its config goes with its slot, so
-            // a long-lived owner serves new keys without growing this map. A
-            // session that registers the key again stores it first.
-            forgetConfig(owner, disconnect.key);
         },
         .refuse => |refuse| {
             const conn = owner.connectionOf(refuse.to) orelse continue;
@@ -1005,7 +1141,7 @@ fn statusMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key:
     // A status asked for before the engine has the slot (registration, before
     // the first need) has nothing to say; a made-up idle phase would overwrite
     // the phase the phases before it told the client.
-    const index = slotOf(owner, key) orelse {
+    const index = liveSlotOf(owner, engine_value, key) orelse {
         debug_trace.logf("mcp-owner", "owner status dropped reason=no engine slot yet", .{});
         return null;
     };
@@ -1035,7 +1171,7 @@ fn statusMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key:
 /// Why the engine refused this server's last tool list, copied for the frame:
 /// null while it refused none. A session reads it in its own slot's status.
 fn refusalMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) ?[]const u8 {
-    const index = slotOf(owner, key) orelse return null;
+    const index = liveSlotOf(owner, engine_value, key) orelse return null;
     const words = engine_value.status(index).list_refusal orelse return null;
     return a.dupe(u8, words) catch null;
 }
@@ -1105,7 +1241,7 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
         .server => |server| switch (server) {
             .tools => |tools| core_event = .{ .engine_tools = .{ .key = key, .ok = tools.ok, .fresh = tools.fresh, .needs_auth = tools.needs_auth } },
             .elicit => |elicit| {
-                const version = if (slotOf(owner, key)) |index| engine_value.status(index).version else null;
+                const version = if (liveSlotOf(owner, engine_value, key)) |index| engine_value.status(index).version else null;
                 // The question's mode is JSON, read as JSON: a formatted
                 // `"mode": "url"` is a URL question, and a form whose text
                 // happens to name one is still a form.
@@ -1575,8 +1711,7 @@ test "an owner takes 300 connections in turn and still serves a new one" {
 test "the event list's cap drops the frame and still takes the connection's leave" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     defer owner.deinit();
     const pair = try testSocketPair("cap");
     defer pair.peer.close(testing.io);
@@ -1615,9 +1750,8 @@ test "the event list's cap drops the frame and still takes the connection's leav
 test "a connection whose reader cannot start is reaped, not freed under the table" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     owner.fail_task_start = .reader;
-    defer owner.engine_arena.deinit();
     defer owner.deinit();
     const pair = try testSocketPair("no-reader");
     defer pair.peer.close(testing.io);
@@ -1636,9 +1770,8 @@ test "a connection whose reader cannot start is reaped, not freed under the tabl
 test "a connection whose writer cannot start ends its reader and is reaped" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     owner.fail_task_start = .writer;
-    defer owner.engine_arena.deinit();
     defer owner.deinit();
     const pair = try testSocketPair("no-writer");
     defer pair.peer.close(testing.io);
@@ -1660,8 +1793,7 @@ test "a connection whose writer cannot start ends its reader and is reaped" {
 test "a client the owner disconnects is ended, reaped, and its id used again" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     defer owner.deinit();
     const first = try testSocketPair("owner-drop-1");
     defer first.peer.close(testing.io);
@@ -1710,8 +1842,7 @@ test "a client the owner disconnects is ended, reaped, and its id used again" {
 test "a registration the route table refuses stores no config, so the map stays at the key limit" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     defer owner.deinit();
     const id: core.ClientId = @fromBackingInt(1);
     var state: core.State = .{};
@@ -1739,8 +1870,7 @@ test "a registration the route table refuses stores no config, so the map stays 
 test "an event still queued when the owner stops is freed with its strings" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     const tool = try alloc.dupe(u8, "echo");
     const arguments = try alloc.dupe(u8, "{}");
     owner.push(.{ .call = .{ .client = @fromBackingInt(1), .id = 1, .key = test_key, .tool = tool, .arguments = arguments } });
@@ -1781,10 +1911,15 @@ test "every key a session leaves is free for the next one, past the slot limit" 
     try fixture.init();
     defer fixture.deinit();
     var stop = std.atomic.Value(bool).init(false);
+    // The owner loop reports how many engine configs it holds, so the test can
+    // see each key's entry leave when the session leaves that key.
+    var held = std.atomic.Value(usize).init(std.math.maxInt(usize));
+    held_configs = &held;
     const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
     defer {
         stop.store(true, .release);
         thread.join();
+        held_configs = null;
     }
     const path = try socketPath(alloc, home);
     defer alloc.free(path);
@@ -1801,6 +1936,14 @@ test "every key a session leaves is free for the next one, past the slot limit" 
         const argv = [_][]const u8{"true"};
         try client.send(.{ .register = .{ .key = key, .config = .{ .argv = &argv }, .ask_form = true, .ask_url = true } });
         try client.send(.{ .unregister = .{ .key = key } });
+    }
+    // Every key this session left took its engine config with it, so the
+    // owner's list holds nothing for them.
+    const drained = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (held.load(.acquire) != 0) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > drained) return error.ConfigsNeverLeft;
+        // Polls the owner loop's report, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     // The last key registers: asking for its server reaches the engine, which
     // starts it, so a phase frame about that key arrives. A refused
@@ -1833,13 +1976,19 @@ test "every key a session leaves is free for the next one, past the slot limit" 
         break;
     }
     try testing.expect(seen);
+    // The list holds the one key in use, and nothing of the 300 before it.
+    const grew = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (held.load(.acquire) != 1) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > grew) return error.NewConfigNotHeld;
+        // Polls the owner loop's report, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
 }
 
 test "a key's config goes when its last client leaves, and its engine slot stays" {
     const alloc = testing.allocator;
     var stop = std.atomic.Value(bool).init(false);
-    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
-    defer owner.engine_arena.deinit();
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version };
     defer owner.deinit();
     storeConfig(&owner, test_key, try ownConfig(alloc, .{ .argv = &.{"server"} }));
     try testing.expectEqual(@as(usize, 1), owner.configs.count());
