@@ -7423,6 +7423,7 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
     try attachOpenerForTest(&session, &state);
+    defer releaseTestSession(&state, &session);
     session.outbound = .{};
     defer session.outbound.pending.deinit(state.alloc);
 
