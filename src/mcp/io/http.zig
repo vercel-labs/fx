@@ -22,7 +22,7 @@ pub const Options = struct {
     /// Headers the host configured for every request, such as an API key.
     headers: []const std.http.Header = &.{},
     /// The largest JSON body or SSE event.
-    max_message: usize = 16 * 1024 * 1024,
+    max_message: usize = @import("limits.zig").max_message_bytes,
     max_in_flight: usize = 32,
     /// Rung after each post, for a host that reads many clients.
     bell: ?*Bell = null,

@@ -47,7 +47,7 @@
   {
     "module": "Engine",
     "unit": "U12",
-    "also": ["Engine.lost.cfg"]
+    "also": ["Engine.idle.cfg", "Engine.lost.cfg"]
   },
   {
     "module": "Backpressure",

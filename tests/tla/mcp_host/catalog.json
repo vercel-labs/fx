@@ -139,5 +139,12 @@
       { "config": "Connect.findings-reissue.cfg", "invariant": "NoReissue" }
     ],
     "repair": []
+  },
+  {
+    "module": "SharedServers",
+    "smoke": "SharedServers.cfg",
+    "stress": "SharedServers.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]
