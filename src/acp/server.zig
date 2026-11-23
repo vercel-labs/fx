@@ -5098,29 +5098,37 @@ fn answerTurnPrompt(
     return answerSenderLocked(active.session, &audience, active.alloc, from, id, need, with, without);
 }
 
-/// A `session/close` while another member remains: the closing client's own running prompt
-/// gets `cancelled` now, before the close's own answer, because the closing client is still a
-/// member here. The turn goes on for the others. The last member's close does not come here:
-/// `cancelAndReapPrompt` cancels its turn. A turn that steers started has no prompt of its own
-/// to answer, so it is left alone.
+/// A `session/close` while another member remains. The closing client's own running prompt, and
+/// each steer its running turn has taken, get `cancelled` now, before the close's own answer. The
+/// turn goes on for the others. The taken steers leave the turn's list, so its end does not answer
+/// them again. The last member's close does not come here: `cancelAndReapPrompt` cancels its turn.
+/// A turn that steers started has no prompt of its own to answer, so its prompt is left alone.
 fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
     if (comptime !follow_supported) return;
     var audience = lockAudience(session);
     defer audience.unlock();
     if (session.members.items.len <= 1) return;
-    // The turn is read under the line lock, as the cancel path reads it. The write below runs
-    // after that lock is released, as the other line-lock paths do. The turn cannot finish
-    // while this holds `audience_mutex`, because its own answer needs that lock, so the
-    // request id it names stays valid.
-    const id = owed: {
+    // The turn and its steering are read under the line lock, as the cancel path reads them. The
+    // writes run after that lock is released, as the other line-lock paths do. The turn cannot
+    // finish while this holds `audience_mutex`, because its own answers need that lock, so the
+    // request ids named here stay valid.
+    var taken: std.ArrayList(libfx_steering.Sender) = .empty;
+    defer {
+        libfx_steering.freeSenders(state.alloc, taken.items);
+        taken.deinit(state.alloc);
+    }
+    const owed: ?jsonrpc.RequestId = blk: {
         session.waiting_prompts.lock();
         defer session.waiting_prompts.unlock();
-        const active = session.prompt orelse return;
-        if (active.answered or active.from != state.connection_id or active.group_ids.len != 0) return;
-        const request_id = active.msg.id orelse return;
+        session.steering.takeAbsorbedFrom(state.alloc, state.connection_id, &taken) catch |err|
+            debug_trace.logf("acp", "failed to take the closing client's taken steers err={s}", .{@errorName(err)});
+        const active = session.prompt orelse break :blk null;
+        if (active.answered or active.from != state.connection_id or active.group_ids.len != 0) break :blk null;
+        const request_id = active.msg.id orelse break :blk null;
         active.answered = true;
-        break :owed request_id;
+        break :blk request_id;
     };
+    if (owed == null and taken.items.len == 0) return;
     var body: std.Io.Writer.Allocating = .init(state.alloc);
     defer body.deinit();
     acp_types.writePromptResponse(&body.writer, .cancelled) catch |err| {
@@ -5128,8 +5136,10 @@ fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
         return;
     };
     const answer: Answer = .{ .response = body.written() };
-    answerSenderLocked(session, &audience, state.alloc, state.connection_id, id, .none, answer, answer) catch |err|
+    if (owed) |id| answerSenderLocked(session, &audience, state.alloc, state.connection_id, id, .none, answer, answer) catch |err|
         debug_trace.logf("acp", "failed to answer a closing prompt err={s}", .{@errorName(err)});
+    for (taken.items) |steer| answerSenderLocked(session, &audience, state.alloc, state.connection_id, steer.id, .none, answer, answer) catch |err|
+        debug_trace.logf("acp", "failed to answer a closing steer err={s}", .{@errorName(err)});
 }
 
 /// Answers a turn that ended: the prompt that started it, or each steer that

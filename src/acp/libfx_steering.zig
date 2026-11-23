@@ -574,6 +574,32 @@ pub const Runtime = struct {
         }
     }
 
+    /// Moves the steers that connection `from` sent and the turn has taken into `out`, so the caller
+    /// answers them now. The turn's end then finds none of them and does not answer them again.
+    /// `out` gets room for every match before anything moves, so a failure takes nothing.
+    pub fn takeAbsorbedFrom(
+        self: *Runtime,
+        alloc: Allocator,
+        from: connection.ConnectionId,
+        out: *std.ArrayList(Sender),
+    ) Allocator.Error!void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.absorbed.items) |sender| {
+            if (connection.sameConnection(sender.from, from)) count += 1;
+        }
+        try out.ensureUnusedCapacity(alloc, count);
+        var index: usize = 0;
+        while (index < self.absorbed.items.len) {
+            if (!connection.sameConnection(self.absorbed.items[index].from, from)) {
+                index += 1;
+                continue;
+            }
+            out.appendAssumeCapacity(self.absorbed.orderedRemove(index));
+        }
+    }
+
     pub fn close(self: *Runtime, alloc: Allocator, reason: []const u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
