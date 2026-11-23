@@ -52,8 +52,12 @@ fn validateModel(model: []const u8) !void {
 
 /// The capabilities every Codex provider bundle declares, in the CLI and in
 /// libfx. `buildRequest` never writes an output limit, so a resend that only
-/// raises the limit would repeat the request.
-pub const bundle_capabilities: provider_set.Bundle.Capabilities = .{ .sends_output_limit = false };
+/// raises the limit would repeat the request. The Codex models catalog lists
+/// every model the account can use, so it checks subagent overrides.
+pub const bundle_capabilities: provider_set.Bundle.Capabilities = .{
+    .sends_output_limit = false,
+    .authoritative_model_catalog = true,
+};
 
 pub fn buildRequest(
     alloc: Allocator,

@@ -3067,22 +3067,16 @@ pub const Runtime = struct {
 
     /// Resolves a creation-time model override against the model catalog before
     /// any child session exists, so an unknown or ambiguous name fails fast
-    /// with actionable guidance instead of dying in the child after a wasted
-    /// gateway request. Without a resolver (or a ready catalog) the raw
-    /// override passes through and the gateway remains the final arbiter.
+    /// with actionable guidance instead of failing in the child after a model
+    /// request. The surface's resolver answers `no_catalog` when the active
+    /// provider's catalog is not authoritative (`Bundle.Capabilities`) or not
+    /// ready; the raw override then passes through and the provider decides.
     fn resolveOverrideModel(
         alloc: Allocator,
         override: model_contract.Override,
         options: ExecuteOptions,
     ) !OverrideModelResolution {
         const raw_model = override.model orelse return .{ .accepted = null };
-        // Only the gateway catalog is an authoritative model list. Configured
-        // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
-        // so overrides for those children pass through to the provider.
-        if (options.defaults.provider != .gateway) {
-            debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
-            return .{ .accepted = null };
-        }
         const resolver = options.model_override_resolver orelse {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
             return .{ .accepted = null };
@@ -8729,6 +8723,8 @@ const OverrideResolverFixture = struct {
     runs: usize = 0,
     observed_model: ?[]u8 = null,
     catalog: []const []const u8 = &.{ "openai/gpt-5.6-terra", "openai/gpt-5.6-terra-fast", "openai/gpt-6-astra" },
+    /// False answers as a surface does when its active provider has no authoritative catalog.
+    catalog_authoritative: bool = true,
 
     fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
         return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
@@ -8750,6 +8746,7 @@ const OverrideResolverFixture = struct {
 
     fn resolveModel(raw: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!model_contract.ModelCatalogMatch {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (!self.catalog_authoritative) return .no_catalog;
         return model_contract.matchCatalogModel(alloc, self.catalog, raw_model);
     }
 };
@@ -8843,32 +8840,129 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expectEqual(@as(usize, 0), registry.children.len);
 }
 
-test "model override passes through for non-gateway providers" {
+/// The catalog a Codex account lists, as the Codex provider serves it.
+const codex_catalog = [_][]const u8{ "gpt-5.6-luna", "gpt-5.4-mini" };
+
+/// Sends one message that names `model` (or none) as `provider`, through `fixture`'s resolver.
+fn executeOverrideMessage(
+    arena: Allocator,
+    alloc: Allocator,
+    runtime: *Runtime,
+    parent: *child_state.TestParent,
+    fixture: *OverrideResolverFixture,
+    provider: model_provider.ProviderId,
+    model: ?[]const u8,
+    invocation_id: []const u8,
+) !ManagedExecutionResult {
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = model } });
+    defer request.deinit(alloc);
+    return runtime.executeManaged(arena, &request, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = invocation_id,
+        .defaults = .{ .provider = provider, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .model_override_resolver = .{ .context = fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
+    });
+}
+
+test "a Codex model override is checked against the catalog before child creation" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
     var parent: child_state.TestParent = undefined;
     try parent.init(alloc);
     defer parent.deinit();
-    var fixture = OverrideResolverFixture{};
+    var fixture = OverrideResolverFixture{ .catalog = &codex_catalog };
     defer if (fixture.observed_model) |model| alloc.free(model);
     const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
-    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "unknown-model" } });
-    defer request.deinit(alloc);
-    const result = try runtime.executeManaged(arena, &request, .{
-        .caller_id = parent.parent.id(),
-        .invocation_id = "override-non-gateway",
-        .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
-        .max_result_bytes = 4096,
-        .timestamp_ms = 1,
-        .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
-    });
+    const result = try executeOverrideMessage(arena_state.allocator(), alloc, runtime, &parent, &fixture, .codex, "gpt-5.4-unlisted", "codex-unlisted");
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.find(u8, result.body, "\"error_code\":\"unknown_model\"") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "gpt-5.4-unlisted") != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.runs);
+    var lock = runtime.managed.state_store.acquireLock();
+    defer lock.release();
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), registry.children.len);
+}
 
-    // The configured provider accepts arbitrary model IDs, so the raw override
-    // reaches the child even though the gateway catalog lacks it.
+test "a Codex model override resolves to the catalog's model ID" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{ .catalog = &codex_catalog };
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const result = try executeOverrideMessage(arena_state.allocator(), alloc, runtime, &parent, &fixture, .codex, "GPT-5.4-MINI", "codex-listed");
+    try std.testing.expect(result.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", fixture.observed_model.?);
+}
+
+test "a Codex model override passes through when the catalog is unavailable" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{ .catalog = &.{} };
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const result = try executeOverrideMessage(arena_state.allocator(), alloc, runtime, &parent, &fixture, .codex, "any-codex-model", "codex-unavailable");
+    try std.testing.expect(result.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqualStrings("any-codex-model", fixture.observed_model.?);
+}
+
+test "a Codex subagent without a model override keeps the parent's model" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{ .catalog = &codex_catalog };
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const result = try executeOverrideMessage(arena_state.allocator(), alloc, runtime, &parent, &fixture, .codex, null, "codex-inherit");
+    try std.testing.expect(result.success);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
+    try std.testing.expectEqualStrings("parent-model", fixture.observed_model.?);
+}
+
+test "a configured provider's model override passes through without a catalog check" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = OverrideResolverFixture{ .catalog = &codex_catalog, .catalog_authoritative = false };
+    defer if (fixture.observed_model) |model| alloc.free(model);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    // A configured connection accepts arbitrary model IDs, so the raw override reaches the child.
+    var provider = model_provider.parse("fixture-provider").?;
+    provider.configured.binding = @splat(0);
+    const result = try executeOverrideMessage(arena_state.allocator(), alloc, runtime, &parent, &fixture, provider, "unknown-model", "configured-passthrough");
     try std.testing.expect(result.success);
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);

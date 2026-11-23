@@ -2716,6 +2716,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const route = ctx.routeView(session);
     const bundle = ctx.state.cfg.provider_set.select(route.provider);
+    if (!bundle.capabilities.authoritative_model_catalog) return .no_catalog;
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
     _ = ctx.capabilityResolver().resolveWithin(
         ctx.state.alloc,

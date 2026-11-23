@@ -446,9 +446,27 @@ function codexLatestToolResult(body: string): { callId: string; output: string }
   return { callId: result.call_id, output: result.output };
 }
 
+/** The distinct outputs the requests carry for one tool call; each later request replays earlier results. */
+function codexToolOutputs(requests: Array<{ body: string }>, callId: string): string[] {
+  const outputs = new Set<string>();
+  for (const request of requests) {
+    const parsed = JSON.parse(request.body) as {
+      input?: Array<{ type?: string; call_id?: string; output?: string }>;
+    };
+    for (const item of parsed.input ?? []) {
+      if (item.type === "function_call_output" && item.call_id === callId && item.output !== undefined) {
+        outputs.add(item.output);
+      }
+    }
+  }
+  return [...outputs];
+}
+
 function startAcpFakeCodex(options: {
   unauthorizedResponses?: number;
   route?: (body: string) => string | Promise<string>;
+  /** Restricts the served catalog to these slugs. Unset serves every built-in model. */
+  catalogSlugs?: string[];
 } = {}) {
   const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale");
   const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh");
@@ -466,10 +484,13 @@ function startAcpFakeCodex(options: {
       const recorded = { path, authorization: request.headers.get("authorization") };
       if (path === "/models") {
         modelRequests.push(recorded);
-        return Response.json({ models: [
+        const builtIn = [
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+        ];
+        return Response.json({ models: [
+          ...builtIn.filter((model) => options.catalogSlugs === undefined || options.catalogSlugs.includes(model.slug)),
           ...extraModels.map((slug) => ({ slug, visibility: "list", supported_in_api: true })),
         ] });
       }
@@ -12461,6 +12482,70 @@ describe("acp: model-independent", () => {
       } finally {
         await acp?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP rejects a Codex subagent model missing from the catalog before any child request",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-subagent-model-");
+      const unlistedCallId = "acp_codex_unlisted_model";
+      const listedCallId = "acp_codex_listed_model";
+      const unlistedModel = "gpt-5.4-mini";
+      const listedModel = "gpt-5.6-luna";
+      const childPrompt = "Reply with the single word done.";
+      const route = (body: string) => {
+        if (!body.includes('"name":"subagent"')) return codexFinalText("child done");
+        if (body.includes("Subagent report (untrusted agent output")) return codexFinalText("ACP_CODEX_REPORT_TURN");
+        const result = codexLatestToolResult(body);
+        if (result?.callId === unlistedCallId) {
+          return codexToolCall(listedCallId, "subagent", {
+            request: { action: "message", agent: "listed-helper", model: listedModel, message: childPrompt },
+          });
+        }
+        if (result?.callId === listedCallId) return codexFinalText("ACP_CODEX_PARENT_DONE");
+        return codexToolCall(unlistedCallId, "subagent", {
+          request: { action: "message", agent: "unlisted-helper", model: unlistedModel, message: childPrompt },
+        });
+      };
+      const gateway = startFakeGateway([]);
+      // The served catalog lacks gpt-5.4-mini, so the override must fail before any child exists.
+      const codex = startAcpFakeCodex({ catalogSlugs: [listedModel, "gpt-5.6-sol"], route });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+        });
+        await startAutoSession(client);
+        await client.request("session/set_config_option", { configId: "provider", value: "codex" }, 4);
+
+        const result = await runPrompt(client, "Delegate two replies.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "the listed model's child request",
+          () => codex.requests.some((request) => JSON.parse(request.body).model === listedModel),
+          TIMEOUT,
+        );
+        const outputs = (callId: string) => codexToolOutputs(codex.requests, callId);
+        expect(outputs(unlistedCallId)).toHaveLength(1);
+        expect(outputs(unlistedCallId)[0]).toContain('"error_code":"unknown_model"');
+        expect(outputs(unlistedCallId)[0]).toContain(unlistedModel);
+        expect(outputs(listedCallId)).toHaveLength(1);
+        expect(outputs(listedCallId)[0]).toContain("Sent to listed-helper");
+        expect(codex.requests.map((request) => JSON.parse(request.body).model)).not.toContain(unlistedModel);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        codex.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
