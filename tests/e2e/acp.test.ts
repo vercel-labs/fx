@@ -16102,6 +16102,59 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a follower that is the last client and closes during its own running prompt gets cancelled, the turn is saved as interrupted, and fx acp exits 0 after stdin ends",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follower-last-close-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => heldReply.promise, finalText("UNUSED")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const opener = started.owner;
+        owner = opener;
+        const joined = await followSession(started.socket, started.sessionId, root);
+        follower = joined;
+
+        // The opener leaves first, so the follower is the last client when its own prompt runs.
+        const openerClosed = (await opener.request("session/close", { sessionId: started.sessionId }, 20)) as any;
+        expect(openerClosed.error).toBeUndefined();
+        expect(openerClosed.result).toEqual({});
+
+        const promptId = joined.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_RUNNING" }],
+        });
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+
+        const closed = await joined.request("session/close", { sessionId: started.sessionId });
+        expect(closed.answer.error).toBeUndefined();
+        expect(closed.answer.result).toEqual({});
+        expect(closed.before.find((message) => message.id === promptId)?.result?.stopReason).toBe("cancelled");
+
+        // The turn stops: it saves as interrupted, and no further model request goes out.
+        await waitForCondition(
+          "the cancelled turn saved as interrupted",
+          () => logLines(root.home, started.sessionId).some((line) => line.kind === "turn_interrupted"),
+          TIMEOUT,
+        );
+        expect(gateway.requests).toHaveLength(2);
+
+        opener.endStdin();
+        expect(await opener.waitForExit(TIMEOUT)).toBe(0);
+        expect(opener.stderr).toBe("");
+      } finally {
+        heldReply.resolve(finalText("UNUSED"));
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a prompt the opener queued behind its turn never runs once the opener leaves while a follower remains",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-stays-open-queue-");
