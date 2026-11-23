@@ -5098,11 +5098,13 @@ fn answerTurnPrompt(
     return answerSenderLocked(active.session, &audience, active.alloc, from, id, need, with, without);
 }
 
-/// A `session/close` while another member remains. The closing client's own running prompt, and
-/// each steer its running turn has taken, get `cancelled` now, before the close's own answer. The
-/// turn goes on for the others. The taken steers leave the turn's list, so its end does not answer
-/// them again. The last member's close does not come here: `cancelAndReapPrompt` cancels its turn.
-/// A turn that steers started has no prompt of its own to answer, so its prompt is left alone.
+/// A `session/close` while another member remains. The closing client's own running prompt, and each
+/// steer its running turn has taken, get `cancelled` now, before the close's own answer. A steer that
+/// started the turn is that turn's running prompt, so it gets the same answer. The turn goes on for the
+/// others. The taken steers leave the turn's list, and the steers that started the turn are marked, so
+/// the turn's end does not answer them again. The last member's close does not come here:
+/// `cancelAndReapPrompt` cancels its turn. A turn that a steer started has no prompt of its own, so its
+/// prompt is left alone.
 fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
     if (comptime !follow_supported) return;
     var audience = lockAudience(session);
@@ -5117,18 +5119,25 @@ fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
         libfx_steering.freeSenders(state.alloc, taken.items);
         taken.deinit(state.alloc);
     }
+    var started: std.ArrayList(jsonrpc.RequestId) = .empty;
+    defer started.deinit(state.alloc);
     const owed: ?jsonrpc.RequestId = blk: {
         session.waiting_prompts.lock();
         defer session.waiting_prompts.unlock();
         session.steering.takeAbsorbedFrom(state.alloc, state.connection_id, &taken) catch |err|
             debug_trace.logf("acp", "failed to take the closing client's taken steers err={s}", .{@errorName(err)});
         const active = session.prompt orelse break :blk null;
-        if (active.answered or active.from != state.connection_id or active.group_ids.len != 0) break :blk null;
+        if (active.group_ids.len != 0) {
+            libfx_steering.markAnsweredFrom(state.alloc, active.group_ids, state.connection_id, &started) catch |err|
+                debug_trace.logf("acp", "failed to mark the closing client's steers that started the turn err={s}", .{@errorName(err)});
+            break :blk null;
+        }
+        if (active.answered or active.from != state.connection_id) break :blk null;
         const request_id = active.msg.id orelse break :blk null;
         active.answered = true;
         break :blk request_id;
     };
-    if (owed == null and taken.items.len == 0) return;
+    if (owed == null and taken.items.len == 0 and started.items.len == 0) return;
     var body: std.Io.Writer.Allocating = .init(state.alloc);
     defer body.deinit();
     acp_types.writePromptResponse(&body.writer, .cancelled) catch |err| {
@@ -5139,6 +5148,8 @@ fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
     if (owed) |id| answerSenderLocked(session, &audience, state.alloc, state.connection_id, id, .none, answer, answer) catch |err|
         debug_trace.logf("acp", "failed to answer a closing prompt err={s}", .{@errorName(err)});
     for (taken.items) |steer| answerSenderLocked(session, &audience, state.alloc, state.connection_id, steer.id, .none, answer, answer) catch |err|
+        debug_trace.logf("acp", "failed to answer a closing steer err={s}", .{@errorName(err)});
+    for (started.items) |id| answerSenderLocked(session, &audience, state.alloc, state.connection_id, id, .none, answer, answer) catch |err|
         debug_trace.logf("acp", "failed to answer a closing steer err={s}", .{@errorName(err)});
 }
 
@@ -5158,10 +5169,10 @@ fn publishTurnOutcome(
         publishPromptOutcome(active, from, owner, outcome) catch |err|
             debug_trace.logf("acp", "failed to answer a prompt err={s}", .{@errorName(err)});
     }
-    for (group) |sender| writeSteeringOutcome(active, sender, outcome, .next_turn) catch |err|
+    for (group) |*sender| writeGroupSteerOutcome(active, sender, outcome) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
     const value = finished orelse return;
-    for (value.absorbed) |sender| writeSteeringOutcome(active, sender, outcome, .absorbed) catch |err|
+    for (value.absorbed) |sender| writeSteeringOutcome(active, sender, outcome, .absorbed, null) catch |err|
         debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
 }
 
@@ -5205,6 +5216,7 @@ fn writeSteeringOutcome(
     sender: libfx_steering.Sender,
     outcome: prompt_handler.TerminalOutcome,
     delivery: acp_types.SteeringDelivery,
+    audience: ?*Audience,
 ) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
@@ -5220,10 +5232,38 @@ fn writeSteeringOutcome(
             defer active.alloc.free(with);
             const without = try steerResponse(active, stop_reason, null);
             defer active.alloc.free(without);
-            try answerSender(active.session, active.alloc, sender.from, sender.id, .{ .extension = .prompt_delivery }, .{ .response = with }, .{ .response = without });
+            try answerSteer(active, audience, sender, .{ .extension = .prompt_delivery }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
+        .rpc_error => |rpc_error| try answerSteer(active, audience, sender, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
+}
+
+/// Writes one steer's answer. `audience` is given when the caller holds `audience_mutex`, and the
+/// answer then goes through it; otherwise `answerSender` takes the lock.
+fn answerSteer(
+    active: *ActivePrompt,
+    audience: ?*Audience,
+    sender: libfx_steering.Sender,
+    need: RunningCopy.Need,
+    with: Answer,
+    without: Answer,
+) !void {
+    if (audience) |locked| return answerSenderLocked(active.session, locked, active.alloc, sender.from, sender.id, need, with, without);
+    return answerSender(active.session, active.alloc, sender.from, sender.id, need, with, without);
+}
+
+/// Answers a steer that started the turn (`next_turn`). A close that left another member has answered
+/// it already (`answerClosingTurn`), so the turn's end skips it. The check and the answer share one
+/// hold of `audience_mutex`.
+fn writeGroupSteerOutcome(active: *ActivePrompt, sender: *const libfx_steering.Sender, outcome: prompt_handler.TerminalOutcome) !void {
+    if (comptime !follow_supported) return writeSteeringOutcome(active, sender.*, outcome, .next_turn, null);
+    var audience = lockAudience(active.session);
+    defer audience.unlock();
+    if (sender.answered) {
+        traceDroppedAnswer(active.session, sender.id, "answered_at_close", null);
+        return;
+    }
+    return writeSteeringOutcome(active, sender.*, outcome, .next_turn, &audience);
 }
 
 /// The response to a steer's turn stop, with its delivery when given. The caller frees the result.

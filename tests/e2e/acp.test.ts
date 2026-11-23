@@ -16236,6 +16236,74 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a steer that started a turn is answered cancelled when its client closes the session while another client remains, and the turn goes on for the other client",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-close-group-steer-");
+      const first = heldFakeGatewayFinalText();
+      const second = heldFakeGatewayFinalText();
+      // The opener cancels the first reply, so the follower's steer waits and then starts the next turn. That turn's
+      // reply waits until the test releases it, so the follower can close while the turn runs.
+      const gateway = startFakeGateway([finalText("TURN_ONE"), first.response, second.response, finalText("OPENER_AFTER_CLOSE")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const opener = started.owner;
+        owner = opener;
+        const joined = await followSession(started.socket, started.sessionId, root);
+        follower = joined;
+
+        sendPrompt(opener, 10, "RUNNING_PROMPT");
+        await waitForCondition("the first model reply", () => gateway.requests.length === 2, TIMEOUT);
+        const steerId = joined.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "GROUP_STEER" }],
+          _meta: { "sh.fx/delivery": "steer" },
+        });
+        // The refused prompt is answered after the steer, so the steer is queued when this returns.
+        await expectRefusedWhileRunning(joined, started.sessionId);
+
+        opener.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: started.sessionId } });
+        await waitForCondition(
+          "the opener's prompt is answered cancelled",
+          () => opener.rawLines.map((line) => JSON.parse(line)).some((message) => message.id === 10 && message.result?.stopReason === "cancelled"),
+          TIMEOUT,
+        );
+        await waitForCondition(
+          "the next turn starts with the steer as its model request",
+          () => gateway.requests.length === 3 && gateway.requests[2].body.includes("GROUP_STEER"),
+          TIMEOUT,
+        );
+
+        const closed = await joined.request("session/close", { sessionId: started.sessionId });
+        expect(closed.answer.error).toBeUndefined();
+        expect(closed.answer.result).toEqual({});
+        const steerAt = joined.received.findIndex((message) => message.id === steerId);
+        const closeAt = joined.received.indexOf(closed.answer);
+        expect(steerAt).toBeGreaterThanOrEqual(0);
+        expect(steerAt).toBeLessThan(closeAt);
+        expect(joined.received[steerAt].result?.stopReason).toBe("cancelled");
+
+        // The turn goes on for the opener, and the follower gets nothing more for the session.
+        second.release("GROUP_TURN_END");
+        await waitForCondition("the opener sees the turn's reply", () => opener.rawLines.some((line) => line.includes("GROUP_TURN_END")), TIMEOUT);
+        await waitForCondition("the turn is saved", () => savedText(root.home, started.sessionId).includes("GROUP_TURN_END"), TIMEOUT);
+        const afterClose = joined.received.slice(closeAt + 1);
+        expect(afterClose.filter((message) => message.method === "session/update" || message.id === steerId)).toEqual([]);
+        expect(opener.stderr).toBe("");
+      } finally {
+        first.dispose();
+        second.dispose();
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a prompt the opener queued behind its turn never runs once the opener leaves while a follower remains",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-stays-open-queue-");
