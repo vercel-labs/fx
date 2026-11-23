@@ -915,6 +915,64 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a named wait between bare waits keeps the group it has live after resume, with the messages that came between them",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    const notes = ["On the model checks.", "Fixes pushed."];
+    let session: TmuxSession | undefined;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const prompt = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        const sent = toolResultsAfter(prompt, CHILD_MARKER);
+        // Each message, and the report, goes while main waits for it.
+        await session!.waitForPane(() => waitsBegun() > sent, TIMEOUT);
+        if (sent < notes.length) {
+          return fakeGatewayToolCall(`lander_note_${sent}`, "subagent", { request: { action: "message", agent: "parent", message: notes[sent] } });
+        }
+        return fakeGatewayFinalText("Landed block B.");
+      }
+      // Two commands, the start, then a bare wait, a wait that names
+      // lander, and a bare wait, with no text between them.
+      const step = toolResultsAfter(prompt, "MIXED_WAITS");
+      if (step <= 1) return fakeGatewayToolCall(`check_${step}`, "shell", { action: "run", command: "sh check.sh status" });
+      if (step === 2) return fakeGatewayToolCall("land", "subagent", { action: "message", agent: "lander", message: `${CHILD_MARKER} Land block B.` });
+      if (step === 3 || step === 5) return fakeGatewayToolCall(`wait_${step}`, "subagent", { action: "wait" });
+      if (step === 4) return fakeGatewayToolCall("wait_lander", "subagent", { action: "wait", agent: "lander" });
+      return fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox" };
+    session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("MIXED_WAITS");
+    await session.waitForText("LANDED", TIMEOUT);
+    const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+    expect(waitsBegun()).toBe(3);
+    // The calls share one group, the start and the named wait share
+    // lander's row, and the bare waits take both messages.
+    expect(live).toEqual([
+      "● Ran commands, waited for a subagent ✓",
+      "├ Ran sh check.sh status ×2",
+      "├ Waited for lander",
+      "└ Waited for lander · 2 messages",
+      "● lander finished",
+    ]);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(paneLines(await resumed.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line))).toEqual(live);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
   "the collapsed view keeps one line per group",
   async () => {
     const { pane } = await runStory(FAILING_BUILD, {
