@@ -84,6 +84,9 @@ pub const ToolDetailRecord = struct {
     /// which its status (`Observed`) does not say when the command passed
     /// (`checkFoundCommandEnded` in src/core/agent/runtime/tool_presentation.zig).
     check_found_command_ended: bool = false,
+    /// A `subagent` message that made a new subagent, as its host said
+    /// live and its session saved (D101).
+    subagent_started: bool = false,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit

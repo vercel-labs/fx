@@ -1071,13 +1071,12 @@ const StoryTally = struct {
     skill_opens: usize = 0,
     subagent_calls: usize = 0,
     subagent_names: std.ArrayList([]const u8) = .empty,
-    /// The subagents main sent a message to, each once; a stop, close, or
-    /// status names a subagent without starting it.
-    subagents_messaged: std.ArrayList([]const u8) = .empty,
+    /// What the group's subagent rows say, set from the rows once they are
+    /// built, so the header names what they show.
+    subagent_rows: SubagentRowTally = .{},
     /// Reports and messages from subagents, which show as subagent calls
     /// that their details mark (src/core/subagent/reports.zig, Row).
     subagent_updates: usize = 0,
-    subagent_waits: usize = 0,
     mcp_calls: usize = 0,
     opens: usize = 0,
     /// Calls that core counts as commands but that ran no shell command, such
@@ -1198,13 +1197,7 @@ const StoryTally = struct {
                 }
                 // Old records keep no arguments, so they say nothing more.
                 if (!storyHasArgs(record)) return;
-                if (storyArgString(scratch, record, "agent")) |agent| {
-                    try addDistinct(&self.subagent_names, scratch, agent);
-                    const action = storyArgString(scratch, record, "action") orelse "message";
-                    if (std.mem.eql(u8, action, "message")) try addDistinct(&self.subagents_messaged, scratch, agent);
-                } else if (storyArgString(scratch, record, "action")) |action| {
-                    if (std.mem.eql(u8, action, "wait") or std.mem.eql(u8, action, "status")) self.subagent_waits += 1;
-                }
+                if (storyArgString(scratch, record, "agent")) |agent| try addDistinct(&self.subagent_names, scratch, agent);
             },
             .mcp => self.mcp_calls += 1,
             .open => self.opens += 1,
@@ -1267,6 +1260,112 @@ test "a toolbox open of a skill counts as a skill in its group's header" {
     try std.testing.expectEqualStrings("● Searched the toolbox, used an MCP tool, opened a tool, and more", firstLineForTest(tool));
 }
 
+/// What a row of main's `subagent` calls says its latest call did, which
+/// its group's header names in turn.
+const SubagentDeed = enum { start, message, wait, other };
+
+/// A group's subagent rows by what they say, so its header says
+/// "started a subagent" only above a row that started one.
+const SubagentRowTally = struct {
+    starts: usize = 0,
+    messages: usize = 0,
+    waits: usize = 0,
+    others: usize = 0,
+    /// Whether a row of each kind still runs, so the header says
+    /// "starting", "messaging", or "waiting for".
+    starting: bool = false,
+    messaging: bool = false,
+    waiting: bool = false,
+    /// The subagents the wait rows name, each once.
+    waited_names: std.ArrayList([]const u8) = .empty,
+    /// Whether a wait row names no subagent, as "Waited for subagents".
+    waited_unnamed: bool = false,
+
+    fn note(self: *SubagentRowTally, scratch: std.mem.Allocator, rows: []const StoryRow) !void {
+        for (rows) |*row| {
+            const deed = try subagentRowDeed(scratch, row) orelse continue;
+            const running = row.detail.?.outcome == null;
+            switch (deed) {
+                .start => {
+                    self.starts += 1;
+                    self.starting = self.starting or running;
+                },
+                .message => {
+                    self.messages += 1;
+                    self.messaging = self.messaging or running;
+                },
+                .wait => {
+                    self.waits += 1;
+                    self.waiting = self.waiting or running;
+                    try self.noteWaitNames(scratch, row);
+                },
+                .other => self.others += 1,
+            }
+        }
+    }
+
+    fn noteWaitNames(self: *SubagentRowTally, scratch: std.mem.Allocator, row: *const StoryRow) !void {
+        if (row.identity.kind == .subagent) return StoryTally.addDistinct(&self.waited_names, scratch, row.identity.key);
+        const roster = waitRoster(try entryStatus(scratch, row.entry) orelse "") orelse {
+            self.waited_unnamed = true;
+            return;
+        };
+        var names = std.mem.splitSequence(u8, roster, ", ");
+        while (names.next()) |name| try StoryTally.addDistinct(&self.waited_names, scratch, name);
+    }
+
+    /// Whether the rows only waited, so the header says so.
+    fn onlyWaited(self: SubagentRowTally) bool {
+        return self.waits > 0 and self.starts == 0 and self.messages == 0 and self.others == 0;
+    }
+
+    /// Whether the rows waited for one subagent, which they name.
+    fn waitedForOne(self: SubagentRowTally) bool {
+        return !self.waited_unnamed and self.waited_names.items.len == 1;
+    }
+};
+
+/// What a row of main's `subagent` calls says its latest call did. Null for
+/// a report's row, a call that did not run or failed, whose row says so, and
+/// an old record that kept no arguments.
+fn subagentRowDeed(scratch: std.mem.Allocator, row: *const StoryRow) !?SubagentDeed {
+    const record = row.detail orelse return null;
+    if (!std.mem.eql(u8, record.tool_name, "subagent") or record.subagent_report) return null;
+    if (record.outcome) |outcome| if (outcome != .completed) return null;
+    if (storyCallFailed(row.detail)) return null;
+    // A call whose arguments still stream in reads as its row does
+    // (`runningSubagentCall`).
+    const action = storyArgString(scratch, record, "action") orelse if (record.outcome == null)
+        (runningSubagentCall(scratch, try entryStatus(scratch, row.entry) orelse "", record) orelse return null).action
+    else
+        return null;
+    if (std.mem.eql(u8, action, "message")) return if (row.starts) .start else .message;
+    if (std.mem.eql(u8, action, "wait")) return .wait;
+    // A status of every subagent says what main did while they worked, as a
+    // wait does.
+    if (std.mem.eql(u8, action, "status") and row.identity.kind == .subagent_wait) return .wait;
+    return .other;
+}
+
+/// The verbs core puts before the subagents a wait concerns.
+const wait_leads = [_][]const u8{ "waited for ", "waiting for " };
+
+/// What core puts after a wait's verb when it lists no subagents
+/// (`action_words` in src/core/tooling/tool_presentation.zig).
+const unnamed_wait_roster = "subagents";
+
+/// The subagents a wait's phrase lists after its verb, such as
+/// "lander, scout", or null when it lists none.
+fn waitRoster(phrase: []const u8) ?[]const u8 {
+    const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
+    for (wait_leads) |verb| if (std.mem.startsWith(u8, lead, verb)) {
+        const roster = std.mem.trim(u8, lead[verb.len..], " ");
+        if (roster.len == 0 or std.mem.eql(u8, roster, unnamed_wait_roster)) return null;
+        return roster;
+    };
+    return null;
+}
+
 /// Whether a command call ran a shell command. Core treats a tool name it
 /// does not know, such as a tool an old session used, as a command
 /// (src/core/tooling/tool_dispatch.zig, unregisteredActivityKind), but such a
@@ -1324,6 +1423,61 @@ fn checkRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow, phrase: []co
     if (!std.mem.startsWith(u8, phrase, own_label)) return null;
     const label = if (record.check_found_command_ended) "Ran" else if (row.turn_ended) check_waited_label else check_running_label;
     return try std.mem.concat(scratch, u8, &.{ label, " ", phrase[own_label.len..] });
+}
+
+/// Whether `check` is a shell check still running after `latest`, the row's
+/// latest call, found the command ended. While it runs its status reads
+/// `Waiting for`, a verb the command is past, so the row keeps showing how
+/// `latest` found the command ended until the check comes back.
+fn rechecksEndedCommand(scratch: std.mem.Allocator, latest: ?*const ToolDetailRecord, check: ?*const ToolDetailRecord) bool {
+    const ended = latest orelse return false;
+    const record = check orelse return false;
+    return ended.check_found_command_ended and record.outcome == null and isSessionCheck(scratch, record);
+}
+
+test "a check of a command an earlier check found ended keeps the row on that end while it runs" {
+    const alloc = std.testing.allocator;
+    const command = "fx-cloud run zig build test";
+    var run = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"fx-cloud run zig build test\"}", 0, null);
+    run.command_process_presentation = null;
+    run.command_display = @constCast(command);
+    var ended = storyCommandDetail(2, "{\"action\":\"interact\",\"session_id\":\"shell-4\"}", 0, null);
+    ended.command_process_presentation = null;
+    ended.command_display = @constCast(command);
+    ended.check_found_command_ended = true;
+    var recheck = ended;
+    recheck.entry_id = 3;
+    recheck.outcome = null;
+    recheck.check_found_command_ended = false;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Still running " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Observed " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Waiting for " ++ command ++ "\n", .class = .tool_status } },
+    };
+    const Case = struct {
+        name: []const u8,
+        ended_status: []const u8,
+        ended_outcome: types.ToolOutcomeKind = .completed,
+        ended_exit_code: ?i64 = null,
+        found_ended: bool = true,
+        want: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .name = "passed", .ended_status = "● Observed " ++ command ++ "\n", .want = "● Ran " ++ command ++ " · 3 calls ✓" },
+        .{ .name = "failed", .ended_status = "● Exited 1 " ++ command ++ "\n", .ended_outcome = .failed, .ended_exit_code = 1, .want = "● Exited 1 " ++ command ++ " · 3 calls" },
+        // A check after one that found the command still running waits too.
+        .{ .name = "still running", .ended_status = "● Observed " ++ command ++ "\n", .found_ended = false, .want = "● Waiting for " ++ command ++ " · 3 calls" },
+    };
+    for (cases) |case| {
+        entries[1].raw_bytes.bytes = case.ended_status;
+        ended.outcome = case.ended_outcome;
+        ended.command_process_presentation = if (case.ended_exit_code) |code| .{ .exit_code = code } else null;
+        ended.check_found_command_ended = case.found_ended;
+        const text = try groupTextForTest(alloc, &entries, &.{ run, ended, recheck });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ case.name, text });
+        try std.testing.expectEqualStrings(case.want, firstLineForTest(text));
+    }
 }
 
 test "a command check row keeps one verb while its command runs" {
@@ -1489,8 +1643,8 @@ fn workAmount(tally: StoryTally, kind: WorkKind) usize {
         .edits => tally.changedFiles(),
         .subagents => if (tally.subagent_calls == 0)
             0
-        else if (tally.subagents_messaged.items.len > 0)
-            tally.subagents_messaged.items.len
+        else if (tally.subagent_rows.starts + tally.subagent_rows.messages > 0)
+            tally.subagent_rows.starts + tally.subagent_rows.messages
         else if (tally.subagent_updates > 0)
             tally.subagent_updates
         else if (tally.subagent_names.items.len > 0)
@@ -1529,13 +1683,7 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
             if (writes_only) break :blk if (one) "wrote a file" else "wrote files";
             break :blk if (one) "edited a file" else "edited files";
         },
-        .subagents => if (tally.subagents_messaged.items.len > 0)
-            (if (one) "started a subagent" else "started subagents")
-        else if (tally.subagent_updates > 0)
-            (if (one) "got a subagent update" else "got subagent updates")
-        else if (tally.subagent_waits == tally.subagent_calls)
-            "waited for subagents"
-        else if (one) "used a subagent" else "used subagents",
+        .subagents => subagentWorkPhrase(tally, one),
         .commands => if (tally.commands_running == tally.commands)
             (if (one) "running a command" else "running commands")
         else if (one) "ran a command" else "ran commands",
@@ -1552,6 +1700,28 @@ fn workPhrase(tally: StoryTally, kind: WorkKind) []const u8 {
         .opens => if (one) "opened a file" else "opened files",
         .other_calls => if (one) "used a tool" else "used tools",
     };
+}
+
+/// What the group did with subagents, as its rows say: "started" only above
+/// a row that started one, "messaged" above a message to one that already
+/// existed, and "waited for" above waits alone, each "-ing" while a row of
+/// that kind still runs. `one` counts calls, for the other words.
+fn subagentWorkPhrase(tally: StoryTally, one: bool) []const u8 {
+    const rows = tally.subagent_rows;
+    if (rows.starts > 0) {
+        if (rows.starting) return if (rows.starts == 1) "starting a subagent" else "starting subagents";
+        return if (rows.starts == 1) "started a subagent" else "started subagents";
+    }
+    if (rows.messages > 0) {
+        if (rows.messaging) return if (rows.messages == 1) "messaging a subagent" else "messaging subagents";
+        return if (rows.messages == 1) "messaged a subagent" else "messaged subagents";
+    }
+    if (tally.subagent_updates > 0) return if (one) "got a subagent update" else "got subagent updates";
+    if (rows.onlyWaited()) {
+        if (rows.waiting) return if (rows.waitedForOne()) "waiting for a subagent" else "waiting for subagents";
+        return if (rows.waitedForOne()) "waited for a subagent" else "waited for subagents";
+    }
+    return if (one) "used a subagent" else "used subagents";
 }
 
 /// "● Edited a file, ran commands ✓": what the group did, like a short
@@ -1777,6 +1947,12 @@ const StoryRow = struct {
     /// Whether the turn of the row's latest call ended, when that call is a
     /// shell check (checkRowPhrase).
     turn_ended: bool = false,
+    /// Whether the row's latest call is a message that makes its subagent
+    /// (`messageStarts`).
+    starts: bool = false,
+    /// The messages its subagent sent main while main waited, which join a
+    /// wait's row (`joinWaitChain`).
+    received_messages: usize = 0,
 };
 
 /// The name a call adds to a `.read`, `.search`, `.more_output`, or
@@ -2088,9 +2264,12 @@ fn withoutPrefix(text: []const u8, prefix: []const u8) ?[]const u8 {
 /// every wording shares one piece of code.
 const SubagentRewording = struct { match: []const u8, reads: []const u8 };
 
+/// How core words a message's row once the message reached its subagent.
+const sent_lead = "sent to ";
+
 /// The rows of a message to a subagent, in the order they are tried.
 const message_rewordings = [_]SubagentRewording{
-    .{ .match = "sent to ", .reads = "Messaged *" },
+    .{ .match = sent_lead, .reads = "Messaged *" },
     .{ .match = " busy; message not sent", .reads = "Couldn't message * (busy)" },
     .{ .match = " failed", .reads = "Couldn't message *" },
     .{ .match = " interrupted", .reads = "Cancelled message to *" },
@@ -2129,17 +2308,27 @@ fn rewordSubagentLead(scratch: std.mem.Allocator, lead: []const u8, rewordings: 
 /// A subagent row by its action and the subagent's name, such as
 /// "Messaged reviewer" or "reviewer finished", without the message or the
 /// reply, which Ctrl+O shows. It rewords core's row text, so a state core
-/// adds later still shows, in core's words, without its message. Null for
-/// other rows.
-fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?[]const u8 {
+/// adds later still shows, in core's words, without its message. A message
+/// reads as one pair of verbs from its start to its end: "Starting scout"
+/// and "Started scout" when it makes its subagent (`started`), and
+/// "Messaging scout" and "Messaged scout" otherwise. Null for other rows.
+fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord, started: bool) !?[]const u8 {
     if (!std.mem.eql(u8, record.tool_name, "subagent")) return null;
     const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
     if (lead.len == 0) return null;
     const action = storyArgString(scratch, record, "action");
     if (action) |name| if (std.mem.eql(u8, name, "message")) {
-        // "reviewer working", "reviewer still running": the subagent works.
-        return try rewordSubagentLead(scratch, lead, &message_rewordings) orelse lead;
+        if (started and std.mem.startsWith(u8, lead, sent_lead)) return try std.mem.concat(scratch, u8, &.{ "Started ", lead[sent_lead.len..] });
+        if (try rewordSubagentLead(scratch, lead, &message_rewordings)) |ended| return ended;
+        // Core says "Managing reviewer" while the message streams and
+        // "reviewer working" while it runs.
+        if (record.outcome == null) return try runningSubagentPhrase(scratch, phrase, record, started) orelse lead;
+        return lead;
     };
+    // A call whose arguments still stream in, once it names its agent.
+    if (action == null and record.outcome == null and !record.subagent_report) {
+        if (try runningSubagentPhrase(scratch, phrase, record, started)) |running| return running;
+    }
     // A report or a message a subagent sent to main.
     if (action == null) return try rewordSubagentLead(scratch, lead, &report_rewordings) orelse lead;
     // A wait, status, stop, or close leads with its verb, which takes a
@@ -2150,7 +2339,116 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
         capital[0] = std.ascii.toUpper(capital[0]);
         return capital;
     };
+    // Core's status while the call streams, "Managing reviewer".
+    if (record.outcome == null) return try runningSubagentPhrase(scratch, phrase, record, started) orelse lead;
     return lead;
+}
+
+/// The verb a `subagent` call that names an agent reads with while its
+/// arguments stream in, by its action, as core words the call once it runs
+/// (`action_words` in src/core/tooling/tool_presentation.zig). A message's
+/// verb depends on whether it starts its subagent, so it is not here.
+const streaming_subagent_verbs = [_]struct { action: []const u8, verb: []const u8 }{
+    .{ .action = "wait", .verb = "Waiting for " },
+    .{ .action = "status", .verb = "Checking " },
+    .{ .action = "stop", .verb = "Stopping " },
+    .{ .action = "close", .verb = "Closing " },
+};
+
+/// What a `subagent` call that has not ended does, and to which agent.
+const RunningSubagentCall = struct { action: []const u8, agent: []const u8 };
+
+/// What a `subagent` call that has not ended does, from its arguments, also
+/// while they still stream in, or, while its record holds none, the agent
+/// its status names (`streamingStatusAgent`). A call that names no action
+/// yet reads as a message, which it most likely is. Null until it names its
+/// agent.
+fn runningSubagentCall(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) ?RunningSubagentCall {
+    const agent = if (record.arguments_json) |json|
+        storyArgString(scratch, record, "agent") orelse tooling_presentation.subagentStreamedAgent(json) orelse return null
+    else
+        streamingStatusAgent(phrase) orelse return null;
+    const action = storyArgString(scratch, record, "action") orelse
+        tooling_presentation.subagentStreamedAction(record.arguments_json orelse "") orelse "message";
+    return .{ .action = action, .agent = agent };
+}
+
+/// The row of a `subagent` call that has not ended: "Starting scout" or
+/// "Messaging scout" for a message, and "Waiting for scout" and the like
+/// for the others. Null until the call names its agent.
+fn runningSubagentPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord, started: bool) !?[]const u8 {
+    const call = runningSubagentCall(scratch, phrase, record) orelse return null;
+    const verb = if (std.mem.eql(u8, call.action, "message"))
+        (if (started) "Starting " else "Messaging ")
+    else for (streaming_subagent_verbs) |entry| {
+        if (std.mem.eql(u8, entry.action, call.action)) break entry.verb;
+    } else return null;
+    return try std.mem.concat(scratch, u8, &.{ verb, try terminalSafeText(scratch, call.agent) });
+}
+
+/// The agent a streaming `subagent` call's status names, as core writes it
+/// once the agent has streamed in, "Managing reviewer": the one word after
+/// the verb. Null for any other status, such as "Subagent working · inspect
+/// auth".
+fn streamingStatusAgent(phrase: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, phrase, " \t\r\n");
+    const space = std.mem.findScalar(u8, trimmed, ' ') orelse return null;
+    const name = trimmed[space + 1 ..];
+    if (name.len == 0 or std.mem.findAny(u8, name, " \t") != null) return null;
+    return name;
+}
+
+/// What a message's saved result says when it made its subagent, in a
+/// session saved before its host marked that (D101). The result says it only
+/// when other subagents were idle or the user had closed one of that name
+/// (`writeStarted` in src/core/subagent/tool_host.zig).
+const new_subagent_result_marker = "starts with no history";
+
+/// Whether a `subagent` call is a message that makes its subagent. An ended
+/// call knows: its host said so (D101), or its saved result did. A call that
+/// still runs or streams starts one when no earlier call in the transcript
+/// left a subagent of that name open. That guess misses a subagent the
+/// transcript no longer holds, after a compaction, or one the user closed in
+/// the agent list; the call's end corrects it.
+fn messageStarts(scratch: std.mem.Allocator, details: []const ToolDetailRecord, entry: TranscriptEntry, detail: ?*const ToolDetailRecord) !bool {
+    const record = detail orelse return false;
+    if (!std.mem.eql(u8, record.tool_name, "subagent") or record.subagent_report) return false;
+    if (record.subagent_started) return true;
+    if (record.outcome != null) {
+        const result = record.result orelse return false;
+        return record.outcome == .completed and std.mem.find(u8, result, new_subagent_result_marker) != null;
+    }
+    const call = runningSubagentCall(scratch, try entryStatus(scratch, entry) orelse "", record) orelse return false;
+    if (!std.mem.eql(u8, call.action, "message")) return false;
+    return !subagentOpenBefore(scratch, details, record.entry_id, call.agent);
+}
+
+/// Whether the transcript shows a subagent named `agent` open before the
+/// call at entry `before`: the latest earlier call of main's that ran and
+/// names it is a message, not a close.
+fn subagentOpenBefore(scratch: std.mem.Allocator, details: []const ToolDetailRecord, before: u32, agent: []const u8) bool {
+    var latest_entry_id: ?u32 = null;
+    var open = false;
+    for (details) |*earlier| {
+        if (earlier.entry_id >= before or earlier.outcome != .completed) continue;
+        if (!std.mem.eql(u8, earlier.tool_name, "subagent") or earlier.subagent_report) continue;
+        // Most calls name another agent; a quick look skips them unparsed.
+        const json = earlier.arguments_json orelse continue;
+        if (std.mem.find(u8, json, agent) == null) continue;
+        const named = storyArgString(scratch, earlier, "agent") orelse continue;
+        if (!std.mem.eql(u8, named, agent)) continue;
+        const action = storyArgString(scratch, earlier, "action") orelse continue;
+        const leaves_open = if (std.mem.eql(u8, action, "message"))
+            true
+        else if (std.mem.eql(u8, action, "close"))
+            false
+        else
+            continue;
+        if (latest_entry_id) |latest| if (earlier.entry_id < latest) continue;
+        latest_entry_id = earlier.entry_id;
+        open = leaves_open;
+    }
+    return open;
 }
 
 /// The saved output a `read_tool_result` call reads more of, by a byte
@@ -3034,10 +3332,7 @@ fn streamingSubagentIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry,
     const record = detail orelse return identity;
     if (record.outcome != null or !std.mem.eql(u8, record.tool_name, "subagent")) return identity;
     if (storyArgString(scratch, record, "agent") != null) return identity;
-    const phrase = std.mem.trim(u8, try entryStatus(scratch, entry) orelse return identity, " \t\r\n");
-    const space = std.mem.findScalar(u8, phrase, ' ') orelse return identity;
-    const name = phrase[space + 1 ..];
-    if (name.len == 0 or std.mem.findAny(u8, name, " \t") != null) return identity;
+    const name = streamingStatusAgent(try entryStatus(scratch, entry) orelse return identity) orelse return identity;
     return .{ .kind = .subagent, .key = name };
 }
 
@@ -3274,9 +3569,11 @@ fn collectStoryRows(
         };
         target.count += 1;
         if (storyRowCallFailed(scratch, detail)) target.failures += 1;
+        if (rechecksEndedCommand(scratch, target.detail, detail)) continue :calls;
         target.entry = entry;
         target.entry_id = entry_id;
         target.detail = detail;
+        target.starts = try messageStarts(scratch, details, entry, detail);
         target.status_index = status_index;
         if (try commandStillRunning(scratch, entry)) target.background = detail;
         target.tries = retries.tries.get(entry_id) orelse 0;
@@ -3452,7 +3749,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const reprojected_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
     const full_phrase = try checkRowPhrase(scratch, row, reprojected_phrase) orelse reprojected_phrase;
-    const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record) else null;
+    const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record, row.starts) else null;
     const named_phrase = if (try savedReadRowPhrase(scratch, row)) |saved|
         saved
     else if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
@@ -3495,6 +3792,10 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         try std.mem.concat(scratch, u8, &.{ phrase, " in ", try searchFolderNames(scratch, row.search_paths.items) })
     else
         phrase;
+    if (row.received_messages > 0) {
+        const note = try countNote(scratch, " · ", row.received_messages, pluralWord(row.received_messages, " message", " messages"));
+        return .{ .display = try std.mem.concat(scratch, u8, &.{ display, note }), .body = display, .suffix = note, .reason = reason };
+    }
     const passed_after_failing = row.failures > 0 and row.detail != null and
         row.detail.?.outcome != null and !storyCallFailed(row.detail);
     // A call that completed after the model repeated it says which try it was.
@@ -3929,6 +4230,7 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
+    wait_messages: usize,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3943,15 +4245,16 @@ fn formatGroupBlock(
     errdefer out.deinit();
     // writeGroupBlock has no cleanup of its own, so its many failure points
     // share this one; each `try` here would repeat the cleanup in the binary.
-    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, focused_entry_id, collapse_tool_calls, cols, style, styles);
+    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, wait_messages, focused_entry_id, collapse_tool_calls, cols, style, styles);
     const bytes = if (collapse_tool_calls) try alloc.dupe(u8, header) else try out.toOwnedSlice();
     errdefer alloc.free(bytes);
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
 /// Writes a group's header and, unless `collapse_tool_calls`, its rows to
-/// `out`, and their provenance to `lines`. Returns the header, which lives in
-/// `scratch`.
+/// `out`, and their provenance to `lines`. `wait_messages` are the messages
+/// that joined the row of the group's last call, a wait (`joinWaitChain`).
+/// Returns the header, which lives in `scratch`.
 fn writeGroupBlock(
     alloc: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -3963,6 +4266,7 @@ fn writeGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
+    wait_messages: usize,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3987,6 +4291,10 @@ fn writeGroupBlock(
         if (retries.fixed.contains(entry_id) or unshown.contains(entry_id)) continue;
         try tally.observe(scratch, entry, detail);
     }
+    try tally.subagent_rows.note(scratch, rows.items);
+    if (wait_messages > 0) if (lastStatusRow(entries, status_indices, rows.items)) |row| {
+        row.received_messages = wait_messages;
+    };
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
@@ -5381,6 +5689,150 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
+/// The row that shows the call of the group's last status entry.
+fn lastStatusRow(entries: []const TranscriptEntry, status_indices: []const usize, rows: []StoryRow) ?*StoryRow {
+    if (status_indices.len == 0) return null;
+    const entry_id = toolStatusEntryId(entries[status_indices[status_indices.len - 1]]) orelse return null;
+    for (rows) |*row| if (row.entry_id == entry_id) return row;
+    return null;
+}
+
+/// Whether a call is main's `subagent` wait that has not failed.
+fn isWaitCall(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    if (!std.mem.eql(u8, record.tool_name, "subagent") or record.subagent_report) return false;
+    if (record.outcome) |outcome| if (outcome != .completed) return false;
+    if (storyCallFailed(detail)) return false;
+    const action = storyArgString(scratch, record, "action") orelse return false;
+    return std.mem.eql(u8, action, "wait");
+}
+
+/// Whether a report's row is a message from a subagent `roster` lists, or
+/// from any subagent when the wait listed none.
+fn isMessageFrom(scratch: std.mem.Allocator, entry: TranscriptEntry, roster: ?[]const u8) !bool {
+    const phrase = try entryStatus(scratch, entry) orelse return false;
+    const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
+    const message_lead = report_rewordings[0].match;
+    if (!std.mem.startsWith(u8, lead, message_lead)) return false;
+    const sender = lead[message_lead.len..];
+    const names = roster orelse return true;
+    var listed = std.mem.splitSequence(u8, names, ", ");
+    while (listed.next()) |name| if (std.mem.eql(u8, name, sender)) return true;
+    return false;
+}
+
+/// Whether the call at `index` would be the only call of its group, as
+/// fillProjection groups them: its presentation group holds nothing else,
+/// or, with none, the run it starts ends at the next status entry, which is
+/// a report's, a question, or another presentation group's.
+fn callIsAloneInGroup(
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    presentation_group_indices: []const ?usize,
+    presentation_groups: []const PresentationGroup,
+    index: usize,
+) bool {
+    if (presentation_group_indices[index]) |group_index| return presentation_groups[group_index].status_indices.items.len == 1;
+    var next = index + 1;
+    while (next < entries.len) : (next += 1) {
+        const entry = entries[next];
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        if (presentation_group_indices[next] != null) return true;
+        if (toolStatusEntryId(entry)) |entry_id| {
+            const detail = detailForEntry(details, detail_indices, entry_id, null);
+            return statusNamesAsk(entry, detail) or isSubagentUpdateRow(detail);
+        }
+        if (isAttachedEntry(entry)) continue;
+        if (!isTransparentCompactEntry(entry)) return true;
+    }
+    return true;
+}
+
+/// Lets a group whose last call is a wait take in the messages its
+/// subagents sent main while main waited, and the waits that took them, so
+/// "Waited for lander", "Message from lander", "Waited for lander" show as
+/// one row, "Waited for lander · 1 message". After the group's first wait
+/// that shares the last one's row, it takes each message from a subagent
+/// the wait before it lists. After the group, it takes such messages and
+/// each wait that would be alone in its group and share that row, and stops
+/// at anything else, such as a report like "lander finished", which keeps a
+/// line of its own, or text. Ctrl+O still shows every message. The entries
+/// it takes are hidden, and the waits join `status_indices` and `summary`.
+/// Returns how many messages it took.
+fn joinWaitChain(
+    alloc: std.mem.Allocator,
+    projection: *Projection,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    presentation_group_indices: []const ?usize,
+    presentation_groups: []const PresentationGroup,
+    status_indices: *std.ArrayList(usize),
+    summary: *Summary,
+) !usize {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+    // The waits it takes go after these, so the group's own calls stay here.
+    const member_count = status_indices.items.len;
+    if (member_count == 0) return 0;
+    const last_index = status_indices.items[member_count - 1];
+    const last_detail = statusDetail(entries, details, detail_indices, last_index);
+    if (!isWaitCall(scratch, last_detail)) return 0;
+    const wait_identity = try storyIdentity(scratch, last_detail);
+    const first_wait = for (status_indices.items) |member| {
+        const detail = statusDetail(entries, details, detail_indices, member);
+        if (isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail))) break member;
+    } else last_index;
+    var roster = waitRoster(try entryStatus(scratch, entries[first_wait]) orelse "");
+    var messages: usize = 0;
+    var index = first_wait + 1;
+    while (index < entries.len) : (index += 1) {
+        const entry = entries[index];
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        const in_group = index <= last_index;
+        const entry_id = toolStatusEntryId(entry) orelse {
+            if (in_group or isAttachedEntry(entry) or isTransparentCompactEntry(entry)) continue;
+            break;
+        };
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        if (isSubagentUpdateRow(detail)) {
+            if (try isMessageFrom(scratch, entry, roster)) {
+                projection.entry_actions.items[index] = .hide;
+                messages += 1;
+                continue;
+            }
+            if (in_group) continue;
+            break;
+        }
+        const takes_row = isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail));
+        if (in_group) {
+            if (takes_row and std.mem.findScalar(usize, status_indices.items[0..member_count], index) != null) roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+            continue;
+        }
+        if (!takes_row or projection.entry_actions.items[index] != .keep) break;
+        if (!callIsAloneInGroup(entries, details, detail_indices, presentation_group_indices, presentation_groups, index)) break;
+        projection.entry_actions.items[index] = .hide;
+        hideAttachedRows(entries, projection.entry_actions.items, index);
+        try status_indices.append(alloc, index);
+        observeTool(summary, detail);
+        roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+    }
+    return messages;
+}
+
+/// The detail of the call whose status entry is at `index`.
+fn statusDetail(
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    index: usize,
+) ?*const ToolDetailRecord {
+    const entry_id = toolStatusEntryId(entries[index]) orelse return null;
+    return detailForEntry(details, detail_indices, entry_id, null);
+}
+
 /// Fills `projection` with every entry's action. The caller owns the state
 /// it works in and frees it.
 fn fillProjection(
@@ -5546,15 +5998,21 @@ fn fillProjection(
                     status_index,
                 );
             }
+            var group_indices: std.ArrayList(usize) = .empty;
+            defer group_indices.deinit(alloc);
+            try group_indices.appendSlice(alloc, group.status_indices.items);
+            var group_summary = group.summary;
+            const wait_messages = try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &group_indices, &group_summary);
 
             const bytes = try formatGroupBlock(
                 alloc,
                 entries,
-                group.status_indices.items,
+                group_indices.items,
                 details,
                 detail_indices,
                 &output_sources,
-                group.summary,
+                group_summary,
+                wait_messages,
                 focused_entry_id,
                 collapse_tool_calls,
                 cols,
@@ -5602,6 +6060,7 @@ fn fillProjection(
             }
             if (!isTransparentCompactEntry(entries[index])) break;
         }
+        const wait_messages = try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &status_indices, &summary);
 
         const bytes = try formatGroupBlock(
             alloc,
@@ -5611,6 +6070,7 @@ fn fillProjection(
             detail_indices,
             &output_sources,
             summary,
+            wait_messages,
             focused_entry_id,
             collapse_tool_calls,
             cols,
@@ -8403,7 +8863,12 @@ test "subagent rows name the action and the subagent, not the message" {
     const cases = [_]Case{
         // Main's calls.
         .{ .phrase = "sent to pr-lister · List open PRs", .args = message, .want = "Messaged pr-lister" },
-        .{ .phrase = "pr-lister working · List open PRs", .args = message, .want = "pr-lister working" },
+        .{ .phrase = "pr-lister working · List open PRs", .args = message, .want = "Messaging pr-lister" },
+        .{ .phrase = "Managing pr-lister", .args = message, .want = "Messaging pr-lister" },
+        .{ .phrase = "Managing pr-lister", .args = "{\"action\":\"message\",\"agent\":\"pr-lister\",\"mess", .want = "Messaging pr-lister" },
+        .{ .phrase = "Managing pr-lister", .args = "{\"agent\":\"pr-lister\",\"act", .want = "Messaging pr-lister" },
+        .{ .phrase = "Managing pr-lister", .args = "{\"action\":\"wait\",\"agent\":\"pr-lister\"", .want = "Waiting for pr-lister" },
+        .{ .phrase = "Managing pr-lister", .args = "{\"action\":\"close\",\"agent\":\"pr-lister\"", .want = "Closing pr-lister" },
         .{ .phrase = "pr-lister failed · List open PRs", .args = message, .want = "Couldn't message pr-lister" },
         .{ .phrase = "pr-lister busy; message not sent · List open PRs", .args = message, .want = "Couldn't message pr-lister (busy)" },
         .{ .phrase = "pr-lister interrupted · List open PRs", .args = message, .want = "Cancelled message to pr-lister" },
@@ -8428,12 +8893,96 @@ test "subagent rows name the action and the subagent, not the message" {
             .activity_kind = .subagent,
             .arguments_json = if (case.args) |args| @constCast(args) else null,
         };
-        const got = (try subagentRowPhrase(arena, case.phrase, &record)) orelse "(null)";
+        const got = (try subagentRowPhrase(arena, case.phrase, &record, false)) orelse "(null)";
         std.testing.expectEqualStrings(case.want, got) catch |err| {
             std.debug.print("phrase: {s}\n", .{case.phrase});
             return err;
         };
     }
+}
+
+test "a message that makes its subagent reads Starting, then Started" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const message = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the TUI wiring\"}";
+    const cases = [_]struct { phrase: []const u8, args: []const u8, outcome: ?types.ToolOutcomeKind, want: []const u8 }{
+        .{ .phrase = "Managing scout", .args = "{\"action\":\"message\",\"agent\":\"scout\",\"instr", .outcome = null, .want = "Starting scout" },
+        .{ .phrase = "scout working · Map the TUI wiring", .args = message, .outcome = null, .want = "Starting scout" },
+        .{ .phrase = "sent to scout · Map the TUI wiring", .args = message, .outcome = .completed, .want = "Started scout" },
+        // A start that failed says so, as any message that failed does.
+        .{ .phrase = "scout failed · Map the TUI wiring", .args = message, .outcome = .failed, .want = "Couldn't message scout" },
+    };
+    for (cases) |case| {
+        const record: ToolDetailRecord = .{
+            .entry_id = 1,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast(case.args),
+            .outcome = case.outcome,
+        };
+        try std.testing.expectEqualStrings(case.want, (try subagentRowPhrase(arena, case.phrase, &record, true)).?);
+    }
+}
+
+test "only a message's host or its saved result says it made its subagent once it ended" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = "{\"action\":\"message\",\"agent\":\"ship-gate\",\"message\":\"Gate the PR\"}";
+    const sent = "{\"ok\":true,\"result\":\"Sent to ship-gate, which works on it now.\",\"error_code\":null}";
+    const new = "{\"ok\":true,\"result\":\"Sent to ship-gate, which works on it now. ship-gate is new and starts with no history.\",\"error_code\":null}";
+    const message: ToolDetailRecord = .{ .entry_id = 5, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast(args), .outcome = .completed, .result = @constCast(sent) };
+    const entry: TranscriptEntry = .{ .raw_bytes = .{ .id = 5, .bytes = "● sent to ship-gate · Gate the PR\n", .class = .tool_status } };
+    // Its host marked it (D101).
+    var marked = message;
+    marked.subagent_started = true;
+    try std.testing.expect(try messageStarts(arena, &.{}, entry, &marked));
+    // A session saved before that: only a result that says the subagent was
+    // new makes it a start, never its place in the transcript.
+    try std.testing.expect(!try messageStarts(arena, &.{}, entry, &message));
+    var said_new = message;
+    said_new.result = @constCast(new);
+    try std.testing.expect(try messageStarts(arena, &.{}, entry, &said_new));
+    // Other calls never start one.
+    var wait = message;
+    wait.arguments_json = @constCast("{\"action\":\"wait\"}");
+    try std.testing.expect(!try messageStarts(arena, &.{}, entry, &wait));
+}
+
+test "a running message starts its subagent unless the transcript shows it open" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const to_scout = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map it\"}";
+    const call = struct {
+        fn of(entry_id: u32, args: []const u8, outcome: ?types.ToolOutcomeKind) ToolDetailRecord {
+            return .{ .entry_id = entry_id, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast(args), .outcome = outcome };
+        }
+    }.of;
+    const running = call(9, to_scout, null);
+    const working: TranscriptEntry = .{ .raw_bytes = .{ .id = 9, .bytes = "● scout working · Map it\n", .class = .tool_status } };
+    // No earlier call named scout.
+    try std.testing.expect(try messageStarts(arena, &.{ call(1, "{\"action\":\"message\",\"agent\":\"scouts\",\"message\":\"x\"}", .completed), running }, working, &running));
+    // An earlier message left it open.
+    try std.testing.expect(!try messageStarts(arena, &.{ call(1, to_scout, .completed), running }, working, &running));
+    // ...also when the call streams and names only its agent yet, or when
+    // its record holds no arguments yet and only its status names the agent.
+    const managing: TranscriptEntry = .{ .raw_bytes = .{ .id = 9, .bytes = "● Managing scout\n", .class = .tool_status } };
+    const streaming = call(9, "{\"agent\":\"scout\",\"mes", null);
+    try std.testing.expect(!try messageStarts(arena, &.{ call(1, to_scout, .completed), streaming }, managing, &streaming));
+    var bare = streaming;
+    bare.arguments_json = null;
+    try std.testing.expect(!try messageStarts(arena, &.{ call(1, to_scout, .completed), bare }, managing, &bare));
+    try std.testing.expect(try messageStarts(arena, &.{bare}, managing, &bare));
+    // A close after it ended it, so the next message starts a new one.
+    try std.testing.expect(try messageStarts(arena, &.{ call(1, to_scout, .completed), call(3, "{\"action\":\"close\",\"agent\":\"scout\"}", .completed), running }, working, &running));
+    // A message that failed opened nothing; a report's row is no call.
+    var report = call(2, "{}", .completed);
+    report.subagent_report = true;
+    try std.testing.expect(try messageStarts(arena, &.{ call(1, to_scout, .failed), report, running }, working, &running));
+    // A later call does not count.
+    try std.testing.expect(try messageStarts(arena, &.{ running, call(12, to_scout, .completed) }, working, &running));
 }
 
 test "a deferred call gets no row and does not count as a run" {
@@ -9136,7 +9685,7 @@ test "a resumed subagent report keeps its own line after main's calls" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "● Started a subagent, read a file\n" ++
+        "● Messaged a subagent, read a file\n" ++
             "├ Messaged reviewer\n" ++
             "└ Read main.ts\n" ++
             "● Got subagent updates\n" ++
@@ -9393,6 +9942,185 @@ test "a subagent that is only closed is not started" {
     );
 }
 
+fn subagentDetailForTest(entry_id: u32, arguments_json: []const u8, outcome: ?types.ToolOutcomeKind) ToolDetailRecord {
+    return .{ .entry_id = entry_id, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast(arguments_json), .outcome = outcome };
+}
+
+test "a group's header says started only above a row that started a subagent" {
+    const alloc = std.testing.allocator;
+    const to_ship_gate = "{\"action\":\"message\",\"agent\":\"ship-gate\",\"message\":\"Gate the PR\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● sent to ship-gate · Gate the PR\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● waited for ship-gate\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"sh build.sh\"}", 0, "built"),
+        subagentDetailForTest(2, to_ship_gate, .completed),
+        subagentDetailForTest(3, "{\"action\":\"wait\"}", .completed),
+    };
+    // A message to a subagent that already existed.
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Messaged a subagent, ran a command ✓\n├ Ran sh build.sh\n├ Messaged ship-gate\n└ Waited for ship-gate", std.mem.trim(u8, text, "\n"));
+    }
+    // One that made it.
+    details[1].subagent_started = true;
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Started a subagent, ran a command ✓\n├ Ran sh build.sh\n├ Started ship-gate\n└ Waited for ship-gate", std.mem.trim(u8, text, "\n"));
+    }
+    // A group that only waited, also when its wait names the subagent and so
+    // shares that subagent's row with the message before it.
+    const waits = [_]TranscriptEntry{ entries[0], entries[2] };
+    const wait_details = [_]ToolDetailRecord{ details[0], details[2] };
+    const only_waited = try groupTextForTest(alloc, &waits, &wait_details);
+    defer alloc.free(only_waited);
+    try std.testing.expectEqualStrings("● Waited for a subagent, ran a command ✓\n├ Ran sh build.sh\n└ Waited for ship-gate", std.mem.trim(u8, only_waited, "\n"));
+    const named = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● sent to ship-gate · Gate the PR\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● waited for ship-gate\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
+    };
+    const named_details = [_]ToolDetailRecord{
+        subagentDetailForTest(1, to_ship_gate, .completed),
+        subagentDetailForTest(2, "{\"action\":\"wait\",\"agent\":\"ship-gate\"}", .completed),
+        storyCommandDetail(3, "{\"command\":\"sh build.sh\"}", 0, "built"),
+    };
+    const shared = try groupTextForTest(alloc, &named, &named_details);
+    defer alloc.free(shared);
+    try std.testing.expectEqualStrings("● Waited for a subagent, ran a command ✓\n├ Waited for ship-gate\n└ Ran sh build.sh", std.mem.trim(u8, shared, "\n"));
+}
+
+test "a group's header follows its subagent rows while they run" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched for createWindow\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched for createTray\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Managing workhorse\n", .class = .tool_status } },
+    };
+    const searches = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("grep_files"), .activity_kind = .list, .arguments_json = @constCast("{\"pattern\":\"createWindow\"}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("grep_files"), .activity_kind = .list, .arguments_json = @constCast("{\"pattern\":\"createTray\"}"), .outcome = .completed },
+    };
+    const earlier = subagentDetailForTest(0, "{\"action\":\"message\",\"agent\":\"workhorse\",\"message\":\"Block 1\"}", .completed);
+    const streaming = subagentDetailForTest(3, "{\"action\":\"message\",\"agent\":\"workhorse\",\"mess", null);
+    // The transcript shows workhorse open, so the message reaches it.
+    {
+        const details = [_]ToolDetailRecord{ earlier, searches[0], searches[1], streaming };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Searched, messaging a subagent\n├ Searched createWindow, createTray\n└ Messaging workhorse", std.mem.trim(u8, text, "\n"));
+    }
+    // A new name: the message makes it.
+    {
+        const details = [_]ToolDetailRecord{ searches[0], searches[1], streaming };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Searched, starting a subagent\n├ Searched createWindow, createTray\n└ Starting workhorse", std.mem.trim(u8, text, "\n"));
+    }
+    // A wait that still runs.
+    {
+        const waiting = [_]TranscriptEntry{ entries[0], entries[1], .{ .raw_bytes = .{ .id = 3, .bytes = "● waiting for workhorse\n", .class = .tool_status } } };
+        const details = [_]ToolDetailRecord{ searches[0], searches[1], subagentDetailForTest(3, "{\"action\":\"wait\"}", null) };
+        const text = try groupTextForTest(alloc, &waiting, &details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Searched, waiting for a subagent\n├ Searched createWindow, createTray\n└ Waiting for workhorse", std.mem.trim(u8, text, "\n"));
+    }
+}
+
+fn waitChainEntryForTest(comptime id: u32, comptime phrase: []const u8) TranscriptEntry {
+    return .{ .raw_bytes = .{ .id = id, .bytes = "● " ++ phrase ++ "\n", .class = .tool_status } };
+}
+
+fn reportDetailForTest(entry_id: u32) ToolDetailRecord {
+    var report = subagentDetailForTest(entry_id, "{}", .completed);
+    report.subagent_report = true;
+    return report;
+}
+
+test "waits and the messages they took read as one row that counts the messages" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const entries = [_]TranscriptEntry{
+        waitChainEntryForTest(1, "waited for lander"),
+        waitChainEntryForTest(2, "from lander · on the model checks"),
+        waitChainEntryForTest(3, "waited for lander"),
+        waitChainEntryForTest(4, "from lander · fixes pushed"),
+        waitChainEntryForTest(5, "waited for lander"),
+        waitChainEntryForTest(6, "lander completed · Landed."),
+    };
+    const details = [_]ToolDetailRecord{
+        subagentDetailForTest(1, wait, .completed),
+        reportDetailForTest(2),
+        subagentDetailForTest(3, wait, .completed),
+        reportDetailForTest(4),
+        subagentDetailForTest(5, wait, .completed),
+        reportDetailForTest(6),
+    };
+    // Resumed rows have no presentation group, so each wait starts a run.
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        // The report keeps a line of its own.
+        try std.testing.expectEqualStrings("● Waited for lander · 2 messages\n● lander finished", std.mem.trim(u8, text, "\n"));
+    }
+    // Live, main's waits share the turn's presentation group, and the
+    // messages, which have none, sit between them.
+    {
+        var live = details;
+        for ([_]usize{ 0, 2, 4 }) |index| live[index].presentation_group_id = .{ .turn_id = 4, .anchor_step_id = 1 };
+        const text = try groupTextForTest(alloc, &entries, &live);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Waited for lander · 2 messages\n● lander finished", std.mem.trim(u8, text, "\n"));
+    }
+    // A wait that still runs keeps counting.
+    {
+        var running = details;
+        running[4].outcome = null;
+        var waiting = entries;
+        waiting[4] = waitChainEntryForTest(5, "waiting for lander");
+        const text = try groupTextForTest(alloc, waiting[0..5], running[0..5]);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Waiting for lander · 2 messages", std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "messages join the wait row of the group before them, and anything else ends the run" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const entries = [_]TranscriptEntry{
+        waitChainEntryForTest(1, "sent to lander · Land block B"),
+        waitChainEntryForTest(2, "waited for lander"),
+        waitChainEntryForTest(3, "from lander · on the E2E runs"),
+        waitChainEntryForTest(4, "waited for lander"),
+        waitChainEntryForTest(5, "from scout · a message from another subagent"),
+        waitChainEntryForTest(6, "waited for lander"),
+    };
+    const details = [_]ToolDetailRecord{
+        subagentDetailForTest(1, "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}", .completed),
+        subagentDetailForTest(2, wait, .completed),
+        reportDetailForTest(3),
+        subagentDetailForTest(4, wait, .completed),
+        reportDetailForTest(5),
+        subagentDetailForTest(6, wait, .completed),
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    // A message from a subagent the wait did not name keeps its own line,
+    // and so does the wait after it.
+    try std.testing.expectEqualStrings(
+        "● Messaged a subagent\n" ++
+            "├ Messaged lander\n" ++
+            "└ Waited for lander · 1 message\n" ++
+            "● Message from scout\n" ++
+            "● Waited for lander",
+        std.mem.trim(u8, text, "\n"),
+    );
+}
+
 test "the result mark shows only beside the commands it is for" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
@@ -9468,7 +10196,7 @@ test "repeated bare subagent waits share one row of their own" {
     // Main's waits share one row that shows the latest of them, and its
     // status keeps its own row, so each says what main did.
     try std.testing.expectEqualStrings(
-        "● Started subagents\n" ++
+        "● Messaged subagents\n" ++
             "├ Messaged reviewer\n" ++
             "├ Messaged tester\n" ++
             "├ Waited for tester\n" ++
@@ -10294,10 +11022,10 @@ test "a subagent call whose arguments are still coming waits in the latest subag
         if (std.mem.eql(u8, agent, "reviewer")) {
             // One row for the reviewer, which shows its latest call in place.
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "reviewer"));
-            try std.testing.expect(std.mem.find(u8, text, "├ Managing reviewer") != null);
+            try std.testing.expect(std.mem.find(u8, text, "├ Messaging reviewer") != null);
             try std.testing.expect(std.mem.find(u8, text, "└ Read a.zig") != null);
         } else {
-            try std.testing.expect(std.mem.find(u8, text, "└ Managing tester") != null);
+            try std.testing.expect(std.mem.find(u8, text, "└ Starting tester") != null);
         }
     };
 }

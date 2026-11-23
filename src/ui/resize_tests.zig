@@ -9434,6 +9434,69 @@ test "a check row keeps one verb on the grid while Ctrl+O keeps each check's own
     }
 }
 
+test "a check of a command found ended keeps its row on Ran on the grid while it runs" {
+    const alloc = std.testing.allocator;
+    const command = "sleep 30; printf done";
+    const check_args = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}";
+    const run_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "run" };
+    const ended_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-ended" };
+    const recheck_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-again" };
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        const calls = [_]struct { id: types.ToolLifecycleId, args: []const u8, label: []const u8, summary: []const u8, ended: bool = false }{
+            .{ .id = run_id, .args = "{\"action\":\"run\",\"command\":\"sleep 30; printf done\"}", .label = "Ran", .summary = "● Still running " ++ command },
+            .{ .id = ended_id, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command, .ended = true },
+        };
+        for (calls) |call| {
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = call.id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "shell",
+                .activity_kind = .command,
+                .arguments_json = call.args,
+            } });
+            try h.shell.setToolCommandMetadata(alloc, call.id, command, call.label);
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = call.id,
+                .outcome = .{ .kind = .completed, .summary = call.summary },
+                .check_found_command_ended = call.ended,
+            } });
+        }
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 2 calls ✓");
+
+        // The model checks the ended command again; the check runs a while.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = recheck_id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = check_args,
+        } });
+        try h.shell.setToolCommandMetadata(alloc, recheck_id, command, "Observed");
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = recheck_id, .text = "● Waiting for " ++ command } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 3 calls ✓");
+        try expectGridNotContains(&h, "Waiting for");
+
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = recheck_id,
+            .outcome = .{ .kind = .completed, .summary = "● Observed " ++ command },
+            .check_found_command_ended = true,
+        } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Ran sleep, printf · 3 calls ✓");
+        try expectGridNotContains(&h, "Waiting for");
+    }
+}
+
 test "transcript painting keeps the shadow terminal in step with the screen" {
     try std.testing.fuzz({}, fuzzTranscriptPaint, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").transcript_paint.*),

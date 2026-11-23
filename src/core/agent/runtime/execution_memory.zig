@@ -1286,6 +1286,7 @@ pub fn applyToolResultMemory(
     prepared.command_process_presentation = source_memory.command_process_presentation;
     prepared.terminal_action_presentation = source_memory.terminal_action_presentation;
     prepared.quiet_crossing = source_memory.quiet_crossing;
+    prepared.subagent_started = source_memory.subagent_started;
     const source_covers_full_file =
         source_memory.model_view_covers_full_file orelse return;
     prepared.model_view_covers_full_file =

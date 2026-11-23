@@ -2947,6 +2947,9 @@ pub const Session = struct {
             }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
+            if (try encodeSubagentStarted(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, subagent_started_type, data) });
+            }
             if (event == .user and author != .user) {
                 try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
             }
@@ -5631,6 +5634,10 @@ noinline fn replay(
                         try noteCancelledCommand(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, subagent_started_type)) {
+                        try noteSubagentStarted(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, author_type)) {
                         try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
                         continue;
@@ -6210,6 +6217,60 @@ fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
     return value.call_id;
 }
 
+/// The item right after the `tool_result` of a `subagent` message that made a
+/// new subagent, `{"call_id":…}`, so a resume reads its row as "Started" and
+/// not "Messaged" (D101). The result piece keeps its bytes: older fx versions
+/// reject an unknown field in a piece but skip an unknown item.
+const subagent_started_type = "subagent_started";
+
+const SubagentStartedData = struct { call_id: []const u8 };
+
+/// The `subagent_started` item data for `event`, or null when it needs none.
+/// The data is owned by `a`.
+fn encodeSubagentStarted(a: Allocator, event: Event) !?[]u8 {
+    const result = switch (event) {
+        .tool_result => |value| value,
+        else => return null,
+    };
+    if (!result.subagent_started) return null;
+    if (result.call_id.len == 0 or result.call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(SubagentStartedData{ .call_id = result.call_id }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Marks the turn's result a `subagent_started` item names. One that can't be
+/// read, or names no subagent result of the turn, is logged and left out, and
+/// the row reads "Messaged" as before the item existed.
+fn noteSubagentStarted(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_subagent_started_unreadable session={s} err={s} dropped=subagent_started", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const call_id = try decodeSubagentStarted(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_subagent_started_invalid session={s} dropped=subagent_started", .{src.id});
+        return;
+    };
+    if (!builder.markSubagentStarted(call_id)) {
+        debug_trace.logf("session", "event=sessions_v2_subagent_started_unmatched session={s} dropped=subagent_started", .{src.id});
+    }
+}
+
+/// The call id a `subagent_started` item's data names, or null when the data
+/// isn't one. Fields a newer fx adds are ignored. The id is in `a`.
+fn decodeSubagentStarted(a: Allocator, data: []const u8) error{OutOfMemory}!?[]const u8 {
+    const value = json_decode.parseFromSliceLeaky(SubagentStartedData, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    return value.call_id;
+}
+
 /// An edit's full-diff rows, saved right after its `tool_result` item rather
 /// than inside it. Older fx versions reject unknown fields in a piece but
 /// skip unknown item types, so they still read the result and show the
@@ -6456,6 +6517,8 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}",
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}",
             "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
+            // A subagent start (D101).
+            "{\"call_id\":\"call-start\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -6473,6 +6536,10 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     // when every string is one Ctrl+O may show.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+    // A subagent start (D101) names one call, within the identity limit.
+    if (try decodeSubagentStarted(arena_state.allocator(), buffer[0..len])) |call_id| {
+        try std.testing.expect(call_id.len > 0 and call_id.len <= session_event.max_conversation_identity_bytes);
+    }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
         inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
@@ -10284,6 +10351,72 @@ test "replay reads a cancelled command item a newer fx wrote and leaves out one 
     @memset(long_id, 'c');
     try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
     try testing.expect(decodeCancelledCommand(a, "not json") == null);
+}
+
+test "a message that made its subagent keeps its start on resume, in an item older fx skips (D101)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("ask the scout twice") };
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-start", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}" },
+        .{ .id = "call-again", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"and this\"}" },
+    };
+    const sent = "{\"ok\":true,\"result\":\"Sent to scout, which works on it now.\",\"error_code\":null}";
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call-start"), .tool_name = @constCast("subagent"), .status = .success, .output = @constCast(sent), .output_bytes = sent.len, .stored_output_bytes = sent.len, .subagent_started = true },
+        .{ .tool_call_id = @constCast("call-again"), .tool_name = @constCast("subagent"), .status = .success, .output = @constCast(sent), .output_bytes = sent.len, .stored_output_bytes = sent.len },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer for (&results) |result| {
+        if (result.output_handle) |handle| testing.allocator.free(handle);
+        if (result.preview) |preview| testing.allocator.free(preview);
+    };
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // One item, for the call that made the subagent, on the line right after
+    // its result, whose piece holds only the fields older fx versions read.
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, subagent_started_type));
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ subagent_started_type ++ "\",\"data\":{\"call_id\":\"call-start\"}") orelse return error.TestExpectedItem;
+    const result_at = std.mem.find(u8, bytes, "\"call_id\":\"call-start\",\"tool_name\":\"subagent\",\"status\"") orelse return error.TestExpectedResult;
+    try testing.expect(result_at < item_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[result_at..item_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"subagent_started\":") == null);
+
+    // Resume puts the start back on that call alone.
+    const history = try detailHistory(.{ .store = &t.store, .id = id }, testing.allocator);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    const restored = history[0].assistant.execution.tool_steps[0].tool_results;
+    try testing.expect(restored[0].subagent_started);
+    try testing.expect(!restored[1].subagent_started);
+}
+
+test "replay reads a subagent start a newer fx wrote and leaves out one it can't read (D101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("c", (try decodeSubagentStarted(a, "{\"call_id\":\"c\",\"child\":\"k\"}")).?);
+    // An empty or missing call id, one too long, and bytes that aren't JSON.
+    try testing.expect(try decodeSubagentStarted(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(try decodeSubagentStarted(a, "{\"agent\":\"scout\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(try decodeSubagentStarted(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(try decodeSubagentStarted(a, "not json") == null);
 }
 
 test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {

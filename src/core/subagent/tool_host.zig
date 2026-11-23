@@ -194,6 +194,9 @@ pub const ManagedExecutionResult = struct {
     body: []u8,
     /// The final status model is owned by the result allocator.
     final_status: ?types.SubagentStatus = null,
+    /// The message made a new subagent, for its row (D101). The model's
+    /// `body` does not change with it.
+    started: bool = false,
 };
 
 pub const Runtime = struct {
@@ -823,7 +826,9 @@ pub const Runtime = struct {
                         debug_trace.eventf("mailbox", "idle_list_unavailable", .{}, "child={s} err={s}", .{ ready.child_id, @errorName(err) });
                         break :unread &.{};
                     };
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = try startedResult(scratch.allocator(), sent, agent, ready.user_closed, idle) });
+                    var answer = try self.encodeManaged(alloc, .{ .ok = true, .result = try startedResult(scratch.allocator(), sent, agent, ready.user_closed, idle) });
+                    answer.started = true;
+                    return answer;
                 },
                 .start_failed => |failed| {
                     var buf: [start_failed_result_bytes]u8 = undefined;
@@ -1169,12 +1174,15 @@ pub const Runtime = struct {
         mask: u64 = 0,
         /// Drops at an index the mask cannot hold. They are logged, not reported.
         beyond: usize = 0,
+        /// Messages lost for memory before the slot kept them: a count only, as
+        /// they have no index.
+        lost: usize = 0,
 
         fn note(self: *LeftoverDrops, index: usize) void {
             if (index < 64) self.mask |= @as(u64, 1) << @intCast(index) else self.beyond += 1;
         }
         fn any(self: LeftoverDrops) bool {
-            return self.mask != 0 or self.beyond != 0;
+            return self.mask != 0 or self.beyond != 0 or self.lost != 0;
         }
         fn has(self: LeftoverDrops, index: usize) bool {
             return index < 64 and (self.mask >> @intCast(index)) & 1 == 1;
@@ -1200,8 +1208,10 @@ pub const Runtime = struct {
     }
 
     /// Queues the parent's messages the ended turn never took ahead of the
-    /// others waiting, so the child's next work takes them.
+    /// others waiting, so the child's next work takes them. It also takes the
+    /// count of messages lost before the slot kept them, into `drops`.
     fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd, drops: *LeftoverDrops) void {
+        drops.lost = self.managed.takeLostLeftovers(end.child_id);
         if (end.leftovers.len == 0) return;
         // A stop or close that came after the slot kept them counted them as
         // dropped, so none may start a work.
@@ -1401,8 +1411,10 @@ pub const Runtime = struct {
         _ = self.postReportWith(end, .{});
     }
 
-    /// Posts `end`'s report, or with no `work_id` the notice that the user's
-    /// stop or close dropped `dropped` messages. True when the sink took it.
+    /// Posts `end`'s report. With no `work_id` and no start failure it is the
+    /// notice that the user's stop or close dropped `dropped` messages. With a
+    /// start failure and no `work_id` it is the report of messages fx lost and
+    /// cannot name. True when the sink took it.
     fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: Dropped) bool {
         const sink = self.report_sink orelse {
             // Nothing here can take it; it stays owed in the log.
@@ -1412,7 +1424,7 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const notice = end.work_id.len == 0;
+        const notice = end.work_id.len == 0 and end.start_failure == null;
         // A report reads the child's facts once, before its text. A work whose
         // start failed says to call status while the registry still holds a
         // work for the child: the same read that decides `idle`.
@@ -1814,15 +1826,16 @@ pub const Runtime = struct {
     }
 
     /// A waiting message for the child that never ran: a work that was saved
-    /// and ended as failed, or a message that could not be saved as a work at
-    /// all. `work_id` is owned by the caller.
+    /// and ended as failed, a message that could not be saved as a work at
+    /// all, or messages lost before the slot kept them, with no work. `work_id`
+    /// is owned by the caller.
     const FailedStart = struct {
         work_id: []u8,
         report_owed: bool,
         end: child_state.EndFacts,
         err: anyerror,
         /// How many of the parent's messages the work carried: the count the
-        /// slot was started with.
+        /// slot was started with, or the count lost before the slot kept them.
         messages: usize,
         /// Whether the work was saved in the registry, and so in the log: a
         /// message that could not be saved has no log entry to post it again.
@@ -1858,8 +1871,9 @@ pub const Runtime = struct {
 
     /// Tells the owner of each leftover of `end` that could not be queued
     /// again, as a failed start: the owner was told the message joined the
-    /// turn, and it never ran. Call with no lock held. True when the sink
-    /// took a report.
+    /// turn, and it never ran. Also tells it, as one failed start with no
+    /// work, how many messages were lost before the slot kept them. Call with
+    /// no lock held. True when the sink took a report.
     fn reportDroppedLeftovers(self: *Runtime, end: managed_owner.WorkEnd, drops: LeftoverDrops) bool {
         var posted = false;
         const owed = !self.managed.treeClosed();
@@ -1875,6 +1889,14 @@ pub const Runtime = struct {
                 .saved = false,
             })) posted = true;
         }
+        if (drops.lost > 0 and self.reportFailedStart(end.child_id, .{
+            .work_id = &.{},
+            .report_owed = owed,
+            .end = .{ .started_by = .parent },
+            .err = error.OutOfMemory,
+            .messages = drops.lost,
+            .saved = false,
+        })) posted = true;
         if (drops.beyond > 0) debug_trace.logf("mailbox", "leftovers dropped unreported child={s} count={d}: they could not be queued again and never ran", .{ end.child_id, drops.beyond });
         return posted;
     }
@@ -3420,9 +3442,13 @@ fn mailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_sta
 
 /// One call of the subagent tool from the root, as its model would make it.
 fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestInput, invocation_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) ![]const u8 {
+    return (try callToolResult(runtime, arena, input, invocation_id, worker)).body;
+}
+
+fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.RequestInput, invocation_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) !ManagedExecutionResult {
     var request = try model_contract.validateRequest(std.testing.allocator, input);
     defer request.deinit(std.testing.allocator);
-    const result = try runtime.executeManaged(arena, &request, .{
+    return runtime.executeManaged(arena, &request, .{
         .caller_id = runtime.root_id,
         .invocation_id = invocation_id,
         .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
@@ -3430,7 +3456,6 @@ fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestIn
         .timestamp_ms = 1,
         .caller_worker = worker,
     });
-    return result.body;
 }
 
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
@@ -3469,6 +3494,34 @@ test "a message returns at once, and the subagent's report reaches its parent on
 
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
     try std.testing.expect(std.mem.find(u8, status, "reviewer: idle, last work completed, reports final") != null);
+}
+
+test "only a message that makes its subagent marks the start, and the model's answer stays the same" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-1", null);
+    try std.testing.expect(first.started);
+    try waitUntilQuiet(runtime);
+    const second = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-2", null);
+    try std.testing.expect(!second.started);
+    try std.testing.expectEqualStrings(first.body, second.body);
+    try waitUntilQuiet(runtime);
+    const closed = try callToolResult(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(!closed.started);
+    // Once closed, the name starts a new one.
+    const again = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-4", null);
+    try std.testing.expect(again.started);
+    try waitUntilQuiet(runtime);
 }
 
 test "a work that saves an empty reply reports that it ended without one" {
@@ -3940,6 +3993,43 @@ test "a message that joined a turn and could not be queued again is reported as 
     try expectBodyHas(again, "Sent to reviewer");
     try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
+// The worker lost a message that joined the turn before the host got it. Main was
+// told it joined, so it hears that it never ran, as a failed start does; the
+// message that did reach the host still runs.
+test "a message that joined a turn and was lost before the host got it is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted_worker = worker_runtime.WorkerRuntime{};
+    defer hosted_worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true, .hosted = &hosted_worker };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    // A second message that the worker lost before the host got it.
+    hosted_worker.lost_parent_steering = 1;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    var lost_report = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work your message made: fx ran out of memory. It never ran. Send the message again if it is still needed.") != null) lost_report = true;
+    }
+    try std.testing.expect(lost_report);
+    // Three reports: the first run's failed end, the lost message's failed start,
+    // and the second run's completion, which runs the message that did reach the host.
+    try std.testing.expectEqual(@as(usize, 3), fixture.reportCount());
 }
 
 // Two messages joined the turn and only the second cannot be queued again: the
@@ -4693,6 +4783,36 @@ test "the user's close of a working subagent reports that the user closed it" {
         alloc.free(taken);
     }
     try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "the user's close of a working subagent counts a message its worker lost" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted_worker = worker_runtime.WorkerRuntime{};
+    defer hosted_worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .hosted = &hosted_worker };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    hosted_worker.lost_parent_steering = 1;
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
+    var counted = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "The user closed it before it finished.") != null and std.mem.find(u8, line, "dropped=1") != null) counted = true;
+    }
+    try std.testing.expect(counted);
 }
 
 test "the user's close tells main how many of its messages waiting for the subagent it dropped" {

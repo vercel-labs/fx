@@ -308,7 +308,8 @@ manager:
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
-  `mcp_bridge_call` (D99), `cancelled_command` (D100), `turn_end` (files
+  `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
+  (D101), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2157,6 +2158,33 @@ as it was sent):
   older fx's strict reader rejects with the whole session; or treating
   every interrupted turn with a command call as a cancelled command,
   which also gives rows to calls that never ran a command.
+- **D101 Decision:** when a `subagent` message makes a new subagent, the
+  turn saves a `subagent_started` item right after the call's
+  `tool_result`: `{"call_id":…}`. A resume then reads the call's row as
+  `Started scout`, as live, and a message to a subagent that already
+  existed as `Messaged scout`.
+  - **Write:** the item goes out in the same batch as the `tool_result`
+    it follows, so it takes the session's lock with it
+    (`tests/tla/session/SessionWrite.tla`). The `tool_result` piece keeps
+    the same bytes. Every host saves it, since any host's session can be
+    resumed in the TUI.
+  - **Reading:** the replay marks the turn's result of that call. An item
+    it can't read, or one that names no `subagent` result of the turn, is
+    left out with a trace line, and the row reads `Messaged`.
+  - **Older sessions:** a session saved before D101 has no item, so its
+    rows read `Messaged`, unless the saved result says the subagent was
+    new.
+  - **Older fx:** an fx from before D101 leaves the item out (D17).
+
+  **Why:** the result the model reads is the same for a message that
+  made a subagent and one that reached an existing one, unless other
+  subagents were idle or the user had closed one of that name, so a
+  resume could not tell them apart. Only the subagent host knows.
+  **Alternative:** a new field in the `tool_result` piece, which an older
+  fx's strict reader rejects with the whole session; new words in the
+  result, which change what the model reads; or the first `child_spawned`
+  of each child, matched to the call through the hash in its work id,
+  which only a resume can read and the live screen cannot.
 
 ## Design Risks And Failure Behavior
 
