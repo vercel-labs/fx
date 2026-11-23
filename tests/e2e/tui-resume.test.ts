@@ -448,7 +448,8 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
 }
 
 function stripAnsi(text: string): string {
-  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  // Style codes, and the links file names carry.
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
 }
 
 type SessionPickerEntry = {

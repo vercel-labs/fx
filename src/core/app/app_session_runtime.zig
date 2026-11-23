@@ -481,6 +481,36 @@ test "a resumed request older than a day, or dated ahead, asks first" {
     try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
 }
 
+/// Whether a saved result's file change shows after a resume as it did live,
+/// with its counts and its diff: a change that `call`, the call fx ran, made
+/// with edit_file or write_file. A toolbox run of one saves its result under
+/// toolbox's name, so the result's own tool name does not say.
+fn showsCommittedFilePresentation(call: types.ToolCall, result: types.PersistedToolResult) bool {
+    return result.status == .success and
+        (std.mem.eql(u8, call.name, "write_file") or std.mem.eql(u8, call.name, "edit_file"));
+}
+
+test "a resumed file change shows its diff for the call fx ran, also through toolbox" {
+    const edit: types.ToolCall = .{ .id = "c", .name = "edit_file", .arguments_json = "{}" };
+    const read: types.ToolCall = .{ .id = "c", .name = "read_file", .arguments_json = "{}" };
+    const saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("c"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited a.txt (2 bytes)"),
+        .output_bytes = 22,
+        .stored_output_bytes = 22,
+    };
+    var under_toolbox = saved;
+    under_toolbox.tool_name = @constCast("toolbox");
+    var failed = saved;
+    failed.status = .failure;
+    try std.testing.expect(showsCommittedFilePresentation(edit, saved));
+    try std.testing.expect(showsCommittedFilePresentation(edit, under_toolbox));
+    try std.testing.expect(!showsCommittedFilePresentation(read, saved));
+    try std.testing.expect(!showsCommittedFilePresentation(edit, failed));
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -1581,11 +1611,24 @@ pub fn Runtime(comptime App: type) type {
             // Before the replay: the resume projection copies the window's
             // retention, so the whole newest cycle comes back.
             syncTranscriptWindowSaveMode(app, agent);
+            // A saved call's path relative to its workspace names a file here
+            // only when the session never ran elsewhere. A fork's turns can
+            // come from another session's workspace.
+            setSavedCallsRoot(app, if (notice != .fork and try v2.ranOnlyIn(app.workspace_root)) app.workspace_root else null);
+            defer setSavedCallsRoot(app, null);
             try hydrateResumedSession(app, agent, resumed.state, &display, notice);
             enableSessionStores(app, agent);
             syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) noteInterruptedRequest(agent, v2);
+        }
+
+        /// Tells the transcript the folder a replayed call's relative path is
+        /// in (`TranscriptRuntime.saved_calls_root`), or that it is not known.
+        fn setSavedCallsRoot(app: *App, root: ?[]const u8) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "saved_calls_root")) return;
+            app.shell.saved_calls_root = root;
         }
 
         /// Notes the request the newest turn left unfinished, if a crash or a
@@ -4677,9 +4720,7 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) !bool {
             const presentation = result.committed_file_presentation orelse return false;
-            if (result.status != .success or
-                (!std.mem.eql(u8, result.tool_name, "write_file") and
-                    !std.mem.eql(u8, result.tool_name, "edit_file")) or
+            if (!showsCommittedFilePresentation(call, result) or
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 

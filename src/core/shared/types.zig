@@ -279,6 +279,15 @@ pub const ToolLifecycleEvent = union(enum) {
         /// src/core/agent/runtime/tool_presentation.zig). Only the
         /// transcript's compact rows read it.
         check_found_command_ended: bool = false,
+        /// The file a read, edit, or write read or changed, as core resolved
+        /// it with symlinks followed, the same for every way the call named
+        /// the file: an edit's or write's absolute path
+        /// (`finishCommittedFileStatus`), or the path a read's result names,
+        /// relative to the workspace for a file in it
+        /// (`finishExecutedToolStatus`, both in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        resolved_path: ?[]const u8 = null,
     },
     turn_finished: TurnFinished,
 };
