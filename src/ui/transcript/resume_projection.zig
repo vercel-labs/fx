@@ -307,6 +307,10 @@ pub const ResumeProjection = struct {
         try self.runtime.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
+    pub fn attachHistoricalMcpToolName(self: *ResumeProjection, entry_id: u32, name: types.McpToolName) !void {
+        try self.runtime.attachHistoricalMcpToolName(self.alloc, entry_id, name);
+    }
+
     pub fn attachHistoricalToolCallWithoutResult(
         self: *ResumeProjection,
         entry_id: u32,

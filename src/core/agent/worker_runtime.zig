@@ -1288,14 +1288,35 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         const joins = joins: {
-            if (!self.worker_processing or self.active_turn_id == 0) break :joins false;
             for (self.queued_prompts.items) |prompt| {
-                if (prompt.delivery.activeTurnId() == self.active_turn_id) break :joins true;
+                if (self.joinsActiveTurnLocked(prompt)) break :joins true;
             }
             break :joins false;
         };
         debug_trace.eventf("worker", "mail_joins_checked", .{ .turn_id = self.active_turn_id }, "worker={x} joins={}", .{ @intFromPtr(self), joins });
         return joins;
+    }
+
+    /// Who wrote the prompts that `wait` reports, so it can say who sent
+    /// what ended it: those that join the running turn when any does, since
+    /// the rest start a later turn, or else every prompt waiting.
+    pub fn queuedAuthors(self: *WorkerRuntime) std.EnumSet(MessageAuthor) {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var joining: std.EnumSet(MessageAuthor) = .empty;
+        var waiting: std.EnumSet(MessageAuthor) = .empty;
+        for (self.queued_prompts.items) |prompt| {
+            waiting.insert(prompt.author);
+            if (self.joinsActiveTurnLocked(prompt)) joining.insert(prompt.author);
+        }
+        return if (joining.count() > 0) joining else waiting;
+    }
+
+    /// Whether `prompt` joins the running turn at its next boundary. The
+    /// caller holds `worker_mutex`.
+    fn joinsActiveTurnLocked(self: *const WorkerRuntime, prompt: QueuedPrompt) bool {
+        if (!self.worker_processing or self.active_turn_id == 0) return false;
+        return prompt.delivery.activeTurnId() == self.active_turn_id;
     }
 
     /// Holds a place in this queue for another agent's message that is on
@@ -5213,12 +5234,14 @@ pub fn dupeToolLifecycleEvent(
             const tool_name = if (started.tool_name) |name| try alloc.dupe(u8, name) else null;
             errdefer if (tool_name) |name| alloc.free(name);
             const arguments_json = if (started.arguments_json) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (arguments_json) |value| alloc.free(value);
             break :blk .{ .provisional = .{
                 .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
                 .presentation_group_id = started.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = started.activity_kind,
                 .arguments_json = arguments_json,
+                .mcp_tool = try dupeMcpToolName(alloc, started.mcp_tool),
             } };
         },
         .authoritative_started => |started| blk: {
@@ -5244,6 +5267,7 @@ pub fn dupeToolLifecycleEvent(
                 .activity_kind = started.activity_kind,
                 .arguments_json = arguments_json,
                 .place_after_current_transcript = started.place_after_current_transcript,
+                .mcp_tool = try dupeMcpToolName(alloc, started.mcp_tool),
             } };
         },
         .progress => |progress| blk: {
@@ -5300,6 +5324,7 @@ pub fn freeToolLifecycleEvent(
             alloc.free(@constCast(started.id.call_id));
             if (started.tool_name) |name| alloc.free(@constCast(name));
             if (started.arguments_json) |arguments_json| alloc.free(@constCast(arguments_json));
+            freeMcpToolName(alloc, started.mcp_tool);
         },
         .authoritative_started => |started| {
             alloc.free(@constCast(started.id.call_id));
@@ -5310,6 +5335,7 @@ pub fn freeToolLifecycleEvent(
             if (started.arguments_json) |arguments_json| {
                 alloc.free(@constCast(arguments_json));
             }
+            freeMcpToolName(alloc, started.mcp_tool);
         },
         .progress => |progress| {
             alloc.free(@constCast(progress.id.call_id));
@@ -5325,6 +5351,57 @@ pub fn freeToolLifecycleEvent(
         },
         .turn_finished => {},
     }
+}
+
+fn dupeMcpToolName(alloc: std.mem.Allocator, source: ?types.McpToolName) !?types.McpToolName {
+    const name = source orelse return null;
+    const server = try alloc.dupe(u8, name.server);
+    errdefer alloc.free(server);
+    return .{ .server = server, .tool = try alloc.dupe(u8, name.tool) };
+}
+
+fn freeMcpToolName(alloc: std.mem.Allocator, name: ?types.McpToolName) void {
+    const value = name orelse return;
+    alloc.free(@constCast(value.server));
+    alloc.free(@constCast(value.tool));
+}
+
+test "a copied start event keeps the MCP tool core named for the call" {
+    const alloc = std.testing.allocator;
+    var server = "my_srv".*;
+    var tool = "echo".*;
+    const events = [_]types.ToolLifecycleEvent{
+        .{ .provisional = .{ .id = .{ .turn_id = 1, .call_id = "a" }, .tool_name = "toolbox", .activity_kind = .mcp, .mcp_tool = .{ .server = &server, .tool = &tool } } },
+        .{ .authoritative_started = .{ .id = .{ .turn_id = 1, .call_id = "b" }, .reconciles_provisional_call_id = null, .tool_name = "toolbox", .activity_kind = .mcp, .mcp_tool = .{ .server = &server, .tool = &tool } } },
+        .{ .authoritative_started = .{ .id = .{ .turn_id = 1, .call_id = "c" }, .reconciles_provisional_call_id = null, .tool_name = "read_file", .activity_kind = .read } },
+    };
+    for (events) |event| {
+        const copy = try dupeToolLifecycleEvent(alloc, event);
+        defer freeToolLifecycleEvent(alloc, copy);
+        const name = switch (copy) {
+            .provisional => |started| started.mcp_tool,
+            .authoritative_started => |started| started.mcp_tool,
+            else => unreachable,
+        };
+        if (std.mem.eql(u8, switch (copy) {
+            .provisional => |started| started.tool_name.?,
+            .authoritative_started => |started| started.tool_name,
+            else => unreachable,
+        }, "read_file")) {
+            try std.testing.expect(name == null);
+            continue;
+        }
+        try std.testing.expectEqualStrings("my_srv", name.?.server);
+        try std.testing.expectEqualStrings("echo", name.?.tool);
+        // A copy, so the push may free the event's own bytes.
+        try std.testing.expect(@intFromPtr(name.?.server.ptr) != @intFromPtr(&server));
+    }
+    // A copy that fails partway frees what it took.
+    try std.testing.checkAllAllocationFailures(@import("../shared/testing_allocator.zig").no_resize, struct {
+        fn run(a: std.mem.Allocator, event: types.ToolLifecycleEvent) !void {
+            freeToolLifecycleEvent(a, try dupeToolLifecycleEvent(a, event));
+        }
+    }.run, .{events[1]});
 }
 
 fn dupeToolResultMemory(
@@ -6789,6 +6866,31 @@ test "an agent's posted message joins the running turn, waits behind older work,
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("wakes", job.prompt);
     try std.testing.expect(job.delivery.isContinuation());
+}
+
+test "wait names the senders whose prompts join the running turn, or else every sender" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    // A report joins the running turn; the user's prompt waits for the next.
+    var report = try makePrompt(alloc, "report", "model");
+    report.author = .child;
+    try runtime.postMail(alloc, report);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "next", "model"));
+    try std.testing.expect(runtime.queuedMailJoinsTurn());
+    const joining = runtime.queuedAuthors();
+    try std.testing.expect(joining.contains(.child));
+    try std.testing.expect(!joining.contains(.user));
+
+    // Between turns nothing joins, so every prompt waiting is named.
+    runtime.worker_processing = false;
+    try std.testing.expect(!runtime.queuedMailJoinsTurn());
+    const waiting = runtime.queuedAuthors();
+    try std.testing.expect(waiting.contains(.child));
+    try std.testing.expect(waiting.contains(.user));
 }
 
 test "a posted message joins a turn the worker started after an earlier turn closed" {

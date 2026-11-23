@@ -1907,6 +1907,7 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                     .labels = &historical_labels,
+                    .agent = agent,
                 };
                 const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels, transcript_matches_history);
                 const projection_finished_ns = io_mod.nanoTimestamp();
@@ -1925,7 +1926,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
             } else {
-                var sink = LiveHistorySink(App){ .app = app };
+                var sink = LiveHistorySink(App){ .app = app, .agent = agent };
                 _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels, transcript_matches_history);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
@@ -3329,6 +3330,8 @@ pub fn Runtime(comptime App: type) type {
         fn LiveHistorySink(comptime SinkApp: type) type {
             return struct {
                 app: *SinkApp,
+                /// Whose history this is, for the names of its MCP calls.
+                agent: ?*AppAgent = null,
 
                 const Self = @This();
 
@@ -3464,6 +3467,12 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                pub fn attachHistoricalMcpToolName(self: *Self, entry_id: u32, name: types.McpToolName) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalMcpToolName")) {
+                        try self.app.attachHistoricalMcpToolName(entry_id, name);
+                    }
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalCommandOutput")) {
                         self.app.attachHistoricalCommandOutput(entry_id);
@@ -3527,6 +3536,8 @@ pub fn Runtime(comptime App: type) type {
                 app: *App,
                 projection: *Projection,
                 labels: *const HistoricalSessionLabels,
+                /// Whose history this is, for the names of its MCP calls.
+                agent: ?*AppAgent = null,
 
                 const Self = @This();
 
@@ -3770,6 +3781,12 @@ pub fn Runtime(comptime App: type) type {
                     outcome: types.ToolOutcomeKind,
                 ) !void {
                     try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
+                }
+
+                pub fn attachHistoricalMcpToolName(self: *Self, entry_id: u32, name: types.McpToolName) !void {
+                    if (comptime @hasDecl(Projection, "attachHistoricalMcpToolName")) {
+                        try self.projection.attachHistoricalMcpToolName(entry_id, name);
+                    }
                 }
 
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
@@ -4197,6 +4214,7 @@ pub fn Runtime(comptime App: type) type {
                 .app = app,
                 .projection = &projection,
                 .labels = &labels,
+                .agent = agent,
             };
             const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, history, &labels, false);
             try projection.finalize();
@@ -4324,7 +4342,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn replayHistory(app: *App, agent: *AppAgent, history: []const types.HistoryTurn) !void {
-            var sink = LiveHistorySink(App){ .app = app };
+            var sink = LiveHistorySink(App){ .app = app, .agent = agent };
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             return replayHistoryToSink(app, agent, &sink, history, &labels);
@@ -4422,6 +4440,7 @@ pub fn Runtime(comptime App: type) type {
                 .app = app,
                 .projection = projection,
                 .labels = &labels,
+                .agent = agent,
             };
             return replayHistoryToSinkIncremental(
                 app,
@@ -4438,6 +4457,59 @@ pub fn Runtime(comptime App: type) type {
         /// they did live. Any other call as it is.
         fn shownHistoricalCall(app: *App, agent: *AppAgent, arena: std.mem.Allocator, call: types.ToolCall) !types.ToolCall {
             return try toolbox.shownBuiltinRun(arena, app.toolAdvertisementSet(agent).registry, call) orelse call;
+        }
+
+        /// The MCP tool a starting call runs, for its compact rows: from the
+        /// live catalog, which the session then records so a resume knows it
+        /// before the servers connect (D46), else from that record. Null for
+        /// any other call, and for one neither knows. Copied into `arena`.
+        pub fn liveMcpToolName(
+            app: *App,
+            agent: *AppAgent,
+            arena: std.mem.Allocator,
+            tool_name: []const u8,
+            arguments_json: ?[]const u8,
+        ) !?types.McpToolName {
+            const alias = try toolbox.mcpToolAlias(arena, tool_name, arguments_json) orelse return null;
+            if (comptime @hasField(App, "mcp")) {
+                if (try app.mcp.toolIdentity(arena, alias)) |identity| {
+                    rememberMcpToolName(agent, alias, identity);
+                    return .{ .server = identity.server, .tool = identity.tool };
+                }
+            }
+            return recordedMcpToolName(agent, arena, alias);
+        }
+
+        /// Gives a saved MCP call's row the tool it ran: from the session's
+        /// record, which says what the call ran, else from the live catalog.
+        /// A call neither knows keeps a row that names no server.
+        fn attachReplayedMcpToolName(app: *App, agent: *AppAgent, sink: anytype, entry_id: u32, alias: []const u8) !void {
+            if (comptime !@hasDecl(@TypeOf(sink.*), "attachHistoricalMcpToolName")) return;
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const name = try recordedMcpToolName(agent, arena, alias) orelse blk: {
+                if (comptime !@hasField(App, "mcp")) return;
+                const identity = try app.mcp.toolIdentity(arena, alias) orelse return;
+                break :blk types.McpToolName{ .server = identity.server, .tool = identity.tool };
+            };
+            try sink.attachHistoricalMcpToolName(entry_id, name);
+        }
+
+        fn recordedMcpToolName(agent: *AppAgent, arena: std.mem.Allocator, alias: []const u8) !?types.McpToolName {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
+            const session = agent.session_persistence.v2 orelse return null;
+            const identity = try agent.session_persistence.tool_identities.lookup(std.heap.c_allocator, arena, session, alias) orelse return null;
+            return .{ .server = identity.server, .tool = identity.tool };
+        }
+
+        /// A record that cannot be written costs only the resumed rows' names.
+        fn rememberMcpToolName(agent: *AppAgent, alias: []const u8, identity: anytype) void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const session = agent.session_persistence.v2 orelse return;
+            agent.session_persistence.tool_identities.remember(std.heap.c_allocator, session, alias, identity) catch |err| {
+                debug_trace.logf("session", "MCP tool identity not recorded for resume tool={s} err={s}", .{ alias, @errorName(err) });
+            };
         }
 
         fn writeCancelledCommandPresentation(
@@ -4476,7 +4548,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeExecutionHistory(app: *App, agent: *AppAgent, execution: types.ExecutionMemory) !void {
-            var sink = LiveHistorySink(App){ .app = app };
+            var sink = LiveHistorySink(App){ .app = app, .agent = agent };
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             return writeExecutionHistoryToSink(app, agent, &sink, execution, &labels);
@@ -4740,14 +4812,20 @@ pub fn Runtime(comptime App: type) type {
                     try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                     &.{},
                 );
-            const formatted_action = if (outcome_decision) |decision|
-                if (decision.detail) |detail|
-                    try action_arena.allocator().print(
-                        "{s}: {s}",
-                        .{ formatted_action_base, detail },
-                    )
-                else
-                    formatted_action_base
+            // A failed MCP call's line says why, as it did live
+            // (`tool_presentation.mcpFailureCause`).
+            const action_detail = if (outcome_decision) |decision|
+                decision.detail
+            else if (!deferred and permission_denial_reason == null and result.status == .failure and
+                try toolbox.mcpToolAlias(action_arena.allocator(), call.name, call.arguments_json) != null)
+                try tool_presentation.mcpFailureCause(action_arena.allocator(), result.output)
+            else
+                null;
+            const formatted_action = if (action_detail) |detail|
+                try action_arena.allocator().print(
+                    "{s}: {s}",
+                    .{ formatted_action_base, detail },
+                )
             else
                 formatted_action_base;
             const action = try app.alloc.dupe(u8, formatted_action);
@@ -4775,6 +4853,9 @@ pub fn Runtime(comptime App: type) type {
             );
             if (!is_command or deferred or permission_denial_reason != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
+                if (try toolbox.mcpToolAlias(action_arena.allocator(), call.name, call.arguments_json)) |alias| {
+                    try attachReplayedMcpToolName(app, agent, sink, entry_id, alias);
+                }
                 return;
             }
             if (!sink.materializeCommandReplay()) {
@@ -5139,6 +5220,9 @@ pub fn Runtime(comptime App: type) type {
                 const kind = record.outcome.toolOutcome();
                 const entry_id = try writeCompletedToolStatus(sink, kind, status);
                 try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+                if (comptime @hasField(@TypeOf(sink.*), "agent")) if (sink.agent) |agent| {
+                    try attachReplayedMcpToolName(app, agent, sink, entry_id, record.tool);
+                };
             }
         }
 
@@ -7630,6 +7714,92 @@ test "a resume shows each saved fx mcp call row right after its shell call's row
         &.{ .completed, .completed, .completed, .failed, .completed },
         app.completed_tool_outcomes.items,
     );
+}
+
+test "a resumed MCP call names the server and tool its session recorded, and a failed one keeps its reason" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const persistence = &app.agent().session_persistence;
+    _ = try persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    persistence.v2 = try session_adapter.Session.create(alloc, persistence.v2_store.?, paths.workspace, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    });
+    // The servers' names hold "_" and a space, so each alias alone could be
+    // another server's tool, and no server is connected yet.
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_my_srv_echo", .{ .server = @constCast("my_srv"), .tool = @constCast("echo") });
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_Team_notes_echo", .{ .server = @constCast("Team notes"), .tool = @constCast("echo") });
+
+    const failure = "{\"server\":\"my_srv\",\"tool\":\"mcp_my_srv_echo\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Invalid input: labels require at least one item\"}],\"isError\":true}}";
+    const held = "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"review_caution\"}}";
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_failed", .name = "mcp_my_srv_echo", .arguments_json = "{}" },
+        .{ .id = "call_held", .name = "mcp_Team_notes_echo", .arguments_json = "{}" },
+        .{ .id = "call_unknown", .name = "mcp_other_srv_echo", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call_failed"), .tool_name = @constCast("mcp_my_srv_echo"), .status = .failure, .output = @constCast(failure), .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        .{ .tool_call_id = @constCast("call_held"), .tool_name = @constCast("mcp_Team_notes_echo"), .status = .failure, .output = @constCast(held), .output_bytes = held.len, .stored_output_bytes = held.len },
+        .{ .tool_call_id = @constCast("call_unknown"), .tool_name = @constCast("mcp_other_srv_echo"), .status = .failure, .output = @constCast(held), .output_bytes = held.len, .stored_output_bytes = held.len },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+        .agent = app.agent(),
+    };
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, app.agent(), &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    // Core's line says why the call failed, as it did live.
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(alloc);
+    for (projection.runtime.notebook.entries.items) |entry| switch (entry) {
+        .raw_bytes => |raw| try lines.appendSlice(alloc, raw.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("lines:\n{s}\n", .{lines.items});
+    try std.testing.expect(std.mem.find(u8, lines.items, "Failed mcp_my_srv_echo: Invalid input: labels require at least one item") != null);
+
+    var group = try tool_group_projection.buildStyled(alloc, projection.runtime.notebook.entries.items, projection.runtime.notebook.tool_details.items, 120, .{}, .{});
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("rows:\n{s}\n", .{text.items});
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't use My_srv to echo") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Didn't use Team notes to echo · safety caution") != null);
+    // A call the record does not name keeps a row that names no server.
+    try std.testing.expect(std.mem.find(u8, text.items, "Didn't use an MCP tool · safety caution") != null);
+    var named: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |detail| {
+        if (detail.mcp_server == null) continue;
+        named += 1;
+        try std.testing.expectEqualStrings("echo", detail.mcp_tool.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), named);
 }
 
 test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
