@@ -3177,7 +3177,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         ["other-code", "Internal error", null],
       ] as const;
       for (const [kind, message, cause] of cases) {
-        const rowText = `Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`;
+        const rowText = `Couldn't use ${TOOL_ROW} · ${cause ?? `MCP protocol error -32603: ${message}`}`;
         const logged = await refusedCall(
           `tui-invalid-params-log-${kind}`,
           { protocolErrorMessage: message, protocolErrorData: data, ...(cause === null ? { protocolErrorCode: -32603 } : {}) },
@@ -3193,7 +3193,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         // no other field of it: the cause is the server's message's and nothing of the data.
         expect({ kind, found: logged.logs.includes(marker) }).toEqual({ kind, found: false });
         expect({ kind, found: logged.screen.includes(marker) }).toEqual({ kind, found: false });
-        expect(logged.screen).toContain(`Couldn't use ${TOOL_ROW} · ${cause ?? `MCP protocol error -32603: ${message}`}`);
+        expect(logged.screen).toContain(rowText);
         expect({ kind, shown: logged.screen.includes("data=") }).toEqual({ kind, shown: false });
         const reportFields: string[] = [];
         const walk = (value: unknown, path: string) => {
