@@ -50,7 +50,8 @@
 //!   `memory_lines` with the `ps` output when it has another shape. A crash
 //!   report writes `memory` as {`status`: `unavailable`} and runs no `ps`}; `worker`
 //!   {`processing`, `queued`, `cancel_requested`, `pending_permission`
-//!   (masked)}; `pending_questions` {`count`, `questions`: the first 3 as
+//!   (masked)}, or {`status`: `unavailable`} in a crash report whose worker lock
+//!   was busy; `pending_questions` {`count`, `questions`: the first 3 as
 //!   {`question` (masked), `options`, a count}}; `pending_images` {`count`,
 //!   `images`: the first 3 as {`media_type`, `path` (masked)}};
 //!   `project_context` {`enabled`, `loaded`, `bytes`}; `fx_trace`, whether
@@ -71,7 +72,9 @@
 //!   `turn_id`, `detail`}, for the newest 3 failures; `mcp_server` {`issue`
 //!   (`failed`, `retrying`, `missing_env`, `invalid_env`, or `needs_login`),
 //!   `name`, `variable`, `error` (masked)}; `model_catalog` {`event`,
-//!   `detail`}, for the newest 3 failures.
+//!   `detail`}, for the newest 3 failures; `worker_unavailable` {`reason`:
+//!   `lock_busy`}, in place of `active_turn` in a crash report whose worker
+//!   lock was busy.
 //! - `last_shutdown`: `status` (`recorded`, `none`, or `unreadable`),
 //!   `total_ms`, `recorded_at`, and `stages`, a list of {`name`, `step_ms`}.
 //! - `last_crash`: `status` (`recorded`, `none`, `too_large`, `unreadable`, `stale`, `future`, or `undated`), the crash
@@ -222,7 +225,8 @@
 //!   1024 bytes), `rationale_bytes`, `rationale_omitted_bytes`. Reviews are
 //!   recorded even when `FX_TRACE` is off.
 //! - `git`: the workspace's git state, read through safe git within 3
-//!   seconds in all. `refused`, why fx won't run git here; or `error`:
+//!   seconds in all. A crash report writes only {`status`: `skipped`, `reason`:
+//!   `crash_report`} and runs no git. `refused`, why fx won't run git here; or `error`:
 //!   `timeout` when the 3 seconds passed (with `timeout_ms`), `signal` when
 //!   a signal ended a git command (with `signal`, its number), or why git
 //!   could not run. With `timeout` or `signal`, `unfinished` maps each field
@@ -318,6 +322,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const io_mod = @import("../shared/io.zig");
+const testing_event = @import("../shared/testing_event.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_time = @import("../shared/local_time.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
@@ -562,6 +567,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     const r = &records;
 
     const agent = agents.screenAgentOf(app);
+    // Only the UI loop thread writes the history; workers read copies, so this read needs no lock.
     const history = agent.session.agent.history.items;
     const permission_view = app_permission_runtime.Runtime(App).viewOf(app, agent);
     // A copy: a subagent's worker can add approvals while the report is built.
@@ -574,7 +580,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     if (fatal) |err| try writeFatalError(r, err);
     try writeSummary(r, app, permissions.permissionModeLabel(permission_view.mode));
     try writeCurrentState(r, app, fatal != null);
-    try writeProblems(r, app);
+    try writeProblems(r, app, fatal != null);
     try writeLastShutdownRead(r, app_lifecycle.readLastShutdownReport(arena));
     // A crash report never embeds an older crash report, so the file cannot grow on each crash.
     if (fatal == null) try writeLastCrashRead(r, readLastCrashReport(arena), now_ms);
@@ -587,7 +593,7 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeToolCalls(r, history, shell_view);
     try writePermissions(r, permission_grants);
     try writeAutoReviews(r);
-    try writeGit(r, app.workspace_root);
+    try writeGit(r, app.workspace_root, fatal != null);
     try writeSettings(r, app.workspace_root);
     try writeSkills(r, app);
     try writeRuntimeContext(r, app);
@@ -659,6 +665,53 @@ fn writeSummary(r: *Records, app: anytype, permission_mode: []const u8) !void {
     try r.end();
 }
 
+/// The worker's state for the report. A crash report reads it only while the
+/// worker lock is free, so the save never waits on a worker (`RULES.md` R2.3).
+/// Null means the state is unavailable.
+fn workerStateForReport(worker: *worker_runtime.WorkerRuntime, alloc: std.mem.Allocator, crash_report: bool) ?worker_runtime.StateSnapshot {
+    if (crash_report) return worker.trySnapshotState(alloc) catch null;
+    return worker.snapshotState(alloc) catch null;
+}
+
+/// The worker's pending questions for the report, read the same way.
+fn pendingQuestionsForReport(worker: *worker_runtime.WorkerRuntime, alloc: std.mem.Allocator, crash_report: bool) ?worker_runtime.PendingQuestionBatchSnapshot {
+    if (crash_report) return worker.trySnapshotPendingQuestionBatch(alloc) catch null;
+    return worker.snapshotPendingQuestionBatch(alloc) catch null;
+}
+
+/// Writes the `worker` and `pending_questions` objects of `current_state`. A
+/// crash report whose worker lock is busy writes `worker` as unavailable and
+/// leaves the questions out.
+fn writeWorkerState(r: *Records, worker: *worker_runtime.WorkerRuntime, crash_report: bool) !void {
+    if (workerStateForReport(worker, r.arena, crash_report)) |state| {
+        defer state.deinit(r.arena);
+        try r.beginObject("worker");
+        try r.boolean("processing", state.processing);
+        try r.number("queued", state.queued_count);
+        try r.boolean("cancel_requested", state.cancel_requested);
+        if (state.pending_permission_request) |request| try r.masked("pending_permission", request.label);
+        try r.endObject();
+    } else if (crash_report) {
+        try r.beginObject("worker");
+        try r.text("status", "unavailable");
+        try r.endObject();
+    }
+    if (pendingQuestionsForReport(worker, r.arena, crash_report)) |questions| {
+        defer questions.deinit(r.arena);
+        try r.beginObject("pending_questions");
+        try r.number("count", questions.entries.len);
+        try r.beginArray("questions");
+        for (questions.entries[0..@min(questions.entries.len, pending_items_shown)]) |entry| {
+            try r.beginItem();
+            try r.masked("question", entry.question);
+            try r.number("options", entry.options.len);
+            try r.endItem();
+        }
+        try r.endArray();
+        try r.endObject();
+    }
+}
+
 noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !void {
     const App = @TypeOf(app.*);
     const agent = agents.screenAgentOf(app);
@@ -679,31 +732,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !vo
     }
     try writeAuthState(r, app);
     try writeProcess(r, crash_report);
-    if (comptime agents.hasAgentField(App, "worker")) {
-        if (agent.worker.snapshotState(r.arena) catch null) |state| {
-            defer state.deinit(r.arena);
-            try r.beginObject("worker");
-            try r.boolean("processing", state.processing);
-            try r.number("queued", state.queued_count);
-            try r.boolean("cancel_requested", state.cancel_requested);
-            if (state.pending_permission_request) |request| try r.masked("pending_permission", request.label);
-            try r.endObject();
-        }
-        if (agent.worker.snapshotPendingQuestionBatch(r.arena) catch null) |questions| {
-            defer questions.deinit(r.arena);
-            try r.beginObject("pending_questions");
-            try r.number("count", questions.entries.len);
-            try r.beginArray("questions");
-            for (questions.entries[0..@min(questions.entries.len, pending_items_shown)]) |entry| {
-                try r.beginItem();
-                try r.masked("question", entry.question);
-                try r.number("options", entry.options.len);
-                try r.endItem();
-            }
-            try r.endArray();
-            try r.endObject();
-        }
-    }
+    if (comptime agents.hasAgentField(App, "worker")) try writeWorkerState(r, &agent.worker, crash_report);
     if (comptime agents.hasAgentField(App, "pending_images")) {
         const images = agent.pending_images.items;
         if (images.len > 0) {
@@ -885,10 +914,10 @@ fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
 }
 
 /// Writes the `problems` record and a `problem` record for each problem.
-noinline fn writeProblems(r: *Records, app: anytype) !void {
+noinline fn writeProblems(r: *Records, app: anytype, crash_report: bool) !void {
     const later = try Buffer.create(r.arena);
     const p = &later.records;
-    try writeActiveTurnProblem(p, app);
+    try writeActiveTurnProblem(p, app, crash_report);
     try writeInterruptedTurnProblem(p, agents.screenAgentOf(app).session.agent.history.items);
     try writeSessionTitleProblem(p, app);
     try writeNetworkProblems(p);
@@ -908,9 +937,19 @@ fn beginProblem(p: *Records, comptime kind: []const u8) !void {
     try p.text("kind", kind);
 }
 
-fn writeActiveTurnProblem(p: *Records, app: anytype) !void {
+/// A crash report whose worker lock is busy says so, in place of the active turn.
+fn writeWorkerUnavailableProblem(p: *Records) !void {
+    try beginProblem(p, "worker_unavailable");
+    try p.text("reason", "lock_busy");
+    try p.end();
+}
+
+fn writeActiveTurnProblem(p: *Records, app: anytype, crash_report: bool) !void {
     const agent = agents.screenAgentOf(app);
-    const snapshot = agent.worker.snapshotState(p.arena) catch return;
+    const snapshot = workerStateForReport(&agent.worker, p.arena, crash_report) orelse {
+        if (crash_report) try writeWorkerUnavailableProblem(p);
+        return;
+    };
     defer snapshot.deinit(p.arena);
     if (!snapshot.processing and !agent.stream.active) return;
     try beginProblem(p, "active_turn");
@@ -2177,7 +2216,15 @@ fn setupLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     return arena.print("{s} ... ({d} bytes)", .{ kept, masked.len });
 }
 
-fn writeGit(r: *Records, workspace_root: []const u8) !void {
+fn writeGit(r: *Records, workspace_root: []const u8, crash_report: bool) !void {
+    // A crash report runs no git: git may use its whole budget while the terminal
+    // is still raw, and the report is written before the terminal is released.
+    if (crash_report) {
+        try r.begin("git");
+        try r.text("status", "skipped");
+        try r.text("reason", "crash_report");
+        return r.end();
+    }
     // The arena owns the parts.
     const parts = git_context.queryParts(r.arena, workspace_root, git_budget_ms) catch |err| {
         try r.begin("git");
@@ -7236,7 +7283,7 @@ test "trace stays well formed with every ring full and a long transcript" {
     const w = try TestWriter.create();
     defer w.destroy();
     try writeHeader(&w.records, "stress", started);
-    try writeProblems(&w.records, &app);
+    try writeProblems(&w.records, &app, false);
     try writeCompaction(&w.records);
     try writeNetwork(&w.records);
     try writeModelCatalog(&w.records, &struct {}{});
@@ -7272,4 +7319,98 @@ test "trace stays well formed with every ring full and a long transcript" {
     try expectStartsWith(last_text, "AI_GATEWAY_API_KEY=[redacted]");
     try std.testing.expect(std.mem.find(u8, last_text, "\\xff\\xc3") != null);
     try expectEndsWith(last_text, "\nred line");
+}
+
+/// The first `problem` record of `kind`, or null.
+fn problemOfKind(trace: *const TestTrace, kind: []const u8) ?std.json.ObjectMap {
+    for (trace.records) |record| {
+        if (!std.mem.eql(u8, record.get("type").?.string, "problem")) continue;
+        const found = record.get("kind") orelse continue;
+        if (std.mem.eql(u8, found.string, kind)) return record;
+    }
+    return null;
+}
+
+test "crash-mode problems do not wait while a worker holds its lock" {
+    const busy_wait_ms: u32 = 500;
+    const FakeApp = struct {
+        main_agent: struct {
+            worker: worker_runtime.WorkerRuntime = .{},
+            stream: struct { active: bool = false } = .{},
+            session: struct { agent: struct { history: std.ArrayList(types.HistoryTurn) = .empty } = .{} } = .{},
+        } = .{},
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+    };
+    var app: FakeApp = .{};
+    defer app.agent().worker.deinit(std.testing.allocator);
+    const Probe = struct {
+        app: *FakeApp,
+        records: *TestWriter,
+        held: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+
+        fn hold(self: *@This()) void {
+            self.app.main_agent.worker.worker_mutex.lockUncancelable(io_mod.getIo());
+            self.held.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            self.app.main_agent.worker.worker_mutex.unlock(io_mod.getIo());
+        }
+
+        fn report(self: *@This()) void {
+            defer self.finished.set(io_mod.getIo());
+            const r = &self.records.records;
+            self.run(r) catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn run(self: *@This(), r: *Records) !void {
+            try r.begin("current_state");
+            try writeWorkerState(r, &self.app.main_agent.worker, true);
+            try r.end();
+            try writeProblems(r, self.app, true);
+        }
+    };
+    const w = try TestWriter.create();
+    defer w.destroy();
+    var probe: Probe = .{ .app = &app, .records = w };
+    const holder = try std.Thread.spawn(.{}, Probe.hold, .{&probe});
+    const held = testing_event.setInTime(&probe.held);
+    const reporter = try std.Thread.spawn(.{}, Probe.report, .{&probe});
+    const finished = testing_event.setWithin(&probe.finished, busy_wait_ms);
+    probe.release.set(io_mod.getIo());
+    holder.join();
+    reporter.join();
+    try std.testing.expect(held);
+    try std.testing.expect(finished);
+    try std.testing.expect(probe.failure == null);
+
+    var trace = try w.trace();
+    defer trace.deinit();
+    const current = try trace.one("current_state");
+    const worker = (current.get("worker") orelse return error.TestExpectedWorkerStatus).object;
+    try std.testing.expectEqualStrings("unavailable", try testString(worker, "status"));
+    try expectAbsent(current, "pending_questions");
+    try std.testing.expect(problemOfKind(&trace, "active_turn") == null);
+    const busy = problemOfKind(&trace, "worker_unavailable") orelse return error.TestExpectedWorkerUnavailable;
+    try std.testing.expectEqualStrings("lock_busy", try testString(busy, "reason"));
+}
+
+test "crash-mode git record is skipped and runs no git" {
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeGit(&w.records, "/nonexistent-fx-2172", true);
+    var trace = try w.trace();
+    defer trace.deinit();
+    const git = try trace.one("git");
+    try std.testing.expectEqualStrings("skipped", try testString(git, "status"));
+    try std.testing.expectEqualStrings("crash_report", try testString(git, "reason"));
+    try expectAbsent(git, "repository");
+    try expectAbsent(git, "branch");
+    try expectAbsent(git, "error");
 }

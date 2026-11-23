@@ -2725,6 +2725,26 @@ pub const WorkerRuntime = struct {
     ) permission_request.RequestCloneError!StateSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.snapshotStateLocked(alloc);
+    }
+
+    /// As `snapshotState`, but never waits: null when another thread holds the
+    /// worker lock, so a crash report can say so instead of blocking (`RULES.md`
+    /// R2.3).
+    pub fn trySnapshotState(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+    ) permission_request.RequestCloneError!?StateSnapshot {
+        if (!self.worker_mutex.tryLock()) return null;
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return try self.snapshotStateLocked(alloc);
+    }
+
+    /// Requires `worker_mutex`.
+    fn snapshotStateLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+    ) permission_request.RequestCloneError!StateSnapshot {
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
         return .{
             .processing = self.worker_processing,
@@ -3634,6 +3654,20 @@ pub const WorkerRuntime = struct {
     pub fn snapshotPendingQuestionBatch(self: *WorkerRuntime, alloc: std.mem.Allocator) !?PendingQuestionBatchSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.snapshotPendingQuestionBatchLocked(alloc);
+    }
+
+    /// As `snapshotPendingQuestionBatch`, but never waits: `error.WorkerBusy`
+    /// when another thread holds the worker lock (`RULES.md` R2.3). A busy lock
+    /// is an error here, not null, because null already means "no batch".
+    pub fn trySnapshotPendingQuestionBatch(self: *WorkerRuntime, alloc: std.mem.Allocator) !?PendingQuestionBatchSnapshot {
+        if (!self.worker_mutex.tryLock()) return error.WorkerBusy;
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.snapshotPendingQuestionBatchLocked(alloc);
+    }
+
+    /// Requires `worker_mutex`.
+    fn snapshotPendingQuestionBatchLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?PendingQuestionBatchSnapshot {
         const pending = self.pending_question_shared orelse return null;
         return try dupePendingBatchSnapshot(alloc, pending);
     }
@@ -10745,4 +10779,59 @@ test "the commit gate logs a finish the app dropped, with its reason" {
     try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
+}
+
+test "crash snapshot of the worker returns null at once while another thread holds its lock" {
+    const busy_wait_ms: u32 = 500;
+    const Probe = struct {
+        runtime: *WorkerRuntime,
+        held: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        state_busy: bool = false,
+        questions_busy: bool = false,
+        failure: ?anyerror = null,
+
+        fn hold(self: *@This()) void {
+            self.runtime.worker_mutex.lockUncancelable(io_mod.getIo());
+            self.held.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            self.runtime.worker_mutex.unlock(io_mod.getIo());
+        }
+
+        fn snapshot(self: *@This()) void {
+            defer self.done.set(io_mod.getIo());
+            const state = self.runtime.trySnapshotState(std.testing.allocator) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.state_busy = state == null;
+            if (state) |value| value.deinit(std.testing.allocator);
+            if (self.runtime.trySnapshotPendingQuestionBatch(std.testing.allocator)) |batch| {
+                if (batch) |value| value.deinit(std.testing.allocator);
+            } else |err| {
+                self.questions_busy = err == error.WorkerBusy;
+            }
+        }
+    };
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    var probe: Probe = .{ .runtime = &runtime };
+    const holder = try std.Thread.spawn(.{}, Probe.hold, .{&probe});
+    const held = testing_event.setInTime(&probe.held);
+    const snapshotter = try std.Thread.spawn(.{}, Probe.snapshot, .{&probe});
+    const returned = testing_event.setWithin(&probe.done, busy_wait_ms);
+    probe.release.set(io_mod.getIo());
+    holder.join();
+    snapshotter.join();
+    try std.testing.expect(held);
+    try std.testing.expect(returned);
+    try std.testing.expect(probe.failure == null);
+    try std.testing.expect(probe.state_busy);
+    try std.testing.expect(probe.questions_busy);
+
+    // Once the lock is free, both return what the blocking snapshots return.
+    var state = (try runtime.trySnapshotState(std.testing.allocator)) orelse return error.TestExpectedStateSnapshot;
+    state.deinit(std.testing.allocator);
+    try std.testing.expect((try runtime.trySnapshotPendingQuestionBatch(std.testing.allocator)) == null);
 }
