@@ -6200,6 +6200,52 @@ test("update runs the manual upgrade", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
+  "TTY upgrade prints bold fx version header before output",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const installedFx = join(root, "fx");
+    const home = join(root, "home");
+    mkdirSync(home);
+    const release = startUpgradeServer(root, argvLogPath);
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let session: TmuxSession | null = null;
+    try {
+      const sq = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
+      const cmd = `${sq(installedFx)} upgrade --channel stable; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+      session = await TmuxSession.create({
+        isolated: true,
+        cmd: `/bin/sh -c ${sq(cmd)}`,
+        cwd: root,
+        env: {
+          ...envWithoutFxHome(),
+          HOME: home,
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          NO_COLOR: undefined,
+        },
+        width: 96,
+        height: 24,
+        remainOnExit: true,
+      });
+      await session.waitForText("__FX_EXIT_0__", UPGRADE_TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain("upgraded to v9.9.9");
+      expect(scrollback).not.toContain("Run /help for commands");
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(escaped).toMatch(/\x1b\[1m𝒇x\x1b\[0m v/);
+    } finally {
+      if (session) await session.kill();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));

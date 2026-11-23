@@ -476,7 +476,12 @@ const RunDeps = struct {
     environ_map: EnvironMapFn = environMapDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
+    stdout_is_tty: ?bool = null,
 };
+
+fn stdoutIsTerminal(deps: RunDeps) bool {
+    return deps.stdout_is_tty orelse (!builtin.is_test and terminal_env.stdoutIsTerminal());
+}
 
 const GlobalLaunchArgs = struct {
     remaining: []const [:0]const u8,
@@ -2296,6 +2301,12 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const channel = opts.channel orelse startup.update_channel;
+            if (opts.format == .text and stdoutIsTerminal(deps)) {
+                const header = try output_contracts.oneOffHeaderMessageStyled(alloc, !terminal_env.colorDisabled());
+                defer alloc.free(header);
+                try writeStdout(deps, header);
+                try writeStdout(deps, "\n");
+            }
             if (opts.channel) |selected| {
                 var outcome = config_runtime.setUserPreferences(alloc, .{ .update_channel = selected }) catch |err| {
                     if (opts.format == .json) {
