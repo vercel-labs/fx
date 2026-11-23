@@ -4362,6 +4362,10 @@ pub fn Runtime(comptime App: type) type {
             const action = try app.describeToolActionDeniedWithAdvertised(agent, arena, call, target, "Cancelled", &.{});
             const entry_id = try writeCompletedToolStatus(sink, .cancelled, action);
             try sink.attachHistoricalCancelledCallDetail(entry_id, call);
+            // An MCP call's row names the server and tool it ran, as live.
+            if (try toolbox.mcpToolAlias(arena, call.name, call.arguments_json)) |alias| {
+                try attachReplayedMcpToolName(app, agent, sink, entry_id, alias);
+            }
         }
 
         fn writeExecutionHistory(app: *App, agent: *AppAgent, execution: types.ExecutionMemory) !void {
@@ -7631,6 +7635,70 @@ test "a resumed MCP call names the server and tool its session recorded, and a f
         try std.testing.expectEqualStrings("echo", detail.mcp_tool.?);
     }
     try std.testing.expectEqual(@as(usize, 2), named);
+}
+
+test "a resumed cancelled MCP call names the server and tool its session recorded, as live" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const persistence = &app.agent().session_persistence;
+    _ = try persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    persistence.v2 = try session_adapter.Session.create(alloc, persistence.v2_store.?, paths.workspace, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    });
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_my_srv_echo", .{ .server = @constCast("my_srv"), .tool = @constCast("echo") });
+
+    // One call the session recorded, and one it did not.
+    const history = [_]types.HistoryTurn{
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("echo it") },
+            .tool_call = .{ .id = "call_cancelled", .name = "mcp_my_srv_echo", .arguments_json = "{}" },
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("echo again") },
+            .tool_call = .{ .id = "call_unknown", .name = "mcp_other_srv_echo", .arguments_json = "{}" },
+        } },
+    };
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var has_prior_turns = false;
+    try Runtime(TestApp).appendHistoryToDetachedProjection(&app, app.agent(), &projection, &history, &has_prior_turns);
+
+    var group = try tool_group_projection.buildStyled(alloc, projection.runtime.notebook.entries.items, projection.runtime.notebook.tool_details.items, 120, .{}, .{});
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("rows:\n{s}\n", .{text.items});
+    try std.testing.expect(std.mem.find(u8, text.items, "Cancelled using My_srv to echo") != null);
+    // A call the record does not name keeps a row that names no server.
+    try std.testing.expect(std.mem.find(u8, text.items, "Cancelled using an MCP tool") != null);
+    var named: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |detail| {
+        try std.testing.expectEqual(@as(?types.ToolOutcomeKind, .cancelled), detail.outcome);
+        if (detail.mcp_server == null) continue;
+        named += 1;
+        try std.testing.expectEqualStrings("my_srv", detail.mcp_server.?);
+        try std.testing.expectEqualStrings("echo", detail.mcp_tool.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), named);
 }
 
 test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
