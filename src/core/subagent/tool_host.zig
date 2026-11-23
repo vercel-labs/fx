@@ -5660,11 +5660,14 @@ fn sweepStart(create: bool, seed: bool, fail_at: usize) !bool {
         try expectAt(where, "reviewer is idle or working", stuck);
     }
     const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
-    const taken = std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
+    // The faulted call may have started the work. While that turn still runs
+    // the next message joins it, and the turn's own report is then the last.
+    const joined = std.mem.find(u8, again, "Sent into the subagent's running turn") != null;
+    const taken = joined or std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
     try expectAt(where, "the next message is taken", if (taken) "the next message is taken" else again);
     try waitUntilQuiet(runtime);
     try std.testing.expect(fixture.reportCount() > reports_before);
-    try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], " completed DONE again");
+    try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], if (joined) " completed DONE second" else " completed DONE again");
     return failed;
 }
 
