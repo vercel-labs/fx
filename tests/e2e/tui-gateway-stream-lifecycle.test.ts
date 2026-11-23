@@ -7815,12 +7815,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Read the notes, then search them.");
       await session.waitForText(running, TIMEOUT);
       // While the calls wait, one row has the finished row's words: never the
-      // handle, and never one row for each search.
-      for (let frame = 0; frame < 10; frame += 1) {
+      // handle, and never one row for each search. The stream holds until
+      // sendRest, so each capture below is a frame of the wait.
+      for (let frame = 0; frame < 30; frame += 1) {
         const rows = toolRows(await session.capturePane());
         expect(rows.filter((row) => row.includes("result-"))).toEqual([]);
         expect(rows.filter((row) => /Searching|Reading/.test(row))).toEqual([running]);
-        await Bun.sleep(50);
       }
       sendRest?.();
       await session.waitForText(finalText, TIMEOUT);

@@ -5287,6 +5287,7 @@ describe("fx mcp call", () => {
       expect(scrollback.split(`Ran ${TOOL_ROW}`)).toHaveLength(2);
       expect(scrollback).toContain(`└ Ran ${TOOL_ROW} ×3`);
       expect(scrollback).not.toContain(`Running ${TOOL_ROW}`);
+      expect(scrollback).not.toContain("Running MCP");
       expect(scrollback).not.toContain(`MCP ${TOOL_NAME}`);
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.
@@ -5339,6 +5340,7 @@ describe("fx mcp call", () => {
       expect(resumed.split(`Ran ${TOOL_ROW}`)).toHaveLength(2);
       expect(resumed).toContain(`└ Ran ${TOOL_ROW} ×3`);
       expect(resumed).not.toContain(`Running ${TOOL_ROW}`);
+      expect(resumed).not.toContain("Running MCP");
       expect(resumed).not.toContain(`MCP ${TOOL_NAME}`);
 
       // Ctrl+O shows each call's row, and neither the arguments the
@@ -5389,6 +5391,7 @@ describe("fx mcp call", () => {
       await tui.waitForStableComposer(10_000);
       const liveScreen = await tui.captureFullScrollback();
       expect(liveScreen).not.toContain(`Running ${TOOL_ROW}`);
+      expect(liveScreen).not.toContain("Running MCP");
       // The compact rows of the cancelled turn: its command by its short
       // name, in one group with the call, which goes by its server and tool.
       const compactRows = (screen: string) =>
@@ -5440,6 +5443,7 @@ describe("fx mcp call", () => {
       expect(resumedRows.filter((line) => line.startsWith("▪"))).toEqual(cancelledNotices);
       expect(resumedRows.join("\n")).not.toContain("> out.txt");
       expect(resumed).not.toContain(`Running ${TOOL_ROW}`);
+      expect(resumed).not.toContain("Running MCP");
       expect(toolCalls(root)).toHaveLength(1);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
