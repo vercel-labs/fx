@@ -1833,8 +1833,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("stream the resize marker command");
-      // The loop's row shows its steps in short form.
-      await session.waitForText("Running printf, sleep", TIMEOUT);
+      // The loop's row shows its steps in short form, with the `seq` its
+      // word list runs.
+      await session.waitForText("Running seq, printf, sleep", TIMEOUT);
 
       const resizeCount = committedResizeFrameCount(tracePath);
       await new Promise((resolve) => setTimeout(resolve, 350));
@@ -1847,7 +1848,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
       expect(scrollback).toContain("stream the resize marker command");
       expect(scrollback).not.toContain(preFxMarker);
-      expect(scrollback).toMatch(/^● Ran printf, sleep ✓$/m);
+      expect(scrollback).toMatch(/^● Ran seq, printf, sleep ✓$/m);
       expect(scrollback).not.toContain("resize-stream-marker 001");
       expect(scrollback).not.toContain("resize-stream-marker 096");
       expect(scrollback).toContain(finalResponse);
