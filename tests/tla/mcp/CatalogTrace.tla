@@ -8,8 +8,10 @@
 \*   - `expired` is Expired; a timer that no longer applies is no step, and
 \*     the core writes no record for it.
 \*   - `page_refused` is PageRefused, a page the server answered and fx could
-\*     not use, and `page_failed` is PageFailed, a page it never answered;
-\*     `refused` is matched in every step. `lastAnswer` is a ghost.
+\*     not use, or PageUnreadable, a page whose line fx could not read and
+\*     whose grace ran out: the core writes one record for both, and they
+\*     differ only in the ghost `lastAnswer`. `page_failed` is PageFailed, a
+\*     page it never answered; `refused` is matched in every step.
 \*   - `page_received` carries `lapse`, which the core works out from the
 \*     pages' arrival times; the model takes it as given.
 \*   - MaxPages comes from the scenario (ObsMaxPages). MaxGen and

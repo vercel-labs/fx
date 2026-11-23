@@ -112,5 +112,11 @@
     "old": "               /\\ refused' = TRUE\n               /\\ lastAnswer' = \"refused\"",
     "new": "               /\\ refused' = refused\n               /\\ lastAnswer' = \"refused\"",
     "invariant": "RefusedIffLastAnswerRefused"
+  },
+  {
+    "description": "A page whose line fx could not read, ended by the grace, is not a refusal: fx says nothing about the list",
+    "old": "    /\\ refused' = TRUE\n    /\\ lastAnswer' = \"unreadable\"",
+    "new": "    /\\ refused' = refused\n    /\\ lastAnswer' = \"unreadable\"",
+    "invariant": "RefusedIffLastAnswerRefused"
   }
 ]

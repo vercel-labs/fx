@@ -28,6 +28,11 @@
 \* A page the server never answered (a timeout, a lost connection, a cancel, a
 \* sign-in needed first) says nothing about the list, so it leaves `refused` as it was. `lastAnswer` is a ghost: how
 \* the last listing that the server answered ended since the last process.
+\*
+\* A server's line that fx cannot read and that names no request (its id comes after the bad part, or the line is too
+\* deep to reach it) is an answer fx could not use as well, but no id says whose it is: the page waits out the grace
+\* (src/mcp/core/request.zig `refused_ms`), and then it is refused (`PageUnreadable`), as a page answered with a malformed
+\* result is. It is not a page that ended with no answer.
 EXTENDS Naturals
 
 CONSTANTS
@@ -60,7 +65,7 @@ VARIABLES
     refused,       \* the last listing the server answered was refused
     servedStale,   \* a need was served from a list that wasn't fresh and current
     extraFetch,    \* a listing started while one was running
-    lastAnswer     \* ghost: how the last answered listing ended: "none", "list", "refused"
+    lastAnswer     \* ghost: how the last answered listing ended: "none", "list", "refused", "unreadable"
 
 vars == <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, listing,
           startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer,
@@ -241,7 +246,17 @@ Expired ==
     /\ UNCHANGED <<era, process, gen, cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
     /\ UNCHANGED refusedVars
 
-Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageRefused \/ PageFailed
+\* The page's server wrote a line fx could not read that named no request, and the grace ran out: no answer fx could use,
+\* as with PageRefused, and the refusal is kept. `lastAnswer` tells the two apart.
+PageUnreadable ==
+    /\ pending # "none"
+    /\ Failed
+    /\ refused' = TRUE
+    /\ lastAnswer' = "unreadable"
+    /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
+                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
+
+Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageRefused \/ PageUnreadable \/ PageFailed
 
 Next ==
     \/ \E e \in {"modern", "legacy"} : ProcessStarted(e)
@@ -274,7 +289,7 @@ TypeOK ==
     /\ refused \in BOOLEAN
     /\ servedStale \in BOOLEAN
     /\ extraFetch \in BOOLEAN
-    /\ lastAnswer \in {"none", "list", "refused"}
+    /\ lastAnswer \in {"none", "list", "refused", "unreadable"}
 
 \* A fresh list was listed in the current generation: no answer from before
 \* an invalidation is ever cached as fresh.
@@ -310,7 +325,7 @@ WaitingMeansListing == waiting <=> listing = "fetching"
 \* fx says it refused the list exactly when the last listing the server answered
 \* was refused: a published list and a new process clear it, and a listing the
 \* server never answered leaves it.
-RefusedIffLastAnswerRefused == refused <=> lastAnswer = "refused"
+RefusedIffLastAnswerRefused == refused <=> lastAnswer \in {"refused", "unreadable"}
 
 \* A refused list was never cached, so no list is fresh while fx says it refused one.
 RefusedListIsNotFresh == refused => cache # "fresh"
