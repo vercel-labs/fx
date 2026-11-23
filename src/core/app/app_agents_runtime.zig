@@ -30,6 +30,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
+const subagent_panes = @import("subagent_panes.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
@@ -2944,6 +2945,7 @@ pub fn Runtime(comptime App: type) type {
                 return err;
             };
             debug_trace.eventf("host", "child_run_started", .{}, "agent={s} work_id={s}", .{ child.id, child.agent.child_run.?.work_id });
+            subagent_panes.start(child.id, child.displayName());
         }
 
         const Start = struct { post: *Post, child: *ChildAgent };
@@ -3430,6 +3432,7 @@ pub fn Runtime(comptime App: type) type {
                         }) catch started.tool_name;
                     } else started.tool_name;
                     host.noteChildCall(child.id, started.id.call_id, label);
+                    subagent_panes.noteTool(child.id, label);
                 },
                 .terminal => |terminal| {
                     host.noteChildCall(child.id, terminal.id.call_id, null);
@@ -3452,6 +3455,7 @@ pub fn Runtime(comptime App: type) type {
         fn finishRun(run: *agents.ChildRun, outcome: agents.ChildRunCompletion.Outcome) void {
             if (!run.inFlight()) return;
             debug_trace.eventf("host", "child_run_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, run.work_id, @tagName(outcome) });
+            subagent_panes.finish(run.child_id, @tagName(outcome));
             run.finish(outcome);
         }
 

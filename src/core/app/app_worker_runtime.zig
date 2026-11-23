@@ -1,6 +1,7 @@
 const std = @import("std");
 const session_notices = @import("../session/session.zig");
 const agents = @import("../agents/agents.zig");
+const subagent_panes = @import("subagent_panes.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
@@ -1314,6 +1315,9 @@ pub fn Runtime(comptime App: type) type {
                         switch (presentation) {
                             .text => |text| {
                                 try handlers.append_text(handlers.ctx, text);
+                                if (comptime agents.hasAgentField(App, "child_run")) {
+                                    if (agent.child_run) |*run| subagent_panes.appendText(run.child_id, text);
+                                }
                                 debug_trace.eventf(
                                     "worker",
                                     "assistant_chunk_applied",
