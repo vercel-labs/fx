@@ -40,7 +40,7 @@ interface Line {
   did?: { action?: string; expect?: string; met?: boolean; error?: string; line?: string; k?: number };
   allow?: { server: string; tool: string; ok: boolean };
   event?: { tag: string; maybe_ran?: boolean; answer?: string | null; names?: string[]; k?: number };
-  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null }[];
+  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null; list_refusal: string | null }[];
   final?: { ok: boolean; logged: { name: string; lines: number }[] };
 }
 type Log = { dir: string; line: string }[];
@@ -343,6 +343,64 @@ export const scenarios: Scenario[] = [
         // last list, still stale.
         same([stale("b"), stale("t"), stale("z"), stale("f")], [1, 1, 0, 2], "tools_stale events for b, t, z, f"),
         expectThat(!before("b") && !before("t"), "a tools_stale came before the first list"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-list-refused",
+    description: "A server whose newest tool list fx refused: the status says so with the fixed words, beside the older list it still serves and with no last_error, and the next good list clears it",
+    servers: {
+      f: { rules: [initialize, { ...list25("add"), times: 1 }, { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }, { method: "tools/list", result: { tools: 7 }, times: 1 }, list25("add", "sub")] },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the three the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 3);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal, s.last_error]), [["ready", 1, null, null], ["ready", 1, '"tools" is not a list', null], ["ready", 2, null, null]], "the status [phase, tools, list_refusal, last_error] after each list"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-list-refused-first-list",
+    description: "A server whose first tool list fx refuses, as a result that is no list or as an error: the host gets the failure, no tools are listed, and the status says why in the fixed words while the server stays ready",
+    servers: {
+      g: { rules: [initialize, { method: "tools/list", result: { tools: 7 } }] },
+      h: { rules: [initialize, { method: "tools/list", error: { code: -32603, message: "Internal error" } }] },
+    },
+    script: ["tools g", "tools h", "expect g.tools.fail", "expect h.tools.fail", "status"],
+    machines: { g: [...BASE, "catalog"], h: [...BASE, "catalog"] },
+    check(lines) {
+      return first(
+        same(["g", "h"].map((n) => { const s = status(lines, n)!; return [s.phase, s.tools, s.list_refusal]; }), [["ready", 0, '"tools" is not a list'], ["ready", 0, "the server answered the list with an error"]], "the status [phase, tools, list_refusal] of g and h"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-restart-count-is-per-listing",
+    description: "A listing restarts once on an invalid cursor, as the model says, and so does the next listing: each starts with its own count, so the second listing's first invalid cursor restarts it, publishes its new list and refuses nothing",
+    servers: {
+      f: {
+        rules: [
+          initialize,
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c1" } },
+          { method: "tools/list", cursor: "c1", times: 1, error: { code: -32602, message: "no such cursor" } },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")] } },
+          { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c2" } },
+          { method: "tools/list", cursor: "c2", times: 1, error: { code: -32602, message: "no such cursor" } },
+          list25("add", "sub"),
+        ],
+      },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the two the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 2);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal]), [["ready", 1, null], ["ready", 2, null]], "the status [phase, tools, list_refusal] after each list: the second list is published, and nothing is refused"),
       );
     },
   }),

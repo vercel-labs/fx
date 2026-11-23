@@ -36,6 +36,10 @@ export type ModernHttpMode =
   | "features_public"
   | "features_stale_read"
   | "features_ttl_expiry"
+  | "list_refused"
+  | "list_http_500"
+  | "list_http_429"
+  | "list_html_200"
   | "mrtr_form"
   | "legacy_session_required"
   | "legacy_json_session_required"
@@ -405,6 +409,23 @@ export function startModernMcpHttpFixture(
           cursor: message.params?.cursor,
           sentAtMs: performance.now(),
         });
+      }
+      if (mode === "list_refused" && message.method === "tools/list") {
+        // `tools` written twice, the second with an escape: fx refuses the list.
+        return new Response(
+          `{"jsonrpc":"2.0","id":${message.id},"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}}`,
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      // The server answers the list with a status and no JSON-RPC message, or with a page that is no JSON.
+      if (mode === "list_http_500" && message.method === "tools/list") {
+        return new Response("upstream failure", { status: 500, headers: { "content-type": "text/plain" } });
+      }
+      if (mode === "list_http_429" && message.method === "tools/list") {
+        return new Response("slow down", { status: 429, headers: { "content-type": "text/plain", "retry-after": "1" } });
+      }
+      if (mode === "list_html_200" && message.method === "tools/list") {
+        return new Response("<html><body>Welcome to the gateway</body></html>", { headers: { "content-type": "text/html" } });
       }
       if (
         mode === "bad_request_result" &&

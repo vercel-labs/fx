@@ -104,6 +104,12 @@ pub const Status = struct {
     version: ?[]const u8 = null,
     tools: usize = 0,
     last_error: ?[]const u8 = null,
+    /// Why fx refused the last tool list the server answered, in the words of `mcp.tools.Refusal`, which may name
+    /// the HTTP status fx read: set only for a server that is `ready`. It is no failure of the server, so
+    /// `last_error` stays empty. An older accepted list is still served: `tools` counts it. The engine only lends
+    /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
+    /// allocator, like the other strings.
+    tools_error: ?[]const u8 = null,
     needs_login: bool = false,
     signed_in: bool = false,
     /// A login is under way: from `/mcp login` until it signs in, fails,
@@ -651,6 +657,7 @@ pub const Runtime = struct {
             o.name = try alloc.dupe(u8, s.name);
             if (s.version) |v| o.version = try alloc.dupe(u8, v);
             if (s.last_error) |e| o.last_error = try alloc.dupe(u8, e);
+            if (s.tools_error) |t| o.tools_error = try alloc.dupe(u8, t);
             if (s.missing) |m| o.missing = try alloc.dupe(u8, m);
             if (s.instructions) |t| o.instructions = try alloc.dupe(u8, t);
             o.reason = try login_words.copy(alloc, s.reason);
@@ -2221,6 +2228,8 @@ pub const Runtime = struct {
                 // A refused login is what `last_error` says, for every surface that shows it.
                 if (try login_words.errorText(a, s.name, o.reason)) |text| o.last_error = text;
             }
+            // The engine lends the words until its next refusal.
+            if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2968,6 +2977,88 @@ test "tools and calls go through the owner thread, from several threads at once"
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Caller.run, .{ &r, &ok });
     for (threads) |t| t.join();
     try testing.expectEqual(@as(u32, 4), ok.load(.acquire));
+}
+
+/// A 2025 server in sh whose first tool list is good and followed by `list_changed`. Every later list is no list
+/// (`tools` is a number), until the file `<server>.fixed` exists, and then it is good again.
+const refusing_server_script =
+    \\#!/bin/sh
+    \\n=0
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*)
+    \\      n=$((n + 1))
+    \\      if [ "$n" -gt 1 ] && [ ! -e "$0.fixed" ]; then
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":7}}\n' "$id"
+    \\      else
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id"
+    \\        if [ "$n" = 1 ]; then printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'; fi
+    \\      fi ;;
+    \\  esac
+    \\done
+    \\
+;
+
+/// Asks for server `fake`'s tools until its status says `want`, for up to thirty seconds: the snapshot follows the engine a moment later,
+/// and a loaded machine can take longer. It stops as soon as the status is right.
+fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status {
+    var status: Status = undefined;
+    for (0..600) |_| {
+        _ = try r.tools(arena, "fake", null);
+        status = (try r.statuses(arena))[0];
+        if ((status.tools_error != null) == want_refused) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    return status;
+}
+
+test "a refused tool list shows in the status beside the older list still served, and a good list clears it" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = refusing_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The first list is good.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    var status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expect(status.tools_error == null);
+
+    // The server says its tools changed, and its next list is refused: the older one is still served, and the status says both.
+    status = try statusAfterListing(&r, a, true);
+    try testing.expectEqualStrings("\"tools\" is not a list", status.tools_error orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqual(@as(usize, 1), status.tools);
+    // The server is not down, so nothing says so.
+    try testing.expect(status.last_error == null);
+    // The words are the caller's own copy. The snapshot's words go with its arena at the next publish, so a copy that
+    // pointed into them would read freed memory. Overwriting them here stands in for that, every time.
+    {
+        const own = try r.statusesNow(a);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        const held = r.snapshot[0].tools_error orelse return error.TestExpectedRefusal;
+        @memset(@constCast(held), 'U');
+        try testing.expectEqualStrings("\"tools\" is not a list", own[0].tools_error orelse return error.TestExpectedRefusal);
+    }
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+
+    // The server lists well again: the refused list left the older one stale, so the next need lists again, and the refusal is gone.
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server.fixed", .data = "" });
+    status = try statusAfterListing(&r, a, false);
+    try testing.expect(status.tools_error == null);
+    try testing.expectEqual(@as(usize, 1), status.tools);
 }
 
 test "a cancelled call ends, and stopping ends a call that never answers" {

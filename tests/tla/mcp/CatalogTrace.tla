@@ -7,6 +7,9 @@
 \*     and every step matches the whole projection instead.
 \*   - `expired` is Expired; a timer that no longer applies is no step, and
 \*     the core writes no record for it.
+\*   - `page_refused` is PageRefused, a page the server answered and fx could
+\*     not use, and `page_failed` is PageFailed, a page it never answered;
+\*     `refused` is matched in every step. `lastAnswer` is a ghost.
 \*   - `page_received` carries `lapse`, which the core works out from the
 \*     pages' arrival times; the model takes it as given.
 \*   - MaxPages comes from the scenario (ObsMaxPages). MaxGen and
@@ -25,6 +28,7 @@ Step(r) ==
       [] r.event = "need" -> Need
       [] r.event = "page_received" -> PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse)
       [] r.event = "invalid_cursor" -> InvalidCursor
+      [] r.event = "page_refused" -> PageRefused
       [] r.event = "page_failed" -> PageFailed
       [] r.event = "invalidated" -> Invalidate
       [] r.event = "expired" -> Expired
@@ -47,6 +51,7 @@ Matches(r) ==
     /\ pending' = r.data.pending
     /\ waiting' = r.data.waiting
     /\ answer' = r.data.answer
+    /\ refused' = r.data.refused
 
 TraceInit ==
     /\ Init
