@@ -1,7 +1,8 @@
 //! One agent's saved bash state for the one bash tool. Each bash tool program
 //! is one captured bash command. Its after-startup text, `. '<dir>/env.sh'`,
 //! makes the program's own shell load the state the last program saved and save
-//! it again when the program ends, so a program killed by a signal saves nothing
+//! it again when the program ends, so a program killed by a signal saves nothing,
+//! and its save record says `pending` until fx reads it
 //! (`tests/tla/bash_tool/ResultStore.tla` `Finish`, `StateNeverTorn`,
 //! `EndedSaves`). The state never holds the MCP token. This module imports only
 //! `std`, so `zig test` runs its tests alone.
@@ -11,7 +12,7 @@ const std = @import("std");
 pub const wait_word = "wait_more";
 
 /// The largest bash state one program saves (R3.7). A larger state is not
-/// saved: the last complete state stays, and the program's output says so
+/// saved: the last complete state stays, and fx's result says so
 /// (`tests/tla/bash_tool/ResultStore.tla` `RefusalNoticed`).
 pub const max_state_bytes: usize = 1 << 20;
 
@@ -45,6 +46,14 @@ const folder_file = "folder";
 /// `>`, which keeps that mode.
 const startup_functions_file = "startup-functions";
 const startup_aliases_file = "startup-aliases";
+
+/// The file, next to the state, that says how the last program ended for its
+/// save. The script writes `pending` when the program loads, `cap <bytes>` when
+/// the state was over the cap, and `failed` when the save could not keep it. A
+/// save that keeps the state empties the file. `takeSaveStatus` reads and empties
+/// it, so a `pending` left by a program that ended without its save shows up.
+const save_status_file = "save-status";
+const max_status_bytes = 64;
 
 /// Appends `path` in single quotes. A `'` in `path` becomes `'\''`, so the path
 /// stays one shell word.
@@ -88,6 +97,7 @@ fn envScript(
     folder_path: []const u8,
     startup_functions_path: []const u8,
     startup_aliases_path: []const u8,
+    status_path: []const u8,
     fx_variables: []const []const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -97,6 +107,7 @@ fn envScript(
     try appendQuotedAssignment(alloc, &out, "__fx_folder", folder_path);
     try appendQuotedAssignment(alloc, &out, "__fx_startup_functions", startup_functions_path);
     try appendQuotedAssignment(alloc, &out, "__fx_startup_aliases", startup_aliases_path);
+    try appendQuotedAssignment(alloc, &out, "__fx_status", status_path);
     try out.appendSlice(alloc, std.fmt.comptimePrint("__fx_max={d}\n", .{max_state_bytes}));
     try out.appendSlice(alloc, body_before_skip);
     for (fx_variables) |name| {
@@ -105,6 +116,29 @@ fn envScript(
     }
     try out.appendSlice(alloc, body_after_skip);
     return out.toOwnedSlice(alloc);
+}
+
+/// Why the last program's state was not saved. `over_cap` holds the size of the
+/// state the program tried to save, in bytes. `not_saved` means the program
+/// ended before its save ran, so its record still says `pending`: a `trap -`,
+/// `exec`, a signal, or a stop by fx.
+pub const SaveStatus = union(enum) {
+    over_cap: usize,
+    failed,
+    not_saved,
+};
+
+/// The status a save record holds, with at most one line end: `pending`, `cap
+/// <bytes>`, or `failed`. An empty record is null, because nothing was reported.
+/// Any other text is `.failed`, so fx reports what it cannot read.
+fn parseSaveStatus(text: []const u8) ?SaveStatus {
+    const line = std.mem.trimEnd(u8, text, "\n");
+    if (line.len == 0) return null;
+    if (std.mem.eql(u8, line, "pending")) return .not_saved;
+    if (std.mem.eql(u8, line, "failed")) return .failed;
+    if (!std.mem.startsWith(u8, line, "cap ")) return .failed;
+    const bytes = std.fmt.parseInt(usize, line["cap ".len..], 10) catch return .failed;
+    return .{ .over_cap = bytes };
 }
 
 /// One agent's bash session: its private folder and the text that loads its
@@ -163,7 +197,9 @@ pub const Session = struct {
         defer alloc.free(startup_functions_path);
         const startup_aliases_path = try alloc.print("{s}/{s}", .{ dir, startup_aliases_file });
         defer alloc.free(startup_aliases_path);
-        const script = try envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, fx_variables);
+        const status_path = try alloc.print("{s}/{s}", .{ dir, save_status_file });
+        defer alloc.free(status_path);
+        const script = try envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, status_path, fx_variables);
         defer alloc.free(script);
         const after_startup = try startupTextFor(alloc, env_path);
         errdefer alloc.free(after_startup);
@@ -171,8 +207,9 @@ pub const Session = struct {
         try std.Io.Dir.cwd().createDir(io, dir, .fromMode(0o700));
         errdefer removeTree(io, dir);
         try writeScript(io, dir, script);
-        try makeStartupRecord(io, dir, startup_functions_file);
-        try makeStartupRecord(io, dir, startup_aliases_file);
+        try makeOwnerFile(io, dir, startup_functions_file);
+        try makeOwnerFile(io, dir, startup_aliases_file);
+        try makeOwnerFile(io, dir, save_status_file);
 
         self.dir = dir;
         self.after_startup = after_startup;
@@ -184,6 +221,26 @@ pub const Session = struct {
     /// until `deinit`.
     pub fn afterStartupText(self: *const Session) ?[]const u8 {
         return self.after_startup;
+    }
+
+    /// Reads the save record the last program left, then empties it, and returns
+    /// what it says. It returns null when the record is empty (the save kept the
+    /// state) or when the folder is gone. The record is emptied, not deleted, so
+    /// the file keeps the owner-only mode `prepare` gave it, and the next
+    /// program's `pending` write needs no umask change. A record that cannot be
+    /// read counts as `.failed`, so fx reports the drop rather than trust it.
+    pub fn takeSaveStatus(self: *Session, io: std.Io) ?SaveStatus {
+        const dir_path = self.dir orelse return null;
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
+        defer dir.close(io);
+        const text = dir.readFileAlloc(io, save_status_file, self.alloc, .limited(max_status_bytes)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return .failed,
+        };
+        defer self.alloc.free(text);
+        // Best effort: a record that stays is read again by the next take, so its notice repeats.
+        dir.writeFile(io, .{ .sub_path = save_status_file, .data = "" }) catch {};
+        return parseSaveStatus(text);
     }
 
     /// Stores `id` as the id of this session's last program, freeing the one
@@ -316,9 +373,9 @@ fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Makes an empty, owner-only startup record. The script fills it with `>`,
-/// which keeps the mode.
-fn makeStartupRecord(io: std.Io, dir: []const u8, name: []const u8) !void {
+/// Makes an empty, owner-only file in the session folder. The script fills the
+/// startup records and the save record with `>`, which keeps the mode.
+fn makeOwnerFile(io: std.Io, dir: []const u8, name: []const u8) !void {
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
     defer folder.close(io);
     var file = try folder.createFile(io, name, .{
@@ -359,14 +416,19 @@ fn removeTree(io: std.Io, dir: []const u8) void {
 /// `command` is out of scope.
 const body_before_skip =
     \\\builtin shopt -u expand_aliases
-    \\__fx_env_n=0
-    \\for __fx_name in $(builtin compgen -e); do
-    \\  __fx_env_names[__fx_env_n]=$__fx_name
-    \\  __fx_env_values[__fx_env_n]="${!__fx_name}"
-    \\  __fx_env_n=$((__fx_env_n + 1))
-    \\done
-    \\builtin declare -f >"$__fx_startup_functions" 2>/dev/null
-    \\builtin alias -p >"$__fx_startup_aliases" 2>/dev/null
+    \\__fx_snapshot_env() {
+    \\  builtin local IFS=$' \t\n' __fx_name
+    \\  __fx_env_n=0
+    \\  for __fx_name in $(builtin compgen -e); do
+    \\    __fx_env_names[__fx_env_n]=$__fx_name
+    \\    __fx_env_values[__fx_env_n]="${!__fx_name}"
+    \\    __fx_env_n=$((__fx_env_n + 1))
+    \\  done
+    \\}
+    \\__fx_snapshot_env
+    \\builtin declare -f 2>/dev/null >|"$__fx_startup_functions"
+    \\builtin alias -p 2>/dev/null >|"$__fx_startup_aliases"
+    \\builtin printf 'pending\n' 2>/dev/null >|"$__fx_status"
     \\__fx_inherited() {
     \\  builtin local __fx_i=0
     \\  while [[ "$__fx_i" -lt "$__fx_env_n" ]]; do
@@ -379,16 +441,17 @@ const body_before_skip =
     \\  builtin return 1
     \\}
     \\__fx_save() {
-    \\  builtin local __fx_rc=$? __fx_name __fx_decl __fx_size __fx_tmp="$__fx_state.$$.tmp" __fx_defs_fn="$__fx_state.$$.functions" __fx_defs_al="$__fx_state.$$.aliases" __fx_keep_n=0 __fx_saved=0
+    \\  builtin local __fx_rc=$? __fx_name __fx_decl __fx_size __fx_tmp="$__fx_state.$$.tmp" __fx_defs_fn="$__fx_state.$$.functions" __fx_defs_al="$__fx_state.$$.aliases" __fx_keep_n=0 __fx_saved=0 __fx_nocase=0 IFS=$' \t\n'
     \\  __fx_keep=()
     \\  [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || builtin return $__fx_rc
+    \\  if builtin shopt -q nocasematch; then __fx_nocase=1; builtin shopt -u nocasematch; fi
     \\  for __fx_name in $(\builtin compgen -v); do
     \\    case $__fx_name in
     \\        BASH|BASH_*|BASHOPTS|BASHPID|COLUMNS|COMP_*|DIRSTACK|EPOCHREALTIME|EPOCHSECONDS|EUID|FUNCNAME|GROUPS|HISTCMD|HOSTNAME|HOSTTYPE|IFS|LINENO|LINES|MACHTYPE|OLDPWD|OPTERR|OPTIND|OSTYPE|PIPESTATUS|PPID|PS4|PWD|RANDOM|SECONDS|SHELLOPTS|SHLVL|SRANDOM|UID|_|__fx_*
 ;
 
 /// The rest of the script, after the names fx adds to every program. The save
-/// writes each function and alias the program has, and then `command awk` keeps
+/// writes each function and alias the program has, and then `command -p awk` keeps
 /// only the blocks whose exact text is not in the startup record. A function block
 /// starts at its `name () ` line and runs to the next block's first line. An alias
 /// is one record that starts with `alias `. So a definition the user's startup
@@ -412,9 +475,9 @@ const body_after_skip =
     \\          esac
     \\          builtin declare -f "$__fx_name"
     \\        done
-    \\      } >"$__fx_defs_fn"
-    \\      builtin alias -p >"$__fx_defs_al"
-    \\      command awk -v startup_functions="$__fx_startup_functions" -v startup_aliases="$__fx_startup_aliases" '
+    \\      } >|"$__fx_defs_fn"
+    \\      builtin alias -p >|"$__fx_defs_al"
+    \\      command -p awk -v startup_functions="$__fx_startup_functions" -v startup_aliases="$__fx_startup_aliases" '
     \\function starts(line) { return line ~ /^alias / || line ~ /^[^ ].* [(][)] $/ }
     \\function learn(path,   line, block) {
     \\    block = ""
@@ -432,27 +495,28 @@ const body_after_skip =
     \\}
     \\END { if (block != "" && !(block in known)) printf "%s", block }' "$__fx_defs_fn" "$__fx_defs_al" || builtin exit 1
     \\      builtin shopt -p
-    \\      builtin shopt -p
-    \\      builtin set +o | while builtin read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix') ;; *) builtin printf '%s\n' "$__fx_decl" ;; esac; done
-    \\    } 2>/dev/null >"$__fx_tmp"
+    \\      builtin set +o | while builtin read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix'|*' xtrace') ;; *) builtin printf '%s\n' "$__fx_decl" ;; esac; done
+    \\    } 2>/dev/null >|"$__fx_tmp"
     \\  ); then
-    \\    __fx_size=$(( $(\command wc -c <"$__fx_tmp") ))
+    \\    __fx_size=$(( $(\command -p wc -c <"$__fx_tmp") ))
     \\    if [[ "$__fx_size" -gt "$__fx_max" ]]; then
-    \\      command rm -f "$__fx_tmp" 2>/dev/null
-    \\      builtin printf "fx: this program's bash state is %s bytes, over the %s-byte limit, so it was not saved; the next program starts from the last saved state.\n" "$__fx_size" "$__fx_max" >&2
+    \\      command -p rm -f "$__fx_tmp" 2>/dev/null
+    \\      ( builtin umask 077; builtin printf 'cap %s\n' "$__fx_size" >|"$__fx_status" ) 2>/dev/null
     \\      __fx_saved=1
-    \\    elif ( builtin umask 077; builtin printf '%s' "$PWD" >"$__fx_folder.$$.tmp" ) 2>/dev/null &&
-    \\      command mv -f "$__fx_tmp" "$__fx_state" && command mv -f "$__fx_folder.$$.tmp" "$__fx_folder"; then
+    \\    elif ( builtin umask 077; builtin printf '%s' "$PWD" >|"$__fx_folder.$$.tmp" ) 2>/dev/null &&
+    \\      command -p mv -f "$__fx_tmp" "$__fx_state" && command -p mv -f "$__fx_folder.$$.tmp" "$__fx_folder"; then
     \\      __fx_saved=1
+    \\      builtin printf '' 2>/dev/null >|"$__fx_status"
     \\    fi
     \\  fi
-    \\  command rm -f "$__fx_defs_fn" "$__fx_defs_al" 2>/dev/null
+    \\  command -p rm -f "$__fx_defs_fn" "$__fx_defs_al" 2>/dev/null
     \\  if [[ "$__fx_saved" -eq 0 ]]; then
-    \\    command rm -f "$__fx_tmp" "$__fx_folder.$$.tmp" 2>/dev/null
+    \\    command -p rm -f "$__fx_tmp" "$__fx_folder.$$.tmp" 2>/dev/null
     \\    if [[ -d "${__fx_state%/*}" ]]; then
-    \\      builtin printf "fx: this program's bash state could not be saved; the next program starts from the last saved state.\n" >&2
+    \\      ( builtin umask 077; builtin printf 'failed\n' >|"$__fx_status" ) 2>/dev/null
     \\    fi
     \\  fi
+    \\  if [[ "$__fx_nocase" -eq 1 ]]; then builtin shopt -s nocasematch; fi
     \\  builtin return $__fx_rc
     \\}
     \\trap() {
@@ -460,19 +524,19 @@ const body_after_skip =
     \\  builtin local __fx_line
     \\  __fx_line=$(\builtin trap -p EXIT)
     \\  if [[ -z "$__fx_line" ]]; then
-    \\    builtin trap __fx_save EXIT
+    \\    builtin trap '{ __fx_save; } 2>/dev/null' EXIT
     \\    builtin return 0
     \\  fi
     \\  builtin eval "\builtin set -- $__fx_line"
     \\  case $3 in
-    \\    __fx_save|__fx_save$'\n'*) builtin return 0 ;;
+    \\    "{ __fx_save; } 2>/dev/null"|"{ __fx_save; } 2>/dev/null"$'\n'*) builtin return 0 ;;
     \\  esac
-    \\  builtin trap "__fx_save
+    \\  builtin trap "{ __fx_save; } 2>/dev/null
     \\$3" EXIT
     \\}
     \\if [[ -r "$__fx_state" ]]; then builtin . "$__fx_state" >/dev/null 2>&1; fi
     \\\builtin shopt -s expand_aliases
-    \\\builtin trap __fx_save EXIT
+    \\\builtin trap '{ __fx_save; } 2>/dev/null' EXIT
     \\
 ;
 
@@ -493,7 +557,7 @@ test "bashPath keeps an absolute bash and falls back to /bin/bash" {
 
 test "envScript quotes the state path, keeps the header, and installs the save trap" {
     const alloc = std.testing.allocator;
-    const script = try envScript(alloc, "/tmp/a'b/state.sh", "/tmp/a'b/folder", "/tmp/a'b/startup-functions", "/tmp/a'b/startup-aliases", &test_fx_variables);
+    const script = try envScript(alloc, "/tmp/a'b/state.sh", "/tmp/a'b/folder", "/tmp/a'b/startup-functions", "/tmp/a'b/startup-aliases", "/tmp/a'b/save-status", &test_fx_variables);
     defer alloc.free(script);
     var lines = std.mem.splitScalar(u8, script, '\n');
     try std.testing.expectEqualStrings("# fx bash tool: load the bash state the last program saved, and save it again", lines.next().?);
@@ -502,17 +566,18 @@ test "envScript quotes the state path, keeps the header, and installs the save t
     try std.testing.expectEqualStrings("__fx_folder='/tmp/a'\\''b/folder'", lines.next().?);
     try std.testing.expectEqualStrings("__fx_startup_functions='/tmp/a'\\''b/startup-functions'", lines.next().?);
     try std.testing.expectEqualStrings("__fx_startup_aliases='/tmp/a'\\''b/startup-aliases'", lines.next().?);
-    try std.testing.expect(std.mem.find(u8, script, "trap __fx_save EXIT\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, script, "\\builtin trap __fx_save EXIT\n"));
+    try std.testing.expectEqualStrings("__fx_status='/tmp/a'\\''b/save-status'", lines.next().?);
+    try std.testing.expect(std.mem.find(u8, script, "trap '{ __fx_save; } 2>/dev/null' EXIT\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, script, "\\builtin trap '{ __fx_save; } 2>/dev/null' EXIT\n"));
 }
 
 test "the bash script keeps the reviewed bytes" {
-    const script = try envScript(std.testing.allocator, "/tmp/fx-pinned/state.sh", "/tmp/fx-pinned/folder", "/tmp/fx-pinned/startup-functions", "/tmp/fx-pinned/startup-aliases", &test_fx_variables);
+    const script = try envScript(std.testing.allocator, "/tmp/fx-pinned/state.sh", "/tmp/fx-pinned/folder", "/tmp/fx-pinned/startup-functions", "/tmp/fx-pinned/startup-aliases", "/tmp/fx-pinned/save-status", &test_fx_variables);
     defer std.testing.allocator.free(script);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("337399ba816061bac12826dd4ed1c0340f955d39a075c9d958eb37acb44ebf75", &hex);
+    try std.testing.expectEqualStrings("550cf4069976d6489eee2c33b109ab3cae63c00799d4fdf1805f1fa28675d867", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -877,7 +942,11 @@ test "a program over the size cap leaves the start folder unchanged" {
     const big = try runProgram(alloc, io, &session, dir, "folder3", "cd /tmp; big=$(head -c 1100000 /dev/zero | tr '\\0' a)");
     defer freeRun(alloc, big);
     try expectExit(big, 0);
-    try std.testing.expect(std.mem.startsWith(u8, big.stderr, "fx: this program's bash state is "));
+    try std.testing.expectEqualStrings("", big.stderr);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => |bytes| try std.testing.expect(bytes > max_state_bytes),
+        .failed, .not_saved => return error.TestUnexpectedFailedSave,
+    }
 
     session.refreshStartFolder(io);
     try std.testing.expectEqualStrings("/", session.startFolder() orelse return error.TestNoStartFolder);
@@ -1100,7 +1169,7 @@ test "a program's functions and aliases named like the save's words do not stop 
     try expectNoTmpFile(io, dir);
 }
 
-test "a state that cannot be written is not saved, and the program says so" {
+test "a state that cannot be written is not saved, and the save records why" {
     const io = std.testing.io;
     std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -1123,10 +1192,12 @@ test "a state that cannot be written is not saved, and the program says so" {
     const second = try runProgram(alloc, io, &session, dir, "blocked", "x=2; mkdir \"$__fx_state.$$.tmp\"");
     defer freeRun(alloc, second);
     try expectExit(second, 0);
-    try std.testing.expectEqualStrings(
-        "fx: this program's bash state could not be saved; the next program starts from the last saved state.\n",
-        second.stderr,
-    );
+    try std.testing.expectEqualStrings("", second.stderr);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => return error.TestUnexpectedOverCap,
+        .failed => {},
+        .not_saved => return error.TestUnexpectedStatus,
+    }
 
     const third = try runProgram(alloc, io, &session, dir, "after-blocked", "echo \"x=$x\"");
     defer freeRun(alloc, third);
@@ -1409,7 +1480,7 @@ test "a new bash folder is named with this process's id" {
 /// The names the tests pass as fx's own: the same three `bash.zig` passes.
 const test_fx_variables = [_][]const u8{ "AI_AGENT", "FX_MCP_CALL_SOCKET", "FX_MCP_CALL_TOKEN" };
 
-test "a state over the size cap is not saved, and the program says so" {
+test "a state over the size cap is not saved, and the save records why" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1429,13 +1500,457 @@ test "a state over the size cap is not saved, and the program says so" {
     const big = try runProgram(alloc, io, &session, dir, "big2", "big=$(head -c 1100000 /dev/zero | tr '\\0' a)");
     defer freeRun(alloc, big);
     try expectExit(big, 0);
-    try std.testing.expect(std.mem.startsWith(u8, big.stderr, "fx: this program's bash state is "));
-    try std.testing.expect(std.mem.endsWith(u8, big.stderr, "bytes, over the 1048576-byte limit, so it was not saved; the next program starts from the last saved state.\n"));
+    try std.testing.expectEqualStrings("", big.stderr);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => |bytes| try std.testing.expect(bytes > max_state_bytes),
+        .failed, .not_saved => return error.TestUnexpectedFailedSave,
+    }
 
     const after = try runProgram(alloc, io, &session, dir, "big3", "echo \"x=${x:-unset} big=${big:-none}\"");
     defer freeRun(alloc, after);
     try expectExit(after, 0);
     try std.testing.expectEqualStrings("x=1 big=none\n", after.stdout);
+}
+
+test "the save records an over-cap state, and a state it keeps leaves no record" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const kept = try runProgram(alloc, io, &session, dir, "kept", "x=1");
+    defer freeRun(alloc, kept);
+    try expectExit(kept, 0);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const big = try runProgram(alloc, io, &session, dir, "big", "big=$(head -c 1100000 /dev/zero | tr '\\0' a)");
+    defer freeRun(alloc, big);
+    try expectExit(big, 0);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => |bytes| try std.testing.expect(bytes > max_state_bytes),
+        .failed, .not_saved => return error.TestUnexpectedFailedSave,
+    }
+    // Taking the record deletes it, so the next take finds none.
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+}
+
+test "a save record is read as the save wrote it, and any other record counts as failed" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+
+    try folder.writeFile(io, .{ .sub_path = "save-status", .data = "cap 42\n" });
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => |bytes| try std.testing.expectEqual(@as(usize, 42), bytes),
+        .failed, .not_saved => return error.TestUnexpectedFailedSave,
+    }
+
+    try folder.writeFile(io, .{ .sub_path = "save-status", .data = "failed\n" });
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => return error.TestUnexpectedOverCap,
+        .failed => {},
+        .not_saved => return error.TestUnexpectedStatus,
+    }
+
+    try folder.writeFile(io, .{ .sub_path = "save-status", .data = "cap lots\n" });
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .over_cap => return error.TestUnexpectedOverCap,
+        .failed => {},
+        .not_saved => return error.TestUnexpectedStatus,
+    }
+
+    try folder.writeFile(io, .{ .sub_path = "save-status", .data = "pending\n" });
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .not_saved => {},
+        .over_cap, .failed => return error.TestUnexpectedStatus,
+    }
+
+    // The take empties the record, so the next take finds nothing to report.
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+}
+
+test "a program that runs trap - EXIT ends without its save, and its record says not saved" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "untrapped1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgram(alloc, io, &session, dir, "untrapped2", "builtin trap - EXIT; x=2");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("", second.stderr);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .not_saved => {},
+        .over_cap, .failed => return error.TestUnexpectedStatus,
+    }
+
+    const third = try runProgram(alloc, io, &session, dir, "untrapped3", "echo \"x=$x\"");
+    defer freeRun(alloc, third);
+    try expectExit(third, 0);
+    try std.testing.expectEqualStrings("x=1\n", third.stdout);
+}
+
+test "a program that runs exec ends without its save, and its record says not saved" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "exec1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgram(alloc, io, &session, dir, "exec2", "x=2; exec true");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .not_saved => {},
+        .over_cap, .failed => return error.TestUnexpectedStatus,
+    }
+
+    const third = try runProgram(alloc, io, &session, dir, "exec3", "echo \"x=$x\"");
+    defer freeRun(alloc, third);
+    try expectExit(third, 0);
+    try std.testing.expectEqualStrings("x=1\n", third.stdout);
+}
+
+test "a program killed with SIGKILL ends without its save, and its record says not saved" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "killed1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgram(alloc, io, &session, dir, "killed2", "x=2; kill -9 $$");
+    defer freeRun(alloc, second);
+    switch (second.term) {
+        .signal => |signal| try std.testing.expectEqual(std.posix.SIG.KILL, signal),
+        else => return error.TestUnexpectedExit,
+    }
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .not_saved => {},
+        .over_cap, .failed => return error.TestUnexpectedStatus,
+    }
+
+    const third = try runProgram(alloc, io, &session, dir, "killed3", "echo \"x=$x\"");
+    defer freeRun(alloc, third);
+    try expectExit(third, 0);
+    try std.testing.expectEqualStrings("x=1\n", third.stdout);
+}
+
+test "a program that sets xtrace is traced, and the save adds no line to its output" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "xtrace1", "set -x; y=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stdout);
+    try std.testing.expect(std.mem.find(u8, first.stderr, "+ y=1") != null);
+    try std.testing.expect(std.mem.find(u8, first.stderr, "__fx_") == null);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    // xtrace is not part of the saved state, so the next program is not traced.
+    const second = try runProgram(alloc, io, &session, dir, "xtrace2", "echo \"y=$y\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("y=1\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+}
+
+test "a program's own EXIT trap gets fx's save once, and a trap on another signal adds none" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // `trap -p` prints the EXIT trap, so the save's text shows once; the handler runs last.
+    const run = try runProgram(alloc, io, &session, dir, "once1", "x=1; trap 'echo bye' EXIT; trap - INT; builtin trap -p EXIT");
+    defer freeRun(alloc, run);
+    try expectExit(run, 0);
+    const first_save = std.mem.find(u8, run.stdout, "__fx_save") orelse return error.TestNoSaveInTrap;
+    try std.testing.expect(std.mem.find(u8, run.stdout[first_save + "__fx_save".len ..], "__fx_save") == null);
+    try std.testing.expect(std.mem.endsWith(u8, run.stdout, "EXIT\nbye\n"));
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const next = try runProgram(alloc, io, &session, dir, "once2", "echo \"x=$x\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=1\n", next.stdout);
+}
+
+test "a program's own EXIT handler still traces after the save" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // The handler is set before xtrace is on, so the trap wrapper's own lines are not traced.
+    // The save never turns xtrace off, so the handler traces.
+    const run = try runProgram(alloc, io, &session, dir, "handler1", "trap 'echo HANDLER' EXIT; set -x; y=1");
+    defer freeRun(alloc, run);
+    try expectExit(run, 0);
+    try std.testing.expectEqualStrings("HANDLER\n", run.stdout);
+    try std.testing.expect(std.mem.find(u8, run.stderr, "+ echo HANDLER") != null);
+    try std.testing.expect(std.mem.find(u8, run.stderr, "__fx_") == null);
+}
+
+test "a program that sets IFS to a tab keeps its state, and the save writes no notice" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "ifs1", "IFS=$'\\t'; x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgram(alloc, io, &session, dir, "ifs2", "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "a program that sets IFS to letters keeps its state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "letters-ifs1", "IFS=abc; x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgram(alloc, io, &session, dir, "letters-ifs2", "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "a program that sets IFS to nothing keeps its state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "empty-ifs1", "IFS=; x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgram(alloc, io, &session, dir, "empty-ifs2", "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "a program that sets nocasematch keeps the variables of the next program" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "nocase1", "shopt -s nocasematch; x=1; hostname=kept");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgram(alloc, io, &session, dir, "nocase2", "echo \"x=$x h=$hostname\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1 h=kept\n", second.stdout);
+}
+
+test "a program that hides awk and mv from PATH still saves its state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "path1", "PATH=/nonexistent; x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgram(alloc, io, &session, dir, "path2", "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "a startup that sets noclobber writes its records and saves no startup function" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "clobber1", "set -C; f() { echo SF; }", &.{}, "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    // The next startup defines f differently, so the program's f is the next startup's only if
+    // the first startup's f was not saved.
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "clobber2", "set -C; f() { echo SF2; }", &.{}, "echo \"x=$x $(f)\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1 SF2\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+}
+
+test "a startup that sets IFS to letters does not stop the save" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "letters1", "IFS=abc", &.{}, "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "letters2", "IFS=abc", &.{}, "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
 }
 
 test "a program that ends after its folder is gone saves nothing and prints nothing" {

@@ -1329,6 +1329,26 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[3]!.body, "bash-read")).toContain("x=1 big=0");
   }, TIMEOUT);
 
+  test("a bash state over the size cap that the program ends with exit is reported, and the old value stays", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-set", "bash", { command: "x=1" }),
+      fakeGatewayToolCall("bash-exit", "bash", { command: "x=2; big=$(head -c 1100000 /dev/zero | tr '\\0' a); exit 0" }),
+      fakeGatewayToolCall("bash-read", "bash", { command: "echo \"x=$x big=${#big}\"" }),
+      fakeGatewayFinalText("Exit checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Save a large state, then exit."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(toolResultText(gateway.requests[2]!.body, "bash-exit")).toContain("over the 1048576-byte limit, so it was not saved");
+    expect(toolResultText(gateway.requests[3]!.body, "bash-read")).toContain("x=1 big=0");
+  }, TIMEOUT);
+
   test("the working folder carries from one program to the next", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([

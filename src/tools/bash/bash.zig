@@ -30,6 +30,9 @@ const cut_marker_reserve_bytes = 64;
 /// The smallest `max_bytes` that leaves room for the reserves and a cut.
 const min_result_bytes = 1024;
 
+/// The largest state a program may save, as the text of its notice.
+const max_state_text = std.fmt.comptimePrint("{d}", .{bash_session.max_state_bytes});
+
 /// How a call acts: `run` sends a program, `wait` waits for the running one.
 pub const Action = enum { run, wait };
 
@@ -247,6 +250,10 @@ fn callRun(
     defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
     var variables: std.ArrayList(managed_execution.EnvironmentVariable) = .empty;
     if (bridge_registration) |registration| try variables.appendSlice(request_arena, registration.environment());
+    // A save record that a program left after it ended, with its end never
+    // delivered, is this program's to report. It is taken here, just before this
+    // program starts, and its notice goes into this program's result.
+    const leftover = takeSaveNotice(ctx.allocator, session, true) catch |err| return runtimeFailure(ctx, err);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -267,11 +274,12 @@ fn callRun(
         .cancel_flag = ctx.cancel_flag,
         .tool_yield_flag = ctx.tool_yield_flag,
     }) catch |err| {
+        if (leftover) |text| ctx.allocator.free(text);
         if (err == error.Cancelled and cancelRequested(ctx)) return error.Cancelled;
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared);
+    return finish(ctx, runtime, &prepared, leftover);
 }
 
 /// Waits up to `yield_ms` for the session's program, or says that nothing is
@@ -295,19 +303,81 @@ fn callWait(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared);
+    return finish(ctx, runtime, &prepared, null);
+}
+
+/// Takes the save record the last program's save left, if there is one, logs why
+/// that program's state was not saved, and returns the notice for the result. The
+/// caller frees a non-null result. `previous` is true when the program ended
+/// before this call.
+fn takeSaveNotice(alloc: Allocator, session: *bash_session.Session, previous: bool) Allocator.Error!?[]u8 {
+    const status = session.takeSaveStatus(io_mod.getIo()) orelse return null;
+    const bytes: usize = switch (status) {
+        .over_cap => |size| size,
+        .failed, .not_saved => 0,
+    };
+    debug_trace.logf("bash", "bash state not saved: reason={s} bytes={d}", .{ @tagName(status), bytes });
+    return switch (status) {
+        .over_cap => |size| if (previous)
+            try alloc.print("fx: the previous program's bash state is {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; this program started from the last saved state.", .{size})
+        else
+            try alloc.print("fx: this program's bash state is {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; the next program starts from the last saved state.", .{size}),
+        .failed => try alloc.dupe(u8, if (previous)
+            "fx: the previous program's bash state could not be saved; this program started from the last saved state."
+        else
+            "fx: this program's bash state could not be saved; the next program starts from the last saved state."),
+        .not_saved => try alloc.dupe(u8, if (previous)
+            "fx: the previous program ended before fx could save its bash state, so it was not saved; this program started from the last saved state."
+        else
+            "fx: this program ended before fx could save its bash state, so it was not saved; the next program starts from the last saved state."),
+    };
+}
+
+/// `body` with each present notice on its own line after it. Frees `body`, also
+/// when it fails.
+fn withNotices(alloc: Allocator, body: []u8, notices: []const ?[]const u8) Allocator.Error![]u8 {
+    defer alloc.free(body);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, body);
+    for (notices) |notice| {
+        if (notice) |text| try appendLine(alloc, &out, text);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The result text for `snapshot`, with `notices` after it. The caller frees it.
+fn formatWithNotices(alloc: Allocator, snapshot: managed_execution.Snapshot, max_bytes: usize, notices: []const ?[]const u8) ![]u8 {
+    const formatted = try formatResult(alloc, snapshot, max_bytes);
+    return withNotices(alloc, formatted, notices);
 }
 
 /// Turns a program's snapshot into the result the model reads, then hands the
-/// delivery to the runtime. A failed hand-off cancels the reservation, so none is
-/// left behind, and frees the body.
+/// delivery to the runtime. `leftover` is a notice from a program that ended
+/// before this one started, and it is freed here. A program that has ended
+/// also reports its own save record, which is taken here. A failed hand-off
+/// cancels the reservation, so none is left behind, and frees the body.
 fn finish(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     prepared: *managed_execution.PreparedSnapshot,
+    leftover: ?[]u8,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    defer if (leftover) |text| ctx.allocator.free(text);
+    const own: ?[]u8 = if (ctx.bash_session) |session| blk: {
+        if (std.meta.activeTag(prepared.snapshot.state) == .running) break :blk null;
+        break :blk takeSaveNotice(ctx.allocator, session, false) catch |err| {
+            // The reservation is made, so it is cancelled on this failure too.
+            runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
+                debug_trace.logf("bash", "delivery cancel failed after a notice error err={s}", .{@errorName(cancel_err)});
+            };
+            return err;
+        };
+    } else null;
+    defer if (own) |text| ctx.allocator.free(text);
+    const notices = [_]?[]const u8{ leftover, own };
     const budget = @max(ctx.max_tool_result_bytes, min_result_bytes);
-    const body = formatResult(ctx.allocator, prepared.snapshot, budget) catch |err| {
+    const body = formatWithNotices(ctx.allocator, prepared.snapshot, budget, &notices) catch |err| {
         runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
             debug_trace.logf("bash", "delivery cancel failed after a format error err={s}", .{@errorName(cancel_err)});
         };
@@ -817,6 +887,13 @@ const TestBash = struct {
         try dir.writeFile(self.io, .{ .sub_path = "folder", .data = folder });
     }
 
+    /// Writes `text` as the session's save record, as a program's save leaves one.
+    fn writeSaveRecord(self: *TestBash, text: []const u8) !void {
+        var dir = try std.Io.Dir.cwd().openDir(self.io, self.session.dir.?, .{});
+        defer dir.close(self.io);
+        try dir.writeFile(self.io, .{ .sub_path = "save-status", .data = text });
+    }
+
     /// Makes the gate: a fifo in the workspace, held open read-write and nonblocking.
     /// That fd is a reader and a writer, so the open never waits, and a program's
     /// `read` finds a writer. The program blocks on its read until `release`.
@@ -889,6 +966,252 @@ test "bash state carries from one program to the next" {
     const second = try callRun(ctx, "echo $((x+1))", program_yield_ms);
     defer second.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
+}
+
+test "an over-cap program says so in its result, and the next program keeps the last saved state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+
+    // The program ends with `exit 0`, so its own end is the only place its save can run.
+    const big_command = "big=$(head -c 1100000 /dev/zero | tr '\\0' a); exit 0";
+    try bash.authorize(&ctx, big_command);
+    const big = try callRun(ctx, big_command, program_yield_ms);
+    defer big.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(big, true), "over the 1048576-byte limit, so it was not saved; the next program starts from the last saved state.") != null);
+
+    try bash.authorize(&ctx, "echo $((x+1))");
+    const second = try callRun(ctx, "echo $((x+1))", program_yield_ms);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
+}
+
+test "an over-cap program logs why its state was not saved" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    const big_command = "big=$(head -c 1100000 /dev/zero | tr '\\0' a); exit 0";
+    try bash.authorize(&ctx, big_command);
+    const big = try callRun(ctx, big_command, program_yield_ms);
+    defer big.deinit(alloc);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "bash state not saved: reason=over_cap") != null);
+}
+
+test "a program that sets IFS to a tab keeps its state, and its result has no notice" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    const first_command = "IFS=$'\\t'; x=1";
+    try bash.authorize(&ctx, first_command);
+    const first = try callRun(ctx, first_command, program_yield_ms);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const second = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "x=1"));
+}
+
+test "a save record a program left unseen is reported with the next program's result" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    // The first call makes the session folder, which the record goes in.
+    try bash.authorize(&ctx, "x=1");
+    const first = try callRun(ctx, "x=1", program_yield_ms);
+    defer first.deinit(alloc);
+
+    try bash.writeSaveRecord("cap 2000000\n");
+    try bash.authorize(&ctx, "echo next");
+    const next = try callRun(ctx, "echo next", program_yield_ms);
+    defer next.deinit(alloc);
+    const text = try outcomeText(next, true);
+    try std.testing.expect(std.mem.startsWith(u8, text, "next\n"));
+    try std.testing.expect(std.mem.find(u8, text, "fx: the previous program's bash state is 2000000 bytes, over the 1048576-byte limit") != null);
+
+    // A record left after the program that followed is reported by the call after it.
+    try bash.writeSaveRecord("failed\n");
+    try bash.authorize(&ctx, "echo later");
+    const later = try callRun(ctx, "echo later", program_yield_ms);
+    defer later.deinit(alloc);
+    const later_text = try outcomeText(later, true);
+    try std.testing.expect(std.mem.find(u8, later_text, "the previous program's bash state could not be saved") != null);
+
+    // A program that ended without its save leaves `pending`, and the call after it reports that.
+    try bash.writeSaveRecord("pending\n");
+    try bash.authorize(&ctx, "echo ended");
+    const ended = try callRun(ctx, "echo ended", program_yield_ms);
+    defer ended.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(ended, true), "fx: the previous program ended before fx could save its bash state, so it was not saved; this program started from the last saved state.") != null);
+}
+
+/// The notice for a program that ended before its save ran.
+const not_saved_notice = "fx: this program ended before fx could save its bash state, so it was not saved; the next program starts from the last saved state.";
+
+test "a program that runs trap - EXIT says so in its result, and the next program keeps the last saved state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+
+    const untrapped = "builtin trap - EXIT; x=42";
+    try bash.authorize(&ctx, untrapped);
+    const second = try callRun(ctx, untrapped, program_yield_ms);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(second, true), not_saved_notice) != null);
+
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer third.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+}
+
+test "a program that runs exec says so in its result, and the next program keeps the last saved state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+
+    const replaced = "x=42; exec true";
+    try bash.authorize(&ctx, replaced);
+    const second = try callRun(ctx, replaced, program_yield_ms);
+    defer second.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(second, true), not_saved_notice) != null);
+
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer third.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+}
+
+test "a program killed with SIGKILL says so in its result, and the next program keeps the last saved state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+
+    const killed = "x=42; kill -9 $$";
+    try bash.authorize(&ctx, killed);
+    const second = try callRun(ctx, killed, program_yield_ms);
+    defer second.deinit(alloc);
+    const second_text = try outcomeText(second, false);
+    try std.testing.expect(std.mem.find(u8, second_text, "[killed by signal 9]") != null);
+    try std.testing.expect(std.mem.find(u8, second_text, not_saved_notice) != null);
+
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer third.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+}
+
+test "a program that fx stops at its timeout says so in its result, and the next program keeps the last saved state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+
+    // A loop that never ends, so only the timeout ends it.
+    const endless = "x=42; while :; do :; done";
+    try bash.authorize(&ctx, endless);
+    ctx.command_timeout_ms = 200;
+    const second = try callRun(ctx, endless, program_yield_ms);
+    defer second.deinit(alloc);
+    ctx.command_timeout_ms = null;
+    const second_text = switch (second) {
+        .success => |body| body,
+        .failure => |body| body,
+        .rich => return error.TestUnexpectedOutcome,
+    };
+    try std.testing.expect(std.mem.find(u8, second_text, not_saved_notice) != null);
+
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer third.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+}
+
+test "a program that sets xtrace shows its own lines and no line from the save" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+
+    const traced = "set -x; y=1";
+    try bash.authorize(&ctx, traced);
+    const run = try callRun(ctx, traced, program_yield_ms);
+    defer run.deinit(alloc);
+    const text = try outcomeText(run, true);
+    try std.testing.expect(std.mem.find(u8, text, "+ y=1") != null);
+    // The bootstrap's own lines are not asserted here: every snapshot run has them.
+    for ([_][]const u8{ "__fx_save", "__fx_keep", "__fx_status" }) |name| {
+        try std.testing.expect(std.mem.find(u8, text, name) == null);
+    }
+
+    // xtrace is not part of the saved state, so the next program is not traced.
+    try bash.authorize(&ctx, "echo \"y=$y\"");
+    const next = try callRun(ctx, "echo \"y=$y\"", program_yield_ms);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings("y=1\n", try outcomeText(next, true));
+}
+
+test "a program that ends before its save logs reason not_saved" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    const untrapped = "builtin trap - EXIT; x=1";
+    try bash.authorize(&ctx, untrapped);
+    const run = try callRun(ctx, untrapped, program_yield_ms);
+    defer run.deinit(alloc);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "bash state not saved: reason=not_saved bytes=0") != null);
 }
 
 test "bash working folder carries from one program to the next" {
