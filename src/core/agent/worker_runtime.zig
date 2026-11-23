@@ -685,11 +685,11 @@ pub const WorkerRuntime = struct {
     /// logged (`commit_gate_since_ms` is set).
     commit_gate_logged: bool = false,
     /// How many of the finished turns that `unacknowledged_finishes` counts are
-    /// missing from `queued_history`. Steering that joins the running turn is
-    /// read by that turn, so it adds none. A queue that was empty took the
-    /// history its first prompt was posted with (`enqueuePromptLocked`), which
-    /// the loop took before it committed those turns. Each acknowledgement
-    /// lowers it, and a commit that carries its turn adds the turn to the queue
+    /// missing from `queued_history`. Steering that joins the running turn adds
+    /// none. A queue that was empty took the history its first prompt was
+    /// posted with (`enqueuePromptLocked`), which the loop took before it
+    /// committed those turns. Each acknowledgement lowers it, and a commit that
+    /// carries its turn adds the turn to the queue
     /// (`acknowledgeFinishCommittedTurn`). Guarded by `worker_mutex`.
     ///
     /// The post that adopts a base sets it, and it means something only while
@@ -1673,7 +1673,10 @@ pub const WorkerRuntime = struct {
             // A prompt queued after the worker finished a turn, and before the
             // loop committed it, brought a history without that turn, whether it
             // is mail or text the user typed. Steering that joins the running turn
-            // is read by that turn, so it owes nothing.
+            // counts none: that turn reads it, or, when it is already queued, the
+            // turn's finish gives it the turn (`propagateHistoryTurn`). Steering
+            // that starts the queue after that finish, and before the loop
+            // committed the turn, misses it.
             self.queued_history_owed = if (queued.delivery.activeTurnId() == null) self.unacknowledged_finishes else 0;
         } else {
             types.freeHistoryTurnSlice(alloc, supplied_history);
@@ -10697,6 +10700,33 @@ test "a prompt typed after a cancelled turn ended starts with that turn" {
     try expectQueuedAnswers(&runtime, &.{ "earlier answer", "what it said before the cancel" });
     try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
     try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+}
+
+test "a typed prompt the gate held past its limit starts without the finished turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.enableCommitGate();
+    try pushTestFinish(alloc, &runtime);
+    var typed = try makePrompt(alloc, "typed", "model");
+    types.freeHistoryTurnSlice(alloc, typed.history);
+    typed.history = try earlierTurns(alloc);
+    try runtime.enqueuePrompt(alloc, typed);
+    try std.testing.expectEqual(@as(u32, 1), runtime.queued_history_owed);
+    // The first take holds the prompt and starts the limit. The loop never
+    // commits, and the limit passes.
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    runtime.commit_gate_since_ms -= WorkerRuntime.commit_gate_limit_ms;
+    const work = (try runtime.tryTakeNextWork(alloc)).?;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqualStrings("typed", work.prompt.prompt);
+    try std.testing.expectEqual(@as(usize, 1), work.prompt.history.len);
+    try std.testing.expectEqual(@as(u32, 0), runtime.unacknowledged_finishes);
+    try std.testing.expectEqual(@as(u32, 0), runtime.queued_history_owed);
+
+    // The commit that comes after the prompt started adds nothing.
+    runtime.acknowledgeFinishCommittedTurn(alloc, finishedTurn("the finished answer"), null, 8);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
 }
 
 test "steering that joins a running turn owes no finished turn and is not held" {
