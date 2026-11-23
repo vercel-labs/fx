@@ -7480,9 +7480,9 @@ test "ACP outbound responses correlate out of order and ignore unknown ids" {
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
     try attachOpenerForTest(&session, &state);
+    defer releaseTestSession(&state, &session);
     session.outbound = .{};
     defer session.outbound.pending.deinit(alloc);
-    try attachOpenerForTest(&session, &state);
 
     const first = (try beginOutboundRequest(&session, .elicitation)).?;
     const second = (try beginOutboundRequest(&session, .elicitation)).?;
