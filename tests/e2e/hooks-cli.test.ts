@@ -197,23 +197,43 @@ describe("fx hook", () => {
     expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("guard", "trusted"));
   });
 
-  test("fx's own agent cannot trust or disable a hook, but it can enable one", async () => {
+  test("fx's own agent may trust a hook, and the list says so; it still cannot disable one", async () => {
     const root = createRoot();
     const agent = { AI_AGENT: "fx" };
 
-    for (const words of [
-      ["hook", "trust", "guard", "--json"],
-      ["hook", "disable", "guard", "--json"],
-    ]) {
-      const refused = await hook(root, words, agent);
-      expect(refused.code).toBe(1);
-      expect(JSON.parse(refused.stdout)).toMatchObject({ code: "TrustNeedsPerson" });
-    }
+    const disabled = await hook(root, ["hook", "disable", "guard", "--json"], agent);
+    expect(disabled.code).toBe(1);
+    expect(JSON.parse(disabled.stdout)).toMatchObject({ code: "TrustNeedsPerson" });
     expect(existsSync(root.trustFile)).toBe(false);
+
+    const trusted = await hook(root, ["hook", "trust", "guard", "--json"], agent);
+    expect(trusted.code).toBe(0);
+    expect(JSON.parse(trusted.stdout)).toMatchObject({ kind: "hook_trust", trusted: ["guard"], trusted_by: "agent" });
+    expect(readFileSync(root.trustFile, "utf8")).toContain('"by":"agent"');
+
+    expect((await hook(root, ["hook", "list"])).stdout).toContain("trusted (by agent)");
+    expect((await hook(root, ["hook", "show", "guard"])).stdout).toContain("trusted (by agent)");
+    const listed = JSON.parse((await hook(root, ["hook", "list", "--json"])).stdout);
+    expect(listed.hooks).toContainEqual(expect.objectContaining({ id: "guard", status: "trusted", trusted_by: "agent" }));
 
     const enabled = await hook(root, ["hook", "enable", "guard"], agent);
     expect(enabled.code).toBe(0);
     expect(enabled.stdout).toContain("Enabled hook guard for this workspace.");
+  });
+
+  test("a person's trust replaces fx's own agent's mark, and the person's entry is saved without one", async () => {
+    const root = createRoot();
+    expect((await hook(root, ["hook", "trust", "guard"], { AI_AGENT: "fx" })).code).toBe(0);
+    expect((await hook(root, ["hook", "list"])).stdout).toContain("trusted (by agent)");
+
+    const person = await hook(root, ["hook", "trust", "guard"]);
+    expect(person.code).toBe(0);
+    expect(person.stdout).toContain("Trusted hook guard.");
+    expect(readFileSync(root.trustFile, "utf8")).not.toContain('"by"');
+    expect((await hook(root, ["hook", "list"])).stdout).not.toContain("by agent");
+    const listed = JSON.parse((await hook(root, ["hook", "list", "--json"])).stdout);
+    expect(listed.hooks).toContainEqual(expect.objectContaining({ id: "guard", status: "trusted" }));
+    expect(listed.hooks).not.toContainEqual(expect.objectContaining({ trusted_by: "agent" }));
   });
 
   test("fx's own agent runs only trusted hooks in fx hook test, and counts the waiting ones it skips", async () => {

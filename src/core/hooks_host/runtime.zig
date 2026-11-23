@@ -42,7 +42,12 @@ const SessionEntry = struct {
     context: ?[]u8 = null,
     /// The waiting-hook count the person was last told about in this session. Changes only under `mutex`.
     trust_notice_count: usize = 0,
+    /// The identities of the hooks fx's own agent trusted that this session was told about. Changes only under `mutex`.
+    agent_trust_told: std.ArrayList([]u8) = .empty,
 };
+
+/// A hook fx's own agent trusted, as its notice names it. Both strings are allocated with the caller's arena.
+pub const AgentTrustedHook = struct { id: []const u8, identity: []const u8 };
 
 /// A note for one session's next turn. Both strings are owned.
 const PendingNote = struct {
@@ -78,6 +83,8 @@ const max_detached_runs: usize = 8;
 /// that needs longer is stopped at this budget. The sessions of one exit share it, so exit waits at most
 /// this long for them.
 const session_end_exit_budget_ms: i64 = 1500;
+/// The most agent-trust notices one session keeps (the process keeps the same for a turn with no session). Past it a notice is dropped and traced.
+const max_agent_trust_notices = 256;
 
 /// Do not copy a Runtime after `init`: the host it gives the engine points into it.
 pub const Runtime = struct {
@@ -98,6 +105,8 @@ pub const Runtime = struct {
     sessions: std.ArrayList(SessionEntry) = .empty,
     /// The waiting count last told to a turn with no session (`--no-save`). Changes only under `mutex`.
     process_trust_notice_count: usize = 0,
+    /// The same, for a turn with no session (`--no-save`). Changes only under `mutex`.
+    process_agent_trust_told: std.ArrayList([]u8) = .empty,
     /// Notes queued for a session's next turn, in the order they were queued. Changes only under `mutex`.
     pending_notes: std.ArrayList(PendingNote) = .empty,
     /// The answers InstructionsLoaded hooks gave, one per session and path. Changes only under `mutex`.
@@ -146,6 +155,7 @@ pub const Runtime = struct {
         // A background run still reads this runtime, so wait for it before anything is freed.
         self.waitDetached();
         self.endOpenSessions();
+        freeIdentities(self.alloc, &self.process_agent_trust_told);
         // Stops the hook groups still live (R3.9). The registry is process-wide, so this assumes one runtime
         // at a time: ACP frees the old runtime before it creates the new one (server.zig:3170-3171).
         live_groups.killAll();
@@ -559,6 +569,47 @@ pub const Runtime = struct {
     fn freePendingNotes(self: *Runtime) void {
         for (self.pending_notes.items) |note| freePendingNote(self.alloc, note);
         self.pending_notes.deinit(self.alloc);
+    }
+
+    /// The hooks fx's own agent trusted that are trusted and not disabled now, with their ids and identities (see
+    /// `trust.identityOf`). Both are allocated with `arena`. Runs no hook.
+    pub fn agentTrustedHooks(self: *Runtime, arena: std.mem.Allocator) ![]AgentTrustedHook {
+        if (!self.enabled) return &.{};
+        const shared = self.acquire() orelse return &.{};
+        defer self.release(shared);
+        const snapshot = &shared.snapshot;
+        var out: std.ArrayList(AgentTrustedHook) = .empty;
+        for (snapshot.hooks, 0..) |hook, index| {
+            if (!snapshot.trusted[index] or snapshot.disabled[index] or !snapshot.trustedByAgent(index)) continue;
+            const id = try arena.dupe(u8, hook.id);
+            const identity = try trust.identityOf(arena, hook, snapshot.sources[index]);
+            try out.append(arena, .{ .id = id, .identity = identity });
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Records that this session (or, for the empty id, this process) was told that the hook with this identity was
+    /// trusted by fx's own agent. Returns true the first time, so each hook is told once per session. A session that
+    /// did not start here is never told. Changes only under `mutex`.
+    pub fn agentTrustNoticeDue(self: *Runtime, session_id: []const u8, identity: []const u8) std.mem.Allocator.Error!bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const told: *std.ArrayList([]u8) = if (session_id.len == 0) &self.process_agent_trust_told else blk: {
+            const index = self.sessionIndexLocked(session_id) orelse return false;
+            break :blk &self.sessions.items[index].agent_trust_told;
+        };
+        for (told.items) |text| {
+            if (std.mem.eql(u8, text, identity)) return false;
+        }
+        if (told.items.len >= max_agent_trust_notices) {
+            debug_trace.logf("hooks", "dropped an agent-trust notice: {d} already told in this session", .{told.items.len});
+            return false;
+        }
+        const copy = try self.alloc.dupe(u8, identity);
+        errdefer self.alloc.free(copy);
+        try told.append(self.alloc, copy);
+        return true;
     }
 
     /// How many hooks wait for trust and do not run here, in any layer. Zero when hooks are off.
@@ -1076,11 +1127,19 @@ fn freePendingNote(alloc: std.mem.Allocator, note: PendingNote) void {
     alloc.free(note.text);
 }
 
+/// Frees the identities a notice list kept, and the list.
+fn freeIdentities(alloc: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |text| alloc.free(text);
+    list.deinit(alloc);
+}
+
 fn freeSession(alloc: std.mem.Allocator, entry: SessionEntry) void {
     alloc.free(entry.info.session_id);
     alloc.free(entry.info.cwd);
     alloc.free(entry.info.permission_mode);
     if (entry.context) |text| alloc.free(text);
+    var told = entry.agent_trust_told;
+    freeIdentities(alloc, &told);
 }
 
 fn builtinWants(builtins: []const hooks.Builtin, name: hooks.EventName) bool {

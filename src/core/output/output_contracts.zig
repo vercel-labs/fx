@@ -66,6 +66,8 @@ pub const HookRow = struct {
     /// The file the hook came from, as fx read it.
     file: []const u8,
     status: HookStatus,
+    /// Set when fx's own agent trusted the hook. Only a trusted hook has it.
+    trusted_by_agent: bool = false,
 };
 
 /// A problem fx found while it read a hook file.
@@ -209,7 +211,7 @@ pub const HookShowSnapshot = struct {
         try w.writeAll("file: ");
         try writeSafePath(alloc, w, self.hook.file);
         try w.writeByte('\n');
-        try w.print("status: {s}\n", .{@tagName(self.hook.status)});
+        try w.print("status: {s}\n", .{hookStatusText(self.hook)});
         try w.print("type: {s}\n", .{self.hook_type});
         try w.writeAll("timeout_seconds: ");
         try writeSeconds(w, self.timeout_ms);
@@ -494,6 +496,8 @@ pub const HookTrustSnapshot = struct {
     trusted: []const []const u8,
     /// The trust file, as fx reads and writes it.
     file: []const u8,
+    /// Set when fx's own agent recorded the trust.
+    by_agent: bool = false,
 
     pub fn render(self: HookTrustSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -510,7 +514,9 @@ pub const HookTrustSnapshot = struct {
             if (index > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(id, .{}, &out.writer);
         }
-        try out.writer.writeAll("],\"file\":");
+        try out.writer.writeAll("]");
+        if (self.by_agent) try out.writer.writeAll(",\"trusted_by\":\"agent\"");
+        try out.writer.writeAll(",\"file\":");
         try std.json.Stringify.value(self.file, .{}, &out.writer);
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
@@ -520,14 +526,15 @@ pub const HookTrustSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         const w = &out.writer;
+        const by = if (self.by_agent) " by fx's agent" else "";
         if (self.trusted.len == 0) {
             try w.writeAll("No hook waits for trust.\n");
             return try out.toOwnedSlice();
         }
         if (self.trusted.len == 1) {
-            try w.print("Trusted hook {f}.", .{text_utils.terminalSafe(self.trusted[0])});
+            try w.print("Trusted hook {f}{s}.", .{ text_utils.terminalSafe(self.trusted[0]), by });
         } else {
-            try w.print("Trusted {d} hooks: ", .{self.trusted.len});
+            try w.print("Trusted {d} hooks{s}: ", .{ self.trusted.len, by });
             for (self.trusted, 0..) |id, index| {
                 if (index > 0) try w.writeAll(", ");
                 try w.print("{f}", .{text_utils.terminalSafe(id)});
@@ -599,6 +606,13 @@ fn writeHookRowFields(writer: *std.Io.Writer, hook: HookRow) !void {
     try writer.writeAll(",\"file\":");
     try std.json.Stringify.value(hook.file, .{}, writer);
     try writer.print(",\"status\":\"{s}\"", .{@tagName(hook.status)});
+    if (hook.trusted_by_agent and hook.status == .trusted) try writer.writeAll(",\"trusted_by\":\"agent\"");
+}
+
+/// The status a person reads: `trusted (by agent)` when fx's own agent trusted the hook, otherwise the status name.
+fn hookStatusText(hook: HookRow) []const u8 {
+    if (hook.status == .trusted and hook.trusted_by_agent) return "trusted (by agent)";
+    return @tagName(hook.status);
 }
 
 /// The table `fx hook list` prints: ID, EVENT, MATCHER, STATUS, FILE. The last column is not padded.
@@ -611,7 +625,7 @@ fn writeHookTable(arena: Allocator, w: *std.Io.Writer, hooks: []const HookRow) !
             try safeCell(arena, hook.id),
             hook.event,
             try safeCell(arena, hook.matcher orelse "-"),
-            @tagName(hook.status),
+            hookStatusText(hook),
             try safeCell(arena, try displayPath(arena, hook.file)),
         };
     }

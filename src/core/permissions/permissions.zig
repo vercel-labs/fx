@@ -4,6 +4,7 @@ const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
 
 const io_mod = @import("../shared/io.zig");
+const hooks_host = @import("../hooks_host/hooks_host.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -405,6 +406,22 @@ const FileTargetPolicyDecision = union(enum) {
     prompt_required: bool,
 };
 
+/// Whether `target`, a canonical path from the resolver, is the hooks trust file of the profile fx uses. The
+/// folder is resolved the way a target is, so a symlinked parent cannot hide the file. A process with no home
+/// folder has no trust file, so nothing is refused. Names compare without case, because on macOS a name that
+/// differs only in case can be the same file.
+fn namesHooksTrustFile(alloc: std.mem.Allocator, target: []const u8) !bool {
+    const home = io_mod.homeDir() orelse return false;
+    const trust_path = try hooks_host.trust.path(alloc, home);
+    defer alloc.free(trust_path);
+    const folder = std.Io.Dir.path.dirname(trust_path) orelse return std.ascii.eqlIgnoreCase(target, trust_path);
+    const resolved_folder = io_mod.realpathAlloc(alloc, folder) catch try alloc.dupe(u8, folder);
+    defer alloc.free(resolved_folder);
+    const resolved = try std.Io.Dir.path.join(alloc, &.{ resolved_folder, std.Io.Dir.path.basename(trust_path) });
+    defer alloc.free(resolved);
+    return std.ascii.eqlIgnoreCase(target, resolved);
+}
+
 pub fn prepareFileMutationTargets(
     alloc: std.mem.Allocator,
     workspace_root: []const u8,
@@ -434,6 +451,10 @@ pub fn prepareFileMutationTargets(
         return .{ .target_resolution_failure = .invalid_path };
     }
 
+    // Every file tool admits its target here, before any permission mode, so full access is checked too.
+    if (try namesHooksTrustFile(alloc, bounded.canonical_target_path)) {
+        return .{ .target_resolution_failure = .hooks_trust_file };
+    }
     const component_count = bounded.relative_components.len;
     const traversal_count = component_count - 1;
     const worst_case_item_count = @max(component_count, 2);
@@ -1068,6 +1089,34 @@ pub fn allowsExternalPath(tool_name: []const u8) bool {
         if (std.mem.eql(u8, tool_name, eligible)) return true;
     }
     return false;
+}
+
+test "the hooks trust file is refused as a file-mutation target, and a file beside it is not" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("HOME", home);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+
+    // The workspace is the home folder, so the trust file is inside it and resolves like any target.
+    switch (try prepareFileMutationTargets(alloc, home, testWriteMutationInput(".fx/hooks-trust.json"))) {
+        .target_resolution_failure => |failure| try std.testing.expectEqual(
+            file_mutation_contract.FileTargetResolutionFailure.hooks_trust_file,
+            failure,
+        ),
+        .prepared => return error.TestExpectedRefusal,
+    }
+    var beside = switch (try prepareFileMutationTargets(alloc, home, testWriteMutationInput(".fx/hooks.json"))) {
+        .target_resolution_failure => return error.TestUnexpectedResult,
+        .prepared => |value| value,
+    };
+    defer beside.deinit(alloc);
 }
 
 test "allowsExternalPath preserves the exact eligible tool set" {

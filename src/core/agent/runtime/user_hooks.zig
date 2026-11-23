@@ -398,8 +398,9 @@ pub const TurnHooks = struct {
         if (comptime host_target.is_wasm) return;
         if (!self.active()) return;
         const session_id = self.session_id orelse {
-            // The empty id is this turn's key for the trust notice (see `trustNoticeDue`).
+            // The empty id is this turn's key for the trust notices (see `trustNoticeDue`).
             self.noticeWaitingHooks(arena, "");
+            self.noticeAgentTrust(arena, "");
             return;
         };
         const first = self.runtime.?.beginSession(.{
@@ -413,6 +414,7 @@ pub const TurnHooks = struct {
             return;
         };
         self.noticeWaitingHooks(arena, session_id);
+        self.noticeAgentTrust(arena, session_id);
         if (!first) return;
 
         if (self.surface == .subagent) {
@@ -453,6 +455,33 @@ pub const TurnHooks = struct {
         self.deps.pushHookNotice(.neutral, text) catch |err| {
             debug_trace.logf("hooks", "dropped the trust notice: {s}", .{@errorName(err)});
         };
+    }
+
+    /// Tells the person, once per hook per session, that fx's own agent trusted a hook. It names the same command
+    /// as the waiting notice, and a surface that is not told (a subagent, libfx) gets none.
+    fn noticeAgentTrust(self: *const TurnHooks, arena: std.mem.Allocator, session_id: []const u8) void {
+        if (comptime host_target.is_wasm) return;
+        if (!self.trust_required) return;
+        const review = reviewCommand(self.surface) orelse return;
+        const runtime = self.runtime orelse return;
+        const trusted = runtime.agentTrustedHooks(arena) catch |err| {
+            debug_trace.logf("hooks", "dropped the agent-trust notice: {s}", .{@errorName(err)});
+            return;
+        };
+        for (trusted) |hook| {
+            const due = runtime.agentTrustNoticeDue(session_id, hook.identity) catch |err| {
+                debug_trace.logf("hooks", "dropped the agent-trust notice: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (!due) continue;
+            const text = agentTrustText(arena, hook.id, review) catch |err| {
+                debug_trace.logf("hooks", "dropped the agent-trust notice: {s}", .{@errorName(err)});
+                continue;
+            };
+            self.deps.pushHookNotice(.neutral, text) catch |err| {
+                debug_trace.logf("hooks", "dropped the agent-trust notice: {s}", .{@errorName(err)});
+            };
+        }
     }
 
     /// The session's start context, framed for the model, or null when no start hook added any.
@@ -1440,6 +1469,11 @@ fn reviewCommand(surface: hooks_engine.Surface) ?[]const u8 {
 fn waitingTrustText(arena: std.mem.Allocator, count: usize, review: []const u8) std.mem.Allocator.Error![]u8 {
     if (count == 1) return arena.print("1 hook waits for trust and does not run. Run {s} to review it.", .{review});
     return arena.print("{d} hooks wait for trust and do not run. Run {s} to review them.", .{ count, review });
+}
+
+/// The notice that fx's own agent trusted a hook: names the hook and the command that lists it. Allocated with `arena`.
+fn agentTrustText(arena: std.mem.Allocator, id: []const u8, review: []const u8) std.mem.Allocator.Error![]u8 {
+    return arena.print("Hook {f} was trusted by fx's agent. Run {s} to review it.", .{ text_utils.terminalSafe(id), review });
 }
 
 fn testLifecycle(kind: @import("../../hooks/definitions.zig").ScopeKind) runtime_lifecycle.LifecycleContext {

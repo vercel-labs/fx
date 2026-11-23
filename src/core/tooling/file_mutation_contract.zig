@@ -462,6 +462,8 @@ pub const FileTargetResolutionFailure = enum {
     path_state_changed,
     unsupported_path_operation,
     filesystem_unavailable,
+    /// The hooks trust file: it changes only through `fx hook trust`, so no file tool writes it.
+    hooks_trust_file,
 };
 
 pub const Kind = enum {

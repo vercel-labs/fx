@@ -240,6 +240,7 @@ async function runAsk(
   flags: string[],
   trust = true,
   json = true,
+  extraEnv: Record<string, string | undefined> = {},
 ) {
   try {
     if (trust) await trustProjectHooks(root);
@@ -259,6 +260,7 @@ async function runAsk(
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
+        ...extraEnv,
       },
       timeoutMs: TIMEOUT,
     });
@@ -300,6 +302,85 @@ describe("fx ask with hooks", () => {
     expect(out.output).toContain("the shell call was refused");
     expect(out.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "error" }));
   });
+
+  test("fx ask tells the person once that fx's own agent trusted a hook", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", id: "guard", command: "true" }] }] },
+    });
+    // fx's own agent trusts the hook. No person trusts it in this test, so the mark stays.
+    const agentTrust = await runFx(["hook", "trust", "guard"], {
+      cwd: root.workspace,
+      env: { HOME: root.home, AI_AGENT: "fx", FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(agentTrust.code).toBe(0);
+
+    const { result, bodies } = await runAsk(
+      root,
+      "Run one shell command.",
+      startFakeGateway([fakeShellRun("shell_one", "echo one"), fakeGatewayFinalText("done")]),
+      ["--yolo", "--no-save"],
+      false,
+    );
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    const notice = "Hook guard was trusted by fx's agent. Run fx hook list to review it.";
+    const out = askJson(result.stdout);
+    expect(out.notices.filter((item) => item.text === notice)).toHaveLength(1);
+  }, TIMEOUT);
+
+  test("fx's file tools refuse the hooks trust file in full access, and the file stays as it was", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", id: "guard", command: "true" }] }] },
+    });
+    await trustProjectHooks(root);
+    const trustFile = join(root.home, ".fx", "hooks-trust.json");
+    const before = readFileSync(trustFile, "utf8");
+
+    // --yolo is full access: no prompt, so the refusal must come from the file tool itself.
+    const { result, bodies } = await ask(root, "Overwrite the hooks trust file with write_file.", [
+      fakeGatewayToolCall("write_trust_1", "write_file", { path: trustFile, content: "{}\n" }),
+      fakeGatewayFinalText("the trust file was refused"),
+    ]);
+    expect(result.code).toBe(0);
+    expect(readFileSync(trustFile, "utf8")).toBe(before);
+    expect(bodies[1]).toContain("the hooks trust file changes only through fx hook trust");
+    const out = askJson(result.stdout);
+    expect(out.tool_calls).toContainEqual(expect.objectContaining({ name: "write_file", status: "error" }));
+  }, TIMEOUT);
+
+  test("a changed trusted guard still blocks fx's own agent's shell call that runs fx hook trust", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    const guard = join(root.workspace, "guard.sh");
+    writeFileSync(guard, "exit 0\n");
+    writeProjectHooks(root, {
+      hooks: { PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", id: "guard", command: "sh guard.sh" }] }] },
+    });
+    await trustProjectHooks(root);
+    writeFileSync(guard, "exit 0\n# edited after trust\n");
+    const trustFile = join(root.home, ".fx", "hooks-trust.json");
+    const before = readFileSync(trustFile, "utf8");
+
+    const { result, bodies } = await runAsk(
+      root,
+      "Trust the guard again with the shell tool.",
+      startFakeGateway([
+        fakeShellRun("shell_trust_1", "fx hook trust guard"),
+        fakeGatewayFinalText("the trust was refused"),
+      ]),
+      ["--yolo", "--no-save"],
+      false,
+      true,
+      { AI_AGENT: "fx" },
+    );
+    expect(result.code).toBe(0);
+    expect(bodies[1]).toContain("hook guard changed since you trusted it. Run fx hook trust guard to trust it again.");
+    expect(readFileSync(trustFile, "utf8")).toBe(before);
+    const out = askJson(result.stdout);
+    expect(out.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "error" }));
+  }, TIMEOUT);
 
   test("a trusted hook whose script changed mid-turn blocks the next call, and the person is told", async () => {
     const root = createRoot({ experimental: { hooks: true } });

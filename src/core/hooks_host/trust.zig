@@ -31,9 +31,13 @@ pub fn path(alloc: std.mem.Allocator, home: []const u8) ![]u8 {
     return profile_paths.rootPath(alloc, home, &.{trust_file_name});
 }
 
+/// Who recorded a trusted hook: the person, or fx's own agent (`AI_AGENT=fx`). A person's trust replaces an agent's.
+pub const Trustee = enum { person, agent };
+
 /// One trusted hook. `label` says what it was, for `fx hook list`. `identity` names the hook across edits
-/// (see `identityOf`); an entry from a trust file that predates identities has an empty one.
-pub const Entry = struct { digest: [hex_length]u8, label: []u8, identity: []u8 };
+/// (see `identityOf`); an entry from a trust file that predates identities has an empty one. `trustee` says who
+/// trusted it; an entry from a trust file that predates the field was the person's.
+pub const Entry = struct { digest: [hex_length]u8, label: []u8, identity: []u8, trustee: Trustee = .person };
 
 /// One hook the person disabled for one workspace. Both strings are owned.
 pub const Disabled = struct { workspace: []u8, id: []u8 };
@@ -71,15 +75,39 @@ pub const Store = struct {
         return self.addWithIdentity(alloc, value, label, "");
     }
 
-    /// Adds a digest with a copy of `label` and of the hook `identity` (see `identityOf`). Does nothing when the digest is there.
+    /// Adds a digest, as the person's trust, with a copy of `label` and of the hook `identity` (see `identityOf`).
+    /// A digest the store holds keeps its entry, except that the person's trust replaces an agent's mark.
     pub fn addWithIdentity(self: *Store, alloc: std.mem.Allocator, value: [Sha256.digest_length]u8, label: []const u8, identity: []const u8) std.mem.Allocator.Error!void {
-        if (self.contains(value)) return;
-        const text = hex(value);
+        _ = try self.trustHook(alloc, value, label, identity, .person);
+    }
+
+    /// Records that `trustee` trusted the hook with this digest. A digest the store already holds keeps its entry,
+    /// except that a person's trust replaces an agent's. Returns whether the store changed.
+    pub fn trustHook(self: *Store, alloc: std.mem.Allocator, value: [Sha256.digest_length]u8, label: []const u8, identity: []const u8, trustee: Trustee) std.mem.Allocator.Error!bool {
+        const wanted = hex(value);
+        for (self.entries.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.digest, &wanted)) continue;
+            if (trustee == .person and entry.trustee == .agent) {
+                entry.trustee = .person;
+                return true;
+            }
+            return false;
+        }
         const copy = try alloc.dupe(u8, label);
         errdefer alloc.free(copy);
         const identity_copy = try alloc.dupe(u8, identity);
         errdefer alloc.free(identity_copy);
-        try self.entries.append(alloc, .{ .digest = text, .label = copy, .identity = identity_copy });
+        try self.entries.append(alloc, .{ .digest = wanted, .label = copy, .identity = identity_copy, .trustee = trustee });
+        return true;
+    }
+
+    /// Whether the store holds this digest as fx's own agent trusted it.
+    pub fn trustedByAgent(self: *const Store, value: [Sha256.digest_length]u8) bool {
+        const wanted = hex(value);
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, &entry.digest, &wanted)) return entry.trustee == .agent;
+        }
+        return false;
     }
 
     /// Whether the store holds the hook `identity` under a digest other than `value`: the hook changed since it was trusted.
@@ -237,7 +265,13 @@ pub fn load(alloc: std.mem.Allocator, file_path: []const u8) LoadError!Store {
             if (identity_value != .string) return error.TrustFileInvalid;
             identity = identity_value.string;
         }
-        try store.addWithIdentity(alloc, digest_bytes, label_value.string, identity);
+        // A trust file from before the field has no `by`, so its entries are the person's.
+        var trustee: Trustee = .person;
+        if (item.object.get("by")) |by_value| {
+            if (by_value != .string or !std.mem.eql(u8, by_value.string, "agent")) return error.TrustFileInvalid;
+            trustee = .agent;
+        }
+        _ = try store.trustHook(alloc, digest_bytes, label_value.string, identity, trustee);
     }
     // A file from before disabled hooks has no such list, so it loads with none.
     if (parsed.value.object.get("disabled")) |disabled_value| {
@@ -378,6 +412,11 @@ fn writeStore(json: *std.json.Stringify, store: *const Store) std.Io.Writer.Erro
         try json.write(entry.label);
         try json.objectField("identity");
         try json.write(entry.identity);
+        // Only an agent's entry says so, so a person's entry is saved exactly as it was before the field existed.
+        if (entry.trustee == .agent) {
+            try json.objectField("by");
+            try json.write("agent");
+        }
         try json.endObject();
     }
     try json.endArray();
@@ -1002,6 +1041,63 @@ test "a trust entry keeps the identity of its hook, and an entry from before ide
     try std.testing.expectEqual(@as(usize, 1), old.entries.items.len);
     try std.testing.expectEqualStrings("", old.entries.items[0].identity);
     try std.testing.expect(!old.holdsOtherDigest(identity, @splat(0x44)));
+}
+
+test "an agent's trust saves its mark, a person's trust saves none, and a person's trust replaces an agent's" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
+    defer alloc.free(file_path);
+
+    const agent_digest: [Sha256.digest_length]u8 = @splat(0x33);
+    const person_digest: [Sha256.digest_length]u8 = @splat(0x44);
+
+    var store = Store{};
+    defer store.deinit(alloc);
+    try std.testing.expect(try store.trustHook(alloc, agent_digest, "agent hook", "", .agent));
+    try std.testing.expect(try store.trustHook(alloc, person_digest, "person hook", "", .person));
+    // The same trust again changes nothing, and the agent cannot take over a person's trust.
+    try std.testing.expect(!try store.trustHook(alloc, agent_digest, "agent hook", "", .agent));
+    try std.testing.expect(!try store.trustHook(alloc, person_digest, "person hook", "", .agent));
+    try save(alloc, file_path, &store);
+
+    var kept = try std.Io.Dir.openFileAbsolute(io, file_path, .{});
+    defer kept.close(io);
+    const saved = try io_mod.readFileToEnd(alloc, &kept, 64 * 1024);
+    defer alloc.free(saved);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved, "\"by\":\"agent\""));
+
+    var loaded = try load(alloc, file_path);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded.trustedByAgent(agent_digest));
+    try std.testing.expect(!loaded.trustedByAgent(person_digest));
+
+    // The person's trust replaces the agent's mark.
+    try std.testing.expect(try store.trustHook(alloc, agent_digest, "agent hook", "", .person));
+    try std.testing.expect(!store.trustedByAgent(agent_digest));
+}
+
+test "a trust entry whose by field is not agent is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
+    defer alloc.free(file_path);
+
+    const digest_text = hex(@splat(0x55));
+    const body = try alloc.print(
+        "{{\"version\":1,\"trusted\":[{{\"digest\":\"{s}\",\"label\":\"x\",\"identity\":\"\",\"by\":\"robot\"}}],\"disabled\":[]}}",
+        .{digest_text[0..]},
+    );
+    defer alloc.free(body);
+    try writeFixture(alloc, file_path, body);
+    try std.testing.expectError(error.TrustFileInvalid, load(alloc, file_path));
 }
 
 test "a trust file others can write is refused" {

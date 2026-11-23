@@ -31,7 +31,7 @@ pub const Context = struct {
     workspace_root: []const u8,
     /// Whether `experimental.hooks` is on. `fx hook list` says so; `test` runs hooks either way.
     hooks_enabled: bool,
-    /// Whether this process is fx's own agent (`AI_AGENT=fx`), which may not trust or disable a hook.
+    /// Whether this process is fx's own agent (`AI_AGENT=fx`), which may not disable a hook.
     /// The CLI reads it from the environment when it starts; the TUI's `/hook` job reads it on the UI thread
     /// when the job is created.
     agent_is_fx: bool,
@@ -314,6 +314,7 @@ fn hookRow(arena: Allocator, loaded: *const hooks_host.loader.Snapshot, index: u
         .layer = @tagName(hook.layer),
         .file = loaded.sources[index],
         .status = hookStatus(loaded, index),
+        .trusted_by_agent = loaded.trustedByAgent(index),
     };
 }
 
@@ -678,7 +679,6 @@ fn writesTrustFile(command: anytype) bool {
 /// The subcommand word fx's own agent may not run, or null when the agent may run it.
 fn agentRefusedWord(command: anytype) ?[]const u8 {
     return switch (command) {
-        .trust => "trust",
         .disable => "disable",
         else => null,
     };
@@ -710,12 +710,13 @@ fn trustRefusedMessage(alloc: Allocator, loaded: *const hooks_host.loader.Snapsh
     return alloc.dupe(u8, "The trust file was refused.");
 }
 
-/// Adds one hook's digest to the trust store, with the hook's identity. The label names the hook in the trust file.
-fn addTrustedHook(alloc: Allocator, arena: Allocator, store: *hooks_host.trust.Store, loaded: *const hooks_host.loader.Snapshot, index: usize) !void {
+/// Records one hook's digest as `trustee` trusted it, with the hook's identity. The label names the hook in the trust
+/// file. Returns whether the store changed.
+fn addTrustedHook(alloc: Allocator, arena: Allocator, store: *hooks_host.trust.Store, loaded: *const hooks_host.loader.Snapshot, index: usize, trustee: hooks_host.trust.Trustee) !bool {
     const hook = loaded.hooks[index];
     const label = try arena.print("{s} hook {s}", .{ hook.event.fileName(), hook.id });
     const identity = try hooks_host.trust.identityOf(arena, hook, loaded.sources[index]);
-    try store.addWithIdentity(alloc, loaded.digests[index], label, identity);
+    return store.trustHook(alloc, loaded.digests[index], label, identity, trustee);
 }
 
 /// How long a trust command waits for another fx process to release the trust file. Past it,
@@ -780,29 +781,36 @@ fn runHookTrust(
         return writeHookFailure(alloc, ctx, json, "hook_trust", "TrustFileRefused", "The trust file was refused: fx could not read it");
     };
     defer store.deinit(alloc);
-    const before = store.entries.items.len;
+    // fx's own agent records its trust as its own. A person's trust replaces an agent's mark.
+    const trustee: hooks_host.trust.Trustee = if (ctx.agent_is_fx) .agent else .person;
+    var changed = false;
     var trusted: std.ArrayList([]const u8) = .empty;
     switch (target) {
         .id => |id| {
             const index = hookIndex(loaded, id) orelse return writeUnknownHook(alloc, ctx, json, "hook_trust", id);
-            try addTrustedHook(alloc, arena, &store, loaded, index);
+            if (try addTrustedHook(alloc, arena, &store, loaded, index, trustee)) changed = true;
             try trusted.append(arena, loaded.hooks[index].id);
         },
         .all => {
             for (loaded.hooks, 0..) |hook, index| {
-                if (loaded.trusted[index] or loaded.disabled[index]) continue;
-                try addTrustedHook(alloc, arena, &store, loaded, index);
+                const replaces_agent = !ctx.agent_is_fx and loaded.trustedByAgent(index);
+                if (loaded.disabled[index] or (loaded.trusted[index] and !replaces_agent)) continue;
+                if (try addTrustedHook(alloc, arena, &store, loaded, index, trustee)) changed = true;
                 try trusted.append(arena, hook.id);
             }
         },
     }
-    if (store.entries.items.len != before) {
+    if (changed) {
         hooks_host.trust.save(alloc, trust_file, &store) catch |err| {
             const message = try trustSaveMessage(arena, trust_file, err);
             return writeHookFailure(alloc, ctx, json, "hook_trust", @errorName(err), message);
         };
     }
-    const snapshot: output_contracts.HookTrustSnapshot = .{ .trusted = trusted.items, .file = trust_file };
+    const snapshot: output_contracts.HookTrustSnapshot = .{
+        .trusted = trusted.items,
+        .file = trust_file,
+        .by_agent = ctx.agent_is_fx and trusted.items.len > 0,
+    };
     return writeRendered(alloc, ctx, snapshot, format);
 }
 
@@ -996,7 +1004,7 @@ fn writeHookUsageError(ctx: Context, alloc: Allocator, args: []const [:0]const u
 }
 
 /// Whether `run` reads the settings and the workspace for these arguments. A usage error reads nothing,
-/// and neither does fx's own agent asking for `trust` or `disable`, which `run` refuses first.
+/// and neither does fx's own agent asking for `disable`, which `run` refuses first.
 pub fn needsSettings(args: []const [:0]const u8, agent_is_fx: bool) bool {
     const opts = parseHookArgs(args) catch return false;
     return !(agent_is_fx and agentRefusedWord(opts.command) != null);
@@ -1018,7 +1026,7 @@ fn runChecked(ctx: Context, args: []const [:0]const u8) !u8 {
         try writeHookUsageError(ctx, alloc, args, err);
         return exit_usage;
     };
-    // fx's own agent may not change trust or disable a hook. This runs before the home, the settings,
+    // fx's own agent may not disable a hook. This runs before the home, the settings,
     // or any file is read, so the answer does not depend on them.
     if (ctx.agent_is_fx) {
         if (agentRefusedWord(opts.command)) |word| {
@@ -1138,7 +1146,7 @@ test "a /hook test run the way the TUI job runs it leaves the SIGTERM handler al
     try std.testing.expect(after.handler.handler == before.handler.handler);
 }
 
-test "fx's own agent is refused trust and disable before the home or any file is read" {
+test "fx's own agent is refused disable before the home or any file is read, and may trust" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1153,10 +1161,11 @@ test "fx's own agent is refused trust and disable before the home or any file is
         .hooks_enabled = false,
         .agent_is_fx = true,
     };
-    try std.testing.expectEqual(exit_failure, run(ctx, &.{ "trust", "lint", "--json" }));
     try std.testing.expectEqual(exit_failure, run(ctx, &.{ "disable", "lint", "--json" }));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), "\"code\":\"TrustNeedsPerson\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.written(), "\"code\":\"TrustNeedsPerson\""));
     try std.testing.expectEqual(@as(usize, 0), err.written().len);
-    try std.testing.expect(!needsSettings(&.{ "trust", "lint" }, true));
+    try std.testing.expect(!needsSettings(&.{ "disable", "lint" }, true));
+    // Trust is not refused: it reads the home and the workspace, so it needs the settings.
+    try std.testing.expect(needsSettings(&.{ "trust", "lint" }, true));
     try std.testing.expect(needsSettings(&.{ "enable", "lint" }, true));
 }

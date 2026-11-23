@@ -29,7 +29,7 @@ pub const Output = struct {
 const Job = struct {
     cancelable: bool,
     hooks_enabled: bool,
-    /// Whether the job starts inside fx's own agent, which may not trust or disable a hook. Read on the UI thread.
+    /// Whether the job starts inside fx's own agent, which may not disable a hook. Read on the UI thread.
     agent_is_fx: bool,
     home: ?[]u8,
     workspace_root: []u8,
@@ -274,13 +274,14 @@ test "a second /hook job is refused while one runs, and Esc twice stops only a t
     state.finish();
 }
 
-test "a /hook trust job started inside fx's own agent is refused, and one started outside it runs" {
+test "a /hook job inside fx's own agent runs trust and refuses disable, and both run outside it" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
     const trust_words = [_][:0]const u8{ "trust", "--all" };
+    const disable_words = [_][:0]const u8{ "disable", "guard" };
 
     // The environment of fx's own agent: AI_AGENT=fx. The job reads it when it is created.
     var agent_env = std.process.Environ.Map.init(alloc);
@@ -293,6 +294,15 @@ test "a /hook trust job started inside fx's own agent is refused, and one starte
         defer state.deinit();
         try state.start(home, home, false, &trust_words);
         const output = try waitFinished(&state);
+        try testing.expect(std.mem.find(u8, output.out, "needs a person") == null);
+        try testing.expect(std.mem.find(u8, output.err, "needs a person") == null);
+        state.finish();
+    }
+    {
+        var state: State = .{};
+        defer state.deinit();
+        try state.start(home, home, false, &disable_words);
+        const output = try waitFinished(&state);
         try testing.expect(std.mem.find(u8, output.out, "needs a person") != null or std.mem.find(u8, output.err, "needs a person") != null);
         state.finish();
     }
@@ -304,7 +314,7 @@ test "a /hook trust job started inside fx's own agent is refused, and one starte
     {
         var state: State = .{};
         defer state.deinit();
-        try state.start(home, home, false, &trust_words);
+        try state.start(home, home, false, &disable_words);
         const output = try waitFinished(&state);
         try testing.expect(std.mem.find(u8, output.out, "needs a person") == null);
         try testing.expect(std.mem.find(u8, output.err, "needs a person") == null);

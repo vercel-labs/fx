@@ -397,6 +397,15 @@ fn decodeFileMutationInput(
     };
 }
 
+/// The reason a file tool gives when its target cannot be admitted. The trust file has its own reason, which
+/// names the one command that changes it.
+fn targetFailureText(alloc: Allocator, failure: file_mutation_contract.FileTargetResolutionFailure) ![]const u8 {
+    return switch (failure) {
+        .hooks_trust_file => "the hooks trust file changes only through fx hook trust",
+        else => try alloc.print("file mutation target resolution failed: {s}", .{@tagName(failure)}),
+    };
+}
+
 pub fn prepareFileMutationCall(
     alloc: Allocator,
     call: ToolCall,
@@ -420,10 +429,7 @@ pub fn prepareFileMutationCall(
         request.workspace_root,
         input,
     )) {
-        .target_resolution_failure => |failure| return .{ .tool_failure = try alloc.print(
-            "file mutation target resolution failed: {s}",
-            .{@tagName(failure)},
-        ) },
+        .target_resolution_failure => |failure| return .{ .tool_failure = try targetFailureText(alloc, failure) },
         .prepared => |value| value,
     };
     errdefer targets.deinit(alloc);
@@ -490,10 +496,7 @@ pub fn preflightPreparedFileMutation(
         );
     var policy_targets = switch (policy_result) {
         .target_resolution_failure => |failure| {
-            return .{ .tool_failure = try arena.print(
-                "file mutation target resolution failed: {s}",
-                .{@tagName(failure)},
-            ) };
+            return .{ .tool_failure = try targetFailureText(arena, failure) };
         },
         .policy_denied => return .policy_denied,
         .evaluated => |evaluated| evaluated,

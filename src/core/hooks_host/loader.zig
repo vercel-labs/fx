@@ -41,6 +41,8 @@ pub const Snapshot = struct {
     /// Parallel to `hooks`: whether the hook changed since a person trusted it. Its digest is not in the trust file,
     /// but another digest of the same hook is. It never runs; a run reports it as changed.
     changed: []bool = &.{},
+    /// Parallel to `hooks`: whether fx's own agent trusted the hook (see `trust.Trustee`). Only a trusted hook can have it.
+    trusted_by_agent: []bool = &.{},
     /// Parallel to `hooks`: whether the person disabled the hook for this workspace. A disabled hook never runs.
     disabled: []bool = &.{},
     /// Parallel to `hooks`: each hook's trust digest.
@@ -57,11 +59,17 @@ pub const Snapshot = struct {
     /// Set when the trust file was refused. No hook runs then, whatever the trust rule or the disabled list.
     trust_refused: bool = false,
 
+    /// Whether fx's own agent trusted hook `index`, and the hook is trusted now.
+    pub fn trustedByAgent(self: *const Snapshot, index: usize) bool {
+        return index < self.trusted_by_agent.len and self.trusted_by_agent[index];
+    }
+
     pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
         for (self.files) |*file| file.deinit(alloc);
         if (self.files.len > 0) alloc.free(self.files);
         if (self.hooks.len > 0) alloc.free(self.hooks);
         if (self.trusted.len > 0) alloc.free(self.trusted);
+        if (self.trusted_by_agent.len > 0) alloc.free(self.trusted_by_agent);
         if (self.changed.len > 0) alloc.free(self.changed);
         if (self.disabled.len > 0) alloc.free(self.disabled);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
@@ -254,6 +262,7 @@ const Builder = struct {
     file_paths: std.ArrayList([]const u8) = .empty,
     hooks: std.ArrayList(*const hooks.config.Hook) = .empty,
     trusted: std.ArrayList(bool) = .empty,
+    trusted_by_agent: std.ArrayList(bool) = .empty,
     changed: std.ArrayList(bool) = .empty,
     /// Parallel to `hooks`: whether the person disabled each hook for this workspace.
     disabled: std.ArrayList(bool) = .empty,
@@ -271,6 +280,7 @@ const Builder = struct {
         self.file_paths.deinit(alloc);
         self.hooks.deinit(alloc);
         self.trusted.deinit(alloc);
+        self.trusted_by_agent.deinit(alloc);
         self.changed.deinit(alloc);
         self.disabled.deinit(alloc);
         self.digests.deinit(alloc);
@@ -291,6 +301,7 @@ const Builder = struct {
         snapshot.files = try self.files.toOwnedSlice(self.alloc);
         snapshot.hooks = try self.hooks.toOwnedSlice(self.alloc);
         snapshot.trusted = try self.trusted.toOwnedSlice(self.alloc);
+        snapshot.trusted_by_agent = try self.trusted_by_agent.toOwnedSlice(self.alloc);
         snapshot.changed = try self.changed.toOwnedSlice(self.alloc);
         snapshot.disabled = try self.disabled.toOwnedSlice(self.alloc);
         snapshot.digests = try self.digests.toOwnedSlice(self.alloc);
@@ -420,6 +431,7 @@ const Builder = struct {
             defer self.alloc.free(identity);
             const trusted = store.contains(value);
             try self.trusted.append(self.alloc, trusted);
+            try self.trusted_by_agent.append(self.alloc, trusted and store.trustedByAgent(value));
             try self.changed.append(self.alloc, !trusted and store.holdsOtherDigest(identity, value));
         }
     }
