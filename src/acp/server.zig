@@ -912,16 +912,20 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
     defer test_host.deinit();
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.host = &test_host;
-    state.pending_member = null;
+    const Discard = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, Discard.write),
+    };
+    defer state.deinit();
     test_host.subagent_authority_mutex = .init;
     state.host.cfg.auth_mode = .local;
     state.host.cfg.credential_override = "next-token";
     state.credential_source = .configured;
     state.api_key = try alloc.dupe(u8, "active-token");
-    defer secret.zeroAndFree(alloc, state.api_key);
     const borrowed = state.api_key;
     var prepared = (try prepareCredentialForProvider(try pendingMember(&state), null, .gateway)).?;
     defer prepared.deinit(alloc);
@@ -935,10 +939,15 @@ test "ACP provider routes are host-managed only when configured and never leak i
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
     defer test_host.deinit();
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.host = &test_host;
-    state.pending_member = null;
+    const Discard = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, Discard.write),
+    };
+    defer state.deinit();
     test_host.subagent_authority_mutex = .init;
     state.host.cfg.auth_mode = .local;
     state.host.cfg.provider_auth_mode = .host_managed;
