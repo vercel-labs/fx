@@ -3572,9 +3572,10 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
-      // The held call is its group's header, which names the caution.
-      expect(pane).toContain(`● Safety caution ${command}`);
-      expect(pane).toContain(`Safety caution ${command}`);
+      // The held call is its group's header: it says the command was held,
+      // then why.
+      expect(pane).toContain(`● Held ${command} · safety caution`);
+      expect(pane).not.toContain("Safety caution");
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
@@ -3606,10 +3607,11 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Safety caution ${command}`),
+        (value) => value.includes(`Held ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain(`● Safety caution ${command}`);
+      expect(resumedPane).toContain(`● Held ${command} · safety caution`);
+      expect(resumedPane).not.toContain("Safety caution");
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
