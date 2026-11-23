@@ -3790,6 +3790,7 @@ fn runSessionFork(alloc: Allocator, deps: RunDeps, fork: SessionForkOptions) !Ru
         .workspace_root = forked.workspace_root,
         .history_len = forked.history_len,
         .copied_agents = forked.copied_agents,
+        .files_complete = forked.files_complete,
     }, fork.format);
 }
 

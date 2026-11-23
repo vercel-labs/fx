@@ -1938,6 +1938,9 @@ pub const SessionForkSnapshot = struct {
         if (result.copied_agents > 0) {
             try out.writer.print("copied_agents: {d}\n", .{result.copied_agents});
         }
+        if (!result.files_complete) {
+            try out.writer.writeAll("warning: some side files could not be copied\n");
+        }
         try out.writer.print("resume: fx --resume {s}\n", .{result.fork_session_id});
         return try out.toOwnedSlice();
     }
@@ -1956,8 +1959,8 @@ pub const SessionForkSnapshot = struct {
         try out.writer.writeAll(",\"workspace_root\":");
         try std.json.Stringify.value(result.workspace_root, .{}, &out.writer);
         try out.writer.print(
-            ",\"history_turns\":{d},\"copied_agents\":{d}}}",
-            .{ result.history_len, result.copied_agents },
+            ",\"history_turns\":{d},\"copied_agents\":{d},\"files_complete\":{}}}",
+            .{ result.history_len, result.copied_agents, result.files_complete },
         );
         return try out.toOwnedSlice();
     }
@@ -3975,7 +3978,7 @@ test "core session fork snapshot text and json stay stable" {
     const alone_json = try (SessionForkSnapshot{ .result = alone }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(alone_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":0}",
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":0,\"files_complete\":true}",
         alone_json,
     );
 
@@ -3995,8 +3998,28 @@ test "core session fork snapshot text and json stay stable" {
     const agents_json = try (SessionForkSnapshot{ .result = with_agents }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(agents_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":2}",
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":2,\"files_complete\":true}",
         agents_json,
+    );
+
+    const partial: session_store.SessionForkResult = .{
+        .source_session_id = @constCast("source-session"),
+        .fork_session_id = @constCast("fork-session"),
+        .workspace_root = @constCast("/w"),
+        .history_len = 4,
+        .files_complete = false,
+    };
+    const partial_text = try (SessionForkSnapshot{ .result = partial }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(partial_text);
+    try std.testing.expectEqualStrings(
+        "[session fork] copied source-session to fork-session\nhistory_turns: 4\nwarning: some side files could not be copied\nresume: fx --resume fork-session\n",
+        partial_text,
+    );
+    const partial_json = try (SessionForkSnapshot{ .result = partial }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(partial_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":0,\"files_complete\":false}",
+        partial_json,
     );
 }
 

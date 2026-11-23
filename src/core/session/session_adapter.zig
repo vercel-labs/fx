@@ -1109,6 +1109,8 @@ pub const Forked = struct {
     history_len: usize,
     /// Subagents the fork took a copy of (D97).
     copied_agents: usize,
+    /// False when a side file could not be copied.
+    files_complete: bool,
 
     pub fn deinit(forked: *Forked, alloc: Allocator) void {
         alloc.free(forked.id);
@@ -1200,13 +1202,14 @@ fn finishFork(store: *Store, alloc: Allocator, source: []const u8, copy: sm.Sess
     errdefer alloc.free(copy_id);
     const owned_workspace = try alloc.dupe(u8, workspace);
     errdefer alloc.free(owned_workspace);
-    _ = store.copyFiles(source, copy_id);
+    const files_complete = store.copyFiles(source, copy_id);
     copy.close() catch |err| debug_trace.logf("session", "event=sessions_v2_fork_close_failed session={s} err={s}", .{ copy_id, @errorName(err) });
     return .{
         .id = copy_id,
         .workspace_root = owned_workspace,
         .history_len = counts.history_len,
         .copied_agents = counts.copied_agents,
+        .files_complete = files_complete,
     };
 }
 
@@ -14313,6 +14316,7 @@ test "forkSession copies finished turns, marks title once, leaves source untouch
     defer forked.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), forked.history_len);
     try testing.expectEqual(@as(usize, 0), forked.copied_agents);
+    try testing.expect(forked.files_complete);
     try testing.expectEqualStrings("/w", forked.workspace_root);
     try testing.expect(!std.mem.eql(u8, forked.id, source_id));
     var copy = try t.store.manager.peek(alloc, forked.id);
@@ -14459,4 +14463,40 @@ test "forkSession refuses missing, invalid, child, and corrupt sessions" {
     defer alloc.free(log_path);
     try t.tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "not a log\n" });
     try testing.expectError(error.Corrupt, forkSession(&t.store, alloc, corrupt_id));
+}
+
+test "forkSession copies side folders, never a link, and reports when one is skipped" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
+        defer owner.close();
+        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+        try owner.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+
+    var forked = try forkSession(&t.store, testing.allocator, id);
+    defer forked.deinit(testing.allocator);
+    try testing.expect(!forked.files_complete);
+    try testing.expectEqual(@as(usize, 1), forked.history_len);
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, forked.id });
+    defer testing.allocator.free(copy);
+    var dir = try t.tmp.dir.openDir(io, copy, .{});
+    defer dir.close(io);
+    const top = try dir.readFileAlloc(io, "top.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(top);
+    try testing.expectEqualStrings("top", top);
+    try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
 }

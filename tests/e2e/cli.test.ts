@@ -5123,6 +5123,7 @@ describe("cli: session", () => {
           workspace_root: workspaceRoot,
           history_turns: 1,
           copied_agents: 0,
+          files_complete: true,
         });
         expect(forked.fork_id).not.toBe(sourceId);
         expect(savedText(home, sourceId)).toBe(sourceBefore);
@@ -5195,7 +5196,7 @@ describe("cli: session", () => {
         expect(fork.stderr).toBe("");
         const forked = JSON.parse(fork.stdout);
         expect(forked.fork_id).not.toBe(sourceId);
-        expect(forked).toMatchObject({ kind: "session_fork", source_id: sourceId, history_turns: 1 });
+        expect(forked).toMatchObject({ kind: "session_fork", source_id: sourceId, history_turns: 1, files_complete: true });
 
         const side = await runFx(["ask", "--resume", forked.fork_id, "--json", "side question"], { cwd: workspace, env });
         expect(side.code, side.stderr).toBe(0);

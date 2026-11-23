@@ -200,6 +200,8 @@ pub const SessionForkResult = struct {
     workspace_root: []u8,
     history_len: usize,
     copied_agents: usize = 0,
+    /// False when a side file could not be copied.
+    files_complete: bool = true,
 
     pub fn deinit(self: *SessionForkResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);
