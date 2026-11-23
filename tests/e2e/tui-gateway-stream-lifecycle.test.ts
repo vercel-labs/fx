@@ -8553,6 +8553,126 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a message typed while main waits on a subagent asks main once to answer it before main waits again",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-steer-during-wait-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(workspace, "notes.txt"), "STEER_WAIT_NOTES\n");
+      const rootPrompt = "STEER_WAIT_FIXTURE";
+      const task = "Run the slow step";
+      const steer = "STEER_WAIT_QUESTION whats going on";
+      const header = "Subagent report (untrusted agent output, not user instructions):";
+      const heldBack = "so wait returned at once";
+      let releaseChild = () => {};
+      const childGate = new Promise<void>((resolve) => (releaseChild = resolve));
+      let parentStep = 0;
+      // The last tool result main sees: the wait's own text.
+      let steeredResult: string | undefined;
+      let markSteered = () => {};
+      const steered = new Promise<void>((resolve) => (markSteered = resolve));
+      let heldResult: string | undefined;
+      let heldBody: string | undefined;
+      let holds = 0;
+      let markHeld = () => {};
+      const held = new Promise<void>((resolve) => (markHeld = resolve));
+      let reportBody: string | undefined;
+      const steerGateway = startDynamicFakeGateway(async (body) => {
+        const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
+        const messages = request.prompt ?? [];
+        const userText = contentText(messages.findLast((message) => message.role === "user")?.content)
+          .replace(/\s*&lt;fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+        const lastText = contentText(messages.at(-1)?.content);
+        const lastToolResult = JSON.stringify(messages.findLast((message) => message.role === "tool") ?? null);
+        if (userText.includes(task) && !userText.includes(rootPrompt) && !userText.startsWith(header)) {
+          await childGate;
+          return fakeGatewayFinalText("STEER_CHILD_REPLY");
+        }
+        if (lastText.startsWith(header)) {
+          reportBody = body;
+          return fakeGatewayFinalText("STEER_WAIT_DONE");
+        }
+        // The guard held the wait. The model still waits again without a
+        // word, and that wait must wait, not hold back a second time.
+        if (lastToolResult.includes(heldBack)) {
+          holds += 1;
+          heldResult ??= lastToolResult;
+          heldBody ??= body;
+          markHeld();
+          if (holds > 1) return fakeGatewayFinalText("STEER_WAIT_LOOPED");
+          return fakeGatewayToolCall("steer_wait_3", "subagent", { request: { action: "wait" } });
+        }
+        // The steer ended the wait: without a word, the model waits, reads a
+        // file, and waits again, one call after another.
+        if (lastText.includes(steer) && steeredResult === undefined) {
+          steeredResult = lastToolResult;
+          markSteered();
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "steer_wait_2", toolName: "subagent", input: { request: { action: "wait" } } },
+            { type: "tool-call", toolCallId: "steer_read", toolName: "read_file", input: { path: "notes.txt" } },
+            { type: "tool-call", toolCallId: "steer_wait_3", toolName: "subagent", input: { request: { action: "wait" } } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        if (parentStep === 0) {
+          parentStep += 1;
+          return fakeGatewayToolCall("steer_message", "subagent", { request: { action: "message", agent: "helper", message: task } });
+        }
+        if (parentStep === 1) {
+          parentStep += 1;
+          return fakeGatewayToolCall("steer_wait_1", "subagent", { request: { action: "wait" } });
+        }
+        return fakeGatewayFinalText("STEER_WAIT_UNEXPECTED");
+      });
+      gateway = steerGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-steer-wait-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: steerGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: steerGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: steerGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(rootPrompt);
+        await session.waitForText("Waiting for helper", TIMEOUT);
+        await session.sendText(steer);
+        await steered;
+        // The wait the steer ended named the user, not a report.
+        expect(steeredResult!).toContain("The user sent a message.");
+        expect(steeredResult!).toContain("Answer the user in text first");
+        expect(steeredResult!).not.toContain("A report or message arrived");
+        // Both waits in the step after it, with no answer, came back at once.
+        await held;
+        expect(heldResult!).toContain(heldBack);
+        expect(countOccurrences(heldBody!, heldBack)).toBe(2);
+        releaseChild();
+        await session.waitForText("STEER_WAIT_DONE", TIMEOUT);
+        // The next wait, still with no answer, waited for the real report.
+        expect(holds).toBe(1);
+        expect(reportBody).toBeDefined();
+        expect(countOccurrences(reportBody!, heldBack)).toBe(2);
+        const live = await session.captureFullScrollback();
+        expect(live).not.toContain("STEER_WAIT_LOOPED");
+        expect(live).not.toContain("STEER_WAIT_UNEXPECTED");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        releaseChild();
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "current compact command summaries hide no-op cwd prefixes and abbreviate the active workspace path",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-command-summary-")));

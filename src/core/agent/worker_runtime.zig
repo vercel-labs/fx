@@ -1284,14 +1284,35 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         const joins = joins: {
-            if (!self.worker_processing or self.active_turn_id == 0) break :joins false;
             for (self.queued_prompts.items) |prompt| {
-                if (prompt.delivery.activeTurnId() == self.active_turn_id) break :joins true;
+                if (self.joinsActiveTurnLocked(prompt)) break :joins true;
             }
             break :joins false;
         };
         debug_trace.eventf("worker", "mail_joins_checked", .{ .turn_id = self.active_turn_id }, "worker={x} joins={}", .{ @intFromPtr(self), joins });
         return joins;
+    }
+
+    /// Who wrote the prompts that `wait` reports, so it can say who sent
+    /// what ended it: those that join the running turn when any does, since
+    /// the rest start a later turn, or else every prompt waiting.
+    pub fn queuedAuthors(self: *WorkerRuntime) std.EnumSet(MessageAuthor) {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var joining: std.EnumSet(MessageAuthor) = .empty;
+        var waiting: std.EnumSet(MessageAuthor) = .empty;
+        for (self.queued_prompts.items) |prompt| {
+            waiting.insert(prompt.author);
+            if (self.joinsActiveTurnLocked(prompt)) joining.insert(prompt.author);
+        }
+        return if (joining.count() > 0) joining else waiting;
+    }
+
+    /// Whether `prompt` joins the running turn at its next boundary. The
+    /// caller holds `worker_mutex`.
+    fn joinsActiveTurnLocked(self: *const WorkerRuntime, prompt: QueuedPrompt) bool {
+        if (!self.worker_processing or self.active_turn_id == 0) return false;
+        return prompt.delivery.activeTurnId() == self.active_turn_id;
     }
 
     /// Holds a place in this queue for another agent's message that is on
@@ -6728,6 +6749,31 @@ test "an agent's posted message joins the running turn, waits behind older work,
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("wakes", job.prompt);
     try std.testing.expect(job.delivery.isContinuation());
+}
+
+test "wait names the senders whose prompts join the running turn, or else every sender" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    // A report joins the running turn; the user's prompt waits for the next.
+    var report = try makePrompt(alloc, "report", "model");
+    report.author = .child;
+    try runtime.postMail(alloc, report);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "next", "model"));
+    try std.testing.expect(runtime.queuedMailJoinsTurn());
+    const joining = runtime.queuedAuthors();
+    try std.testing.expect(joining.contains(.child));
+    try std.testing.expect(!joining.contains(.user));
+
+    // Between turns nothing joins, so every prompt waiting is named.
+    runtime.worker_processing = false;
+    try std.testing.expect(!runtime.queuedMailJoinsTurn());
+    const waiting = runtime.queuedAuthors();
+    try std.testing.expect(waiting.contains(.child));
+    try std.testing.expect(waiting.contains(.user));
 }
 
 test "a posted message joins a turn the worker started after an earlier turn closed" {

@@ -2966,6 +2966,7 @@ fn executeSubagentProvider(
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
+        .turn_messages = ctx.current_turn_messages,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
