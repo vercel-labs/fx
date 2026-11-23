@@ -76,6 +76,9 @@ const still_running_text = "A program is still running. " ++ wait_hint;
 const nothing_running_text = "Nothing is running.";
 const unavailable_text = "bash is not available in this host.";
 const folder_changed_text = "The bash session's start folder changed after this program was approved, because the last program ended in another folder. Send the program again.";
+/// The notice a call's result carries when the session dropped the saved start
+/// folder. It is true of a started program, a refused call, and a failed start.
+const start_folder_notice = "fx: the bash session's saved folder could not be used, so programs start in the workspace root until one saves a new folder.";
 
 /// The action a call gets, decided by its command: `wait` when the command is
 /// the wait request, else `run`. This is fx's own field, so an `action` the
@@ -213,11 +216,13 @@ fn callRun(
     };
     const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
     if (swept > 0) debug_trace.logf("bash", "removed {d} bash session folders that ended processes left", .{swept});
+    // Before the program, so the shell that writes these records never waits on a FIFO or a link.
+    replaceStartupRecords(session);
     // Set by the prepare above. Looked up before the program is set, so a missing
     // text fails the call without running a program with no saved state.
     const after_startup = session.afterStartupText() orelse return runtimeFailure(ctx, error.SessionNotPrepared);
     // A background program may have ended since the approval and left another folder.
-    session.refreshStartFolder(io_mod.getIo());
+    const folder_note = refreshFolder(session);
     const folder = session.startFolder() orelse ctx.workspace_root;
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(request_arena_state);
@@ -233,7 +238,7 @@ fn callRun(
         .target_os = builtin.target.os.tag,
         .environment = environment,
     };
-    if (!approvedFingerprint(authority).matches(starts_in)) return failureText(ctx, folder_changed_text);
+    if (!approvedFingerprint(authority).matches(starts_in)) return failureWithNote(ctx, folder_changed_text, folder_note);
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err| return runtimeFailure(ctx, err);
     // Set before the start, so a failed start never leaves an untracked program.
@@ -275,17 +280,17 @@ fn callRun(
         .tool_yield_flag = ctx.tool_yield_flag,
     }) catch |err| {
         if (err == error.Cancelled and cancelRequested(ctx)) {
-            // A cancelled call returns an error, not a result, so the notice has no result to go in.
-            if (leftover) |text| {
-                ctx.allocator.free(text);
+            // A cancelled call returns an error, not a result, so the notices have no result to go in.
+            if (leftover != null or folder_note != null) {
+                if (leftover) |text| ctx.allocator.free(text);
                 logDroppedNotice(err);
             }
             return error.Cancelled;
         }
-        return startFailure(ctx, err, leftover);
+        return startFailure(ctx, err, leftover, folder_note);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared, leftover);
+    return finish(ctx, runtime, &prepared, leftover, folder_note);
 }
 
 /// Waits up to `yield_ms` for the session's program, or says that nothing is
@@ -309,7 +314,7 @@ fn callWait(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared, null);
+    return finish(ctx, runtime, &prepared, null, null);
 }
 
 /// Which program a save notice is about: `own` is the program whose result carries
@@ -361,22 +366,64 @@ fn formatWithNotices(alloc: Allocator, snapshot: managed_execution.Snapshot, max
     return withNotices(alloc, formatted, notices);
 }
 
+/// Replaces each startup record that is not a regular file before a program
+/// starts, and logs each replacement by name. The save record is replaced by
+/// `takeSaveStatus`, which runs just before the start and reports its `.failed`, so
+/// it is not replaced here, where its report would be lost.
+fn replaceStartupRecords(session: *bash_session.Session) void {
+    const records = [_]bash_session.StartupRecord{ .functions, .aliases };
+    for (records) |record| {
+        const replaced = session.replaceIrregularStartupRecord(io_mod.getIo(), record) catch |err| {
+            debug_trace.logf("bash", "bash session record not replaced name={s} err={s}", .{ record.fileName(), @errorName(err) });
+            continue;
+        };
+        if (replaced) debug_trace.logf("bash", "bash session record replaced name={s}", .{record.fileName()});
+    }
+}
+
+/// Refreshes the session's start folder and returns the notice this call's result
+/// carries: null when the folder was kept or there was no folder file yet, and
+/// the start-folder notice when it was dropped. A dropped folder is logged by
+/// reason, never by path, whichever caller refreshes.
+fn refreshFolder(session: *bash_session.Session) ?[]const u8 {
+    const status = session.refreshStartFolder(io_mod.getIo());
+    switch (status) {
+        .kept, .no_record => return null,
+        .gone, .bad_record => {
+            debug_trace.logf("bash", "start folder dropped reason={s}", .{@tagName(status)});
+            return start_folder_notice;
+        },
+    }
+}
+
+/// `text` as a failure result, with `note` after it when there is one.
+fn failureWithNote(ctx: tool_dispatch.DispatchContext, text: []const u8, note: ?[]const u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const body = try ctx.allocator.dupe(u8, text);
+    return .{ .failure = try withNotices(ctx.allocator, body, &.{note}) };
+}
+
 /// The result when the program did not start. The previous program's notice, if
-/// it has one, goes after the failure text, so the model still reads it. Takes
+/// it has one, goes after the failure text, so the model still reads it, and so
+/// does the notice of a start folder dropped for this call, `folder_note`. Takes
 /// `leftover`.
-fn startFailure(ctx: tool_dispatch.DispatchContext, err: anyerror, leftover: ?[]u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+fn startFailure(
+    ctx: tool_dispatch.DispatchContext,
+    err: anyerror,
+    leftover: ?[]u8,
+    folder_note: ?[]const u8,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     defer if (leftover) |text| ctx.allocator.free(text);
     if (err == error.OutOfMemory) {
-        if (leftover != null) logDroppedNotice(err);
+        if (leftover != null or folder_note != null) logDroppedNotice(err);
         return error.OutOfMemory;
     }
     const failure = ctx.allocator.print("bash could not run the program: {s}.", .{@errorName(err)}) catch |alloc_err| {
-        if (leftover != null) logDroppedNotice(alloc_err);
+        if (leftover != null or folder_note != null) logDroppedNotice(alloc_err);
         return alloc_err;
     };
-    const notices = [_]?[]const u8{leftover};
+    const notices = [_]?[]const u8{ leftover, folder_note };
     const body = withNotices(ctx.allocator, failure, &notices) catch |attach_err| {
-        if (leftover != null) logDroppedNotice(attach_err);
+        if (leftover != null or folder_note != null) logDroppedNotice(attach_err);
         return attach_err;
     };
     if (leftover != null) debug_trace.logf("bash", "the previous program's not-saved notice went with a start failure err={s}", .{@errorName(err)});
@@ -420,7 +467,8 @@ fn logDroppedNotice(err: anyerror) void {
 
 /// Turns a program's snapshot into the result the model reads, then hands the
 /// delivery to the runtime. `leftover` is a notice from a program that ended
-/// before this one started, and it is freed here. A program that has ended
+/// before this one started, and it is freed here. `folder_note` is the notice of
+/// a start folder dropped for this call, borrowed. A program that has ended
 /// also reports its own save record, which is taken here. A failed hand-off
 /// cancels the reservation, so none is left behind, and frees the body.
 fn finish(
@@ -428,6 +476,7 @@ fn finish(
     runtime: *managed_execution.Runtime,
     prepared: *managed_execution.PreparedSnapshot,
     leftover: ?[]u8,
+    folder_note: ?[]const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     defer if (leftover) |text| ctx.allocator.free(text);
     const own: ?[]u8 = if (ctx.bash_session) |session| blk: {
@@ -437,12 +486,12 @@ fn finish(
             runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
                 debug_trace.logf("bash", "delivery cancel failed after a notice error err={s}", .{@errorName(cancel_err)});
             };
-            if (leftover != null) logDroppedNotice(err);
+            if (leftover != null or folder_note != null) logDroppedNotice(err);
             return err;
         };
     } else null;
     defer if (own) |text| ctx.allocator.free(text);
-    const notices = [_]?[]const u8{ leftover, own };
+    const notices = [_]?[]const u8{ leftover, own, folder_note };
     const budget = @max(ctx.max_tool_result_bytes, min_result_bytes);
     const body = formatWithNotices(ctx.allocator, prepared.snapshot, budget, &notices) catch |err| {
         runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
@@ -458,9 +507,10 @@ fn finish(
         };
         return undeliveredResult(ctx, "bash result commit failed", &notices, err);
     };
-    // The program has ended, so the next program starts where it left off.
+    // The program has ended, so the next program starts where it left off. A folder
+    // dropped here is logged, and its notice goes to the next call, which refreshes again.
     if (ctx.bash_session) |session| {
-        if (std.meta.activeTag(prepared.snapshot.state) != .running) session.refreshStartFolder(io_mod.getIo());
+        if (std.meta.activeTag(prepared.snapshot.state) != .running) _ = refreshFolder(session);
     }
     return if (prepared.snapshot.failed())
         .{ .failure = body }
@@ -960,6 +1010,16 @@ const TestBash = struct {
         try dir.writeFile(self.io, .{ .sub_path = "save-status", .data = text });
     }
 
+    /// Replaces the session folder's entry `name` with a FIFO, as a stray program can.
+    fn makeSessionFifo(self: *TestBash, name: []const u8) !void {
+        var dir = try std.Io.Dir.cwd().openDir(self.io, self.session.dir.?, .{});
+        defer dir.close(self.io);
+        try dir.deleteFile(self.io, name);
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ self.session.dir.?, name }, 0);
+        if (mkfifo(path, 0o600) != 0) return error.MkfifoFailed;
+    }
+
     /// Makes the gate: a fifo in the workspace, held open read-write and nonblocking.
     /// That fd is a reader and a writer, so the open never waits, and a program's
     /// `read` finds a writer. The program blocks on its read until `release`.
@@ -1295,6 +1355,175 @@ test "a notice a previous program left goes into the result of a call that fails
     try std.testing.expect(std.mem.startsWith(u8, try outcomeText(next, true), "x=41"));
 }
 
+test "a saved folder that a program removed after its save is dropped: the next program starts in the workspace root, with a notice and a trace line" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    // The program saves its folder, then its own EXIT trap removes that folder, as in review r31.
+    const target = try alloc.print("{s}/gone-target", .{bash.workspace});
+    defer alloc.free(target);
+    const program = try alloc.print("mkdir '{s}' && cd '{s}' && trap 'rm -rf \"$PWD\"' EXIT", .{ target, target });
+    defer alloc.free(program);
+    try bash.authorize(&ctx, program);
+    const ended = try callRun(ctx, program, program_yield_ms);
+    defer ended.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(ended, true));
+
+    // The next program starts in the workspace root, its result says so, and the trace names the reason, never the path.
+    try bash.authorize(&ctx, "pwd");
+    const next = try callRun(ctx, "pwd", program_yield_ms);
+    defer next.deinit(alloc);
+    const next_text = try outcomeText(next, true);
+    const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
+    defer alloc.free(workspace_line);
+    try std.testing.expect(std.mem.startsWith(u8, next_text, workspace_line));
+    try std.testing.expect(std.mem.find(u8, next_text, start_folder_notice) != null);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "start folder dropped reason=gone") != null);
+    try std.testing.expect(std.mem.find(u8, trace, target) == null);
+}
+
+test "a saved folder that is not an absolute path is a bad record: the next program starts in the workspace root, with a notice and a trace line" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    try bash.writeSessionFolder("relative/folder");
+    try bash.authorize(&ctx, "pwd");
+    const result = try callRun(ctx, "pwd", program_yield_ms);
+    defer result.deinit(alloc);
+    const text = try outcomeText(result, true);
+    const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
+    defer alloc.free(workspace_line);
+    try std.testing.expect(std.mem.startsWith(u8, text, workspace_line));
+    try std.testing.expect(std.mem.find(u8, text, start_folder_notice) != null);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "start folder dropped reason=bad_record") != null);
+}
+
+test "a fresh session with no saved folder gives no notice and no trace line" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    try bash.authorize(&ctx, "pwd");
+    const result = try callRun(ctx, "pwd", program_yield_ms);
+    defer result.deinit(alloc);
+    const text = try outcomeText(result, true);
+    const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
+    defer alloc.free(workspace_line);
+    try std.testing.expect(std.mem.startsWith(u8, text, workspace_line));
+    try std.testing.expect(std.mem.find(u8, text, start_folder_notice) == null);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "start folder dropped") == null);
+}
+
+test "a startup record that is a FIFO is replaced before the next program, which then runs and keeps its state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    try bash.authorize(&ctx, "x=1");
+    const first = try callRun(ctx, "x=1", program_yield_ms);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+
+    // A FIFO where the functions record is. The next program's shell writes that record with `>|`, which would wait on it.
+    try bash.makeSessionFifo("startup-functions");
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const second = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "bash session record replaced name=startup-functions") != null);
+}
+
+test "a refused call carries the folder notice, since the folder it was approved for was dropped" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+
+    // The session keeps a folder, and the next program is approved to start in it.
+    try bash.tmp.dir.createDirPath(bash.io, "refused-target");
+    const target = try alloc.print("{s}/refused-target", .{bash.workspace});
+    defer alloc.free(target);
+    try bash.writeSessionFolder(target);
+    try std.testing.expect(refreshFolder(&bash.session) == null);
+    try bash.authorize(&ctx, "pwd");
+
+    // The folder is removed before the call, so the call drops it and no longer matches its approval.
+    try bash.tmp.dir.deleteTree(bash.io, "refused-target");
+    const refused = try callRun(ctx, "pwd", program_yield_ms);
+    defer refused.deinit(alloc);
+    const text = try outcomeText(refused, false);
+    try std.testing.expect(std.mem.startsWith(u8, text, folder_changed_text));
+    try std.testing.expect(std.mem.find(u8, text, start_folder_notice) != null);
+}
+
+test "a failed start carries the folder notice too" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+
+    // A folder file that is not a usable path: the next call drops it, and starts in the workspace root.
+    try bash.writeSessionFolder("relative/folder");
+    try bash.authorize(&ctx, "echo never");
+    // A yield above the ceiling makes startCaptured refuse before the program runs.
+    const failed = try callRun(ctx, "echo never", managed_contract.max_wait_ceiling_ms + 1);
+    defer failed.deinit(alloc);
+    const text = try outcomeText(failed, false);
+    try std.testing.expect(std.mem.startsWith(u8, text, "bash could not run the program: InvalidYieldTime."));
+    try std.testing.expect(std.mem.find(u8, text, start_folder_notice) != null);
+}
+
+test "the folder notice says programs start in the workspace root until one saves a new folder" {
+    try std.testing.expectEqualStrings(
+        "fx: the bash session's saved folder could not be used, so programs start in the workspace root until one saves a new folder.",
+        start_folder_notice,
+    );
+}
+
 test "a program that ends before its save logs reason not_saved" {
     const alloc = std.testing.allocator;
     var bash = try TestBash.init(alloc);
@@ -1450,7 +1679,7 @@ test "a program starts in the folder the session holds, not one the saved state 
 
     // fx moves the start folder back to the workspace, as a program's end would.
     try bash.writeSessionFolder(bash.workspace);
-    bash.session.refreshStartFolder(bash.io);
+    _ = bash.session.refreshStartFolder(bash.io);
     try bash.authorize(&ctx, "pwd");
     const pwd = try callRun(ctx, "pwd", program_yield_ms);
     defer pwd.deinit(alloc);

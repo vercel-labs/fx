@@ -122,7 +122,7 @@ fn envScript(
 /// state the program tried to save, in bytes. `not_saved` means the program
 /// ended before its save ran, so its record still says `pending`: a `trap -`,
 /// `exec`, a signal, or a stop by fx.
-pub const SaveStatus = union(enum) {
+const SaveStatus = union(enum) {
     over_cap: usize,
     failed,
     not_saved,
@@ -140,6 +140,30 @@ fn parseSaveStatus(text: []const u8) ?SaveStatus {
     const bytes = std.fmt.parseInt(usize, line["cap ".len..], 10) catch return .failed;
     return .{ .over_cap = bytes };
 }
+
+/// The startup records the script writes with `>|` at load. A program's own shell
+/// would wait on one that is a FIFO, so `replaceIrregularStartupRecord` replaces
+/// it before each program.
+pub const StartupRecord = enum {
+    functions,
+    aliases,
+
+    /// The record's name in the session folder.
+    pub fn fileName(self: StartupRecord) []const u8 {
+        return switch (self) {
+            .functions => startup_functions_file,
+            .aliases => startup_aliases_file,
+        };
+    }
+};
+
+/// Why the session keeps the start folder it keeps, or drops the one the last
+/// saved program wrote. Only `kept` keeps a folder. `no_record` is a session
+/// with no folder file yet, the normal case of a fresh session. `gone` is a
+/// saved folder that no longer exists or is not a directory. `bad_record` is a
+/// folder file that is not a regular file, is too long, holds a NUL byte, is not
+/// an absolute path, or cannot be read.
+const StartFolderStatus = enum { kept, no_record, gone, bad_record };
 
 /// One agent's bash session: its private folder and the text that loads its
 /// state. The folder is made by `prepare` and deleted by `deinit`.
@@ -227,24 +251,32 @@ pub const Session = struct {
     /// what it says. It returns null when the record is empty (the save kept the
     /// state) or when the folder is gone. The record is emptied, not deleted, so
     /// the file keeps the owner-only mode `prepare` gave it, and the next
-    /// program's `pending` write needs no umask change. A record that cannot be
-    /// read, or is not a regular file, counts as `.failed`, so fx reports the drop
-    /// rather than trust it. The program can put a FIFO or a link there, so the
-    /// record is opened without waiting and without following a link, and it is
-    /// emptied through that same open file.
+    /// program's `pending` write needs no umask change. Once the record is open
+    /// as a regular file it is emptied whatever the read gives, so a record that
+    /// cannot be read is reported once, not on every call. A record that cannot
+    /// be read, or is not a regular file, counts as `.failed`, so fx reports the
+    /// drop rather than trust it. The program can put a FIFO or a link there, so
+    /// the record is opened without waiting and without following a link, and it
+    /// is emptied through that same open file.
     pub fn takeSaveStatus(self: *Session, io: std.Io) ?SaveStatus {
         const dir_path = self.dir orelse return null;
         var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
         defer dir.close(io);
-        var file = openRegularFile(io, dir, save_status_file, true) catch |err| switch (err) {
+        var file = openRegularFile(io, dir, save_status_file, .read_write) catch |err| switch (err) {
             error.FileNotFound => return null,
+            error.NotRegularFile, error.SymLinkLoop => {
+                // Replaced now, so the program's shell, which writes this record with `>|`, never waits on it.
+                // An entry that cannot be replaced stays, and the next take reports it again.
+                _ = replaceRecordEntry(io, dir, dir_path, save_status_file) catch false;
+                return .failed;
+            },
             else => return .failed,
         };
         defer file.close(io);
+        // Best effort: a record that stays is read again by the next take, so its notice repeats.
+        defer file.setLength(io, 0) catch {};
         const text = readOpenedFile(self.alloc, file, max_status_bytes) catch return .failed;
         defer self.alloc.free(text);
-        // Best effort: a record that stays is read again by the next take, so its notice repeats.
-        file.setLength(io, 0) catch {};
         return parseSaveStatus(text);
     }
 
@@ -267,31 +299,59 @@ pub const Session = struct {
         return self.start_folder;
     }
 
-    /// Reads the folder the last saved program ended in and keeps it when it is
-    /// an absolute path, with no NUL byte, that opens as a directory. The folder
-    /// file must be a regular file: a FIFO, a link, or any other kind is a bad
-    /// record, and the read never waits on it. Anything else sets null, which
-    /// means the workspace root.
-    pub fn refreshStartFolder(self: *Session, io: std.Io) void {
-        // A missing or bad folder file is not an error: the workspace root is
-        // the folder a session starts in until a program saves one.
-        const next = self.readStartFolder(io) catch null;
+    /// Reads the folder the last saved program ended in, keeps it when it is an
+    /// absolute path, with no NUL byte, that opens as a directory, and returns why
+    /// it kept it or dropped it. The folder file must be a regular file: a FIFO,
+    /// a link, or any other kind is a bad record, and the read never waits on it.
+    /// Only `.kept` keeps a folder, so anything else means the workspace root.
+    pub fn refreshStartFolder(self: *Session, io: std.Io) StartFolderStatus {
         if (self.start_folder) |old| self.alloc.free(old);
-        self.start_folder = next;
+        self.start_folder = null;
+        const dir_path = self.dir orelse return .no_record;
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return .bad_record;
+        defer dir.close(io);
+        var file = openRegularFile(io, dir, folder_file, .read_only) catch |err| switch (err) {
+            error.FileNotFound => return .no_record,
+            error.NotRegularFile, error.SymLinkLoop => {
+                // Unlinked, never followed. A folder file that cannot be unlinked stays, and the next refresh reports it again.
+                dir.deleteFile(io, folder_file) catch {};
+                return .bad_record;
+            },
+            else => return .bad_record,
+        };
+        defer file.close(io);
+        const folder = readOpenedFile(self.alloc, file, std.Io.Dir.max_path_bytes) catch return .bad_record;
+        if (!std.Io.Dir.path.isAbsolute(folder) or std.mem.findScalar(u8, folder, 0) != null) {
+            self.alloc.free(folder);
+            return .bad_record;
+        }
+        var target = std.Io.Dir.cwd().openDir(io, folder, .{}) catch |err| {
+            self.alloc.free(folder);
+            return switch (err) {
+                error.FileNotFound, error.NotDir => .gone,
+                else => .bad_record,
+            };
+        };
+        target.close(io);
+        self.start_folder = folder;
+        return .kept;
     }
 
-    fn readStartFolder(self: *Session, io: std.Io) !?[]u8 {
-        const dir_path = self.dir orelse return null;
-        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    /// Makes the startup record `record` a regular file when it is not one, as
+    /// `prepare` makes it, so the program's shell, which writes it with `>|`, never
+    /// waits on it. Returns whether the record was replaced. A link is unlinked, not
+    /// followed. A record that is missing or already a regular file is left alone.
+    pub fn replaceIrregularStartupRecord(self: *Session, io: std.Io, record: StartupRecord) !bool {
+        const dir_path = self.dir orelse return false;
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return false;
         defer dir.close(io);
-        var file = try openRegularFile(io, dir, folder_file, false);
-        defer file.close(io);
-        const folder = try readOpenedFile(self.alloc, file, std.Io.Dir.max_path_bytes);
-        errdefer self.alloc.free(folder);
-        if (!std.Io.Dir.path.isAbsolute(folder) or std.mem.findScalar(u8, folder, 0) != null) return error.BadStartFolder;
-        var target = try std.Io.Dir.cwd().openDir(io, folder, .{});
-        target.close(io);
-        return folder;
+        const name = record.fileName();
+        var file = openRegularFile(io, dir, name, .read_only) catch |err| switch (err) {
+            error.NotRegularFile, error.SymLinkLoop => return replaceRecordEntry(io, dir, dir_path, name),
+            else => return false,
+        };
+        file.close(io);
+        return false;
     }
 
     /// Deletes the session folder and frees what the session holds. The session is
@@ -382,6 +442,16 @@ fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Unlinks `name` in the session folder, then makes it again as an empty owner-only
+/// regular file, as `prepare` does. The unlink never follows a link, so a link is
+/// removed and its target is not touched. Returns false, and leaves the entry, when
+/// the entry cannot be unlinked, as a directory cannot.
+fn replaceRecordEntry(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, name: []const u8) !bool {
+    dir.deleteFile(io, name) catch return false;
+    try makeOwnerFile(io, dir_path, name);
+    return true;
+}
+
 /// Makes an empty, owner-only file in the session folder. The script fills the
 /// startup records and the save record with `>`, which keeps the mode.
 fn makeOwnerFile(io: std.Io, dir: []const u8, name: []const u8) !void {
@@ -401,15 +471,21 @@ fn removeTree(io: std.Io, dir: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
 
+/// What `openRegularFile` opens a file for: reading only, or reading to truncate it.
+const Access = enum { read_only, read_write };
+
 /// Opens `name` in `dir` as a regular file, for the reads and the one truncate
 /// that the session makes of files the program can also write. The open does not
 /// follow a link and does not wait: a program can put a FIFO or a device at
 /// either name, and a plain open of a FIFO waits for a writer. The file is
 /// checked once it is open, so anything but a regular file is an error. The
 /// caller closes the returned file.
-fn openRegularFile(io: std.Io, dir: std.Io.Dir, name: []const u8, writable: bool) !std.Io.File {
+fn openRegularFile(io: std.Io, dir: std.Io.Dir, name: []const u8, access: Access) !std.Io.File {
     const flags: std.posix.O = .{
-        .ACCMODE = if (writable) .RDWR else .RDONLY,
+        .ACCMODE = switch (access) {
+            .read_only => .RDONLY,
+            .read_write => .RDWR,
+        },
         .NOFOLLOW = true,
         .NONBLOCK = true,
     };
@@ -757,7 +833,7 @@ test "a bash tool program saves its state for the next, and a killed one saves n
     try expectExit(first, 3);
 
     // fx starts each program in the folder the last saved program ended in.
-    session.refreshStartFolder(io);
+    _ = session.refreshStartFolder(io);
     const start = session.startFolder() orelse dir;
 
     const second = try runProgram(alloc, io, &session, start, "t2", program_two);
@@ -975,7 +1051,7 @@ test "the start folder is the folder the last saved program ended in" {
     defer freeRun(alloc, moved);
     try expectExit(moved, 0);
 
-    session.refreshStartFolder(io);
+    _ = session.refreshStartFolder(io);
     try std.testing.expectEqualStrings("/", session.startFolder() orelse return error.TestNoStartFolder);
 }
 
@@ -996,7 +1072,7 @@ test "a program over the size cap leaves the start folder unchanged" {
     const first = try runProgram(alloc, io, &session, dir, "folder2", "cd /");
     defer freeRun(alloc, first);
     try expectExit(first, 0);
-    session.refreshStartFolder(io);
+    _ = session.refreshStartFolder(io);
     try std.testing.expectEqualStrings("/", session.startFolder() orelse return error.TestNoStartFolder);
 
     const big = try runProgram(alloc, io, &session, dir, "folder3", "cd /tmp; big=$(head -c 1100000 /dev/zero | tr '\\0' a)");
@@ -1008,7 +1084,7 @@ test "a program over the size cap leaves the start folder unchanged" {
         .failed, .not_saved => return error.TestUnexpectedFailedSave,
     }
 
-    session.refreshStartFolder(io);
+    _ = session.refreshStartFolder(io);
     try std.testing.expectEqualStrings("/", session.startFolder() orelse return error.TestNoStartFolder);
 }
 
@@ -1025,13 +1101,65 @@ test "a folder file that names a removed directory gives no start folder" {
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
-    session.refreshStartFolder(io);
+    try std.testing.expectEqual(StartFolderStatus.no_record, session.refreshStartFolder(io));
     try std.testing.expect(session.startFolder() == null);
 
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
     defer folder.close(io);
     try folder.writeFile(io, .{ .sub_path = folder_file, .data = "/fx-bash-no-such-folder" });
-    session.refreshStartFolder(io);
+    try std.testing.expectEqual(StartFolderStatus.gone, session.refreshStartFolder(io));
+    try std.testing.expect(session.startFolder() == null);
+}
+
+test "refreshStartFolder says why it kept or dropped the saved folder" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+
+    // A fresh session has no folder file yet: the normal case, which is not a drop.
+    try std.testing.expectEqual(StartFolderStatus.no_record, session.refreshStartFolder(io));
+    try std.testing.expect(session.startFolder() == null);
+
+    // A folder that exists is kept.
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = root });
+    try std.testing.expectEqual(StartFolderStatus.kept, session.refreshStartFolder(io));
+    try std.testing.expectEqualStrings(root, session.startFolder() orelse return error.TestNoStartFolder);
+
+    // A folder that no longer exists is gone.
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = "/fx-bash-no-such-folder" });
+    try std.testing.expectEqual(StartFolderStatus.gone, session.refreshStartFolder(io));
+    try std.testing.expect(session.startFolder() == null);
+
+    // A folder file that names a regular file is gone too: that is not a directory.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a-file", .data = "x" });
+    const file_path = try alloc.print("{s}/a-file", .{root});
+    defer alloc.free(file_path);
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = file_path });
+    try std.testing.expectEqual(StartFolderStatus.gone, session.refreshStartFolder(io));
+
+    // A relative path, a NUL byte, or a path too long for the limit is a bad record.
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = "relative/dir" });
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = "/tmp/a\x00b" });
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
+    var long: [std.Io.Dir.max_path_bytes + 1]u8 = @splat('a');
+    long[0] = '/';
+    try folder.writeFile(io, .{ .sub_path = folder_file, .data = &long });
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
+
+    // A directory in place of the folder file is not a regular file.
+    try folder.deleteFile(io, folder_file);
+    try folder.createDirPath(io, folder_file);
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
     try std.testing.expect(session.startFolder() == null);
 }
 
@@ -1979,7 +2107,7 @@ test "a folder file that is a FIFO is a bad record: the start folder is the work
     try makeFifo(alloc, io, folder_path);
 
     // A plain open would wait here for a writer that never comes, so this call is the check.
-    session.refreshStartFolder(io);
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
     try std.testing.expect(session.startFolder() == null);
 }
 
@@ -2003,8 +2131,173 @@ test "a folder file that is a symlink is a bad record, even when the link leads 
     defer folder.close(io);
     try folder.symLink(io, target_path, folder_file, .{});
 
-    session.refreshStartFolder(io);
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
     try std.testing.expect(session.startFolder() == null);
+}
+
+test "a save-status that is a FIFO is replaced by an empty owner-only file, and the next program saves its state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, save_status_file);
+    const status_path = try alloc.print("{s}/{s}", .{ dir, save_status_file });
+    defer alloc.free(status_path);
+    try makeFifo(alloc, io, status_path);
+
+    // Reported once as a failure, and then an empty owner-only regular file.
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+    const stat = try folder.statFile(io, save_status_file, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    // The next program's `pending` write and its save both go through, and its state carries.
+    const first = try runProgram(alloc, io, &session, dir, "fifo1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    const second = try runProgram(alloc, io, &session, dir, "fifo2", "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "a save-status that is a link is replaced by an empty owner-only file, and the file it names is not written" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere", .data = "keep\n" });
+    const target = try alloc.print("{s}/elsewhere", .{root});
+    defer alloc.free(target);
+    try folder.deleteFile(io, save_status_file);
+    try folder.symLink(io, target, save_status_file, .{});
+
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+    const stat = try folder.statFile(io, save_status_file, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    const kept = try tmp.dir.readFileAlloc(io, "elsewhere", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+}
+
+test "a folder file that is a FIFO is bad once, and then there is no folder file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
+    defer alloc.free(folder_path);
+    try makeFifo(alloc, io, folder_path);
+
+    // The first refresh reports the FIFO and unlinks it; the next one finds no folder file.
+    try std.testing.expectEqual(StartFolderStatus.bad_record, session.refreshStartFolder(io));
+    try std.testing.expectEqual(StartFolderStatus.no_record, session.refreshStartFolder(io));
+    try std.testing.expectError(error.FileNotFound, folder.statFile(io, folder_file, .{}));
+    try std.testing.expect(session.startFolder() == null);
+}
+
+test "a startup record that is a FIFO or a link is replaced, and a regular one is left alone" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+
+    // A regular record is left alone.
+    try std.testing.expect(!try session.replaceIrregularStartupRecord(io, .functions));
+
+    // A FIFO where the functions record is: replaced, once.
+    try folder.deleteFile(io, startup_functions_file);
+    const functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
+    defer alloc.free(functions_path);
+    try makeFifo(alloc, io, functions_path);
+    try std.testing.expect(try session.replaceIrregularStartupRecord(io, .functions));
+    const functions = try folder.statFile(io, startup_functions_file, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, functions.kind);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), functions.permissions.toMode() & 0o777);
+    try std.testing.expect(!try session.replaceIrregularStartupRecord(io, .functions));
+
+    // A link where the aliases record is: unlinked, and its target is not written.
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere", .data = "keep\n" });
+    const target = try alloc.print("{s}/elsewhere", .{root});
+    defer alloc.free(target);
+    try folder.deleteFile(io, startup_aliases_file);
+    try folder.symLink(io, target, startup_aliases_file, .{});
+    try std.testing.expect(try session.replaceIrregularStartupRecord(io, .aliases));
+    const aliases = try folder.statFile(io, startup_aliases_file, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, aliases.kind);
+    const kept = try tmp.dir.readFileAlloc(io, "elsewhere", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+}
+
+test "a save record too long to read is reported once, and then emptied" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+
+    const oversized: [max_status_bytes + 1]u8 = @splat('x');
+    try folder.writeFile(io, .{ .sub_path = save_status_file, .data = &oversized });
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+    // The record was emptied though it could not be read, so the next take reports nothing again.
+    try std.testing.expect(session.takeSaveStatus(io) == null);
 }
 
 test "a save-status that is a FIFO is a failed record, and the call returns" {
