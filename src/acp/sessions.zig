@@ -4450,12 +4450,14 @@ test "a repeat session/load of a followed session replays again and adds no seco
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
     try deliverOwnerThought(alloc, session, "thought before join");
 
     var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
