@@ -236,8 +236,12 @@ describe("shared MCP servers", () => {
     expect(calls).toHaveLength(2);
     // Both sessions' calls ran on the one server.
     expect(new Set(calls.map((call) => call.pid)).size).toBe(1);
-    // One owner ran both sessions, from start to end.
-    expect(seenOwners).toHaveLength(1);
+    // One owner served both sessions. Two fx runs that start at the same
+    // moment may each start an owner, and the one that finds the lock taken
+    // exits at once: that is the startup race working, so the owner seen
+    // serving is the one asserted, and every owner seen exits below.
+    expect(seenOwners).toContain(runningOwners[0]!);
+    expect(runningOwners).toHaveLength(1);
     // The server runs under the owner, and hears the same client a session's
     // own copy sends: fx, with the version this binary prints. The 2026 first
     // request carries it in its metadata; `initialize` is the legacy fallback.
@@ -306,8 +310,11 @@ describe("shared MCP servers", () => {
     expect(JSON.parse(results[0]!.stdout).output).toContain("REPOS_ALPHA_DONE");
     expect(JSON.parse(results[1]!.stdout).output).toContain("REPOS_BETA_DONE");
     // The same launch config in two repos has two start directories, so two
-    // keys and two servers, both in the one owner.
-    expect(seenOwners).toHaveLength(1);
+    // keys and two servers, both in the one owner. A cold start may race two
+    // owners and the loser exits at once, so the one serving is the one
+    // asserted, and every owner seen exits below.
+    expect(seenOwners).toContain(runningOwners[0]!);
+    expect(runningOwners).toHaveLength(1);
 
     await expectExited([...pids, ...seenOwners]);
   }, 120_000);

@@ -1302,8 +1302,8 @@ pub const Runtime = struct {
     fn startLogin(r: *Runtime, req: *Request, name: []const u8, open_browser: bool) !void {
         const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = if (r.serverIndex(name) == null) error.UnknownServer else error.Held });
         const s = r.resolved.servers[i];
-        // Only HTTP servers sign in, and a shared server is stdio.
-        if (r.shared) |*shared| std.debug.assert(!shared.has(s.name));
+        // Only HTTP servers sign in, and a shared server is stdio: the
+        // transport decides first, so this is an answer, never an assert.
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
         // The sign-in already under way is the one asked for. Ending it would
         // close the port its browser comes back to while the engine keeps its
@@ -2747,8 +2747,8 @@ pub const Runtime = struct {
     /// and so is a server signing in here.
     fn pickUpLogin(r: *Runtime, i: usize) !bool {
         const s = r.resolved.servers[i];
-        // Only HTTP servers sign in, and a shared server is stdio.
-        if (r.shared) |*shared| std.debug.assert(!shared.has(s.name));
+        // Only HTTP servers sign in, and a shared server is stdio: the
+        // transport decides first, so this is never an assert.
         if (s.transport != .http or s.held != null or r.loginFor(i) != null) return false;
         if (!try r.takeSaved(i)) return false;
         // A new login was just refused: the saved login back in use is the one from before it.
@@ -4671,6 +4671,38 @@ test "a session past the owner's key limit runs the extra server itself" {
     // again.
     const again = try r.tools(a, configs[0].name, null);
     try testing.expectEqual(@as(usize, 1), again.tools.len);
+}
+
+test "a login on a shared stdio server is NotHttp, and a saved login passes it by" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const home = try sharedHome("login");
+    defer freeSharedHome(home);
+    var stop = std.atomic.Value(bool).init(false);
+    const served = try std.Thread.spawn(.{}, serveOwner, .{ testing.io, testing.allocator, home, &stop });
+    defer {
+        stop.store(true, .release);
+        served.join();
+    }
+    try waitForOwner(home);
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.share = .{ .fx_home = home, .spawn_owner = false };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The owner runs it, so this session only routes to it: a shared server is
+    // stdio, so a login is an answer (NotHttp), never a failed assert.
+    try testing.expectEqual(@as(usize, 1), (try r.tools(a, "fake", null)).tools.len);
+    try testing.expectError(error.NotHttp, r.login("fake", false));
+    // The saved-login path passes a shared stdio server by the same way.
+    try r.pickUpLogins();
 }
 
 test "a shared server's status comes from the owner" {

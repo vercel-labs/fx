@@ -37,6 +37,14 @@
 \*   one stays connected to the owner.
 \* LostNotRetried: an ended call never goes out again.
 \* EveryCallEnds: every call that waits or is in flight ends.
+\*
+\* One server stands for every key, so the model says nothing about how many
+\* keys an owner can hold: `using` and `conn` are per session and a session
+\* uses the server or does not. The code frees a key's slot when its last
+\* session leaves (`owner_core.zig` `freeSlotIfEmpty`), so the key's next
+\* registration is a fresh one; `Register` here already allows exactly that,
+\* with no key remembered, so it is the same rule. The model leaves out the
+\* bound (a fixed count of keys) rather than the rule.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Sessions, Calls, CallSession(_), Versions, MaxCrash

@@ -107,7 +107,7 @@ pub const CallRequest = struct { client: ClientId, id: u32, key: Key, tool: []co
 pub const AnswerRequest = struct { client: ClientId, key: Key, slot: u8, n: u32, action: mcp.elicitation.Action, content: ?[]const u8 = null };
 pub const Issued = struct { call: CallId, handle: engine.Handle };
 pub const IssueFailed = struct { call: CallId };
-pub const EngineCalled = struct { handle: engine.Handle, outcome: engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false };
+pub const EngineCalled = struct { handle: engine.Handle, outcome: engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false, lost_why: ?mcp.server.LostWhy = null };
 pub const EngineProgress = struct { handle: engine.Handle, progress: f64, total: ?f64, message: ?[]const u8 };
 pub const EngineInput = struct { handle: engine.Handle, requests: []const u8 };
 pub const EngineQuestion = struct { key: Key, slot: u8, n: u32, kind: QuestionKind, params: []const u8, version: ?[]const u8, required: bool = false };
@@ -316,12 +316,17 @@ fn onGone(state: *State, id: ClientId, out: *Output) void {
         }
     }
     // A key it alone was registered for stops its server now, so no server
-    // outlives its last session.
+    // outlives its last session, and its slot is freed so a long-lived owner
+    // keeps serving new keys: the key's next registration is a fresh one.
     for (&state.slots) |*maybe| {
         const slot = if (maybe.*) |*value| value else continue;
         if (!slot.clients.isSet(index - 1)) continue;
+        const key = slot.key;
         slot.clients.unset(index - 1);
-        if (slot.clients.count() == 0) out.push(.{ .disconnect = .{ .key = slot.key } });
+        if (slot.clients.count() == 0) {
+            maybe.* = null;
+            out.push(.{ .disconnect = .{ .key = key } });
+        }
     }
     if (cancelled > 0) out.push(.{ .log = .{ .what = .orphaned_call, .client = id } });
 }
@@ -358,8 +363,12 @@ fn onUnregister(state: *State, id: ClientId, key: Key, out: *Output) void {
         }
     }
     slot.clients.unset(index - 1);
-    // No session left on the key: its server stops now.
-    if (slot.clients.count() == 0) out.push(.{ .disconnect = .{ .key = key } });
+    // No session left on the key: its server stops now, and its slot is freed
+    // so the key's next registration is a fresh one.
+    if (slot.clients.count() == 0) {
+        _ = freeSlotIfEmpty(state, key);
+        out.push(.{ .disconnect = .{ .key = key } });
+    }
     if (cancelled > 0) out.push(.{ .log = .{ .what = .orphaned_call, .client = id } });
 }
 
@@ -428,16 +437,26 @@ fn onIssueFailed(state: *State, id: CallId, out: *Output) void {
 
 fn onEngineCalled(state: *State, called: EngineCalled, out: *Output) void {
     const call = callByHandle(state, called.handle) orelse return out.push(.{ .log = .{ .what = .orphaned_call } });
-    if (call.client) |client| out.push(.{ .send = .{ .to = client, .message = .{ .called = .{
-        .id = call.client_call,
-        .outcome = called.outcome,
-        .maybe_ran = called.maybe_ran,
-        .timed_out = called.timed_out,
-        .oversized = called.oversized,
-        .answer = called.answer,
-        .refused_bytes = called.refused_bytes,
-        .refused_body = called.refused_body,
-    } } } }) else out.push(.{ .log = .{ .what = .orphaned_call } });
+    if (call.client) |client| out.push(.{
+        .send = .{
+            .to = client,
+            .message = .{
+                .called = .{
+                    .id = call.client_call,
+                    .outcome = called.outcome,
+                    .maybe_ran = called.maybe_ran,
+                    .timed_out = called.timed_out,
+                    .oversized = called.oversized,
+                    .answer = called.answer,
+                    .refused_bytes = called.refused_bytes,
+                    .refused_body = called.refused_body,
+                    // Why the engine lost it, when it did: the session logs the same
+                    // reason for a shared call as for one it ran itself.
+                    .lost_why = called.lost_why,
+                },
+            },
+        },
+    }) else out.push(.{ .log = .{ .what = .orphaned_call } });
     endCall(state, call);
 }
 
@@ -583,6 +602,19 @@ fn slotForMut(state: *State, key: Key) ?*Slot {
         if (std.mem.eql(u8, &slot.key, &key)) return slot;
     }
     return null;
+}
+
+/// Frees the key's slot once no client is left on it, so a long-lived owner
+/// keeps serving new keys. True when it freed one.
+fn freeSlotIfEmpty(state: *State, key: Key) bool {
+    for (&state.slots) |*maybe| {
+        const slot = if (maybe.*) |*value| value else continue;
+        if (!std.mem.eql(u8, &slot.key, &key)) continue;
+        if (slot.clients.count() != 0) return false;
+        maybe.* = null;
+        return true;
+    }
+    return false;
 }
 
 fn ensureSlot(state: *State, key: Key) ?*Slot {
@@ -1183,9 +1215,12 @@ const Model = struct {
                     .answer => |answer| try testing.expectEqual(mcp.elicitation.Action.cancel, answer.action),
                     .disconnect => |gone| {
                         try testing.expect(std.mem.eql(u8, &gone.key, &left.key));
-                        // The server goes only with its last session.
-                        const left_on = clientsOf(&m.state, gone.key) orelse return error.NoSlot;
-                        try testing.expectEqual(@as(usize, 0), left_on.count());
+                        // The server goes only with its last session, and the
+                        // key's slot goes with it, so its next registration is
+                        // a fresh one: no client is left on the key either way.
+                        const left_on = clientsOf(&m.state, gone.key);
+                        try testing.expect(left_on == null or left_on.?.count() == 0);
+                        try testing.expect(slotFor(&m.state, gone.key) == null);
                     },
                     else => {},
                 };

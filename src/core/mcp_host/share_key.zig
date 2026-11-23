@@ -55,8 +55,11 @@ pub fn of(config: mcp.engine.Config) Key {
 
 /// The environment sorted by key, so the map's order never changes the key.
 /// Environments are small, so finding the next key each time costs nothing.
+/// Whether the map exists is hashed first: `same()` treats no environment
+/// and an empty one as different, so two such configs are two keys.
 fn feedEnv(hasher: *Sha256, map: ?*const std.process.Environ.Map) void {
-    const m = map orelse return feedInt(hasher, @as(u32, 0));
+    feedByte(hasher, @intFromBool(map != null));
+    const m = map orelse return;
     feedInt(hasher, m.count());
     var last: ?[]const u8 = null;
     var hashed: usize = 0;
@@ -236,4 +239,19 @@ test "same() and the key agree on random pairs" {
         const keys_equal = std.mem.eql(u8, &of(configs[0]), &of(configs[1]));
         try testing.expectEqual(same, keys_equal);
     }
+}
+
+test "no environment and an empty environment are different configs and keys" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a_ = arena.allocator();
+    const argv = [_][]const u8{"node"};
+    const none: engine.Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } } };
+    const empty: engine.Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv, .environ_map = try envMap(a_, &.{}) } } };
+    // `same()` calls them different, so the key must too: two sessions that
+    // resolved one entry with an environment and one without run two servers.
+    try testing.expect(!engine.same(none, empty));
+    try testing.expect(!std.mem.eql(u8, &of(none), &of(empty)));
+    // And two configs with no environment stay one key.
+    try testing.expectEqual(of(none), of(none));
 }

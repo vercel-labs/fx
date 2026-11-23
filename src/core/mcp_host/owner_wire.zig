@@ -95,8 +95,10 @@ pub const OwnerMessage = union(enum) {
     /// objects, carried as text.
     tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]", list_refusal: ?[]const u8 = null },
     /// How one of this client's calls ended; `answer` is the `tools.Call`
-    /// JSON text, or null when the call ended without one.
-    called: struct { id: u32, outcome: mcp.engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool = false, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false },
+    /// JSON text, or null when the call ended without one. `lost_why` says
+    /// why a lost call was lost, so the session logs the reason it would log
+    /// for its own engine's loss.
+    called: struct { id: u32, outcome: mcp.engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool = false, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false, lost_why: ?mcp.server.LostWhy = null },
     progress: struct { id: u32, progress: f64, total: ?f64 = null, message: ?[]const u8 = null },
     /// The call's 2026 input requests, as the `mrtr.Request` list's JSON text.
     input: struct { id: u32, requests: []const u8 },
@@ -253,6 +255,7 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             if (m.answer) |answer| try raw(writer, "answer", answer);
             try uint(writer, "refused_bytes", m.refused_bytes);
             try boolean(writer, "refused_body", m.refused_body);
+            if (m.lost_why) |why| try textField(writer, "lost_why", @tagName(why));
         },
         .progress => {
             try uint(writer, "id", m.id);
@@ -377,16 +380,20 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
                 .list_refusal = try optionalText(object, "list_refusal"),
             },
         },
-        .called => .{ .called = .{
-            .id = try u32Field(object, "id"),
-            .outcome = try enumField(mcp.engine.Outcome, object, "outcome"),
-            .maybe_ran = try boolField(object, "maybe_ran"),
-            .timed_out = try boolField(object, "timed_out"),
-            .oversized = try boolField(object, "oversized"),
-            .answer = try optionalRaw(object, "answer"),
-            .refused_bytes = try u32FieldDefault(object, "refused_bytes", 0),
-            .refused_body = try boolFieldDefault(object, "refused_body", false),
-        } },
+        .called => .{
+            .called = .{
+                .id = try u32Field(object, "id"),
+                .outcome = try enumField(mcp.engine.Outcome, object, "outcome"),
+                .maybe_ran = try boolField(object, "maybe_ran"),
+                .timed_out = try boolField(object, "timed_out"),
+                .oversized = try boolField(object, "oversized"),
+                .answer = try optionalRaw(object, "answer"),
+                .refused_bytes = try u32FieldDefault(object, "refused_bytes", 0),
+                .refused_body = try boolFieldDefault(object, "refused_body", false),
+                // Absent from an owner that ran before the reason crossed the wire.
+                .lost_why = try optionalEnumField(mcp.server.LostWhy, object, "lost_why"),
+            },
+        },
         .progress => .{ .progress = .{
             .id = try u32Field(object, "id"),
             .progress = try floatField(object, "progress"),
@@ -551,6 +558,14 @@ fn optionalFloatField(object: std.json.ObjectMap, key: []const u8) DecodeError!?
 
 fn enumField(comptime E: type, object: std.json.ObjectMap, key: []const u8) DecodeError!E {
     return std.meta.stringToEnum(E, try text(object, key)) orelse error.Malformed;
+}
+
+/// An enum field a frame may leave out, as `lost_why` is left out of a call
+/// that did not end as lost.
+fn optionalEnumField(comptime E: type, object: std.json.ObjectMap, key: []const u8) DecodeError!?E {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return error.Malformed;
+    return std.meta.stringToEnum(E, value.string) orelse error.Malformed;
 }
 
 fn optionalKey(object: std.json.ObjectMap, key: []const u8) DecodeError!?share_key.Key {
@@ -730,6 +745,13 @@ test "every owner message round-trips" {
     try testing.expectEqualStrings("\"tools\" is not a list", refused.tools.list_refusal.?);
     const refusing = try expectOwner(a, .{ .status = .{ .key = key, .phase = .ready, .list_refusal = "a field is written twice" } });
     try testing.expectEqualStrings("a field is written twice", refusing.status.list_refusal.?);
+
+    // Why a call was lost crosses with its end, so a shared call logs as
+    // detailed a reason as one this session ran itself.
+    const lost_call = try expectOwner(a, .{ .called = .{ .id = 5, .outcome = .lost, .maybe_ran = true, .timed_out = false, .lost_why = .link_down } });
+    try testing.expectEqual(mcp.server.LostWhy.link_down, lost_call.called.lost_why.?);
+    const answered = try expectOwner(a, .{ .called = .{ .id = 6, .outcome = .result, .maybe_ran = false, .timed_out = false } });
+    try testing.expectEqual(@as(?mcp.server.LostWhy, null), answered.called.lost_why);
 }
 
 test "server JSON nested 3000 levels deep crosses the wire as text" {

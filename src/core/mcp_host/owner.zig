@@ -27,8 +27,10 @@ const engine = mcp.engine;
 /// The internal mode's flag; exactly one argument follows it, fx's home.
 pub const mode = "--fx-internal-mcp-owner";
 pub const run_dir_name = "run";
-pub const socket_name = "mcp-owner-v1.sock";
-pub const lock_name = "mcp-owner-v1.lock";
+/// The socket and the lock carry the wire version, so a build that speaks
+/// another protocol gets its own and two versions never misread each other.
+pub const socket_name = std.fmt.comptimePrint("mcp-owner-v{d}.sock", .{wire.version});
+pub const lock_name = std.fmt.comptimePrint("mcp-owner-v{d}.lock", .{wire.version});
 /// How long the owner waits for a client to reconnect after the last one left.
 pub const exit_grace_ms: i64 = 500;
 const poll_ms = 20;
@@ -591,15 +593,18 @@ fn ownConfig(gpa: Allocator, config: wire.ServerConfig) Allocator.Error!OwnedCon
     return owned;
 }
 
+/// The engine's copy of a key's config, built in `arena`. Every string is
+/// copied into the arena, so the config the engine keeps never borrows the
+/// `OwnedConfig` the owner frees when the key's last session leaves.
 fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) Allocator.Error!engine.Config {
     const argv = try arena.alloc([]const u8, config.argv.len);
-    for (config.argv, argv) |arg, *copy| copy.* = arg;
+    for (config.argv, argv) |arg, *copy| copy.* = try arena.dupe(u8, arg);
     const map = try arena.create(std.process.Environ.Map);
     map.* = .init(arena);
-    for (config.env) |pair| try map.put(pair[0], pair[1]);
-    var auth: @FieldType(engine.Config, "auth") = .{ .client_name = config.auth.client_name };
+    for (config.env) |pair| try map.put(try arena.dupe(u8, pair[0]), try arena.dupe(u8, pair[1]));
+    var auth: @FieldType(engine.Config, "auth") = .{ .client_name = try arena.dupe(u8, config.auth.client_name) };
     inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
-        @field(auth, field) = @field(config.auth, field);
+        @field(auth, field) = if (@field(config.auth, field)) |value| try arena.dupe(u8, value) else null;
     }
     const timeouts: ?mcp.core.request.Timeouts = if (config.timeouts) |t| .{
         .start_ms = t.start_ms,
@@ -611,7 +616,7 @@ fn engineConfig(arena: Allocator, key: core.Key, config: *const OwnedConfig) All
     } else null;
     return .{
         .name = try arena.dupe(u8, &key),
-        .transport = .{ .stdio = .{ .argv = argv, .environ_map = map, .cwd = config.cwd } },
+        .transport = .{ .stdio = .{ .argv = argv, .environ_map = map, .cwd = if (config.cwd) |cwd| try arena.dupe(u8, cwd) else null } },
         .auth = auth,
         .timeouts = timeouts,
     };
@@ -667,6 +672,21 @@ fn storeConfig(owner: *Owner, key: core.Key, config: OwnedConfig) void {
         debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
     };
 }
+/// Drops a key's config once no session is left on it. The engine keeps the
+/// key's own config, so a later registration stores this one again.
+fn forgetConfig(owner: *Owner, key: core.Key) void {
+    owner.configs_mutex.lockUncancelable(owner.io);
+    defer owner.configs_mutex.unlock(owner.io);
+    // Both are read before the removal: a swap may move the entries.
+    const name = owner.configs.getKeyPtr(&key) orelse return;
+    const value = owner.configs.getPtr(&key) orelse return;
+    const stored_name = name.*;
+    var stored = value.*;
+    _ = owner.configs.swapRemove(&key);
+    owner.gpa.free(stored_name);
+    stored.deinit(owner.gpa);
+}
+
 /// Serves until the last client has been gone for `exit_grace_ms` or `stop`
 /// is set. `error.LockBusy` means another owner holds the lock.
 pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool), client_version: []const u8) !void {
@@ -939,6 +959,10 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
             engine_value.disconnect(&disconnect.key) catch |err| {
                 debug_trace.logf("mcp-owner", "owner server not disconnected err={s}", .{@errorName(err)});
             };
+            // No session is left on the key: its config goes with its slot, so
+            // a long-lived owner serves new keys without growing this map. A
+            // session that registers the key again stores it first.
+            forgetConfig(owner, disconnect.key);
         },
         .refuse => |refuse| {
             const conn = owner.connectionOf(refuse.to) orelse continue;
@@ -1055,16 +1079,21 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
                     break :blk null;
                 };
             }
-            core_event = .{ .engine_called = .{
-                .handle = called.call,
-                .outcome = called.outcome,
-                .maybe_ran = called.maybe_ran,
-                .timed_out = called.timed_out,
-                .oversized = called.oversized,
-                .answer = answer,
-                .refused_bytes = called.refused_bytes,
-                .refused_body = called.refused_body,
-            } };
+            core_event = .{
+                .engine_called = .{
+                    .handle = called.call,
+                    .outcome = called.outcome,
+                    .maybe_ran = called.maybe_ran,
+                    .timed_out = called.timed_out,
+                    .oversized = called.oversized,
+                    .answer = answer,
+                    .refused_bytes = called.refused_bytes,
+                    .refused_body = called.refused_body,
+                    // Why the call was lost, so the session logs it as its own
+                    // engine's loss.
+                    .lost_why = called.lost_why,
+                },
+            };
         },
         .progress => |progress| core_event = .{ .engine_progress = .{
             .handle = progress.call,
@@ -1077,12 +1106,28 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
             .tools => |tools| core_event = .{ .engine_tools = .{ .key = key, .ok = tools.ok, .fresh = tools.fresh, .needs_auth = tools.needs_auth } },
             .elicit => |elicit| {
                 const version = if (slotOf(owner, key)) |index| engine_value.status(index).version else null;
+                // The question's mode is JSON, read as JSON: a formatted
+                // `"mode": "url"` is a URL question, and a form whose text
+                // happens to name one is still a form.
+                var form: mcp.elicitation.Form = undefined;
+                const kind = questionKind(elicit.params, &form) orelse {
+                    // No session could show a question fx cannot read: decline
+                    // it, so the server does not wait for an answer.
+                    debug_trace.logf("mcp-owner", "owner question declined reason=unreadable params key={s} slot={d} n={d}", .{ key[0..], elicit.id.slot, elicit.id.n });
+                    engine_value.answerElicitation(&key, .{ .slot = elicit.id.slot, .n = elicit.id.n }, .{ .action = .cancel, .content = null }) catch |err| {
+                        debug_trace.logf("mcp-owner", "owner question not declined reason={s} key={s}", .{ @errorName(err), key[0..] });
+                    };
+                    return;
+                };
                 core_event = .{ .engine_question = .{
                     .key = key,
                     .slot = elicit.id.slot,
                     .n = elicit.id.n,
-                    .kind = if (std.mem.find(u8, elicit.params, "\"mode\":\"url\"") != null) .url else .form,
-                    .params = a.dupe(u8, elicit.params) catch return,
+                    .kind = kind,
+                    .params = a.dupe(u8, elicit.params) catch {
+                        debug_trace.logf("mcp-owner", "owner question dropped reason=out of memory key={s} slot={d} n={d}", .{ key[0..], elicit.id.slot, elicit.id.n });
+                        return;
+                    },
                     .version = if (version) |v| a.dupe(u8, v) catch null else null,
                     .required = elicit.required,
                 } };
@@ -1098,6 +1143,18 @@ fn stepEngineEvent(owner: *Owner, state: *core.State, engine_value: *engine.Engi
         core.step(state, e, &output);
         apply(owner, state, engine_value, scratch, output.effects());
     }
+}
+
+/// The kind of a 2025 question, read from its params as JSON
+/// (`mcp.elicitation.parse`): a formatted `"mode": "url"` is a URL question,
+/// and a form whose text names one is still a form. Null for params fx cannot
+/// read, which the owner declines rather than showing.
+fn questionKind(params: []const u8, form: *mcp.elicitation.Form) ?core.QuestionKind {
+    const request = mcp.elicitation.parse(params, form) catch return null;
+    return switch (request.mode) {
+        .form => .form,
+        .url => .url,
+    };
 }
 
 fn requestsJson(a: Allocator, requests: []const mcp.mrtr.Request) []const u8 {
@@ -1690,6 +1747,107 @@ test "an event still queued when the owner stops is freed with its strings" {
     // A stop can land with events the loop never takes: their strings are this
     // allocator's, so one left behind fails this test as a leak.
     owner.deinit();
+}
+
+test "a question's kind comes from its JSON mode, not from its text" {
+    var form: mcp.elicitation.Form = undefined;
+    const schema = "\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}";
+    // Both spellings of the same JSON are URL questions: RFC 8259 makes the
+    // spacing insignificant.
+    try testing.expectEqual(core.QuestionKind.url, questionKind("{\"mode\":\"url\",\"message\":\"m\",\"url\":\"https://x.example/\"}", &form).?);
+    try testing.expectEqual(core.QuestionKind.url, questionKind("{\"mode\": \"url\", \"message\": \"m\", \"url\": \"https://x.example/\"}", &form).?);
+    // A form whose message names a URL question is still a form.
+    try testing.expectEqual(core.QuestionKind.form, questionKind("{\"mode\":\"form\",\"message\":\"Type \\\"mode\\\":\\\"url\\\" to continue\"," ++ schema ++ "}", &form).?);
+    try testing.expectEqual(core.QuestionKind.form, questionKind("{\"message\":\"m\"," ++ schema ++ "}", &form).?);
+    // Params fx cannot read have no kind: the owner declines that question.
+    try testing.expectEqual(@as(?core.QuestionKind, null), questionKind("not json", &form));
+    try testing.expectEqual(@as(?core.QuestionKind, null), questionKind("{\"mode\":\"popup\",\"message\":\"m\"}", &form));
+}
+
+/// A test key from its number: the wire carries keys as 32 hex digits, so a
+/// key filled with raw bytes would not decode.
+fn testKey(n: usize) core.Key {
+    var key = test_key;
+    const digits = "0123456789abcdef";
+    for (0..8) |i| key[24 + i] = digits[(n >> @intCast((7 - i) * 4)) & 0xf];
+    return key;
+}
+
+test "every key a session leaves is free for the next one, past the slot limit" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc);
+    defer removeHome(alloc, home);
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveThread, .{ testing.io, alloc, home, &stop });
+    defer {
+        stop.store(true, .release);
+        thread.join();
+    }
+    const path = try socketPath(alloc, home);
+    defer alloc.free(path);
+    try waitForSocket(path);
+
+    var client = try TestClient.connect(path);
+    defer client.close();
+    try client.send(.{ .hello = .{ .pid = 1 } });
+    // One key past every slot the owner has: each is registered and then left,
+    // so none is still held when the next arrives.
+    const count = core.max_keys + 44;
+    for (0..count - 1) |n| {
+        const key = testKey(n);
+        const argv = [_][]const u8{"true"};
+        try client.send(.{ .register = .{ .key = key, .config = .{ .argv = &argv }, .ask_form = true, .ask_url = true } });
+        try client.send(.{ .unregister = .{ .key = key } });
+    }
+    // The last key registers: asking for its server reaches the engine, which
+    // starts it, so a phase frame about that key arrives. A refused
+    // registration would answer `refused` for it instead.
+    const last = testKey(count - 1);
+    const argv = [_][]const u8{"true"};
+    try client.send(.{ .register = .{ .key = last, .config = .{ .argv = &argv }, .ask_form = true, .ask_url = true } });
+    try client.send(.{ .need = .{ .key = last } });
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var seen = false;
+    for (0..200) |_| {
+        const message = client.receive(a, 100) catch continue;
+        const said = switch (message) {
+            .owner => |owner_message| owner_message,
+            .client => continue,
+        };
+        const key = switch (said) {
+            .phase => |m| m.key,
+            .status => |m| m.key,
+            .refused => |m| m.key orelse continue,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, &key, &last)) continue;
+        // A phase or a status for the key means the route table took it and
+        // the engine has its server; a refused registration says so instead.
+        try testing.expect(said != .refused);
+        seen = true;
+        break;
+    }
+    try testing.expect(seen);
+}
+
+test "a key's config goes when its last client leaves, and its engine slot stays" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    defer owner.engine_arena.deinit();
+    defer owner.deinit();
+    storeConfig(&owner, test_key, try ownConfig(alloc, .{ .argv = &.{"server"} }));
+    try testing.expectEqual(@as(usize, 1), owner.configs.count());
+    forgetConfig(&owner, test_key);
+    try testing.expectEqual(@as(usize, 0), owner.configs.count());
+    // A key the owner never held is nothing to drop.
+    forgetConfig(&owner, test_key);
+    try testing.expectEqual(@as(usize, 0), owner.configs.count());
 }
 
 test "two clients registered for one key share one server process" {

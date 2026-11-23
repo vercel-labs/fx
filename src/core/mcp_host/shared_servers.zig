@@ -17,7 +17,7 @@ const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
-const tools = @import("../../mcp/protocol/tools.zig");
+const tools = mcp.tools;
 const wire = owner_wire;
 
 /// The list for a server this adapter does not have, as `Engine.toolList` returns.
@@ -161,17 +161,15 @@ pub const Shared = struct {
             };
             const id = found orelse break;
             _ = s.calls.swapRemove(id);
-            s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
+            // This session's call on the slot ends here; a dropped end leaves
+            // its caller waiting out the deadline, and the queue's line says so.
+            s.appendPending(.{ .server = slot.name, .kind = .{ .called = .{
                 .call = handle_base | id,
                 .outcome = .cancelled,
                 .maybe_ran = true,
                 .timed_out = false,
                 .answer = null,
-            } } }) catch |err| {
-                // This session's call on the slot would have ended here;
-                // without the event its caller waits for its deadline.
-                debug_trace.logf("mcp", "shared call end dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
-            };
+            } } });
         }
         slot.tools_store.deinit(s.gpa);
         if (slot.version) |v| s.gpa.free(v);
@@ -388,32 +386,38 @@ pub const Shared = struct {
     fn buildSlackEvents(s: *Shared) void {
         var it = s.calls.iterator();
         while (it.next()) |entry| {
-            s.pending.append(s.gpa, .{
+            s.appendPending(.{
                 .server = s.slots.items[entry.value_ptr.*].name,
-                .kind = .{ .called = .{
-                    .call = handle_base | entry.key_ptr.*,
-                    .outcome = .lost,
-                    .maybe_ran = true,
-                    .timed_out = false,
-                    .answer = null,
-                } },
-            }) catch |err| {
-                // The call's end is gone: its session waits out the deadline.
-                debug_trace.logf("mcp", "shared lost call dropped server={s} id={d} reason=out of memory err={s}", .{ s.slots.items[entry.value_ptr.*].name, entry.key_ptr.*, @errorName(err) });
-                continue;
-            };
+                .kind = .{
+                    .called = .{
+                        .call = handle_base | entry.key_ptr.*,
+                        .outcome = .lost,
+                        .maybe_ran = true,
+                        .timed_out = false,
+                        .answer = null,
+                        // The link the call was on went away with the owner.
+                        .lost_why = .link_down,
+                    },
+                },
+            });
         }
         s.calls.clearRetainingCapacity();
         for (s.slots.items) |*slot| {
             if (!slot.needing) continue;
             slot.needing = false;
-            s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = false, .fresh = false } } } }) catch |err| {
-                // The failed listing never reaches the session, so its request
-                // for tools waits for the next list instead.
-                debug_trace.logf("mcp", "shared failed listing dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
-                continue;
-            };
+            // The failed listing never reaches the session, so its request for
+            // tools waits for the next list instead.
+            s.appendPending(.{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = false, .fresh = false } } } });
         }
+    }
+
+    /// Queues one event for the runtime. A queue that cannot grow drops it,
+    /// and the line names what was lost and why: the session hears nothing
+    /// more for that step, so the trace is the only record of it.
+    fn appendPending(s: *Shared, event: engine.Event) void {
+        s.pending.append(s.gpa, event) catch |err| {
+            debug_trace.logf("mcp", "shared event dropped server={s} kind={s} reason=out of memory err={s}", .{ event.server, @tagName(event.kind), @errorName(err) });
+        };
     }
 
     fn frame(s: *Shared, payload: []const u8) void {
@@ -440,7 +444,7 @@ pub const Shared = struct {
                 slot.phase = update.phase;
                 // The runtime ends tool waiters and checks logins on a phase
                 // event, so a failed start must reach it, not just the slot.
-                s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .phase = update.phase } }) catch return;
+                s.appendPending(.{ .server = slot.name, .kind = .{ .phase = update.phase } });
             },
             .status => |update| {
                 const i = s.indexByKey(update.key) orelse {
@@ -471,7 +475,8 @@ pub const Shared = struct {
                 replace(s.gpa, &slot.list_refusal, page.list_refusal);
                 // A listing replaces the list, even with none: an old list
                 // must not outlive the server saying it has no tools. A
-                // failed listing keeps the last one.
+                // listing fx could not read, or could not keep, changes
+                // nothing: the last accepted list stays in place.
                 if (page.ok) {
                     slot.tools_store.discard();
                     // The wire carries the raw tool objects; a page is a
@@ -479,16 +484,19 @@ pub const Shared = struct {
                     const result = a.print("{{\"tools\":{s}}}", .{page.tools}) catch null;
                     const parsed = if (result) |text| tools.parsePage(text) catch null else null;
                     if (parsed) |parsed_page| {
-                        // Only out of memory fails here; the session then sees
-                        // the list this frame could not replace.
-                        _ = slot.tools_store.addPage(s.gpa, parsed_page) catch |err| {
+                        if (slot.tools_store.addPage(s.gpa, parsed_page)) |_| {
+                            slot.tools_store.publish();
+                        } else |err| {
+                            // Only out of memory fails here; the session keeps
+                            // the list it had.
                             debug_trace.logf("mcp", "shared tool list dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
-                        };
+                        }
+                    } else {
+                        debug_trace.logf("mcp", "shared tool list dropped server={s} reason=unreadable page", .{slot.name});
                     }
-                    slot.tools_store.publish();
                 }
                 slot.needing = false;
-                s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = page.ok, .fresh = page.fresh, .needs_auth = page.needs_auth } } } }) catch return;
+                s.appendPending(.{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = page.ok, .fresh = page.fresh, .needs_auth = page.needs_auth } } } });
             },
             .called => |called| {
                 const i = s.calls.get(called.id) orelse {
@@ -510,28 +518,35 @@ pub const Shared = struct {
                         unreadable = true;
                     }
                 }
-                s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
-                    .call = handle_base | called.id,
-                    .outcome = if (unreadable) .malformed else called.outcome,
-                    .maybe_ran = if (unreadable) true else called.maybe_ran,
-                    .timed_out = called.timed_out,
-                    .answer = answer,
-                    .oversized = called.oversized,
-                    .refused_bytes = called.refused_bytes,
-                    .refused_body = called.refused_body,
-                } } }) catch return;
+                s.appendPending(.{
+                    .server = slot.name,
+                    .kind = .{
+                        .called = .{
+                            .call = handle_base | called.id,
+                            .outcome = if (unreadable) .malformed else called.outcome,
+                            .maybe_ran = if (unreadable) true else called.maybe_ran,
+                            .timed_out = called.timed_out,
+                            .answer = answer,
+                            .oversized = called.oversized,
+                            .refused_bytes = called.refused_bytes,
+                            .refused_body = called.refused_body,
+                            // Why the owner's engine lost it, when it did.
+                            .lost_why = called.lost_why,
+                        },
+                    },
+                });
             },
             .progress => |progress| {
                 const i = s.calls.get(progress.id) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=progress reason=unknown call id={d}", .{progress.id});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .progress = .{
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .progress = .{
                     .call = handle_base | progress.id,
                     .progress = progress.progress,
                     .total = progress.total,
                     .message = progress.message,
-                } } }) catch return;
+                } } });
             },
             .input => |input| {
                 const i = s.calls.get(input.id) orelse {
@@ -542,42 +557,42 @@ pub const Shared = struct {
                     debug_trace.logf("mcp", "shared server frame dropped kind=input reason=malformed requests", .{});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .input = .{
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .input = .{
                     .call = handle_base | input.id,
                     .requests = parsed.value,
-                } } }) catch return;
+                } } });
             },
             .question => |question| {
                 const i = s.indexByKey(question.key) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=question reason=unknown key", .{});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit = .{
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit = .{
                     .id = .{ .slot = question.slot, .n = question.n },
                     .params = question.params,
                     .required = question.required,
-                } } } }) catch return;
+                } } } });
             },
             .elicitation_complete => |done| {
                 const i = s.indexByKey(done.key) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=elicitation_complete reason=unknown key", .{});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicitation_complete = done.slot } } }) catch return;
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicitation_complete = done.slot } } });
             },
             .elicit_withdrawn => |gone| {
                 const i = s.indexByKey(gone.key) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=elicit_withdrawn reason=unknown key", .{});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit_withdrawn = gone.slot } } }) catch return;
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit_withdrawn = gone.slot } } });
             },
             .stopped_idle => |stopped| {
                 const i = s.indexByKey(stopped.key) orelse {
                     debug_trace.logf("mcp", "shared server frame dropped kind=stopped_idle reason=unknown key", .{});
                     return;
                 };
-                s.pending.append(s.gpa, .{ .server = s.slots.items[i].name, .kind = .stopped_idle }) catch return;
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .stopped_idle });
             },
             .refused => |refused| {
                 // One request refused: a call ends as one the server never
@@ -590,13 +605,13 @@ pub const Shared = struct {
                     };
                     _ = s.calls.swapRemove(id);
                     const slot = &s.slots.items[i];
-                    s.pending.append(s.gpa, .{ .server = slot.name, .kind = .{ .called = .{
+                    s.appendPending(.{ .server = slot.name, .kind = .{ .called = .{
                         .call = handle_base | id,
                         .outcome = .transport_failed,
                         .maybe_ran = false,
                         .timed_out = false,
                         .answer = null,
-                    } } }) catch return;
+                    } } });
                     return;
                 }
                 const key = refused.key orelse {
@@ -879,6 +894,44 @@ test "a refused tool list's words reach this session's status, and an accepted l
     const accepted: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
     try feedOwner(&shared, a, accepted);
     try testing.expectEqual(@as(?[]const u8, null), shared.status("fake").list_refusal);
+}
+
+test "a tools page fx cannot read leaves the last good list in place" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "badpage");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A list the owner accepted.
+    const good: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]" } };
+    try feedOwner(&shared, a, good);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // A page that is no tool list at all: the list it had stays.
+    const bad: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "7" } };
+    try feedOwner(&shared, a, bad);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // So does a page whose tools are not listed as one.
+    const worse: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "{\"name\":\"echo\"}" } };
+    try feedOwner(&shared, a, worse);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // An accepted empty list does replace it: the server said it has none.
+    const empty: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
+    try feedOwner(&shared, a, empty);
+    try testing.expectEqual(@as(usize, 0), shared.toolList("fake").len());
 }
 
 test "a call in flight when the connection closes ends as lost, and its server registers again on the next owner" {

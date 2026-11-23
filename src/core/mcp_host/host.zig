@@ -13,6 +13,7 @@ const model = @import("model.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Runtime = runtime_mod.Runtime;
+pub const owner = @import("owner.zig");
 pub const Options = runtime_mod.Options;
 /// How long a server nothing used for stops (`idle_control.zig`).
 pub const idleMs = @import("idle_control.zig").idleMs;
