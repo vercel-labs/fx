@@ -32,8 +32,8 @@ import {
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
-// How the compact view names that tool: its server, then the tool.
-const TOOL_ROW = "fixture echo";
+// How the compact view names that tool: its server, then what the tool does.
+const TOOL_ROW = "Fixture to echo";
 
 let cleanupRoot: string | null = null;
 let fixture: ReturnType<typeof startModernMcpHttpFixture> | null = null;
@@ -1306,7 +1306,7 @@ describe("modern MCP Streamable HTTP", () => {
       ).toBe(true);
 
       await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_ROW}`, 10_000);
+      await tui.waitForText(`Cancelled using ${TOOL_ROW}`, 10_000);
       const cancelDeadline = Date.now() + 5_000;
       while (fixture.cancelledCalls === 0 && Date.now() < cancelDeadline) {
         await Bun.sleep(25);

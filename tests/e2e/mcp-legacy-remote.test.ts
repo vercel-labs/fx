@@ -26,8 +26,8 @@ import {
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
-// How the compact view names that tool: its server, then the tool.
-const TOOL_ROW = "fixture echo";
+// How the compact view names that tool: its server, then what the tool does.
+const TOOL_ROW = "Fixture to echo";
 const REPO_ROOT = realpathSync(join(import.meta.dirname, "..", ".."));
 const VERSIONS: LegacyStreamableVersion[] = [
   "2025-11-25",
@@ -958,7 +958,7 @@ describe("version-scoped legacy MCP remote transports", () => {
         ).toBe(true);
 
         await tui.sendInterruptEscapePair(10_000);
-        await tui.waitForText(`Cancelled ${TOOL_ROW}`, 10_000);
+        await tui.waitForText(`Cancelled using ${TOOL_ROW}`, 10_000);
         const cancelDeadline = Date.now() + 5_000;
         while (
           (streamable.cancellationNotifications === 0 ||

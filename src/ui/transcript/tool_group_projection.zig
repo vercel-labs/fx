@@ -3231,13 +3231,15 @@ fn mcpAliasSegment(scratch: std.mem.Allocator, server: []const u8) ![]const u8 {
     return segment;
 }
 
-/// An MCP tool by its server and then its own name, from its alias
-/// `mcp_<server>_<tool>`: "slack read_thread" for slack's slack_read_thread.
-/// A tool name that repeats its server's name, as many do, leaves it out.
-/// `server` is the server the call's result names, or "" when none does,
-/// and then the alias up to its first "_" names the server. Null for a name
-/// that is no alias, such as another program's "mcp__server__tool".
-fn mcpToolName(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?[]const u8 {
+const McpToolParts = struct { server: []const u8, tool: []const u8 };
+
+/// An MCP tool's server and the tool's own name, from its alias
+/// `mcp_<server>_<tool>`: "slack" and "read_thread" for slack's
+/// slack_read_thread. A tool name that repeats its server's name, as many do,
+/// leaves it out. `server` is the server the call's result names, or "" when
+/// none does, and then the alias up to its first "_" names the server. Null
+/// for a name that is no alias, such as another program's "mcp__server__tool".
+fn mcpToolParts(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?McpToolParts {
     if (!types.isMcpToolName(alias)) return null;
     const rest = alias[types.mcp_tool_prefix.len..];
     const named = try mcpAliasSegment(scratch, server);
@@ -3247,59 +3249,126 @@ fn mcpToolName(scratch: std.mem.Allocator, alias: []const u8, server: []const u8
     var tool = rest[server_segment.len + 1 ..];
     if (startsWithSegment(tool, server_segment)) tool = tool[server_segment.len + 1 ..];
     if (tool.len == 0) return null;
-    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, if (known) server else server_segment), " ", tool });
+    return .{ .server = if (known) server else server_segment, .tool = tool };
+}
+
+/// An MCP tool in words: its server once, with its first letter in upper
+/// case, then what the tool does, as "Slack to read thread" for slack's
+/// slack_read_thread and "Linear to get issue" for linear's getIssue.
+/// Terminal-safe. Null for a name that is no alias (`mcpToolParts`).
+fn mcpToolWords(scratch: std.mem.Allocator, alias: []const u8, server: []const u8) !?[]const u8 {
+    const parts = try mcpToolParts(scratch, alias, server) orelse return null;
+    const words = try toolNameWords(scratch, parts.tool);
+    if (words.len == 0) return null;
+    const name = try scratch.dupe(u8, parts.server);
+    name[0] = std.ascii.toUpper(name[0]);
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, name), " to ", words });
+}
+
+/// A tool's name as lower-case words: "read thread" for read_thread, and
+/// "get issue" for getIssue. An alias holds only letters, digits, "_", and
+/// "-" (`isIdentifierByte` in src/core/mcp/tool_names.zig).
+fn toolNameWords(scratch: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (name, 0..) |byte, index| {
+        const starts_word = std.ascii.isUpper(byte) and index > 0 and
+            (std.ascii.isLower(name[index - 1]) or std.ascii.isDigit(name[index - 1]) or
+                (std.ascii.isUpper(name[index - 1]) and index + 1 < name.len and std.ascii.isLower(name[index + 1])));
+        if (byte == '_' or starts_word) {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(scratch, ' ');
+            if (byte == '_') continue;
+        }
+        try out.append(scratch, std.ascii.toLower(byte));
+    }
+    return std.mem.trimEnd(u8, out.items, " ");
 }
 
 /// Core's labels that lead an MCP tool's row, and the compact row's for each.
-/// The labels of a call that did not run come from `permissionDeniedStatusLabel`
-/// in src/core/agent/runtime/tool_admission.zig, the longest first, so
-/// "Denied" does not take "Denied by auto agent". A held call has a row of its
-/// own (`heldMcpRowText`).
+/// A call that did not run has a row of its own (`unrunMcpRowText`).
 const mcp_row_labels = [_]struct { core: []const u8, shown: []const u8 }{
-    .{ .core = tooling_presentation.mcp_ran_label ++ " ", .shown = "Ran " },
-    .{ .core = tooling_presentation.mcp_running_label ++ " ", .shown = "Running " },
-    .{ .core = "Failed ", .shown = "Failed " },
-    .{ .core = cancelled_label ++ " ", .shown = cancelled_label ++ " " },
-    .{ .core = "Denied by auto agent ", .shown = "Denied by auto agent " },
-    .{ .core = "Denied ", .shown = "Denied " },
-    .{ .core = "Review evidence incomplete ", .shown = "Review evidence incomplete " },
-    .{ .core = "Review unavailable ", .shown = "Review unavailable " },
-    .{ .core = "Permission required ", .shown = "Permission required " },
+    .{ .core = tooling_presentation.mcp_ran_label ++ " ", .shown = "Used " },
+    .{ .core = tooling_presentation.mcp_running_label ++ " ", .shown = "Using " },
+    .{ .core = "Failed ", .shown = "Couldn't use " },
+    .{ .core = cancelled_label ++ " ", .shown = cancelled_label ++ " using " },
 };
 
-/// An MCP tool's row by its server and then the tool, such as "Ran slack
-/// read_thread" for core's "Ran MCP mcp_slack_slack_read_thread". Null for
-/// any other row.
+/// An MCP tool's row in words, such as "Used Slack to read thread" for
+/// core's "Ran MCP mcp_slack_slack_read_thread". Null for any other row.
 fn mcpRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     if (record.activity_kind != .mcp) return null;
     for (mcp_row_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
-        const shown = try mcpToolName(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const shown = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
         return try std.mem.concat(scratch, u8, &.{ label.shown, shown });
     };
     return null;
 }
 
-test "MCP rows name the server, then its tool" {
+/// Core's labels for a call that did not run (`permissionDeniedStatusLabel`
+/// in src/core/agent/runtime/tool_admission.zig), and the note an MCP call's
+/// row ends with for each. The longest come first, so "Denied" does not take
+/// "Denied by auto agent".
+const mcp_unrun_labels = [_]struct { core: []const u8, note: []const u8 }{
+    .{ .core = "Denied by auto agent ", .note = " · denied by auto agent" },
+    .{ .core = "Denied ", .note = " · denied" },
+    .{ .core = "Review evidence incomplete ", .note = " · review evidence incomplete" },
+    .{ .core = "Review unavailable ", .note = " · review unavailable" },
+    .{ .core = "Permission required ", .note = " · permission required" },
+    .{ .core = safety_caution_label ++ " ", .note = safety_caution_note },
+};
+
+/// An MCP call that did not run, as "Didn't use Slack to read thread ·
+/// denied": what happened to the call, then why, as a held command reads.
+/// Null for any other row.
+fn unrunMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?StoryRowText {
+    const record = row.detail orelse return null;
+    if (record.outcome != .denied or record.activity_kind != .mcp) return null;
+    for (mcp_unrun_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
+        const words = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const body = try std.mem.concat(scratch, u8, &.{ "Didn't use ", words });
+        return .{ .display = try std.mem.concat(scratch, u8, &.{ body, label.note }), .body = body, .suffix = label.note };
+    };
+    return null;
+}
+
+test "an MCP tool's name reads as lower-case words" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { name: []const u8, words: []const u8 }{
+        .{ .name = "read_thread", .words = "read thread" },
+        .{ .name = "getIssue", .words = "get issue" },
+        .{ .name = "getHTTPStatus", .words = "get http status" },
+        .{ .name = "list__v2_items_", .words = "list v2 items" },
+        .{ .name = "take-screenshot", .words = "take-screenshot" },
+        .{ .name = "search", .words = "search" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.words, try toolNameWords(a, case.name));
+}
+
+test "MCP rows say in words which server's tool a call used" {
     const alloc = std.testing.allocator;
     const Case = struct { phrase: []const u8, run: []const u8, result: ?[]const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
     const cases = [_]Case{
         // The tool repeats its server's name.
-        .{ .phrase = "● Ran MCP mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = "{\"server\":\"slack\",\"tool\":\"mcp_slack_slack_read_thread\",\"result\":{\"content\":[]}}", .outcome = .completed, .row = "● Ran slack read_thread" },
-        .{ .phrase = "● Ran MCP mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = "{\"server\":\"linear\",\"tool\":\"mcp_linear_get_issue\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"cut sho", .outcome = .completed, .row = "● Ran linear get_issue" },
+        .{ .phrase = "● Ran MCP mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = "{\"server\":\"slack\",\"tool\":\"mcp_slack_slack_read_thread\",\"result\":{\"content\":[]}}", .outcome = .completed, .row = "● Used Slack to read thread" },
+        .{ .phrase = "● Ran MCP mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = "{\"server\":\"linear\",\"tool\":\"mcp_linear_get_issue\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"cut sho", .outcome = .completed, .row = "● Used Linear to get issue" },
+        .{ .phrase = "● Ran MCP mcp_linear_getIssue\n", .run = "mcp_linear_getIssue", .result = null, .outcome = .completed, .row = "● Used Linear to get issue" },
         // A running call has no result yet.
-        .{ .phrase = "● Running MCP mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = null, .row = "● Running bloop get_account" },
-        .{ .phrase = "● Ran MCP mcp_chrome-devtools_take_screenshot\n", .run = "mcp_chrome-devtools_take_screenshot", .result = null, .outcome = .completed, .row = "● Ran chrome-devtools take_screenshot" },
+        .{ .phrase = "● Running MCP mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = null, .row = "● Using Bloop to get account" },
+        .{ .phrase = "● Ran MCP mcp_chrome-devtools_take_screenshot\n", .run = "mcp_chrome-devtools_take_screenshot", .result = null, .outcome = .completed, .row = "● Used Chrome-devtools to take screenshot" },
         // A server whose name has a "_" in it: the result names the server.
-        .{ .phrase = "● Ran MCP mcp_team_notes_search\n", .run = "mcp_team_notes_search", .result = "{\"server\":\"team notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}", .outcome = .completed, .row = "● Ran team notes search" },
-        // A call that did not run keeps core's words for why, and one the
-        // safety review held reads as a held command does.
-        .{ .phrase = "● Denied mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Denied bloop get_account" },
-        .{ .phrase = "● Denied by auto agent mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Denied by auto agent bloop get_account" },
-        .{ .phrase = "● Review unavailable mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Review unavailable linear get_issue" },
-        .{ .phrase = "● Review evidence incomplete mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Review evidence incomplete linear get_issue" },
-        .{ .phrase = "● Permission required mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Permission required slack read_thread" },
-        .{ .phrase = "● Safety caution mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Held slack read_thread · safety caution" },
+        .{ .phrase = "● Ran MCP mcp_team_notes_search\n", .run = "mcp_team_notes_search", .result = "{\"server\":\"team notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}", .outcome = .completed, .row = "● Used Team notes to search" },
+        // A server name the terminal would act on shows escaped.
+        .{ .phrase = "● Ran MCP mcp_bad_name_search\n", .run = "mcp_bad_name_search", .result = "{\"server\":\"bad\\u001bname\",\"tool\":\"mcp_bad_name_search\",\"result\":{}}", .outcome = .completed, .row = "● Used Bad\\x1bname to search" },
+        .{ .phrase = "● Failed mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .failed, .row = "● Couldn't use Linear to get issue" },
+        // A call that did not run says so, then core's reason.
+        .{ .phrase = "● Denied mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Didn't use Bloop to get account · denied" },
+        .{ .phrase = "● Denied by auto agent mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Didn't use Bloop to get account · denied by auto agent" },
+        .{ .phrase = "● Review unavailable mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · review unavailable" },
+        .{ .phrase = "● Review evidence incomplete mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Didn't use Linear to get issue · review evidence incomplete" },
+        .{ .phrase = "● Permission required mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Didn't use Slack to read thread · permission required" },
+        .{ .phrase = "● Safety caution mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Didn't use Slack to read thread · safety caution" },
     };
     for (cases) |case| {
         const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
@@ -3340,13 +3409,14 @@ test "MCP rows name the server, then its tool" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("rows:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "├ Running team_notes search ×2\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run fixture echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Using Team_notes to search ×2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "├ Couldn't use Fixture to echo\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "├ Couldn't run mcp__filesystem__read_text_file\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled bloop get_account\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled bloop get_account" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled using Bloop to get account\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled using Bloop to get account" ++ cancellation_follow_up) != null);
     try std.testing.expect(std.mem.find(u8, text, "mcp_bloop") == null);
     try std.testing.expect(std.mem.find(u8, text, "mcp_team") == null);
+    try std.testing.expect(std.mem.find(u8, text, "get_account") == null);
     try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
     try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
 }
@@ -3774,7 +3844,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
     };
     if (row.detail) |record| if (try heldCommandRowText(scratch, status_phrase, record, row.launch_command, style)) |held| return held;
-    if (try heldMcpRowText(scratch, status_phrase, row)) |held| return held;
+    if (try unrunMcpRowText(scratch, status_phrase, row)) |unrun| return unrun;
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const reprojected_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
@@ -4416,7 +4486,7 @@ fn writeGroupBlock(
 }
 
 /// What the row of the cancelled call `entry_id` names it by in the compact
-/// row's words, such as "github.com output for "npx"" or "fixture echo".
+/// row's words, such as "github.com output for "npx"" or "using Fixture to echo".
 /// Null for a call whose row keeps core's name.
 fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_id: u32) !?[]const u8 {
     const row = for (rows) |*candidate| {
@@ -5243,15 +5313,6 @@ fn heldCommandRowText(scratch: std.mem.Allocator, phrase: []const u8, record: *c
         try highlightCommandPhrase(scratch, full_phrase, record, style.text_style) orelse full_phrase;
     if (!std.mem.startsWith(u8, shown, label)) return null;
     return try heldRowText(scratch, shown[label.len..]);
-}
-
-/// An MCP call the safety review held, as "Held slack read_thread · safety
-/// caution", the way a held command reads. Null for any other row.
-fn heldMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?StoryRowText {
-    const record = row.detail orelse return null;
-    if (record.outcome != .denied or record.activity_kind != .mcp) return null;
-    const alias = withoutPrefix(phrase, safety_caution_label ++ " ") orelse return null;
-    return try heldRowText(scratch, try mcpToolName(scratch, alias, row.mcp_server) orelse return null);
 }
 
 /// "Held <name> · safety caution": what happened to the call, then why.
@@ -7082,7 +7143,7 @@ test "a toolbox run of a built-in tool reads as a direct call of it, by the tool
         .{ .status = "● Read notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .completed, .row = "● Read notes.txt" },
         // An MCP tool's run keeps toolbox's record and reads as a direct
         // call of that tool.
-        .{ .status = "● Failed mcp_fixture_echo\n", .tool_name = "toolbox", .activity_kind = .mcp, .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .outcome = .failed, .row = "● Couldn't run fixture echo" },
+        .{ .status = "● Failed mcp_fixture_echo\n", .tool_name = "toolbox", .activity_kind = .mcp, .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .outcome = .failed, .row = "● Couldn't use Fixture to echo" },
     };
     for (cases) |case| {
         const entry = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = case.status, .class = .tool_status } };
@@ -8050,8 +8111,8 @@ test "a cancelled command's notice drops only the command and keeps the line's s
     );
     // A name in place of core's sits in the line's styles.
     try std.testing.expectEqualStrings(
-        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled fixture echo", reset, follow_up }),
-        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled mcp_fixture_echo", reset, follow_up }), "fixture echo")).?,
+        try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled using Fixture to echo", reset, follow_up }),
+        (try cancelledNotice(a, try std.mem.concat(a, u8, &.{ warn, "▪", reset, " ", hint, "Cancelled mcp_fixture_echo", reset, follow_up }), "using Fixture to echo")).?,
     );
     // A line already without a command, and one an older fx saved with no
     // follow-up.
@@ -8082,7 +8143,7 @@ test "only a cancelled command's notice leaves out its text, in a group with an 
     // Each command's notice names no command, and the MCP call's names its
     // server and tool, as its row does.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\n\n▪ Cancelled · What can fx do differently?"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled fixture echo · What can fx do differently?"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n\n▪ Cancelled using Fixture to echo · What can fx do differently?"));
     try std.testing.expect(std.mem.find(u8, bytes, "Cancelled mcp_fixture_echo") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "> out.txt") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "Cancelled sleep 30 ·") == null);
@@ -9363,7 +9424,7 @@ test "a running toolbox run of an MCP tool joins that tool's row before its argu
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running fixture echo ×3", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● Using Fixture to echo ×3", std.mem.trim(u8, text, "\n"));
 }
 
 test "toolbox lookups and wrapped arguments name what the group did" {
@@ -10645,9 +10706,9 @@ test "calls of one MCP tool share a row that counts them" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    try std.testing.expect(std.mem.find(u8, text, "Ran slack read_thread ×4") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Ran slack"));
-    try std.testing.expect(std.mem.find(u8, text, "Couldn't run slack read_thread") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Used Slack to read thread ×4") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Used Slack"));
+    try std.testing.expect(std.mem.find(u8, text, "Couldn't use Slack to read thread") != null);
 }
 
 test "a run that returns while its command goes on stays on the row it joined, and so do its session's calls" {

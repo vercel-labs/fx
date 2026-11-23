@@ -35,8 +35,8 @@ import { zigGlobalCacheDir } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
-// How the compact view names that tool: its server, then the tool.
-const TOOL_ROW = "fixture echo";
+// How the compact view names that tool: its server, then what the tool does.
+const TOOL_ROW = "Fixture to echo";
 const ACCESS_INITIAL = "mcp-access-initial-secret";
 const ACCESS_REFRESHED = "mcp-access-refreshed-secret";
 const REFRESH_INITIAL = "mcp-refresh-initial-secret";
@@ -3706,7 +3706,7 @@ describe("MCP login", () => {
     const renewalStarted = Date.now();
 
     await tui.sendInterruptEscapePair(10_000);
-    await tui.waitForText(`Cancelled ${TOOL_ROW}`, 10_000);
+    await tui.waitForText(`Cancelled using ${TOOL_ROW}`, 10_000);
     expect(auth.protectedToolCalls).toBe(0);
     expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
     expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
