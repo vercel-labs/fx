@@ -341,11 +341,12 @@ pub fn configure(options: Options) !void {
     state.stderr_enabled = options.stderr_enabled;
 
     if (options.file_path) |path| {
-        try ensureParentDir(path);
-        rotateIfTooLarge(path, default_log_max_bytes);
-        var file = try std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = false });
-        file.close(zio);
-        state.file_path = std.heap.c_allocator.dupe(u8, path) catch null;
+        if (prepareTraceFile(zio, path)) |_| {
+            state.file_path = std.heap.c_allocator.dupe(u8, path) catch null;
+        } else |_| {
+            // Refused without a word: the file sink stays off, and the stderr
+            // sink below still starts.
+        }
     }
     if (options.scope_filter) |filter| {
         const trimmed = std.mem.trim(u8, filter, " \t\r\n");
@@ -355,18 +356,22 @@ pub fn configure(options: Options) !void {
     state.enabled = state.stderr_enabled or state.file_path != null;
 }
 
-fn rotateIfTooLarge(path: []const u8, max_bytes: u64) void {
-    const zio = io_mod.getIo();
-    var file = std.Io.Dir.openFileAbsolute(zio, path, .{}) catch return;
-    var should_truncate = false;
-    {
-        defer file.close(zio);
-        const stat = file.stat(zio) catch return;
-        if (stat.size > max_bytes) should_truncate = true;
-    }
-    if (!should_truncate) return;
-    var truncate = std.Io.Dir.createFileAbsolute(zio, path, .{ .truncate = true }) catch return;
-    truncate.close(zio);
+/// Opens the trace file for appending and creates it when missing. It is refused
+/// unless it is a regular file, so a FIFO or a device never blocks startup.
+fn prepareTraceFile(zio: std.Io, path: []const u8) !void {
+    try ensureParentDir(path);
+    var file = try io_mod.openRegularFileForAppendAbsolute(path, .follow);
+    defer file.close(zio);
+    rotateIfTooLargeFile(zio, file, default_log_max_bytes);
+}
+
+/// Truncates the open trace file once it passes `max_bytes`. The size is read and
+/// the file is cut through the same descriptor, so they cannot disagree.
+fn rotateIfTooLargeFile(zio: std.Io, file: std.Io.File, max_bytes: u64) void {
+    const stat = file.stat(zio) catch return;
+    if (stat.size <= max_bytes) return;
+    // A failed truncate keeps the old contents; logging goes on.
+    file.setLength(zio, 0) catch {};
 }
 
 pub fn isEnabled() bool {
@@ -401,12 +406,12 @@ fn writeLine(line: []const u8) void {
 }
 
 fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
-    var file = std.Io.Dir.createFileAbsolute(zio, path, .{
-        .truncate = false,
-        .lock = .exclusive,
-    }) catch return;
+    var file = io_mod.openRegularFileForAppendAbsolute(path, .follow) catch return;
     defer file.close(zio);
+    file.lock(zio, .exclusive) catch return;
+    defer file.unlock(zio);
     _ = std.c.lseek(file.handle, 0, std.posix.SEEK.END);
+    // A failed write loses one trace line; the trace is best effort.
     file.writeStreamingAll(zio, line) catch {};
 }
 
@@ -729,4 +734,133 @@ test "configureFromEnv leaves tracing disabled without env" {
     try std.testing.expect(io_mod.getenv("FX_TRACE_STDERR") == null);
     configureFromEnv(std.testing.allocator, "/tmp/workspace");
     try std.testing.expect(!isEnabled());
+}
+
+fn mkfifoForTest(alloc: Allocator, path: []const u8) !void {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    const path_z = try alloc.allocSentinel(u8, path.len, 0);
+    defer alloc.free(path_z);
+    @memcpy(path_z, path);
+    if (fifo_c.mkfifo(path_z, 0o600) != 0) return error.MkfifoFailed;
+}
+
+test "trace log refuses a FIFO at startup without blocking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const fifo = try tmpPath(alloc, root, "trace.fifo");
+    defer alloc.free(fifo);
+    try mkfifoForTest(alloc, fifo);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, fifo);
+    try std.testing.expect(!isEnabled());
+    try std.testing.expect(activeLogPath() == null);
+}
+
+test "trace log refuses a symlink to a FIFO without blocking" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const fifo = try tmpPath(alloc, root, "trace.fifo");
+    defer alloc.free(fifo);
+    try mkfifoForTest(alloc, fifo);
+    try tmp.dir.symLink(std.testing.io, fifo, "trace-link", .{});
+    const link = try tmpPath(alloc, root, "trace-link");
+    defer alloc.free(link);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, link);
+    try std.testing.expect(!isEnabled());
+    try std.testing.expect(activeLogPath() == null);
+}
+
+test "trace log refuses a FIFO that has a reader open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const fifo = try tmpPath(alloc, root, "trace.fifo");
+    defer alloc.free(fifo);
+    try mkfifoForTest(alloc, fifo);
+
+    // With a reader open, the write open succeeds and only the descriptor check refuses it.
+    const reader_fd = try std.posix.openat(std.Io.Dir.cwd().handle, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
+    var reader: std.Io.File = .{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
+    defer reader.close(io_mod.getIo());
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, fifo);
+    try std.testing.expect(!isEnabled());
+}
+
+test "refused trace file still starts the stderr sink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const fifo = try tmpPath(alloc, root, "trace.fifo");
+    defer alloc.free(fifo);
+    try mkfifoForTest(alloc, fifo);
+
+    resetForTest();
+    defer resetForTest();
+    try configure(.{ .file_path = fifo, .stderr_enabled = true });
+    try std.testing.expect(isEnabled());
+    try std.testing.expect(activeLogPath() == null);
+}
+
+test "oversized trace log is truncated in place before the first line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "trace.log");
+    defer alloc.free(path);
+    const big = try alloc.alloc(u8, default_log_max_bytes + 1);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.log", .data = big });
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+    logf("test", "after rotate", .{});
+
+    const trace = try readFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "[test] after rotate") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "xxxx") == null);
+}
+
+test "trace append refuses a FIFO that replaces the log after startup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "trace.log");
+    defer alloc.free(path);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+    try tmp.dir.deleteFile(std.testing.io, "trace.log");
+    try mkfifoForTest(alloc, path);
+
+    // Returns at once; a blocking open here would stall every thread that logs.
+    logf("test", "lost", .{});
+    try std.testing.expect(isEnabled());
 }

@@ -394,6 +394,189 @@ fn makeFileBlocking(file: *std.Io.File) !void {
     file.flags.nonblocking = false;
 }
 
+/// Owner-only: a trace log can carry request details.
+const append_file_mode = 0o600;
+
+/// Opens `sub_path` for appending, creating it when missing, and returns it only
+/// when it is a regular file. A relative path is taken from `dir`. The open never
+/// waits: `O_NONBLOCK` makes a FIFO with no reader fail with `ENXIO`, and a FIFO
+/// with a reader opens and is then refused by the descriptor check. Every other
+/// non-regular file is refused by that check too.
+pub fn openRegularFileForAppend(
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    final_symlink: FinalSymlinkPolicy,
+) !std.Io.File {
+    const zio = getIo();
+    const policy: RegularFileOpenPolicy = .{
+        .mode = .write_only,
+        .final_symlink = final_symlink,
+        .hardlinks = .allow,
+    };
+
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        if (final_symlink == .no_follow) {
+            const link = dir.statFile(zio, sub_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (link) |stat| {
+                if (stat.kind == .sym_link) return error.DurablePathUnsafe;
+            }
+        }
+        // Windows and WASI have no POSIX mode bits, so the default permissions apply.
+        var file = try dir.createFile(zio, sub_path, .{ .truncate = false });
+        errdefer file.close(zio);
+        try verifyOpenedRegularFileWithPolicy(try file.stat(zio), policy);
+        return file;
+    }
+
+    var flags: std.posix.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .NOFOLLOW = final_symlink == .no_follow,
+        .NONBLOCK = true,
+    };
+    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+    if (@hasField(std.posix.O, "NOCTTY")) flags.NOCTTY = true;
+
+    const fd = std.posix.openat(dir.handle, sub_path, flags, append_file_mode) catch |err| switch (err) {
+        error.NoDevice, error.SymLinkLoop, error.NotDir, error.IsDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    var file = std.Io.File{
+        .handle = fd,
+        .flags = .{ .nonblocking = true },
+    };
+    errdefer file.close(zio);
+    try verifyOpenedRegularFileWithPolicy(try file.stat(zio), policy);
+    try makeFileBlocking(&file);
+    return file;
+}
+
+/// `openRegularFileForAppend` for a path taken from the current directory. The
+/// path may be absolute or relative to it.
+pub fn openRegularFileForAppendAbsolute(path: []const u8, final_symlink: FinalSymlinkPolicy) !std.Io.File {
+    return openRegularFileForAppend(std.Io.Dir.cwd(), path, final_symlink);
+}
+
+test "append open creates a missing regular file and appends to an existing one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+
+    var first = try openRegularFileForAppend(tmp.dir, "trace.log", .follow);
+    try first.writeStreamingAll(getIo(), "one ");
+    first.close(getIo());
+
+    var second = try openRegularFileForAppend(tmp.dir, "trace.log", .follow);
+    try second.writeStreamingAll(getIo(), "two");
+    second.close(getIo());
+
+    var read = try tmp.dir.openFile(getIo(), "trace.log", .{});
+    defer read.close(getIo());
+    const bytes = try readFileToEnd(alloc, &read, 64);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("one two", bytes);
+}
+
+test "append open refuses a FIFO with no reader without blocking" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ root, "trace.fifo" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(fifo, .follow));
+}
+
+test "append open refuses a FIFO that has a reader, after the open" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ root, "trace.fifo" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    // A reader is open, so the write open succeeds and the descriptor check decides.
+    const reader_fd = try std.posix.openat(std.Io.Dir.cwd().handle, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
+    var reader: std.Io.File = .{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
+    defer reader.close(getIo());
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(fifo, .follow));
+}
+
+test "append open refuses a symlink to a FIFO under either policy, and refuses a directory" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ root, "trace.fifo" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+    try tmp.dir.symLink(std.testing.io, fifo, "trace-link", .{});
+    const link = try std.Io.Dir.path.join(alloc, &.{ root, "trace-link" });
+    defer alloc.free(link);
+
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(link, .follow));
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(link, .no_follow));
+    try tmp.dir.createDirPath(getIo(), "trace-dir");
+    const dir_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace-dir" });
+    defer alloc.free(dir_path);
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(dir_path, .follow));
+}
+
+test "append open follows a symlink to a regular file, but not under no_follow" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "target.log", .data = "" });
+    try tmp.dir.symLink(std.testing.io, "target.log", "link.log", .{});
+    const link = try std.Io.Dir.path.join(alloc, &.{ root, "link.log" });
+    defer alloc.free(link);
+
+    var file = try openRegularFileForAppendAbsolute(link, .follow);
+    try file.writeStreamingAll(getIo(), "through link");
+    file.close(getIo());
+    try std.testing.expectError(error.DurablePathUnsafe, openRegularFileForAppendAbsolute(link, .no_follow));
+
+    var target = try tmp.dir.openFile(getIo(), "target.log", .{});
+    defer target.close(getIo());
+    const bytes = try readFileToEnd(alloc, &target, 64);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("through link", bytes);
+}
+
 test "read-only regular files remain valid when atomic replacement unlinks the descriptor" {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
