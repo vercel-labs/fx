@@ -9647,10 +9647,12 @@ test "a parent's stop drops the parent's steering that was set aside too" {
     try std.testing.expectEqual(@as(usize, 0), runtime.dropParentSteering(alloc));
 }
 
-// A parent's steering that the worker cannot set aside is kept or counted: no
-// list holds a message whose copy failed, so the lost count is what is left.
+// A parent's steering the worker set aside is kept or counted, whichever
+// allocation fails. The sweep fails each allocation in turn, in the worker's
+// next take and in the owner's take of the leftovers. A copy that fails leaves
+// no list holding the message, so the lost count is what is left.
 test "a parent's steering message the worker cannot set aside is kept or counted as lost" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var receipt = SteeringReceipt{ .operation_id = "op-5" };
@@ -9669,10 +9671,10 @@ test "a parent's steering message the worker cannot set aside is kept or counted
             if (maybe_prompt) |prompt| freeQueuedPrompt(failing.allocator(), prompt);
         } else |_| {}
         {
-            const taken = runtime.takeLeftoverMessages(alloc);
+            const taken = runtime.takeLeftoverMessages(failing.allocator());
             defer {
-                for (taken) |item| item.deinit(alloc);
-                alloc.free(taken);
+                for (taken) |item| item.deinit(failing.allocator());
+                failing.allocator().free(taken);
             }
             try std.testing.expectEqual(@as(usize, 1), taken.len + runtime.takeLostSteering());
         }
@@ -9683,7 +9685,7 @@ test "a parent's steering message the worker cannot set aside is kept or counted
 // Two steering messages the worker cannot copy are each kept or counted as lost,
 // whichever copy fails: the messages taken and the lost count make both.
 test "leftover steering the worker cannot copy is counted as lost" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var first_receipt = SteeringReceipt{ .operation_id = "op-7a" };

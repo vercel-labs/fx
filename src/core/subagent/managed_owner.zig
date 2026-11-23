@@ -2332,7 +2332,7 @@ test "subagent wait returns its completed observation after the registry advance
 // The owner's copy of a leftover can fail. Then no list holds the message, so the
 // slot counts it as lost, and a stop or the end still has the count to report.
 test "a leftover the owner cannot keep is counted as lost" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
