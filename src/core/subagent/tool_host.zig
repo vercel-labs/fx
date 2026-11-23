@@ -1352,7 +1352,7 @@ pub const Runtime = struct {
         // The slot's end counted the messages a user's stop or close dropped
         // from the turn, which no stop or close had counted.
         dropped.count += end.dropped_by_user;
-        if (end.dropped_by_user > 0 and end.end.cause == .user_close) dropped.closed = true;
+        if (end.dropped_by_user > 0 and end.closed_by_user) dropped.closed = true;
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
         if (dropped.count > 0) return self.postDropNotice(end.child_id, dropped);
@@ -3881,6 +3881,40 @@ test "a user's stop of a work that owes no report tells the parent of its droppe
         "reviewer   cancelled The user stopped it, and 1 of your messages waiting for it were dropped. dropped=1",
         fixture.reports.items[0],
     );
+}
+
+test "a user's close of a turn that had returned tells the parent it was closed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    RunHeld.arm();
+    defer end_test_controls.test_hold_run = null;
+    defer RunHeld.release();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first", .report = "never" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    fixture.release.set(io_mod.getIo());
+    try RunHeld.first.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    RunHeld.release();
+    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[0], "The user closed it, and 1 of your messages waiting for it were dropped.");
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user stopped it") == null);
 }
 
 test "a turn the user starts on an idle subagent is a work, and reports its reply under every_turn" {
