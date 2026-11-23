@@ -2718,8 +2718,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     activeGateway: ReturnType<typeof startFakeGateway>,
     finalText: string,
     row: string,
-    options: { env?: Record<string, string>; answer?: (session: TmuxSession) => Promise<void> } = {},
+    options: { env?: Record<string, string>; answer?: (session: TmuxSession) => Promise<void>; alias?: string } = {},
   ) {
+    const alias = options.alias ?? TOOL_NAME;
     const compactRows = (screen: string) =>
       screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
     const stderrPath = join(root.root, "stderr.log");
@@ -2731,7 +2732,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForText(finalText, 20_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(`└ ${row}`);
-    expect(live.filter((line) => line.includes(TOOL_NAME))).toEqual([`├ Opened ${TOOL_NAME}`]);
+    expect(live.filter((line) => line.includes(alias))).toEqual([`├ Opened ${alias}`]);
     expect(readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await tui.sendText("/quit");
@@ -2783,6 +2784,149 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     },
     45_000,
   );
+
+  // A server whose name holds a "_" or a space gives an alias that could be
+  // another server's tool, as my_srv's echo could be my's srv_echo. With no
+  // result to name the server, the row names none rather than the wrong one.
+  function renameFixtureServer(root: FixtureRoot, name: string): string {
+    const configPath = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { mcp: Record<string, unknown> };
+    config.mcp[name] = config.mcp.fixture;
+    delete config.mcp.fixture;
+    writeFileSync(configPath, JSON.stringify(config));
+    return `mcp_${name.replace(/[^A-Za-z0-9_-]/g, "_")}_echo`;
+  }
+
+  function startAliasGateway(alias: string, finalText: string, classifierDecision?: "caution") {
+    return startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: alias }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: alias, arguments: { text: "hello" } }),
+      fakeGatewayFinalText(finalText),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      ...(classifierDecision ? { classifierDecision } : {}),
+    });
+  }
+
+  for (const server of ["my_srv", "Team notes"]) {
+    const label = server.replace(/[^A-Za-z0-9]/g, "-").toLowerCase();
+
+    test.skipIf(!tmuxAvailable())(
+      `the TUI names ${server} once a call's result names it, live and after a resume`,
+      async () => {
+        const root = createRoot(`tui-done-${label}`, MODERN_FIXTURE, { expectedElicitation: "both" });
+        const alias = renameFixtureServer(root, server);
+        const finalText = "DONE_NAMED_SERVER_COMPLETE";
+        const activeGateway = startAliasGateway(alias, finalText);
+        gateway = activeGateway;
+        const compactRows = (screen: string) =>
+          screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
+        const stderrPath = join(root.root, "stderr.log");
+        const env = fixtureEnv(root, activeGateway);
+        tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("Call the MCP fixture.");
+        await tui.waitForText(finalText, 20_000);
+        await tui.waitForStableComposer(10_000);
+        const live = compactRows(await tui.captureFullScrollback());
+        const serverName = server.charAt(0).toUpperCase() + server.slice(1);
+        expect(live).toContain(`└ Used ${serverName} to echo`);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+
+        const resumedStderrPath = join(root.root, "resumed-stderr.log");
+        tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
+        await tui.waitForComposer(15_000);
+        await tui.waitForText(finalText, 15_000);
+        expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
+        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+        await tui.kill();
+        tui = null;
+      },
+      45_000,
+    );
+
+    test.skipIf(!tmuxAvailable())(
+      `the TUI names no server for a held call on ${server}, whose alias could be another server's`,
+      async () => {
+        const root = createRoot(`tui-held-${label}`, MODERN_FIXTURE, { expectedElicitation: "both" });
+        const alias = renameFixtureServer(root, server);
+        const finalText = "HELD_UNNAMED_SERVER_COMPLETE";
+        const activeGateway = startAliasGateway(alias, finalText, "caution");
+        gateway = activeGateway;
+        await expectUnrunCallRows(root, activeGateway, finalText, "Didn't use an MCP tool · safety caution", { alias });
+      },
+      45_000,
+    );
+
+    test.skipIf(!tmuxAvailable())(
+      `the TUI names no server for a denied call on ${server}, whose alias could be another server's`,
+      async () => {
+        const root = createRoot(`tui-denied-${label}`, MODERN_FIXTURE, { expectedElicitation: "both" });
+        const alias = renameFixtureServer(root, server);
+        const finalText = "DENIED_UNNAMED_SERVER_COMPLETE";
+        const activeGateway = startAliasGateway(alias, finalText);
+        gateway = activeGateway;
+        await expectUnrunCallRows(root, activeGateway, finalText, "Didn't use an MCP tool · denied", {
+          alias,
+          env: { FX_PERMISSION_MODE: "ask" },
+          answer: async (session) => {
+            await session.waitForText("Allow this MCP tool call?", 15_000);
+            await session.sendKeys("3");
+          },
+        });
+      },
+      45_000,
+    );
+
+    test.skipIf(!tmuxAvailable())(
+      `the TUI names no server for a running, then cancelled, call on ${server}`,
+      async () => {
+        const root = createRoot(`tui-cancel-${label}`, MODERN_FIXTURE, {
+          mode: "stall_operation",
+          operationTimeoutMs: 30_000,
+          expectedElicitation: "both",
+        });
+        const alias = renameFixtureServer(root, server);
+        const activeGateway = startAliasGateway(alias, "CANCELLED_UNNAMED_SERVER_COMPLETE");
+        gateway = activeGateway;
+        const compactRows = (screen: string) =>
+          screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
+        const stderrPath = join(root.root, "stderr.log");
+        const env = fixtureEnv(root, activeGateway);
+        tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("Call the stalled MCP fixture.");
+        await tui.waitForText("└ Using an MCP tool", 20_000);
+        // The call reaches the server, so the session keeps it for the resume.
+        await tui.waitForPane(() => readWire(root.wireLogPath).some((entry) => entry.message.method === "tools/call"), 15_000);
+        await tui.sendInterruptEscapePair(10_000);
+        await tui.waitForText("Cancelled using an MCP tool", 10_000);
+        await tui.waitForStableComposer(10_000);
+        const live = compactRows(await tui.captureFullScrollback());
+        expect(live).toContain("└ Cancelled using an MCP tool");
+        expect(live).toContain("▪ Cancelled using an MCP tool · What can fx do differently?");
+        expect(live.filter((line) => / to (srv|notes) /.test(line) || line.includes("My to") || line.includes("Team to"))).toEqual([]);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await tui.sendText("/quit");
+        expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+
+        const resumedStderrPath = join(root.root, "resumed-stderr.log");
+        tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
+        await tui.waitForComposer(15_000);
+        // A resume shows no row for a call cancelled while it ran: core keeps
+        // no line for it, as Ctrl+O shows too. Only the turn's notice comes
+        // back, so no row can name a server either.
+        await tui.waitForText("▪ Cancelled · What can fx do differently?", 15_000);
+        expect(compactRows(await tui.captureFullScrollback())).toEqual([`● Opened ${alias}`, "▪ Cancelled · What can fx do differently?"]);
+        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+        await tui.kill();
+        tui = null;
+      },
+      45_000,
+    );
+  }
 
   test.skipIf(!tmuxAvailable())(
     "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
