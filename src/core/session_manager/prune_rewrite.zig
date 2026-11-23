@@ -137,15 +137,6 @@ fn rebuildSnapshot(
     try emitSnapshot(gpa, state, planned.seq, planned.ts, line_buf, out);
 }
 
-fn foldLine(gpa: std.mem.Allocator, state: *fold.State, fork_seq: u64, seq: u64, offset: u64, body: ?schema.Body) format.Error!void {
-    if (body) |known| {
-        try fold.apply(gpa, state, fork_seq, .{ .seq = seq, .offset = offset, .body = known });
-    } else {
-        state.last_seq = seq;
-        state.clean_exit = false;
-    }
-}
-
 /// Writes the restored log: every line of the first original, then every line
 /// of the current log past the original's last seq. The original's lines are
 /// the same bytes, so the seqs they name are the same lines. A snapshot past
@@ -183,7 +174,7 @@ pub fn restoreWrite(
         }
         const offset = out.position();
         try out.append(line.bytes);
-        try foldLine(gpa, &state, fork_seq, line.header.seq, offset, body);
+        try format.foldLine(gpa, &state, fork_seq, line.header.seq, offset, body);
         original_last = line.header.seq;
     }
 
@@ -203,7 +194,7 @@ pub fn restoreWrite(
         const body = try format.bodyOf(parsing.allocator(), line);
         const offset = out.position();
         try out.append(line.bytes);
-        try foldLine(gpa, &state, fork_seq, line.header.seq, offset, body);
+        try format.foldLine(gpa, &state, fork_seq, line.header.seq, offset, body);
     }
     try out.flush();
 }

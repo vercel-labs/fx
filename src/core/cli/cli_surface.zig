@@ -3770,7 +3770,7 @@ fn runSessionPrune(alloc: Allocator, deps: RunDeps, opts: SessionPruneOptions) !
     defer store.deinit(alloc);
     if (opts.all) return runPruneEvery(alloc, deps, &store, opts);
 
-    var row = try sessionPruneRow(alloc, &store, opts.target.?, opts.dry_run, opts.discard_original, false);
+    var row = try sessionPruneRow(alloc, &store, opts.target.?, opts);
     defer row.deinit(alloc);
     if (row.failure) |failure| return writeSessionActionFailure(alloc, deps, "session_prune", failure, opts.format);
     const single = [_]session_prune.Row{row};
@@ -3780,16 +3780,9 @@ fn runSessionPrune(alloc: Allocator, deps: RunDeps, opts: SessionPruneOptions) !
     return .handled_success;
 }
 
-fn sessionPruneRow(
-    alloc: Allocator,
-    store: *session_adapter.Store,
-    id: []const u8,
-    dry_run: bool,
-    discard_original: bool,
-    many: bool,
-) !session_prune.Row {
-    if (discard_original) return session_prune.discardOriginal(store, alloc, id, dry_run, many);
-    return session_prune.prune(store, alloc, id, dry_run);
+fn sessionPruneRow(alloc: Allocator, store: *session_adapter.Store, id: []const u8, opts: SessionPruneOptions) !session_prune.Row {
+    if (opts.discard_original) return session_prune.discardOriginal(store, alloc, id, opts.dry_run, opts.all);
+    return session_prune.prune(store, alloc, id, opts.dry_run);
 }
 
 /// One row per root session, newest first. Exit 1 when any session was busy
@@ -3804,7 +3797,7 @@ fn runPruneEvery(alloc: Allocator, deps: RunDeps, store: *session_adapter.Store,
     }
     var clean = true;
     for (ids) |id| {
-        var row = try sessionPruneRow(alloc, store, id, opts.dry_run, opts.discard_original, true);
+        var row = try sessionPruneRow(alloc, store, id, opts);
         errdefer row.deinit(alloc);
         if (row.failure) |failure| row.message = commandFailureMessage(failure);
         if (row.status == .busy or row.status == .failed) clean = false;

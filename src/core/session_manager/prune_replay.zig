@@ -198,22 +198,13 @@ fn checkSnapshot(gpa: std.mem.Allocator, arena: std.mem.Allocator, body: schema.
 }
 
 fn applyKnown(gpa: std.mem.Allocator, state: *fold.State, fork_seq: u64, line: log_mod.Line, body: ?schema.Body) format.Error!void {
-    if (body) |known| {
-        try fold.apply(gpa, state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = known });
-    } else {
-        state.last_seq = line.header.seq;
-        state.clean_exit = false;
-    }
+    return format.foldLine(gpa, state, fork_seq, line.header.seq, line.offset, body);
 }
 
 fn isTurnEnd(header: schema.Header) bool {
     return header.kind == .turn_committed or header.kind == .turn_interrupted;
 }
 
-/// Two folded states agree. The compaction offset is a byte position, which
-/// the rewrite moves, and a legacy usage value reads as no totals, so both are
-/// compared as their readers see them: the offset not at all, the usage as
-/// its meaning.
 /// The state a reader folds from every line of the log.
 pub fn foldOf(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, end: u64) format.Error!fold.State {
     var reader = log_mod.ForwardReader.init(gpa, s, file, 0, end, 1);
@@ -234,6 +225,10 @@ pub fn foldOf(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, en
     return state;
 }
 
+/// Two folded states agree. The compaction offset is a byte position, which
+/// the rewrite moves, and a legacy usage value reads as no totals, so both are
+/// compared as their readers see them: the offset not at all, the usage as
+/// its meaning.
 pub fn sameState(gpa: std.mem.Allocator, a: *const fold.State, b: *const fold.State) format.Error!bool {
     var ca = try a.clone(gpa);
     defer ca.deinit(gpa);

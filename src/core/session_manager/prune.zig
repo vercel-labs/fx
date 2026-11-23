@@ -50,14 +50,14 @@ pub const Report = struct {
 
 /// Writes the cleaned log into `dst`. `rewrite.write` is the real one; a test
 /// passes a planted one to prove the replay check refuses it.
-pub const WriteFn = *const fn (std.mem.Allocator, storage.Storage, storage.File, *const scan.Plan, storage.File) format.Error!void;
+const WriteFn = *const fn (std.mem.Allocator, storage.Storage, storage.File, *const scan.Plan, storage.File) format.Error!void;
 
 /// A step after staging: linking the original, or committing the staged file.
-pub const StepFn = *const fn (storage.Storage, storage.Dir) Error!void;
+const StepFn = *const fn (storage.Storage, storage.Dir) Error!void;
 
 /// The steps a cleanup runs. The real ones are the defaults; a test passes a
 /// failing or planted one to prove the protocol holds.
-pub const Seams = struct {
+const Seams = struct {
     write: WriteFn = rewrite.write,
     link: StepFn = linkOriginal,
     commit: StepFn = commit,
@@ -67,7 +67,7 @@ pub fn prune(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, optio
     return pruneWith(gpa, s, dir, options, .{});
 }
 
-pub fn pruneWith(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, options: Options, seams: Seams) Error!Report {
+fn pruneWith(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, options: Options, seams: Seams) Error!Report {
     const lock = try acquire(s, dir);
     defer release(s, lock);
     const log = try format.openLog(s, dir, format.log_name);
@@ -105,13 +105,11 @@ fn reportOf(outcome: Outcome, plan: *const scan.Plan, bytes_before: u64, bytes_a
     };
 }
 
-/// Puts the kept original back as the log. Refused unless a finished cleanup
-/// is there and the log has no lines past the cleanup's last seq.
 /// Writes the restored log into `dst`, from the first original and the
 /// current log.
-pub const RestoreWriteFn = *const fn (std.mem.Allocator, storage.Storage, storage.File, u64, storage.File, u64, storage.File) format.Error!void;
+const RestoreWriteFn = *const fn (std.mem.Allocator, storage.Storage, storage.File, u64, storage.File, u64, storage.File) format.Error!void;
 
-pub const RestoreSeams = struct {
+const RestoreSeams = struct {
     write: RestoreWriteFn = rewrite.restoreWrite,
     commit: StepFn = commit,
 };
@@ -122,6 +120,8 @@ pub const RestoreReport = struct {
     bytes_after: u64,
 };
 
+/// Puts the kept original back as the log, with every turn written since the
+/// cleanup. Refused unless a finished cleanup is there.
 pub fn restore(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir) Error!RestoreReport {
     return restoreWith(gpa, s, dir, .{});
 }
@@ -130,7 +130,7 @@ pub fn restore(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir) Err
 /// cleanup. The restored log is staged, proved by the replay check against the
 /// current log, and renamed over it. The kept folder goes last. A crash before
 /// the rename leaves the current log; after it, the restored one.
-pub fn restoreWith(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, seams: RestoreSeams) Error!RestoreReport {
+fn restoreWith(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, seams: RestoreSeams) Error!RestoreReport {
     const lock = try acquire(s, dir);
     defer release(s, lock);
     const log = try format.openLog(s, dir, format.log_name);
@@ -216,14 +216,20 @@ fn finished(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, log: f
     return scan.hasPlaceholder(gpa, s, log.file, log.end);
 }
 
+/// The kept original is `pruned/log.jsonl` itself. A folder without it, left by
+/// a crash inside a delete or by a person, holds no original.
 fn keptExists(s: storage.Storage, dir: storage.Dir) bool {
+    const kept = s.openDir(dir, format.kept_dir_name) catch return false;
+    defer s.closeDir(kept);
+    _ = s.stat(kept, format.log_name) catch return false;
+    return true;
+}
+
+fn keptFolderExists(s: storage.Storage, dir: storage.Dir) bool {
     _ = s.stat(dir, format.kept_dir_name) catch return false;
     return true;
 }
 
-/// Removes what a run that stopped before its commit left behind: a staged
-/// file, and a kept link to a log that was never replaced. A finished
-/// cleanup's kept original is left alone.
 /// Removes a staged file that a run left behind when it stopped. A missing
 /// one is fine.
 fn removeStaged(s: storage.Storage, dir: storage.Dir) Error!void {
@@ -233,10 +239,14 @@ fn removeStaged(s: storage.Storage, dir: storage.Dir) Error!void {
     };
 }
 
+/// Removes what a stopped run left behind: a staged file, a kept link to a log
+/// that was never replaced, and a kept folder without its log. A finished
+/// cleanup's kept original is left alone.
 fn removeLeftovers(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir, log: format.OpenedLog) Error!void {
     try removeStaged(s, dir);
-    if (!keptExists(s, dir)) return;
-    if (try scan.hasPlaceholder(gpa, s, log.file, log.end)) return;
+    if (keptExists(s, dir)) {
+        if (try scan.hasPlaceholder(gpa, s, log.file, log.end)) return;
+    } else if (!keptFolderExists(s, dir)) return;
     try s.deleteTree(dir, format.kept_dir_name);
 }
 
@@ -1009,6 +1019,51 @@ test "discard deletes only the kept original, and refuses before a cleanup" {
     const after = try Helpers.logBytes(gpa, dir);
     defer gpa.free(after);
     try std.testing.expectEqualSlices(u8, completed_bytes, after);
+}
+
+test "a kept folder without its log is no finished cleanup, and the next cleanup replaces it" {
+    const gpa = std.testing.allocator;
+    var scratch = fixture.Scratch.init(gpa);
+    defer scratch.deinit();
+    var b = fixture.Builder.init(gpa);
+    defer b.deinit();
+    try Helpers.sampleLog(&b);
+    const dir = try fixture.sessionDir(scratch.s, scratch.root, "s");
+    defer scratch.s.closeDir(dir);
+    try b.writeTo(scratch.s, dir, format.log_name);
+    _ = try prune(gpa, scratch.s, dir, .{});
+
+    // A crash inside the discard's delete, or a person who deletes the kept
+    // original by hand, leaves the folder without its log.
+    {
+        const kept = try scratch.s.openDir(dir, format.kept_dir_name);
+        defer scratch.s.closeDir(kept);
+        try scratch.s.deleteFile(kept, format.log_name);
+    }
+
+    const left = try status(gpa, scratch.s, dir);
+    try std.testing.expect(!left.finished);
+    try std.testing.expectEqual(@as(u64, 0), left.kept_bytes);
+    try std.testing.expectError(error.NotPruned, discard(gpa, scratch.s, dir));
+    try std.testing.expectError(error.NotPruned, restore(gpa, scratch.s, dir));
+
+    const tail_start = b.bytes.items.len;
+    try b.turn(4);
+    try b.snapshot();
+    try fixture.appendRaw(scratch.s, dir, format.log_name, b.bytes.items[tail_start..]);
+    const before = try Helpers.logBytes(gpa, dir);
+    defer gpa.free(before);
+
+    const again = try prune(gpa, scratch.s, dir, .{});
+    try std.testing.expectEqual(Outcome.pruned, again.outcome);
+    try std.testing.expect(!again.original_kept);
+    const kept = try scratch.s.openDir(dir, format.kept_dir_name);
+    defer scratch.s.closeDir(kept);
+    const kept_bytes = try Helpers.logBytes(gpa, kept);
+    defer gpa.free(kept_bytes);
+    try std.testing.expectEqualSlices(u8, before, kept_bytes);
+    try std.testing.expect((try status(gpa, scratch.s, dir)).finished);
+    try std.testing.expect(!Helpers.exists(scratch.s, dir, format.pruning_name));
 }
 
 const schema = @import("schema.zig");

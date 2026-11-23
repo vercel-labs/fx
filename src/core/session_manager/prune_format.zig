@@ -3,6 +3,7 @@
 //! door all read them from this file.
 
 const std = @import("std");
+const fold = @import("fold.zig");
 const log_mod = @import("log.zig");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
@@ -63,6 +64,18 @@ pub fn openLog(s: storage.Storage, dir: storage.Dir, name: []const u8) Error!Ope
 }
 
 /// The seq a fork's view ends at, from line 1's `forked_from`; 0 for a root.
+/// Folds one line as a reader does. A line of a kind this build does not know
+/// (null `body`) moves the seq on and marks the exit unclean, as `fold` does
+/// for a kind it skips.
+pub fn foldLine(gpa: std.mem.Allocator, state: *fold.State, fork_seq: u64, seq: u64, offset: u64, body: ?schema.Body) Error!void {
+    if (body) |known| {
+        try fold.apply(gpa, state, fork_seq, .{ .seq = seq, .offset = offset, .body = known });
+    } else {
+        state.last_seq = seq;
+        state.clean_exit = false;
+    }
+}
+
 pub fn forkSeqOf(body: schema.Body) u64 {
     return switch (body) {
         .session_created => |created| if (created.forked_from) |origin| origin.seq else 0,

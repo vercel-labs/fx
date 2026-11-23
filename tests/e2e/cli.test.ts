@@ -7031,7 +7031,8 @@ describe("cli: session prune, restore, and discard", () => {
   // Holds the session's writer lock, as another fx process with the session
   // open does, until the returned function runs.
   async function holdSessionLock(ctx: PruneContext, id: string): Promise<() => Promise<void>> {
-    const holder = Bun.spawn(["flock", "-x", join(sessionFolder(ctx, id), "lock"), "-c", "echo READY; read _"], {
+    const lockScript = 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "READY\\n"; <STDIN>;';
+    const holder = Bun.spawn(["perl", "-e", lockScript, join(sessionFolder(ctx, id), "lock")], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",

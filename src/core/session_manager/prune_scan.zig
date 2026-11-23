@@ -143,14 +143,6 @@ pub fn hasPlaceholder(gpa: std.mem.Allocator, s: storage.Storage, file: storage.
     }
 }
 
-/// The seq of the last whole line, or 0 for an empty log.
-pub fn lastSeq(gpa: std.mem.Allocator, s: storage.Storage, file: storage.File, end: u64) format.Error!u64 {
-    var reader = log_mod.BackwardReader.init(gpa, s, file, end);
-    defer reader.deinit();
-    const line = (reader.next() catch |err| return format.readError(err)) orelse return 0;
-    return line.header.seq;
-}
-
 test "a legacy usage line is superseded when a newer usage line follows it" {
     const gpa = std.testing.allocator;
     var scratch = fixture.Scratch.init(gpa);
