@@ -362,7 +362,7 @@ const append_file_mode = 0o600;
 /// waits: `O_NONBLOCK` makes a FIFO with no reader fail with `ENXIO`, and a FIFO
 /// with a reader opens and is then refused by the descriptor check. Every other
 /// non-regular file is refused by that check too.
-pub fn openRegularFileForAppend(
+fn openRegularFileForAppend(
     dir: std.Io.Dir,
     sub_path: []const u8,
     final_symlink: FinalSymlinkPolicy,

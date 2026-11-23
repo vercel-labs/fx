@@ -609,11 +609,17 @@ fn buildReport(app: anytype, fatal: ?anyerror) !BuiltTrace {
     try writeRendererState(r, app, &secrets, &masking);
     try writeRendererEvents(r);
     try writeTranscript(r, transcript);
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| {
+    if (traceLogPath()) |path| {
         try writeTraceLog(r, path);
     }
     try writeEnd(r);
     return .{ .bytes = try out.toOwnedSlice(), .crash = records.included_crash };
+}
+
+/// The trace log path a report names: only a path that a trace actually opened.
+/// A refused path is never reported, even when `FX_TRACE_LOG` names it.
+fn traceLogPath() ?[]const u8 {
+    return debug_trace.activeLogPath();
 }
 
 fn writeHeader(r: *Records, fx_version: []const u8, now_ms: i64) !void {
@@ -758,7 +764,7 @@ noinline fn writeCurrentState(r: *Records, app: anytype, crash_report: bool) !vo
         try r.endObject();
     }
     try r.boolean("fx_trace", envTruthy("FX_TRACE"));
-    if (debug_trace.activeLogPath() orelse io_mod.getenv("FX_TRACE_LOG")) |path| try r.masked("trace_log", path);
+    if (traceLogPath()) |path| try r.masked("trace_log", path);
     if (comptime agents.hasAgentField(App, "stream")) {
         const stream = &agent.stream;
         try r.beginObject("stream");
@@ -3025,6 +3031,9 @@ fn writeCrashReportInner(app: anytype, err: anyerror) !SavedCrashReport {
     defer alloc.free(built.bytes);
     const report = try capCrashReportBytes(alloc, built.bytes, last_crash_max_bytes);
     defer alloc.free(report);
+    if (report.len != built.bytes.len) {
+        debug_trace.logf("core", "crash report truncated original_bytes={d} kept_bytes={d} limit_bytes={d}", .{ built.bytes.len, report.len, last_crash_max_bytes });
+    }
 
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
@@ -7413,4 +7422,35 @@ test "crash-mode git record is skipped and runs no git" {
     try expectAbsent(git, "repository");
     try expectAbsent(git, "branch");
     try expectAbsent(git, "error");
+}
+
+test "trace log path for a report never falls back to a refused FX_TRACE_LOG" {
+    const alloc = std.testing.allocator;
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const fifo = try std.Io.Dir.path.join(alloc, &.{ dir, "trace.log" });
+    defer alloc.free(fifo);
+    const fifo_z = try alloc.allocSentinel(u8, fifo.len, 0);
+    defer alloc.free(fifo_z);
+    @memcpy(fifo_z, fifo);
+    try std.testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(fifo_z, 0o600));
+
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("FX_TRACE_LOG", fifo);
+    io_mod.setEnvironMap(&env);
+
+    // Configuring refuses the FIFO without blocking, so no file sink is active.
+    try debug_trace.configureForTest(alloc, fifo);
+    try std.testing.expectEqual(@as(?[]const u8, null), debug_trace.activeLogPath());
+    try std.testing.expectEqual(@as(?[]const u8, null), traceLogPath());
 }
