@@ -1973,7 +1973,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.commit_gate and self.unacknowledged_finishes > 0 and self.queued_history_owed > 0) {
             self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, null, .{ .given = ownership }) catch |err| {
-                debug_trace.logf("worker", "queued mail misses a committed turn err={s} dropped=turn_in_queued_history", .{@errorName(err)});
+                debug_trace.logf("worker", "queued prompt misses a committed turn err={s} dropped=turn_in_queued_history", .{@errorName(err)});
             };
         }
         self.releaseFinishesLocked(1, "committed");
@@ -2090,7 +2090,7 @@ pub const WorkerRuntime = struct {
         if (waited >= commit_gate_limit_ms) {
             debug_trace.eventf("worker", "commit_gate_expired", .{ .turn_id = head.turn_id }, "worker={x} unacknowledged={d} waited_ms={d} mail={s} reason=timeout", .{ @intFromPtr(self), self.unacknowledged_finishes, waited, @tagName(head.mail) });
             if (self.queued_history_owed > 0) {
-                debug_trace.logf("worker", "queued mail starts without finished turns turns={d} reason=gate_expired dropped=turns_in_queued_history", .{self.queued_history_owed});
+                debug_trace.logf("worker", "queued prompt starts without finished turns turns={d} reason=gate_expired dropped=turns_in_queued_history", .{self.queued_history_owed});
             }
             self.unacknowledged_finishes = 0;
             self.queued_history_owed = 0;
@@ -10581,7 +10581,7 @@ test "a gate that expires logs the turns its mail starts without, and a late com
     defer file.close(io_mod.getIo());
     const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
     defer alloc.free(trace);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "queued mail starts without finished turns turns=2 reason=gate_expired"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "queued prompt starts without finished turns turns=2 reason=gate_expired"));
 }
 
 test "a turn added at its end to a queue that was not empty is not added again at its commit" {
