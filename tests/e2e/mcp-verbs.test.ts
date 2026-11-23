@@ -1574,4 +1574,60 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
     await tui.waitForText("Added web to .mcp.json.", 10_000);
   }, 90_000);
+
+  // A file nested past the limit (src/core/shared/json_depth.zig) is not rewritten: the writer aborts the whole
+  // process at 256 levels. The reader still loads such a file.
+  const nested = (levels: number, server = "old") => `{"mcpServers":{"${server}":{"command":"true"}},"notes":${"[".repeat(levels)}${"]".repeat(levels)}}`;
+  const TOO_DEEP = "the file is nested more than 64 levels deep; flatten it by hand first";
+
+  test("add and remove refuse a file nested past the limit, however deep, and leave it as it was", async () => {
+    for (const levels of [64, 256, 300, 400_000]) {
+      const root = fresh(nested(levels));
+      writeFileSync(root.projectPath, nested(levels, "proj"));
+      for (const [flag, file, path, server] of [["--global", "~/.fx/mcp.json", root.profilePath, "old"], ["--project", ".mcp.json", root.projectPath, "proj"]] as const) {
+        await refused(root, ["--no-login", flag, "web", "https://mcp.example/mcp"], TOO_DEEP, file, "add", "web", path);
+        await refused(root, [flag, server], TOO_DEEP, file, "remove", server, path);
+      }
+      expect((await loaded(root)).sort()).toEqual(["old", "proj"]);
+    }
+  }, 120_000);
+
+  test("guard: a file at the limit is edited, and a deep file beside the one being edited does not stop it", async () => {
+    const root = fresh(nested(63));
+    const added = await mcp(root, "add", "--no-login", "web", "https://mcp.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.stdout).toBe("Added web to ~/.fx/mcp.json.\n");
+    expect(Object.keys(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers)).toEqual(["old", "web"]);
+    const removed = await mcp(root, "remove", "--global", "old");
+    expect(removed.stdout).toBe("Removed old from ~/.fx/mcp.json.\n");
+
+    writeFileSync(root.profilePath, nested(400_000));
+    const profile = bytesOf(root.profilePath);
+    const project = await mcp(root, "add", "--no-login", "--project", "web", "https://mcp.example/mcp");
+    expect(project.stderr).toBe("");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toStartWith("Added web to .mcp.json.\n");
+    expect(bytesOf(root.profilePath)).toBe(profile);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add and /mcp remove refuse a file nested past the limit and the shell keeps running", async () => {
+    const root = fresh(nested(300));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 220,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const before = readFileSync(root.profilePath, "utf8");
+    await tui.sendText("/mcp add web https://x.example/mcp");
+    await tui.waitForText(`Couldn't add web to ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    await tui.sendText("/mcp remove old");
+    await tui.waitForText(`Couldn't remove old from ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
+    await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
+    await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
 });

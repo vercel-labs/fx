@@ -8,6 +8,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const project_config = @import("../mcp/project_config.zig");
+const json_depth = @import("../shared/json_depth.zig");
 
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -32,10 +33,20 @@ pub const Error = Allocator.Error || error{
     BothKeys,
     /// `add`: the name is already in the file.
     Exists,
+    /// The file nests objects and arrays deeper than `json_depth.max_depth`.
+    TooDeep,
 };
+
+/// An edit writes the whole file back with `std.json.Stringify`, which aborts at 256 levels in a
+/// safe build, so a file past the shared limit is refused before it is parsed
+/// (`tests/tla/mcp_host/ConfigEdit.tla` `NoWriteOfDeep`). Reading such a file is not limited.
+fn requireShallow(text: []const u8) error{TooDeep}!void {
+    if (json_depth.exceeds(text)) return error.TooDeep;
+}
 
 /// The file with `name` added. `text` is null when the file doesn't exist yet.
 pub fn add(alloc: Allocator, file: File, text: ?[]const u8, name: []const u8, entry: Entry) Error![]u8 {
+    if (text) |t| try requireShallow(t);
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -60,6 +71,7 @@ pub const Removed = struct {
 
 /// The file without `name`, or null when `name` isn't in it.
 pub fn remove(alloc: Allocator, file: File, text: []const u8, name: []const u8) Error!?Removed {
+    try requireShallow(text);
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -359,6 +371,64 @@ test "add refuses what it can't edit safely" {
     const blank = try add(a, .profile, " \n", "b", entry);
     defer a.free(blank);
     try testing.expect(has(a, .profile, blank, "b"));
+}
+
+/// A config file with the server `a` and an unrelated key that nests `levels` arrays,
+/// so the file is `levels + 1` deep.
+fn nestedFile(a: Allocator, levels: usize) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "{\"mcpServers\":{\"a\":{\"command\":\"x\"}},\"notes\":");
+    try out.appendNTimes(a, '[', levels);
+    try out.appendNTimes(a, ']', levels);
+    try out.append(a, '}');
+    return out.toOwnedSlice(a);
+}
+
+test "add and remove edit a file at the nesting limit and refuse one past it, whatever its size" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entry: Entry = .{ .stdio = .{ .command = "y" } };
+    const at_limit = try nestedFile(a, json_depth.max_depth - 1);
+    // `std.json.Stringify` aborts at 256 levels; 100,000 is far past anything it could hold.
+    const past_limit = [_]usize{ json_depth.max_depth, 256, 300, 100_000 };
+    for ([_]File{ .profile, .project }) |file| {
+        const added = try add(a, file, at_limit, "web", entry);
+        try testing.expect(has(a, file, added, "web"));
+        const removed = (try remove(a, file, at_limit, "a")).?;
+        try testing.expect(!has(a, file, removed.text, "a"));
+        for (past_limit) |levels| {
+            const deep = try nestedFile(a, levels);
+            try testing.expectError(error.TooDeep, add(a, file, deep, "web", entry));
+            try testing.expectError(error.TooDeep, remove(a, file, deep, "a"));
+            // A read still finds the server, so a remove of it says why it won't edit the file.
+            try testing.expect(has(a, file, deep, "a"));
+        }
+    }
+}
+
+test "update leaves a file nested past the limit as it was" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const profile = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(profile);
+    const project = try std.Io.Dir.path.join(alloc, &.{ home, ".mcp.json" });
+    defer alloc.free(project);
+    const deep = try nestedFile(alloc, 300);
+    defer alloc.free(deep);
+
+    for ([_]File{ .profile, .project }) |file| {
+        const path = if (file == .profile) profile else project;
+        try write(alloc, file, path, deep);
+        try testing.expectError(error.TooDeep, update(alloc, profile, file, path, .{ .add = .{ .name = "web", .entry = good_entry } }));
+        try testing.expectError(error.TooDeep, update(alloc, profile, file, path, .{ .remove = "a" }));
+        const same = (try read(alloc, path)).?;
+        defer alloc.free(same);
+        try testing.expectEqualStrings(deep, same);
+    }
 }
 
 test "remove drops one entry, keeps the rest in order, and returns its url" {
@@ -779,6 +849,19 @@ fn loadedOrHeld(configs: anytype, diagnostics: []const project_config.WorkspaceD
     return false;
 }
 
+/// How deep a fuzzed file nests its unrelated key: around the shared limit, and around the 256
+/// levels `std.json.Stringify` holds, which is where an edit used to abort.
+const fuzz_nesting = [_]usize{ 0, 1, 62, 63, 64, 65, 128, 255, 256, 257, 300, 1000 };
+
+/// An add or a remove of a file nested `fuzz_nesting` deep is refused as `TooDeep` exactly when the
+/// file is past the shared limit, and never aborts. Another refusal, such as a name that is there, is not.
+fn fuzzNested(a: Allocator, smith: *std.testing.Smith, file: File, name: []const u8, entry: Entry) !void {
+    const text = try nestedFile(a, fuzz_nesting[smith.index(fuzz_nesting.len)]);
+    const too_deep = json_depth.exceeds(text);
+    if (add(a, file, text, name, entry)) |_| try testing.expect(!too_deep) else |err| try testing.expectEqual(too_deep, err == error.TooDeep);
+    if (remove(a, file, text, "a")) |_| try testing.expect(!too_deep) else |err| try testing.expectEqual(too_deep, err == error.TooDeep);
+}
+
 fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -787,6 +870,7 @@ fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
     const name = fuzz_names[smith.index(fuzz_names.len)];
     const before = try fuzzBefore(a, smith);
     const entry = try fuzzEntry(a, smith);
+    try fuzzNested(a, smith, file, name, entry);
     // A file add refuses on its own (not JSON, both keys, a name that is there) has nothing to check.
     const after = add(a, file, before, name, entry) catch |err| switch (err) {
         error.OutOfMemory => return err,
