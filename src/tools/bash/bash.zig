@@ -253,7 +253,7 @@ fn callRun(
     // A save record that a program left after it ended, with its end never
     // delivered, is this program's to report. It is taken here, just before this
     // program starts, and its notice goes into this program's result.
-    const leftover = takeSaveNotice(ctx.allocator, session, true) catch |err| return runtimeFailure(ctx, err);
+    const leftover = takeSaveNotice(ctx.allocator, session, .previous) catch |err| return runtimeFailure(ctx, err);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -274,9 +274,15 @@ fn callRun(
         .cancel_flag = ctx.cancel_flag,
         .tool_yield_flag = ctx.tool_yield_flag,
     }) catch |err| {
-        if (leftover) |text| ctx.allocator.free(text);
-        if (err == error.Cancelled and cancelRequested(ctx)) return error.Cancelled;
-        return runtimeFailure(ctx, err);
+        if (err == error.Cancelled and cancelRequested(ctx)) {
+            // A cancelled call returns an error, not a result, so the notice has no result to go in.
+            if (leftover) |text| {
+                ctx.allocator.free(text);
+                logDroppedNotice(err);
+            }
+            return error.Cancelled;
+        }
+        return startFailure(ctx, err, leftover);
     };
     defer prepared.deinit(ctx.allocator);
     return finish(ctx, runtime, &prepared, leftover);
@@ -306,11 +312,14 @@ fn callWait(
     return finish(ctx, runtime, &prepared, null);
 }
 
+/// Which program a save notice is about: `own` is the program whose result carries
+/// the notice, and `previous` is a program that ended before that call.
+const NoticeOwner = enum { own, previous };
+
 /// Takes the save record the last program's save left, if there is one, logs why
 /// that program's state was not saved, and returns the notice for the result. The
-/// caller frees a non-null result. `previous` is true when the program ended
-/// before this call.
-fn takeSaveNotice(alloc: Allocator, session: *bash_session.Session, previous: bool) Allocator.Error!?[]u8 {
+/// caller frees a non-null result.
+fn takeSaveNotice(alloc: Allocator, session: *bash_session.Session, owner: NoticeOwner) Allocator.Error!?[]u8 {
     const status = session.takeSaveStatus(io_mod.getIo()) orelse return null;
     const bytes: usize = switch (status) {
         .over_cap => |size| size,
@@ -318,16 +327,16 @@ fn takeSaveNotice(alloc: Allocator, session: *bash_session.Session, previous: bo
     };
     debug_trace.logf("bash", "bash state not saved: reason={s} bytes={d}", .{ @tagName(status), bytes });
     return switch (status) {
-        .over_cap => |size| if (previous)
-            try alloc.print("fx: the previous program's bash state is {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; this program started from the last saved state.", .{size})
+        .over_cap => |size| if (owner == .previous)
+            try alloc.print("fx: the previous program's bash state was {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; the last saved state stays.", .{size})
         else
             try alloc.print("fx: this program's bash state is {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; the next program starts from the last saved state.", .{size}),
-        .failed => try alloc.dupe(u8, if (previous)
-            "fx: the previous program's bash state could not be saved; this program started from the last saved state."
+        .failed => try alloc.dupe(u8, if (owner == .previous)
+            "fx: the previous program's bash state could not be saved; the last saved state stays."
         else
             "fx: this program's bash state could not be saved; the next program starts from the last saved state."),
-        .not_saved => try alloc.dupe(u8, if (previous)
-            "fx: the previous program ended before fx could save its bash state, so it was not saved; this program started from the last saved state."
+        .not_saved => try alloc.dupe(u8, if (owner == .previous)
+            "fx: the previous program ended before fx could save its bash state, so it was not saved; the last saved state stays."
         else
             "fx: this program ended before fx could save its bash state, so it was not saved; the next program starts from the last saved state."),
     };
@@ -352,6 +361,63 @@ fn formatWithNotices(alloc: Allocator, snapshot: managed_execution.Snapshot, max
     return withNotices(alloc, formatted, notices);
 }
 
+/// The result when the program did not start. The previous program's notice, if
+/// it has one, goes after the failure text, so the model still reads it. Takes
+/// `leftover`.
+fn startFailure(ctx: tool_dispatch.DispatchContext, err: anyerror, leftover: ?[]u8) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    defer if (leftover) |text| ctx.allocator.free(text);
+    if (err == error.OutOfMemory) {
+        if (leftover != null) logDroppedNotice(err);
+        return error.OutOfMemory;
+    }
+    const failure = ctx.allocator.print("bash could not run the program: {s}.", .{@errorName(err)}) catch |alloc_err| {
+        if (leftover != null) logDroppedNotice(alloc_err);
+        return alloc_err;
+    };
+    const notices = [_]?[]const u8{leftover};
+    const body = withNotices(ctx.allocator, failure, &notices) catch |attach_err| {
+        if (leftover != null) logDroppedNotice(attach_err);
+        return attach_err;
+    };
+    if (leftover != null) debug_trace.logf("bash", "the previous program's not-saved notice went with a start failure err={s}", .{@errorName(err)});
+    return .{ .failure = body };
+}
+
+/// The failure result for a call whose program ran, but whose result could not be
+/// delivered. Its save notices go after `text`, and the trace says so. Out of
+/// memory leaves no result to carry them, so it is returned as an error and the
+/// notices are logged as dropped.
+fn undeliveredResult(ctx: tool_dispatch.DispatchContext, text: []const u8, notices: []const ?[]const u8, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const has_notice = hasNotice(notices);
+    if (err == error.OutOfMemory) {
+        if (has_notice) logDroppedNotice(err);
+        return error.OutOfMemory;
+    }
+    const body = ctx.allocator.dupe(u8, text) catch |alloc_err| {
+        if (has_notice) logDroppedNotice(alloc_err);
+        return alloc_err;
+    };
+    const with_notices = withNotices(ctx.allocator, body, notices) catch |attach_err| {
+        if (has_notice) logDroppedNotice(attach_err);
+        return attach_err;
+    };
+    if (has_notice) debug_trace.logf("bash", "a save notice went with a result failure err={s}", .{@errorName(err)});
+    return .{ .failure = with_notices };
+}
+
+/// Whether any of `notices` is present.
+fn hasNotice(notices: []const ?[]const u8) bool {
+    for (notices) |notice| {
+        if (notice != null) return true;
+    }
+    return false;
+}
+
+/// Logs that a save notice reached no result, and why.
+fn logDroppedNotice(err: anyerror) void {
+    debug_trace.logf("bash", "a save notice was dropped with no result to carry it err={s}", .{@errorName(err)});
+}
+
 /// Turns a program's snapshot into the result the model reads, then hands the
 /// delivery to the runtime. `leftover` is a notice from a program that ended
 /// before this one started, and it is freed here. A program that has ended
@@ -366,11 +432,12 @@ fn finish(
     defer if (leftover) |text| ctx.allocator.free(text);
     const own: ?[]u8 = if (ctx.bash_session) |session| blk: {
         if (std.meta.activeTag(prepared.snapshot.state) == .running) break :blk null;
-        break :blk takeSaveNotice(ctx.allocator, session, false) catch |err| {
+        break :blk takeSaveNotice(ctx.allocator, session, .own) catch |err| {
             // The reservation is made, so it is cancelled on this failure too.
             runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
                 debug_trace.logf("bash", "delivery cancel failed after a notice error err={s}", .{@errorName(cancel_err)});
             };
+            if (leftover != null) logDroppedNotice(err);
             return err;
         };
     } else null;
@@ -381,8 +448,7 @@ fn finish(
         runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
             debug_trace.logf("bash", "delivery cancel failed after a format error err={s}", .{@errorName(cancel_err)});
         };
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return failureText(ctx, "bash result is unavailable");
+        return undeliveredResult(ctx, "bash result is unavailable", &notices, err);
     };
     managed_delivery.handoff(ctx, runtime, prepared.reservation_id) catch |err| {
         debug_trace.logf("bash", "result commit failed err={s}", .{@errorName(err)});
@@ -390,7 +456,7 @@ fn finish(
         runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
             debug_trace.logf("bash", "delivery cancel failed after a commit failure err={s}", .{@errorName(cancel_err)});
         };
-        return failureText(ctx, "bash result commit failed");
+        return undeliveredResult(ctx, "bash result commit failed", &notices, err);
     };
     // The program has ended, so the next program starts where it left off.
     if (ctx.bash_session) |session| {
@@ -1049,7 +1115,7 @@ test "a save record a program left unseen is reported with the next program's re
     defer next.deinit(alloc);
     const text = try outcomeText(next, true);
     try std.testing.expect(std.mem.startsWith(u8, text, "next\n"));
-    try std.testing.expect(std.mem.find(u8, text, "fx: the previous program's bash state is 2000000 bytes, over the 1048576-byte limit") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fx: the previous program's bash state was 2000000 bytes, over the 1048576-byte limit, so it was not saved; the last saved state stays.") != null);
 
     // A record left after the program that followed is reported by the call after it.
     try bash.writeSaveRecord("failed\n");
@@ -1057,14 +1123,14 @@ test "a save record a program left unseen is reported with the next program's re
     const later = try callRun(ctx, "echo later", program_yield_ms);
     defer later.deinit(alloc);
     const later_text = try outcomeText(later, true);
-    try std.testing.expect(std.mem.find(u8, later_text, "the previous program's bash state could not be saved") != null);
+    try std.testing.expect(std.mem.find(u8, later_text, "fx: the previous program's bash state could not be saved; the last saved state stays.") != null);
 
     // A program that ended without its save leaves `pending`, and the call after it reports that.
     try bash.writeSaveRecord("pending\n");
     try bash.authorize(&ctx, "echo ended");
     const ended = try callRun(ctx, "echo ended", program_yield_ms);
     defer ended.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, try outcomeText(ended, true), "fx: the previous program ended before fx could save its bash state, so it was not saved; this program started from the last saved state.") != null);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(ended, true), "fx: the previous program ended before fx could save its bash state, so it was not saved; the last saved state stays.") != null);
 }
 
 /// The notice for a program that ended before its save ran.
@@ -1190,6 +1256,43 @@ test "a program that sets xtrace shows its own lines and no line from the save" 
     const next = try callRun(ctx, "echo \"y=$y\"", program_yield_ms);
     defer next.deinit(alloc);
     try std.testing.expectEqualStrings("y=1\n", try outcomeText(next, true));
+}
+
+test "a notice a previous program left goes into the result of a call that fails to start, and the trace says so" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    try bash.authorize(&ctx, "x=41");
+    const first = try callRun(ctx, "x=41", program_yield_ms);
+    defer first.deinit(alloc);
+
+    // The record is written after the call that makes the session folder, as the leftover test does.
+    try bash.writeSaveRecord("pending\n");
+    // A yield above the ceiling makes startCaptured refuse before the program runs.
+    try bash.authorize(&ctx, "echo never");
+    const refused = try callRun(ctx, "echo never", managed_contract.max_wait_ceiling_ms + 1);
+    defer refused.deinit(alloc);
+    const refused_text = try outcomeText(refused, false);
+    try std.testing.expect(std.mem.startsWith(u8, refused_text, "bash could not run the program: InvalidYieldTime."));
+    try std.testing.expect(std.mem.find(u8, refused_text, "fx: the previous program ended before fx could save its bash state, so it was not saved; the last saved state stays.") != null);
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "the previous program's not-saved notice went with a start failure err=InvalidYieldTime") != null);
+
+    // The refused call took the record, so the next call starts from the last saved state.
+    try bash.authorize(&ctx, "echo \"x=$x\"");
+    const next = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
+    defer next.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(next, true), "x=41"));
 }
 
 test "a program that ends before its save logs reason not_saved" {

@@ -495,6 +495,7 @@ const body_after_skip =
     \\}
     \\END { if (block != "" && !(block in known)) printf "%s", block }' "$__fx_defs_fn" "$__fx_defs_al" || builtin exit 1
     \\      builtin shopt -p
+    \\      if [[ "$__fx_nocase" -eq 1 ]]; then builtin printf 'shopt -s nocasematch\n'; fi
     \\      builtin set +o | while builtin read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix'|*' xtrace') ;; *) builtin printf '%s\n' "$__fx_decl" ;; esac; done
     \\    } 2>/dev/null >|"$__fx_tmp"
     \\  ); then
@@ -577,7 +578,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("550cf4069976d6489eee2c33b109ab3cae63c00799d4fdf1805f1fa28675d867", &hex);
+    try std.testing.expectEqualStrings("55071cfb512399d6714c5641cebecb641c3e33c81f81fe8d5ba40551158e51e1", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -1867,10 +1868,11 @@ test "a program that sets nocasematch keeps the variables of the next program" {
     try expectExit(first, 0);
     try std.testing.expect(session.takeSaveStatus(io) == null);
 
-    const second = try runProgram(alloc, io, &session, dir, "nocase2", "echo \"x=$x h=$hostname\"");
+    // The option is part of the program's state, so the next program has it on too.
+    const second = try runProgram(alloc, io, &session, dir, "nocase2", "echo \"x=$x h=$hostname\"; if shopt -q nocasematch; then echo on; else echo off; fi");
     defer freeRun(alloc, second);
     try expectExit(second, 0);
-    try std.testing.expectEqualStrings("x=1 h=kept\n", second.stdout);
+    try std.testing.expectEqualStrings("x=1 h=kept\non\n", second.stdout);
 }
 
 test "a program that hides awk and mv from PATH still saves its state" {
