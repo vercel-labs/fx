@@ -130,6 +130,22 @@ const NAMES_ONLY: StoryStep[] = [
   { at: 2, text: "The notes are saved." },
 ];
 
+// A command that nests `$( )` deeper than any stack, in a request the shell
+// refuses before it runs anything, so fx draws its row and nothing runs.
+const NESTED_WITHOUT_END: StoryStep[] = [
+  {
+    at: 0,
+    calls: [{
+      name: "shell",
+      input: {
+        command: `echo ${"$(".repeat(50_000)}x`,
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  { at: 1, text: "The shell refused the request." },
+];
+
 // Two commands whose steps read the same, with a read between them.
 const SAID_AGAIN: StoryStep[] = [
   { at: 0, calls: [sh("sed -n 1,2p desktop/src/main.ts; grep -c export desktop/src/window.ts")] },
@@ -539,6 +555,35 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The notes are saved.", TIMEOUT);
     expectNames(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command nested without end gets a row that names its program, also after resume",
+  async () => {
+    const { root, gateway, session, pane } = await runStory(NESTED_WITHOUT_END, {
+      prompt: "echo it",
+      finalText: "The shell refused the request.",
+    });
+    const expectRow = (lines: string[]) => {
+      expect(lines.some((line) => line.startsWith("● Couldn't run echo"))).toBe(true);
+      expect(lines.some((line) => line.includes("$($("))).toBe(false);
+    };
+    expectRow(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The shell refused the request.", TIMEOUT);
+    expectRow(paneLines(await resumed.waitForComposer(TIMEOUT)));
   },
   TIMEOUT * 3,
 );

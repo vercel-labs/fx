@@ -2522,7 +2522,9 @@ fn collectStoryRows(
 /// that row, which then counts the calls of both, so a repeat shows once and
 /// the other rows keep their order. A row still running or that failed keeps
 /// its own, and so does a row for a file, a saved output, or a pattern, whose
-/// calls already share a row: two files with the same name stay two rows.
+/// calls already share a row: two files with the same name stay two rows. A
+/// subagent's report keeps its own line, and so does a subagent wait or
+/// status, whose row tells what main did while its subagents worked.
 fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) !void {
     const keys = try scratch.alloc(?[]const u8, rows.items.len);
     for (rows.items, keys) |*row, *key| key.* = try repeatKey(scratch, row);
@@ -2551,14 +2553,13 @@ const repeat_key_cols = std.math.maxInt(u16);
 /// to join it. Null for a row that keeps its own.
 fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
+    if (record.activity_kind == .subagent and !isSubagentMessage(scratch, record)) return null;
     switch (row.identity.kind) {
-        .read, .more_output, .search, .edit => return null,
+        .read, .more_output, .search, .edit, .subagent_wait => return null,
         // A command, read, search, or change whose arguments do not name
         // what it ran or touched may not be the same call, so it keeps its
         // own row, and so does any call with no usable arguments.
-        .single => if (!record.subagent_report) {
-            if (record.activity_kind == .command or joinsByArgument(record) or !storyHasArgs(record)) return null;
-        },
+        .single => if (record.activity_kind == .command or joinsByArgument(record) or !storyHasArgs(record)) return null,
         else => {},
     }
     if (record.outcome != .completed or record.streaming or row.failures > 0 or row.tries > 1 or storyCallFailed(row.detail)) return null;
@@ -2576,10 +2577,15 @@ fn rowCalls(row: *const StoryRow) usize {
 /// when no row joined it.
 fn joinedNote(scratch: std.mem.Allocator, row: *const StoryRow) ![]const u8 {
     if (row.joined_calls == 0) return "";
-    const record = row.detail.?;
-    const action = storyArgString(scratch, record, "action") orelse "";
-    const messages = record.subagent_report or (record.activity_kind == .subagent and std.mem.eql(u8, action, "message"));
+    const messages = isSubagentMessage(scratch, row.detail.?);
     return countNote(scratch, " · ", rowCalls(row) + row.joined_calls, if (messages) " messages" else " calls");
+}
+
+/// Whether a call is main's message to a subagent, not a report, wait, or
+/// status.
+fn isSubagentMessage(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    if (record.activity_kind != .subagent or record.subagent_report) return false;
+    return std.mem.eql(u8, storyArgString(scratch, record, "action") orelse "", "message");
 }
 
 /// The latest row with a run that returned while its command went on, for a
@@ -3537,6 +3543,11 @@ const shell_programs = [_][]const u8{
 /// How deep the short form looks into `sh -c` scripts inside `sh -c` scripts.
 const short_command_max_depth = 2;
 
+/// How many `$( )`, `<( )`, and array lists inside one another shortText
+/// reads part by part. Deeper ones it only counts its way through, so a
+/// command nested without end cannot run the stack out.
+const short_text_max_depth = 16;
+
 /// Programs that run a script named by their first argument.
 const interpreter_programs = [_][]const u8{
     "sh",      "bash", "zsh", "dash", "fish", "python",
@@ -4084,6 +4095,8 @@ const ShortTextScan = struct {
     /// here-document's body follows the words of its opening line.
     folded: bool,
     index: usize = 0,
+    /// How many parts the scan is inside, up to short_text_max_depth.
+    depth: usize = 0,
     out: std.ArrayList(u8) = .empty,
     substitutions: std.ArrayList(ShortSubstitution) = .empty,
     /// Here-documents whose bodies start on the next line.
@@ -4132,7 +4145,7 @@ const ShortTextScan = struct {
                 },
                 '<', '>' => if (rest.len > 1 and rest[1] == '(') {
                     self.index += 2;
-                    try self.skipToClose();
+                    _ = try self.skipToClose();
                     try self.emit(keep, "''");
                     continue;
                 } else if (std.mem.startsWith(u8, rest, "<<<")) {
@@ -4149,7 +4162,7 @@ const ShortTextScan = struct {
                     // qualifier or pattern, as in `test(N.om)`, belongs to
                     // its word.
                     self.index += 1;
-                    try self.skipToClose();
+                    _ = try self.skipToClose();
                     continue;
                 } else if (closes) {
                     parens += 1;
@@ -4166,19 +4179,63 @@ const ShortTextScan = struct {
         }
     }
 
-    /// Skips past the `)` that closes the part the scan is in.
-    fn skipToClose(self: *ShortTextScan) Error!void {
+    /// Skips past the `)` that closes the part the scan is in. True when
+    /// the part closes before the end.
+    fn skipToClose(self: *ShortTextScan) Error!bool {
+        if (self.depth >= short_text_max_depth) return self.countToClose();
+        self.depth += 1;
+        defer self.depth -= 1;
         try self.run(false, true);
-        if (self.index < self.command.len) self.index += 1;
+        if (self.index == self.command.len) return false;
+        self.index += 1;
+        return true;
     }
 
+    /// skipToClose for a part too deep to read: it counts the parentheses
+    /// and quotes up to the part's `)`, with no recursion. True when the
+    /// part closes before the end.
+    fn countToClose(self: *ShortTextScan) Error!bool {
+        const command = self.command;
+        // The `)` or `"` that closes each part the count is inside.
+        var closers: std.ArrayList(u8) = .empty;
+        try closers.append(self.scratch, ')');
+        while (self.index < command.len) {
+            const byte = command[self.index];
+            self.index += 1;
+            if (byte == '\\') {
+                self.index = @min(self.index + 1, command.len);
+                continue;
+            }
+            if (closers.last().? == '"') {
+                if (byte == '"') _ = closers.pop();
+                if (byte == '$' and self.index < command.len and command[self.index] == '(') {
+                    try closers.append(self.scratch, ')');
+                    self.index += 1;
+                }
+                continue;
+            }
+            switch (byte) {
+                '\'' => self.index = if (std.mem.findScalarPos(u8, command, self.index, '\'')) |at| at + 1 else command.len,
+                '"' => try closers.append(self.scratch, '"'),
+                '(' => try closers.append(self.scratch, ')'),
+                ')' => {
+                    _ = closers.pop();
+                    if (closers.items.len == 0) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// A `$( )`, which stays as `$()`. The scan keeps the script of one in
+    /// the text it keeps, for the step the script belongs to.
     fn substitution(self: *ShortTextScan, keep: bool) Error!void {
         self.index += "$(".len;
         const start = self.index;
-        try self.run(false, true);
-        const script = self.command[start..self.index];
-        if (self.index < self.command.len) self.index += 1;
-        if (keep) try self.substitutions.append(self.scratch, .{ .at = self.out.items.len, .script = script });
+        const closed = try self.skipToClose();
+        const script_end = if (closed) self.index - 1 else self.index;
+        if (keep) try self.substitutions.append(self.scratch, .{ .at = self.out.items.len, .script = self.command[start..script_end] });
         try self.emit(keep, "$()");
     }
 
@@ -8453,6 +8510,36 @@ test "a long shell command shows its steps in short form" {
     }
 }
 
+test "the short form of a command nested without end still names its program" {
+    // A command can nest `$( )` deeper than the stack holds; past a few
+    // levels the short form counts its way to the end of a part.
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const levels = 50_000;
+    const repeated = struct {
+        fn of(scratch: std.mem.Allocator, text: []const u8, count: usize) ![]const u8 {
+            const out = try scratch.alloc(u8, text.len * count);
+            for (0..count) |index| @memcpy(out[index * text.len ..][0..text.len], text);
+            return out;
+        }
+    }.of;
+    const closes = try repeated(arena, ")", levels);
+    const cases = [_]struct { command: []const u8, short: []const u8 }{
+        // Never closed, as in a command core cut short or a hostile one.
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "$(", levels), "x" }), .short = "echo" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "\"$(", levels), "x" }), .short = "echo" },
+        // Closed, so the steps after the part still show.
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "$(", levels), "x", closes, "; ls -la" }), .short = "echo, ls" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "diff ", try repeated(arena, "<(", levels), "x", closes, " b; ls -la" }), .short = "diff, ls" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "files=(", try repeated(arena, "$(", levels), "x", closes, ")", "; ls -la" }), .short = "ls" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.short, (try shortCommand(arena, case.command)) orelse return error.TestExpectedShortForm);
+    }
+}
+
 test "the short form names only the commands a shell command runs" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -8610,17 +8697,40 @@ test "a row said again in its group joins the first and counts its calls" {
     try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "└ Exited 1 sed, grep"));
     try std.testing.expect(rows.next() == null);
 
-    // Two messages from one subagent in a row are one row.
+    // Each report from a subagent keeps its own line, and so does a wait,
+    // which tells what main did while its subagents worked.
     const report: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{}"), .outcome = .completed, .subagent_report = true };
     const report_entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● from scout · found the owner\n", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "● from scout · found the callers\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● lander completed · Opened the PR.\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● lander completed · Opened the PR.\n", .class = .tool_status } },
     };
     var reports = [_]ToolDetailRecord{ report, report };
     reports[1].entry_id = 2;
     const report_text = try groupTextForTest(alloc, &report_entries, &reports);
     defer alloc.free(report_text);
-    try std.testing.expectEqualStrings("● Message from scout · 2 messages", std.mem.trim(u8, report_text, "\n"));
+    try std.testing.expect(std.mem.find(u8, report_text, "messages") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, report_text, "lander finished"));
+    const wait_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● waited for lander\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● waited for lander\n", .class = .tool_status } },
+    };
+    const waits = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"wait\"}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"wait\",\"agent\":\"lander\"}"), .outcome = .completed },
+    };
+    const wait_text = try groupTextForTest(alloc, &wait_entries, &waits);
+    defer alloc.free(wait_text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wait_text, "Waited for lander"));
+    try std.testing.expect(std.mem.find(u8, wait_text, "calls") == null);
+
+    // Main's messages to one subagent count as messages.
+    const message: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}"), .outcome = .completed };
+    var message_row: StoryRow = .{ .entry = report_entries[0], .entry_id = 1, .detail = &message, .identity = .{ .kind = .subagent, .key = "scout" }, .joined_calls = 1 };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings(" · 2 messages", try joinedNote(arena_state.allocator(), &message_row));
+    message_row.detail = &report;
+    try std.testing.expect(try repeatKey(arena_state.allocator(), &message_row) == null);
 
     // Two calls of another tool whose rows read the same are one row too.
     const skill: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("skill"), .activity_kind = .read, .arguments_json = @constCast("{\"name\":\"land\"}"), .outcome = .completed };
