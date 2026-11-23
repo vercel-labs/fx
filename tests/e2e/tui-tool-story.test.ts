@@ -6,6 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
+import { rootSessionIds } from "./saved-sessions";
 import {
   CHILD_MARKER,
   createStoryRoot,
@@ -374,13 +375,26 @@ function lastLinkTarget(tape: string, name: string): string | undefined {
   return [...bytes.matchAll(link)].at(-1)?.[1];
 }
 
-async function resumeStory(root: StoryRoot, gateway: { baseUrl: string; chatUrl: string }, finalText: string, tape?: string) {
+async function resumeStory(
+  root: StoryRoot,
+  gateway: { baseUrl: string; chatUrl: string },
+  finalText: string,
+  tape?: string,
+  options: { ready?: RegExp; cwd?: string; target?: string } = {},
+) {
   const env = tape ? { ...storyEnv(root, gateway), FX_RECORD: tape } : storyEnv(root, gateway);
-  const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env, width: 110, height: 60 });
+  const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${options.target ?? "last"}`, cwd: options.cwd ?? root.workspace, env, width: 110, height: 60 });
   sessions.push(resumed);
   await resumed.waitForText(finalText, TIMEOUT);
   await resumed.waitForComposer(TIMEOUT);
-  return { resumed, lines: paneLines(await resumed.waitForText(/^ {2}\d+ files? changed /m, TIMEOUT)) };
+  // The turn's recap shows once its history has replayed.
+  return { resumed, lines: paneLines(await resumed.waitForText(options.ready ?? /^ {2}\d+ files? changed /m, TIMEOUT)) };
+}
+
+/** Whether fx's recorded bytes link any file whose URL path ends in `name`. */
+function linksTo(tape: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\x1b\\]8;;file://[^\\x1b]*/${escaped}\\x1b\\\\`).test(readFileSync(tape).toString("latin1"));
 }
 
 test.skipIf(!tmuxAvailable())(
@@ -422,10 +436,10 @@ test.skipIf(!tmuxAvailable())(
     expect(lines.some((line) => /^ {2}2 files changed \+5 -5 · /.test(line))).toBe(true);
     // Each name links to its file, so Cmd+click opens it: a relative path in
     // the workspace, and a symlinked one where it resolves.
-    const targets = { "main.ts": fileUrlPath(main), "notes.md": fileUrlPath(notes), "window.ts": fileUrlPath(join(root.workspace, "desktop", "src", "window.ts")) };
+    const targets = { "main.ts": fileUrlPath(realpathSync(main)), "notes.md": fileUrlPath(notes), "window.ts": fileUrlPath(realpathSync(join(root.workspace, "desktop", "src", "window.ts"))) };
     for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(tape, name)).toBe(target);
     // What the model gets and what the session saves stay as they were.
-    for (const request of gateway.requests) expect(request.body).not.toContain("changed_path");
+    for (const request of gateway.requests) expect(request.body).not.toContain("resolved_path");
     expect(gateway.requests.at(-1)!.body).toContain("edited desktop/src/main.ts (");
 
     await session.kill();
@@ -434,7 +448,105 @@ test.skipIf(!tmuxAvailable())(
     const { lines: resumedLines } = await resumeStory(root, gateway, "Tidied main.ts.", resumedTape);
     expect(group(resumedLines, /^● Edited /)).toEqual(story);
     for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(resumedTape, name)).toBe(target);
-    for (const log of savedSessionLogs(root.home)) expect(readFileSync(log, "utf8")).not.toContain("changed_path");
+    for (const log of savedSessionLogs(root.home)) expect(readFileSync(log, "utf8")).not.toContain("resolved_path");
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a read through a symlink links to the file it read, and to nothing a click could run, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    // A repository can ship these: a note that is a script, a note that
+    // points to another note, and one that points nowhere.
+    writeFileSync(join(root.workspace, "run.command"), "#!/bin/sh\necho ran\n", { mode: 0o755 });
+    symlinkSync("run.command", join(root.workspace, "notes.md"));
+    mkdirSync(join(root.workspace, "real"));
+    writeFileSync(join(root.workspace, "real", "real.md"), "# real\n");
+    symlinkSync("real/real.md", join(root.workspace, "link.md"));
+    symlinkSync("missing.md", join(root.workspace, "gone.md"));
+    const read = (path: string) => ({ name: "read_file", input: { path } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will read the notes.", calls: [read("notes.md")] },
+      { at: 1, calls: [read("link.md")] },
+      { at: 2, calls: [read("gone.md")] },
+      { at: 3, text: "Read the notes." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("read the notes");
+    await session.waitForText("Read the notes.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const ready = /^ {2}Explored /m;
+    const lines = paneLines(await session.waitForText(ready, TIMEOUT));
+    const story = group(lines, /^● /);
+    expect(story.join("\n")).toContain("notes.md");
+    expect(story.join("\n")).toContain("gone.md");
+
+    // link.md links to the note it points to; notes.md, whose file would
+    // run, and gone.md, which names no file, link to nothing.
+    const real = fileUrlPath(realpathSync(join(root.workspace, "real", "real.md")));
+    const expectLinks = (recorded: string) => {
+      expect(lastLinkTarget(recorded, "link.md")).toBe(real);
+      expect(lastLinkTarget(recorded, "notes.md")).toBeUndefined();
+      expect(lastLinkTarget(recorded, "gone.md")).toBeUndefined();
+      for (const name of ["notes.md", "link.md", "gone.md", "run.command", "missing.md"]) expect(linksTo(recorded, name)).toBe(false);
+    };
+    expectLinks(tape);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Read the notes.", resumedTape, { ready });
+    expect(group(resumedLines, /^● /)).toEqual(story);
+    expectLinks(resumedTape);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a session resumed in another folder links no saved path, which could name another file there",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    mkdirSync(join(root.workspace, "real"));
+    writeFileSync(join(root.workspace, "real", "real.md"), "# real\n");
+    symlinkSync("real/real.md", join(root.workspace, "link.md"));
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will read the note.", calls: [{ name: "read_file", input: { path: "link.md" } }] },
+      { at: 1, text: "Read the note." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("read the note");
+    await session.waitForText("Read the note.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const ready = /^ {2}Explored /m;
+    const lines = paneLines(await session.waitForText(ready, TIMEOUT));
+    expect(lastLinkTarget(tape, "link.md")).toBe(fileUrlPath(realpathSync(join(root.workspace, "real", "real.md"))));
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+
+    // In this folder, the same relative path is a symlink to a script.
+    const other = join(root.root, "other");
+    mkdirSync(join(other, "real"), { recursive: true });
+    writeFileSync(join(other, "run.command"), "#!/bin/sh\necho ran\n", { mode: 0o755 });
+    symlinkSync("../run.command", join(other, "real", "real.md"));
+    const [id] = rootSessionIds(root.home);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Read the note.", resumedTape, { ready, cwd: other, target: id });
+    expect(group(resumedLines, /^● /)).toEqual(group(lines, /^● /));
+    expect(lastLinkTarget(resumedTape, "link.md")).toBeUndefined();
+    expect(linksTo(resumedTape, "real.md")).toBe(false);
   },
   TIMEOUT * 3,
 );

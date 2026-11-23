@@ -5269,8 +5269,8 @@ pub fn dupeToolLifecycleEvent(
             else
                 null;
             errdefer if (command_artifact_handle) |handle| alloc.free(handle);
-            const changed_path = if (terminal.changed_path) |path| try alloc.dupe(u8, path) else null;
-            errdefer if (changed_path) |path| alloc.free(path);
+            const resolved_path = if (terminal.resolved_path) |path| try alloc.dupe(u8, path) else null;
+            errdefer if (resolved_path) |path| alloc.free(path);
             break :blk .{ .terminal = .{
                 .id = .{ .turn_id = terminal.id.turn_id, .call_id = call_id },
                 .outcome = .{
@@ -5281,7 +5281,7 @@ pub fn dupeToolLifecycleEvent(
                 .result_memory = result_memory,
                 .command_artifact_handle = command_artifact_handle,
                 .check_found_command_ended = terminal.check_found_command_ended,
-                .changed_path = changed_path,
+                .resolved_path = resolved_path,
             } };
         },
         .turn_finished => |finished| .{ .turn_finished = finished },
@@ -5317,7 +5317,7 @@ pub fn freeToolLifecycleEvent(
             if (terminal.result) |result| alloc.free(@constCast(result));
             freeToolResultMemory(alloc, terminal.result_memory);
             if (terminal.command_artifact_handle) |handle| alloc.free(@constCast(handle));
-            if (terminal.changed_path) |path| alloc.free(@constCast(path));
+            if (terminal.resolved_path) |path| alloc.free(@constCast(path));
         },
         .turn_finished => {},
     }
@@ -8249,10 +8249,10 @@ test "a copied terminal event keeps the file an edit changed" {
     const owned = try dupeToolLifecycleEvent(alloc, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "edit" },
         .outcome = .{ .kind = .completed, .summary = "Edited x.tse" },
-        .changed_path = "tsec/x.tse",
+        .resolved_path = "tsec/x.tse",
     } });
     defer freeToolLifecycleEvent(alloc, owned);
-    try std.testing.expectEqualStrings("tsec/x.tse", owned.terminal.changed_path.?);
+    try std.testing.expectEqualStrings("tsec/x.tse", owned.terminal.resolved_path.?);
 }
 
 fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {

@@ -1611,11 +1611,24 @@ pub fn Runtime(comptime App: type) type {
             // Before the replay: the resume projection copies the window's
             // retention, so the whole newest cycle comes back.
             syncTranscriptWindowSaveMode(app, agent);
+            // A saved call's path relative to its workspace names a file here
+            // only when the session never ran elsewhere. A fork's turns can
+            // come from another session's workspace.
+            setSavedCallsRoot(app, if (notice != .fork and try v2.ranOnlyIn(app.workspace_root)) app.workspace_root else null);
+            defer setSavedCallsRoot(app, null);
             try hydrateResumedSession(app, agent, resumed.state, &display, notice);
             enableSessionStores(app, agent);
             syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) noteInterruptedRequest(agent, v2);
+        }
+
+        /// Tells the transcript the folder a replayed call's relative path is
+        /// in (`TranscriptRuntime.saved_calls_root`), or that it is not known.
+        fn setSavedCallsRoot(app: *App, root: ?[]const u8) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "saved_calls_root")) return;
+            app.shell.saved_calls_root = root;
         }
 
         /// Notes the request the newest turn left unfinished, if a crash or a

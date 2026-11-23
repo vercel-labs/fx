@@ -1978,8 +1978,8 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .call_id = try alloc.dupe(u8, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
-    const changed_path = if (source.changed_path) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (changed_path) |value| alloc.free(value);
+    const resolved_path = if (source.resolved_path) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (resolved_path) |value| alloc.free(value);
 
     return .{
         .entry_id = source.entry_id,
@@ -2004,7 +2004,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
         .check_found_command_ended = source.check_found_command_ended,
-        .changed_path = changed_path,
+        .resolved_path = resolved_path,
         .subagent_started = source.subagent_started,
     };
 }
@@ -2049,11 +2049,11 @@ test "a snapshot copy of an edit keeps the file core says it changed" {
         .activity_kind = .edit,
         .arguments_json = @constCast("{\"path\":\"./tsec/selfhost/checker.tse\"}"),
         .outcome = .completed,
-        .changed_path = &changed,
+        .resolved_path = &changed,
     });
     defer copy.deinit(alloc);
-    try std.testing.expectEqualStrings("tsec/selfhost/checker.tse", copy.changed_path.?);
-    try std.testing.expect(copy.changed_path.?.ptr != &changed);
+    try std.testing.expectEqualStrings("tsec/selfhost/checker.tse", copy.resolved_path.?);
+    try std.testing.expect(copy.resolved_path.?.ptr != &changed);
 }
 
 test "a snapshot copy of a tool detail keeps its subagent start mark" {
