@@ -4361,6 +4361,7 @@ test "a joiner of a running turn whose copy dropped part of its output gets the 
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
@@ -4384,6 +4385,7 @@ test "a joiner of a running turn whose copy dropped part of its output gets the 
     try std.testing.expect(session.running_copy.dropped > 0);
 
     var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
