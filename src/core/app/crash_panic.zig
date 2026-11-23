@@ -5,7 +5,8 @@
 //! it over `last-crash.jsonl`, so a failed write keeps the last saved record. The
 //! lines are the `fx_trace` header and a `fatal_error` record. Its error is
 //! `panic` for a panic and `signal` for a segfault. `trace_report.zig` reads that
-//! file. The handler then calls `std.debug.defaultPanic` or
+//! file. The message is masked for secrets first, by
+//! `text_utils.maskSecretsInto`. The handler then calls `std.debug.defaultPanic` or
 //! `std.debug.defaultHandleSegfault`, so stderr and the abort stay as they were.
 //!
 //! The handler can run on any thread and in any state, so it does not allocate
@@ -34,6 +35,9 @@ const writeJsonStr = @import("../../acp/jsonrpc.zig").writeJsonStr;
 /// The most bytes of a message that the record keeps. Escaping can make
 /// the kept text up to six times longer, which still fits `record_buf_bytes`.
 const max_message_bytes = 512;
+/// The masked message is taken one byte past `max_message_bytes`, so the UTF-8
+/// cut sees the byte after the kept text, as it does on the whole message.
+const masked_buf_bytes = max_message_bytes + 1;
 /// Holds both lines at the longest kept message, with room for long version
 /// and commit text.
 const record_buf_bytes = 8192;
@@ -305,7 +309,8 @@ fn writeLines(w: *std.Io.Writer, fx_version: []const u8, git_commit: []const u8,
     try w.writeAll("{\"type\":\"fatal_error\",\"error\":");
     try writeJsonStr(error_name, w);
     try w.writeAll(",\"message\":");
-    try writeJsonStr(keptMessage(msg), w);
+    var masked_buf: [masked_buf_bytes]u8 = undefined;
+    try writeJsonStr(keptMessage(text_utils.maskSecretsInto(&masked_buf, msg)), w);
     if (utc) |text| try writeTime(w, "at", text, now_ms);
     try w.writeAll("}\n");
 }
@@ -318,11 +323,11 @@ fn writeTime(w: *std.Io.Writer, name: []const u8, utc: []const u8, now_ms: i64) 
     try w.print(",\"{s}_ms\":{d}", .{ name, now_ms });
 }
 
-/// The message cut to `max_message_bytes` at a UTF-8 boundary, which
+/// The masked message cut to `max_message_bytes` at a UTF-8 boundary, which
 /// `text_utils.utf8PrefixByBytes` does without allocating. When the kept bytes
 /// are not valid UTF-8, the record holds a fixed note instead.
-fn keptMessage(msg: []const u8) []const u8 {
-    const kept = text_utils.utf8PrefixByBytes(msg, max_message_bytes);
+fn keptMessage(masked: []const u8) []const u8 {
+    const kept = text_utils.utf8PrefixByBytes(masked, max_message_bytes);
     if (!std.unicode.utf8ValidateSlice(kept)) return not_utf8_note;
     return kept;
 }
@@ -775,4 +780,50 @@ test "crash panic notices name the saved report and a folder it refuses" {
     );
     var small: [8]u8 = undefined;
     try std.testing.expect(noticeText(&small, "fx: crash report saved to ", "/x", "\n") == null);
+}
+
+test "crash panic record masks each secret shape in the written record" {
+    var buf: [record_buf_bytes]u8 = undefined;
+    const msg = "env AI_GATEWAY_API_KEY=abcdefghijklmnop; auth Bearer abcdefghijklmnopqrstuvwx; key sk-abcdefghijklmnopqrstuvwxyz123456; gh gho_abcdefghijklmnopqrstuvwxyz1234567890; url https://fxuser:fakepass123@example.com/p";
+    const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", msg);
+    for ([_][]const u8{ "abcdefghijklmnop", "abcdefghijklmnopqrstuvwx", "abcdefghijklmnopqrstuvwxyz123456", "abcdefghijklmnopqrstuvwxyz1234567890", "fakepass123" }) |secret| {
+        try std.testing.expect(std.mem.find(u8, record, secret) == null);
+    }
+    try std.testing.expect(std.mem.find(u8, record, "[redacted]") != null);
+}
+
+test "crash panic record leaves no secret byte when a secret crosses the 512-byte cut" {
+    var buf: [record_buf_bytes]u8 = undefined;
+    const Shape = struct { token: []const u8, body: []const u8 };
+    const shapes = [_]Shape{
+        .{ .token = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", .body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+        .{ .token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", .body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+    };
+    for (shapes) |shape| {
+        var msg: [640]u8 = undefined;
+        for (490..513) |offset| {
+            @memset(&msg, 'a');
+            msg[offset - 1] = ' ';
+            @memcpy(msg[offset..][0..shape.token.len], shape.token);
+            const record = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", &msg);
+            var window: usize = 0;
+            while (window + 6 <= shape.body.len) : (window += 1) {
+                if (std.mem.find(u8, record, shape.body[window..][0..6]) != null) {
+                    std.debug.print("\nLEAK offset={d} token={s}\n", .{ offset, shape.token[0..4] });
+                    return error.SecretLeaked;
+                }
+            }
+        }
+    }
+}
+
+test "crash panic record keeps the not-UTF-8 note and escapes quotes, controls, and multibyte text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [record_buf_bytes]u8 = undefined;
+    const bad = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", "bad \xff byte");
+    try std.testing.expectEqualStrings(not_utf8_note, try fatalMessage(arena.allocator(), bad));
+    const text = "say \"hi\"\n\x01 caf\xc3\xa9 tab\there";
+    const good = formatRecord(&buf, "0.0.17", "abc1234", 1_700_000_000_123, "panic", text);
+    try std.testing.expectEqualStrings(text, try fatalMessage(arena.allocator(), good));
 }
