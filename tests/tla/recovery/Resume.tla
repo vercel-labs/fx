@@ -30,7 +30,8 @@
 (*   clean, marks the turn as yielded, and re-execs (Relaunch). The next   *)
 (*   launch continues that turn with no note to the model. While the       *)
 (*   restart waits, a new message is held. Proposed only: fx today         *)
-(*   refuses Ctrl+G while a turn runs.                                     *)
+(*   refuses Ctrl+G while a turn runs. If that save does not land, the     *)
+(*   turn goes on, and the next save asks again (YieldSaveFails).          *)
 (*                                                                         *)
 (* Policy selects fx's behavior:                                           *)
 (* - "today" saves no record, and a close dies as a kill does. A launch    *)
@@ -63,7 +64,8 @@ CONSTANTS
 
 Bugs == {"none", "no_closing", "no_clear", "send_before_save",
          "reset_on_resume", "resume_answered", "resume_cancelled",
-         "ignore_age", "no_lock", "yield_unclean", "yield_first"}
+         "ignore_age", "no_lock", "yield_unclean", "yield_first",
+         "yield_unsaved"}
 
 Procs == {1, 2}
 Reqs  == 1..MaxReq
@@ -470,12 +472,34 @@ Relaunch(p) ==
     /\ up' = [up EXCEPT !.pending = FALSE, !.yielded = IF boundary THEN ps[p].req ELSE 0]
     /\ UNCHANGED <<wall, fate, answered, stranded>>
 
+\* The restart's save does not land, as a failed disk write can make it:
+\* the turn goes on, and its send goes out with the record of a send in
+\* flight that its earlier write left, as Save does. The restart still
+\* waits, and the next save asks again (orchestrator.zig yieldTurn,
+\* request_recovery.zig closeForYield). Planted defect yield_unsaved: the
+\* turn stops anyway and is marked yielded, so the next launch reads a
+\* send in flight and counts a death that no crash caused.
+YieldSaveFails(p) ==
+    /\ Proposed /\ up.pending /\ Holds(p) /\ CanFault
+    /\ ps[p].pc = "save" /\ ~ps[p].cont
+    /\ turn' = Written(p, SendRec(p))
+    /\ seen' = IF ps[p].fresh THEN 0 ELSE seen
+    /\ faults' = faults + 1
+    /\ IF Bug = "yield_unsaved"
+          THEN /\ ps' = [ps EXCEPT ![p] = OffProc]
+               /\ lock' = lock \ {p}
+               /\ up' = [up EXCEPT !.pending = FALSE, !.yielded = ps[p].req]
+          ELSE /\ ps' = [ps EXCEPT ![p].pc = "flight", ![p].cont = FALSE, ![p].fresh = FALSE]
+               /\ UNCHANGED <<lock, up>>
+    /\ UNCHANGED <<wall, fate, answered, stranded>>
+
 Next ==
     \/ \E p \in Procs :
           \/ Launch(p) \/ Prompt(p) \/ UserContinue(p) \/ Enter(p) \/ Esc(p)
           \/ Quit(p) \/ Save(p) \/ LateSave(p) \/ Respond(p) \/ Finish(p)
           \/ ToolsDone(p) \/ Fail(p) \/ Retry(p) \/ NeedFail(p)
           \/ Kill(p) \/ Close(p) \/ Upgrade(p) \/ Relaunch(p)
+          \/ YieldSaveFails(p)
     \/ Day
 
 Spec == Init /\ [][Next]_vars

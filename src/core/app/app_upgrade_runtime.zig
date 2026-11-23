@@ -12,7 +12,7 @@ pub const ApplyOutcome = enum {
     not_ready,
     unavailable,
     relaunch_requested,
-    /// The relaunch waits for the running turns to stop between steps.
+    /// The relaunch waits for the running turns to stop between steps or end.
     waiting,
 };
 
@@ -26,9 +26,11 @@ pub const Deps = struct {
     current_executable_path: CurrentExecutablePathFn = currentExecutablePathDefault,
 };
 
-/// What Ctrl+G says while the relaunch waits for the running turns.
-const restart_waits_notice = "fx restarts for the upgrade when the running turns stop between steps";
-const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop between steps and the subagents finish";
+/// What Ctrl+G says while the relaunch waits: a turn on the AI Gateway stops
+/// at its next step and goes on after the restart, and a turn on another
+/// provider runs to its end (`orchestrator.zig` `canStopForRestart`).
+const restart_waits_notice = "fx restarts for the upgrade when the running turns stop or end";
+const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the running turns stop or end and the subagents finish";
 
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
@@ -77,21 +79,30 @@ pub fn Runtime(comptime App: type) type {
             requestFooterRender(app);
         }
 
-        /// Text, a paste, or images in the composer, or a prompt sent but not
-        /// yet started, which exiting would lose.
-        fn draftPending(app: *App) bool {
+        /// What the composer holds that exiting would lose, as the notice
+        /// that names it, or null: a paste, typed text, images, or a prompt
+        /// sent but not yet started. Ctrl+G refuses with it
+        /// (`upgradeUnavailableNotice`), and a waiting restart holds its exit
+        /// while one is there (`draftPending`).
+        fn draftNotice(app: *App, agent: *AppAgent) ?[]const u8 {
             if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.paste.active()) return true;
-                if (app.input_runtime.edit_state.input.items.len > 0) return true;
+                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
+                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
             }
-            if (comptime @hasDecl(App, "screenAgent") and agents.hasAgentField(App, "pending_images")) {
-                if (app.screenAgent().pending_images.items.len > 0) return true;
+            if (comptime agents.hasAgentField(App, "pending_images")) {
+                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
             }
-            // Ctrl+G refuses while one is pending (`upgradeUnavailableNotice`)
-            // and the wait holds new text in the composer, so this only guards
-            // the exit.
-            if (submissionPending(app)) return true;
-            return false;
+            // The worker holds its queue while it yields, so a sent prompt
+            // that has not started would wait there until fx exits.
+            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
+            return null;
+        }
+
+        /// Whether the composer holds something exiting would lose
+        /// (`draftNotice`). Ctrl+G refuses while it does, and the wait holds
+        /// new text in the composer, so this only guards the exit.
+        fn draftPending(app: *App) bool {
+            return draftNotice(app, agents.screenAgentOf(app)) != null;
         }
 
         /// A prompt sent but not yet started by its agent's worker, on main
@@ -257,16 +268,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
             }
-            if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
-                if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
-            }
-            if (comptime agents.hasAgentField(App, "pending_images")) {
-                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
-            }
-            // The worker holds its queue while it yields, so a sent prompt
-            // that has not started would wait there until fx exits.
-            if (submissionPending(app)) return "upgrade is unavailable while a sent prompt waits to go out";
+            if (draftNotice(app, agent)) |notice| return notice;
             if (comptime @hasField(App, "terminal_input_runtime")) {
                 if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
             }

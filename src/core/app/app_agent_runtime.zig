@@ -1218,6 +1218,21 @@ pub fn Runtime(comptime App: type) type {
             try refreshProjectContext(app, agent);
         }
 
+        /// `ensureProjectContext` for a turn fx starts for an agent's mail,
+        /// such as a subagent's report. A failed read does not hold the
+        /// mail back: the turn goes out without the instructions, and a
+        /// notice names the error and what the person can do.
+        pub fn ensureProjectContextForMail(app: *App, agent: *AppAgent) void {
+            ensureProjectContext(app, agent) catch |err| {
+                debug_trace.logf("context", "message turn has no project instructions err={s}", .{@errorName(err)});
+                if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+                var buffer: [256]u8 = undefined;
+                const body = std.mem.print(&buffer, "fx could not read the project instructions ({s}); this turn goes out without them. Check the workspace instruction files, then send a message to go on.", .{@errorName(err)}) catch "fx could not read the project instructions; this turn goes out without them. Check the workspace instruction files, then send a message to go on.";
+                app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = body }, true) catch |write_err|
+                    debug_trace.logf("context", "event=missing_instructions_notice_failed err={s}", .{@errorName(write_err)});
+            };
+        }
+
         pub fn fetchModelIds(
             app: *App,
             provider: model_catalog.Provider,
@@ -3276,6 +3291,27 @@ test "app agent runtime propagates project context gathering failures" {
         try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
         try std.testing.expect(app.agent().context_snapshot.contribution == null);
     }
+}
+
+test "a mail turn whose project instructions cannot be read goes on with a notice that names the error" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    refresh_gather_error = error.NoSpaceLeft;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .context_enabled = true,
+        .context_registry = failing_context_registry,
+        .main_agent = .{ .context_snapshot = .{} },
+    };
+    defer app.deinit();
+
+    Runtime(RefreshContextApp).ensureProjectContextForMail(&app, (&app).agent());
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    try std.testing.expect(app.agent().context_snapshot.contribution == null);
+    try std.testing.expectEqual(@as(?types.NoticeTone, .neutral), app.context_notice_tone);
+    try std.testing.expect(std.mem.find(u8, app.context_notices.items, "could not read the project instructions") != null);
+    try std.testing.expect(std.mem.find(u8, app.context_notices.items, "NoSpaceLeft") != null);
 }
 
 test "app agent runtime appends static and transient context through configured registry" {

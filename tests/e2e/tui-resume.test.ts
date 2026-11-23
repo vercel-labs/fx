@@ -6479,7 +6479,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
       // A draft in the composer holds the restart, so the screen before it
       // can be checked.
       await active.sendLiteralText("HOLD");
@@ -6652,7 +6652,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Ctrl+G while the turn runs: the upgrade waits instead of refusing.
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
       releaseFirst();
 
       // The tool runs, the turn stops between steps, fx relaunches with the
@@ -7107,7 +7107,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
       await active.waitForText("and the subagents finish", TIMEOUT);
       expect(relaunched()).toBe(false);
 
@@ -7253,7 +7253,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
       // The restart waits for the subagent to finish its work.
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
       await active.waitForText("and the subagents finish", TIMEOUT);
       expect(relaunched()).toBe(false);
 
@@ -7366,7 +7366,7 @@ test.skipIf(!tmuxAvailable())(
       await soloAsked.fired;
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
 
       // A prompt waits for the restart, but /quit still quits, with no relaunch.
       await active.sendText("/quit");
@@ -7574,7 +7574,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("UPGRADE_MAIN start solo");
       await mainAsked.fired;
       await active.sendHexBytes(["07"]);
-      await active.waitForText("fx restarts for the upgrade when the running turns stop between steps", TIMEOUT);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
 
       // Main starts the subagent, then stops before its next request. The
       // subagent keeps working, so fx waits for it.

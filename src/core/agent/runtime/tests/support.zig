@@ -680,6 +680,9 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_record: ?[32]u8 = null,
     recovery_record_writes: usize = 0,
     recovery_record_clears: usize = 0,
+    /// The next record saves through `save_recovery_record` fail, as a
+    /// write that does not land.
+    recovery_record_save_failures: usize = 0,
     /// The turn has pieces on disk, so a save between sends lands.
     recovery_turn_written: bool = true,
     /// How many times the turn was marked as yielded (`mark_turn_yielded`).
@@ -1039,6 +1042,10 @@ pub const FakeAgentRuntimeDeps = struct {
         switch (write) {
             .keep => return false,
             .save => |bytes| {
+                if (self.recovery_record_save_failures > 0) {
+                    self.recovery_record_save_failures -= 1;
+                    return error.WriteFailed;
+                }
                 self.recovery_record = bytes;
                 self.recovery_record_writes += 1;
             },

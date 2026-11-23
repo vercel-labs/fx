@@ -373,14 +373,11 @@ fn busyAs(state: InstanceState) ?Busiest {
     };
 }
 
-/// What `state` waits for the user for, or null when it does not.
+/// What `state` waits for the user for, or null when it does not: what
+/// `busyAs` says, without its working case.
 fn waitsForUserAs(state: InstanceState) ?Busiest {
-    return switch (state) {
-        .needs_approval => .needs_approval,
-        .has_question => .has_question,
-        .needs_you => .needs_you,
-        .working, .finished, .idle, .failed, .stopped => null,
-    };
+    const busy = busyAs(state) orelse return null;
+    return if (busy == .working) null else busy;
 }
 
 /// The more urgent of `a` and `b`; `InstanceState` lists the most urgent

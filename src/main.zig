@@ -2215,12 +2215,10 @@ const App = struct {
         var place_held = mail == .message;
         defer if (place_held) agent.worker.releaseAgentMessage();
         // A new process has no project instructions until its first user
-        // turn; a report turn gathers them, so it sends the same ones.
-        // A failed read must not lose the report: the turn goes out
-        // without them, as before.
-        AgentAppRuntime.ensureProjectContext(self, agent) catch |err| {
-            debug_trace.logf("context", "message turn has no project instructions err={s}", .{@errorName(err)});
-        };
+        // turn; a mail turn gathers them, so it sends the same ones. A
+        // failed read does not lose the mail: the turn goes out without
+        // them, and a notice says so.
+        AgentAppRuntime.ensureProjectContextForMail(self, agent);
         var prompt = try self.snapshotPrompt(agent, text, &.{}, null, &.{}, debug_trace.nextTurnId(), false);
         var owned = true;
         defer if (owned) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);

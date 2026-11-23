@@ -4568,20 +4568,26 @@ fn canStopForRestart(
     return false;
 }
 
-/// Stops the turn between steps for its host. The request's record is saved
-/// marked clean, as a closing fx saves it, so the next launch resumes it
-/// without counting a death, and the session marks the turn as yielded, so
-/// the launch continues it as the same turn (`tests/tla/recovery/Resume.tla`
-/// Relaunch, NoFalseCrashQuestion). Only a turn `canStopForRestart` allows
-/// gets here. The clean record is then the turn's newest item and the request
-/// is closed, so a marker that cannot be written leaves a turn the next launch
-/// resumes from that record, with the resume note: nothing is lost.
+/// Stops the turn between steps for its host, once its request's clean
+/// record is saved: marked clean, as a closing fx saves it, so the next
+/// launch resumes it without counting a death, and the session marks the turn
+/// as yielded, so the launch continues it as the same turn
+/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion). Only
+/// a turn `canStopForRestart` allows gets here. When the clean record does
+/// not land, nothing is marked and it returns false: the request is still
+/// open with its send's record, so the turn goes on and the next boundary
+/// asks again (`Resume.tla` YieldSaveFails). A marker that cannot be written
+/// after a saved record leaves a turn the next launch resumes from that
+/// record, with the resume note: nothing is lost.
 fn yieldTurn(
     deps: *const AgentRuntimeDeps,
     request_recovery: *runtime_request_recovery.RequestRecovery,
     trace_ctx: TraceContext,
-) void {
-    const record_saved = request_recovery.closeForYield();
+) bool {
+    if (!request_recovery.closeForYield()) {
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason=closing_save_failed", .{});
+        return false;
+    }
     var marked = false;
     if (deps.mark_turn_yielded) |mark| {
         if (mark(deps.ctx)) {
@@ -4590,7 +4596,8 @@ fn yieldTurn(
             debug_trace.logf("agent", "event=turn_yield_unmarked err={s} reason=marker_write_failed", .{@errorName(err)});
         }
     }
-    debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved={} marked={}", .{ record_saved, marked });
+    debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
+    return true;
 }
 
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
@@ -9076,8 +9083,9 @@ fn processQueuedPromptLoop(
                 .stop_requested = stop_requested,
                 .kind = if (recovery_cause == .compaction_prepared) .compaction else .request,
             } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
-                yieldTurn(deps, &request_recovery, step_ctx);
-                return error.TurnYielded;
+                // A stop whose clean record does not land leaves the turn
+                // going on; the next boundary asks again.
+                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
             }
 
             disarmCacheWarming(deps);

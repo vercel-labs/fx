@@ -44,6 +44,7 @@
 #   no-lock             a second fx resuming a session another holds       OneWorker
 #   yield-unclean       an upgrade's restart saved as a death              NoFalseCrashQuestion
 #   yield-first         a turn stopped for a restart before it is logged   YieldContinues
+#   yield-unsaved       a stop whose save failed, left as a clean stop     NoFalseCrashQuestion
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -95,4 +96,5 @@ Resume resume-mutation-ignore-age OldAsks
 Resume resume-mutation-no-lock OneWorker
 Resume resume-mutation-yield-unclean NoFalseCrashQuestion
 Resume resume-mutation-yield-first YieldContinues
+Resume resume-mutation-yield-unsaved NoFalseCrashQuestion
 EOF

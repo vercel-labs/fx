@@ -972,6 +972,71 @@ test "a stop asked during the first step yields at the next request, not one lat
     try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
 }
 
+test "a turn whose closing save fails goes on and stops at the next boundary" {
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const second_calls = [_]ToolCall{toolCall("call_search_again", "web_search", "{\"query\":\"more news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    // The clean record of the first stop does not land.
+    hooks.recovery_record_save_failures = 1;
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "search output" } },
+        .{ .result = .{ .model_output = "search output" } },
+    };
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    // The refused stop let the second request go out; the next boundary stopped the turn.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    // The record the yield left resumes without counting a death.
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = hooks.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a turn whose closing saves all fail runs to its end and is never marked" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.recovery_record_save_failures = 1000;
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = "search output" } }};
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // Every stop was refused, so the turn ran to its final answer and was never marked.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.turn_yielded_marks);
+}
+
 test "a turn whose flag stays clear never yields" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};
