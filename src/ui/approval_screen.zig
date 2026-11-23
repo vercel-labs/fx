@@ -1736,6 +1736,18 @@ test "bounded command approval previews route by complete command fit" {
     ));
 }
 
+test "zero-width command approval routes to review screen" {
+    try std.testing.expect(try needsScreen(
+        std.testing.allocator,
+        .{
+            .label = "shell.run printf short",
+            .command = "printf short",
+        },
+        testLayout(150, 1),
+        0,
+    ));
+}
+
 test "command and file approval screen routing preserves short inline and file review behavior" {
     try std.testing.expect(!try needsScreen(
         std.testing.allocator,
