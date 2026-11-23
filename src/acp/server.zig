@@ -1951,6 +1951,8 @@ pub fn removeMemberLocked(session: *ActiveSessionState, connection_id: Connectio
         if (was_main) markOwedRequests(session, connection_id, false);
         return false;
     }
+    // Only where follow_supported holds can another member take the session.
+    if (comptime !follow_supported) return false;
     if (was_main) markOwedRequests(session, connection_id, true);
     clearWriterDrop(session);
     return true;
