@@ -2844,6 +2844,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture with a typed argument.");
     await tui.waitForText(finalText, 25_000);
+    // The failed call's row gets its reason once the turn ends on it, which
+    // is after the final text arrives.
+    await tui.waitForText(`Couldn't run ${TOOL_ROW} · `, 10_000);
     const body = activeGateway.requests.at(-1)?.body;
     const screen = await tui.captureFullScrollback();
     let traced: { records: Array<Record<string, unknown>>; calls: Array<Record<string, unknown>> } | null = null;
