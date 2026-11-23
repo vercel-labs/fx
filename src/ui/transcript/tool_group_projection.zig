@@ -2737,11 +2737,20 @@ fn mcpToolName(scratch: std.mem.Allocator, alias: []const u8, server: []const u8
 }
 
 /// Core's labels that lead an MCP tool's row, and the compact row's for each.
+/// The labels of a call that did not run come from `permissionDeniedStatusLabel`
+/// in src/core/agent/runtime/tool_admission.zig, the longest first, so
+/// "Denied" does not take "Denied by auto agent". A held call has a row of its
+/// own (`heldMcpRowText`).
 const mcp_row_labels = [_]struct { core: []const u8, shown: []const u8 }{
     .{ .core = tooling_presentation.mcp_ran_label ++ " ", .shown = "Ran " },
     .{ .core = tooling_presentation.mcp_running_label ++ " ", .shown = "Running " },
     .{ .core = "Failed ", .shown = "Failed " },
     .{ .core = cancelled_label ++ " ", .shown = cancelled_label ++ " " },
+    .{ .core = "Denied by auto agent ", .shown = "Denied by auto agent " },
+    .{ .core = "Denied ", .shown = "Denied " },
+    .{ .core = "Review evidence incomplete ", .shown = "Review evidence incomplete " },
+    .{ .core = "Review unavailable ", .shown = "Review unavailable " },
+    .{ .core = "Permission required ", .shown = "Permission required " },
 };
 
 /// An MCP tool's row by its server and then the tool, such as "Ran slack
@@ -2769,6 +2778,14 @@ test "MCP rows name the server, then its tool" {
         .{ .phrase = "● Ran MCP mcp_chrome-devtools_take_screenshot\n", .run = "mcp_chrome-devtools_take_screenshot", .result = null, .outcome = .completed, .row = "● Ran chrome-devtools take_screenshot" },
         // A server whose name has a "_" in it: the result names the server.
         .{ .phrase = "● Ran MCP mcp_team_notes_search\n", .run = "mcp_team_notes_search", .result = "{\"server\":\"team notes\",\"tool\":\"mcp_team_notes_search\",\"result\":{}}", .outcome = .completed, .row = "● Ran team notes search" },
+        // A call that did not run keeps core's words for why, and one the
+        // safety review held reads as a held command does.
+        .{ .phrase = "● Denied mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Denied bloop get_account" },
+        .{ .phrase = "● Denied by auto agent mcp_bloop_get_account\n", .run = "mcp_bloop_get_account", .result = null, .outcome = .denied, .row = "● Denied by auto agent bloop get_account" },
+        .{ .phrase = "● Review unavailable mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Review unavailable linear get_issue" },
+        .{ .phrase = "● Review evidence incomplete mcp_linear_get_issue\n", .run = "mcp_linear_get_issue", .result = null, .outcome = .denied, .row = "● Review evidence incomplete linear get_issue" },
+        .{ .phrase = "● Permission required mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Permission required slack read_thread" },
+        .{ .phrase = "● Safety caution mcp_slack_slack_read_thread\n", .run = "mcp_slack_slack_read_thread", .result = null, .outcome = .denied, .row = "● Held slack read_thread · safety caution" },
     };
     for (cases) |case| {
         const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
@@ -3169,6 +3186,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         return .{ .display = phrase, .body = phrase, .suffix = "", .reason = reason };
     };
     if (row.detail) |record| if (try heldCommandRowText(scratch, status_phrase, record, style)) |held| return held;
+    if (try heldMcpRowText(scratch, status_phrase, row)) |held| return held;
     const split_failure = splitFailedPhrase(status_phrase, row.detail);
     const raw_phrase = if (split_failure) |split| split.row else status_phrase;
     const full_phrase = try reprojectTruncatedCommandPhrase(scratch, raw_phrase, row.detail) orelse raw_phrase;
@@ -4618,7 +4636,21 @@ fn heldCommandRowText(scratch: std.mem.Allocator, phrase: []const u8, record: *c
     const shown = try shortenCommandPhrase(scratch, full_phrase, record, style.text_style) orelse
         try highlightCommandPhrase(scratch, full_phrase, record, style.text_style) orelse full_phrase;
     if (!std.mem.startsWith(u8, shown, label)) return null;
-    const body = try std.mem.concat(scratch, u8, &.{ "Held ", shown[label.len..] });
+    return try heldRowText(scratch, shown[label.len..]);
+}
+
+/// An MCP call the safety review held, as "Held slack read_thread · safety
+/// caution", the way a held command reads. Null for any other row.
+fn heldMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?StoryRowText {
+    const record = row.detail orelse return null;
+    if (record.outcome != .denied or record.activity_kind != .mcp) return null;
+    const alias = withoutPrefix(phrase, safety_caution_label ++ " ") orelse return null;
+    return try heldRowText(scratch, try mcpToolName(scratch, alias, row.mcp_server) orelse return null);
+}
+
+/// "Held <name> · safety caution": what happened to the call, then why.
+fn heldRowText(scratch: std.mem.Allocator, name: []const u8) !StoryRowText {
+    const body = try std.mem.concat(scratch, u8, &.{ "Held ", name });
     return .{ .display = try std.mem.concat(scratch, u8, &.{ body, safety_caution_note }), .body = body, .suffix = safety_caution_note };
 }
 

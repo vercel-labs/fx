@@ -2685,6 +2685,80 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     30_000,
   );
 
+  // A call that did not run names its server and tool, as a call that ran
+  // does, live and after a resume. The toolbox open before it keeps the
+  // alias, as an open does.
+  async function expectUnrunCallRows(
+    root: FixtureRoot,
+    activeGateway: ReturnType<typeof startFakeGateway>,
+    finalText: string,
+    row: string,
+    options: { env?: Record<string, string>; answer?: (session: TmuxSession) => Promise<void> } = {},
+  ) {
+    const compactRows = (screen: string) =>
+      screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
+    const stderrPath = join(root.root, "stderr.log");
+    const env = { ...fixtureEnv(root, activeGateway), ...options.env };
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MCP fixture.");
+    await options.answer?.(tui);
+    await tui.waitForText(finalText, 20_000);
+    const live = compactRows(await tui.captureFullScrollback());
+    expect(live).toContain(`└ ${row}`);
+    expect(live.filter((line) => line.includes(TOOL_NAME))).toEqual([`├ Opened ${TOOL_NAME}`]);
+    expect(readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")).toEqual([]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.sendText("/quit");
+    expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+
+    const resumedStderrPath = join(root.root, "resumed-stderr.log");
+    tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
+    await tui.waitForComposer(15_000);
+    await tui.waitForText(finalText, 15_000);
+    expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
+    expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI names an MCP call the safety review held by its server and tool, as a held command reads",
+    async () => {
+      const root = createRoot("tui-held-call", MODERN_FIXTURE, { expectedElicitation: "both" });
+      const finalText = "HELD_MCP_CALL_COMPLETE";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
+        fakeGatewayFinalText(finalText),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+        classifierDecision: "caution",
+      });
+      gateway = activeGateway;
+      await expectUnrunCallRows(root, activeGateway, finalText, `Held ${TOOL_ROW} · safety caution`);
+    },
+    45_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI names an MCP call the user denied by its server and tool",
+    async () => {
+      const root = createRoot("tui-denied-call", MODERN_FIXTURE, { expectedElicitation: "both" });
+      const finalText = "DENIED_MCP_CALL_COMPLETE";
+      const activeGateway = startToolGateway(finalText);
+      gateway = activeGateway;
+      await expectUnrunCallRows(root, activeGateway, finalText, `Denied ${TOOL_ROW}`, {
+        env: { FX_PERMISSION_MODE: "ask" },
+        answer: async (session) => {
+          await session.waitForText("Allow this MCP tool call?", 15_000);
+          await session.sendKeys("3");
+        },
+      });
+    },
+    45_000,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
     async () => {
