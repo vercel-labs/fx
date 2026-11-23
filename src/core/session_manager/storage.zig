@@ -12,6 +12,7 @@
 //! `storage_fault.zig`, which models process and machine crashes for tests
 //! and the driver. Without hooks that code does not exist in the binary.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const build_options = @import("build_options");
 const Io = std.Io;
@@ -303,6 +304,7 @@ pub const Storage = struct {
     /// metadata so contended opens can name the holder. Never registers with
     /// fault-injection tracking, since the kernel owns the flock lifetime.
     pub fn writeLockPid(s: Storage, file: File) void {
+        if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .freestanding) return;
         const pid = std.c.getpid();
         if (pid <= 0) return;
         var buf: [32]u8 = undefined;
@@ -622,4 +624,26 @@ test "listing names every entry" {
     };
     try testing.expectEqual(@as(usize, 1), files);
     try testing.expectEqual(@as(usize, 1), dirs);
+}
+
+test "readLockPid handles empty, garbage, zero, and multiline lock files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const s: Storage = .{ .io = testing.io };
+    const root = testRoot(&tmp);
+
+    const cases = [_]struct { name: []const u8, bytes: []const u8, expected: ?u32 }{
+        .{ .name = "empty", .bytes = "", .expected = null },
+        .{ .name = "garbage", .bytes = "not-a-pid\n", .expected = null },
+        .{ .name = "zero", .bytes = "0\n", .expected = null },
+        .{ .name = "negative", .bytes = "-42\n", .expected = null },
+        .{ .name = "valid", .bytes = "4242\n", .expected = 4242 },
+        .{ .name = "multiline", .bytes = "1234\n99999\n", .expected = 1234 },
+    };
+    for (cases) |case| {
+        const file = try s.createFile(root, case.name);
+        defer s.closeFile(file);
+        if (case.bytes.len > 0) try file.handle.writePositionalAll(s.io, case.bytes, 0);
+        try testing.expectEqual(case.expected, s.readLockPid(file));
+    }
 }

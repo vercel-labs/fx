@@ -204,28 +204,47 @@ pub const State = struct {
 
 const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
 
-pub fn isMessageItemType(item_type: []const u8) bool {
+fn isMessageItemType(item_type: []const u8) bool {
     return std.mem.eql(u8, item_type, "user") or
         std.mem.eql(u8, item_type, "steering") or
         std.mem.eql(u8, item_type, "assistant");
 }
 
-pub fn isActivityBody(body: schema.Body) bool {
-    return switch (body) {
+const ActivityCheck = union(enum) {
+    turn_started,
+    turn_committed,
+    turn_interrupted: schema.Reason,
+    item_type: []const u8,
+    other,
+};
+
+fn isActivity(check: ActivityCheck) bool {
+    return switch (check) {
         .turn_started, .turn_committed => true,
-        .turn_interrupted => |i| i.reason != .crash and i.reason != .closed,
-        .item => |piece| isMessageItemType(piece.type),
-        else => false,
+        .turn_interrupted => |reason| reason != .crash and reason != .closed,
+        .item_type => |item_type| isMessageItemType(item_type),
+        .other => false,
     };
 }
 
+pub fn isActivityBody(body: schema.Body) bool {
+    return isActivity(switch (body) {
+        .turn_started => .turn_started,
+        .turn_committed => .turn_committed,
+        .turn_interrupted => |i| .{ .turn_interrupted = i.reason },
+        .item => |piece| .{ .item_type = piece.type },
+        else => .other,
+    });
+}
+
 pub fn isActivityEvent(event: Event) bool {
-    return switch (event) {
-        .turn_started, .turn_committed => true,
-        .turn_interrupted => |reason| reason != .crash and reason != .closed,
-        .item => |piece| isMessageItemType(piece.type),
-        else => false,
-    };
+    return isActivity(switch (event) {
+        .turn_started => .turn_started,
+        .turn_committed => .turn_committed,
+        .turn_interrupted => |reason| .{ .turn_interrupted = reason },
+        .item => |piece| .{ .item_type = piece.type },
+        else => .other,
+    });
 }
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {

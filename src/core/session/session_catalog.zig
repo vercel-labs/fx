@@ -26,6 +26,7 @@ pub const PendingAction = enum {
 pub const ResumeFailure = enum {
     open_elsewhere,
     being_updated,
+    busy_starting,
     /// The session's custom connection changed or was removed in settings
     /// (`config_runtime.sessionConnectionNotice`).
     connection_changed,
@@ -36,6 +37,7 @@ pub const ResumeFailure = enum {
 pub fn classifyResumeFailure(err: anyerror) ResumeFailure {
     return switch (err) {
         error.SessionBusy => .open_elsewhere,
+        error.SessionPickerResumeBusy => .busy_starting,
         error.SessionAuthorityBoundaryUnavailable,
         error.SessionCommitBoundaryUnavailable,
         => .being_updated,

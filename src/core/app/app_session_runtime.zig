@@ -1554,7 +1554,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn cancelSessionPickerPendingAction(app: *App, agent: *AppAgent) bool {
             const picker = &agent.session_persistence.session_picker;
-            if (!picker.actionPending()) return false;
+            const action = picker.pending_action orelse return false;
+            debug_trace.logf("session", "picker pending action cancelled action={s}", .{@tagName(action)});
             agent.session_persistence.session_picker_resume.cancel();
             picker.pending_action = null;
             if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
@@ -1569,10 +1570,10 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        pub fn selectSessionPickerBusyPrompt(app: *App, agent: *AppAgent, yes: bool) bool {
+        pub fn selectSessionPickerBusyPrompt(app: *App, agent: *AppAgent, choice: session_persistence.BusyPromptChoice) bool {
             const picker = &agent.session_persistence.session_picker;
             if (!picker.busyPromptActive() or picker.actionPending()) return false;
-            picker.selectBusyPromptChoice(yes);
+            picker.selectBusyPromptChoice(choice);
             if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
             return true;
         }
@@ -2209,7 +2210,19 @@ pub fn Runtime(comptime App: type) type {
             defer task.deinit();
 
             const picker = &agent.session_persistence.session_picker;
-            if (task.abandoned or !picker.active) return;
+            if (task.abandoned or !picker.active) {
+                debug_trace.logf(
+                    "session",
+                    "picker prepared result dropped action={s} session_id={s} reason={s}",
+                    .{
+                        @tagName(task.request.action),
+                        task.request.session_id,
+                        if (task.abandoned) "cancelled" else "picker_closed",
+                    },
+                );
+                task.discardAbandonedFork();
+                return;
+            }
 
             picker.pending_action = null;
             switch (task.outcome) {
@@ -2220,31 +2233,7 @@ pub fn Runtime(comptime App: type) type {
                     try picker.openBusyPrompt(app.alloc, task.request.session_id, task.request.title, busy.pid);
                     if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
                 },
-                .failed => |err| {
-                    if (agent.session_persistence.v2_store) |v2_store| {
-                        noteConversionProblem(app, v2_store, err);
-                    }
-                    debug_trace.logf(
-                        "session",
-                        "picker prepare failed action={s} err={s}",
-                        .{ @tagName(task.request.action), @errorName(err) },
-                    );
-                    if (task.request.action == .forking) {
-                        if (picker.busy_prompt) |*prompt| {
-                            const msg = switch (err) {
-                                error.InvalidForkPoint => "Cannot fork yet · turn 1 still running.",
-                                error.NotFound => "Cannot fork this session format while open in another fx.",
-                                else => "Unable to fork this session.",
-                            };
-                            try prompt.setError(app.alloc, msg);
-                        } else {
-                            picker.selection_failure = .unavailable;
-                        }
-                    } else {
-                        picker.selection_failure = session_catalog.classifyResumeFailure(err);
-                    }
-                    if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
-                },
+                .failed => |err| try handlePickerResumeFailure(app, agent, picker, task.request.action, err),
                 .ready => |*prepared| {
                     const v2 = prepared.v2;
                     const resumed = prepared.resumed;
@@ -2271,6 +2260,38 @@ pub fn Runtime(comptime App: type) type {
                     };
                 },
             }
+        }
+
+        fn handlePickerResumeFailure(
+            app: *App,
+            agent: *AppAgent,
+            picker: *session_persistence.SessionPicker,
+            action: session_persistence.SessionPickerAction,
+            err: anyerror,
+        ) !void {
+            if (agent.session_persistence.v2_store) |v2_store| {
+                noteConversionProblem(app, v2_store, err);
+            }
+            debug_trace.logf(
+                "session",
+                "picker prepare failed action={s} err={s}",
+                .{ @tagName(action), @errorName(err) },
+            );
+            if (action == .forking) {
+                if (picker.busy_prompt) |*prompt| {
+                    const msg = switch (err) {
+                        error.InvalidForkPoint => "Cannot fork yet · turn 1 still running.",
+                        error.NotFound => "Cannot fork this session format while open in another fx.",
+                        else => "Unable to fork this session. Press esc and try again.",
+                    };
+                    try prompt.setError(app.alloc, msg);
+                } else {
+                    picker.selection_failure = .unavailable;
+                }
+            } else {
+                picker.selection_failure = session_catalog.classifyResumeFailure(err);
+            }
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
         }
 
         fn finishPreparedPickerResume(

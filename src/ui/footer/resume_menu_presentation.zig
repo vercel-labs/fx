@@ -608,6 +608,18 @@ fn appendBusyOptionRow(
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
+const busy_fork_description = "Copy through the last finished turn";
+const busy_back_description = "Keep the running session untouched";
+const busy_back_retry_description = "Close the other fx and retry";
+
+fn busyBackDescription(buf: []u8, prompt: render_input.BusyForkPromptProjection) []const u8 {
+    if (prompt.error_message == null) return busy_back_description;
+    if (prompt.pid) |pid| {
+        return std.mem.print(buf, "Wait for turn 1 or close pid {d}", .{pid}) catch busy_back_retry_description;
+    }
+    return busy_back_retry_description;
+}
+
 fn composeBusyForkPromptRow(
     alloc: Allocator,
     prompt: render_input.BusyForkPromptProjection,
@@ -680,25 +692,19 @@ fn composeBusyForkPromptRow(
                 prompt.selected_yes,
                 "1) ",
                 "Fork and continue here",
-                "Copy through the last finished turn",
+                busy_fork_description,
             );
         },
         .option_fork_desc => {
             const desc_indent: usize = if (width > 6) 5 else indent_width;
             try row.appendNTimes(alloc, ' ', desc_indent);
             try row.appendSlice(alloc, ui_render.dim_style);
-            try row_text.appendSingleLineEllipsized(alloc, &row, "Copy through the last finished turn", @as(usize, width) -| desc_indent);
+            try row_text.appendSingleLineEllipsized(alloc, &row, busy_fork_description, @as(usize, width) -| desc_indent);
             try row.appendSlice(alloc, ui_render.reset_style);
         },
         .option_back => {
             var desc_buf: [64]u8 = undefined;
-            const desc = if (has_error)
-                if (prompt.pid) |pid|
-                    std.mem.print(&desc_buf, "Wait for turn 1 or close pid {d}", .{pid}) catch "Close the other fx and retry"
-                else
-                    "Close the other fx and retry"
-            else
-                "Keep the running session untouched";
+            const desc = busyBackDescription(&desc_buf, prompt);
             try appendBusyOptionRow(
                 alloc,
                 &row,
@@ -713,13 +719,7 @@ fn composeBusyForkPromptRow(
         .option_back_desc => {
             const desc_indent: usize = if (width > 6) 5 else indent_width;
             var desc_buf: [64]u8 = undefined;
-            const desc = if (has_error)
-                if (prompt.pid) |pid|
-                    std.mem.print(&desc_buf, "Wait for turn 1 or close pid {d}", .{pid}) catch "Close the other fx and retry"
-                else
-                    "Close the other fx and retry"
-            else
-                "Keep the running session untouched";
+            const desc = busyBackDescription(&desc_buf, prompt);
             try row.appendNTimes(alloc, ' ', desc_indent);
             try row.appendSlice(alloc, ui_render.dim_style);
             try row_text.appendSingleLineEllipsized(alloc, &row, desc, @as(usize, width) -| desc_indent);
@@ -743,6 +743,7 @@ fn composeSelectionFailureRow(
     const message = switch (failure) {
         .open_elsewhere => "This session is open in another fx. Close it there, then press enter to retry.",
         .being_updated => "This session is being updated. Wait a moment, then press enter to retry.",
+        .busy_starting => "Still closing the previous open. Press enter to try again.",
         .connection_changed => "This session's custom connection changed in settings. Change it back, or start a new session.",
         .connection_removed => "This session's custom connection is no longer in settings. Add it back, or start a new session.",
         .unavailable => "Unable to resume this session.",

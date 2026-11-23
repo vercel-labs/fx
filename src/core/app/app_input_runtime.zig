@@ -1705,12 +1705,7 @@ pub fn Runtime(comptime App: type) type {
             if (!picker.active) return false;
             if (picker.actionPending()) return true;
             if (picker.busyPromptActive()) {
-                const prompt = picker.busy_prompt.?;
-                if (prompt.error_message == null and prompt.selected_yes) {
-                    try startSessionPickerBusyFork(app, agent);
-                } else {
-                    _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
-                }
+                try confirmSessionPickerBusyChoice(app, agent);
                 return true;
             }
 
@@ -1764,12 +1759,25 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        fn confirmSessionPickerBusyChoice(app: *App, agent: *AppAgent) !void {
+            const prompt = agent.session_persistence.session_picker.busy_prompt orelse return;
+            if (prompt.error_message == null and prompt.selected_yes) {
+                try startSessionPickerBusyFork(app, agent);
+            } else {
+                _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+            }
+        }
+
         fn startSessionPickerBusyFork(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(App, "startSessionPickerBusyFork")) {
                 _ = app.startSessionPickerBusyFork(agent) catch |err| {
                     debug_trace.logf("session", "picker busy fork start failed err={s}", .{@errorName(err)});
                     if (agent.session_persistence.session_picker.busy_prompt) |*prompt| {
-                        try prompt.setError(app.alloc, "Unable to fork this session.");
+                        const msg = if (err == error.SessionPickerResumeBusy)
+                            "Still closing the previous open. Press enter to try again."
+                        else
+                            "Unable to fork this session. Press esc and try again.";
+                        try prompt.setError(app.alloc, msg);
                     }
                     app.shell.render_requests.request(.footer);
                 };
@@ -1785,6 +1793,7 @@ pub fn Runtime(comptime App: type) type {
             if (picker.actionPending()) {
                 if (byte < 0x20 and byte != '\r' and byte != '\n' and byte != '\t' and byte != 8) return false;
                 if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "session_picker_pending");
+                debug_trace.logf("input", "session picker pending ignored byte=0x{x} reason=action_pending", .{byte});
                 return true;
             }
             if (!picker.busyPromptActive()) return false;
@@ -1813,11 +1822,7 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
                 '\r', '\n' => {
-                    if (!has_error and picker.busy_prompt.?.selected_yes) {
-                        try startSessionPickerBusyFork(app, agent);
-                    } else {
-                        _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
-                    }
+                    try confirmSessionPickerBusyChoice(app, agent);
                     return true;
                 },
                 '\t' => {
@@ -1843,25 +1848,25 @@ pub fn Runtime(comptime App: type) type {
             const picker = &agent.session_persistence.session_picker;
             if (picker.actionPending()) {
                 return switch (resolved) {
-                    .mouse_wheel, .mouse_pointer => false,
+                    .escape, .mouse_wheel, .mouse_pointer => false,
                     else => true,
                 };
             }
             if (!picker.busyPromptActive()) return false;
             switch (resolved) {
                 .cursor_up, .history_up => {
-                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, true);
+                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, .fork);
                     return true;
                 },
                 .cursor_down, .history_down => {
-                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, false);
+                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, .back);
                     return true;
                 },
                 .cursor_left, .cursor_right, .toggle_permission_mode => {
                     _ = app_session_runtime.Runtime(App).toggleSessionPickerBusyPrompt(app, agent);
                     return true;
                 },
-                .mouse_wheel, .mouse_pointer => return false,
+                .escape, .mouse_wheel, .mouse_pointer => return false,
                 else => return true,
             }
         }

@@ -55,7 +55,12 @@ const PickerContinuation = struct {
 pub const SessionPickerScope = session_catalog.Scope;
 pub const SessionPickerAction = session_catalog.PendingAction;
 
-pub const SessionPickerBusyPrompt = struct {
+pub const BusyPromptChoice = enum {
+    fork,
+    back,
+};
+
+const SessionPickerBusyPrompt = struct {
     session_id: []u8,
     title: []u8,
     workspace_label: []u8,
@@ -64,7 +69,7 @@ pub const SessionPickerBusyPrompt = struct {
     selected_yes: bool = true,
     error_message: ?[]u8 = null,
 
-    pub fn deinit(self: *SessionPickerBusyPrompt, alloc: Allocator) void {
+    fn deinit(self: *SessionPickerBusyPrompt, alloc: Allocator) void {
         alloc.free(self.session_id);
         alloc.free(self.title);
         alloc.free(self.workspace_label);
@@ -191,10 +196,10 @@ pub const SessionPicker = struct {
         }
     }
 
-    pub fn selectBusyPromptChoice(self: *SessionPicker, yes: bool) void {
+    pub fn selectBusyPromptChoice(self: *SessionPicker, choice: BusyPromptChoice) void {
         if (self.busy_prompt) |*prompt| {
             if (prompt.error_message != null) return;
-            prompt.selected_yes = yes;
+            prompt.selected_yes = choice == .fork;
         }
     }
 
@@ -203,7 +208,14 @@ pub const SessionPicker = struct {
     }
 
     pub fn setQuery(self: *SessionPicker, query_text: []const u8) void {
-        if (self.busy_prompt != null or self.pending_action != null) return;
+        if (self.busy_prompt != null or self.pending_action != null) {
+            debug_trace.logf(
+                "session",
+                "picker query ignored len={d} reason={s}",
+                .{ query_text.len, if (self.pending_action != null) "action_pending" else "busy_prompt" },
+            );
+            return;
+        }
         const len = @min(query_text.len, self.query_buf.len);
         if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
@@ -783,12 +795,12 @@ pub const SessionPickerResume = struct {
     };
 
     pub const Task = struct {
-        thread: ?std.Thread = null,
+        future: ?std.Io.Future(void) = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         abandoned: bool = false,
         request: Request,
-        /// Shared with Persistence, which joins this thread before freeing store.
+        /// Shared with Persistence, which awaits this task before freeing store.
         store: *session_adapter.Store,
         outcome: Outcome = .none,
 
@@ -796,15 +808,140 @@ pub const SessionPickerResume = struct {
             self.cancel_requested.store(true, .release);
         }
 
+        /// Removes a newly created fork if the user cancelled or closed the
+        /// picker before it was installed, so cancelled forks do not stay listed.
+        pub fn discardAbandonedFork(self: *Task) void {
+            if (comptime host_target.is_wasm) return;
+            if (self.request.action != .forking) return;
+            switch (self.outcome) {
+                .ready => |*prepared| {
+                    var id_buf: [64]u8 = undefined;
+                    const raw_id = prepared.v2.id();
+                    const copy_len = @min(raw_id.len, id_buf.len);
+                    @memcpy(id_buf[0..copy_len], raw_id[0..copy_len]);
+                    const fork_id = id_buf[0..copy_len];
+                    prepared.deinit();
+                    self.outcome = .none;
+                    self.store.manager.delete(fork_id) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "picker cancelled fork cleanup failed id={s} err={s}",
+                            .{ fork_id, @errorName(err) },
+                        );
+                    };
+                },
+                else => {},
+            }
+        }
+
         pub fn deinit(self: *Task) void {
             self.requestStop();
-            if (self.thread) |thread| thread.join();
-            switch (self.outcome) {
-                .ready => |*prepared| prepared.deinit(),
-                else => {},
+            if (self.future) |*future| future.await(io_mod.getIo());
+            if (comptime !host_target.is_wasm) {
+                if (self.abandoned) self.discardAbandonedFork();
+                switch (self.outcome) {
+                    .ready => |*prepared| prepared.deinit(),
+                    else => {},
+                }
             }
             self.request.deinit();
             std.heap.c_allocator.destroy(self);
+        }
+
+        fn run(self: *Task) void {
+            defer self.done.store(true, .release);
+            const alloc = std.heap.c_allocator;
+            const started = io_mod.nanoTimestamp();
+            if (self.cancel_requested.load(.acquire)) {
+                self.outcome = .cancelled;
+                return;
+            }
+            const v2 = switch (self.request.action) {
+                .opening => session_adapter.Session.resumeSessionWithoutWaiting(
+                    alloc,
+                    self.store,
+                    .{ .id = self.request.session_id },
+                    self.request.workspace_root,
+                    .app,
+                ) catch |err| {
+                    if (err == error.SessionBusy) {
+                        const pid = self.store.lockHolderPid(self.request.session_id);
+                        debug_trace.logf("session", "picker open busy session={s} pid={?d}", .{ self.request.session_id, pid });
+                        self.outcome = .{ .busy = .{ .pid = pid } };
+                        return;
+                    }
+                    self.outcome = .{ .failed = err };
+                    return;
+                },
+                .forking => session_adapter.Session.forkLatest(
+                    alloc,
+                    self.store,
+                    self.request.session_id,
+                    self.request.workspace_root,
+                    .app,
+                    if (self.request.title.len > 0) self.request.title else null,
+                ) catch |err| {
+                    self.outcome = .{ .failed = err };
+                    return;
+                },
+            };
+            var v2_owned = true;
+            defer if (v2_owned) {
+                var id_buf: [64]u8 = undefined;
+                const delete_fork = self.request.action == .forking and self.cancel_requested.load(.acquire);
+                const raw_id = v2.id();
+                const copy_len = @min(raw_id.len, id_buf.len);
+                if (delete_fork) @memcpy(id_buf[0..copy_len], raw_id[0..copy_len]);
+                v2.close();
+                if (delete_fork) {
+                    const fork_id = id_buf[0..copy_len];
+                    self.store.manager.delete(fork_id) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "picker cancelled fork cleanup failed id={s} err={s}",
+                            .{ fork_id, @errorName(err) },
+                        );
+                    };
+                }
+            };
+            if (self.cancel_requested.load(.acquire)) {
+                self.outcome = .cancelled;
+                return;
+            }
+            var resumed = v2.durableState(alloc, self.request.workspace_root) catch |err| {
+                self.outcome = .{ .failed = err };
+                return;
+            };
+            var resumed_owned = true;
+            defer if (resumed_owned) resumed.deinit(alloc);
+            if (self.cancel_requested.load(.acquire)) {
+                self.outcome = .cancelled;
+                return;
+            }
+            const forked_from: ?[]u8 = if (self.request.action == .forking)
+                alloc.dupe(u8, self.request.session_id) catch |err| {
+                    self.outcome = .{ .failed = err };
+                    return;
+                }
+            else
+                null;
+            v2_owned = false;
+            resumed_owned = false;
+            debug_trace.logf(
+                "session",
+                "picker prepare ready action={s} session={s} turns={d} elapsed_us={d}",
+                .{
+                    @tagName(self.request.action),
+                    v2.id(),
+                    resumed.state.history.len,
+                    @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us),
+                },
+            );
+            self.outcome = .{ .ready = .{
+                .v2 = v2,
+                .resumed = resumed,
+                .forked_from = forked_from,
+            } };
         }
     };
 
@@ -819,6 +956,11 @@ pub const SessionPickerResume = struct {
         store: *session_adapter.Store,
         request: Request,
     ) !void {
+        if (comptime host_target.is_wasm) {
+            var owned_unused = request;
+            owned_unused.deinit();
+            return error.SessionPersistenceUnavailable;
+        }
         if (self.task != null) return error.SessionPickerResumeBusy;
         const alloc = std.heap.c_allocator;
         var owned = request;
@@ -827,10 +969,10 @@ pub const SessionPickerResume = struct {
             return err;
         };
         task.* = .{ .request = owned, .store = store };
-        if (comptime builtin.single_threaded or host_target.is_wasm) {
-            threadMain(task);
+        if (comptime builtin.single_threaded) {
+            task.run();
         } else {
-            task.thread = std.Thread.spawn(.{}, threadMain, .{task}) catch |err| {
+            task.future = io_mod.getIo().concurrent(Task.run, .{task}) catch |err| {
                 task.request.deinit();
                 alloc.destroy(task);
                 return err;
@@ -849,6 +991,8 @@ pub const SessionPickerResume = struct {
     pub fn takeCompleted(self: *SessionPickerResume) ?*Task {
         const task = self.task orelse return null;
         if (!task.done.load(.acquire)) return null;
+        if (task.future) |*future| future.await(io_mod.getIo());
+        task.future = null;
         self.task = null;
         return task;
     }
@@ -859,85 +1003,6 @@ pub const SessionPickerResume = struct {
             task.deinit();
         }
         self.* = .{};
-    }
-
-    fn threadMain(task: *Task) void {
-        defer task.done.store(true, .release);
-        const alloc = std.heap.c_allocator;
-        const started = io_mod.nanoTimestamp();
-        if (task.cancel_requested.load(.acquire)) {
-            task.outcome = .cancelled;
-            return;
-        }
-        const v2 = switch (task.request.action) {
-            .opening => session_adapter.Session.resumeSessionWithoutWaiting(
-                alloc,
-                task.store,
-                .{ .id = task.request.session_id },
-                task.request.workspace_root,
-                .app,
-            ) catch |err| {
-                if (err == error.SessionBusy) {
-                    const pid = task.store.lockHolderPid(task.request.session_id);
-                    debug_trace.logf("session", "picker open busy session={s} pid={?d}", .{ task.request.session_id, pid });
-                    task.outcome = .{ .busy = .{ .pid = pid } };
-                    return;
-                }
-                task.outcome = .{ .failed = err };
-                return;
-            },
-            .forking => session_adapter.Session.forkLatest(
-                alloc,
-                task.store,
-                task.request.session_id,
-                task.request.workspace_root,
-                .app,
-                if (task.request.title.len > 0) task.request.title else null,
-            ) catch |err| {
-                task.outcome = .{ .failed = err };
-                return;
-            },
-        };
-        var v2_owned = true;
-        defer if (v2_owned) v2.close();
-        if (task.cancel_requested.load(.acquire)) {
-            task.outcome = .cancelled;
-            return;
-        }
-        var resumed = v2.durableState(alloc, task.request.workspace_root) catch |err| {
-            task.outcome = .{ .failed = err };
-            return;
-        };
-        var resumed_owned = true;
-        defer if (resumed_owned) resumed.deinit(alloc);
-        if (task.cancel_requested.load(.acquire)) {
-            task.outcome = .cancelled;
-            return;
-        }
-        const forked_from: ?[]u8 = if (task.request.action == .forking)
-            alloc.dupe(u8, task.request.session_id) catch |err| {
-                task.outcome = .{ .failed = err };
-                return;
-            }
-        else
-            null;
-        v2_owned = false;
-        resumed_owned = false;
-        debug_trace.logf(
-            "session",
-            "picker prepare ready action={s} session={s} turns={d} elapsed_us={d}",
-            .{
-                @tagName(task.request.action),
-                v2.id(),
-                resumed.state.history.len,
-                @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us),
-            },
-        );
-        task.outcome = .{ .ready = .{
-            .v2 = v2,
-            .resumed = resumed,
-            .forked_from = forked_from,
-        } };
     }
 };
 

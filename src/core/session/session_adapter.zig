@@ -4095,14 +4095,18 @@ fn putBodies(handle: sm.Session, bodies: []Body) PutBodyError!void {
         }
     };
     var putter: Putter = .{ .handle = handle, .bodies = bodies };
-    var threads: [3]?std.Thread = @splat(null);
-    for (&threads, 1..) |*thread, count| {
-        if (bodies.len <= count) break;
-        // Without a thread the others, and this one, do its share.
-        thread.* = std.Thread.spawn(.{}, Putter.run, .{&putter}) catch null;
+    if (comptime !builtin.single_threaded) {
+        var threads: [3]?std.Thread = @splat(null);
+        for (&threads, 1..) |*thread, count| {
+            if (bodies.len <= count) break;
+            // Without a thread the others, and this one, do its share.
+            thread.* = std.Thread.spawn(.{}, Putter.run, .{&putter}) catch null;
+        }
+        putter.run();
+        for (threads) |thread| if (thread) |value| value.join();
+    } else {
+        putter.run();
     }
-    putter.run();
-    for (threads) |thread| if (thread) |value| value.join();
     if (putter.failed.load(.acquire)) return putter.failure;
 }
 /// The side files an ACP client's settings came from, as `acp`'s
@@ -6121,7 +6125,7 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
         .created_at_ms = std.math.cast(i64, item.created_ms) orelse 0,
         .updated_at_ms = std.math.cast(i64, item.updated_ms) orelse 0,
         .conversation_language = if (item.language) |raw| try decodeLanguage(scratch, raw) else types.ConversationLanguage.default(),
-        .history_len = @max(item.turns, 1),
+        .history_len = std.math.cast(usize, @max(item.turns, 1)) orelse std.math.maxInt(usize),
     };
 }
 
@@ -14346,4 +14350,24 @@ test "childLatestReplyAt reads backward to the newest completed reply timestamp"
     s.close();
 
     try testing.expectEqual(@as(i64, 2222), try t.store.childLatestReplyAt(alloc, id));
+}
+
+test "childLatestReplyAt returns 0 when a child has no completed reply" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const s = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+    const id = try alloc.dupe(u8, s.id());
+    defer alloc.free(id);
+
+    try s.commitTurn(.{ .interrupted = .{
+        .user = .{ .text = @constCast("q1") },
+        .assistant = @constCast("partial"),
+        .terminal_reason = .cancelled,
+    } }, types.ConversationLanguage.default());
+    s.close();
+
+    try testing.expectEqual(@as(i64, 0), try t.store.childLatestReplyAt(alloc, id));
 }
