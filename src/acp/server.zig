@@ -8731,8 +8731,9 @@ test "a follower that does not list usage gets its answer without the usage meta
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
-    const session = try openAnswerSession(alloc, &state, &follower);
+    defer follower.deinit();
     state.extensions = sh_fx.Set.initMany(&.{.usage});
+    const session = try openAnswerSession(alloc, &state, &follower);
     session.turn_summary = .{};
 
     var owner_turn = answerTestPrompt(&state, session, 1);
