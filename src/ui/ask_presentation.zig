@@ -125,13 +125,10 @@ pub const Runtime = struct {
 
     pub fn setThinking(self: *Runtime, active: bool) !void {
         try self.checkPendingError();
+        if (self.finished) return;
         if (self.thinking == active) return;
         self.thinking = active;
         self.render() catch |err| return self.failWith(err);
-    }
-
-    pub fn clearActivity(self: *Runtime) !void {
-        try self.setThinking(false);
     }
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
@@ -709,7 +706,7 @@ test "ask presentation shows transient thinking row on init and clears it on tex
     try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
 }
 
-test "ask presentation restores thinking after tool lifecycle and clears on clearActivity and finish without screen clears" {
+test "ask presentation restores thinking after tool lifecycle and clears on setThinking(false) and finish without screen clears" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -753,7 +750,7 @@ test "ask presentation restores thinking after tool lifecycle and clears on clea
     try runtime.setThinking(true);
     try std.testing.expect(try testShadowContains(alloc, &runtime, thinking_activity_label));
 
-    try runtime.clearActivity();
+    try runtime.setThinking(false);
     try std.testing.expect(!try testShadowContains(alloc, &runtime, thinking_activity_label));
 
     try runtime.setThinking(true);

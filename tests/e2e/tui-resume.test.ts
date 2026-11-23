@@ -6199,7 +6199,7 @@ test("update runs the manual upgrade", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
-  "TTY upgrade prints plain white fx version header before output",
+  "TTY upgrade prints bold fx version header before output",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
     const argvLogPath = join(root, "upgrade-argv.log");

@@ -522,24 +522,10 @@ pub fn fetchGatewayJsonCancellable(
     cancel_flag: *std.atomic.Value(bool),
     connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
-    return fetchGatewayJsonWithPoolCancellable(alloc, null, api_key, gateway_team, url, cancel_flag, connected);
-}
-
-/// Like `fetchGatewayJsonCancellable`, reusing a shared `HttpPool` when given
-/// so the request can share warmed TCP/TLS connections with gateway chat calls.
-pub fn fetchGatewayJsonWithPoolCancellable(
-    alloc: std.mem.Allocator,
-    pool: ?*http_pool.HttpPool,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
-    url: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-    connected: ?*std.atomic.Value(bool),
-) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlWithPoolCancellable(alloc, pool, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms, connected);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms, connected);
 }
 
 /// A stalled catalog request fails with `error.Timeout` after this long, so a
@@ -555,22 +541,8 @@ fn fetchGatewayJsonAtUrlCancellable(
     timeout_ms: i64,
     connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
-    return fetchGatewayJsonAtUrlWithPoolCancellable(alloc, null, api_key, gateway_team, url, cancel_flag, timeout_ms, connected);
-}
-
-fn fetchGatewayJsonAtUrlWithPoolCancellable(
-    alloc: std.mem.Allocator,
-    pool: ?*http_pool.HttpPool,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
-    url: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-    timeout_ms: i64,
-    connected: ?*std.atomic.Value(bool),
-) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
-        .pool = pool,
         .api_key = api_key,
         .gateway_team = gateway_team,
         .url = url,
@@ -586,7 +558,6 @@ fn fetchGatewayJsonAtUrlWithPoolCancellable(
 
 const GatewayJsonFetchOperation = struct {
     alloc: std.mem.Allocator,
-    pool: ?*http_pool.HttpPool,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
@@ -596,7 +567,6 @@ const GatewayJsonFetchOperation = struct {
     fn run(self: *@This()) !GatewayJsonResult {
         return fetchGatewayJsonAtUrlCore(
             self.alloc,
-            self.pool,
             self.api_key,
             self.gateway_team,
             self.url,
@@ -608,7 +578,6 @@ const GatewayJsonFetchOperation = struct {
 
 fn fetchGatewayJsonAtUrlCore(
     alloc: std.mem.Allocator,
-    pool: ?*http_pool.HttpPool,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
@@ -631,150 +600,71 @@ fn fetchGatewayJsonAtUrlCore(
     var extra_headers_buf: [1]std.http.Header = undefined;
     const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
-    var stale_retry_used = false;
-    while (true) {
-        if (pool) |shared| _ = shared.clientFor(url);
-        var reused = false;
-        var opened = openRequestOnJobWithPool(pool, .GET, uri, .{
-            .headers = headers,
-            .extra_headers = extra_headers,
-            .keep_alive = pool != null,
-            .redirect_behavior = .unhandled,
-        }, &reused) catch |err| {
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-            return err;
-        };
-        var deinit_opened = true;
-        defer if (deinit_opened) opened.deinit();
-        const req = &opened.request;
-        // The open returns once the connection is open, TLS included.
-        if (connected) |flag| flag.store(true, .release);
-        if (cancel_flag.load(.seq_cst)) {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            return error.Cancelled;
-        }
+    var opened = openRequestOnJob(.GET, uri, .{
+        .headers = headers,
+        .extra_headers = extra_headers,
+        .redirect_behavior = .unhandled,
+    }) catch |err| {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        return err;
+    };
+    defer opened.deinit();
+    const req = &opened.request;
+    // The open returns once the connection is open, TLS included.
+    if (connected) |flag| flag.store(true, .release);
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-        var cancel_watch_done = std.atomic.Value(bool).init(false);
-        var cancel_watcher = if (req.connection) |conn|
-            try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
-        else
-            null;
-        defer {
-            cancel_watch_done.store(true, .seq_cst);
-            if (cancel_watcher) |thread| thread.join();
-        }
-        if (cancel_flag.load(.seq_cst)) {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            return error.Cancelled;
-        }
-
-        const send_ok = blk: {
-            req.sendBodiless() catch |err| {
-                if (pool != null) if (req.connection) |conn| {
-                    conn.closing = true;
-                };
-                if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-                if (reused and !stale_retry_used) break :blk false;
-                return err;
-            };
-            if (req.connection) |conn| {
-                conn.flush() catch |err| {
-                    if (pool != null) conn.closing = true;
-                    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-                    if (reused and !stale_retry_used) break :blk false;
-                    return err;
-                };
-            }
-            break :blk true;
-        };
-        if (!send_ok) {
-            stale_retry_used = true;
-            cancel_watch_done.store(true, .seq_cst);
-            if (cancel_watcher) |thread| {
-                cancel_watcher = null;
-                thread.join();
-            }
-            opened.deinit();
-            deinit_opened = false;
-            if (pool) |shared| _ = shared.closeIdleConnections(url);
-            continue;
-        }
-        if (cancel_flag.load(.seq_cst)) {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            return error.Cancelled;
-        }
-
-        var response = req.receiveHead(&.{}) catch |err| {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-            if (reused and !stale_retry_used) {
-                stale_retry_used = true;
-                cancel_watch_done.store(true, .seq_cst);
-                if (cancel_watcher) |thread| {
-                    cancel_watcher = null;
-                    thread.join();
-                }
-                opened.deinit();
-                deinit_opened = false;
-                if (pool) |shared| _ = shared.closeIdleConnections(url);
-                continue;
-            }
-            return err;
-        };
-        if (cancel_flag.load(.seq_cst)) {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            return error.Cancelled;
-        }
-        if (failedGatewayJsonStatus(response.head.status)) |status| {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            return .{ .http_status = status };
-        }
-
-        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-            .identity => &.{},
-            .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
-            .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
-            .compress => {
-                if (pool != null) if (req.connection) |conn| {
-                    conn.closing = true;
-                };
-                return error.UnsupportedCompressionMethod;
-            },
-        };
-        defer if (decompress_buffer.len > 0) alloc.free(decompress_buffer);
-
-        var transfer_buffer: [64 * 1024]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-        const body = readGatewayJsonBody(alloc, reader, max_gateway_json_bytes) catch |err| {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-            return if (err == error.ReadFailed) bodyReadError(&response) else err;
-        };
-        if (cancel_flag.load(.seq_cst)) {
-            if (pool != null) if (req.connection) |conn| {
-                conn.closing = true;
-            };
-            alloc.free(body);
-            return error.Cancelled;
-        }
-        if (pool) |shared| shared.noteActivity();
-        return .{ .success = body };
+    var cancel_watch_done = std.atomic.Value(bool).init(false);
+    const cancel_watcher = if (req.connection) |conn|
+        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
+    else
+        null;
+    defer {
+        cancel_watch_done.store(true, .seq_cst);
+        if (cancel_watcher) |thread| thread.join();
     }
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+
+    req.sendBodiless() catch |err| {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        return err;
+    };
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (req.connection) |conn| {
+        conn.flush() catch |err| {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return err;
+        };
+    }
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+
+    var response = req.receiveHead(&.{}) catch |err| {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        return err;
+    };
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
+        .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) alloc.free(decompress_buffer);
+
+    var transfer_buffer: [64 * 1024]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    const body = readGatewayJsonBody(alloc, reader, max_gateway_json_bytes) catch |err| {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        return if (err == error.ReadFailed) bodyReadError(&response) else err;
+    };
+    if (cancel_flag.load(.seq_cst)) {
+        alloc.free(body);
+        return error.Cancelled;
+    }
+    return .{ .success = body };
 }
 
 /// About fifty times today's model catalog. A larger response fails rather
@@ -2851,24 +2741,14 @@ pub fn openRequestOnJob(
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
 ) !OpenedRequest {
-    var reused = false;
-    return openRequestOnJobWithPool(null, method, uri, options, &reused);
-}
-
-fn openRequestOnJobWithPool(
-    pool: ?*http_pool.HttpPool,
-    method: std.http.Method,
-    uri: std.Uri,
-    options: std.http.Client.RequestOptions,
-    reused: *bool,
-) !OpenedRequest {
     if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
-    const job = try OpenJob.start(pool, method, uri, options, null);
+    const job = try OpenJob.start(null, method, uri, options, null);
     // The bounded operation's watch owns the cancel flag and deadline; it
     // ends this wait by cancelling the task.
     var never_cancelled = std.atomic.Value(bool).init(false);
     const no_deadline: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .fromNanoseconds(std.math.maxInt(i96)) };
-    return job.waitForOpen(uri, options, no_deadline, &never_cancelled, reused);
+    var reused = false;
+    return job.waitForOpen(uri, options, no_deadline, &never_cancelled, &reused);
 }
 
 /// The error behind a failed read of a response body. The body reader keeps
@@ -10605,7 +10485,7 @@ test "cancellable gateway JSON request interrupts a stalled TLS handshake" {
     try expectCancellableGatewayJsonCancellation(.tls_handshake_stall, "test-key", true, 20, 1200, 500);
 }
 
-test "gateway JSON fetch requests compression, decompresses gzip, and reuses pooled connections" {
+test "gateway JSON fetch requests compression and decodes gzip responses" {
     const zio = io_mod.getIo();
     const alloc = std.testing.allocator;
     const plain = "{\"object\":\"list\",\"data\":[{\"id\":\"test/model\"}]}";
@@ -10626,9 +10506,7 @@ test "gateway JSON fetch requests compression, decompresses gzip, and reuses poo
     const ServerState = struct {
         server: *std.Io.net.Server,
         gzip_body: []const u8,
-        accepted_count: std.atomic.Value(usize) = .init(0),
-        requests_served: std.atomic.Value(usize) = .init(0),
-        accept_encoding_ok: std.atomic.Value(bool) = .init(true),
+        accept_encoding_ok: bool = false,
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
@@ -10638,54 +10516,46 @@ test "gateway JSON fetch requests compression, decompresses gzip, and reuses poo
                 return;
             };
             defer stream.close(inner_zio);
-            _ = self.accepted_count.fetchAdd(1, .seq_cst);
 
             var read_buf: [4096]u8 = undefined;
             var reader = stream.reader(inner_zio, &read_buf);
             var write_buf: [4096]u8 = undefined;
             var writer = stream.writer(inner_zio, &write_buf);
 
-            while (true) {
-                var header_buf: [16 * 1024]u8 = undefined;
-                var header_len: usize = 0;
-                while (header_len < header_buf.len) {
-                    const byte = reader.interface.takeByte() catch |err| switch (err) {
-                        error.EndOfStream => return,
-                        else => {
-                            self.failure = err;
-                            return;
-                        },
-                    };
-                    header_buf[header_len] = byte;
-                    header_len += 1;
-                    if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
-                } else {
-                    self.failure = error.TestRequestTooLarge;
-                    return;
-                }
-                const headers = header_buf[0 .. header_len - 4];
-                const enc = rawHeaderValue(headers, "accept-encoding") orelse "";
-                if (std.mem.find(u8, enc, "gzip") == null) {
-                    self.accept_encoding_ok.store(false, .seq_cst);
-                }
-
-                writer.interface.print(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                    .{self.gzip_body.len},
-                ) catch |err| {
+            var header_buf: [16 * 1024]u8 = undefined;
+            var header_len: usize = 0;
+            while (header_len < header_buf.len) {
+                header_buf[header_len] = reader.interface.takeByte() catch |err| {
                     self.failure = err;
                     return;
                 };
-                writer.interface.writeAll(self.gzip_body) catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                writer.interface.flush() catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                header_len += 1;
+                if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
             }
+            const headers = header_buf[0 .. header_len - 4];
+            const enc = rawHeaderValue(headers, "accept-encoding") orelse "";
+            if (std.mem.find(u8, enc, "gzip") != null) {
+                self.accept_encoding_ok = true;
+            }
+
+            writer.interface.print(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{self.gzip_body.len},
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.writeAll(self.gzip_body) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+                return;
+            };
         }
     };
 
@@ -10697,147 +10567,20 @@ test "gateway JSON fetch requests compression, decompresses gzip, and reuses poo
     const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
     defer alloc.free(url);
 
-    var pool = http_pool.HttpPool.init(alloc);
-    defer _ = pool.deinit();
-
     var cancel_flag = std.atomic.Value(bool).init(false);
-    const first = try fetchGatewayJsonAtUrlWithPoolCancellable(alloc, &pool, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
-    defer switch (first) {
+    const response = try fetchGatewayJsonAtUrlCancellable(alloc, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
+    defer switch (response) {
         .success => |body| alloc.free(body),
         .http_status => {},
     };
-    try std.testing.expectEqualStrings(plain, first.success);
-    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+    try std.testing.expectEqualStrings(plain, response.success);
 
-    const second = try fetchGatewayJsonAtUrlWithPoolCancellable(alloc, &pool, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
-    defer switch (second) {
-        .success => |body| alloc.free(body),
-        .http_status => {},
-    };
-    try std.testing.expectEqualStrings(plain, second.success);
-    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
-    try std.testing.expectEqual(@as(usize, 1), state.accepted_count.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 2), state.requests_served.load(.seq_cst));
-    try std.testing.expect(state.accept_encoding_ok.load(.seq_cst));
-
-    _ = pool.deinit();
     server.deinit(zio);
     server_closed = true;
     thread.join();
     joined = true;
     if (state.failure) |err| return err;
-}
-
-test "gateway JSON fetch retries once when a pooled keep-alive connection went stale" {
-    const zio = io_mod.getIo();
-    const alloc = std.testing.allocator;
-    const plain = "{\"object\":\"list\",\"data\":[{\"id\":\"test/stale-retry\"}]}";
-
-    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
-    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
-    var server_closed = false;
-    defer if (!server_closed) server.deinit(zio);
-
-    const ServerState = struct {
-        server: *std.Io.net.Server,
-        body: []const u8,
-        accepted_count: std.atomic.Value(usize) = .init(0),
-        requests_served: std.atomic.Value(usize) = .init(0),
-        first_closed: std.Io.Event = .unset,
-        failure: ?anyerror = null,
-
-        fn serveOne(self: *@This(), inner_zio: std.Io, stream: std.Io.net.Stream) !void {
-            var read_buf: [4096]u8 = undefined;
-            var reader = stream.reader(inner_zio, &read_buf);
-            var write_buf: [4096]u8 = undefined;
-            var writer = stream.writer(inner_zio, &write_buf);
-
-            var header_buf: [16 * 1024]u8 = undefined;
-            var header_len: usize = 0;
-            while (header_len < header_buf.len) {
-                header_buf[header_len] = try reader.interface.takeByte();
-                header_len += 1;
-                if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
-            } else {
-                return error.TestRequestTooLarge;
-            }
-
-            try writer.interface.print(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-                .{self.body.len},
-            );
-            try writer.interface.writeAll(self.body);
-            try writer.interface.flush();
-            _ = self.requests_served.fetchAdd(1, .seq_cst);
-        }
-
-        fn run(self: *@This()) void {
-            const inner_zio = io_mod.getIo();
-            {
-                defer self.first_closed.set(inner_zio);
-                const first_stream = self.server.accept(inner_zio) catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                _ = self.accepted_count.fetchAdd(1, .seq_cst);
-                self.serveOne(inner_zio, first_stream) catch |err| {
-                    first_stream.close(inner_zio);
-                    self.failure = err;
-                    return;
-                };
-                // Drop connection 1 right after request 1 so the pooled socket goes stale.
-                first_stream.close(inner_zio);
-            }
-
-            const second_stream = self.server.accept(inner_zio) catch |err| {
-                self.failure = err;
-                return;
-            };
-            defer second_stream.close(inner_zio);
-            _ = self.accepted_count.fetchAdd(1, .seq_cst);
-            self.serveOne(inner_zio, second_stream) catch |err| {
-                self.failure = err;
-                return;
-            };
-        }
-    };
-
-    var state = ServerState{ .server = &server, .body = plain };
-    const thread = try std.Thread.spawn(.{}, ServerState.run, .{&state});
-    var joined = false;
-    defer if (!joined) thread.join();
-
-    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
-    defer alloc.free(url);
-
-    var pool = http_pool.HttpPool.init(alloc);
-    defer _ = pool.deinit();
-
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    const first = try fetchGatewayJsonAtUrlWithPoolCancellable(alloc, &pool, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
-    defer switch (first) {
-        .success => |body| alloc.free(body),
-        .http_status => {},
-    };
-    try std.testing.expectEqualStrings(plain, first.success);
-
-    state.first_closed.waitUncancelable(zio);
-
-    const second = try fetchGatewayJsonAtUrlWithPoolCancellable(alloc, &pool, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
-    defer switch (second) {
-        .success => |body| alloc.free(body),
-        .http_status => {},
-    };
-    try std.testing.expectEqualStrings(plain, second.success);
-    try std.testing.expectEqual(@as(usize, 2), state.accepted_count.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 2), state.requests_served.load(.seq_cst));
-
-    _ = pool.deinit();
-    server.deinit(zio);
-    server_closed = true;
-    thread.join();
-    joined = true;
-    if (state.failure) |err| return err;
+    try std.testing.expect(state.accept_encoding_ok);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {

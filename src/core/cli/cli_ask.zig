@@ -1587,11 +1587,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 stamped.context = pool;
                 cfg.provider_set.gateway.agent_stream = stamped;
             }
-            if (cfg.provider_set.gateway.model_catalog) |catalog| {
-                var stamped = catalog;
-                stamped.context = pool;
-                cfg.provider_set.gateway.model_catalog = stamped;
-            }
             pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
         } else |_| {}
     }
@@ -1790,7 +1785,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.accountId(),
         );
     }
-    maybeStartCatalogPrewarm(&ctx);
 
     // A team with Token Pass starts a new session on the Token Pass default
     // when nothing chose the model. The check refreshes the saved answer
@@ -2344,18 +2338,6 @@ fn adoptRefreshedAskCredential(
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
-}
-
-fn maybeStartCatalogPrewarm(ctx: *AskContext) void {
-    if (comptime std_builtin.is_test) return;
-    if (io_mod.getenv("FX_BENCH") != null) return;
-    const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const catalog = bundle.model_catalog orelse return;
-    ctx.capability_resolver.startBackgroundLoad(ctx.alloc, catalog, .{
-        .access = ctx.model_catalog_access,
-        .endpoint = ctx.cfg.gateway_models_path,
-        .cancel_flag = ctx.cancelFlag(),
-    });
 }
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

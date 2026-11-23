@@ -239,7 +239,10 @@ test(
         ["ask", "--json", "--no-save", "Finish the ask notification fixture."],
         {
           cwd: fixture.workspace,
-          env: notificationEnv(fixture.home, gateway, tracePath),
+          env: {
+            ...notificationEnv(fixture.home, gateway, tracePath),
+            FX_TRACE_SCOPES: "hooks,notifications,agent",
+          },
           timeoutMs: TIMEOUT,
         },
       );
@@ -247,7 +250,9 @@ test(
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output.trim()).toBe("NOTIFICATION_ASK_COMPLETE");
       expect(result.stderr).toBe("");
-      const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      expect(existsSync(tracePath)).toBe(true);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("[agent]");
       expect(trace).not.toContain("sound play");
       expect(trace).not.toContain("fx.sound.");
       expect(handlerStartCount(trace, "PostTurnEnd")).toBe(0);
@@ -280,7 +285,10 @@ test.skipIf(!tmuxAvailable())(
       session = await TmuxSession.create({
         cmd: `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`,
         cwd: fixture.workspace,
-        env: notificationEnv(fixture.home, gateway, tracePath),
+        env: {
+          ...notificationEnv(fixture.home, gateway, tracePath),
+          FX_TRACE_SCOPES: "hooks,notifications,agent",
+        },
         remainOnExit: true,
       });
       session.startPaneOutputCapture(paneOutputPath);
@@ -290,7 +298,9 @@ test.skipIf(!tmuxAvailable())(
       await session.waitForText("NOTIFICATION_ASK_PERMISSION_COMPLETE", TIMEOUT);
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
 
-      const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+      expect(existsSync(tracePath)).toBe(true);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("[agent]");
       expect(trace).not.toContain("sound play");
       expect(trace).not.toContain("fx.sound.");
       expect(handlerStartCount(trace, "AttentionRequired")).toBe(0);
