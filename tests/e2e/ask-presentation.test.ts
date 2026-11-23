@@ -10,10 +10,11 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
@@ -61,6 +62,7 @@ const sessions: TmuxSession[] = [];
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.kill();
   for (const gateway of gateways.splice(0)) gateway.stop();
+  for (const watcher of openOutputWatchers.splice(0)) watcher.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -117,26 +119,27 @@ function directCommand(args: string[]): string {
   return [FX_BIN, ...args].map(shellQuote).join(" ");
 }
 
-/** Waits until the pane's process has ended. `remainOnExit` keeps the pane, so the session stays alive. */
-async function waitForPaneDead(session: TmuxSession, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (session.paneStatus().dead) return;
-    await Bun.sleep(25);
-  }
-  throw new Error(`Timed out waiting for fx to exit.\n${await session.captureFullScrollback()}`);
-}
+const openOutputWatchers: Array<ReturnType<typeof watch>> = [];
 
-/** The raw pane output is copied to a file asynchronously, so wait until it holds `needle`. */
-async function readOutputUntil(path: string, needle: string, timeoutMs: number): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  let text = "";
-  while (Date.now() < deadline) {
-    text = existsSync(path) ? readFileSync(path, "utf8") : "";
-    if (text.includes(needle)) return text;
-    await Bun.sleep(25);
-  }
-  throw new Error(`Timed out waiting for ${JSON.stringify(needle)} in the pane output: ${JSON.stringify(text.slice(-300))}`);
+/**
+ * Resolves with the raw pane output once it holds `needle`. The pipe copies the
+ * output to the file asynchronously, so each write to the folder checks the file
+ * again. The test's own timeout ends a wait that never sees `needle`; afterEach
+ * closes any watcher still open.
+ */
+function readOutputUntil(path: string, needle: string): Promise<string> {
+  return new Promise((resolve) => {
+    let watcher: ReturnType<typeof watch> | undefined;
+    const check = (): void => {
+      const text = existsSync(path) ? readFileSync(path, "utf8") : "";
+      if (!text.includes(needle)) return;
+      watcher?.close();
+      resolve(text);
+    };
+    watcher = watch(dirname(path), check);
+    openOutputWatchers.push(watcher);
+    check();
+  });
 }
 
 function fakeGatewayStreamingText(lines: string[], delayMs: number) {
@@ -1138,6 +1141,270 @@ describe("fx ask presentation", () => {
     },
     TIMEOUT,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "a shell snapshot fallback in terminal mode is a notice on its own row",
+    async () => {
+      const root = createRoot();
+      // A 9 MB alias exceeds the 8 MiB capture limit, so the snapshot falls back once.
+      writeStartupFiles(
+        root.home,
+        "alias fxbig=\"$(head -c 9000000 /dev/zero | tr '\\0' x)\"\n" +
+          "alias fxsmall='printf FX_FULL_STARTUP_ALIAS'\n",
+      );
+      const gateway = startFakeGateway([
+        userShellRun("first", "fxsmall"),
+        fakeGatewayFinalText("Fallback checked.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--yolo", "--no-save", "Check the fallback."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
+      expect(occurrences(scrollback, notice)).toBe(1);
+      expect(scrollback).toMatch(/^! startup: shell snapshot unavailable /m);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a gateway error in terminal mode is a notice on its own row",
+    async () => {
+      const root = createRoot();
+      const message = "The gateway refused this request for a test reason.";
+      const gateway = startFakeGateway([
+        () => Response.json({ error: { message, type: "invalid_request_error" } }, { status: 400 }),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--yolo", "--no-save", "Trigger the gateway error."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForPane((pane) => /__FX_EXIT_\d+__/.test(pane), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(occurrences(scrollback, message)).toBe(1);
+      expect(scrollback).toMatch(
+        /^✗ error: API request failed · HTTP 400 · invalid_request_error: The gateway refused this request for a test reason\.\s*$/m,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "an MCP form answered mid-turn keeps its lines, and the next tool and the final reply stay visible",
+    async () => {
+      const root = createMcpFormRoot({ type: "string", title: "Release note" });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayToolCall("after_form", "shell", {
+          request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf after-form-output" },
+        }),
+        fakeGatewayFinalText("Form and shell complete.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Fill the form, then run a command."]),
+        cwd: root.workspace,
+        env: mcpFormEnv(root.home, gateway),
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Enter a value:", MCP_TIMEOUT);
+      await session.sendText("local-value");
+      await session.waitForText("Current values:", MCP_TIMEOUT);
+      await session.sendText("1");
+      await session.waitForText("Form and shell complete.", MCP_TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Enter a value: local-value");
+      expect(scrollback).toContain("Running printf after-form-output");
+      expect(scrollback).toContain("Form and shell complete.");
+    },
+    MCP_TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a long MCP form prompt line keeps its full text at 120 columns",
+    async () => {
+      const question =
+        "Describe the release note for the ask presentation fix, keeping every word of this long prompt line " +
+        "visible across the wrapped rows until the tail LONG_PROMPT_TAIL is printed.";
+      const root = createMcpFormRoot({ type: "string", title: question });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Long prompt answered.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Answer the long prompt."]),
+        cwd: root.workspace,
+        env: mcpFormEnv(root.home, gateway),
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Enter a value:", MCP_TIMEOUT);
+      await session.sendText("local-value");
+      await session.waitForText("Current values:", MCP_TIMEOUT);
+      await session.sendText("1");
+      await session.waitForText("Long prompt answered.", MCP_TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(withoutWhitespace(scrollback)).toContain(withoutWhitespace(question));
+    },
+    MCP_TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "an approval prompt in terminal mode keeps its lines, and the next tool and the final reply stay visible",
+    async () => {
+      const root = createAskPermissionRoot();
+      writeFileSync(join(root.workspace, "approval-fixture.txt"), "approval fixture contents\n");
+      const marker = join(root.workspace, "approved-marker.txt");
+      const gateway = startFakeGateway([
+        fakeShellRun("approve_shell", `touch ${JSON.stringify(marker)}`, { timeout_ms: 600_000 }),
+        fakeGatewayToolCall("after_approval", "read_file", { path: "approval-fixture.txt" }),
+        fakeGatewayFinalText("Approval flow complete.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Touch the marker, then read the fixture."]),
+        cwd: root.workspace,
+        env: permissionAskEnv(root.home, gateway),
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Approve? [y/N]", MCP_TIMEOUT);
+      await session.sendText("y");
+      await session.waitForText("Approval flow complete.", MCP_TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toMatch(/^fx wants to run:\s*$/m);
+      expect(scrollback).toContain("Approve? [y/N] y");
+      expect(scrollback).toContain("Reading approval-fixture.txt");
+      expect(scrollback).toContain("Approval flow complete.");
+      expect(existsSync(marker)).toBe(true);
+    },
+    MCP_TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a blocked tool in terminal mode shows its guidance on its own line",
+    async () => {
+      const root = createAskPermissionRoot();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("blocked_install", "install_skill", { source: "owner/repo@blocked-skill" }),
+        fakeGatewayFinalText("Blocked action handled.\n"),
+      ]);
+      gateways.push(gateway);
+
+      // With stdin from /dev/null the approval prompt is unavailable, so the call is refused with guidance.
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Install the blocked skill."], "/dev/null"),
+        cwd: root.workspace,
+        env: permissionAskEnv(root.home, gateway),
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      // A refused call ends the run with status 1, so no later reply prints.
+      await session.waitForText("__FX_EXIT_1__", MCP_TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toMatch(
+        /^! permission: fx ask: permission required for tool execution in noninteractive mode\s*$/m,
+      );
+      expect(scrollback).toContain("fx ask: rerun with --auto to review this exact action automatically");
+    },
+    MCP_TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "Ctrl-C while an MCP form is open ends fx and turns autowrap back on",
+    async () => {
+      const root = createMcpFormRoot({ type: "string", title: "Release note" });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Form was not answered.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      // fx is the pane's own process, so the Ctrl-C reaches fx and no wrapper shell.
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: directCommand(["ask", "--auto", "--no-save", "Fill the form, then cancel it."]),
+        cwd: root.workspace,
+        env: mcpFormEnv(root.home, gateway),
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      const outputPath = join(root.root, "pane-output.bin");
+      session.startPaneOutputCapture(outputPath);
+
+      await session.waitForText("Enter a value:", MCP_TIMEOUT);
+      await session.sendKeys("C-c");
+      await session.waitForText("Pane is dead", MCP_TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toMatch(/^MCP server fixture requests Release note \(required\)\s*$/m);
+      expect(scrollback).toMatch(/^Reason: Choose the next step\s*$/m);
+      expect(scrollback).toMatch(/^Enter a value: \^C\s*$/m);
+      // fx ends by re-raising SIGINT: tmux reports signal 2, and a shell reports the same exit as 130.
+      expect(session.paneStatus()).toEqual({ dead: true, status: null });
+      expect(scrollback).toContain("Pane is dead (signal 2");
+
+      // The restore sequence comes after the last autowrap change, and it turns autowrap on.
+      const output = await readOutputUntil(outputPath, "\x1b[?25h\x1b[?7h");
+      const lastAutowrapOff = output.lastIndexOf("\x1b[?7l");
+      expect(output.lastIndexOf("\x1b[?7h")).toBeGreaterThan(lastAutowrapOff);
+      expect(output.slice(lastAutowrapOff)).toContain("\x1b[?25h\x1b[?7h");
+    },
+    MCP_TIMEOUT,
+  );
 });
 
 // Both login shells read these files, so the tests hold for zsh and bash.
@@ -1369,280 +1636,5 @@ describe("fx ask shell startup files", () => {
       for (const request of gateway.requests) expect(request.body).not.toContain(secret);
     },
     TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "an MCP form answered mid-turn keeps its lines, and the next tool and the final reply stay visible",
-    async () => {
-      const root = createMcpFormRoot({ type: "string", title: "Release note" });
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
-        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
-        fakeGatewayToolCall("after_form", "shell", {
-          request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf after-form-output" },
-        }),
-        fakeGatewayFinalText("Form and shell complete.\n"),
-      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
-      gateways.push(gateway);
-
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: terminalCommand(["ask", "--auto", "--no-save", "Fill the form, then run a command."]),
-        cwd: root.workspace,
-        env: mcpFormEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-
-      await session.waitForText("Enter a value:", MCP_TIMEOUT);
-      await session.sendText("local-value");
-      await session.waitForText("Current values:", MCP_TIMEOUT);
-      await session.sendText("1");
-      await session.waitForText("Form and shell complete.", MCP_TIMEOUT);
-      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("Enter a value: local-value");
-      expect(scrollback).toContain("Running printf after-form-output");
-      expect(scrollback).toContain("Form and shell complete.");
-    },
-    MCP_TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "a long MCP form prompt line keeps its full text at 120 columns",
-    async () => {
-      const question =
-        "Describe the release note for the ask presentation fix, keeping every word of this long prompt line " +
-        "visible across the wrapped rows until the tail LONG_PROMPT_TAIL is printed.";
-      const root = createMcpFormRoot({ type: "string", title: question });
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
-        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
-        fakeGatewayFinalText("Long prompt answered.\n"),
-      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
-      gateways.push(gateway);
-
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: terminalCommand(["ask", "--auto", "--no-save", "Answer the long prompt."]),
-        cwd: root.workspace,
-        env: mcpFormEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-
-      await session.waitForText("Enter a value:", MCP_TIMEOUT);
-      await session.sendText("local-value");
-      await session.waitForText("Current values:", MCP_TIMEOUT);
-      await session.sendText("1");
-      await session.waitForText("Long prompt answered.", MCP_TIMEOUT);
-      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(withoutWhitespace(scrollback)).toContain(withoutWhitespace(question));
-    },
-    MCP_TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "an approval prompt in terminal mode keeps its lines, and the next tool and the final reply stay visible",
-    async () => {
-      const root = createAskPermissionRoot();
-      writeFileSync(join(root.workspace, "approval-fixture.txt"), "approval fixture contents\n");
-      const marker = join(root.workspace, "approved-marker.txt");
-      const gateway = startFakeGateway([
-        fakeShellRun("approve_shell", `touch ${JSON.stringify(marker)}`, { timeout_ms: 600_000 }),
-        fakeGatewayToolCall("after_approval", "read_file", { path: "approval-fixture.txt" }),
-        fakeGatewayFinalText("Approval flow complete.\n"),
-      ]);
-      gateways.push(gateway);
-
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: terminalCommand(["ask", "--no-save", "Touch the marker, then read the fixture."]),
-        cwd: root.workspace,
-        env: permissionAskEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-
-      await session.waitForText("Approve? [y/N]", MCP_TIMEOUT);
-      await session.sendText("y");
-      await session.waitForText("Approval flow complete.", MCP_TIMEOUT);
-      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toMatch(/^fx wants to run:\s*$/m);
-      expect(scrollback).toContain("Approve? [y/N] y");
-      expect(scrollback).toContain("Reading approval-fixture.txt");
-      expect(scrollback).toContain("Approval flow complete.");
-      expect(existsSync(marker)).toBe(true);
-    },
-    MCP_TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "a blocked tool in terminal mode shows its guidance on its own line",
-    async () => {
-      const root = createAskPermissionRoot();
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("blocked_install", "install_skill", { source: "owner/repo@blocked-skill" }),
-        fakeGatewayFinalText("Blocked action handled.\n"),
-      ]);
-      gateways.push(gateway);
-
-      // With stdin from /dev/null the approval prompt is unavailable, so the call is refused with guidance.
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: terminalCommand(["ask", "--no-save", "Install the blocked skill."], "/dev/null"),
-        cwd: root.workspace,
-        env: permissionAskEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-
-      // A refused call ends the run with status 1, so no later reply prints.
-      await session.waitForText("__FX_EXIT_1__", MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toMatch(
-        /^! permission: fx ask: permission required for tool execution in noninteractive mode\s*$/m,
-      );
-      expect(scrollback).toContain("fx ask: rerun with --auto to review this exact action automatically");
-    },
-    MCP_TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "Ctrl-C while an MCP form is open ends fx and turns autowrap back on",
-    async () => {
-      const root = createMcpFormRoot({ type: "string", title: "Release note" });
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
-        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
-        fakeGatewayFinalText("Form was not answered.\n"),
-      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
-      gateways.push(gateway);
-
-      // fx is the pane's own process, so the Ctrl-C reaches fx and no wrapper shell.
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: directCommand(["ask", "--auto", "--no-save", "Fill the form, then cancel it."]),
-        cwd: root.workspace,
-        env: mcpFormEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-      const outputPath = join(root.root, "pane-output.bin");
-      session.startPaneOutputCapture(outputPath);
-
-      await session.waitForText("Enter a value:", MCP_TIMEOUT);
-      await session.sendKeys("C-c");
-      await waitForPaneDead(session, MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toMatch(/^MCP server fixture requests Release note \(required\)\s*$/m);
-      expect(scrollback).toMatch(/^Reason: Choose the next step\s*$/m);
-      expect(scrollback).toMatch(/^Enter a value: \^C\s*$/m);
-      // fx ends by re-raising SIGINT: tmux reports signal 2, and a shell reports the same exit as 130.
-      expect(session.paneStatus()).toEqual({ dead: true, status: null });
-      expect(scrollback).toContain("Pane is dead (signal 2");
-
-      // The restore sequence comes after the last autowrap change, and it turns autowrap on.
-      const output = await readOutputUntil(outputPath, "\x1b[?25h\x1b[?7h", MCP_TIMEOUT);
-      const lastAutowrapOff = output.lastIndexOf("\x1b[?7l");
-      expect(output.lastIndexOf("\x1b[?7h")).toBeGreaterThan(lastAutowrapOff);
-      expect(output.slice(lastAutowrapOff)).toContain("\x1b[?25h\x1b[?7h");
-    },
-    MCP_TIMEOUT,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "progress sent while an MCP form is open keeps the form and the final reply intact",
-    async () => {
-      // The server sends progress right after the form request, so the progress arrives while the form is open.
-      const progressFormServer = `
-import { createInterface } from "node:readline";
-const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
-let pendingCall = null;
-createInterface({ input: process.stdin }).on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.id === "progress-form" && message.method === undefined) {
-    // Answers 1.5 s later, so the progress shows while the call still runs.
-    setTimeout(() => send({ jsonrpc: "2.0", id: pendingCall.id, result: { content: [{ type: "text", text: "Form answered." }] } }), 1500);
-    return;
-  }
-  switch (message.method) {
-    case "initialize":
-      send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "progress-form", version: "1.0.0" } } });
-      return;
-    case "tools/list":
-      send({ jsonrpc: "2.0", id: message.id, result: { tools: [{ name: "echo", description: "Asks a form while it reports progress.", inputSchema: { type: "object", properties: { text: { type: "string" } } } }] } });
-      return;
-    case "tools/call": {
-      pendingCall = message;
-      const progressToken = message.params?._meta?.progressToken;
-      send({ jsonrpc: "2.0", id: "progress-form", method: "elicitation/create", params: { message: "Enter the release note", requestedSchema: { type: "object", properties: { value: { type: "string", title: "Release note" } }, required: ["value"] } } });
-      send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: 1, total: 2, message: "Progress while the form is open" } });
-      return;
-    }
-    default:
-      if (message.id !== undefined) send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
-  }
-});
-`;
-      const root = createRoot();
-      mkdirSync(join(root.home, ".fx"), { recursive: true });
-      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({}));
-      const serverPath = join(root.root, "progress-form-server.mjs");
-      writeFileSync(serverPath, progressFormServer);
-      writeFileSync(
-        join(root.home, ".fx", "mcp.json"),
-        JSON.stringify({
-          mcp: { fixture: { type: "local", command: [process.execPath, serverPath], enabled: true } },
-        }),
-      );
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
-        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
-        fakeGatewayFinalText("Progress form complete.\n"),
-      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
-      gateways.push(gateway);
-
-      const session = await TmuxSession.create({
-        isolated: true,
-        cmd: terminalCommand(["ask", "--auto", "--no-save", "Run the progress form."]),
-        cwd: root.workspace,
-        env: mcpFormEnv(root.home, gateway),
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-      });
-      sessions.push(session);
-
-      await session.waitForText("Enter a value:", MCP_TIMEOUT);
-      await session.sendText("local-value");
-      await session.waitForText("Current values:", MCP_TIMEOUT);
-      await session.sendText("1");
-      await session.waitForText("Progress form complete.", MCP_TIMEOUT);
-      await session.waitForText("__FX_EXIT_0__", MCP_TIMEOUT);
-
-      const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("Enter a value: local-value");
-      expect(scrollback).toContain("Choose a number or enter a value: 1");
-      expect(scrollback).toContain("Progress form complete.");
-    },
-    MCP_TIMEOUT,
   );
 });

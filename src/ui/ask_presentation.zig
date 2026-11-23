@@ -45,7 +45,7 @@ pub const Runtime = struct {
     ) !Runtime {
         const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
         var terminal = shell_runtime.TerminalState{};
-        const cursor = probeTerminal(&terminal, layout, no_color);
+        const cursor = probeTerminal(&terminal, layout, no_color, .startup);
         return initConfigured(
             alloc,
             user,
@@ -389,8 +389,12 @@ pub const Runtime = struct {
     pub fn endOutsidePrompt(self: *Runtime) void {
         defer self.unlock();
         if (self.finished or !self.terminal_prepared) return;
-        const layout = zeroFooterLayout(ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0) catch |err| return self.rememberFailure(err));
-        const cursor = cursorAfterOutsidePrompt(layout);
+        // The presentation never saw the rows the prompt wrote or the echoed answer,
+        // so the cursor comes from the terminal. The layout is the one the presentation
+        // last drew with: a resize during the prompt is applied at the next draw.
+        const layout = self.shell.layout;
+        var terminal = shell_runtime.TerminalState{};
+        const cursor = probeTerminal(&terminal, layout, self.no_color, .after_outside_prompt);
         debug_trace.logf("ask", "presentation restarts below an outside prompt cursor={d},{d} layout={d}x{d}", .{ cursor.row, cursor.col, layout.rows, layout.cols });
         self.restartBelow(layout, cursor) catch |err| self.rememberFailure(err);
     }
@@ -498,15 +502,24 @@ const PaintContext = struct {
     }
 };
 
+/// Why the terminal is probed. Startup also sets the theme. A probe after an
+/// outside prompt only reads the cursor: the theme is already set, and the
+/// prompt must not change it.
+const TerminalProbe = enum { startup, after_outside_prompt };
+
+/// The one terminal probe: raw mode on stdin, then the cursor position. Without
+/// an answer from the terminal, the last row of `layout` is used.
 fn probeTerminal(
     terminal: *shell_runtime.TerminalState,
     layout: types.Layout,
     no_color: bool,
+    probe: TerminalProbe,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
+    const sets_theme = probe == .startup;
     // A light/dark pin was applied before presentation setup; leave it alone.
     const theme_locked = ui_render.themeInputLocked();
-    if (!theme_locked) {
+    if (sets_theme and !theme_locked) {
         const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
         ui_render.initTheme(fallback_light, null);
     }
@@ -515,7 +528,7 @@ fn probeTerminal(
     terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (!no_color and !theme_locked) {
+    if (sets_theme and !no_color and !theme_locked) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         if (shared_theme.sourceName()) |name| {
             // Custom themes resolve after detection picks the variant, same
@@ -567,19 +580,6 @@ fn normalizeStartCursor(
     const col = @min(@max(cursor.col, 1), layout.cols);
     if (col > 1 and row < layout.rows) row += 1;
     return .{ .row = row, .col = 1 };
-}
-
-/// Where the cursor is after an answered prompt. The presentation never saw the
-/// rows the prompt wrote or the echoed answer, so it asks the terminal. Without
-/// an answer from the terminal, the last row is used.
-fn cursorAfterOutsidePrompt(layout: types.Layout) shell_runtime.CursorPosition {
-    const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
-    var terminal = shell_runtime.TerminalState{};
-    terminal.captureOriginalTermios() catch return fallback;
-    terminal.enableRawMode() catch return fallback;
-    defer terminal.disableRawMode();
-    return terminal.queryCursorPosition() catch fallback;
 }
 
 test "ask presentation paints Minimal prompt and assistant into a footerless frame" {

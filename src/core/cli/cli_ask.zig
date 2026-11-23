@@ -2198,10 +2198,15 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     }
 }
 
-/// Reports a pending shell snapshot fallback once, on stderr.
+/// Reports a pending shell snapshot fallback once.
 fn writeShellSnapshotNotice(ctx: *AskContext) void {
     var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+    if (ctx.presenter) |presenter| {
+        // A failed draw stays pending in the presentation and is reported at finish.
+        presenter.pushNotice(.{ .topic = "startup", .tone = .warning, .body = notice }) catch return;
+        return;
+    }
     ctx.writeStderr("fx ask: warning: ") catch return;
     ctx.writeStderr(notice) catch return;
     ctx.writeStderr("\n") catch return;
@@ -3698,6 +3703,8 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
+    // Terminal output goes through the presentation, so the error cannot land on its cursor.
+    if (ctx.presenter) |presenter| return presenter.pushNotice(.{ .topic = "error", .tone = .@"error", .body = message });
     try ctx.writeStderr("fx ask: ");
     try ctx.writeStderr(message);
     try ctx.writeStderr("\n");
