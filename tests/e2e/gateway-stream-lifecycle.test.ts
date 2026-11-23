@@ -4432,6 +4432,152 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("same-batch external read returns the file an earlier call wrote outside the workspace", async () => {
+    const root = createFixtureRoot("same-batch-external-read");
+    const tracePath = join(root.root, "trace.log");
+    const outsideDir = join(root.root, "outside");
+    mkdirSync(outsideDir);
+    const externalPath = join(outsideDir, "written-in-batch.txt");
+    const sentinel = "same-batch external sentinel";
+    expect(existsSync(externalPath)).toBe(false);
+    const responses = [
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "external_write",
+          toolName: "shell",
+          input: { action: "run", command: `printf '%s' '${sentinel}' > '${externalPath}'` },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "external_read",
+          toolName: "read_file",
+          input: { path: externalPath },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayFinalText("same-batch external read complete"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--full-access", "--no-save", "Write the outside file, then read it."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(readFileSync(externalPath, "utf8")).toBe(sentinel);
+      const results = parseGatewayRequest(gateway.requests[1]!.body).prompt
+        .filter((message) => message.role === "tool");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.content).toEqual([
+        expect.objectContaining({ toolCallId: "external_write", toolName: "shell" }),
+        expect.objectContaining({ toolCallId: "external_read", toolName: "read_file" }),
+      ]);
+      const readOutput = toolResultOutput(gateway.requests[1]!.body, "external_read");
+      expect(readOutput).toContain(externalPath);
+      expect(readOutput).toContain(sentinel);
+      expect(readOutput).not.toContain("Not executed");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        expect.objectContaining({ name: "shell", status: "success" }),
+        expect.objectContaining({ name: "read_file", status: "success" }),
+      ]);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("same-batch glob and grep find a file an earlier call created in a new directory", async () => {
+    const root = createFixtureRoot("same-batch-glob-grep");
+    const tracePath = join(root.root, "trace.log");
+    const createdDir = join(root.workspace, "made-in-batch");
+    const marker = "same-batch index marker";
+    expect(existsSync(createdDir)).toBe(false);
+    const responses = [
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "make_dir",
+          toolName: "shell",
+          input: {
+            action: "run",
+            command: `mkdir made-in-batch && printf '%s\\n' '${marker}' > made-in-batch/found.txt`,
+          },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "glob_made",
+          toolName: "glob_files",
+          input: { pattern: "*.txt", path: createdDir },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "grep_made",
+          toolName: "grep_files",
+          input: { pattern: marker, path: createdDir },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayFinalText("same-batch glob and grep complete"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--full-access", "--no-save", "Create the folder, then search it."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const results = parseGatewayRequest(gateway.requests[1]!.body).prompt
+        .filter((message) => message.role === "tool");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.content).toEqual([
+        expect.objectContaining({ toolCallId: "make_dir", toolName: "shell" }),
+        expect.objectContaining({ toolCallId: "glob_made", toolName: "glob_files" }),
+        expect.objectContaining({ toolCallId: "grep_made", toolName: "grep_files" }),
+      ]);
+      const globOutput = toolResultOutput(gateway.requests[1]!.body, "glob_made");
+      expect(globOutput).toContain("made-in-batch/found.txt");
+      expect(globOutput).not.toContain("Not executed");
+      const grepOutput = toolResultOutput(gateway.requests[1]!.body, "grep_made");
+      expect(grepOutput).toContain(`made-in-batch/found.txt:1: ${marker}`);
+      expect(grepOutput).not.toContain("Not executed");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        expect.objectContaining({ name: "shell", status: "success" }),
+        expect.objectContaining({ name: "glob_files", status: "success" }),
+        expect.objectContaining({ name: "grep_files", status: "success" }),
+      ]);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test.skipIf(ignoresFileModes())("OS filesystem access denial reaches the next gateway request", async () => {
     const root = createFixtureRoot("os-filesystem-access-denial");
     const tracePath = join(root.root, "trace.log");
