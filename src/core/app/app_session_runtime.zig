@@ -4172,11 +4172,11 @@ pub fn Runtime(comptime App: type) type {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
                         try writeModelCallNotices(sink, final_calls.after);
-                        const cancelled_call = cancelledCallOf(app, agent, entry);
+                        var wrote_cancelled_call = false;
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
-                        } else if (cancelled_call) |call| {
-                            try writeCancelledCallPresentation(app, agent, sink, call, entry.cancelled_wait, labels);
+                        } else if (cancelledCallOf(app, agent, entry)) |call| {
+                            wrote_cancelled_call = try writeCancelledCallPresentation(app, agent, sink, call, entry.cancelled_wait, labels);
                         }
                         if (entry.tool_call) |call| {
                             try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
@@ -4184,7 +4184,7 @@ pub fn Runtime(comptime App: type) type {
                         switch (entry.terminal_reason) {
                             // The cancelled call's row says the turn stopped, as
                             // it did live.
-                            .cancelled => if (entry.cancelled_command == null and cancelled_call == null and entry.cancellation_origin == .turn) {
+                            .cancelled => if (entry.cancelled_command == null and !wrote_cancelled_call and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
                             },
                             .failed => try sink.appendNotice(
@@ -4322,21 +4322,26 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        /// The open call of a turn the user cancelled, when it is no command,
-        /// whose row a resume shows as live did: "Cancelled" and its call. A
-        /// command's row comes from its `cancelled_command` presentation
-        /// (D100), or not at all. Null when the turn has no such call.
+        /// The open call of a turn the user cancelled whose row a resume
+        /// shows as live did: "Cancelled" and its call. A command's row comes
+        /// from its `cancelled_command` presentation (D100), or not at all,
+        /// and a question shows its prompt live and never a row
+        /// (`startToolVisibleLifecycle`). Null when the turn has no such call.
         fn cancelledCallOf(app: *App, agent: *AppAgent, entry: types.InterruptedHistoryTurn) ?types.ToolCall {
             if (entry.cancelled_command != null) return null;
             if (entry.terminal_reason != .cancelled or entry.cancellation_origin != .turn) return null;
             const call = entry.tool_call orelse return null;
-            if (app.historicalToolActivityKind(agent, call) == .command) return null;
-            return call;
+            return switch (app.historicalToolActivityKind(agent, call)) {
+                .command, .ask => null,
+                else => call,
+            };
         }
 
         /// Writes the row of `model_call`, which the turn cancelled while it
-        /// ran, as live wrote it. A `subagent` wait names the subagents its
-        /// row named live (D102); a wait saved before that names none.
+        /// ran, as live wrote it, and returns whether it wrote one. A
+        /// `subagent` wait names the subagents its row named live (D102); a
+        /// wait saved before that names none. A call that names nothing after
+        /// "Cancelled" gets no row, so the turn's own notice says it stopped.
         fn writeCancelledCallPresentation(
             app: *App,
             agent: *AppAgent,
@@ -4344,7 +4349,7 @@ pub fn Runtime(comptime App: type) type {
             model_call: types.ToolCall,
             cancelled_wait: ?types.CancelledWaitPresentation,
             labels: *HistoricalSessionLabels,
-        ) !void {
+        ) !bool {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
             const arena = action_arena.allocator();
@@ -4359,13 +4364,16 @@ pub fn Runtime(comptime App: type) type {
                         call,
                         &labels.saved_output_sources,
                     );
-            const action = try app.describeToolActionDeniedWithAdvertised(agent, arena, call, target, "Cancelled", &.{});
+            const label = "Cancelled";
+            const action = try app.describeToolActionDeniedWithAdvertised(agent, arena, call, target, label, &.{});
+            if (std.mem.eql(u8, std.mem.trim(u8, action, " "), label)) return false;
             const entry_id = try writeCompletedToolStatus(sink, .cancelled, action);
             try sink.attachHistoricalCancelledCallDetail(entry_id, call);
             // An MCP call's row names the server and tool it ran, as live.
             if (try toolbox.mcpToolAlias(arena, call.name, call.arguments_json)) |alias| {
                 try attachReplayedMcpToolName(app, agent, sink, entry_id, alias);
             }
+            return true;
         }
 
         fn writeExecutionHistory(app: *App, agent: *AppAgent, execution: types.ExecutionMemory) !void {
@@ -6116,6 +6124,9 @@ const TestApp = struct {
     cancelled_command_replayed_output: bool = false,
     cancelled_call_detail_count: usize = 0,
     denied_action_targets: std.ArrayList([]u8) = .empty,
+    /// Describes a refused or cancelled call by its label alone, as fx does
+    /// for a call that names nothing.
+    bare_denied_action: bool = false,
     command_stdout: std.ArrayList(u8) = .empty,
     command_stderr: std.ArrayList(u8) = .empty,
     command_output_writes: std.ArrayList(CapturedCommandOutput) = .empty,
@@ -6427,6 +6438,7 @@ const TestApp = struct {
             errdefer self.alloc.free(owned);
             try self.denied_action_targets.append(self.alloc, owned);
         }
+        if (self.bare_denied_action) return label;
         return arena.print("● {s} {s}", .{ label, call.name });
     }
 
@@ -10295,10 +10307,13 @@ test "a cancelled call that is no command keeps its row on replay, in place of t
         /// Whether the turn's own "Cancelled" notice follows.
         notice: bool = false,
         target: ?[]const u8 = null,
+        /// Whether fx describes the call by its label alone.
+        bare: bool = false,
     };
     const read: types.ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
     const wait: types.ToolCall = .{ .id = "wait", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" };
     const command: types.ToolCall = .{ .id = "cmd", .name = "shell", .arguments_json = "{\"command\":\"sleep 20\"}" };
+    const question: types.ToolCall = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{\"questions\":[{\"question\":\"Which one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}" };
     const cases = [_]Case{
         .{ .name = "read", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = true },
         .{ .name = "wait with names (D102)", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "lander" } }, .row = true, .target = "lander" },
@@ -10306,6 +10321,10 @@ test "a cancelled call that is no command keeps its row on replay, in place of t
         // Unchanged: a command with no presentation, a failed turn, a turn
         // that compaction cancelled, and a turn with no open call.
         .{ .name = "command", .turn = .{ .user = .{ .text = @constCast("run") }, .tool_call = command }, .row = false, .notice = true },
+        // A question shows its prompt live, never a row, and a call that names
+        // nothing after "Cancelled" gets none either; the turn's notice stays.
+        .{ .name = "question", .turn = .{ .user = .{ .text = @constCast("ask") }, .tool_call = question }, .row = false, .notice = true },
+        .{ .name = "names nothing", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = false, .notice = true, .bare = true },
         .{ .name = "failed", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .terminal_reason = .failed }, .row = false },
         .{ .name = "compaction", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .cancellation_origin = .compaction }, .row = false },
         .{ .name = "no call", .turn = .{ .user = .{ .text = @constCast("stop") } }, .row = false, .notice = true },
@@ -10314,6 +10333,7 @@ test "a cancelled call that is no command keeps its row on replay, in place of t
         errdefer std.debug.print("case: {s}\n", .{case.name});
         var app = try TestApp.init(alloc, "/workspace");
         defer app.deinit();
+        app.bare_denied_action = case.bare;
         const history = [_]types.HistoryTurn{.{ .interrupted = case.turn }};
         try Runtime(TestApp).replayHistory(&app, (&app).agent(), &history);
         const rows: usize = if (case.row) 1 else 0;
