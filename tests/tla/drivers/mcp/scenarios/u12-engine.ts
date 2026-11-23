@@ -1133,6 +1133,90 @@ export const scenarios: Scenario[] = [
     check: (_lines, _logs, trace) =>
       expectThat(!trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "the grace ended a call that was answered inside it"),
   }),
+  // ---- a line the engine refuses after an id it read: the request it names (tests/tla/mcp/Request.tla RefusedNaming) ----
+  engineScenario({
+    name: "u12-refused-named-at-once",
+    description:
+      "A stdio line the engine refuses after the id of a call, however it goes wrong (not JSON, nested past the limit, a key written twice), ends that call at once as -32600, not as malformed when the grace runs out, and the server is not told it was cancelled",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "cut", raw: '{"jsonrpc":"2.0","id":{id},"result":{"content":[nope]}}' },
+          { method: "tools/call", tool: "deep", raw: `{"jsonrpc":"2.0","id":{id},"result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}}}` },
+          { method: "tools/call", tool: "twice", raw: '{"jsonrpc":"2.0","id":{id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}' },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a cut", "expect a.called.1.failure 3000", "call a deep", "expect a.called.2.failure 3000", "call a twice", "expect a.called.3.failure 3000"],
+    machines: { a: BASE },
+    check: (lines, logs, trace) =>
+      first(
+        ...[1, 2, 3].map((n) =>
+          expectThat(
+            event(lines, `a.called.${n}`)?.answer?.startsWith('error -32600 "invalid reply (it isn\'t valid JSON-RPC): {\\"jsonrpc\\":\\"2.0\\",\\"id\\":') ?? false,
+            `call ${n}'s answer (${event(lines, `a.called.${n}`)?.answer})`,
+          ),
+        ),
+        same([1, 2, 3].map((n) => event(lines, `a.called.${n}`)?.timed_out), [false, false, false], "timed out"),
+        same(received(logs.a, "notifications/cancelled").length, 0, "cancel notices the server got"),
+        expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a refused line that names its call gave a grace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-refused-named-stray",
+    description:
+      "A line the engine refuses after the id of a call that is not in flight is a stray, as a late reply is: it gives the call in flight no grace, which returns its result after the grace would have run out",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          tool: "slow",
+          beforeRaw: ['{"jsonrpc":"2.0","id":99,"result":{"x":nope}}'],
+          delayMs: 1500,
+          result: { resultType: "complete", content: [{ type: "text", text: "fine" }] },
+        }),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a slow", "expect a.called.1.result 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a stray line gave a grace"),
+  }),
+  engineScenario({
+    name: "u12-refused-two-ids",
+    description: "A line the engine refuses that writes the id twice names no call, as the decoder refuses it: the call ends as malformed when the grace runs out",
+    servers: {
+      a: { rules: modern({ method: "tools/call", tool: "twin", beforeRaw: ['{"jsonrpc":"2.0","id":{id},"id":{id},"result":{"content":[]}}'], noReply: true }) },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["call a twin", "expect a.called.1.malformed 5000"],
+    machines: { a: BASE },
+    check: (_lines, _logs, trace) =>
+      first(
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "refused_line"), "no refused_line step in the request trace"),
+        expectThat(trace.some((t) => t.machine === "request" && t.event === "grace_expired"), "no grace_expired step in the request trace"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-list-refused-after-its-id",
+    description:
+      "A stdio tool list reply that goes wrong after its id ends the list at once, and the status says the answer is not a readable tool list, not that the server answered with an error",
+    servers: {
+      a: {
+        rules: [discover, listen, { method: "tools/list", raw: '{"jsonrpc":"2.0","id":{id},"result":{"resultType":"complete","tools":[]},"extra":nope}' }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "expect a.tools.fail 3000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(status(lines, "a")?.list_refusal, "the answer is not a readable tool list", "the list refusal"),
+        expectThat(!trace.some((t) => t.machine === "request" && (t.event === "refused_line" || t.event === "grace_expired")), "a refused line that names its list gave a grace"),
+      ),
+  }),
   engineScenario({
     name: "u12-refused-http-json-body",
     description: "An HTTP JSON body the engine cannot read ends its call at once as malformed, not as an HTTP failure",

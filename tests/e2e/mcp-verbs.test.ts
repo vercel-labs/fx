@@ -248,6 +248,15 @@ describe("fx mcp", () => {
     ["`tools` is written twice, once with an escape", '"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}', "a field is written twice"],
     ["the server answers with an error", '"error":{"code":-32603,"message":"Internal error"}', "the server answered the list with an error"],
     ["the answer is no finished list", '"result":{"resultType":"input_required","inputRequests":{}}', "the server's answer was not a finished list"],
+    // The reply is matched to the list by its id, which comes first, and then fx cannot read the rest. It says so, not that the server
+    // answered with an error, and it does not wait 30 seconds for the list.
+    ["the reply goes wrong after its id: not JSON", '"result":{"resultType":"complete","tools":[]},"extra":nope', "the answer is not a readable tool list"],
+    [
+      "the reply goes wrong after its id: nested past the engine's limit",
+      `"result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)}`,
+      "the answer is not a readable tool list",
+    ],
+    ["the reply goes wrong after its id: `result` is written twice", '"result":{"resultType":"complete","tools":[]},"result":{"resultType":"complete","tools":[]}', "a field is written twice"],
   ];
 
   for (const [what, reply, why] of refusedLists) {

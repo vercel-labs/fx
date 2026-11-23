@@ -127,7 +127,7 @@ type RootOptions = {
   /** How the invalid_params fixture breaks its reply: "pieces" or "cut". */
   protocolErrorFault?: "pieces" | "cut";
   /** Nests JSON `depth` levels deep at `site` in the legacy fixture's reply or tool list (see the fixture). */
-  deep?: { site: string; depth: number; shape?: "object" | "array" | "mixed"; fault?: "cut" };
+  deep?: { site: string; depth: number; shape?: "object" | "array" | "mixed"; fault?: "cut"; idLast?: boolean };
   /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
   failureText?: string;
   operationTimeoutMs?: number;
@@ -155,7 +155,17 @@ type RootOptions = {
 
 /** A line fx refuses and cannot attach to a call, then what the server does (mcp-legacy-stdio.mjs says). */
 type RefusedCall = {
-  bad?: "utf8_last" | "deep_last" | "garbage" | "duplicate_escaped" | "cut";
+  bad?:
+    | "utf8_last"
+    | "deep_last"
+    | "garbage"
+    | "cut_no_id"
+    | "duplicate_id"
+    | "utf8_first"
+    | "deep_first"
+    | "duplicate_escaped"
+    | "cut"
+    | "other_id";
   then?: "silent" | "exit";
   slowMs?: number;
   progressEveryMs?: number;
@@ -226,6 +236,7 @@ function createRoot(
             FX_MCP_DEEP_DEPTH: options.deep?.depth.toString(),
             FX_MCP_DEEP_SHAPE: options.deep?.shape,
             FX_MCP_DEEP_FAULT: options.deep?.fault,
+            FX_MCP_DEEP_ID_LAST: options.deep?.idLast ? "1" : undefined,
             // JSON, so the text can hold bytes an environment variable cannot.
             FX_MCP_FAILURE_TEXT: options.failureText === undefined
               ? undefined
@@ -2556,15 +2567,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
   test("fx ask ends a call that a refused line leaves silent 30 seconds later, as malformed, and cancels it; one that shows progress, or starts after the line, goes on", async () => {
     // Each server writes a line fx refuses and cannot attach to the call (its id comes after the
-    // bad part, or it has none), then says nothing. Until now fx waited out the operation timeout,
+    // bad part, or it has none, or it has two), then says nothing. Until now fx waited out the operation timeout,
     // 5 minutes by default, and then said that the server did not answer.
     const variants: Array<[string, RefusedCall]> = [
       ["bytes that are not UTF-8, the id after them", { bad: "utf8_last", then: "silent" }],
       ["JSON nested past the engine's limit, the id last", { bad: "deep_last", then: "silent" }],
       ["a line with no JSON in it", { bad: "garbage", then: "silent" }],
-      // `responseId` reads the line with the same decoder as the engine, which refuses a repeated name
-      // however it is written, so this line names no call.
-      ["a result written twice, the second time with an escape, the id first", { bad: "duplicate_escaped", then: "silent" }],
+      // `responseId` refuses a repeated `id` as the engine's decoder does, so this line names no call.
+      ["the id written twice", { bad: "duplicate_id", then: "silent" }],
     ];
     // All of them at once, so the test takes as long as its slowest wait, not their sum.
     const [runs, progress, later] = await Promise.all([
@@ -2610,11 +2620,42 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     expect(later.seconds).toBeGreaterThan(33);
   }, 90_000);
 
+  test("fx ask ends a call at once when the line fx refused was read as far as its id, and gives no grace for a line that names a call that is not in flight", async () => {
+    // Each server writes the call's id first, then a part fx cannot read, then says nothing. Until now fx dropped the id with the
+    // rest of the line and waited out the 30 second grace.
+    const variants: Array<[string, RefusedCall]> = [
+      ["bytes that are not UTF-8 after the id", { bad: "utf8_first", then: "silent" }],
+      ["JSON nested past the engine's limit after the id", { bad: "deep_first", then: "silent" }],
+      ["a result written twice after the id, the second time with an escape", { bad: "duplicate_escaped", then: "silent" }],
+      ["a reply cut after its id", { bad: "cut", then: "silent" }],
+    ];
+    const [runs, stray] = await Promise.all([
+      Promise.all(variants.map(([, spec], index) => askRefused(`refused-named-${index}`, [spec], 30_000))),
+      // The id of a call that is not in flight, then bytes that are not UTF-8: a stray, like a late reply, so it gives the call no
+      // grace, and the call returns its own result 36 seconds later.
+      askRefused("refused-stray", [{ bad: "other_id", slowMs: 36_000 }]),
+    ]);
+    for (const [index, run] of runs.entries()) {
+      const what = variants[index]![0];
+      expect({ what, code: run.code, requests: run.requests }).toEqual({ what, code: 0, requests: 3 });
+      expect({ what, text: run.results[0] }).toEqual({ what, text: expect.stringContaining("invalid reply") });
+      expect(run.results[0]).not.toContain("operation timeout");
+      expect(run.results[0]).not.toContain("the server's answer was malformed");
+      // At once: nowhere near the 30 second grace.
+      expect({ what, seconds: run.seconds < 15 }).toEqual({ what, seconds: true });
+      expect({ what, graced: run.trace.includes("code=malformed") }).toEqual({ what, graced: false });
+    }
+    expect({ code: stray.code, requests: stray.requests }).toEqual({ code: 0, requests: 3 });
+    expect(stray.results[0]).toContain(LEGACY_RESULT);
+    expect(stray.trace).not.toContain("code=malformed");
+    expect(stray.seconds).toBeGreaterThan(33);
+  }, 90_000);
+
   test("fx ask still returns a valid reply that follows a refused line inside the grace, and ends at once when the server exits", async () => {
     const [late, notified, cut] = await Promise.all([
       askRefused("refused-valid-late", [{ bad: "utf8_last", slowMs: 3_000 }], 30_000),
       askRefused("refused-notification", [{ bad: "garbage" }], 30_000),
-      askRefused("refused-cut", [{ bad: "cut", then: "exit" }], 30_000),
+      askRefused("refused-cut", [{ bad: "cut_no_id", then: "exit" }], 30_000),
     ]);
     for (const run of [late, notified]) {
       expect({ code: run.code, requests: run.requests }).toEqual({ code: 0, requests: 3 });
@@ -4713,8 +4754,9 @@ describe("MCP stdio servers", () => {
   test("a result nested past the engine's own limit ends the call after the grace for an unreadable line, as malformed, and cancels it", async () => {
     // The engine reads a message up to about 2,584 levels deep and drops a deeper one, so fx never sees
     // the depth limit's check: the call waits out the grace for a line it cannot read (30 seconds), then
-    // ends as malformed and is cancelled on the server.
-    const root = deepRoot("deep-past-engine", "structured", 3000);
+    // ends as malformed and is cancelled on the server. The id comes after the result here, so fx has no
+    // id to match the line to the call; with the id first the call ends at once (the refused replies above).
+    const root = deepRoot("deep-past-engine", "structured", 3000, { idLast: true });
     gateway = deepGateway("DEEP_PAST_ENGINE_DONE", false);
     const started = Date.now();
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool."], {
