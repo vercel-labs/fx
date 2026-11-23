@@ -9447,6 +9447,7 @@ test "a follower's queued prompt and steer, sent while the owner's turn runs, ar
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
 
