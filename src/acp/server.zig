@@ -915,6 +915,7 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.host = &test_host;
+    state.pending_member = null;
     test_host.subagent_authority_mutex = .init;
     state.host.cfg.auth_mode = .local;
     state.host.cfg.credential_override = "next-token";
@@ -937,6 +938,7 @@ test "ACP provider routes are host-managed only when configured and never leak i
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.host = &test_host;
+    state.pending_member = null;
     test_host.subagent_authority_mutex = .init;
     state.host.cfg.auth_mode = .local;
     state.host.cfg.provider_auth_mode = .host_managed;
@@ -8289,13 +8291,17 @@ test "ACP model commits honor the active session write boundary" {
 /// A server with only what a credential change reads: its allocator, the
 /// authority lock, and the web search settings.
 fn testCredentialServer(host: *Host, alloc: Allocator) ServerState {
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.host = host;
+    const Discard = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {}
+    };
     host.subagent_authority_mutex = .init;
     host.cfg.gateway_retry_count = 0;
     host.cfg.gateway_chat_url = "";
-    return state;
+    return .{
+        .alloc = alloc,
+        .host = host,
+        .writer = jsonrpc.Writer.initCallback(null, Discard.write),
+    };
 }
 
 fn testCodexSession(state: *ServerState, alloc: Allocator, token: []const u8) !ActiveSessionState {
