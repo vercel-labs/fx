@@ -7894,3 +7894,47 @@ test "a subagent's always approvals of two calls in one step store the session g
     try std.testing.expect(hooks.propagated_grants.items.len > 0);
     try std.testing.expectEqual(hooks.propagated_grants.items.len, hooks.event_grants.items.len);
 }
+
+test "processQueuedPrompt settles the start capture before its first tool and again as the turn returns" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.record_workspace_capture = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    const expected = [_][]const u8{ "capture:begin", "capture:capture", "capture:settle", "execute:read_file", "capture:settle" };
+    try std.testing.expectEqual(expected.len, hooks.capture_log.items.len);
+    for (expected, hooks.capture_log.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "processQueuedPrompt settles the start capture of a turn that fails before any tool" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"rejected\"}}" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.record_workspace_capture = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()) catch {};
+
+    // No end capture runs for a failed turn, so the turn itself must not
+    // return while its start capture still uses the session.
+    const expected = [_][]const u8{ "capture:begin", "capture:capture", "capture:settle" };
+    try std.testing.expectEqual(expected.len, hooks.capture_log.items.len);
+    for (expected, hooks.capture_log.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}

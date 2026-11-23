@@ -327,6 +327,19 @@ pub fn requestedHandle(alloc: Allocator, arguments_json: []const u8) Allocator.E
     return try std.mem.concat(alloc, u8, &.{ normalization.trimmed, normalization.suffix });
 }
 
+/// The saved output a call reads more of, by a byte range or from its start,
+/// with the suffix `validate` restores. Null for a search of an output or of
+/// the conversation, a saved record, saved images, or arguments `decode`
+/// rejects. The caller owns the returned handle.
+pub fn rangeReadHandle(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
+    var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
+    defer parsed.deinit();
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
+    if (view.kind != .range) return null;
+    const normalization = classifyHandleNormalization(view.handle);
+    return try std.mem.concat(alloc, u8, &.{ normalization.trimmed, normalization.suffix });
+}
+
 /// The row text for what a call reads: the output of the earlier call that
 /// `source` names, the text it searches for, or the saved record it opens.
 /// Returns null when the default object from `presentation` already says it.

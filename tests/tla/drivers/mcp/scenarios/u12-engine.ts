@@ -16,6 +16,8 @@ const FAKE = join(import.meta.dir, "../fakes/stdio.ts");
 const FAKE_HTTP = join(import.meta.dir, "../fakes/http.ts");
 const WITH_SERVER = join(import.meta.dir, "../with-server.ts");
 const MODERN = "2026-07-28";
+// The engine's default lost_limit (src/mcp/core/engine.zig), as ObsLostLimit.
+const LOST_LIMIT = 2;
 const LEGACY = "2025-11-25";
 
 // ---- fake servers ----
@@ -38,7 +40,7 @@ interface Line {
   did?: { action?: string; expect?: string; met?: boolean; error?: string; line?: string; k?: number };
   allow?: { server: string; tool: string; ok: boolean };
   event?: { tag: string; maybe_ran?: boolean; answer?: string | null; names?: string[]; k?: number };
-  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null }[];
+  status?: { name: string; phase: string; version: string | null; tools: number; last_error: string | null; list_refusal: string | null }[];
   final?: { ok: boolean; logged: { name: string; lines: number }[] };
 }
 type Log = { dir: string; line: string }[];
@@ -89,7 +91,7 @@ function engineScenario(c: EngineCase): Scenario {
       const remote = `${server}.remote`;
       if (m === "engine") {
         const control = c.control?.server === server ? c.control : undefined;
-        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts } });
+        traces.push({ machine: "engine", instance: server, specDir: "tests/tla/mcp", wrapper: "EngineTrace", verdict: control ? "REJECTED" : "ACCEPTED", constants: { ObsMaxAttempts: control?.maxAttempts ?? attempts, ObsLostLimit: LOST_LIMIT } });
       } else if (m === "stdio") traces.push({ machine: "stdio", instance: `${server}.stdio`, specDir: "tests/tla/mcp", wrapper: "StdioConnTrace", verdict: "ACCEPTED", constants: { ObsMaxAttempts: 255 } });
       else if (m === "request") traces.push({ machine: "request", instance: remote, specDir: "tests/tla/mcp", wrapper: "RequestTrace", verdict: "ACCEPTED" });
       else if (m === "era") traces.push({ machine: "era", instance: remote, specDir: "tests/tla/mcp", wrapper: "EraTrace", verdict: "ACCEPTED", constants: { ObsPreferredCount: 1 } });
@@ -341,6 +343,64 @@ export const scenarios: Scenario[] = [
         // last list, still stale.
         same([stale("b"), stale("t"), stale("z"), stale("f")], [1, 1, 0, 2], "tools_stale events for b, t, z, f"),
         expectThat(!before("b") && !before("t"), "a tools_stale came before the first list"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-list-refused",
+    description: "A server whose newest tool list fx refused: the status says so with the fixed words, beside the older list it still serves and with no last_error, and the next good list clears it",
+    servers: {
+      f: { rules: [initialize, { ...list25("add"), times: 1 }, { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }, { method: "tools/list", result: { tools: 7 }, times: 1 }, list25("add", "sub")] },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the three the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 3);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal, s.last_error]), [["ready", 1, null, null], ["ready", 1, '"tools" is not a list', null], ["ready", 2, null, null]], "the status [phase, tools, list_refusal, last_error] after each list"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-list-refused-first-list",
+    description: "A server whose first tool list fx refuses, as a result that is no list or as an error: the host gets the failure, no tools are listed, and the status says why in the fixed words while the server stays ready",
+    servers: {
+      g: { rules: [initialize, { method: "tools/list", result: { tools: 7 } }] },
+      h: { rules: [initialize, { method: "tools/list", error: { code: -32603, message: "Internal error" } }] },
+    },
+    script: ["tools g", "tools h", "expect g.tools.fail", "expect h.tools.fail", "status"],
+    machines: { g: [...BASE, "catalog"], h: [...BASE, "catalog"] },
+    check(lines) {
+      return first(
+        same(["g", "h"].map((n) => { const s = status(lines, n)!; return [s.phase, s.tools, s.list_refusal]; }), [["ready", 0, '"tools" is not a list'], ["ready", 0, "the server answered the list with an error"]], "the status [phase, tools, list_refusal] of g and h"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-restart-count-is-per-listing",
+    description: "A listing restarts once on an invalid cursor, as the model says, and so does the next listing: each starts with its own count, so the second listing's first invalid cursor restarts it, publishes its new list and refuses nothing",
+    servers: {
+      f: {
+        rules: [
+          initialize,
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c1" } },
+          { method: "tools/list", cursor: "c1", times: 1, error: { code: -32602, message: "no such cursor" } },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")] } },
+          { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c2" } },
+          { method: "tools/list", cursor: "c2", times: 1, error: { code: -32602, message: "no such cursor" } },
+          list25("add", "sub"),
+        ],
+      },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the two the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 2);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal]), [["ready", 1, null], ["ready", 2, null]], "the status [phase, tools, list_refusal] after each list: the second list is published, and nothing is refused"),
       );
     },
   }),
@@ -605,6 +665,73 @@ export const scenarios: Scenario[] = [
         same(event(lines, "h.called.1")?.answer, '[{"type":"text","text":"from h"}]', "h's answer"),
         same([status(lines, "h")?.phase, status(lines, "a")?.phase], ["ready", "ready"], "phases"),
       ),
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart",
+    description: "Two HTTP calls whose answer streams break are lost in a row: the engine drops the link, so the third call detects the server again and is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The link restarts: the second detection goes out after the second call's stream broke, and call 3 goes out on the new link.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-http-lost-restart-while-listing",
+    description: "A tool list still loading when two HTTP calls are lost is failed by the restart, so the next tool request lists again on the new link, and a third call is answered",
+    http: {
+      name: "h",
+      rules: [
+        { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] }, delayMs: 3000, times: 1 },
+        { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")] } },
+        { method: "tools/call", sse: true, drop: true, times: 2 },
+        { method: "tools/call", result: { resultType: "complete", content: [{ type: "text", text: "third" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen"],
+    script: ["tools h", "expect h.phase.ready 5000", "call h echo", "expect h.called.1.lost 10000", "call h echo", "expect h.called.2.lost 10000", "expect h.tools.fail 10000", "tools h", "expect h.tools.ok 10000", "call h echo", "expect h.called.3.result 10000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      // The restart: the second detection and the second tool list both go out after the second lost call.
+      const raw = logs.h as unknown as { t: number; dir: string; body?: string }[];
+      const posts = raw.filter((l) => l.dir === "in" && l.body).map((l) => ({ t: l.t, ...JSON.parse(l.body!) }));
+      const detections = posts.filter((m) => m.method === "server/discover");
+      const listings = posts.filter((m) => m.method === "tools/list");
+      const calls = posts.filter((m) => m.method === "tools/call");
+      const restarted = detections.length === 2 && calls.length === 3 && detections[1].t > calls[1].t;
+      const relisted = listings.length === 2 && calls.length === 3 && listings[1].t > calls[1].t;
+      return first(
+        same(calls.length, 3, "tools/call posts"),
+        same(detections.length, 2, "server/discover posts"),
+        same(listings.length, 2, "tools/list posts"),
+        restarted ? null : "the second detection did not come after the second lost call",
+        relisted ? null : "the second tool list did not come after the second lost call",
+        same(event(lines, "h.called.3")?.answer, '[{"type":"text","text":"third"}]', "the third call's answer"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-http-initialized-timeout",

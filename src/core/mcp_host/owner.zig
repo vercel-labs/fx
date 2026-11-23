@@ -905,7 +905,18 @@ fn apply(owner: *Owner, state: *core.State, engine_value: *engine.Engine, scratc
 fn broadcastMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key, what: core.Broadcast) ?wire.OwnerMessage {
     return switch (what) {
         .phase => |phase| .{ .phase = .{ .key = key, .phase = phase } },
-        .tools => |tools| .{ .tools = .{ .key = key, .ok = tools.ok, .fresh = tools.fresh, .needs_auth = tools.needs_auth, .tools = toolsJson(owner, engine_value, a, key) } },
+        .tools => |tools| .{
+            .tools = .{
+                .key = key,
+                .ok = tools.ok,
+                .fresh = tools.fresh,
+                .needs_auth = tools.needs_auth,
+                // The engine lends the words until its next refusal; the frame
+                // copies them, as it copies the list.
+                .list_refusal = refusalMessage(owner, engine_value, a, key),
+                .tools = toolsJson(owner, engine_value, a, key),
+            },
+        },
         .status => statusMessage(owner, engine_value, a, key) orelse return null,
         .stopped_idle => .{ .stopped_idle = .{ .key = key } },
         .elicitation_complete => |slot| .{ .elicitation_complete = .{ .key = key, .slot = slot } },
@@ -940,7 +951,16 @@ fn statusMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key:
             .code => null,
         }) else null,
         .stray_line = if (status.stray_line) |line| a.dupe(u8, line) catch null else null,
+        .list_refusal = if (status.list_refusal) |words| a.dupe(u8, words) catch null else null,
     } };
+}
+
+/// Why the engine refused this server's last tool list, copied for the frame:
+/// null while it refused none. A session reads it in its own slot's status.
+fn refusalMessage(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) ?[]const u8 {
+    const index = slotOf(owner, key) orelse return null;
+    const words = engine_value.status(index).list_refusal orelse return null;
+    return a.dupe(u8, words) catch null;
 }
 
 fn toolsJson(owner: *Owner, engine_value: *engine.Engine, a: Allocator, key: core.Key) []const u8 {

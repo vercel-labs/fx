@@ -6,8 +6,10 @@
 //! starts only when the host needs its tool list
 //! or a call waits for it (LazyConnect). After a failure it starts again by
 //! itself once its backoff is over, at most `max_attempts` times in a
-//! row; the tries start over once it has stayed up for `stable_ms`. A step
-//! that also starts the server is traced as a second record. Pure.
+//! row; the tries start over once it has stayed up for `stable_ms`. After
+//! `lost_limit` calls lost in a row with none in flight, the core drops the
+//! link, so the next call starts a new one. A step that also starts or
+//! restarts the server is traced as a second record. Pure.
 //!
 //! TLA+ model: `tests/tla/mcp/Engine.tla`.
 
@@ -28,6 +30,8 @@ pub const Config = struct {
     stable_ms: u32 = 60_000,
     /// How long a ready server may hold nothing before it stops; 0 never.
     idle_ms: u32 = 0,
+    /// Calls lost in a row, with the link still up, before the engine drops the link.
+    lost_limit: u8 = 2,
 };
 
 /// The gate's limits from the idle limit, the only one a host sets. A server
@@ -62,6 +66,9 @@ pub const Event = union(enum) {
     listed: bool,
     /// The server ended a call in flight, however it ended.
     answered: Handle,
+    /// The server ended a call in flight without its answer while its link
+    /// stays up, such as a broken HTTP stream.
+    lost: Handle,
 };
 
 /// How a call ends without its server's answer.
@@ -102,6 +109,7 @@ pub const Projection = struct {
     retry: bool,
     /// A tool list is in flight: the server is busy until it ends.
     listing: bool,
+    lost: u8,
 };
 
 pub const Output = struct {
@@ -112,8 +120,10 @@ pub const Output = struct {
     ignored: bool = false,
     /// The call the step was about, numbered from 1 in the order asked; 0 for none.
     n: u32 = 0,
-    /// Set when the step also started the server: the state before that.
+    /// Set when the step also started or restarted the server: the state before that.
     mid: ?Projection = null,
+    /// The model action of the second record: "connect" or "restart".
+    mid_action: []const u8 = "connect",
 
     pub fn effects(out: *const Output) []const Effect {
         return out.effect_buffer[0..out.effect_count];
@@ -144,6 +154,8 @@ pub const Gate = struct {
     /// A tool list is in flight: the server is busy until it ends, so an idle
     /// timer that fires meanwhile stops nothing.
     listing: bool = false,
+    /// Calls lost in a row while the link stayed up (tests/tla/mcp/Engine.tla `lost`).
+    lost: u8 = 0,
     calls: [max_calls]Call = @splat(.{}),
     /// The number of the last call asked.
     last: u32 = 0,
@@ -203,6 +215,7 @@ pub const Gate = struct {
                 };
                 s.phase = .idle;
                 s.attempts = 0;
+                s.lost = 0;
                 // A disconnect refuses a waiting tool list need, so the host
                 // hears; a reconnect keeps it.
                 if (s.need and !d.keep) out.emit(.refuse_need);
@@ -217,6 +230,7 @@ pub const Gate = struct {
                 out.action = "up";
                 if (s.phase != .connecting) return ignore(out);
                 s.phase = .ready;
+                s.lost = 0;
                 s.retry = false;
                 // One that stopped by idle lists again, so a tool list that
                 // changed while it was stopped reaches the catalog.
@@ -238,6 +252,7 @@ pub const Gate = struct {
             .down => {
                 out.action = "down";
                 if (s.phase != .connecting and s.phase != .ready) return ignore(out);
+                s.lost = 0;
                 const gave_up = s.attempts >= s.config.max_attempts;
                 s.retry = !gave_up;
                 s.kept = false;
@@ -287,6 +302,7 @@ pub const Gate = struct {
                 const c = s.find(handle) orelse return ignore(out);
                 out.n = c.n;
                 if (!c.sent) return ignore(out);
+                s.lost = 0;
                 c.* = .{};
                 if (s.phase == .ready) s.armIdle(out);
             },
@@ -296,6 +312,15 @@ pub const Gate = struct {
                 s.listing = false;
                 // The timer arms from the end of the list, not from before it.
                 if (s.phase == .ready) s.armIdle(out);
+            },
+            .lost => |handle| {
+                out.action = "lose";
+                const c = s.find(handle) orelse return ignore(out);
+                out.n = c.n;
+                if (!c.sent) return ignore(out);
+                c.* = .{};
+                if (s.lost < s.config.lost_limit) s.lost += 1;
+                s.restartIfLosing(out);
             },
         }
     }
@@ -323,6 +348,26 @@ pub const Gate = struct {
         out.emit(.connect);
     }
 
+    /// Restarts a link that lost `lost_limit` calls in a row. With no call in
+    /// flight, none ends (tests/tla/mcp/Engine.tla `Restart`). A tool list in
+    /// flight goes down with the link, as a drop's would; the host hears its
+    /// failure from the server, so the gate stops holding it.
+    fn restartIfLosing(s: *Gate, out: *Output) void {
+        if (s.phase != .ready or s.lost != s.config.lost_limit or s.anySent()) return;
+        out.mid = s.project(out.n);
+        out.mid_action = "restart";
+        out.emit(.teardown);
+        s.phase = .idle;
+        s.attempts = 0;
+        s.lost = 0;
+        s.listing = false;
+    }
+
+    fn anySent(s: *const Gate) bool {
+        for (s.calls) |c| if (c.used and c.sent) return true;
+        return false;
+    }
+
     pub fn demand(s: *const Gate) bool {
         if (s.need) return true;
         for (s.calls) |c| if (c.used and !c.sent) return true;
@@ -335,7 +380,7 @@ pub const Gate = struct {
     }
 
     pub fn project(s: *const Gate, n: u32) Projection {
-        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3, .retry = s.retry, .listing = s.listing };
+        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3, .retry = s.retry, .listing = s.listing, .lost = s.lost };
         for (s.calls) |c| if (c.used) {
             if (c.sent) p.sent += 1 else p.waiting += 1;
             if (c.n == n) p.state = if (c.sent) 2 else 1;
@@ -353,13 +398,14 @@ pub const Gate = struct {
     }
 };
 
-/// One record per model action: the event's, then "connect" when the step
-/// also started the server. Each carries the server's state after it.
+/// One record per model action: the event's, then "connect" or "restart" when
+/// the step also started or restarted the server. Each carries the server's
+/// state after it.
 pub fn writeTrace(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Event, out: *const Output) std.Io.Writer.Error!void {
     if (out.action.len == 0) return;
     if (out.mid) |mid| {
         try record(writer, instance, s, event, out, out.action, mid);
-        return record(writer, instance, s, event, out, "connect", s.project(out.n));
+        return record(writer, instance, s, event, out, out.mid_action, s.project(out.n));
     }
     try record(writer, instance, s, event, out, out.action, s.project(out.n));
 }
@@ -386,6 +432,8 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
             .{ .name = "retry", .value = .{ .boolean = p.retry } },
             .{ .name = "listing", .value = .{ .boolean = p.listing } },
             .{ .name = "max", .value = .{ .int = s.config.max_attempts } },
+            .{ .name = "lost", .value = .{ .int = p.lost } },
+            .{ .name = "lost_limit", .value = .{ .int = s.config.lost_limit } },
         },
     });
 }
@@ -428,6 +476,19 @@ const World = struct {
             else => {},
         };
         try testing.expect(s.attempts <= s.config.max_attempts);
+        // tests/tla/mcp/Engine.tla `RestartOnlyAfterLosses`: a link restarts only
+        // after lost_limit losses in a row, with no call in flight.
+        try testing.expect(s.lost <= s.config.lost_limit);
+        if (!out.ignored and (event == .up or event == .down or event == .drop or event == .answered)) try testing.expectEqual(@as(u8, 0), s.lost);
+        var torn_down = false;
+        for (out.effects()) |effect| torn_down = torn_down or effect == .teardown;
+        // A lost step restarts the link; an idle stop tears it down too, and
+        // the `.idle_over` branch below says what must hold for that.
+        if (torn_down and event != .drop and event != .idle_over) {
+            try testing.expect(event == .lost);
+            try testing.expect(before.lost + 1 >= s.config.lost_limit);
+            try testing.expectEqual(@as(u32, 0), s.project(0).sent);
+        }
         if (!out.ignored) switch (event) {
             .down => w.downs += 1,
             .stable, .drop => w.downs = 0,
@@ -512,6 +573,8 @@ const alphabet = [_]Event{
     .{ .listed = false },
     .{ .answered = 1 },
     .{ .answered = 2 },
+    .{ .lost = 1 },
+    .{ .lost = 2 },
 };
 
 fn walk(s: Gate, w: World, depth: usize) !void {
@@ -545,7 +608,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
         var w: World = .{};
         var handle: Handle = 1;
         for (0..300) |_| {
-            const event: Event = switch (random.uintLessThan(u8, 12)) {
+            const event: Event = switch (random.uintLessThan(u8, 13)) {
                 0 => blk: {
                     handle += 1;
                     break :blk .{ .asked = .{ .call = handle, .allowed = random.boolean() } };
@@ -559,6 +622,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
                 7 => .stable,
                 8 => .idle_over,
                 9 => .{ .listed = random.boolean() },
+                10 => .{ .lost = random.uintAtMost(Handle, handle) },
                 else => .{ .answered = random.uintAtMost(Handle, handle) },
             };
             const before = s;
@@ -802,4 +866,90 @@ test "the gate's limits lower stable_ms only for a shorter idle limit" {
     try testing.expectEqual(@as(u32, 30_000), limitsFor(30_000).stable_ms);
     try testing.expectEqual(@as(u32, 1_000), limitsFor(1_000).stable_ms);
     try testing.expectEqual(@as(u8, 8), limitsFor(1_000).max_attempts);
+}
+
+test "two calls lost in a row with none in flight drop the link" {
+    var s: Gate = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    var out = try run(&s, .{ .lost = 1 });
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    try testing.expectEqual(Phase.ready, s.phase);
+    _ = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
+    out = try run(&s, .{ .lost = 2 });
+    try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());
+    try testing.expectEqual(Phase.idle, s.phase);
+    try testing.expectEqual(@as(u8, 0), s.attempts);
+    try testing.expectEqual(@as(u8, 0), s.lost);
+    out = try run(&s, .{ .asked = .{ .call = 3, .allowed = true } });
+    try testing.expectEqualSlices(Effect, &.{.connect}, out.effects());
+}
+
+test "an answer between lost calls starts the count over" {
+    var s: Gate = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 3, .allowed = true } });
+    _ = try run(&s, .{ .lost = 1 });
+    try testing.expectEqual(@as(u8, 1), s.lost);
+    _ = try run(&s, .{ .answered = 2 });
+    try testing.expectEqual(@as(u8, 0), s.lost);
+    const out = try run(&s, .{ .lost = 3 });
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    try testing.expectEqual(Phase.ready, s.phase);
+    try testing.expectEqual(@as(u8, 1), s.lost);
+}
+
+test "a restart waits until no call is in flight" {
+    var s: Gate = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 3, .allowed = true } });
+    _ = try run(&s, .{ .lost = 1 });
+    var out = try run(&s, .{ .lost = 2 });
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    try testing.expectEqual(Phase.ready, s.phase);
+    try testing.expectEqual(@as(u8, 2), s.lost);
+    out = try run(&s, .{ .lost = 3 });
+    try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());
+    try testing.expectEqual(Phase.idle, s.phase);
+
+    // An answer to the call still in flight keeps the link, and clears the count.
+    s = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 3, .allowed = true } });
+    _ = try run(&s, .{ .lost = 1 });
+    _ = try run(&s, .{ .lost = 2 });
+    out = try run(&s, .{ .answered = 3 });
+    try testing.expectEqual(@as(usize, 0), out.effect_count);
+    try testing.expectEqual(Phase.ready, s.phase);
+    try testing.expectEqual(@as(u8, 0), s.lost);
+}
+
+test "a loss that restarts the link is traced as a lose record and a restart record" {
+    var buffer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buffer.deinit();
+    var writer: trace.Writer = .init(&buffer.writer);
+    var s: Gate = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
+    _ = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
+    _ = try run(&s, .{ .lost = 1 });
+    const lose: Event = .{ .lost = 2 };
+    const out = try run(&s, lose);
+    try writeTrace(&writer, "web", &s, lose, &out);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"seq\":1,\"machine\":\"engine\",\"inst\":\"web\",\"event\":\"lose\",\"from\":\"\",\"to\":\"\",\"effects\":[],\"data\":{\"ignored\":false,\"n\":2,\"allowed\":false,\"keep\":false,\"phase\":2,\"attempts\":1,\"need\":false,\"waiting\":0,\"sent\":0,\"state\":3,\"retry\":false,\"listing\":true,\"max\":8,\"lost\":2,\"lost_limit\":2}}\n" ++
+            "{\"v\":1,\"seq\":2,\"machine\":\"engine\",\"inst\":\"web\",\"event\":\"restart\",\"from\":\"\",\"to\":\"\",\"effects\":[],\"data\":{\"ignored\":false,\"n\":2,\"allowed\":false,\"keep\":false,\"phase\":0,\"attempts\":0,\"need\":false,\"waiting\":0,\"sent\":0,\"state\":3,\"retry\":false,\"listing\":false,\"max\":8,\"lost\":0,\"lost_limit\":2}}\n",
+        buffer.written(),
+    );
 }

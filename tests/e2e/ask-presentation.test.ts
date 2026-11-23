@@ -46,6 +46,13 @@ const WIDE_TABLE =
   "| 1 | **Change:** on reopen, an unfinished turn gets `turn_interrupted{reason: crash}`; it's never cut | " +
   "`recovery.json` and `recovery.asked` go away. The adapter handles a turn that ends in a tool call with no result |\n" +
   "| 8 | **Keep:** forks start only at turn boundaries (or turn 0) | Mid-turn forks deferred |\n";
+const TOKEN_BREAKS_TABLE =
+  "| Check | Status | Notes |\n" +
+  "|---|---|---|\n" +
+  "| node tsec/scripts/seed.ts update && node tsec/scripts/seed.ts check | Pass (exit 0) | 63 .js files, byte-for-byte stage1 == stage2 == seed fixpoint |\n" +
+  "| TSE_BUILD_JOBS=4 node tsec/scripts/native.ts | Pass (exit 0) | 58 C units compiled and linked cleanly into native tsec (8.0 MB) |\n" +
+  "| TSE_BUILD_JOBS=4 node tsec/test/run.ts --only native-const-prim-arrays,native-cow-clone,native-export-inline,cache-gc,native-stats-line,native-fast-split,build-run305,d307 | Pass (exit 0) | All 8 sections passed (O2 -Werror, ASan+UBSan live 0, 8-thread TSan 0 races, --c-dir, nm -u inline proof, cache-gc 28/28, native-stats-line 213 checks) |\n" +
+  "| node tsec/test/run.ts --only query | Pass (exit 0) | All query and query layout checks passed (nullable own + --cow-reachable) |\n";
 
 const roots: string[] = [];
 const gateways: Array<{ stop(): void }> = [];
@@ -736,6 +743,42 @@ describe("fx ask presentation", () => {
       expect(grid.some((line) => /^\s*│   │ \S/.test(line))).toBe(true);
       expect(scrollback).not.toContain("Choice: ");
       expect(scrollback).not.toContain("Direct consequences: ");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY tables break a long token instead of widening its column",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText(TOKEN_BREAKS_TABLE)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Render the check table fixture."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      const grid = lines.filter((line) => /^\s*[┌│├└]/.test(line));
+      const top = lines.find((line) => line.includes("┌")) ?? "";
+      const segments = top.trim().replace(/^┌/, "").replace(/┐$/, "").split("┬").map((segment) => segment.length);
+      expect(segments).toEqual([42, 15, 37]);
+      expect(new Set(grid.map((line) => line.length)).size).toBe(1);
+      expect(Math.max(...grid.map((line) => line.length))).toBeLessThanOrEqual(100);
+      expect(scrollback.split("Pass (exit 0)").length - 1).toBe(4);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

@@ -269,6 +269,12 @@ pub const ToolLifecycleEvent = union(enum) {
         result: ?[]const u8 = null,
         result_memory: ?ToolResultMemory = null,
         command_artifact_handle: ?[]const u8 = null,
+        /// Whether the call, a shell check, found its session's command
+        /// ended, which its status does not say when the command passed
+        /// (`checkFoundCommandEnded` in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        check_found_command_ended: bool = false,
     },
     turn_finished: TurnFinished,
 };
@@ -1236,6 +1242,9 @@ pub const PersistedToolResult = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// A `subagent` message that made a new subagent, which a v2 session
+    /// saves as an item of its own beside the result (D101).
+    subagent_started: bool = false,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -1400,6 +1409,9 @@ pub const ToolResultMemory = struct {
     /// the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
+    /// A `subagent` message that made a new subagent, so its row reads
+    /// "Started" rather than "Messaged". The model never sees it.
+    subagent_started: bool = false,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1755,6 +1767,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
@@ -3661,6 +3674,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .subagent_started = result.subagent_started,
     };
 }
 

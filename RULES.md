@@ -36,7 +36,7 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R3.6** One live writer per session. A second fx gets a clear warning. Two processes never write the same file at once.
 - **R3.7** Memory, model context, queues, caches, and session files have a size cap. Large values go in as a bounded preview with a handle. Model-driven loops have a step and retry cap.
 - **R3.8** Never drop user input, a paste, or queued work silently. Keep it or show a notice. Trace the kind, size, and reason, never the content.
-- **R3.9** Every process, file, lock, connection, and thread has one owner that frees it on success, error, cancel, and signal. No owned process outlives fx. An idle session uses almost no CPU.
+- **R3.9** Every process, file, lock, connection, and thread has one owner that frees it on success, error, cancel, and signal. Each allocation is freed on success and error by its owner: a `defer`, an `errdefer`, or an arena. No owned process outlives fx. An idle session uses almost no CPU.
 
 ## 4. Security
 
@@ -63,6 +63,7 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R6.2** A change that grows the binary must buy a clear feature or fix. Stay inside the release ceilings in `AGENTS.md`.
 - **R6.3** Do the smallest change that solves the problem. No daemon, setting, layer, or helper for a need that does not exist yet. Name limits and durations as constants with their unit.
 - **R6.4** Code explains itself through names and types. A comment says only what the code cannot show: why a rule holds, who owns returned memory, why a `catch {}` is safe, or which test or model pins the behavior.
+- **R6.5** When one caller needs different behavior from a shared helper, add a focused helper. Widen the shared helper only when the new behavior is right for every caller, and then delete the old variants.
 
 ## 7. Tests
 

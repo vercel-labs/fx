@@ -4,14 +4,14 @@
 \*
 \* Mapping from the Zig core (src/mcp/core/engine.zig):
 \*   - Records ask, need, cancel, drop, connect, up, down, backoff_over,
-\*     stable, idle, listed, and answer are the model's actions for the one
-\*     server. Calls are numbered from 1 in the order asked, and n is the
-\*     model's c. A need on a ready server is the model's Relist.
+\*     stable, idle, listed, answer, lose, and restart are the model's actions
+\*     for the one server. Calls are numbered from 1 in the order asked, and n
+\*     is the model's c. A need on a ready server is the model's Relist.
 \*   - Each record carries the server's state after the step: phase (0 idle,
 \*     1 connecting, 2 ready, 3 backoff, 4 failed), attempts, need, how many
 \*     calls wait and how many are in flight, n's state (0 none,
-\*     1 waiting, 2 sent, 3 done), whether it starts again by itself, and
-\*     whether a tool list is in flight.
+\*     1 waiting, 2 sent, 3 done), whether it starts again by itself, whether a
+\*     tool list is in flight, and the calls lost in a row (lost).
 \*   - A record marked ignored is accepted only where nothing changes.
 \*   - Arming the idle timer is hidden state: the code arms it inside up,
 \*     answer, and stable, so a trace shows no arming step and the model may
@@ -19,6 +19,8 @@
 \*   - MaxAttempts comes from the scenario (ObsMaxAttempts), the engine's
 \*     limit, which every record also carries as `max`; a planted control
 \*     gives a wrong one. MaxHost is the number of drop records.
+\*   - LostLimit comes from the scenario (ObsLostLimit), the engine's
+\*     lost_limit, which every record also carries as `lost_limit`.
 EXTENDS Engine, TraceObs, Integers, Sequences, FiniteSets
 
 VARIABLE i
@@ -48,6 +50,8 @@ Step(r) ==
          [] r.event = "idle" -> IdleFire(1)
          [] r.event = "listed" -> Listed(1)
          [] r.event = "answer" -> Answer(n)
+         [] r.event = "lose" -> Lose(n)
+         [] r.event = "restart" -> Restart(1)
          [] OTHER -> FALSE
 
 Matches(r) ==
@@ -59,6 +63,8 @@ Matches(r) ==
     /\ r.data.n # 0 => call'[r.data.n] = StateName(r.data.state)
     /\ retry'[1] = r.data.retry
     /\ listing'[1] = r.data.listing
+    /\ lost'[1] = r.data.lost
+    /\ r.data.lost_limit = LostLimit
 
 TraceInit ==
     /\ Init

@@ -93,7 +93,7 @@ pub const OwnerMessage = union(enum) {
     phase: struct { key: share_key.Key, phase: mcp.engine.Phase },
     /// The key's tool list as the engine holds it: a JSON array of raw tool
     /// objects, carried as text.
-    tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]" },
+    tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]", list_refusal: ?[]const u8 = null },
     /// How one of this client's calls ended; `answer` is the `tools.Call`
     /// JSON text, or null when the call ended without one.
     called: struct { id: u32, outcome: mcp.engine.Outcome, maybe_ran: bool, timed_out: bool, oversized: bool = false, answer: ?[]const u8 = null, refused_bytes: u32 = 0, refused_body: bool = false },
@@ -112,7 +112,7 @@ pub const OwnerMessage = union(enum) {
     /// falls back for that server, or ends that call as one that never went
     /// out, and every other key on the connection keeps working.
     refused: struct { reason: Refused, key: ?share_key.Key = null, call: ?u32 = null },
-    status: struct { key: share_key.Key, phase: mcp.engine.Phase, version: ?[]const u8 = null, last_error: ?[]const u8 = null, stderr_tail: ?[]const u8 = null, instructions: ?[]const u8 = null, exit_code: ?u8 = null, exit_signal: ?u8 = null, stray_line: ?[]const u8 = null },
+    status: struct { key: share_key.Key, phase: mcp.engine.Phase, version: ?[]const u8 = null, last_error: ?[]const u8 = null, stderr_tail: ?[]const u8 = null, instructions: ?[]const u8 = null, exit_code: ?u8 = null, exit_signal: ?u8 = null, stray_line: ?[]const u8 = null, list_refusal: ?[]const u8 = null },
 };
 
 pub const Message = union(enum) {
@@ -239,6 +239,9 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             try boolean(writer, "ok", m.ok);
             try boolean(writer, "fresh", m.fresh);
             try boolean(writer, "needs_auth", m.needs_auth);
+            // Why fx refused the list, when it did: the words the owner's
+            // status has, for a session that only reads its own slot.
+            if (m.list_refusal) |words| try textField(writer, "list_refusal", words);
             try raw(writer, "tools", m.tools);
         },
         .called => {
@@ -297,6 +300,7 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             if (m.exit_code) |value| try uint(writer, "exit_code", value);
             if (m.exit_signal) |value| try uint(writer, "exit_signal", value);
             if (m.stray_line) |value| try textField(writer, "stray_line", value);
+            if (m.list_refusal) |value| try textField(writer, "list_refusal", value);
         },
     }
 }
@@ -362,13 +366,17 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
     return switch (tag) {
         .welcome => .{ .welcome = .{ .owner = try u32Field(object, "owner") } },
         .phase => .{ .phase = .{ .key = try keyField(object, "key"), .phase = try enumField(mcp.engine.Phase, object, "phase") } },
-        .tools => .{ .tools = .{
-            .key = try keyField(object, "key"),
-            .ok = try boolField(object, "ok"),
-            .fresh = try boolField(object, "fresh"),
-            .needs_auth = try boolField(object, "needs_auth"),
-            .tools = try rawField(object, "tools"),
-        } },
+        .tools => .{
+            .tools = .{
+                .key = try keyField(object, "key"),
+                .ok = try boolField(object, "ok"),
+                .fresh = try boolField(object, "fresh"),
+                .needs_auth = try boolField(object, "needs_auth"),
+                .tools = try rawField(object, "tools"),
+                // Absent from an owner that ran before fx reported a refusal.
+                .list_refusal = try optionalText(object, "list_refusal"),
+            },
+        },
         .called => .{ .called = .{
             .id = try u32Field(object, "id"),
             .outcome = try enumField(mcp.engine.Outcome, object, "outcome"),
@@ -418,6 +426,7 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
             .exit_code = try optionalU8(object, "exit_code"),
             .exit_signal = try optionalU8(object, "exit_signal"),
             .stray_line = try optionalText(object, "stray_line"),
+            .list_refusal = try optionalText(object, "list_refusal"),
         } },
     };
 }
@@ -713,6 +722,14 @@ test "every owner message round-trips" {
     const signalled = try expectOwner(a, .{ .status = .{ .key = key, .phase = .failed, .exit_signal = 15 } });
     try testing.expectEqual(@as(?u8, 15), signalled.status.exit_signal);
     try testing.expectEqual(@as(?u8, null), signalled.status.exit_code);
+    try testing.expectEqual(@as(?[]const u8, null), signalled.status.list_refusal);
+
+    // A refused list's words cross the wire with the list and in a status, so
+    // a session that runs the server elsewhere can say why fx refused it.
+    const refused = try expectOwner(a, .{ .tools = .{ .key = key, .ok = false, .fresh = false, .needs_auth = false, .list_refusal = "\"tools\" is not a list" } });
+    try testing.expectEqualStrings("\"tools\" is not a list", refused.tools.list_refusal.?);
+    const refusing = try expectOwner(a, .{ .status = .{ .key = key, .phase = .ready, .list_refusal = "a field is written twice" } });
+    try testing.expectEqualStrings("a field is written twice", refusing.status.list_refusal.?);
 }
 
 test "server JSON nested 3000 levels deep crosses the wire as text" {
@@ -730,6 +747,7 @@ test "server JSON nested 3000 levels deep crosses the wire as text" {
 
     const tools = try expectOwner(a, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = page } });
     try testing.expectEqualStrings(page, tools.tools.tools);
+    try testing.expectEqual(@as(?[]const u8, null), tools.tools.list_refusal);
 
     const called = try expectOwner(a, .{ .called = .{ .id = 4, .outcome = .result, .maybe_ran = false, .timed_out = false, .answer = deep } });
     try testing.expectEqualStrings(deep, called.called.answer.?);

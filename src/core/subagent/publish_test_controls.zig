@@ -35,8 +35,8 @@ pub fn holdPublish(child_id: []const u8) void {
         if (test_hold) |hold| hold(child_id);
         return;
     }
-    const held = io_mod.getenv("FX_TEST_SUBAGENT_PUBLISH_HELD") orelse return;
-    const release = io_mod.getenv("FX_TEST_SUBAGENT_PUBLISH_RELEASE") orelse return;
+    const held = io_mod.getenvAbsolutePath("FX_TEST_SUBAGENT_PUBLISH_HELD") orelse return;
+    const release = io_mod.getenvAbsolutePath("FX_TEST_SUBAGENT_PUBLISH_RELEASE") orelse return;
     const n = holds.fetchAdd(1, .seq_cst) + 1;
     var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ held, n }) catch return;

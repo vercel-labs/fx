@@ -2774,6 +2774,22 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .item = .{ .type = bridge_call_type, .data = try encodeBridgeCall(a, record) } }});
     }
 
+    /// Saves `status` in the open turn as a `model_recovery` item. With no
+    /// turn open, nothing is written and the caller logs the status as
+    /// dropped.
+    pub fn saveModelRecovery(self: *Session, status: types.RouteRecoveryStatus) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.turn_open) return error.NoOpenTurn;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+        var out: std.Io.Writer.Allocating = .init(a);
+        try status.report(&label_buf).writeJson(&out.writer);
+        _ = try self.write(&.{.{ .item = .{ .type = model_recovery_type, .data = out.written() } }});
+    }
+
     fn recoveryItem(self: *Session, a: Allocator, record: types.RecoveryRecordWrite) !?sm.Piece {
         const bytes: []u8 = switch (record) {
             .keep => return null,
@@ -2931,6 +2947,9 @@ pub const Session = struct {
             }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
+            if (try encodeSubagentStarted(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, subagent_started_type, data) });
+            }
             if (event == .user and author != .user) {
                 try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
             }
@@ -5589,6 +5608,8 @@ noinline fn replay(
                     if (std.mem.eql(u8, piece.type, recovery_type)) continue;
                     // A workspace capture, evidence beside the conversation (D98).
                     if (std.mem.eql(u8, piece.type, workspace_capture_type)) continue;
+                    // A model request's recovery status, for reading the log.
+                    if (std.mem.eql(u8, piece.type, model_recovery_type)) continue;
                     const ta = turn_arena.allocator();
                     if (std.mem.eql(u8, piece.type, running_type)) {
                         // Kept for the whole turn: copies, not views of the page.
@@ -5611,6 +5632,10 @@ noinline fn replay(
                     }
                     if (std.mem.eql(u8, piece.type, cancelled_command_type)) {
                         try noteCancelledCommand(src, pa, &builder, piece);
+                        continue;
+                    }
+                    if (std.mem.eql(u8, piece.type, subagent_started_type)) {
+                        try noteSubagentStarted(src, pa, &builder, piece);
                         continue;
                     }
                     if (std.mem.eql(u8, piece.type, author_type)) {
@@ -6059,6 +6084,12 @@ const running_assistant_type = "assistant_running";
 /// the newest one (`interruptedRequest`). Older builds drop the piece as an
 /// unknown item.
 const recovery_type = "recovery";
+/// A model request's recovery status, as `fx ask --json` reports it
+/// (`types.RouteRecoveryStatus.Report`), saved when the status's kind or
+/// attempt changes and for its outcome, so the log shows when a request
+/// failed, why, how long fx waited, and how it ended. No reader of the
+/// conversation reads it. Older builds drop the piece as an unknown item.
+const model_recovery_type = "model_recovery";
 /// The bytes of a `recovery` piece's record; null for a cleared one or one
 /// that does not parse, which the recovery module treats as no record.
 fn parseRecoveryRecord(data: []const u8) ?[32]u8 {
@@ -6182,6 +6213,60 @@ fn noteCancelledCommand(src: Source, a: Allocator, builder: *session_log.Convers
 /// data isn't one. Fields a newer fx adds are ignored.
 fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
     const value = json_decode.parseFromSliceLeaky(CancelledCommandData, a, data, .{ .ignore_unknown_fields = true }) catch return null;
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    return value.call_id;
+}
+
+/// The item right after the `tool_result` of a `subagent` message that made a
+/// new subagent, `{"call_id":…}`, so a resume reads its row as "Started" and
+/// not "Messaged" (D101). The result piece keeps its bytes: older fx versions
+/// reject an unknown field in a piece but skip an unknown item.
+const subagent_started_type = "subagent_started";
+
+const SubagentStartedData = struct { call_id: []const u8 };
+
+/// The `subagent_started` item data for `event`, or null when it needs none.
+/// The data is owned by `a`.
+fn encodeSubagentStarted(a: Allocator, event: Event) !?[]u8 {
+    const result = switch (event) {
+        .tool_result => |value| value,
+        else => return null,
+    };
+    if (!result.subagent_started) return null;
+    if (result.call_id.len == 0 or result.call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(SubagentStartedData{ .call_id = result.call_id }, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Marks the turn's result a `subagent_started` item names. One that can't be
+/// read, or names no subagent result of the turn, is logged and left out, and
+/// the row reads "Messaged" as before the item existed.
+fn noteSubagentStarted(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_subagent_started_unreadable session={s} err={s} dropped=subagent_started", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const call_id = try decodeSubagentStarted(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_subagent_started_invalid session={s} dropped=subagent_started", .{src.id});
+        return;
+    };
+    if (!builder.markSubagentStarted(call_id)) {
+        debug_trace.logf("session", "event=sessions_v2_subagent_started_unmatched session={s} dropped=subagent_started", .{src.id});
+    }
+}
+
+/// The call id a `subagent_started` item's data names, or null when the data
+/// isn't one. Fields a newer fx adds are ignored. The id is in `a`.
+fn decodeSubagentStarted(a: Allocator, data: []const u8) error{OutOfMemory}!?[]const u8 {
+    const value = json_decode.parseFromSliceLeaky(SubagentStartedData, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
     return value.call_id;
 }
@@ -6432,6 +6517,8 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}",
             "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}",
             "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
+            // A subagent start (D101).
+            "{\"call_id\":\"call-start\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -6449,6 +6536,10 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     // when every string is one Ctrl+O may show.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+    // A subagent start (D101) names one call, within the identity limit.
+    if (try decodeSubagentStarted(arena_state.allocator(), buffer[0..len])) |call_id| {
+        try std.testing.expect(call_id.len > 0 and call_id.len <= session_event.max_conversation_identity_bytes);
+    }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
         inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
@@ -10132,6 +10223,74 @@ test "the calls a command made through fx mcp call come back on resume with thei
     try testing.expectEqual(@as(usize, 1), restored.history[0].assistant.execution.tool_steps.len);
 }
 
+test "a model recovery status is saved in the open turn as the report's JSON" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("page through the list") };
+    try s.appendProgress(user, .{}, .{});
+    try s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited, .text = types.testRecoveryText("Rate limited, next try in 1s") });
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), model_recovery_type));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"state\":\"waiting\",\"attempt\":1,\"cause\":\"rate_limited\",\"message\":\"Rate limited, next try in 1s\"}") != null);
+    try testing.expect(std.mem.find(u8, bytes, "\"data\":{\"state\":\"recovered\",\"attempt\":2,\"cause\":\"rate_limited\"}") != null);
+}
+
+test "a model recovery status with no open turn is not saved" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("asked") };
+    // No turn is open before the first write, so there is nothing to save into.
+    try testing.expectError(error.NoOpenTurn, s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited }));
+    try s.appendProgress(user, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
+    // The turn is committed, so a status after it finds none open.
+    try testing.expectError(error.NoOpenTurn, s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited }));
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, s.id(), model_recovery_type));
+    s.close();
+}
+
+test "a loaded session leaves model recovery items out of the conversation" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("asked") };
+    try s.appendProgress(user, .{}, .{});
+    try s.saveModelRecovery(.{ .kind = .waiting, .attempt = 1, .failure = .rate_limited, .text = types.testRecoveryText("Rate limited, next try in 1s") });
+    try s.saveModelRecovery(.{ .kind = .recovered, .attempt = 2, .failure = .rate_limited });
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("answered") } }, types.ConversationLanguage.default());
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, s.id(), model_recovery_type));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    // The same turn a session with no recovery items restores.
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("asked", restored.history[0].assistant.user.text);
+    try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
+    try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+}
+
 test "a command cancelled before it printed anything keeps its row on resume (D100)" {
     var t: TestHome = undefined;
     try t.init();
@@ -10192,6 +10351,72 @@ test "replay reads a cancelled command item a newer fx wrote and leaves out one 
     @memset(long_id, 'c');
     try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
     try testing.expect(decodeCancelledCommand(a, "not json") == null);
+}
+
+test "a message that made its subagent keeps its start on resume, in an item older fx skips (D101)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("ask the scout twice") };
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-start", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}" },
+        .{ .id = "call-again", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"and this\"}" },
+    };
+    const sent = "{\"ok\":true,\"result\":\"Sent to scout, which works on it now.\",\"error_code\":null}";
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call-start"), .tool_name = @constCast("subagent"), .status = .success, .output = @constCast(sent), .output_bytes = sent.len, .stored_output_bytes = sent.len, .subagent_started = true },
+        .{ .tool_call_id = @constCast("call-again"), .tool_name = @constCast("subagent"), .status = .success, .output = @constCast(sent), .output_bytes = sent.len, .stored_output_bytes = sent.len },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer for (&results) |result| {
+        if (result.output_handle) |handle| testing.allocator.free(handle);
+        if (result.preview) |preview| testing.allocator.free(preview);
+    };
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // One item, for the call that made the subagent, on the line right after
+    // its result, whose piece holds only the fields older fx versions read.
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, subagent_started_type));
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ subagent_started_type ++ "\",\"data\":{\"call_id\":\"call-start\"}") orelse return error.TestExpectedItem;
+    const result_at = std.mem.find(u8, bytes, "\"call_id\":\"call-start\",\"tool_name\":\"subagent\",\"status\"") orelse return error.TestExpectedResult;
+    try testing.expect(result_at < item_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[result_at..item_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"subagent_started\":") == null);
+
+    // Resume puts the start back on that call alone.
+    const history = try detailHistory(.{ .store = &t.store, .id = id }, testing.allocator);
+    defer types.freeHistoryTurnSlice(testing.allocator, history);
+    const restored = history[0].assistant.execution.tool_steps[0].tool_results;
+    try testing.expect(restored[0].subagent_started);
+    try testing.expect(!restored[1].subagent_started);
+}
+
+test "replay reads a subagent start a newer fx wrote and leaves out one it can't read (D101)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("c", (try decodeSubagentStarted(a, "{\"call_id\":\"c\",\"child\":\"k\"}")).?);
+    // An empty or missing call id, one too long, and bytes that aren't JSON.
+    try testing.expect(try decodeSubagentStarted(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(try decodeSubagentStarted(a, "{\"agent\":\"scout\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(try decodeSubagentStarted(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(try decodeSubagentStarted(a, "not json") == null);
 }
 
 test "replay keeps a bridge call record a newer fx wrote and leaves out one it can't show" {

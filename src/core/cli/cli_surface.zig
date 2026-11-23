@@ -739,6 +739,19 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     return args[parser.index..];
 }
 
+/// Whether `args` start the interactive app. This is the decision that
+/// `parseInteractiveLaunch` makes: no words, or a launch command, but not a help
+/// request. It allocates nothing, so it can run before the launch is parsed.
+pub fn isInteractiveInvocation(command_catalog: CommandCatalog, args: []const [:0]const u8) bool {
+    const effective_args = argsAfterGlobalLaunchArgs(args);
+    if (effective_args.len == 0) return true;
+    if (topLevelHelpRequest(command_catalog, effective_args) != null) return false;
+    return switch (parse(command_catalog, effective_args)) {
+        .interactive, .resume_session => true,
+        else => false,
+    };
+}
+
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
     @setRuntimeSafety(false);
     if (args.len == 0) return .interactive;
@@ -5190,6 +5203,13 @@ test "launch flags may follow the resume word and its target" {
     try std.testing.expectError(error.InvalidFlag, parseInteractiveLaunch(alloc, bad, command_catalog));
     try std.testing.expectEqualStrings("--bogus", launchFlagFailure(bad).?.unknown.flag);
     try std.testing.expectError(error.InvalidResumeArgs, parseInteractiveLaunch(alloc, &.{ "session", "resume", "last", "hello" }, command_catalog));
+}
+
+test "interactive invocation is the bare launch, not another command" {
+    const command_catalog = testCommandCatalog();
+    try std.testing.expect(isInteractiveInvocation(command_catalog, &.{}));
+    try std.testing.expect(!isInteractiveInvocation(command_catalog, &.{@constCast("help")}));
+    try std.testing.expect(!isInteractiveInvocation(command_catalog, &.{ @constCast("ask"), @constCast("hello") }));
 }
 
 test "parse recognizes every top-level command and preserves unknown commands" {

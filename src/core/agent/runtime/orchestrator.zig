@@ -220,7 +220,11 @@ fn appendContinuationPrompt(
 }
 
 const ignored_effort_notice =
-    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+    "Effort {s} is not available for {s}, so it is not sent.";
+/// Only a custom connection offers a level through its settings, so only its
+/// notice says where to add one.
+const custom_effort_hint =
+    " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -5068,8 +5072,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // A saved login's slug is not checked when it loads, so only a valid team
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
@@ -6811,9 +6814,10 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
-    // The repository as the turn found it, before any request or tool
-    // (D98). The prompt reaches the session first: the capture can take
-    // seconds, and a process killed during it must keep the prompt.
+    // The repository as the turn found it, before any tool (D98). The
+    // prompt reaches the session first, so a process killed during the
+    // capture keeps it; the capture then runs beside the first request, and
+    // `executeToolCall` waits for it before any tool acts.
     if (deps.start_workspace_capture) |start| {
         const fresh = !job.delivery.isSteering();
         start(deps.ctx, fresh, .begin);
@@ -6822,6 +6826,11 @@ fn processQueuedPromptInner(
         }
         start(deps.ctx, fresh, .capture);
     }
+    // The turn owns the start capture's task: however it ends, failed or
+    // paused before any tool and before any end capture included, the
+    // capture is saved before the turn returns, never after its session
+    // closes.
+    defer if (deps.start_workspace_capture) |start| start(deps.ctx, false, .settle);
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7500,7 +7509,14 @@ const CompactionProgress = struct {
     before_summary: ?BeforeSummary,
 
     fn interface(self: *CompactionProgress) compactor.Progress {
-        return .{ .context = self, .report_fn = report, .written_fn = written };
+        return .{ .context = self, .report_fn = report, .written_fn = written, .asked_fn = asked };
+    }
+
+    fn asked(context: *anyopaque) void {
+        const self: *CompactionProgress = @ptrCast(@alignCast(context));
+        const id = self.operation_id orelse return;
+        const effect = self.deps.compaction_activity orelse return;
+        if (effect.asked) |ask| ask(self.deps.ctx, id);
     }
 
     fn written(context: *anyopaque, percent: u8) void {
@@ -7775,6 +7791,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
             from(raw).worker.runCompactionActivity(id, stage);
         }
+        fn asked(raw: *anyopaque, id: compaction_activity.OperationId) void {
+            from(raw).worker.askedCompactionActivity(id);
+        }
         fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
             const self = from(raw);
             if (feedback.outcome == .succeeded) std.debug.assert(self.acknowledged);
@@ -7791,6 +7810,9 @@ test "compaction activity transaction settles only after publication and preserv
         fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
+            // The request was announced before it was sent, so the row
+            // counts its wait.
+            try std.testing.expect(self.worker.compactionActivitySnapshot().operation.?.progress.waiting);
             if (self.provider_error) |err| return err;
             try request.admission.admit();
             request.delivery.markPossiblySent();
@@ -7822,7 +7844,7 @@ test "compaction activity transaction settles only after publication and preserv
         deps.agent_stream_provider = gateway.provider();
         deps.agent_stream_provider.context = &host;
         deps.agent_stream_provider.stream_fn = Host.stream;
-        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
+        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle, .asked = Host.asked };
         deps.commit_context_compaction = .{ .commit = Host.commit };
         deps.push_interactive_notice = null;
         var tmp = std.testing.tmpDir(.{});
@@ -8624,14 +8646,28 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it. One the person set and the model does not
-            // declare is left out, and the session says so once
+            // settings declare it, and the Gateway only when its catalog lists
+            // it. One the person set and the model does not declare is left
+            // out, and the session says so once
             // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession).
-            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
+            // that failed cannot say what it lists, so its drop stays quiet
+            // (`deps.zig` model_catalog_failure).
+            const effort_catalog_known = job.provider == .configured or
+                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+            if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
+                    const notice = if (job.provider == .configured)
+                        try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
+                    else
+                        sentence;
+                    try push(deps.ctx, notice);
                 }
             }
             // Fast drops silently when the catalog cannot confirm support.

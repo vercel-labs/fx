@@ -115,8 +115,8 @@
   },
   {
     "description": "An idle stop with a call in flight cuts the call",
-    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            /\\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked, listing>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing>>",
-    "new": "    /\\ IF phase[s] = \"ready\" /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            \\* The stop cuts the calls still in flight.\n            /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"done\" ELSE call[c]]\n            /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"cut\" ELSE ended[c]]\n            /\\ UNCHANGED <<attempts, need, allowed, cause, host, stayed, dropped, asked, listing>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing>>",
+    "old": "    /\\ IF phase[s] = \"ready\" /\\ Quiet(s) /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            /\\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked, listing, lost>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>",
+    "new": "    /\\ IF phase[s] = \"ready\" /\\ attempts[s] = 0\n       THEN /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n            /\\ retry' = [retry EXCEPT ![s] = FALSE]\n            /\\ kept' = [kept EXCEPT ![s] = TRUE]\n            \\* The stop cuts the calls still in flight.\n            /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"done\" ELSE call[c]]\n            /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"cut\" ELSE ended[c]]\n            /\\ UNCHANGED <<attempts, need, allowed, cause, host, stayed, dropped, asked, listing, lost>>\n       ELSE /\\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>",
     "invariant": "IdleEndsNothing",
     "config": "Engine.idle.cfg"
   },
@@ -133,5 +133,24 @@
     "new": "Quiet(s) == Sent(s) = {} /\\ Waiting(s) = {} /\\ ~need[s]",
     "invariant": "IdleStopsNoList",
     "config": "Engine.idle.cfg"
+  },
+  {
+    "description": "The engine restarts a link after one lost call",
+    "old": "    /\\ lost[s] = LostLimit\n    /\\ Sent(s) = {}",
+    "new": "    /\\ lost[s] >= 1\n    /\\ Sent(s) = {}",
+    "property": "RestartOnlyAfterLosses"
+  },
+  {
+    "description": "The engine restarts a link with a call in flight",
+    "old": "    /\\ Sent(s) = {}\n    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "new": "    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n",
+    "config": "Engine.lost.cfg",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "The engine never restarts a link that loses calls",
+    "old": "    /\\ phase[s] = \"ready\"\n    /\\ lost[s] = LostLimit",
+    "new": "    /\\ phase[s] = \"ready\" /\\ need[s]\n    /\\ lost[s] = LostLimit",
+    "property": "LossesRestart"
   }
 ]

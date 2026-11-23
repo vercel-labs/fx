@@ -4,6 +4,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
 import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
@@ -239,6 +240,97 @@ describe("fx mcp", () => {
     expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
   });
 
+  // What fx refuses in a server's answer to tools/list, and the words it gives for each. The reply is raw text after the
+  // request id, so a repeated key reaches fx as written.
+  const refusedLists: [string, string, string][] = [
+    ["`tools` is no list", '"result":{"resultType":"complete","tools":7}', '"tools" is not a list'],
+    ["`tools` is written twice", '"result":{"resultType":"complete","tools":[],"tools":[]}', "a field is written twice"],
+    ["`tools` is written twice, once with an escape", '"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}', "a field is written twice"],
+    ["the server answers with an error", '"error":{"code":-32603,"message":"Internal error"}', "the server answered the list with an error"],
+    ["the answer is no finished list", '"result":{"resultType":"input_required","inputRequests":{}}', "the server's answer was not a finished list"],
+  ];
+
+  for (const [what, reply, why] of refusedLists) {
+    test(`show says when fx refused the tool list, as the server's answer: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      // The server works, so the exit stays 0.
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${why}\n  version    2026-07-28\n  transport  stdio\n`);
+      expect(text.stdout).not.toContain("0 tools");
+
+      const json = await mcp(root, "show", "fixture", "--json");
+      expect(json.code).toBe(0);
+      const shown = JSON.parse(json.stdout);
+      // `error` is what says a server is down, and this one is not; `status` and `tools` keep their meaning.
+      expect(shown).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: why, tools: [] });
+    }, 30_000);
+  }
+
+  test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
+    const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    const text = await mcp(good, "show", "fixture");
+    expect(text.stdout).toMatch(/^fixture\n  status     ready, 1 tool\n  version/);
+    expect(text.stdout).not.toContain("tool list");
+    expect(JSON.parse((await mcp(good, "show", "fixture", "--json")).stdout)).toMatchObject({ status: "ready", error: null, tools_error: null });
+
+    // A tool whose `name` is written twice is dropped and the list is still the server's answer: nothing is refused.
+    const dropped = createRoot({
+      mcpServers: {
+        fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":[{"name":"a","name":"b","inputSchema":{"type":"object"}}]}' } }),
+      },
+    });
+    const shown = JSON.parse((await mcp(dropped, "show", "fixture", "--json")).stdout);
+    expect(shown).toMatchObject({ status: "ready", tools_error: null, tools: [] });
+  }, 30_000);
+
+  test("show says when fx refused the tool list of an HTTP server too", async () => {
+    const upstream = startModernMcpHttpFixture("list_refused");
+    try {
+      const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+      const text = await mcp(root, "show", "web");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith("web\n  status     ready, tool list refused\n  tool list  refused: a field is written twice\n");
+      const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", error: null, tools_error: "a field is written twice", tools: [] });
+    } finally {
+      upstream.stop();
+    }
+  }, 30_000);
+
+  // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
+  // that is no JSON. That is an answer fx refuses, not a server that gave none.
+  const httpAnswers = [
+    ["list_http_500", "the server answered the list with HTTP 500"],
+    ["list_http_429", "the server answered the list with HTTP 429"],
+    ["list_html_200", "the list is not valid JSON"],
+  ] as const;
+  for (const [mode, why] of httpAnswers) {
+    test(`show says when an HTTP server answered the tool list with ${mode.replace("list_", "").replaceAll("_", " ")}`, async () => {
+      const upstream = startModernMcpHttpFixture(mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, tool list refused\n  tool list  refused: ${why}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: why, tools: [] });
+      } finally {
+        upstream.stop();
+      }
+    }, 30_000);
+  }
+
+  test("list --json carries tools_error, null for a server fx has not asked for its tools", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: refusedLists[0][1] } }), off: { command: "never-run", enabled: false } } });
+    const listed = await mcp(root, "list", "--json");
+    expect(listed.code).toBe(0);
+    for (const server of JSON.parse(listed.stdout).servers) expect(server).toHaveProperty("tools_error", null);
+  });
+
   test("a variable a header can't carry holds its server back instead of aborting fx", async () => {
     // Nothing listens on port 1, and nothing should be sent there.
     const root = createRoot({
@@ -398,6 +490,29 @@ describe("fx mcp", () => {
 });
 
 describe("/mcp in the shell", () => {
+  test.skipIf(!tmuxAvailable())("/mcp list and /mcp show say when fx refused a server's tool list", async () => {
+    // The shell can ask questions, so it says so to servers, and the fixture expects that.
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":7}' } }) } });
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    // Servers start on their own once the first frame is up; ask until the status says what happened to the list.
+    const listed = "fixture  ~/.fx/mcp.json  stdio      ready, tool list refused";
+    for (let i = 0; i < 20 && !(await tui.capturePane()).includes(listed); i++) {
+      await tui.sendText("/mcp list");
+      await tui.waitForText(listed, 500).catch(() => {});
+    }
+    await tui.waitForText(listed, 1_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText('tool list  refused: "tools" is not a list', 15_000);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });

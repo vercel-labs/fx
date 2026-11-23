@@ -20,6 +20,14 @@
 \* there is one, still stale, so the next need lists again. Tool
 \* contents (validity, duplicate names) are data, checked by the Zig tests,
 \* not here.
+\*
+\* A page that the server answered but fx could not use (an error, input_required,
+\* a malformed page, over HTTP a status with no JSON-RPC message or a body that is
+\* no JSON) is refused, and `refused` says so until a list is published or a new
+\* process starts: `fx mcp show` tells the person fx refused the list.
+\* A page the server never answered (a timeout, a lost connection, a cancel, a
+\* sign-in needed first) says nothing about the list, so it leaves `refused` as it was. `lastAnswer` is a ghost: how
+\* the last listing that the server answered ended since the last process.
 EXTENDS Naturals
 
 CONSTANTS
@@ -49,12 +57,16 @@ VARIABLES
                    \* yet, a "list", the "lastGood" list after a failure, or
                    \* a "failure"
     \* Ghost variables for the safety properties.
+    refused,       \* the last listing the server answered was refused
     servedStale,   \* a need was served from a list that wasn't fresh and current
-    extraFetch     \* a listing started while one was running
+    extraFetch,    \* a listing started while one was running
+    lastAnswer     \* ghost: how the last answered listing ended: "none", "list", "refused"
 
 vars == <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, listing,
           startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer,
-          servedStale, extraFetch>>
+          refused, servedStale, extraFetch, lastAnswer>>
+
+refusedVars == <<refused, lastAnswer>>
 
 listingVars == <<listing, startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer>>
 
@@ -75,8 +87,10 @@ Init ==
     /\ pending = "none"
     /\ waiting = FALSE
     /\ answer = "none"
+    /\ refused = FALSE
     /\ servedStale = FALSE
     /\ extraFetch = FALSE
+    /\ lastAnswer = "none"
 
 \* Mark the current list stale and move to a new generation.
 Invalidated ==
@@ -93,6 +107,8 @@ ProcessStarted(e) ==
     /\ process' = process + 1
     /\ era' = e
     /\ Invalidated
+    /\ refused' = FALSE
+    /\ lastAnswer' = "none"
     /\ UNCHANGED <<cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
 
 StartListing ==
@@ -119,6 +135,7 @@ Need ==
             /\ extraFetch' = (extraFetch \/ listing = "fetching")
             /\ UNCHANGED servedStale
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed>>
+    /\ UNCHANGED refusedVars
 
 \* The listing ends with a list, delivered to everyone waiting. It is cached
 \* as fresh only if nothing was invalidated since it started and, on a
@@ -133,6 +150,8 @@ Finish(z, l) ==
     /\ cacheGen' = startGen
     /\ cachedZero' = z
     /\ cachedLapsed' = l
+    /\ refused' = FALSE
+    /\ lastAnswer' = "list"
     /\ UNCHANGED <<startGen, restarts>>
 
 \* A complete page. `more`: it has a nextCursor (an empty string is a
@@ -149,6 +168,7 @@ PageReceived(more, ttlZero, lapse) ==
              THEN /\ page' = p /\ zeroTtl' = z /\ lapsed' = l /\ pending' = "next"
                   /\ UNCHANGED <<listing, startGen, restarts, waiting, answer, cache, cacheGen,
                                  cachedZero, cachedLapsed>>
+                  /\ UNCHANGED refusedVars
           ELSE /\ page' = p /\ zeroTtl' = z /\ lapsed' = l
                /\ Finish(z, l)
     /\ UNCHANGED <<era, process, gen, servedStale, extraFetch>>
@@ -174,17 +194,34 @@ InvalidCursor ==
                /\ lapsed' = FALSE
                /\ pending' = "first"
                /\ UNCHANGED <<listing, waiting, answer>>
+               /\ UNCHANGED refusedVars
           ELSE /\ Failed
+               /\ refused' = TRUE
+               /\ lastAnswer' = "refused"
                /\ UNCHANGED <<startGen, page, restarts, zeroTtl, lapsed>>
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, servedStale, extraFetch>>
 
-\* Any other end of a page request: an error (including -32602 on the first
-\* page), input_required (MRTR-07: never cached), a malformed result, a
-\* timeout, or a lost connection. The listing fails: an answer that failed
-\* is never cached, and its waiters may get the last list.
+\* The server answered a page request, and fx could not use the answer: an
+\* error (including -32602 on the first page), input_required (MRTR-07: never
+\* cached), or a malformed result. The listing fails: an answer that failed is
+\* never cached, and its waiters may get the last list. The refusal is kept.
+PageRefused ==
+    /\ pending # "none"
+    /\ Failed
+    /\ refused' = TRUE
+    /\ lastAnswer' = "refused"
+    /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
+                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
+
+\* A page request that ended with no answer: a timeout, a lost connection, a cancel,
+\* or a sign-in needed first.
+\* The listing fails as above, and says nothing about whether the server would
+\* refuse the list, so what was known stays.
 PageFailed ==
     /\ pending # "none"
     /\ Failed
+    /\ refused' = refused
+    /\ lastAnswer' = lastAnswer
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
@@ -194,6 +231,7 @@ Invalidate ==
     /\ gen < MaxGen
     /\ Invalidated
     /\ UNCHANGED <<era, process, cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
+    /\ UNCHANGED refusedVars
 
 \* A modern list's TTL ran out (CAT-04). Legacy lists have no TTL.
 Expired ==
@@ -201,8 +239,9 @@ Expired ==
     /\ era = "modern"
     /\ cache' = "stale"
     /\ UNCHANGED <<era, process, gen, cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
+    /\ UNCHANGED refusedVars
 
-Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageFailed
+Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageRefused \/ PageFailed
 
 Next ==
     \/ \E e \in {"modern", "legacy"} : ProcessStarted(e)
@@ -232,8 +271,10 @@ TypeOK ==
     /\ pending \in {"none", "first", "next"}
     /\ waiting \in BOOLEAN
     /\ answer \in {"none", "list", "lastGood", "failure"}
+    /\ refused \in BOOLEAN
     /\ servedStale \in BOOLEAN
     /\ extraFetch \in BOOLEAN
+    /\ lastAnswer \in {"none", "list", "refused"}
 
 \* A fresh list was listed in the current generation: no answer from before
 \* an invalidation is ever cached as fresh.
@@ -265,6 +306,18 @@ PagesBounded == page <= MaxPages /\ (pending # "none" => page < MaxPages)
 
 \* A listing runs only while someone waits for it, and waiting implies a listing.
 WaitingMeansListing == waiting <=> listing = "fetching"
+
+\* fx says it refused the list exactly when the last listing the server answered
+\* was refused: a published list and a new process clear it, and a listing the
+\* server never answered leaves it.
+RefusedIffLastAnswerRefused == refused <=> lastAnswer = "refused"
+
+\* A refused list was never cached, so no list is fresh while fx says it refused one.
+RefusedListIsNotFresh == refused => cache # "fresh"
+
+\* A refusal ended a listing, so its waiters got the failure, or the last list
+\* listed, which fx still serves: the status says both.
+RefusedMeansFailureAnswer == refused => answer \in {"failure", "lastGood"}
 
 \* Everyone who needs the list gets an answer.
 EveryNeedAnswered == waiting ~> ~waiting

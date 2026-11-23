@@ -62,6 +62,9 @@ pub const Slot = struct {
     last_error: ?[]u8 = null,
     stderr_tail: ?[]u8 = null,
     instructions: ?[]u8 = null,
+    /// Why the owner refused this server's last tool list, in its words; null
+    /// while it refused none. A list it accepted clears them.
+    list_refusal: ?[]u8 = null,
     /// How the last process ended, and the stdout line that answered
     /// nothing, as the engine keeps them for a failure's text.
     exit: ?mcp.stdio.Exit = null,
@@ -175,6 +178,7 @@ pub const Shared = struct {
         if (slot.last_error) |v| s.gpa.free(v);
         if (slot.stderr_tail) |v| s.gpa.free(v);
         if (slot.instructions) |v| s.gpa.free(v);
+        if (slot.list_refusal) |v| s.gpa.free(v);
         if (slot.stray_line) |v| s.gpa.free(v);
         _ = s.slots.orderedRemove(i);
         // The calls left point at slots after this one, which moved back.
@@ -314,6 +318,7 @@ pub const Shared = struct {
             .version = slot.version,
             .tools = slot.tools_store.current.len(),
             .last_error = slot.last_error,
+            .list_refusal = slot.list_refusal,
             .exit = slot.exit,
             .stray_line = slot.stray_line,
         };
@@ -435,6 +440,9 @@ pub const Shared = struct {
                 replace(s.gpa, &slot.instructions, update.instructions);
                 slot.exit = if (update.exit_code) |code| .{ .code = code } else if (update.exit_signal) |signal| .{ .signal = signal } else null;
                 replace(s.gpa, &slot.stray_line, update.stray_line);
+                // The words of a refused list stand until an accepted one
+                // clears them, in a status as in a listing frame.
+                replace(s.gpa, &slot.list_refusal, update.list_refusal);
             },
             .tools => |page| {
                 const i = s.indexByKey(page.key) orelse {
@@ -442,6 +450,10 @@ pub const Shared = struct {
                     return;
                 };
                 const slot = &s.slots.items[i];
+                // Why the owner refused the list comes with the list it
+                // answered: a refusal replaces the words, an accepted list
+                // clears them, as the owner's status does.
+                replace(s.gpa, &slot.list_refusal, page.list_refusal);
                 // A listing replaces the list, even with none: an old list
                 // must not outlive the server saying it has no tools. A
                 // failed listing keeps the last one.
@@ -611,6 +623,7 @@ pub const Shared = struct {
             if (slot.last_error) |v| s.gpa.free(v);
             if (slot.stderr_tail) |v| s.gpa.free(v);
             if (slot.instructions) |v| s.gpa.free(v);
+            if (slot.list_refusal) |v| s.gpa.free(v);
             if (slot.stray_line) |v| s.gpa.free(v);
         }
         s.slots.deinit(s.gpa);
@@ -811,6 +824,46 @@ test "a shared server lists its tools through the owner" {
     stop.store(true, .release);
     thread.join();
     joined = true;
+}
+
+/// Feeds one owner message to a shared adapter as the frame the owner writes.
+fn feedOwner(s: *Shared, a: Allocator, message: wire.OwnerMessage) !void {
+    const encoded = try wire.encode(a, message);
+    s.frame(encoded[wire.header_bytes..]);
+}
+
+test "a refused tool list's words reach this session's status, and an accepted list clears them" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "refusal");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The owner answers a list it refused: the words come with the list, so a
+    // session says why fx refused it, as one that runs the server itself does.
+    const refused: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = false, .fresh = false, .needs_auth = false, .list_refusal = "\"tools\" is not a list" } };
+    try feedOwner(&shared, a, refused);
+    try testing.expectEqualStrings("\"tools\" is not a list", shared.status("fake").list_refusal.?);
+
+    // A status carries them too, for a session that never asked for the list.
+    const refusing: wire.OwnerMessage = .{ .status = .{ .key = key, .phase = .ready, .list_refusal = "a field is written twice" } };
+    try feedOwner(&shared, a, refusing);
+    try testing.expectEqualStrings("a field is written twice", shared.status("fake").list_refusal.?);
+
+    // A list it accepted clears them.
+    const accepted: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
+    try feedOwner(&shared, a, accepted);
+    try testing.expectEqual(@as(?[]const u8, null), shared.status("fake").list_refusal);
 }
 
 test "a call through the owner answers, and two sessions get one process" {

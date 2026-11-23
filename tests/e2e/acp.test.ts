@@ -2256,6 +2256,17 @@ describe("acp: model-independent", () => {
         );
         expect(gateway.requests[3]!.body).not.toContain(partialText);
         expect(client.stderr).toBe("");
+        // The session log keeps the recovery as a timeline; its last status is the outcome.
+        const [sessionId] = savedSessionIds(root.home);
+        const timeline = logLines(root.home, sessionId!).filter(
+          (line: any) => line.kind === "item" && line.type === "model_recovery",
+        ) as any[];
+        const last = timeline.at(-1);
+        expect(typeof last?.data === "string" ? JSON.parse(last.data) : last?.data).toEqual({
+          state: "recovered",
+          attempt: 4,
+          cause: "server",
+        });
       } finally {
         await client?.close();
         gateway.stop();

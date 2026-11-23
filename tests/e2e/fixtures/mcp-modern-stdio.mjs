@@ -33,6 +33,9 @@ const catalogDelayMs = Math.max(
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
 const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+// FX_MCP_LIST_REPLY is raw JSON text that goes out as written after the id of every tools/list reply: `"result":{...}`
+// or `"error":{...}`. A test gives fx a list it refuses, with a repeated or escaped key that JSON.stringify cannot write.
+const rawListReply = process.env.FX_MCP_LIST_REPLY;
 const rawFormSchemaMark = "raw-form-schema-mark";
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 // FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
@@ -366,6 +369,10 @@ function handle(message) {
         }
       }, 50);
     }
+    return;
+  }
+  if (message.method === "tools/list" && rawListReply !== undefined) {
+    process.stdout.write(`{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},${rawListReply}}\n`);
     return;
   }
   if (message.method === "tools/list") {

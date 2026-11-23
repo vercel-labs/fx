@@ -1753,6 +1753,58 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("ask names an effort the gateway catalog does not list, and sends none", async () => {
+    const root = createFixtureRoot("ask-unlisted-effort");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("UNLISTED_EFFORT_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        [
+          "ask", "--json", "--auto", "--no-save",
+          "--model", MODEL,
+          "--effort", "xhigh",
+          "Use the unlisted effort.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "UNLISTED_EFFORT_COMPLETE",
+      );
+      const notices = result.stderr.trim().split("\n");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toBe(
+        `[notice] Effort xhigh is not available for ${MODEL}, so it is not sent.`,
+      );
+      expect(gateway.requests).toHaveLength(1);
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("reasoning");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("ask --config overrides the settings files and yields to dedicated flags", async () => {
     const root = createFixtureRoot("ask-config-overrides");
     const tracePath = join(root.root, "trace.log");
@@ -7397,6 +7449,82 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(children.length).toBe(1);
       expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
       expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test("a subagent's retried model request leaves its recovery timeline in the child's own log", async () => {
+    const root = createFixtureRoot("usage-subagent-recovery");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    // The child's requests are the ones whose tools lack `subagent`. Its first
+    // fails with a 503, and its retry gets the reply.
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        childRequests += 1;
+        if (childRequests === 1) return unavailableResponse("1");
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      // The child's report reaches the parent as a turn of its own, or joins
+      // the turn that is still running, so the reply that carries it ends the
+      // run either way.
+      if (body.includes("Subagent report")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_wait", delta: "PARENT_WAITING" }, finish("stop", 0, 0, 0)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "message", agent: "usage", message: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+
+      // The child's log: waiting, then its retry, then the recovered outcome,
+      // all inside its turn.
+      const childLines = logLines(root.home, children[0]!) as Array<any>;
+      const started = childLines.find((line) => line.kind === "turn_started");
+      const committed = childLines.find((line) => line.kind === "turn_committed");
+      const timeline = childLines
+        .filter((line) => line.kind === "item" && line.type === "model_recovery")
+        .map((line) => ({
+          seq: line.seq as number,
+          status: typeof line.data === "string" ? JSON.parse(line.data) : line.data,
+        }));
+      expect(timeline.map((entry) => entry.status.state)).toEqual(["waiting", "retrying", "recovered"]);
+      expect(timeline.map((entry) => entry.status.attempt)).toEqual([1, 2, 2]);
+      for (const entry of timeline) {
+        expect(entry.status.cause).toBe("server");
+        expect(entry.seq).toBeGreaterThan(started!.seq);
+        expect(entry.seq).toBeLessThan(committed!.seq);
+      }
+      for (const entry of timeline.slice(0, -1)) expect(typeof entry.status.message).toBe("string");
+      expect(timeline.at(-1)!.status).not.toHaveProperty("message");
+
+      // The parent's requests never failed, so its own log has no recovery item.
+      const parentLines = logLines(root.home, parent!) as Array<any>;
+      expect(parentLines.filter((line) => line.kind === "item" && line.type === "model_recovery")).toEqual([]);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -13273,6 +13401,65 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("a retried model request leaves its recovery timeline in the session log", async () => {
+    const root = createFixtureRoot("recovery-timeline");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      unavailableResponse("1"),
+      unavailableResponse("1"),
+      fakeGatewayFinalText("Recovered with a timeline."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Recover with a timeline."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("Recovered with a timeline.");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "server" });
+
+      // One `model_recovery` item per change of state, inside the open turn.
+      const lines = logLines(root.home, onlySessionId(root.home)) as Array<any>;
+      const started = lines.find((line) => line.kind === "turn_started");
+      const committed = lines.find((line) => line.kind === "turn_committed");
+      const timeline = lines
+        .filter((line) => line.kind === "item" && line.type === "model_recovery")
+        .map((line) => ({
+          seq: line.seq as number,
+          status: typeof line.data === "string" ? JSON.parse(line.data) : line.data,
+        }));
+      expect(timeline.map((entry) => entry.status.state)).toEqual([
+        "waiting",
+        "retrying",
+        "waiting",
+        "retrying",
+        "recovered",
+      ]);
+      expect(timeline.map((entry) => entry.status.attempt)).toEqual([1, 2, 2, 3, 3]);
+      for (const entry of timeline) {
+        expect(entry.status.cause).toBe("server");
+        expect(entry.seq).toBeGreaterThan(started!.seq);
+        expect(entry.seq).toBeLessThan(committed!.seq);
+      }
+      // Waits and retries carry fx's status text. The recovered status has none.
+      for (const entry of timeline.slice(0, -1)) expect(typeof entry.status.message).toBe("string");
+      expect(timeline.at(-1)!.status).not.toHaveProperty("message");
+      expect(timeline.at(-1)!.status).toEqual(json.recovery);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("CLI recovery prints one complete response after checkpointed partial output", async () => {
     const root = createFixtureRoot("partial-autonomous-recovery");
     const tracePath = join(root.root, "trace.log");
@@ -15233,10 +15420,10 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
 
 // A test hold reads its two file paths from the environment and takes only
 // absolute ones: a relative path is ignored, as if the hold were not set. Main
-// starts subagent `worker`, whose first turn is held until main stops it, so the
-// run reaches the start hold, the stopped-end hold, and the settle hold, each set
-// to relative paths. fx must neither crash nor write a marker file into the
-// workspace.
+// starts subagent `worker`, stops it, and closes it, so the run reaches the
+// start, stopped-end, settle, publish, and close holds, each set to a relative
+// path; the session-write hold is set too, though this run does not reach it.
+// fx must neither crash nor write a marker file into the workspace.
 test("a test hold set to a relative path is ignored", async () => {
   const root = createFixtureRoot("relative-hold-paths");
   const held = heldFakeGatewayFinalText();
@@ -15248,7 +15435,8 @@ test("a test hold set to a relative path is ignored", async () => {
       childRequests++;
       return held.response;
     }
-    if (raw.includes("relhold-stop")) return fakeGatewayFinalText("RELHOLD_MAIN_DONE");
+    if (raw.includes("relhold-close")) return fakeGatewayFinalText("RELHOLD_MAIN_DONE");
+    if (raw.includes("relhold-stop")) return fakeGatewayToolCall("relhold-close", "subagent", { request: { action: "close", agent: "worker" } });
     if (raw.includes("relhold-start")) {
       await waitUntil(() => childRequests > 0, 20_000);
       return fakeGatewayToolCall("relhold-stop", "subagent", { request: { action: "stop", agent: "worker" } });
@@ -15258,7 +15446,7 @@ test("a test hold set to a relative path is ignored", async () => {
     });
   }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
   try {
-    const result = await runFx(["ask", "--json", "--full-access", "Start the worker, then stop it."], {
+    const result = await runFx(["ask", "--json", "--full-access", "Start the worker, stop it, then close it."], {
       cwd: root.workspace,
       env: {
         ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
@@ -15269,6 +15457,12 @@ test("a test hold set to a relative path is ignored", async () => {
         FX_TEST_SUBAGENT_END_RELEASE: "relative-end-release",
         FX_TEST_SUBAGENT_SETTLE_HELD: "relative-settle-held",
         FX_TEST_SUBAGENT_SETTLE_RELEASE: "relative-settle-release",
+        FX_TEST_SUBAGENT_PUBLISH_HELD: "relative-publish-held",
+        FX_TEST_SUBAGENT_PUBLISH_RELEASE: "relative-publish-release",
+        FX_TEST_SUBAGENT_CLOSE_HELD: "relative-close-held",
+        FX_TEST_SUBAGENT_CLOSE_RELEASE: "relative-close-release",
+        FX_TEST_SESSION_WRITE_HELD: "relative-session-write-held",
+        FX_TEST_SESSION_WRITE_RELEASE: "relative-session-write-release",
       },
       timeoutMs: 30_000,
     });

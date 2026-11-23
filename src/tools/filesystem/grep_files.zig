@@ -156,7 +156,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 // running. The libfx artifacts leave it out.
 fn holdForTest() void {
     if (comptime build_options.libfx) return;
-    const release_path = io_mod.getenv("FX_TEST_GREP_RELEASE") orelse return;
+    const release_path = io_mod.getenvAbsolutePath("FX_TEST_GREP_RELEASE") orelse return;
     while (true) : (io_mod.sleep(std.time.ns_per_ms)) {
         std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch continue;
         return;
