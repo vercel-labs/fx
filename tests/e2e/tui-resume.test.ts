@@ -4920,28 +4920,41 @@ test.skipIf(!tmuxAvailable())(
       const contentionStartedAt = Date.now();
       await contender.sendKeys("Enter");
       await contender.waitForPane(
-        (pane) => stripAnsi(pane).includes(
-          "This session is open in another fx. Close it there, then press enter to retry.",
-        ),
+        (pane) => {
+          const text = stripAnsi(pane);
+          return /This session is running in pid \d+/.test(text) &&
+            text.includes("1) Fork and continue here");
+        },
         1_000,
       );
       expect(Date.now() - contentionStartedAt).toBeLessThan(1_000);
 
       const contendedPicker = stripAnsi(await contender.capturePane());
       expect(contendedPicker).toContain(savedTitle);
-      expect(contendedPicker).toContain(
-        "This session is open in another fx. Close it there, then press enter to retry.",
-      );
+      expect(contendedPicker).toMatch(/This session is running in pid \d+/);
+      expect(contendedPicker).toContain("1) Fork and continue here");
+      expect(contendedPicker).toContain("2) Back to sessions");
       expect(contendedPicker).not.toContain("SessionBusy");
+      expect(owner.isPaneAlive()).toBe(true);
+      expect(contender.isPaneAlive()).toBe(true);
+      expect(readFileSync(ownerStderrPath, "utf8")).toBe("");
+      expect(readFileSync(contenderStderrPath, "utf8")).toBe("");
+
+      // Pressing Down then Enter selects "2) Back to sessions" and returns to the open list.
+      await contender.sendKeys("Down");
+      await contender.sendKeys("Enter");
+      await contender.waitForPane(
+        (pane) => {
+          const text = stripAnsi(pane);
+          return text.includes(savedTitle) && !text.includes("1) Fork and continue here");
+        },
+        TIMEOUT,
+      );
       const contendedEntries = visibleSessionPickerEntries(
         await contender.capturePaneEscapes(),
       );
       expect(contendedEntries).toHaveLength(1);
       expect(contendedEntries[0]!.selected).toBe(true);
-      expect(owner.isPaneAlive()).toBe(true);
-      expect(contender.isPaneAlive()).toBe(true);
-      expect(readFileSync(ownerStderrPath, "utf8")).toBe("");
-      expect(readFileSync(contenderStderrPath, "utf8")).toBe("");
 
       await owner.sendText("/quit");
       expect(await owner.waitForSessionEnd()).toBe(true);
@@ -9893,6 +9906,167 @@ test.skipIf(!tmuxAvailable())(
       expect(gateway.requests.slice(before).some((request) => request.body.includes(RESUME_NOTE))).toBe(false);
     } finally {
       await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "fx -r shows the running pid modal for an open session and forks it on y while the owner stays open",
+  async () => {
+    const fixture = resumeFixture("fx-busy-fork-modal-");
+    const ownerMarker = "OWNER_LIVE_MARKER_8812";
+    const forkReplyMarker = "FORK_CONTINUATION_8813";
+    const title = "Busy fork target session";
+    let requestCount = 0;
+    const gateway = startDynamicFakeGateway(async () => {
+      requestCount += 1;
+      return fakeGatewayFinalText(requestCount === 1 ? ownerMarker : forkReplyMarker);
+    });
+    let owner: TmuxSession | null = null;
+    let contender: TmuxSession | null = null;
+    try {
+      owner = (await launchFx(fixture, gateway, "", "owner")).session;
+      await owner.sendText(title);
+      await owner.waitForText(ownerMarker, TIMEOUT);
+      await owner.waitForComposer(TIMEOUT);
+
+      contender = (await launchFx(fixture, gateway, "-r", "contender")).session;
+      await waitForSessionPicker(contender);
+      await contender.waitForText(title, TIMEOUT);
+      await contender.sendKeys("Enter");
+      await contender.waitForPane(
+        (pane) => {
+          const text = stripAnsi(pane);
+          return /This session is running in pid \d+/.test(text) &&
+            text.includes("1) Fork and continue here");
+        },
+        TIMEOUT,
+      );
+
+      await contender.sendKeys("y");
+      const forked = await waitForScrollback(contender, ownerMarker);
+      expect(forked).toContain("* session forked:");
+      expect(forked).toContain(ownerMarker);
+      await waitForSessionPickerClosed(contender);
+      await contender.waitForComposer(TIMEOUT);
+
+      // The forked session is writable while the owner stays alive untouched.
+      await contender.sendText("continue in fork");
+      await contender.waitForText(forkReplyMarker, TIMEOUT);
+      expect(owner.isPaneAlive()).toBe(true);
+      expect(contender.isPaneAlive()).toBe(true);
+    } finally {
+      await contender?.kill();
+      await owner?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "fx -r sorts by last message with live turn counts and fx -c follows last activity",
+  async () => {
+    const fixture = resumeFixture("fx-resume-sort-activity-");
+    const alphaTitle = "Alpha marathon thread";
+    const betaTitle = "Beta side thread";
+    let replyNum = 0;
+    const gateway = startDynamicFakeGateway(async () => {
+      replyNum += 1;
+      return fakeGatewayFinalText(`SORT_REPLY_${replyNum}`);
+    });
+    let alpha: TmuxSession | null = null;
+    let beta: TmuxSession | null = null;
+    let picker: TmuxSession | null = null;
+    let peek: TmuxSession | null = null;
+    let continued: TmuxSession | null = null;
+    try {
+      alpha = (await launchFx(fixture, gateway, "", "alpha")).session;
+      await alpha.sendText(alphaTitle);
+      await alpha.waitForText("SORT_REPLY_1", TIMEOUT);
+      await alpha.waitForComposer(TIMEOUT);
+
+      // Open a second session later and finish one turn there.
+      beta = (await launchFx(fixture, gateway, "", "beta")).session;
+      await beta.sendText(betaTitle);
+      await beta.waitForText("SORT_REPLY_2", TIMEOUT);
+      await beta.waitForComposer(TIMEOUT);
+      await beta.sendText("/quit");
+      expect(await beta.waitForSessionEnd()).toBe(true);
+      await beta.kill();
+      beta = null;
+
+      // Send two more turns in alpha while it stays open (3 turns total).
+      await alpha.sendText("alpha follow up two");
+      await alpha.waitForText("SORT_REPLY_3", TIMEOUT);
+      await alpha.waitForComposer(TIMEOUT);
+      await alpha.sendText("alpha follow up three");
+      await alpha.waitForText("SORT_REPLY_4", TIMEOUT);
+      await alpha.waitForComposer(TIMEOUT);
+
+      // While alpha is still open, fx -r must list alpha first with 3 turns.
+      picker = (await launchFx(fixture, gateway, "-r", "picker")).session;
+      await waitForSessionPicker(picker);
+      await picker.waitForText(alphaTitle, TIMEOUT);
+      await picker.waitForText(betaTitle, TIMEOUT);
+      const entriesWhileOpen = visibleSessionPickerEntries(
+        await picker.capturePaneEscapes(),
+      );
+      expect(entriesWhileOpen.length).toBeGreaterThanOrEqual(2);
+      expect(entriesWhileOpen[0]!.title).toContain(alphaTitle);
+      expect(entriesWhileOpen[0]!.meta).toContain("3 turns");
+      expect(entriesWhileOpen[1]!.title).toContain(betaTitle);
+
+      // Open beta via the picker and quit without sending a message; beta must
+      // not overtake alpha in fx -r or fx -c.
+      await picker.sendKeys("Down");
+      await picker.sendKeys("Enter");
+      await waitForScrollback(picker, "SORT_REPLY_2");
+      await picker.waitForComposer(TIMEOUT);
+      await picker.sendText("/quit");
+      expect(await picker.waitForSessionEnd()).toBe(true);
+      await picker.kill();
+      picker = null;
+
+      // Close alpha cleanly so fx -c can acquire it.
+      await alpha.sendText("/quit");
+      expect(await alpha.waitForSessionEnd()).toBe(true);
+      await alpha.kill();
+      alpha = null;
+
+      // fx -r still lists alpha first with 3 turns.
+      peek = (await launchFx(fixture, gateway, "-r", "peek")).session;
+      await waitForSessionPicker(peek);
+      await peek.waitForText(alphaTitle, TIMEOUT);
+      await peek.waitForText(betaTitle, TIMEOUT);
+      const entriesAfterPeek = visibleSessionPickerEntries(
+        await peek.capturePaneEscapes(),
+      );
+      expect(entriesAfterPeek[0]!.title).toContain(alphaTitle);
+      expect(entriesAfterPeek[0]!.meta).toContain("3 turns");
+      await peek.sendKeys("Escape");
+      await waitForSessionPickerClosed(peek);
+      await peek.waitForComposer(TIMEOUT);
+      await peek.sendText("/quit");
+      expect(await peek.waitForSessionEnd()).toBe(true);
+      await peek.kill();
+      peek = null;
+
+      // fx -c resumes alpha (last activity), not beta (opened and closed later).
+      continued = (await launchFx(fixture, gateway, "-c", "continue")).session;
+      const resumed = await waitForScrollback(continued, "SORT_REPLY_4");
+      expect(resumed).toContain(alphaTitle);
+      expect(resumed).toContain("SORT_REPLY_4");
+    } finally {
+      await continued?.kill();
+      await peek?.kill();
+      await picker?.kill();
+      await beta?.kill();
+      await alpha?.kill();
       gateway.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }

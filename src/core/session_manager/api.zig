@@ -468,6 +468,14 @@ pub const Manager = struct {
         return session_mod.isBusy(&m.env, id);
     }
 
+    /// The advisory PID of the process holding `id`'s writer lock, or null if
+    /// free or recorded by an older build without a PID.
+    pub fn lockHolderPid(m: *Manager, id: []const u8) OpenError!?u32 {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.lockHolderPid(&m.env, id);
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
@@ -582,7 +590,13 @@ pub const Session = struct {
         // that stays held in memory does no disk I/O at all (D2).
         if (!s.inner.staysHeld(events)) try s.manager.ready();
         const result = try s.inner.appendReport(events, ts_ms);
-        if (result.published) s.updateIndexAs(.published) else if (result.listing_changed) s.updateIndex();
+        if (result.published) {
+            s.updateIndexAs(.published);
+        } else if (result.activity_changed) {
+            s.updateIndexAs(.{ .activity = s.inner.activeHost() });
+        } else if (result.listing_changed) {
+            s.updateIndex();
+        }
         return result.last_seq;
     }
 
@@ -636,17 +650,19 @@ pub const Session = struct {
         s.updateIndexAs(.changed);
     }
 
-    /// A new session counts as opened by the host that created it, and a
-    /// resumed one by the host that resumed it, so `-c` finds it; other
-    /// updates leave the open times alone.
-    fn updateIndexAs(s: Session, why: union(enum) { published, changed, resumed: Host }) void {
+    /// A session's host timestamp tracks its last message or turn activity in
+    /// that host so `-c` follows where the person was working. Resuming stamps
+    /// the session's existing activity time so an untouched reopen does not
+    /// overtake a session messaged more recently.
+    fn updateIndexAs(s: Session, why: union(enum) { published, activity: Host, changed, resumed: Host }) void {
         const m = s.manager;
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
         switch (why) {
             .published => summary.opened_ms[@backingInt(summary.host)] = summary.updated_ms,
-            .resumed => |host| summary.opened_ms[@backingInt(host)] = m.nowMs(),
+            .activity => |host| summary.opened_ms[@backingInt(host)] = summary.updated_ms,
+            .resumed => |host| summary.opened_ms[@backingInt(host)] = summary.updated_ms,
             .changed => {},
         }
         m.catalog().put(summary) catch m.indexStale(s.id());
@@ -1129,15 +1145,22 @@ const api_tests = struct {
         _ = try other.append(&.{ .turn_started, .turn_committed });
         other.release();
 
-        // The app opens a; then ask and acp open b, a millisecond later at
-        // least, so b is the newer one however fast this runs.
-        (try m.openResume(.{ .target = .{ .id = a_id }, .workspace = "/w", .host = .app })).release();
+        // The app appends a turn on a; then ask appends a turn on b a
+        // millisecond later, so b has the newest activity while the app's
+        // newest activity stays on a.
+        {
+            const ra = try m.openResume(.{ .target = .{ .id = a_id }, .workspace = "/w", .host = .app });
+            defer ra.release();
+            _ = try ra.append(&.{ .turn_started, piece, .turn_committed });
+        }
         try nextMillisecond();
-        (try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .ask })).release();
-        (try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .acp })).release();
+        {
+            const rb = try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .ask });
+            defer rb.release();
+            _ = try rb.append(&.{ .turn_started, piece, .turn_committed });
+        }
 
-        // b was updated last (closed by acp); the app last opened a. Resuming
-        // is itself an open, so this check runs as `fx ask --resume last`.
+        // b had the newest turn (by ask); the app last had activity on a.
         const last = try m.openResume(.{ .target = .last, .workspace = "/w", .host = .ask });
         try testing.expectEqualStrings(b_id, last.id());
         last.release();
@@ -1525,17 +1548,18 @@ const api_tests = struct {
         try testing.expectEqual(try newestTs(m, id), first.updated_ms);
         s.release();
 
-        // Resume reads both back from the log; the list shows the same times.
+        // Resume reads both back from the log; closing without new activity
+        // keeps the last message/turn timestamp, and the list agrees.
         const r = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
         var st = try r.state(gpa);
         defer st.deinit(gpa);
         try testing.expectEqual(first.created_ms, st.created_ms);
-        try testing.expectEqual(try newestTs(m, id), st.updated_ms);
+        try testing.expectEqual(first.updated_ms, st.updated_ms);
         r.release();
         var listed = try m.list(gpa, .all, null, 10);
         defer listed.deinit();
         try testing.expectEqual(first.created_ms, listed.items[0].created_ms);
-        try testing.expectEqual(try newestTs(m, id), listed.items[0].updated_ms);
+        try testing.expectEqual(first.updated_ms, listed.items[0].updated_ms);
 
         // A fork is created now; its copied lines keep older times.
         const fk = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
@@ -2271,6 +2295,139 @@ const api_tests = struct {
         defer st.deinit(gpa);
         try testing.expectEqualStrings("\"You run inside Mini.\"", st.client_prompt.?);
         try testing.expectEqualStrings("{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\"}}", st.tool_identities.?);
+    }
+
+    test "list updates turn count and activity time while a session stays open" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed, .{ .set = .{ .key = .title, .value = "\"first\"" } } });
+        var first = try m.list(gpa, .all, null, 10);
+        defer first.deinit();
+        try testing.expectEqual(@as(u64, 1), first.items[0].turns);
+        const turn1_ms = first.items[0].updated_ms;
+
+        try nextMillisecond();
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        try nextMillisecond();
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+
+        // Still open, no title/workspace change and no close(): the index must
+        // already reflect turn 3 and its newer timestamp.
+        var live = try m.list(gpa, .all, null, 10);
+        defer live.deinit();
+        try testing.expectEqual(@as(u64, 3), live.items[0].turns);
+        try testing.expect(live.items[0].updated_ms > turn1_ms);
+    }
+
+    test "reopening and closing an older session without a message does not bump list or -c" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const old = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try old.append(&.{ .turn_started, piece, .turn_committed });
+        const old_id = try gpa.dupe(u8, old.id());
+        defer gpa.free(old_id);
+        old.release();
+
+        try nextMillisecond();
+        const fresh = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try fresh.append(&.{ .turn_started, piece, .turn_committed });
+        const fresh_id = try gpa.dupe(u8, fresh.id());
+        defer gpa.free(fresh_id);
+        fresh.release();
+
+        try nextMillisecond();
+        // Open and immediately close the older session with no new message.
+        (try m.openResume(.{ .target = .{ .id = old_id }, .workspace = "/w", .host = .app })).release();
+
+        var listed = try m.list(gpa, .{ .workspace = "/w" }, null, 10);
+        defer listed.deinit();
+        try testing.expectEqualStrings(fresh_id, listed.items[0].id);
+
+        const c_id = (try m.lastOpened(gpa, "/w", .app)).?;
+        defer gpa.free(c_id);
+        try testing.expectEqualStrings(fresh_id, c_id);
+    }
+
+    test "later message in an earlier-opened session wins both list order and -c" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const a = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer a.release();
+        _ = try a.append(&.{ .turn_started, piece, .turn_committed });
+        const a_id = try gpa.dupe(u8, a.id());
+        defer gpa.free(a_id);
+
+        try nextMillisecond();
+        const b = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer b.release();
+        _ = try b.append(&.{ .turn_started, piece, .turn_committed });
+
+        try nextMillisecond();
+        // Session a (opened first) gets a new message while both are open.
+        _ = try a.append(&.{ .turn_started, piece, .turn_committed });
+
+        var listed = try m.list(gpa, .{ .workspace = "/w" }, null, 10);
+        defer listed.deinit();
+        try testing.expectEqualStrings(a_id, listed.items[0].id);
+
+        const c_id = (try m.lastOpened(gpa, "/w", .app)).?;
+        defer gpa.free(c_id);
+        try testing.expectEqualStrings(a_id, c_id);
+    }
+
+    test "tool-only items do not bump activity time while messages and turns do" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        defer s.release();
+        _ = try s.append(&.{.turn_started});
+        var at_start = try m.list(gpa, .all, null, 10);
+        defer at_start.deinit();
+        const start_ms = at_start.items[0].updated_ms;
+
+        try nextMillisecond();
+        _ = try s.append(&.{.{ .item = .{ .type = "tool_call", .data = "{}" } }});
+        _ = try s.append(&.{.{ .item = .{ .type = "tool_result", .data = "{}" } }});
+        var after_tool = try m.list(gpa, .all, null, 10);
+        defer after_tool.deinit();
+        try testing.expectEqual(start_ms, after_tool.items[0].updated_ms);
+
+        try nextMillisecond();
+        _ = try s.append(&.{.{ .item = .{ .type = "steering", .data = "{\"text\":\"change course\"}" } }});
+        var after_steer = try m.list(gpa, .all, null, 10);
+        defer after_steer.deinit();
+        try testing.expect(after_steer.items[0].updated_ms > start_ms);
+    }
+
+    test "lockHolderPid returns the active writer pid and null once closed" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+
+        const expected: u32 = @intCast(std.c.getpid());
+        try testing.expectEqual(@as(?u32, expected), try m.lockHolderPid(id));
+        s.release();
+        try testing.expectEqual(@as(?u32, null), try m.lockHolderPid(id));
+
+        const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expectEqual(@as(?u32, expected), try m.lockHolderPid(id));
+        reopened.release();
+        try testing.expectEqual(@as(?u32, null), try m.lockHolderPid(id));
     }
 };
 

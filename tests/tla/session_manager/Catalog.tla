@@ -80,11 +80,12 @@ Purge(s) ==
     /\ dir' = [dir EXCEPT ![s] = "gone"]
     /\ UNCHANGED <<index, pending, everDeleted>>
 
-\* A resume, or a title, workspace or language change, rewrites the entry of
-\* a live session (D42). The session holds its writer lock throughout, and
-\* delete needs that lock (Busy), so no Trash lands inside it. Over an entry
-\* already put, a refresh changes no last op, so the spec leaves that case
-\* out; over a missing one, such as a publish put a crash forgot, it heals.
+\* A resume, turn/message activity, or a title, workspace or language change,
+\* rewrites the entry of a live session (D42). The session holds its writer lock
+\* throughout, and delete needs that lock (Busy), so no Trash lands inside it.
+\* Over an entry already put, a refresh changes no last op, so the spec leaves
+\* that case out; over a missing one, such as a publish put a crash forgot, it
+\* heals.
 Refresh(s) ==
     /\ dir[s] = "live"
     /\ LastOp(s) # "put"

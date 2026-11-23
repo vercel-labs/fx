@@ -18,6 +18,11 @@ pub const LoadState = enum {
     failed,
 };
 
+pub const PendingAction = enum {
+    opening,
+    forking,
+};
+
 pub const ResumeFailure = enum {
     open_elsewhere,
     being_updated,
@@ -27,6 +32,18 @@ pub const ResumeFailure = enum {
     connection_removed,
     unavailable,
 };
+
+pub fn classifyResumeFailure(err: anyerror) ResumeFailure {
+    return switch (err) {
+        error.SessionBusy => .open_elsewhere,
+        error.SessionAuthorityBoundaryUnavailable,
+        error.SessionCommitBoundaryUnavailable,
+        => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
+        else => .unavailable,
+    };
+}
 
 pub fn filteredCount(summaries: []const session_store.SessionSummary, query: []const u8) usize {
     return pickerFilter(summaries, null, query, .any).count();

@@ -271,10 +271,16 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   expect(sessionIds).toHaveLength(1);
   const lines = logLines(paths.home, sessionIds[0]!) as any[];
   const created = lines.find((line) => line.kind === "session_created");
+  const lastActivity = lines.findLast(
+    (line) =>
+      line.kind === "turn_committed" ||
+      line.kind === "turn_interrupted" ||
+      line.kind === "turn_started",
+  ) ?? lines[0];
   return {
     id: sessionIds[0]!,
     created_at_ms: lines[0].ts,
-    updated_at_ms: lines.at(-1).ts,
+    updated_at_ms: lastActivity.ts,
     workspace_root: created.workspace,
     origin_workspace_root: created.workspace,
     conversation_language: "en",

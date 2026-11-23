@@ -92,15 +92,7 @@ pub const file_picker_completion_cap = input_completion_runtime.file_picker_comp
 const ctrl_g_upgrade_byte: u8 = 7;
 
 fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
-    return switch (err) {
-        error.SessionBusy => .open_elsewhere,
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => .being_updated,
-        error.ConfiguredProviderChanged => .connection_changed,
-        error.ConfiguredProviderRemoved => .connection_removed,
-        else => .unavailable,
-    };
+    return session_catalog.classifyResumeFailure(err);
 }
 
 const ExplicitModelSelection = struct {
@@ -1038,6 +1030,8 @@ pub fn Runtime(comptime App: type) type {
             if (resolved == .cursor_left and try backMcpHostMenuScreen(app)) return .done;
             if (resolved == .cursor_right and try enterMcpHostMenuItem(app)) return .done;
 
+            if (routeSessionBusyPromptAction(app, agents.screenAgentOf(app), resolved)) return .done;
+
             if (try full_transcript_rt.routeComposerAction(app, agents.screenAgentOf(app), resolved)) return .done;
 
             if (composer_shortcut) |action| {
@@ -1248,6 +1242,7 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
+            if (try routeSessionBusyPromptByte(app, agent, byte)) return true;
             if (try routeForkQuestionByte(app, agent, byte)) return true;
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
@@ -1706,7 +1701,18 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitSessionPickerSelection(app: *App, agent: *AppAgent) !bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
-            if (!agent.session_persistence.session_picker.active) return false;
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.active) return false;
+            if (picker.actionPending()) return true;
+            if (picker.busyPromptActive()) {
+                const prompt = picker.busy_prompt.?;
+                if (prompt.error_message == null and prompt.selected_yes) {
+                    try startSessionPickerBusyFork(app, agent);
+                } else {
+                    _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                }
+                return true;
+            }
 
             if (app.loadMoreSessionPicker(agent) catch |err| {
                 const notice = try app.alloc.print(
@@ -1719,10 +1725,25 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }) return true;
 
-            if (agent.session_persistence.session_picker.selectedId() == null) return true;
+            if (picker.selectedId() == null) return true;
+
+            if (comptime @hasDecl(App, "startSessionPickerResume")) {
+                _ = app.startSessionPickerResume(agent) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "picker async start failed err={s}",
+                        .{@errorName(err)},
+                    );
+                    if (picker.active) {
+                        picker.selection_failure = classifyResumeFailure(err);
+                    }
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                };
+                return true;
+            }
 
             _ = app.resumeSelectedSession(agent) catch |err| {
-                const picker = &agent.session_persistence.session_picker;
                 debug_trace.logf(
                     "session",
                     "picker resume failed err={s} picker_active={s}",
@@ -1741,6 +1762,114 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             };
             return true;
+        }
+
+        fn startSessionPickerBusyFork(app: *App, agent: *AppAgent) !void {
+            if (comptime @hasDecl(App, "startSessionPickerBusyFork")) {
+                _ = app.startSessionPickerBusyFork(agent) catch |err| {
+                    debug_trace.logf("session", "picker busy fork start failed err={s}", .{@errorName(err)});
+                    if (agent.session_persistence.session_picker.busy_prompt) |*prompt| {
+                        try prompt.setError(app.alloc, "Unable to fork this session.");
+                    }
+                    app.shell.render_requests.request(.footer);
+                };
+            }
+        }
+
+        /// While the session picker is opening/forking or showing its busy-fork
+        /// modal, keys stay on that modal instead of leaking into the search
+        /// box behind it. Control bytes (Ctrl+C, Esc) still pass through.
+        fn routeSessionBusyPromptByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            const picker = &agent.session_persistence.session_picker;
+            if (picker.actionPending()) {
+                if (byte < 0x20 and byte != '\r' and byte != '\n' and byte != '\t' and byte != 8) return false;
+                if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "session_picker_pending");
+                return true;
+            }
+            if (!picker.busyPromptActive()) return false;
+            const has_error = picker.busy_prompt.?.error_message != null;
+            switch (byte) {
+                '1' => {
+                    if (has_error) {
+                        _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                    } else {
+                        try startSessionPickerBusyFork(app, agent);
+                    }
+                    return true;
+                },
+                '2' => {
+                    if (!has_error) {
+                        _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                    }
+                    return true;
+                },
+                'y', 'Y' => {
+                    if (!has_error) try startSessionPickerBusyFork(app, agent);
+                    return true;
+                },
+                'n', 'N' => {
+                    _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                    return true;
+                },
+                '\r', '\n' => {
+                    if (!has_error and picker.busy_prompt.?.selected_yes) {
+                        try startSessionPickerBusyFork(app, agent);
+                    } else {
+                        _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                    }
+                    return true;
+                },
+                '\t' => {
+                    if (!has_error) _ = app_session_runtime.Runtime(App).toggleSessionPickerBusyPrompt(app, agent);
+                    return true;
+                },
+                8, 127 => return true,
+                else => {
+                    if (byte < 0x20) return false;
+                    if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "session_busy_prompt");
+                    debug_trace.logf("input", "session busy prompt ignored byte=0x{x} reason=not_an_answer", .{byte});
+                    return true;
+                },
+            }
+        }
+
+        fn routeSessionBusyPromptAction(
+            app: *App,
+            agent: *AppAgent,
+            resolved: input_action.Action,
+        ) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            const picker = &agent.session_persistence.session_picker;
+            if (picker.actionPending()) {
+                return switch (resolved) {
+                    .mouse_wheel, .mouse_pointer => false,
+                    else => true,
+                };
+            }
+            if (!picker.busyPromptActive()) return false;
+            switch (resolved) {
+                .cursor_up, .history_up => {
+                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, true);
+                    return true;
+                },
+                .cursor_down, .history_down => {
+                    _ = app_session_runtime.Runtime(App).selectSessionPickerBusyPrompt(app, agent, false);
+                    return true;
+                },
+                .cursor_left, .cursor_right, .toggle_permission_mode => {
+                    _ = app_session_runtime.Runtime(App).toggleSessionPickerBusyPrompt(app, agent);
+                    return true;
+                },
+                .mouse_wheel, .mouse_pointer => return false,
+                else => return true,
+            }
+        }
+
+        fn cancelSessionBusyPromptOnEscape(app: *App, agent: *AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (app_session_runtime.Runtime(App).cancelSessionPickerPendingAction(app, agent)) return true;
+            return app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
         }
 
         /// Shows the instance the list has selected.
@@ -2280,7 +2409,8 @@ pub fn Runtime(comptime App: type) type {
         fn toggleSessionPickerScopeIfActive(app: *App, agent: *AppAgent) !bool {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
-            if (!agent.session_persistence.session_picker.active) return false;
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.active or picker.busyPromptActive() or picker.actionPending()) return false;
             return try app_session_runtime.Runtime(App).toggleSessionPickerScope(app, agent);
         }
 
@@ -3033,6 +3163,13 @@ pub fn Runtime(comptime App: type) type {
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
+            // Esc dismisses the session picker's busy-fork modal or cancels an
+            // in-flight open/fork, returning to the session list.
+            if (cancelSessionBusyPromptOnEscape(app, agent)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "session_busy_prompt");
                 return;
             }
             // Esc answers `/fork`'s question: fork without the subagents (D97).
@@ -3813,6 +3950,7 @@ const RoutingFakeApp = struct {
     affirmative_claim_count: usize = 0,
     affirmative_release_count: usize = 0,
     resume_selected_count: usize = 0,
+    busy_fork_starts: usize = 0,
     resume_selected_error: anyerror = error.SessionStoreUnavailable,
     resume_selected_closes_picker: bool = false,
     load_more_session_count: usize = 0,
@@ -4064,6 +4202,11 @@ const RoutingFakeApp = struct {
             self.agent().session_persistence.session_picker.active = false;
         }
         return self.resume_selected_error;
+    }
+
+    pub fn startSessionPickerBusyFork(self: *RoutingFakeApp, _: anytype) !bool {
+        self.busy_fork_starts += 1;
+        return true;
     }
 
     pub fn loadMoreSessionPicker(self: *RoutingFakeApp, _: anytype) !bool {
@@ -6281,6 +6424,43 @@ test "app_input_runtime Enter consumes an active session picker on target failur
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(session_catalog.ResumeFailure.unavailable, picker.selection_failure.?);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "unable to resume") == null);
+}
+
+test "app_input_runtime session busy fork modal handles y, n, arrows, Esc, and ignores stray typing" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const picker = &app.agent().session_persistence.session_picker;
+    picker.active = true;
+    picker.load_state = .ready;
+    try picker.openBusyPrompt(alloc, "busy-1", "Active session", 9876);
+
+    // Stray printable letters stay out of the search box behind the modal.
+    try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(picker.busyPromptActive());
+    try std.testing.expect(picker.busy_prompt.?.selected_yes);
+
+    // Tab and arrow keys toggle Yes/No cleanly.
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try std.testing.expect(!picker.busy_prompt.?.selected_yes);
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(&app, .cursor_left, null, null, null, false, 4096);
+    try std.testing.expect(picker.busy_prompt.?.selected_yes);
+
+    // Pressing y triggers the fork start.
+    try Runtime(RoutingFakeApp).handleByte(&app, 'y', 4096, 100);
+    try std.testing.expectEqual(@as(usize, 1), app.busy_fork_starts);
+
+    // Pressing n dismisses the modal back to the open session list.
+    try Runtime(RoutingFakeApp).handleByte(&app, 'n', 4096, 100);
+    try std.testing.expect(picker.active);
+    try std.testing.expect(!picker.busyPromptActive());
+
+    // Reopen modal and verify Esc returns to the list without closing the picker.
+    try picker.openBusyPrompt(alloc, "busy-1", "Active session", 9876);
+    try Runtime(RoutingFakeApp).resolveEscape(&app, (&app).agent(), true, 10);
+    try std.testing.expect(picker.active);
+    try std.testing.expect(!picker.busyPromptActive());
 }
 
 test "a resume refused for a changed or removed custom connection says which" {

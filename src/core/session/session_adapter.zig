@@ -417,6 +417,87 @@ pub const Store = struct {
         return store.manager.isBusy(id) catch true;
     }
 
+    /// The advisory PID of the process holding session `id`, or null when
+    /// free, unknown, or held by an older build.
+    pub fn lockHolderPid(store: *Store, id: []const u8) ?u32 {
+        return store.manager.lockHolderPid(id) catch null;
+    }
+
+    /// Completion timestamp of the child's newest completed assistant reply,
+    /// read backward from the end of its log without replaying earlier turns.
+    /// Returns 0 when no completed reply has a saved timestamp.
+    pub fn childLatestReplyAt(store: *Store, alloc: Allocator, child_id: []const u8) !i64 {
+        const src: Source = .{ .store = store, .id = child_id };
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var from: sm.From = .end;
+        var candidate_turn: ?u64 = null;
+        var candidate_completed_at_ms: i64 = 0;
+        var saw_turn_end = false;
+        while (true) {
+            var page = try store.manager.read(alloc, child_id, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_committed => |t| {
+                        candidate_turn = t.turn;
+                        candidate_completed_at_ms = 0;
+                        saw_turn_end = false;
+                    },
+                    .turn_started, .turn_interrupted => {
+                        candidate_turn = null;
+                        candidate_completed_at_ms = 0;
+                        saw_turn_end = false;
+                    },
+                    .item => |piece| {
+                        const turn = candidate_turn orelse continue;
+                        if (piece.turn != turn) continue;
+                        if (std.mem.eql(u8, piece.type, "turn_end")) {
+                            _ = scratch.reset(.retain_capacity);
+                            const TurnEnd = struct {
+                                turn_summary: ?struct { completed_at_ms: i64 = 0 } = null,
+                            };
+                            const data = src.pieceData(scratch.allocator(), piece) catch {
+                                candidate_turn = null;
+                                continue;
+                            };
+                            const parsed = json_decode.parseFromSliceLeaky(TurnEnd, scratch.allocator(), data, .{ .ignore_unknown_fields = true }) catch {
+                                candidate_turn = null;
+                                continue;
+                            };
+                            const completed = if (parsed.turn_summary) |summary| summary.completed_at_ms else 0;
+                            if (completed > 0) {
+                                candidate_completed_at_ms = completed;
+                                saw_turn_end = true;
+                            } else {
+                                candidate_turn = null;
+                            }
+                        } else if (saw_turn_end and std.mem.eql(u8, piece.type, "assistant")) {
+                            _ = scratch.reset(.retain_capacity);
+                            const Assistant = struct { text: []const u8 = "" };
+                            const data = src.pieceData(scratch.allocator(), piece) catch {
+                                candidate_turn = null;
+                                continue;
+                            };
+                            const parsed = json_decode.parseFromSliceLeaky(Assistant, scratch.allocator(), data, .{ .ignore_unknown_fields = true }) catch {
+                                candidate_turn = null;
+                                continue;
+                            };
+                            if (parsed.text.len > 0) return candidate_completed_at_ms;
+                            candidate_turn = null;
+                        } else if (saw_turn_end and (std.mem.eql(u8, piece.type, "tool_call") or std.mem.eql(u8, piece.type, "tool_result"))) {
+                            // A tool call/result after the last assistant text means this turn had no final reply.
+                            candidate_turn = null;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse return 0 };
+        }
+    }
+
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -1429,6 +1510,10 @@ pub const Restored = struct {
     title: ?[]u8 = null,
     created_at_ms: i64,
     updated_at_ms: i64 = 0,
+    /// True when `history` (ignoring any leading `.compacted_summary`) holds
+    /// the exact turns `visitHistorySinceCompaction` would replay, avoiding a
+    /// second disk pass on resume.
+    transcript_matches_history: bool = false,
 
     pub fn deinit(restored: *Restored, alloc: Allocator) void {
         types.freeHistoryTurnSlice(alloc, restored.history);
@@ -1443,6 +1528,7 @@ pub const Restored = struct {
 pub const Resumed = struct {
     state: session_codec.DurableSessionState,
     title: ?[]u8,
+    transcript_matches_history: bool = false,
 
     pub fn deinit(resumed: *Resumed, alloc: Allocator) void {
         resumed.state.deinit(alloc);
@@ -3660,6 +3746,43 @@ pub const Session = struct {
         return copy;
     }
 
+    /// Forks a saved session up to its last completed turn without locking or
+    /// writing the source, so a session currently running in another fx can be
+    /// forked safely. Caller owns the returned writable session.
+    pub fn forkLatest(
+        alloc: Allocator,
+        store: *Store,
+        source_id: []const u8,
+        workspace: []const u8,
+        host: Host,
+        title: ?[]const u8,
+    ) !*Session {
+        io_mod.e2eFailIfDurableMutationAttempted();
+        const handle = try store.manager.openFork(.{
+            .source = source_id,
+            .at = .last_good,
+            .workspace = workspace,
+            .host = host,
+        });
+        errdefer handle.release();
+        const copy = try init(alloc, store, handle, false);
+        errdefer copy.destroyInner();
+        try copy.openMoved();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const state = try handle.state(arena.allocator());
+        copy.last_turn = state.last_turn;
+        const source_title: ?[]const u8 = title orelse if (state.title) |raw|
+            json_decode.parseFromSliceLeaky([]const u8, arena.allocator(), raw, .{}) catch null
+        else
+            null;
+        if (source_title) |value| {
+            if (value.len > 0) try copy.rename(try forkTitle(arena.allocator(), value));
+        }
+        traceWiring("Fork", copy.id(), "", copy.store.pid);
+        return copy;
+    }
+
     /// The session as v1's `DurableSessionState`, for hosts that restore
     /// through it, and its stored title. Caller owns both.
     pub fn durableState(self: *Session, alloc: Allocator, workspace: []const u8) !Resumed {
@@ -5344,15 +5467,18 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     var from: sm.From = .start;
     var skip_offset: ?u64 = null;
     var covered: types.ContextHistoryCut = .{};
+    var compaction_in_turn = false;
+    var compaction_kept_turn = false;
     if (state.compaction_offset) |offset| {
         const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
         var page = try src.read(sa, .{ .at = cursor }, 1);
         defer page.deinit();
-        const data = compactedData(&page) orelse {
+        const line = compactedLine(&page) orelse {
             debug_trace.logf("session", "event=sessions_v2_compaction_unreadable session={s} offset={d}", .{ src.id, offset });
             return error.InvalidSessionFormat;
         };
-        const compacted = try json_decode.parseFromSliceLeaky(CompactedData, sa, data, .{});
+        compaction_in_turn = line.turn != null;
+        const compacted = try json_decode.parseFromSliceLeaky(CompactedData, sa, line.data, .{});
         try history.ensureUnusedCapacity(alloc, 1);
         if (numbers) |n| try n.list.append(n.alloc, null);
         history.appendAssumeCapacity(.{ .compacted_summary = .{
@@ -5364,7 +5490,10 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
         } });
         skip_offset = offset;
         from = .{ .at = cursor };
-        if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
+        if (compacted.keep_from_turn) |turn| {
+            compaction_kept_turn = true;
+            from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
+        }
         covered = .{ .tool_steps = compacted.keep_tool_steps, .steering = compacted.keep_steering };
     }
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
@@ -5375,6 +5504,10 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
             if (numbers) |n| n.trim.* = .{ .turn = n.list.items[1], .tool_steps = covered.tool_steps, .steering = covered.steering };
         }
     }
+    restored.transcript_matches_history = if (state.compaction_offset == null)
+        true
+    else
+        !compaction_in_turn and !compaction_kept_turn and covered.tool_steps == 0 and covered.steering == 0 and history.items.len > 1;
     restored.history = try history.toOwnedSlice(alloc);
     return restored;
 }
@@ -5504,6 +5637,7 @@ fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: [
             .permission_state = restored.permission_state orelse .{},
         },
         .title = restored.title,
+        .transcript_matches_history = restored.transcript_matches_history,
     };
     restored.history = &.{};
     restored.permission_state = null;
@@ -6318,11 +6452,11 @@ const Trim = struct {
 /// that line is damaged. Open reads only line 1, the newest snapshot and the
 /// tail, and every compaction is followed by a snapshot, so damage to its
 /// line shows only here.
-fn compactedData(page: *const sm.Page) ?[]const u8 {
+fn compactedLine(page: *const sm.Page) ?struct { turn: ?u64, data: []const u8 } {
     if (page.entries.len == 0) return null;
     const body = page.entries[0].body orelse return null;
     return switch (body) {
-        .compacted => |line| line.data,
+        .compacted => |line| .{ .turn = line.turn, .data = line.data },
         else => null,
     };
 }
@@ -14005,4 +14139,73 @@ test "only the adapter imports the session manager" {
         checked += 1;
     }
     try testing.expect(checked > 100);
+}
+
+test "forkLatest forks an actively open session without locking it and rejects unfinished turn 1" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+
+    // Session with only an open turn 1 cannot be forked yet.
+    const opening = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+    defer opening.close();
+    try opening.beginTurn();
+    try testing.expectError(
+        error.InvalidForkPoint,
+        Session.forkLatest(alloc, &t.store, opening.id(), "/w", .app, "still running"),
+    );
+
+    // Session with 2 completed turns held open by this process can be forked cleanly.
+    const live = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+    defer live.close();
+    try live.commitTurn(assistantTurn("first", "one"), types.ConversationLanguage.default());
+    try live.commitTurn(assistantTurn("second", "two"), types.ConversationLanguage.default());
+    try live.rename("Live task");
+
+    const expected_pid: u32 = @intCast(std.c.getpid());
+    try testing.expectEqual(@as(?u32, expected_pid), t.store.lockHolderPid(live.id()));
+
+    const forked = try Session.forkLatest(alloc, &t.store, live.id(), "/w", .app, "Live task");
+    defer forked.close();
+    try testing.expect(!std.mem.eql(u8, live.id(), forked.id()));
+
+    var resumed = try forked.durableState(alloc, "/w");
+    defer resumed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), resumed.state.history.len);
+    try testing.expect(resumed.transcript_matches_history);
+    try testing.expectEqualStrings("second", resumed.state.history[1].assistant.user.text);
+    try testing.expectEqualStrings("two", resumed.state.history[1].assistant.assistant);
+    try testing.expect(resumed.title != null);
+    try testing.expect(std.mem.find(u8, resumed.title.?, "Live task") != null);
+}
+
+test "childLatestReplyAt reads backward to the newest completed reply timestamp" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const s = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+    const id = try alloc.dupe(u8, s.id());
+    defer alloc.free(id);
+
+    var turn1 = assistantTurn("q1", "a1");
+    turn1.assistant.execution.turn_summary = .{ .completed_at_ms = 1111, .turn_duration_ms = 5 };
+    try s.commitTurn(turn1, types.ConversationLanguage.default());
+
+    var turn2 = assistantTurn("q2", "a2");
+    turn2.assistant.execution.turn_summary = .{ .completed_at_ms = 2222, .turn_duration_ms = 5 };
+    try s.commitTurn(turn2, types.ConversationLanguage.default());
+
+    // An interrupted turn after turn 2 must not erase turn 2's completed reply time.
+    try s.commitTurn(.{ .interrupted = .{
+        .user = .{ .text = @constCast("q3") },
+        .assistant = @constCast("partial"),
+        .terminal_reason = .cancelled,
+    } }, types.ConversationLanguage.default());
+    s.close();
+
+    try testing.expectEqual(@as(i64, 2222), try t.store.childLatestReplyAt(alloc, id));
 }

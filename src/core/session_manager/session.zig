@@ -207,6 +207,8 @@ pub const Session = struct {
     sync_mutex: std.Io.Mutex = .init,
 
     identity: Identity,
+    /// Host currently using this open session (created by or resumed by).
+    active_host: schema.Host,
     /// Under `mutex`.
     state: fold.State = .{},
     phase: Phase,
@@ -247,6 +249,10 @@ pub const Session = struct {
 
     pub fn id(session: *const Session) []const u8 {
         return session.identity.id;
+    }
+
+    pub fn activeHost(session: *const Session) schema.Host {
+        return session.active_host;
     }
 
     /// Whether this open session's log is on disk, so a resume finds it:
@@ -312,7 +318,10 @@ pub const Session = struct {
         defer session.mutex.unlock(io);
         var copy = try session.state.clone(gpa);
         copy.created_ms = session.created_ms orelse 0;
-        copy.updated_ms = session.updated_ms;
+        copy.updated_ms = if (session.state.last_activity_ms != 0)
+            @max(session.state.last_activity_ms, copy.created_ms)
+        else
+            session.updated_ms;
         return copy;
     }
 
@@ -333,7 +342,10 @@ pub const Session = struct {
         last_seq: u64,
         /// This call published the session (its first turn).
         published: bool,
-        /// The batch set the title or the workspace.
+        /// The batch holds a message or turn event that advances activity time
+        /// or turn count.
+        activity_changed: bool,
+        /// The batch set the title, workspace, or language.
         listing_changed: bool,
     };
 
@@ -356,6 +368,7 @@ pub const Session = struct {
                 .last_seq = last,
                 .published = was_held and session.phase == .live,
                 // Only a published session is in the index.
+                .activity_changed = session.phase == .live and hasActivity(events),
                 .listing_changed = session.phase == .live and changesListing(events),
             };
         };
@@ -453,10 +466,11 @@ pub const Session = struct {
             try fold.apply(gpa, &session.state, 0, .{
                 .seq = first + 1 + i,
                 .offset = session.bounds.items[first + i - 1],
+                .ts_ms = ts,
                 .body = body,
             });
         }
-        session.wrote(ts);
+        if (session.updated_ms == 0 or bodiesHaveActivity(bodies)) session.wrote(ts);
     }
 
     /// Import only (D59): writes every held line through the staged publish
@@ -527,6 +541,7 @@ pub const Session = struct {
             try fold.apply(gpa, &session.state, 0, .{
                 .seq = first_batch_seq + i,
                 .offset = session.bounds.items[line_index - 1],
+                .ts_ms = ts,
                 .body = body,
             });
         }
@@ -571,6 +586,7 @@ pub const Session = struct {
         const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeFile(lock);
         if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
+        s.writeLockPid(lock);
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         if (!rename_first) try session.publishRename(tmp);
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
@@ -743,9 +759,11 @@ pub const Session = struct {
         const fork_seq = session.identity.forkSeq();
         for (bodies, 0..) |body, i| {
             const offset = base + if (i == 0) 0 else session.bounds.items[i - 1];
-            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .body = body });
+            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .ts_ms = ts, .body = body });
         }
-        session.wrote(ts);
+        if (cause == .host and (session.updated_ms == 0 or bodiesHaveActivity(bodies))) {
+            session.wrote(ts);
+        }
         session.written_seq.store(session.env.s.io, session.state.last_seq);
     }
 
@@ -835,7 +853,7 @@ pub const Session = struct {
     fn frameFolded(session: *Session, seq: u64, ts: u64, body: schema.Body, fork_seq: u64) AppendError!void {
         const start = session.batch.items.len;
         try session.frameMarked(seq, ts, body);
-        try fold.apply(session.env.gpa, &session.state, fork_seq, .{ .seq = seq, .offset = start, .body = body });
+        try fold.apply(session.env.gpa, &session.state, fork_seq, .{ .seq = seq, .offset = start, .ts_ms = ts, .body = body });
     }
 
     /// Returns once every line through `seq` is synced. Runs outside
@@ -1086,6 +1104,20 @@ fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []c
     s.sync(to) catch |io_err| return storage.ioFault(io_err);
 }
 
+fn hasActivity(events: []const fold.Event) bool {
+    for (events) |event| {
+        if (fold.isActivityEvent(event)) return true;
+    }
+    return false;
+}
+
+fn bodiesHaveActivity(bodies: []const schema.Body) bool {
+    for (bodies) |body| {
+        if (fold.isActivityBody(body)) return true;
+    }
+    return false;
+}
+
 fn changesListing(events: []const fold.Event) bool {
     for (events) |event| switch (event) {
         .set => |s| if (s.key == .title or s.key == .workspace or s.key == .language) return true,
@@ -1154,7 +1186,7 @@ pub fn openNew(env: *const Env, options: NewOptions) error{OutOfMemory}!*Session
     });
     errdefer identity.deinit(gpa);
     const session = try gpa.create(Session);
-    session.* = .{ .env = env, .identity = identity, .phase = .held, .created_ms = options.created_ms, .import = options.import };
+    session.* = .{ .env = env, .identity = identity, .active_host = options.host, .phase = .held, .created_ms = options.created_ms, .import = options.import };
     session.observe(.opened_new);
     return session;
 }
@@ -1184,6 +1216,7 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
     session.* = .{
         .env = env,
         .identity = parts.loaded.identity,
+        .active_host = options.host,
         .state = parts.loaded.state,
         .phase = .{ .live = .{ .dir = parts.dir, .log = parts.log, .lock = parts.lock } },
         .snapshot_base = parts.loaded.snapshot_end,
@@ -1232,7 +1265,10 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         else => |io_err| storage.ioFault(io_err),
     };
     errdefer s.closeFile(lock);
-    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    if (!env.isPlanted(.skip_flock)) {
+        try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+        s.writeLockPid(lock);
+    }
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1359,7 +1395,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         from = snap.end;
         expected = snap.seq + 1;
     }
-    var updated_ms = if (snapshot) |snap| snap.ts_ms else line1.header.ts_ms;
+    var fallback_updated_ms = if (snapshot) |snap| snap.ts_ms else line1.header.ts_ms;
     const created_ms = line1.header.ts_ms;
     var tail = log_mod.ForwardReader.init(gpa, env.s, file, from, end, expected);
     defer tail.deinit();
@@ -1370,22 +1406,23 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         return mapRead(err);
     }) |line| {
         _ = line_arena.reset(.retain_capacity);
-        updated_ms = line.header.ts_ms;
+        if (line.header.kind != .closed) fallback_updated_ms = line.header.ts_ms;
         const kind = line.header.kind orelse {
             state.last_seq = line.header.seq; // unknown kinds are skipped
             state.clean_exit = false;
             continue;
         };
         const body = schema.parseBody(line_arena.allocator(), kind, line.body()) catch return error.Corrupt;
-        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
+        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .ts_ms = line.header.ts_ms, .body = body });
     }
+    const effective_updated = if (state.last_activity_ms != 0) state.last_activity_ms else fallback_updated_ms;
     return .{
         .identity = identity,
         .state = state,
         .snapshot_end = if (snapshot) |snap| snap.end else 0,
         .created_ms = created_ms,
         // A fork's copied lines keep the source's older times (D20).
-        .updated_ms = @max(updated_ms, created_ms),
+        .updated_ms = @max(effective_updated, created_ms),
     };
 }
 
@@ -2196,7 +2233,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
         const header = log_mod.checkLine(line) catch |io_err| return storage.ioFault(io_err);
         if (header.kind) |kind| {
             const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
-            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });
+            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .ts_ms = header.ts_ms, .body = body });
             if (kind == .snapshot) session.snapshot_base = session.batch.items.len;
         } else {
             session.state.last_seq = header.seq;
@@ -2287,6 +2324,25 @@ pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
     if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return true;
     s.unlock(lock);
     return false;
+}
+
+/// The advisory PID holding `id_`'s writer lock, or null when the session is
+/// not locked or the holder did not record a valid PID.
+pub fn lockHolderPid(env: *const Env, id_: []const u8) DeleteError!?u32 {
+    const s = env.s;
+    if (!schema.validId(id_)) return error.NotFound;
+    const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
+    defer s.closeDir(dir);
+    const lock = s.openFile(dir, "lock", .read_write) catch |err| return switch (err) {
+        error.NotFound => null,
+        else => |io_err| storage.ioFault(io_err),
+    };
+    defer s.closeFile(lock);
+    if (s.tryLock(lock) catch |io_err| return storage.ioFault(io_err)) {
+        s.unlock(lock);
+        return null;
+    }
+    return s.readLockPid(lock);
 }
 
 /// The distinct child ids named by `child_spawned` lines.
@@ -2474,13 +2530,18 @@ pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) O
                 defer decoded.deinit(gpa);
                 decoded.last_seq = state.last_seq;
                 decoded.clean_exit = state.clean_exit;
+                // Snapshots from older builds omit `activity`; accept them
+                // during verify while still checking snapshots that wrote it.
+                if (decoded.last_activity_ms == 0 and std.mem.find(u8, snap.state, "\"activity\":") == null) {
+                    decoded.last_activity_ms = state.last_activity_ms;
+                }
                 // A snapshot copied from a fork's source carries its children.
                 if (line.header.seq <= fork_seq) decoded.clearChildren(gpa);
                 if (!decoded.eql(&state)) result.bad_snapshots += 1;
             },
             else => {},
         }
-        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
+        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .ts_ms = line.header.ts_ms, .body = body });
     }
     return result;
 }
@@ -2771,7 +2832,7 @@ const session_tests = struct {
                 state.clean_exit = false;
                 continue;
             }
-            try fold.apply(gpa, &state, 0, .{ .seq = entry.seq, .offset = entry.offset, .body = body });
+            try fold.apply(gpa, &state, 0, .{ .seq = entry.seq, .offset = entry.offset, .ts_ms = entry.ts_ms, .body = body });
         }
         return state;
     }

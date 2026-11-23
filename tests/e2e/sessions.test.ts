@@ -1834,7 +1834,6 @@ test.skipIf(!tmuxAvailable())("the picker lists v2 sessions, /rename sticks, and
 test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as busy at once, and opens it once the owner quits", async () => {
   const fixture = createFixture("fx-v2-app-picker-busy-");
   const gateway = replyToLatest([["Hold this session open.", "PICKER_BUSY_SAVED"]]);
-  const busy = "This session is open in another fx. Close it there, then press enter to retry.";
   let contender: TmuxSession | null = null;
   try {
     const owner = await startApp(fixture, gateway, []);
@@ -1854,9 +1853,16 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
     // v1's picker takes no lock wait, and neither does v2's (D38).
     const pressed = Date.now();
     await contender.sendKeys("Enter");
-    await contender.waitForPane((pane) => pane.includes(busy), 1_000);
+    await contender.waitForPane(
+      (pane) => /This session is running in pid \d+/.test(pane) && pane.includes("1) Fork and continue here"),
+      1_000,
+    );
     expect(Date.now() - pressed).toBeLessThan(1_000);
     expect(owner.session.isPaneAlive()).toBe(true);
+
+    // Dismiss the fork modal back to the session list, then retry after the owner quits.
+    await contender.sendKeys("n");
+    await contender.waitForPane((pane) => pane.includes("Hold this session open.") && pane.includes("enter resume"), TIMEOUT);
 
     await quitApp(owner);
     await contender.sendKeys("Enter");

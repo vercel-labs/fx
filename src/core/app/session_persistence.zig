@@ -53,6 +53,31 @@ const PickerContinuation = struct {
 };
 
 pub const SessionPickerScope = session_catalog.Scope;
+pub const SessionPickerAction = session_catalog.PendingAction;
+
+pub const SessionPickerBusyPrompt = struct {
+    session_id: []u8,
+    title: []u8,
+    workspace_label: []u8,
+    turn_count: usize = 0,
+    pid: ?u32 = null,
+    selected_yes: bool = true,
+    error_message: ?[]u8 = null,
+
+    pub fn deinit(self: *SessionPickerBusyPrompt, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        alloc.free(self.title);
+        alloc.free(self.workspace_label);
+        if (self.error_message) |message| alloc.free(message);
+        self.* = undefined;
+    }
+
+    pub fn setError(self: *SessionPickerBusyPrompt, alloc: Allocator, message: []const u8) !void {
+        const owned = try alloc.dupe(u8, message);
+        if (self.error_message) |old| alloc.free(old);
+        self.error_message = owned;
+    }
+};
 
 pub const ResumeHandoffIntent = enum {
     none,
@@ -74,11 +99,14 @@ pub const SessionPicker = struct {
     query_buf: [256]u8 = undefined,
     query_len: usize = 0,
     selection_failure: ?session_catalog.ResumeFailure = null,
+    pending_action: ?SessionPickerAction = null,
+    busy_prompt: ?SessionPickerBusyPrompt = null,
 
     pub fn deinit(self: *SessionPicker, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
         if (self.continuation) |*continuation| continuation.deinit(alloc);
+        if (self.busy_prompt) |*prompt| prompt.deinit(alloc);
         self.* = .{};
     }
 
@@ -94,10 +122,14 @@ pub const SessionPicker = struct {
         try self.summaries.append(alloc, summary);
     }
 
-    pub fn selectedId(self: *const SessionPicker) ?[]const u8 {
+    pub fn selectedSummary(self: *const SessionPicker) ?*const session_store.SessionSummary {
         if (!self.active or self.load_state != .ready) return null;
         if (self.selected >= self.filteredItemCount()) return null;
-        const summary = session_catalog.summaryAt(self.summaries.items, self.query(), self.selected) orelse return null;
+        return session_catalog.summaryAt(self.summaries.items, self.query(), self.selected);
+    }
+
+    pub fn selectedId(self: *const SessionPicker) ?[]const u8 {
+        const summary = self.selectedSummary() orelse return null;
         return summary.id;
     }
 
@@ -105,11 +137,73 @@ pub const SessionPicker = struct {
         return self.active and self.load_state == .loading;
     }
 
+    pub fn busyPromptActive(self: *const SessionPicker) bool {
+        return self.active and self.busy_prompt != null;
+    }
+
+    pub fn actionPending(self: *const SessionPicker) bool {
+        return self.active and self.pending_action != null;
+    }
+
+    pub fn openBusyPrompt(
+        self: *SessionPicker,
+        alloc: Allocator,
+        session_id: []const u8,
+        title: []const u8,
+        pid: ?u32,
+    ) !void {
+        var workspace_label: []const u8 = "";
+        var turn_count: usize = 0;
+        for (self.summaries.items) |summary| {
+            if (std.mem.eql(u8, summary.id, session_id)) {
+                workspace_label = std.Io.Dir.path.basename(session_catalog.workspacePath(summary));
+                turn_count = summary.history_len;
+                break;
+            }
+        }
+        const owned_id = try alloc.dupe(u8, session_id);
+        errdefer alloc.free(owned_id);
+        const owned_title = try alloc.dupe(u8, title);
+        errdefer alloc.free(owned_title);
+        const owned_workspace = try alloc.dupe(u8, workspace_label);
+        errdefer alloc.free(owned_workspace);
+        self.closeBusyPrompt(alloc);
+        self.selection_failure = null;
+        self.busy_prompt = .{
+            .session_id = owned_id,
+            .title = owned_title,
+            .workspace_label = owned_workspace,
+            .turn_count = turn_count,
+            .pid = pid,
+            .selected_yes = true,
+        };
+    }
+
+    pub fn closeBusyPrompt(self: *SessionPicker, alloc: Allocator) void {
+        if (self.busy_prompt) |*prompt| prompt.deinit(alloc);
+        self.busy_prompt = null;
+    }
+
+    pub fn toggleBusyPromptChoice(self: *SessionPicker) void {
+        if (self.busy_prompt) |*prompt| {
+            if (prompt.error_message != null) return;
+            prompt.selected_yes = !prompt.selected_yes;
+        }
+    }
+
+    pub fn selectBusyPromptChoice(self: *SessionPicker, yes: bool) void {
+        if (self.busy_prompt) |*prompt| {
+            if (prompt.error_message != null) return;
+            prompt.selected_yes = yes;
+        }
+    }
+
     pub fn query(self: *const SessionPicker) []const u8 {
         return self.query_buf[0..self.query_len];
     }
 
     pub fn setQuery(self: *SessionPicker, query_text: []const u8) void {
+        if (self.busy_prompt != null or self.pending_action != null) return;
         const len = @min(query_text.len, self.query_buf.len);
         if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
@@ -133,6 +227,7 @@ pub const SessionPicker = struct {
 
     pub fn moveVisibleItems(self: *SessionPicker, delta: i32, visible_items: u16) bool {
         if (!self.active or self.load_state != .ready) return false;
+        if (self.busy_prompt != null or self.pending_action != null) return true;
         self.selection_failure = null;
         const count = self.navigationItemCount();
         if (count == 0) return true;
@@ -626,6 +721,226 @@ pub const SessionPickerLoad = struct {
     }
 };
 
+/// Runs session open/fork and durable state decoding off the UI thread so
+/// selecting a session in `fx -r` or `/resume` paints a working state at once
+/// (`RULES.md` R2.1).
+pub const SessionPickerResume = struct {
+    pub const Request = struct {
+        action: SessionPickerAction,
+        session_id: []u8,
+        title: []u8,
+        workspace_root: []u8,
+
+        pub fn init(
+            action: SessionPickerAction,
+            session_id: []const u8,
+            title: []const u8,
+            workspace_root: []const u8,
+        ) !Request {
+            const alloc = std.heap.c_allocator;
+            const id = try alloc.dupe(u8, session_id);
+            errdefer alloc.free(id);
+            const title_copy = try alloc.dupe(u8, title);
+            errdefer alloc.free(title_copy);
+            const workspace = try alloc.dupe(u8, workspace_root);
+            return .{
+                .action = action,
+                .session_id = id,
+                .title = title_copy,
+                .workspace_root = workspace,
+            };
+        }
+
+        pub fn deinit(self: *Request) void {
+            const alloc = std.heap.c_allocator;
+            alloc.free(self.session_id);
+            alloc.free(self.title);
+            alloc.free(self.workspace_root);
+            self.* = undefined;
+        }
+    };
+
+    pub const Prepared = struct {
+        v2: *session_adapter.Session,
+        resumed: session_adapter.Resumed,
+        forked_from: ?[]u8 = null,
+
+        pub fn deinit(self: *Prepared) void {
+            const alloc = std.heap.c_allocator;
+            self.v2.close();
+            self.resumed.deinit(alloc);
+            if (self.forked_from) |id| alloc.free(id);
+            self.* = undefined;
+        }
+    };
+
+    pub const Outcome = union(enum) {
+        none,
+        cancelled,
+        busy: struct { pid: ?u32 },
+        ready: Prepared,
+        failed: anyerror,
+    };
+
+    pub const Task = struct {
+        thread: ?std.Thread = null,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        abandoned: bool = false,
+        request: Request,
+        /// Shared with Persistence, which joins this thread before freeing store.
+        store: *session_adapter.Store,
+        outcome: Outcome = .none,
+
+        pub fn requestStop(self: *Task) void {
+            self.cancel_requested.store(true, .release);
+        }
+
+        pub fn deinit(self: *Task) void {
+            self.requestStop();
+            if (self.thread) |thread| thread.join();
+            switch (self.outcome) {
+                .ready => |*prepared| prepared.deinit(),
+                else => {},
+            }
+            self.request.deinit();
+            std.heap.c_allocator.destroy(self);
+        }
+    };
+
+    task: ?*Task = null,
+
+    pub fn busy(self: *const SessionPickerResume) bool {
+        return self.task != null;
+    }
+
+    pub fn start(
+        self: *SessionPickerResume,
+        store: *session_adapter.Store,
+        request: Request,
+    ) !void {
+        if (self.task != null) return error.SessionPickerResumeBusy;
+        const alloc = std.heap.c_allocator;
+        var owned = request;
+        const task = alloc.create(Task) catch |err| {
+            owned.deinit();
+            return err;
+        };
+        task.* = .{ .request = owned, .store = store };
+        if (comptime builtin.single_threaded or host_target.is_wasm) {
+            threadMain(task);
+        } else {
+            task.thread = std.Thread.spawn(.{}, threadMain, .{task}) catch |err| {
+                task.request.deinit();
+                alloc.destroy(task);
+                return err;
+            };
+        }
+        self.task = task;
+    }
+
+    pub fn cancel(self: *SessionPickerResume) void {
+        if (self.task) |task| {
+            task.abandoned = true;
+            task.requestStop();
+        }
+    }
+
+    pub fn takeCompleted(self: *SessionPickerResume) ?*Task {
+        const task = self.task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        self.task = null;
+        return task;
+    }
+
+    pub fn deinit(self: *SessionPickerResume) void {
+        if (self.task) |task| {
+            self.task = null;
+            task.deinit();
+        }
+        self.* = .{};
+    }
+
+    fn threadMain(task: *Task) void {
+        defer task.done.store(true, .release);
+        const alloc = std.heap.c_allocator;
+        const started = io_mod.nanoTimestamp();
+        if (task.cancel_requested.load(.acquire)) {
+            task.outcome = .cancelled;
+            return;
+        }
+        const v2 = switch (task.request.action) {
+            .opening => session_adapter.Session.resumeSessionWithoutWaiting(
+                alloc,
+                task.store,
+                .{ .id = task.request.session_id },
+                task.request.workspace_root,
+                .app,
+            ) catch |err| {
+                if (err == error.SessionBusy) {
+                    const pid = task.store.lockHolderPid(task.request.session_id);
+                    debug_trace.logf("session", "picker open busy session={s} pid={?d}", .{ task.request.session_id, pid });
+                    task.outcome = .{ .busy = .{ .pid = pid } };
+                    return;
+                }
+                task.outcome = .{ .failed = err };
+                return;
+            },
+            .forking => session_adapter.Session.forkLatest(
+                alloc,
+                task.store,
+                task.request.session_id,
+                task.request.workspace_root,
+                .app,
+                if (task.request.title.len > 0) task.request.title else null,
+            ) catch |err| {
+                task.outcome = .{ .failed = err };
+                return;
+            },
+        };
+        var v2_owned = true;
+        defer if (v2_owned) v2.close();
+        if (task.cancel_requested.load(.acquire)) {
+            task.outcome = .cancelled;
+            return;
+        }
+        var resumed = v2.durableState(alloc, task.request.workspace_root) catch |err| {
+            task.outcome = .{ .failed = err };
+            return;
+        };
+        var resumed_owned = true;
+        defer if (resumed_owned) resumed.deinit(alloc);
+        if (task.cancel_requested.load(.acquire)) {
+            task.outcome = .cancelled;
+            return;
+        }
+        const forked_from: ?[]u8 = if (task.request.action == .forking)
+            alloc.dupe(u8, task.request.session_id) catch |err| {
+                task.outcome = .{ .failed = err };
+                return;
+            }
+        else
+            null;
+        v2_owned = false;
+        resumed_owned = false;
+        debug_trace.logf(
+            "session",
+            "picker prepare ready action={s} session={s} turns={d} elapsed_us={d}",
+            .{
+                @tagName(task.request.action),
+                v2.id(),
+                resumed.state.history.len,
+                @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us),
+            },
+        );
+        task.outcome = .{ .ready = .{
+            .v2 = v2,
+            .resumed = resumed,
+            .forked_from = forked_from,
+        } };
+    }
+};
+
 pub const TitleGenerationLoad = struct {
     task: ?*session_title_generation.Task = null,
     last: LastResult = .{},
@@ -1057,6 +1372,7 @@ pub const Persistence = struct {
     process_ultrafast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
+    session_picker_resume: SessionPickerResume = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
     fork_menu: ForkMenu = .{},
     /// How many subagent tasks the last switch stopped, for its notice in
@@ -1090,7 +1406,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 36) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 37) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1114,6 +1430,7 @@ pub const Persistence = struct {
         storage.process_ultrafast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
+        storage.session_picker_resume = .{};
         storage.session_picker_cache = .{};
         storage.fork_menu = .{};
         storage.switch_stopped_tasks = 0;
@@ -1196,6 +1513,7 @@ pub const Persistence = struct {
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
+        self.session_picker_resume.deinit();
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();

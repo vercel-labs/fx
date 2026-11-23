@@ -85,9 +85,12 @@ pub const State = struct {
     /// The last line is `closed`.
     clean_exit: bool = false,
     last_seq: u64 = 0,
-    /// `ts` of line 1 and of the newest line; 0 before the first turn
+    /// `ts` of the newest message or turn event; 0 before the first turn or in
+    /// older snapshots written before this field existed.
+    last_activity_ms: u64 = 0,
+    /// `ts` of line 1 and of the newest activity; 0 before the first turn
     /// (D20). The session fills both in the copies it hands out, from the
-    /// log it reads and writes; the fold and snapshots leave them alone.
+    /// log it reads and writes; snapshots serialize `last_activity_ms`.
     created_ms: u64 = 0,
     updated_ms: u64 = 0,
 
@@ -194,11 +197,36 @@ pub const State = struct {
         return a.last_compaction_seq == b.last_compaction_seq and
             a.compaction_offset == b.compaction_offset and
             a.clean_exit == b.clean_exit and
-            a.last_seq == b.last_seq;
+            a.last_seq == b.last_seq and
+            a.last_activity_ms == b.last_activity_ms;
     }
 };
 
 const setting_fields = .{ "prefs", "title", "permissions", "usage", "workspace", "language", "client_prompt", "tool_identities", "moved_files", "compaction_records", "v1_source" };
+
+pub fn isMessageItemType(item_type: []const u8) bool {
+    return std.mem.eql(u8, item_type, "user") or
+        std.mem.eql(u8, item_type, "steering") or
+        std.mem.eql(u8, item_type, "assistant");
+}
+
+pub fn isActivityBody(body: schema.Body) bool {
+    return switch (body) {
+        .turn_started, .turn_committed => true,
+        .turn_interrupted => |i| i.reason != .crash and i.reason != .closed,
+        .item => |piece| isMessageItemType(piece.type),
+        else => false,
+    };
+}
+
+pub fn isActivityEvent(event: Event) bool {
+    return switch (event) {
+        .turn_started, .turn_committed => true,
+        .turn_interrupted => |reason| reason != .crash and reason != .closed,
+        .item => |piece| isMessageItemType(piece.type),
+        else => false,
+    };
+}
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -216,6 +244,7 @@ pub const Line = struct {
     seq: u64,
     /// Byte offset of the line in the log.
     offset: u64,
+    ts_ms: u64 = 0,
     body: schema.Body,
 };
 
@@ -250,6 +279,9 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         },
         .child_spawned => |c| if (line.seq > fork_seq) try state.spawnChild(gpa, line.seq, c),
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
+    }
+    if (line.ts_ms != 0 and isActivityBody(line.body)) {
+        state.last_activity_ms = @max(state.last_activity_ms, line.ts_ms);
     }
     state.last_seq = line.seq;
     state.clean_exit = line.body == .closed;
@@ -381,6 +413,9 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
     try printOptional(gpa, out, state.last_compaction_seq);
     try out.appendSlice(gpa, ",\"compaction_offset\":");
     try printOptional(gpa, out, state.compaction_offset);
+    if (state.last_activity_ms != 0) {
+        try out.print(gpa, ",\"activity\":{d}", .{state.last_activity_ms});
+    }
     try out.append(gpa, '}');
 }
 
@@ -405,6 +440,7 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
         .last_interrupted = try f.opt(Interruption, "last_interrupted"),
         .last_compaction_seq = try f.opt(u64, "last_compaction_seq"),
         .compaction_offset = try f.opt(u64, "compaction_offset"),
+        .last_activity_ms = (try f.opt(u64, "activity")) orelse 0,
     };
     errdefer state.deinit(gpa);
     inline for (setting_fields) |name| {
@@ -453,7 +489,7 @@ const MemLog = struct {
 
     fn add(m: *MemLog, body: schema.Body) !void {
         const seq = m.lines.items.len + 1;
-        try m.lines.append(m.arena.allocator(), .{ .seq = seq, .offset = seq * 100, .body = body });
+        try m.lines.append(m.arena.allocator(), .{ .seq = seq, .offset = seq * 100, .ts_ms = seq * 10, .body = body });
     }
 
     fn fullFold(m: *const MemLog, skip_snapshots: bool) !State {
@@ -698,4 +734,16 @@ test "snapshot state round trips" {
     try testing.expect(decoded.eql(&state));
     try testing.expectEqualStrings("null", decoded.usage.?);
     try testing.expectEqual(@as(?[]u8, null), decoded.prefs);
+}
+
+test "snapshot decode stays compatible with snapshots that omit activity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const legacy =
+        \\{"open_turn":null,"last_turn":2,"committed":2,"interrupted":0,"last_interrupted":null,"children":[],"last_compaction_seq":null,"compaction_offset":null}
+    ;
+    var decoded = try decodeState(testing.allocator, arena.allocator(), legacy);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 2), decoded.committed);
+    try testing.expectEqual(@as(u64, 0), decoded.last_activity_ms);
 }

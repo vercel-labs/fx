@@ -1382,7 +1382,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, agent, loaded.state, &display, notice) catch |err| {
+            hydrateResumedSession(app, agent, loaded.state, &display, notice, true) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app, agent);
                 return;
@@ -1457,6 +1457,93 @@ pub fn Runtime(comptime App: type) type {
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
             startPendingResume(app, agent);
+            return true;
+        }
+
+        /// Starts opening the selected picker session off the UI thread so the
+        /// terminal immediately shows a working state (`RULES.md` R2.1).
+        pub fn startSessionPickerResume(app: *App, agent: *AppAgent) !bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.active or picker.load_state != .ready) return false;
+            if (picker.actionPending() or picker.busyPromptActive()) return true;
+            const summary = picker.selectedSummary() orelse return false;
+            const v2_store = agent.session_persistence.v2_store orelse return false;
+            const title = session_catalog.displayTitle(summary.*);
+            const request = try session_persistence.SessionPickerResume.Request.init(
+                .opening,
+                summary.id,
+                title,
+                app.workspace_root,
+            );
+            picker.selection_failure = null;
+            picker.pending_action = .opening;
+            agent.session_persistence.session_picker_resume.start(v2_store, request) catch |err| {
+                picker.pending_action = null;
+                return err;
+            };
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        /// Starts forking the busy session named by the picker's modal off the
+        /// UI thread without locking or changing the running source session.
+        pub fn startSessionPickerBusyFork(app: *App, agent: *AppAgent) !bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.busyPromptActive()) return false;
+            if (picker.actionPending()) return true;
+            const prompt = &picker.busy_prompt.?;
+            const v2_store = agent.session_persistence.v2_store orelse return false;
+            const request = try session_persistence.SessionPickerResume.Request.init(
+                .forking,
+                prompt.session_id,
+                prompt.title,
+                app.workspace_root,
+            );
+            if (prompt.error_message) |old| {
+                app.alloc.free(old);
+                prompt.error_message = null;
+            }
+            picker.pending_action = .forking;
+            agent.session_persistence.session_picker_resume.start(v2_store, request) catch |err| {
+                picker.pending_action = null;
+                return err;
+            };
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn dismissSessionPickerBusyPrompt(app: *App, agent: *AppAgent) bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.busyPromptActive()) return false;
+            agent.session_persistence.session_picker_resume.cancel();
+            picker.pending_action = null;
+            picker.closeBusyPrompt(app.alloc);
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn cancelSessionPickerPendingAction(app: *App, agent: *AppAgent) bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.actionPending()) return false;
+            agent.session_persistence.session_picker_resume.cancel();
+            picker.pending_action = null;
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn toggleSessionPickerBusyPrompt(app: *App, agent: *AppAgent) bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.busyPromptActive() or picker.actionPending()) return false;
+            picker.toggleBusyPromptChoice();
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn selectSessionPickerBusyPrompt(app: *App, agent: *AppAgent, yes: bool) bool {
+            const picker = &agent.session_persistence.session_picker;
+            if (!picker.busyPromptActive() or picker.actionPending()) return false;
+            picker.selectBusyPromptChoice(yes);
+            if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
             return true;
         }
 
@@ -1566,8 +1653,25 @@ pub fn Runtime(comptime App: type) type {
         fn installResumedV2Session(app: *App, agent: *AppAgent, v2: *session_adapter.Session, notice: ResumeNotice) !void {
             var v2_owned = true;
             errdefer if (v2_owned) v2.close();
-            var resumed = try v2.durableState(app.alloc, app.workspace_root);
-            defer resumed.deinit(app.alloc);
+            const resumed = try v2.durableState(app.alloc, app.workspace_root);
+            v2_owned = false;
+            try installPreparedV2Session(app, agent, v2, resumed, app.alloc, notice);
+        }
+
+        /// Installs an already-opened session and its already-decoded state
+        /// (taking ownership of `v2` and freeing `resumed` with `resumed_alloc`).
+        fn installPreparedV2Session(
+            app: *App,
+            agent: *AppAgent,
+            v2: *session_adapter.Session,
+            prepared_resumed: session_adapter.Resumed,
+            resumed_alloc: Allocator,
+            notice: ResumeNotice,
+        ) !void {
+            var v2_owned = true;
+            errdefer if (v2_owned) v2.close();
+            var resumed = prepared_resumed;
+            defer resumed.deinit(resumed_alloc);
             var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|
                 .{ .present = true, .title = try app.alloc.dupe(u8, title) }
             else
@@ -1581,7 +1685,7 @@ pub fn Runtime(comptime App: type) type {
             // Before the replay: the resume projection copies the window's
             // retention, so the whole newest cycle comes back.
             syncTranscriptWindowSaveMode(app, agent);
-            try hydrateResumedSession(app, agent, resumed.state, &display, notice);
+            try hydrateResumedSession(app, agent, resumed.state, &display, notice, resumed.transcript_matches_history);
             enableSessionStores(app, agent);
             syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
@@ -1723,6 +1827,7 @@ pub fn Runtime(comptime App: type) type {
             loaded_state: session_codec.DurableSessionState,
             display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
+            transcript_matches_history: bool,
         ) !void {
             const state = loaded_state;
             const previous_provider = provider_runtime.providerOf(app, agent);
@@ -1759,7 +1864,7 @@ pub fn Runtime(comptime App: type) type {
                     .projection = &projection,
                     .labels = &historical_labels,
                 };
-                const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
+                const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels, transcript_matches_history);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1777,7 +1882,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
+                _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels, transcript_matches_history);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -1908,6 +2013,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn pollSessionPicker(app: *App, agent: *AppAgent) !void {
+            try pollSessionPickerResume(app, agent);
             const loader = &agent.session_persistence.session_picker_load;
             const task = loader.takeCompleted() orelse return;
             var task_owned = true;
@@ -2055,11 +2161,119 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        fn pollSessionPickerResume(app: *App, agent: *AppAgent) !void {
+            const task = agent.session_persistence.session_picker_resume.takeCompleted() orelse return;
+            defer task.deinit();
+
+            const picker = &agent.session_persistence.session_picker;
+            if (task.abandoned or !picker.active) return;
+
+            picker.pending_action = null;
+            switch (task.outcome) {
+                .none, .cancelled => {
+                    if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+                },
+                .busy => |busy| {
+                    try picker.openBusyPrompt(app.alloc, task.request.session_id, task.request.title, busy.pid);
+                    if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+                },
+                .failed => |err| {
+                    if (agent.session_persistence.v2_store) |v2_store| {
+                        noteConversionProblem(app, v2_store, err);
+                    }
+                    debug_trace.logf(
+                        "session",
+                        "picker prepare failed action={s} err={s}",
+                        .{ @tagName(task.request.action), @errorName(err) },
+                    );
+                    if (task.request.action == .forking) {
+                        if (picker.busy_prompt) |*prompt| {
+                            const msg = switch (err) {
+                                error.InvalidForkPoint => "Cannot fork yet · turn 1 still running.",
+                                error.NotFound => "Cannot fork this session format while open in another fx.",
+                                else => "Unable to fork this session.",
+                            };
+                            try prompt.setError(app.alloc, msg);
+                        } else {
+                            picker.selection_failure = .unavailable;
+                        }
+                    } else {
+                        picker.selection_failure = session_catalog.classifyResumeFailure(err);
+                    }
+                    if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+                },
+                .ready => |*prepared| {
+                    const v2 = prepared.v2;
+                    const resumed = prepared.resumed;
+                    const forked_from = prepared.forked_from;
+                    // Ownership transfers out of `task.outcome` before `defer task.deinit()`.
+                    task.outcome = .none;
+                    finishPreparedPickerResume(app, agent, v2, resumed, forked_from) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        debug_trace.logf(
+                            "session",
+                            "picker install failed action={s} err={s}",
+                            .{ @tagName(task.request.action), @errorName(err) },
+                        );
+                        if (picker.active) {
+                            picker.selection_failure = session_catalog.classifyResumeFailure(err);
+                        } else {
+                            try app.writeDomainNotice(.{
+                                .topic = "session",
+                                .tone = .@"error",
+                                .body = config_runtime.sessionConnectionNotice(err) orelse "Unable to resume selected session.",
+                            }, true);
+                        }
+                        if (comptime @hasField(App, "shell")) app.shell.render_requests.request(.footer);
+                    };
+                },
+            }
+        }
+
+        fn finishPreparedPickerResume(
+            app: *App,
+            agent: *AppAgent,
+            v2: *session_adapter.Session,
+            prepared_resumed: session_adapter.Resumed,
+            forked_from: ?[]u8,
+        ) !void {
+            defer if (forked_from) |id| std.heap.c_allocator.free(id);
+            var v2_owned = true;
+            errdefer if (v2_owned) v2.close();
+            var resumed = prepared_resumed;
+            var resumed_owned = true;
+            errdefer if (resumed_owned) resumed.deinit(std.heap.c_allocator);
+
+            const startup_pick = if (comptime @hasDecl(App, "consumeStartupPickerGroupRestore"))
+                app.consumeStartupPickerGroupRestore(agent, forked_from == null)
+            else
+                false;
+
+            try app.prepareLiveSessionResume(agent);
+            const notice: ResumeNotice = if (forked_from) |source_id|
+                .{ .fork = source_id }
+            else
+                .session;
+            v2_owned = false;
+            resumed_owned = false;
+            try installPreparedV2Session(app, agent, v2, resumed, std.heap.c_allocator, notice);
+            startResumedSessionWarmup(app);
+            try app.finishLiveSessionResume();
+            try noteStoppedSubagentTasks(app, agent);
+            if (notice != .fork) startPendingResume(app, agent);
+            if (startup_pick and notice != .fork) {
+                if (comptime @hasDecl(App, "finishStartupPickerGroupRestore")) {
+                    app.finishStartupPickerGroupRestore();
+                }
+            }
+        }
+
         pub fn cancelSessionPicker(app: *App, agent: *AppAgent) void {
             const picker = &agent.session_persistence.session_picker;
             const loader = &agent.session_persistence.session_picker_load;
             if (loader.task) |task| loader.cancelGeneration(task.request.generation);
             if (loader.pending) |pending| loader.cancelGeneration(pending.generation);
+            agent.session_persistence.session_picker_resume.cancel();
             picker.deinit(app.alloc);
         }
 
@@ -3044,6 +3258,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn requestPersistenceShutdown(agent: *AppAgent) void {
             agent.session_persistence.session_picker_load.requestStop();
+            agent.session_persistence.session_picker_resume.cancel();
             agent.session_persistence.title_generation.requestStop();
         }
 
@@ -3919,7 +4134,7 @@ pub fn Runtime(comptime App: type) type {
                 .projection = &projection,
                 .labels = &labels,
             };
-            const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, history, &labels);
+            const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, history, &labels, false);
             try projection.finalize();
             var scratch: transcript_runtime.TranscriptRuntime = .{};
             defer scratch.deinit(app.alloc);
@@ -3942,24 +4157,27 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             context_history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
+            transcript_matches_history: bool,
         ) !bool {
-            if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                // The screen holds the newest compaction cycle; Ctrl+O reads
-                // the older ones from the log.
-                if (agent.session_persistence.v2) |v2| {
-                    const Visitor = struct {
-                        app: *App,
-                        agent: *AppAgent,
-                        sink: @TypeOf(sink),
-                        labels: *HistoricalSessionLabels,
-                        has_prior_turns: bool = false,
+            if (!transcript_matches_history) {
+                if (comptime runtime_profile.allows(App, .durable_sessions)) {
+                    // The screen holds the newest compaction cycle; Ctrl+O reads
+                    // the older ones from the log.
+                    if (agent.session_persistence.v2) |v2| {
+                        const Visitor = struct {
+                            app: *App,
+                            agent: *AppAgent,
+                            sink: @TypeOf(sink),
+                            labels: *HistoricalSessionLabels,
+                            has_prior_turns: bool = false,
 
-                        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                            return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
-                        }
-                    };
-                    var visitor = Visitor{ .app = app, .agent = agent, .sink = sink, .labels = labels };
-                    return v2.visitHistorySinceCompaction(app.alloc, &visitor);
+                            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                                return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                            }
+                        };
+                        var visitor = Visitor{ .app = app, .agent = agent, .sink = sink, .labels = labels };
+                        return v2.visitHistorySinceCompaction(app.alloc, &visitor);
+                    }
                 }
             }
             try replayHistoryToSink(app, agent, sink, context_history, labels);
@@ -3979,13 +4197,14 @@ pub fn Runtime(comptime App: type) type {
             notice: ResumeNotice,
             history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
+            transcript_matches_history: bool,
         ) !bool {
             // Only a real title enters the cache: the fallback placeholder must
             // not count as an existing title, or background title generation
             // would consider the session already named and never run.
             if (display.present) try setCachedSessionTitle(app, agent, display.title);
             if (notice != .fork) try writeResumeNotice(app, sink, display, notice);
-            const holds_previous = try replayResumedHistoryToSink(app, agent, sink, history, labels);
+            const holds_previous = try replayResumedHistoryToSink(app, agent, sink, history, labels, transcript_matches_history);
             if (notice == .fork) try writeResumeNotice(app, sink, display, notice);
             return holds_previous;
         }

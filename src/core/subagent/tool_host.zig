@@ -550,6 +550,12 @@ pub const Runtime = struct {
         return self.children.parent.store.childTitle(alloc, child_id);
     }
 
+    /// Timestamp of the child's newest completed assistant reply, read backward
+    /// from the end of its log without replaying earlier turns.
+    pub fn childLatestReplyAt(self: *Runtime, alloc: Allocator, child_id: []const u8) !i64 {
+        return self.children.parent.store.childLatestReplyAt(alloc, child_id);
+    }
+
     /// What a turn the user starts on a subagent's own screen runs under.
     pub const UserTurnAdmission = struct {
         admission: domain.AdmissionSnapshot,

@@ -848,6 +848,15 @@ pub fn Runtime(comptime App: type) type {
                     .query = agent.session_persistence.session_picker.query(),
                     .now_ms = now_ms,
                     .selection_failure = agent.session_persistence.session_picker.selection_failure,
+                    .pending_action = agent.session_persistence.session_picker.pending_action,
+                    .busy_prompt = if (agent.session_persistence.session_picker.busy_prompt) |prompt| .{
+                        .title = prompt.title,
+                        .workspace_label = prompt.workspace_label,
+                        .turn_count = prompt.turn_count,
+                        .pid = prompt.pid,
+                        .selected_yes = prompt.selected_yes,
+                        .error_message = prompt.error_message,
+                    } else null,
                 } else .{},
                 .fork_menu = if (comptime agents.hasAgentField(App, "session_persistence"))
                     app_session_runtime.forkMenuProjection(&agent.session_persistence.fork_menu)

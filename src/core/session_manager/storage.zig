@@ -299,6 +299,32 @@ pub const Storage = struct {
         file.handle.unlock(s.io);
     }
 
+    /// Writes this process's PID to an already-locked lock file as advisory
+    /// metadata so contended opens can name the holder. Never registers with
+    /// fault-injection tracking, since the kernel owns the flock lifetime.
+    pub fn writeLockPid(s: Storage, file: File) void {
+        const pid = std.c.getpid();
+        if (pid <= 0) return;
+        var buf: [32]u8 = undefined;
+        const text = std.mem.print(&buf, "{d}\n", .{pid}) catch return;
+        file.handle.writePositionalAll(s.io, text, 0) catch return;
+        // Advisory metadata only: flock owns exclusivity and readLockPid stops at the first newline.
+        file.handle.setLength(s.io, text.len) catch {};
+    }
+
+    /// Reads the advisory PID from a lock file held by another process.
+    /// Returns null for empty (older format), unreadable, or malformed bytes.
+    pub fn readLockPid(s: Storage, file: File) ?u32 {
+        var buf: [32]u8 = undefined;
+        const n = file.handle.readPositional(s.io, &.{&buf}, 0) catch return null;
+        if (n == 0) return null;
+        const first_line = std.mem.sliceTo(buf[0..n], '\n');
+        const trimmed = std.mem.trim(u8, first_line, " \t\r");
+        if (trimmed.len == 0) return null;
+        const pid = std.fmt.parseInt(u32, trimmed, 10) catch return null;
+        return if (pid > 0) pid else null;
+    }
+
     /// Renames within the root. A file rename replaces an existing file; a
     /// folder rename never replaces a non-empty folder (AlreadyExists).
     pub fn rename(s: Storage, old_dir: Dir, old_name: []const u8, new_dir: Dir, new_name: []const u8) Error!void {
