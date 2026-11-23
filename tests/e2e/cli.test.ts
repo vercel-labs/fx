@@ -2021,6 +2021,39 @@ describe("cli: status", () => {
   );
 
   test(
+    "FX_TRACE_LOG as a FIFO fails closed without blocking startup",
+    async () => {
+      if (platform() === "win32") return;
+      const home = createIsolatedTestHome();
+      const fifoDir = mkdtempSync(join(tmpdir(), "fx-e2e-trace-fifo-"));
+      try {
+        const fxHome = join(home, ".fx");
+        const fifo = join(fifoDir, "trace.fifo");
+        expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+
+        const result = await runFx(["status"], {
+          cwd: fifoDir,
+          env: {
+            ...NO_GATEWAY_AUTH,
+            HOME: home,
+            FX_HOME: fxHome,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TRACE_LOG: fifo,
+          },
+          timeoutMs: 5_000,
+        });
+        expect(result.timedOut, "fx blocked opening the FIFO trace log").toBe(false);
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(fifoDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "special settings files fail closed without blocking CLI startup",
     async () => {
       if (platform() === "win32") return;
