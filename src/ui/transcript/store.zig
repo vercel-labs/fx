@@ -2002,6 +2002,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
         .check_found_command_ended = source.check_found_command_ended,
+        .subagent_started = source.subagent_started,
     };
 }
 
@@ -2033,6 +2034,21 @@ test "a snapshot copy of a shell check keeps whether it found its command ended"
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(ended, copy.check_found_command_ended);
+    }
+}
+
+test "a snapshot copy of a tool detail keeps its subagent start mark" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |started| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}"),
+            .subagent_started = started,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(started, copy.subagent_started);
     }
 }
 
