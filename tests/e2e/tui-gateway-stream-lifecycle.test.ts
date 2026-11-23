@@ -7869,9 +7869,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       // A local stand-in for gh, so the command runs as written and no
       // request leaves the machine. Its output is short, so Ctrl+O shows
-      // the search's row above what the search found.
+      // the search's row above what the search found. Its invalid UTF-8 byte
+      // makes the result an escaped view that comes with a replay handle.
       const fakeGh = join(fakeBin, "gh");
-      writeFileSync(fakeGh, "#!/bin/sh\nprintf 'blob\\tsrc/a.zig\\nblob\\tsrc/b.zig\\ntree\\tsrc\\n'\n");
+      writeFileSync(fakeGh, "#!/bin/sh\nprintf 'blob\\tsrc/a.zig\\nblob\\tsrc/b.zig\\ntree\\tsrc\\377\\n'\n");
       chmodSync(fakeGh, 0o755);
       const command = String.raw`gh api repos/vercel-labs/fx-factory/git/trees/HEAD?recursive=1 --jq '.tree[] | "\(.type)\t\(.path)"'`;
       const finalText = "COMMAND_SEARCH_ROW_FINISHED";

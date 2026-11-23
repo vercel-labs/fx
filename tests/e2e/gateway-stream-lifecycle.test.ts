@@ -980,6 +980,7 @@ type ShellResult = {
   backend?: string;
   persistence?: string;
   output_delta: string;
+  output_terminal_safe?: true;
   full_output_handle?: string;
   exit_code?: number;
   signal?: string;
@@ -6200,9 +6201,11 @@ describe("gateway stream lifecycle", () => {
           expect(correction).toContain("invalid_shell_request");
           expect(correction).toContain("command");
           expect(existsSync(markerPath)).toBe(false);
+          // The invalid UTF-8 byte makes the result an escaped view, which
+          // comes with a replay handle.
           return fakeShellRun(
             timeoutCallId,
-            `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\n'; wait "$child"`,
+            `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\377\\n'; wait "$child"`,
             { profile: "clean", timeout_ms: 500 },
           );
         }
@@ -6211,6 +6214,7 @@ describe("gateway stream lifecycle", () => {
           expect(timedOut).toMatchObject({
             state: "stopped",
             error: "TimeoutExpired",
+            output_terminal_safe: true,
           });
           expect(timedOut.output_delta).toContain("PRE-TIMEOUT-OUT");
           replayHandle = timedOut.full_output_handle ?? "";
@@ -7170,14 +7174,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const commandCallId = "saved_terminal_command_1";
     const readCallId = "saved_terminal_read_1";
     let replayHandle = "";
+    // The invalid UTF-8 byte makes the result an escaped view, which comes
+    // with a replay handle.
     const firstResponses = [
       fakeShellRun(
         commandCallId,
-        "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\n'",
+        "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\377\\n'",
         { profile: "clean", timeout_ms: 600_000 },
       ),
       (body: string) => {
         const commandOutput = shellResult(body, commandCallId);
+        expect(commandOutput.output_terminal_safe).toBe(true);
         replayHandle = commandOutput.full_output_handle ?? "";
         expect(replayHandle).not.toBe("");
         expect(commandOutput.output_delta).toContain("SAVED-REPLAY-NEEDLE");
@@ -8693,6 +8700,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
       const marker = "READ_TEXT_MATCH";
+      // The source prints an invalid UTF-8 byte, so its result is an escaped
+      // view that comes with a replay handle.
       let step = 0;
       let readOutput = "";
       let replayedInput: unknown = null;
@@ -8700,10 +8709,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         switch (step++) {
           case 0:
             return fakeGatewayToolCall("read-text-source", "shell", {
-              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+              request: { action: "run", command: `printf '${marker} found\\377\\n'`, profile: "clean", yield_time_ms: 30000 },
             });
           case 1: {
             const source = JSON.parse(toolResultOutput(body, "read-text-source"));
+            expect(source.output_terminal_safe).toBe(true);
             expect(source.full_output_handle).toBeString();
             return fakeGatewayToolCall("read-text-page", "read_tool_result", {
               request: JSON.stringify({ handle: source.full_output_handle, query: marker }),
@@ -8762,16 +8772,19 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // A query as long as a model can make it. Text past about 2 KB once
       // lost the row's verb, and no saved output holds this one.
       const query = `${marker} ${"x".repeat(5000)}`;
+      // The source prints an invalid UTF-8 byte, so its result is an escaped
+      // view that comes with a replay handle.
       let step = 0;
       let readOutput = "";
       const gateway = startDynamicFakeGateway((body) => {
         switch (step++) {
           case 0:
             return fakeGatewayToolCall("read-long-source", "shell", {
-              request: { action: "run", command: `printf '${marker} found\\n'`, profile: "clean", yield_time_ms: 30000 },
+              request: { action: "run", command: `printf '${marker} found\\377\\n'`, profile: "clean", yield_time_ms: 30000 },
             });
           case 1: {
             const source = JSON.parse(toolResultOutput(body, "read-long-source"));
+            expect(source.output_terminal_safe).toBe(true);
             expect(source.full_output_handle).toBeString();
             return fakeGatewayToolCall("read-long-page", "read_tool_result", {
               request: JSON.stringify({ handle: source.full_output_handle, query }),
@@ -13036,6 +13049,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("distinct-replay-handles");
     const tracePath = join(root.root, "trace.log");
     const handles: string[] = [];
+    // Both commands print the same invalid UTF-8 byte, so each result is an
+    // escaped view that comes with a replay handle.
     const run = (id: string, command: string) => fakeGatewayToolCall(id, "shell", {
       request: { action: "run", command, profile: "clean", yield_time_ms: 30000 },
     });
@@ -13046,10 +13061,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const gateway = startDynamicFakeGateway((body) => {
       switch (step++) {
         case 0:
-          return run("same-a", "printf 'SAME_OUTPUT\\n'");
+          return run("same-a", "printf 'SAME_OUTPUT\\377\\n'");
         case 1:
           handles.push(JSON.parse(toolResultOutput(body, "same-a")).full_output_handle);
-          return run("same-b", "echo SAME_OUTPUT");
+          return run("same-b", "printf '%s\\377\\n' SAME_OUTPUT");
         case 2:
           handles.push(JSON.parse(toolResultOutput(body, "same-b")).full_output_handle);
           return fakeGatewayFinalText("DISTINCT_HANDLES_RECORDED");
