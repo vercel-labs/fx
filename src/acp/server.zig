@@ -8531,6 +8531,7 @@ test "a session is in the shared table until it closes, and a follower is droppe
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
     };
+    defer follower.deinit();
     try joinMemberForTest(session, &follower);
 
     // Closing frees the session. The table lets go of it first, and the follower is dropped with it.
@@ -8657,6 +8658,7 @@ test "a steer's outcome is written on the connection that sent the steer" {
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
     const owner_before = owner_wire.bytes.items.len;
 
@@ -8691,6 +8693,7 @@ test "an answer to a connection that has left the session is dropped, and no con
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
     const owner_before = owner_wire.bytes.items.len;
     const follower_before = follower_wire.bytes.items.len;
@@ -8778,6 +8781,7 @@ test "a write that fails to a follower drops it and is traced, and the owner's t
         .writer = jsonrpc.Writer.initCallback(null, refuseAnswer),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
 
     var follower_turn = answerTestPrompt(&state, session, 2);
@@ -9306,6 +9310,7 @@ test "after a close has taken the session out of the table, retain finds nothing
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
 
     var detached = prompt_test_controls.Gate{};
@@ -9587,6 +9592,7 @@ test "two prompts that arrive together on an idle session start one turn, and th
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
 
