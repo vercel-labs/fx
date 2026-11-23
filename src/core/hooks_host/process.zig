@@ -715,14 +715,6 @@ fn hookGroup(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !std.posix.p
     return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, bytes, " \n"), 10);
 }
 
-/// True when no process is left in process group `group`. The hook is one process
-/// (`exec sleep`), and `reap` has waited for it, so the group is empty as soon as
-/// `run` returns.
-fn groupGone(group: std.posix.pid_t) bool {
-    std.posix.kill(-group, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
-    return false;
-}
-
 test "a hook that closes its output is still stopped at its timeout" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -740,7 +732,8 @@ test "a hook that closes its output is still stopped at its timeout" {
 
     try std.testing.expect(result == .timed_out);
     try std.testing.expect(elapsed < 2000);
-    try std.testing.expect(groupGone(try hookGroup(alloc, io, tmp.dir)));
+    // The hook is one process, and reap has waited for it, so its group is empty once run returns.
+    try std.testing.expect(test_signal.groupGone(try hookGroup(alloc, io, tmp.dir)));
 }
 
 test "a hook that closes its output is stopped by a cancel" {
@@ -767,7 +760,7 @@ test "a hook that closes its output is stopped by a cancel" {
     try std.testing.expect(result == .cancelled);
     try std.testing.expect(elapsed < 2000);
     try std.testing.expect(watch.pid != null);
-    try std.testing.expect(groupGone(watch.pid.?));
+    try std.testing.expect(test_signal.groupGone(watch.pid.?));
 }
 
 test "a hook that closes its output and exits at once keeps its exit code" {

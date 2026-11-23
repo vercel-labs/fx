@@ -3843,6 +3843,7 @@ fn hookNoticeSeverity(tone: agent_runtime.HookNoticeTone) []const u8 {
 /// A hook's notice. A client that set `session.notices` gets an ACP v1 Session Notice with the tone as its
 /// severity; any other client gets the notice as agent text, as before.
 fn pushHookNotice(raw_ctx: *anyopaque, tone: agent_runtime.HookNoticeTone, text: []const u8) !void {
+    if (comptime host_target.is_wasm) return;
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (!ctx.state.client_notices) return pushSystemNotice(raw_ctx, text);
     ctx.sendHookNotice(tone, text) catch |err| {
@@ -3859,6 +3860,7 @@ pub fn sendSettingsHookNotices(
     session_id: []const u8,
     notices: []const agent_runtime.HookNotice,
 ) void {
+    if (comptime host_target.is_wasm) return;
     if (notices.len == 0) return;
     if (!state.client_notices) {
         for (notices) |notice| {

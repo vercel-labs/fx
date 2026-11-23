@@ -225,10 +225,6 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
     hasher.update(&bytes);
 }
 
-/// The context of a session's instructions. It names no file a turn attaches,
-/// since those would change the instructions the provider cached: a turn's
-/// attachments reach the model as a note, through `LaterContextInput`
-/// (`AttachedFiles`).
 /// Why fx is about to load an instruction file, as hooks name it.
 pub const InstructionLoadReason = enum {
     /// The profile, project, or launch-ancestor file, loaded when the context gathers.
@@ -244,6 +240,10 @@ pub const InstructionFilter = struct {
     allow: *const fn (context: *anyopaque, path: []const u8, reason: InstructionLoadReason, stamp: u64) bool,
 };
 
+/// The context of a session's instructions. It names no file a turn attaches,
+/// since those would change the instructions the provider cached: a turn's
+/// attachments reach the model as a note, through `LaterContextInput`
+/// (`AttachedFiles`).
 pub const InitialContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,

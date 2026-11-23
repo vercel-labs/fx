@@ -299,6 +299,54 @@ describe("fx ask with hooks", () => {
     expect(out.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "error" }));
   });
 
+  test("a trusted hook whose script changed mid-turn blocks the next call, and the person is told", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    const marks = join(root.workspace, "marks.txt");
+    const script = join(root.workspace, "check.sh");
+    // The guard runs check.sh before each shell call. The rewriter, after the first call, changes check.sh.
+    writeFileSync(script, "echo ran >> marks.txt\n");
+    writeProjectHooks(root, {
+      hooks: {
+        PreToolUse: [
+          { matcher: "shell", hooks: [{ type: "command", id: "guard", command: "sh check.sh" }] },
+        ],
+        PostToolUse: [
+          {
+            matcher: "shell",
+            hooks: [{ type: "command", id: "rewriter", command: "echo 'echo rewritten >> marks.txt' > check.sh" }],
+          },
+        ],
+      },
+    });
+
+    const { result, bodies } = await ask(root, "Run the shell twice.", [
+      fakeShellRun("shell_first", "echo first"),
+      fakeShellRun("shell_second", "echo second"),
+      fakeGatewayFinalText("the second call was refused"),
+    ]);
+
+    expect(result.code).toBe(0);
+    // The guard ran for the first call only. After the rewrite, check.sh no longer matches its trusted digest,
+    // so the guard denies the second call without running it.
+    expect(readFileSync(script, "utf8")).toBe("echo rewritten >> marks.txt\n");
+    expect(readFileSync(marks, "utf8")).toBe("ran\n");
+    expect(bodies).toHaveLength(3);
+    expect(bodies[2]).toContain("hook guard changed since you trusted it. Run fx hook trust guard to trust it again.");
+    const out = askJson(result.stdout);
+    expect(out.tool_calls.filter((call) => call.name === "shell" && call.status === "success")).toHaveLength(1);
+    expect(out.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "error" }));
+    expect(out.notices).toContainEqual({
+      topic: "hooks",
+      tone: "warning",
+      text: "Hook guard: its command or a file it runs changed since you trusted it. Run fx hook trust guard to trust it again.",
+    });
+    expect(out.notices).toContainEqual({
+      topic: "hooks",
+      tone: "warning",
+      text: "Hook guard blocked shell: hook guard changed since you trusted it. Run fx hook trust guard to trust it again.",
+    });
+  }, TIMEOUT);
+
   test("a deny reason with an ESC sequence reaches stderr as visible text, and the model still gets the raw bytes", async () => {
     const root = createRoot({ experimental: { hooks: true } });
     // printf writes an ESC sequence to stderr, and that is the reason the hook gives for the deny.

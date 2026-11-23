@@ -82,6 +82,17 @@ pub const Engine = struct {
             if (cancel) |flag| {
                 if (flag.load(.acquire)) break;
             }
+            // Checked here, not once per run, so a file that an earlier hook of this run changed counts.
+            if (self.host.hook_changed) |changedSince| {
+                if (try changedSince(self.host.ctx, arena, hook)) {
+                    try results.append(arena, .{ .hook_id = hook.id, .result = .changed });
+                    self.host.trace(self.host.ctx, try arena.print("hook {s} {s} did not run: it changed since it was trusted", .{
+                        hook.id,
+                        ev.name.fileName(),
+                    }));
+                    continue;
+                }
+            }
             if (stdin == null) {
                 stdin = try protocol.buildInput(arena, ev);
                 env = try buildEnv(arena, ev);
@@ -143,6 +154,8 @@ pub const Engine = struct {
                     @tagName(failed.kind),
                     elapsed,
                 }),
+                // A hook that changed never starts, so it continues above and never reaches this line.
+                .changed => unreachable,
             });
         }
 

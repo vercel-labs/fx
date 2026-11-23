@@ -10,8 +10,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const trust_file_name = "hooks-trust.json";
 const max_file_bytes = 1024 * 1024;
 pub const max_entries = 4096;
-/// How many temp names `save` tries before it gives up.
-const temp_attempts = 8;
+/// How many random temp names `save` tries before it gives up.
+const temp_attempts = 32;
 /// The mode of the trust file, its temp file, its lock file, and the run log: only the owner
 /// reads or writes them.
 pub const private_file_mode = 0o600;
@@ -102,21 +102,83 @@ pub const Store = struct {
     }
 };
 
-pub const LoadError = std.mem.Allocator.Error || error{ TrustFileUnsafe, TrustFileInvalid, TrustFileUnreadable };
+pub const LoadError = std.mem.Allocator.Error || error{ TrustFileUnsafe, TrustFileNotRegular, TrustFileInvalid, TrustFileUnreadable };
 
-/// Reads the trust file. A missing file is an empty store. A file that group or
-/// others can write is refused (TrustFileUnsafe), so another account cannot add trust.
-pub fn load(alloc: std.mem.Allocator, file_path: []const u8) LoadError!Store {
+/// An open regular file, and the stat fx took of it after the open.
+const OpenedRegular = struct { file: std.Io.File, stat: std.Io.File.Stat };
+
+/// Why `openRegular` gave no file: the path is missing, is not a regular file, changed between
+/// its stat and its open, or could not be read. Memory can also run out.
+const OpenRegularError = std.mem.Allocator.Error || error{ FileNotFound, NotRegular, Changed, Unreadable };
+
+/// Opens `file_path` only when it is a regular file, and never waits on a FIFO, device, or
+/// socket: a plain open of a FIFO that no writer has opened waits forever (review 6a, 6c).
+/// fx stats the path and refuses anything that is not a regular file. It opens with O_NONBLOCK,
+/// so a path swapped for a FIFO after the stat opens at once. Then it checks the descriptor's
+/// kind and inode against the stat, so a file swapped in between is refused, not read.
+/// The caller closes the file.
+fn openRegular(alloc: std.mem.Allocator, file_path: []const u8) OpenRegularError!OpenedRegular {
     const io = io_mod.getIo();
-    var file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return Store{},
-        else => return error.TrustFileUnreadable,
+    const before = std.Io.Dir.cwd().statFile(io, file_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return error.Unreadable,
     };
-    defer file.close(io);
+    if (before.kind != .file) return error.NotRegular;
 
-    const stat = file.stat(io) catch return error.TrustFileUnreadable;
-    if (stat.kind != .file or stat.permissions.toMode() & group_or_other_write != 0) {
-        debug_trace.logf("hooks", "refused to read {s}: group or others can write it, or it is not a file", .{file_path});
+    const file_path_z = try alloc.dupeSentinel(u8, file_path, 0);
+    defer alloc.free(file_path_z);
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, file_path_z, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    }, 0) catch return error.Unreadable;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    const stat = file.stat(io) catch {
+        file.close(io);
+        return error.Unreadable;
+    };
+    if (stat.kind != .file or stat.inode != before.inode) {
+        file.close(io);
+        return error.Changed;
+    }
+    return .{ .file = file, .stat = stat };
+}
+
+/// The refusal for a file that `openRegular` did not open, or null for a missing file, which is an
+/// empty store. A file that changed while fx opened it is unreadable, not group-writable.
+fn openRefusal(file_path: []const u8, err: OpenRegularError) ?LoadError {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound => return null,
+        error.NotRegular => {
+            debug_trace.logf("hooks", "refused to read {s}: it is not a regular file", .{file_path});
+            return error.TrustFileNotRegular;
+        },
+        error.Changed => {
+            debug_trace.logf("hooks", "refused to read {s}: it changed while fx opened it", .{file_path});
+            return error.TrustFileUnreadable;
+        },
+        error.Unreadable => return error.TrustFileUnreadable,
+    }
+}
+
+/// Reads the trust file. A missing file is an empty store. A file that group or others can
+/// write is refused (TrustFileUnsafe), so another account cannot add trust. A file that
+/// changes while fx opens it, or that cannot be read, is unreadable (TrustFileUnreadable).
+/// A path that is not a regular file, such as a FIFO or a folder, is refused
+/// (TrustFileNotRegular) without a read, so it never blocks fx.
+pub fn load(alloc: std.mem.Allocator, file_path: []const u8) LoadError!Store {
+    const opened = openRegular(alloc, file_path) catch |err| {
+        const refusal = openRefusal(file_path, err) orelse return Store{};
+        return refusal;
+    };
+    const io = io_mod.getIo();
+    var file = opened.file;
+    defer file.close(io);
+    const stat = opened.stat;
+
+    if (stat.permissions.toMode() & group_or_other_write != 0) {
+        debug_trace.logf("hooks", "refused to read {s}: group or others can write it", .{file_path});
         return error.TrustFileUnsafe;
     }
     if (stat.size > max_file_bytes) return error.TrustFileInvalid;
@@ -210,15 +272,18 @@ pub fn lockWriters(alloc: std.mem.Allocator, file_path: []const u8, wait_ms: u32
     }
 }
 
-/// The temp file `save` writes first: the first `<file_path>.tmp.N` that does not exist
-/// yet. Each name is created exclusively, so a file or link planted at a name is skipped,
-/// never written through.
+/// The temp file `save` writes first: a `<file_path>.tmp.<16 hex digits>` with a random name.
+/// Each name is created exclusively, so a file or link planted at a name is skipped, never
+/// written through. The names are random, so leftovers from interrupted saves never block one.
 const Temp = struct { name: []u8, file: std.Io.File };
 
 fn createTemp(alloc: std.mem.Allocator, io: std.Io, file_path: []const u8) !Temp {
     var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        const name = try alloc.print("{s}.tmp.{d}", .{ file_path, attempt });
+    while (attempt < temp_attempts) : (attempt += 1) {
+        var random_bytes: [8]u8 = undefined;
+        io.random(&random_bytes);
+        const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+        const name = try alloc.print("{s}.tmp.{s}", .{ file_path, suffix });
         if (std.Io.Dir.createFileAbsolute(io, name, .{
             .exclusive = true,
             .permissions = std.Io.File.Permissions.fromMode(private_file_mode),
@@ -226,9 +291,13 @@ fn createTemp(alloc: std.mem.Allocator, io: std.Io, file_path: []const u8) !Temp
             return .{ .name = name, .file = file };
         } else |err| {
             alloc.free(name);
-            if (err != error.PathAlreadyExists or attempt + 1 == temp_attempts) return err;
+            if (err != error.PathAlreadyExists) return err;
         }
     }
+    // A Zig error carries no text, so the folder goes to the debug trace; the caller shows the error name.
+    const folder = std.Io.Dir.path.dirname(file_path) orelse file_path;
+    debug_trace.logf("hooks", "could not save the trust file: no free temp name in {s} after {d} tries", .{ folder, temp_attempts });
+    return error.NoFreeTempName;
 }
 
 /// Writes the store to a temp file with mode 0600 in the same folder, syncs it,
@@ -333,11 +402,13 @@ pub const Named = struct {
 pub const max_named_files = 64;
 
 /// The files a hook's command names, resolved and sorted. The caller owns them.
-/// A word that is only the target of an output redirect (`>`, `>>`, `2>`, `&>`, `>|`, `>&`) is not
-/// named: the command writes that file and does not run it. An input redirect target is named, since
-/// `sh < script.sh` runs the file. A file that the command also names outside a redirect target is
-/// named, through that other word. A word with no `/` is named when the hook's working directory, the
-/// workspace root, holds it as a regular file, so `sh check.sh` names `check.sh`.
+/// A word that is only the target of an output redirect (`>`, `>>`, `2>`, `&>`, `>|`, `>&`) is not named: the
+/// command writes that file and does not run it. An input redirect target is named, since `sh < script.sh` runs
+/// the file. A path the command writes is left out everywhere in that command, even where it also appears as a
+/// plain word, such as the `[ -s state ]` of a hook that counts its runs, unless the command runs it: it is the
+/// program of a simple command, or the first operand of sh, bash, zsh, dash, ksh, source, or `.`. A word with no
+/// `/` is named when the hook's working directory, the workspace root, holds it as a regular file, so `sh check.sh`
+/// names `check.sh`.
 pub fn namedFiles(
     alloc: std.mem.Allocator,
     command: hooks.config.Command,
@@ -351,57 +422,40 @@ pub fn namedFiles(
     }
     var words: std.ArrayList([]const u8) = .empty;
     defer words.deinit(alloc);
-    // Parallel to `words`: true for the word that only receives the command's output.
-    var redirect_targets: std.ArrayList(bool) = .empty;
-    defer redirect_targets.deinit(alloc);
+    // Parallel to `words`: what each word is for.
+    var roles: std.ArrayList(WordRole) = .empty;
+    defer roles.deinit(alloc);
 
     switch (command) {
-        .shell => |text| try splitShellWords(alloc, &words, &redirect_targets, &owned, text),
+        .shell => |text| try splitShellWords(alloc, &words, &roles, &owned, text),
         .argv => |items| {
-            // An exec-form item is one word as written; it is never split.
-            for (items) |item| {
+            // An exec-form item is one word as written; it is never split. The first item is the program.
+            for (items, 0..) |item, index| {
                 try words.append(alloc, item);
-                try redirect_targets.append(alloc, false);
+                try roles.append(alloc, if (index == 0) .program else .argument);
             }
         },
     }
 
-    var candidates: std.ArrayList([]u8) = .empty;
-    defer {
-        for (candidates.items) |candidate| alloc.free(candidate);
-        candidates.deinit(alloc);
-    }
-
-    for (words.items, redirect_targets.items) |raw, is_redirect_target| {
-        // The command writes this file and runs none of it, so it is not a file the hook runs.
-        if (is_redirect_target) continue;
-        const maybe = try substitute(alloc, raw, workspace_root, home);
-        const word = maybe orelse continue;
-        if (std.mem.findScalar(u8, word, '/') == null) {
-            // The hook runs in the workspace root, so `check.sh` is that file. A program found on the
-            // PATH is not in the workspace and is not named.
-            const in_workspace = std.Io.Dir.path.join(alloc, &.{ workspace_root, word }) catch |err| {
-                alloc.free(word);
-                return err;
-            };
-            alloc.free(word);
-            if (isRegularFile(in_workspace)) {
-                try appendOwned(alloc, &candidates, in_workspace);
-            } else {
-                alloc.free(in_workspace);
-            }
-            continue;
-        }
-        const absolute = std.Io.Dir.path.isAbsolute(word);
-        if (absolute) {
-            try appendOwned(alloc, &candidates, word);
-        } else {
-            const joined = std.Io.Dir.path.join(alloc, &.{ workspace_root, word }) catch |err| {
-                alloc.free(word);
-                return err;
-            };
-            alloc.free(word);
-            try appendOwned(alloc, &candidates, joined);
+    // The paths the command writes, and the paths it runs, resolved the way every named word is.
+    var written: std.ArrayList([]u8) = .empty;
+    defer freePaths(alloc, &written);
+    var run: std.ArrayList([]u8) = .empty;
+    defer freePaths(alloc, &run);
+    var runner_operand = false;
+    for (words.items, roles.items) |raw, role| {
+        switch (role) {
+            .output_target => try addResolved(alloc, &written, raw, workspace_root, home),
+            .program => {
+                runner_operand = isRunner(raw);
+                try addResolved(alloc, &run, raw, workspace_root, home);
+            },
+            .argument => {
+                if (runner_operand and !std.mem.startsWith(u8, raw, "-")) {
+                    runner_operand = false;
+                    try addResolved(alloc, &run, raw, workspace_root, home);
+                }
+            },
         }
     }
 
@@ -410,8 +464,19 @@ pub fn namedFiles(
         for (result.items) |text| alloc.free(text);
         result.deinit(alloc);
     }
-    for (candidates.items) |candidate| {
-        try appendOwned(alloc, &result, try std.Io.Dir.path.resolveAlloc(alloc, &.{candidate}));
+    for (words.items, roles.items) |raw, role| {
+        // The command writes this file and runs none of it, so it is not a file the hook runs.
+        if (role == .output_target) continue;
+        const named = (try resolveWord(alloc, raw, workspace_root, home)) orelse continue;
+        // A bare word names a file only when the workspace holds it as a regular file.
+        const absent = named.bare and !isRegularFile(named.path);
+        // A path the command writes is state, not code, unless the command runs it too.
+        const state = containsPath(written.items, named.path) and !containsPath(run.items, named.path);
+        if (absent or state) {
+            alloc.free(named.path);
+            continue;
+        }
+        try appendOwned(alloc, &result, named.path);
     }
 
     std.mem.sort([]u8, result.items, {}, lessThanPath);
@@ -454,27 +519,42 @@ fn appendOwned(alloc: std.mem.Allocator, list: *std.ArrayList([]u8), text: []u8)
     };
 }
 
-/// Splits a shell command into words and copies each into `owned`. `redirect_targets` gets one flag per
-/// word: true for the word after an output redirect (`>`, `>>`, `2>`, `&>`, `>|`, `>&`). An input redirect
-/// (`<`) and every other word leave the flag false. Quotes group a word, and the quote characters are
-/// removed: text inside single quotes is literal up to the next single quote, and text inside double quotes
-/// is literal up to the next unescaped double quote, where `\"` and `\\` stand for `"` and `\`. Outside
-/// quotes a backslash takes the next character as written. White space and operators inside quotes stay in
-/// the word. An unclosed quote takes the rest of the text as one word, so the command names more files, not fewer.
+/// What a word of a shell command is for.
+const WordRole = enum {
+    /// Any other word: an argument, an input redirect's target, a keyword, or an assignment before a command.
+    argument,
+    /// The target of an output redirect: the command writes it.
+    output_target,
+    /// The first word of a simple command: the program it runs.
+    program,
+};
+
+/// Splits a shell command into words and copies each into `owned`. `roles` gets one role per word.
+/// Quotes group a word, and the quote characters are removed: text inside single quotes is literal up to the next
+/// single quote, and text inside double quotes is literal up to the next unescaped double quote, where `\"` and `\\`
+/// stand for `"` and `\`. Outside quotes a backslash takes the next character as written. White space and operators
+/// inside quotes stay in the word. An unclosed quote takes the rest of the text as one word, so the command names
+/// more files, not fewer. A command separator (a newline, `;`, `(`, `)`, a backquote, `|`, or `&`) ends a simple
+/// command, so the next word that is not a keyword or an assignment is that command's program.
 const ShellQuote = enum { none, single, double };
+
+const SplitState = struct {
+    /// Set by an output redirect until the next word ends.
+    output_next: bool = false,
+    /// True until a program is read: the next word that is not a keyword or an assignment is one.
+    command_start: bool = true,
+};
 
 fn splitShellWords(
     alloc: std.mem.Allocator,
     words: *std.ArrayList([]const u8),
-    redirect_targets: *std.ArrayList(bool),
+    roles: *std.ArrayList(WordRole),
     owned: *std.ArrayList([]u8),
     text: []const u8,
 ) std.mem.Allocator.Error!void {
     var current: std.ArrayList(u8) = .empty;
     defer current.deinit(alloc);
-    // Set by an output redirect until the next word ends. White space keeps it, so `> file` works. Any other
-    // separator clears it, so a word after `;`, `(`, or a pipe is a command word and is named.
-    var output_next = false;
+    var state: SplitState = .{};
     var previous: u8 = 0;
     var quote: ShellQuote = .none;
     var index: usize = 0;
@@ -508,47 +588,126 @@ fn splitShellWords(
                     try current.append(alloc, text[index]);
                 }
             },
-            ' ', '\t' => try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next),
+            ' ', '\t' => try finishShellWord(alloc, words, roles, owned, &current, &state),
             '\n', ';', '(', ')', '`' => {
-                try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
-                output_next = false;
+                try finishShellWord(alloc, words, roles, owned, &current, &state);
+                state.output_next = false;
+                state.command_start = true;
             },
             '>' => {
-                try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
-                output_next = true;
+                try finishShellWord(alloc, words, roles, owned, &current, &state);
+                state.output_next = true;
             },
             '<' => {
-                try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
-                output_next = false;
+                try finishShellWord(alloc, words, roles, owned, &current, &state);
+                state.output_next = false;
             },
             // `>|` and `>&` continue an output redirect. Any other `|` or `&` ends the command.
             '|', '&' => {
                 if (previous != '>') {
-                    try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
-                    output_next = false;
+                    try finishShellWord(alloc, words, roles, owned, &current, &state);
+                    state.output_next = false;
+                    state.command_start = true;
                 }
             },
             else => try current.append(alloc, c),
         }
         previous = c;
     }
-    try finishShellWord(alloc, words, redirect_targets, owned, &current, &output_next);
+    try finishShellWord(alloc, words, roles, owned, &current, &state);
 }
 
-/// Ends the word being read, if there is one, and records whether it is an output redirect's target.
+/// Ends the word being read, if there is one, and records its role.
 fn finishShellWord(
     alloc: std.mem.Allocator,
     words: *std.ArrayList([]const u8),
-    redirect_targets: *std.ArrayList(bool),
+    roles: *std.ArrayList(WordRole),
     owned: *std.ArrayList([]u8),
     current: *std.ArrayList(u8),
-    output_next: *bool,
+    state: *SplitState,
 ) std.mem.Allocator.Error!void {
     if (current.items.len == 0) return;
+    const role: WordRole = if (state.output_next)
+        .output_target
+    else if (state.command_start and !isKeywordOrAssignment(current.items))
+        .program
+    else
+        .argument;
+    if (role == .program) state.command_start = false;
     try keepWord(alloc, words, owned, current.items);
-    try redirect_targets.append(alloc, output_next.*);
-    output_next.* = false;
+    try roles.append(alloc, role);
+    state.output_next = false;
     current.clearRetainingCapacity();
+}
+
+/// Keywords that come before a command without being one, and `NAME=value` assignments.
+fn isKeywordOrAssignment(word: []const u8) bool {
+    const keywords = [_][]const u8{ "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}" };
+    for (keywords) |keyword| {
+        if (std.mem.eql(u8, word, keyword)) return true;
+    }
+    const equals = std.mem.findScalar(u8, word, '=') orelse return false;
+    if (equals == 0) return false;
+    for (word[0..equals], 0..) |c, index| {
+        const name_char = std.ascii.isAlphabetic(c) or c == '_' or (index > 0 and std.ascii.isDigit(c));
+        if (!name_char) return false;
+    }
+    return true;
+}
+
+/// Whether a program runs the file its first operand names: a shell, or `source` and `.`.
+fn isRunner(program: []const u8) bool {
+    const base = if (std.mem.findScalarLast(u8, program, '/')) |slash| program[slash + 1 ..] else program;
+    const runners = [_][]const u8{ "sh", "bash", "zsh", "dash", "ksh", "source", "." };
+    for (runners) |name| {
+        if (std.mem.eql(u8, base, name)) return true;
+    }
+    return false;
+}
+
+/// A word resolved the way every named file is: `~`, `$HOME`, and fx's project variables expanded, a relative
+/// path joined to the workspace root, and `.` and `..` resolved. `bare` is true when the word has no `/`.
+const ResolvedWord = struct { path: []u8, bare: bool };
+
+/// The caller frees `path`. Null when the word needs a home directory that is not known.
+fn resolveWord(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    workspace_root: []const u8,
+    home: ?[]const u8,
+) std.mem.Allocator.Error!?ResolvedWord {
+    const word = (try substitute(alloc, raw, workspace_root, home)) orelse return null;
+    defer alloc.free(word);
+    const bare = std.mem.findScalar(u8, word, '/') == null;
+    const joined = if (std.Io.Dir.path.isAbsolute(word))
+        try alloc.dupe(u8, word)
+    else
+        try std.Io.Dir.path.join(alloc, &.{ workspace_root, word });
+    defer alloc.free(joined);
+    return .{ .path = try std.Io.Dir.path.resolveAlloc(alloc, &.{joined}), .bare = bare };
+}
+
+fn addResolved(
+    alloc: std.mem.Allocator,
+    paths: *std.ArrayList([]u8),
+    raw: []const u8,
+    workspace_root: []const u8,
+    home: ?[]const u8,
+) std.mem.Allocator.Error!void {
+    const named = (try resolveWord(alloc, raw, workspace_root, home)) orelse return;
+    try appendOwned(alloc, paths, named.path);
+}
+
+fn containsPath(paths: []const []u8, wanted: []const u8) bool {
+    for (paths) |item| {
+        if (std.mem.eql(u8, item, wanted)) return true;
+    }
+    return false;
+}
+
+fn freePaths(alloc: std.mem.Allocator, paths: *std.ArrayList([]u8)) void {
+    for (paths.items) |text| alloc.free(text);
+    paths.deinit(alloc);
 }
 
 fn keepWord(
@@ -646,25 +805,26 @@ pub fn digest(
 }
 
 /// Hashes what fx found at one path: a file's content; for a file too large to
-/// read, its size and its change and modification times; or a word for a path
-/// fx could not read.
+/// read, its size and its change and modification times; a word for a path that
+/// is missing or that fx could not read; or the word `not_regular` for any other
+/// kind of file. A FIFO, device, or socket is never opened: an open of a FIFO
+/// that no writer has opened waits forever, and the loader hashes every named
+/// file on each refresh (review 6a).
 fn hashFile(alloc: std.mem.Allocator, hasher: *Sha256, file_path: []const u8) std.mem.Allocator.Error!void {
     const io = io_mod.getIo();
 
-    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch |err| {
-        hashTag(hasher, if (err == error.FileNotFound) "missing" else "other", file_path);
+    const opened = openRegular(alloc, file_path) catch |err| {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.FileNotFound => hashTag(hasher, "missing", file_path),
+            error.NotRegular => hashTag(hasher, "not_regular", file_path),
+            error.Changed, error.Unreadable => hashTag(hasher, "other", file_path),
+        }
         return;
     };
+    var file = opened.file;
     defer file.close(io);
-
-    const stat = file.stat(io) catch {
-        hashTag(hasher, "other", file_path);
-        return;
-    };
-    if (stat.kind != .file) {
-        hashTag(hasher, "other", file_path);
-        return;
-    }
+    const stat = opened.stat;
 
     if (stat.size > max_content_bytes) {
         hashTag(hasher, "large", file_path);
@@ -795,6 +955,22 @@ test "a trust file others can write is refused" {
     try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), file_path, std.Io.File.Permissions.fromMode(0o664), .{});
 
     try std.testing.expectError(error.TrustFileUnsafe, load(alloc, file_path));
+}
+
+test "a trust file that is a FIFO is refused at once, without waiting for a writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
+    defer alloc.free(file_path);
+    const file_path_z = try alloc.dupeSentinel(u8, file_path, 0);
+    defer alloc.free(file_path_z);
+    // No writer ever opens the FIFO, so a plain open of it would never return.
+    if (mkfifo(file_path_z.ptr, 0o600) != 0) return error.MkfifoFailed;
+
+    try std.testing.expectError(error.TrustFileNotRegular, load(alloc, file_path));
 }
 
 test "a trust file that is not what fx wrote is refused" {
@@ -1131,6 +1307,83 @@ test "a hook that appends to a log keeps its trust after a run changes the log" 
     try std.testing.expectEqual(first, second);
 }
 
+test "a hook that tests its state file and appends to it keeps its trust after the write" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    // The command reads `./state` in a test and appends to it. The append makes `./state` a file the command
+    // writes, so it is state, not code: the collection leaves it out, and the write does not change the digest.
+    // The path has a `/`, so it is named whether or not it exists: only the redirect rule keeps it out.
+    const text = "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"if [ ! -s ./state ]; then echo again; fi; echo run >> ./state\"}]}]}}";
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    const hook = &project_file.hooks[0];
+    var named = try namedFiles(alloc, hook.command, workspace, null);
+    defer named.deinit(alloc);
+    try expectNamed(alloc, named, workspace, &.{}, 0);
+
+    const before = try digest(alloc, hook, workspace, named.files);
+    const state_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "state" });
+    defer alloc.free(state_path);
+    try writeFixture(alloc, state_path, "run\n");
+    const after = try digest(alloc, hook, workspace, named.files);
+    try std.testing.expectEqual(before, after);
+}
+
+test "a file the command writes and also runs stays named, and a change to it needs trust again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const script = try std.Io.Dir.path.join(alloc, &.{ workspace, "run.sh" });
+    defer alloc.free(script);
+    try writeFixture(alloc, script, "echo 1\n");
+
+    // The command writes run.sh through a quoted, relative path, and runs it by its bare name.
+    const text = "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"sh run.sh > \\\"./run.sh\\\"\"}]}]}}";
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    const hook = &project_file.hooks[0];
+    var named = try namedFiles(alloc, hook.command, workspace, null);
+    defer named.deinit(alloc);
+    try expectNamed(alloc, named, workspace, &.{"run.sh"}, 0);
+
+    const first = try digest(alloc, hook, workspace, named.files);
+    try writeFixture(alloc, script, "echo 2\n");
+    const changed = try digest(alloc, hook, workspace, named.files);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "a program after a keyword or an assignment is the program of its command, so its path stays named" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const script = try std.Io.Dir.path.join(alloc, &.{ workspace, "run.sh" });
+    defer alloc.free(script);
+    try writeFixture(alloc, script, "echo 1\n");
+    {
+        // `sh` runs run.sh after `then`, a keyword, so it is that command's program.
+        var named = try namedFiles(alloc, shellCommand("if true; then sh run.sh; fi; echo x > run.sh"), workspace, null);
+        defer named.deinit(alloc);
+        try expectNamed(alloc, named, workspace, &.{"run.sh"}, 0);
+    }
+    {
+        // An assignment before the program does not end the command's slot.
+        var named = try namedFiles(alloc, shellCommand("FLAG=1 sh run.sh > run.sh"), workspace, null);
+        defer named.deinit(alloc);
+        try expectNamed(alloc, named, workspace, &.{"run.sh"}, 0);
+    }
+}
+
 fn expectNamed(
     alloc: std.mem.Allocator,
     named: Named,
@@ -1315,6 +1568,73 @@ test "a temp name that already exists is skipped, never written" {
     const text = try io_mod.readFileToEnd(alloc, &kept, 64);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("keep me", text);
+}
+
+/// Test-only: `std.posix` in this Zig has no `mkfifo`, so the test calls libc, as `test_signal.zig` does.
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "a hook whose named file is a FIFO hashes at once, and differs from a regular file" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "workspace/scripts");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const script = try std.Io.Dir.path.join(alloc, &.{ workspace, "scripts/pipe" });
+    defer alloc.free(script);
+    const script_z = try alloc.dupeSentinel(u8, script, 0);
+    defer alloc.free(script_z);
+    // Nothing ever opens the FIFO for writing, so an open that waits for a writer never returns.
+    if (mkfifo(script_z.ptr, 0o600) != 0) return error.MkfifoFailed;
+
+    const text = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"./scripts/pipe\"}]}]}}";
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    const project_hook = &project_file.hooks[0];
+    var named = try namedFiles(alloc, project_hook.command, workspace, null);
+    defer named.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), named.files.len);
+
+    const fifo_digest = try digest(alloc, project_hook, workspace, named.files);
+
+    try std.Io.Dir.deleteFileAbsolute(io, script);
+    try writeFixture(alloc, script, "echo 1");
+    const file_digest = try digest(alloc, project_hook, workspace, named.files);
+    try std.testing.expect(!std.mem.eql(u8, &fifo_digest, &file_digest));
+}
+
+test "an open that finds the file changed reads as unreadable, not as group-writable" {
+    try std.testing.expectEqual(@as(?LoadError, error.TrustFileUnreadable), openRefusal("/hooks-trust.json", error.Changed));
+    try std.testing.expectEqual(@as(?LoadError, error.TrustFileNotRegular), openRefusal("/hooks-trust.json", error.NotRegular));
+    try std.testing.expectEqual(@as(?LoadError, null), openRefusal("/hooks-trust.json", error.FileNotFound));
+}
+
+test "a save passes the temp names that interrupted saves left behind" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
+    defer alloc.free(file_path);
+    const value: [Sha256.digest_length]u8 = @splat(0x33);
+
+    var store = Store{};
+    defer store.deinit(alloc);
+    try store.add(alloc, value, "a hook");
+    // Eight leftovers used to fill every name `save` tried; forty fill any short fixed list.
+    for ([_]usize{ 8, 40 }) |leftovers| {
+        for (0..leftovers) |index| {
+            const leftover = try alloc.print("{s}.tmp.{d}", .{ file_path, index });
+            defer alloc.free(leftover);
+            try writeFixture(alloc, leftover, "left over");
+        }
+        try save(alloc, file_path, &store);
+        var loaded = try load(alloc, file_path);
+        defer loaded.deinit(alloc);
+        try std.testing.expect(loaded.contains(value));
+    }
 }
 
 test "a lock with no wait takes a free lock at once" {

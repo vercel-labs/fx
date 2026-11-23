@@ -328,7 +328,8 @@ pub const Runtime = struct {
         }
         defer if (allocated) alloc.free(runnable);
 
-        var engine = hooks.Engine{ .host = host, .builtins = self.builtins };
+        var gate = ChangeGate{ .inner = host, .snapshot = if (shared) |value| &value.snapshot else null };
+        var engine = hooks.Engine{ .host = gate.host(), .builtins = self.builtins };
         if (!engine.wants(runnable, ev.name, ev.match_value)) return null;
         const outcome = try engine.run(alloc, runnable, ev, cancel);
         // Background runs come through here too, so one call logs both.
@@ -906,6 +907,68 @@ const ExitBudget = struct {
     }
 };
 
+/// Checks each trusted hook right before the engine starts its process: a hook whose command or named files
+/// changed since the person trusted it does not start (`changedSinceTrusted`). The engine asks through `Host`,
+/// so this host wraps the one it was given and changes no engine code, as `ExitBudget` does.
+const ChangeGate = struct {
+    inner: hooks.Host,
+    /// The snapshot this run uses, which holds the digests the check compares with. Null when there is none.
+    snapshot: ?*const loader.Snapshot,
+
+    fn host(self: *ChangeGate) hooks.Host {
+        return .{
+            .ctx = self,
+            .run_process = runProcess,
+            .now_ms = nowMs,
+            .trace = trace,
+            .hook_changed = if (self.snapshot != null) &hookChanged else null,
+        };
+    }
+
+    fn runProcess(
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: hooks.host.ProcessRequest,
+    ) std.mem.Allocator.Error!hooks.host.ProcessResult {
+        const self: *ChangeGate = @ptrCast(@alignCast(ctx));
+        return self.inner.run_process(self.inner.ctx, alloc, request);
+    }
+
+    fn nowMs(ctx: *anyopaque) u64 {
+        const self: *ChangeGate = @ptrCast(@alignCast(ctx));
+        return self.inner.now_ms(self.inner.ctx);
+    }
+
+    fn trace(ctx: *anyopaque, line: []const u8) void {
+        const self: *ChangeGate = @ptrCast(@alignCast(ctx));
+        self.inner.trace(self.inner.ctx, line);
+    }
+
+    fn hookChanged(ctx: *anyopaque, alloc: std.mem.Allocator, hook: *const hooks.config.Hook) std.mem.Allocator.Error!bool {
+        const self: *ChangeGate = @ptrCast(@alignCast(ctx));
+        return changedSinceTrusted(alloc, self.snapshot.?, hook);
+    }
+};
+
+/// Whether a trusted hook changed since the person trusted it: its digest now, from its command and the files it
+/// names, differs from the digest the snapshot stored at load. It reads the hook's files and writes nothing, so it
+/// needs no lock. A hook the person did not trust is not checked: a run that does not need trust runs it as before.
+/// A hook that is not in the snapshot does not run.
+fn changedSinceTrusted(
+    alloc: std.mem.Allocator,
+    snapshot: *const loader.Snapshot,
+    hook: *const hooks.config.Hook,
+) std.mem.Allocator.Error!bool {
+    const index = for (snapshot.hooks, 0..) |candidate, position| {
+        if (candidate == hook) break position;
+    } else return true;
+    if (!snapshot.trusted[index]) return false;
+    var named = try trust.namedFiles(alloc, hook.command, snapshot.workspace_root, snapshot.home);
+    defer named.deinit(alloc);
+    const now = try trust.digest(alloc, hook, snapshot.workspace_root, named.files);
+    return !std.mem.eql(u8, &now, &snapshot.digests[index]);
+}
+
 /// The awake clock in milliseconds: the clock process.zig waits on, so a budget and a timeout agree.
 fn awakeMs() i64 {
     return std.Io.Clock.awake.now(io_mod.getIo()).toMilliseconds();
@@ -1225,6 +1288,120 @@ test "trust decides which hooks run" {
     var everything = (try runtime.dispatch(alloc, event, false, null)).?;
     defer everything.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), everything.ran);
+}
+
+/// Trusts the one project hook in `text`, as `fx hook trust` does, by the digest the loader computes.
+fn trustProjectHook(alloc: std.mem.Allocator, fixture: *const Fixture, text: []const u8) !void {
+    var project_file = try hooks.config.parse(alloc, text, .{ .layer = .project });
+    defer project_file.deinit(alloc);
+    var named = try trust.namedFiles(alloc, project_file.hooks[0].command, fixture.workspace, fixture.home);
+    defer named.deinit(alloc);
+    const value = try trust.digest(alloc, &project_file.hooks[0], fixture.workspace, named.files);
+    var store = trust.Store{};
+    defer store.deinit(alloc);
+    try store.add(alloc, value, "guard hook");
+    const trust_file = try trust.path(alloc, fixture.home);
+    defer alloc.free(trust_file);
+    try trust.save(alloc, trust_file, &store);
+}
+
+const changed_notice_text = "guard: its command or a file it runs changed since you trusted it. Run fx hook trust guard to trust it again.";
+const changed_reason_text = "hook guard changed since you trusted it. Run fx hook trust guard to trust it again.";
+
+test "a trusted hook whose script changed after it was trusted does not start until the script is restored" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.init(alloc);
+    defer fixture.deinit(alloc);
+    const project_text = "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"id\":\"guard\",\"command\":\"sh check.sh\"}]}]}}";
+    try writeProject(alloc, &fixture, project_text);
+    const script = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "check.sh" });
+    defer alloc.free(script);
+    const marks = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "marks.txt" });
+    defer alloc.free(marks);
+    try writeFixture(alloc, script, "echo ran >> marks.txt\n");
+    try trustProjectHook(alloc, &fixture, project_text);
+
+    var env = try testEnv(alloc);
+    defer env.deinit();
+    var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
+    defer runtime.deinit();
+    runtime.native.base_env = &env;
+    runtime.refresh();
+
+    const fields = [_]hooks.Field{
+        .{ .key = "tool_name", .value = .{ .string = "shell" } },
+    };
+    const event = testEvent(fixture.workspace, &fields);
+
+    var first = (try runtime.dispatch(alloc, event, true, null)).?;
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.ran);
+    const after_first = try readRunLog(alloc, marks);
+    defer alloc.free(after_first);
+    try std.testing.expectEqualStrings("ran\n", after_first);
+
+    // The script changes after the person trusted it. The hook must not start, and the person is told.
+    try writeFixture(alloc, script, "echo changed >> marks.txt\n");
+    var second = (try runtime.dispatch(alloc, event, true, null)).?;
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), second.ran);
+    try std.testing.expectEqual(@as(usize, 1), second.notices.len);
+    try std.testing.expectEqual(hooks.answer.NoticeKind.changed, second.notices[0].kind);
+    try std.testing.expectEqualStrings(changed_notice_text, second.notices[0].text);
+    // PreToolUse can deny, so the changed hook stops the call.
+    try std.testing.expectEqual(hooks.Decision.deny, second.decision);
+    try std.testing.expectEqualStrings(changed_reason_text, second.reason.?);
+    const after_change = try readRunLog(alloc, marks);
+    defer alloc.free(after_change);
+    try std.testing.expectEqualStrings("ran\n", after_change);
+
+    // The script is restored to the trusted bytes. Its digest matches again, so the hook starts.
+    try writeFixture(alloc, script, "echo ran >> marks.txt\n");
+    var third = (try runtime.dispatch(alloc, event, true, null)).?;
+    defer third.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), third.ran);
+    try std.testing.expectEqual(hooks.Decision.proceed, third.decision);
+    const after_restore = try readRunLog(alloc, marks);
+    defer alloc.free(after_restore);
+    try std.testing.expectEqualStrings("ran\nran\n", after_restore);
+}
+
+test "a trusted hook that named a script which did not exist does not start once the script appears" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.init(alloc);
+    defer fixture.deinit(alloc);
+    const project_text = "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"id\":\"guard\",\"command\":\"sh check.sh\"}]}]}}";
+    try writeProject(alloc, &fixture, project_text);
+    // Trusted while check.sh does not exist: its digest names no file.
+    try trustProjectHook(alloc, &fixture, project_text);
+    const script = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "check.sh" });
+    defer alloc.free(script);
+    const marks = try std.Io.Dir.path.join(alloc, &.{ fixture.workspace, "marks.txt" });
+    defer alloc.free(marks);
+
+    var env = try testEnv(alloc);
+    defer env.deinit();
+    var runtime = try Runtime.init(alloc, .{ .enabled = true, .home = fixture.home, .workspace_root = fixture.workspace });
+    defer runtime.deinit();
+    runtime.native.base_env = &env;
+    runtime.refresh();
+
+    const fields = [_]hooks.Field{
+        .{ .key = "tool_name", .value = .{ .string = "shell" } },
+    };
+    const event = testEvent(fixture.workspace, &fields);
+
+    // The script appears after trust. Its digest now names it, so the hook must not start.
+    try writeFixture(alloc, script, "echo ran >> marks.txt\n");
+    var outcome = (try runtime.dispatch(alloc, event, true, null)).?;
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), outcome.ran);
+    try std.testing.expectEqual(@as(usize, 1), outcome.notices.len);
+    try std.testing.expectEqual(hooks.answer.NoticeKind.changed, outcome.notices[0].kind);
+    try std.testing.expectEqualStrings(changed_notice_text, outcome.notices[0].text);
+    try std.testing.expectEqual(hooks.Decision.deny, outcome.decision);
+    try std.testing.expectEqualStrings(changed_reason_text, outcome.reason.?);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_mod.getIo(), marks, .{}));
 }
 
 /// The run log's text, read in full.
@@ -1859,12 +2036,6 @@ fn waitForHookPid(signal: *test_signal.Signal) !std.posix.pid_t {
     return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line, " \n"), 10);
 }
 
-/// Whether a process group has no members left, by the kernel's answer to signal 0 (the same check as process.zig's `groupGone`).
-fn groupGone(group: std.posix.pid_t) bool {
-    std.posix.kill(-group, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
-    return false;
-}
-
 /// Writes a SessionEnd hook that records its pid in `pid_path` and then sleeps 30 s.
 fn writeSleepingSessionEnd(alloc: std.mem.Allocator, fixture: *const Fixture, pid_path: []const u8) !void {
     const command = try std.mem.concat(alloc, u8, &.{ "echo $$ > '", pid_path, "'; exec sleep 30" });
@@ -1918,7 +2089,7 @@ test "deinit stops a background run at once, and its group is gone" {
     const elapsed = std.Io.Clock.awake.now(io).toMilliseconds() - started;
 
     try std.testing.expect(elapsed < exit_limit_ms);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(test_signal.groupGone(pid));
 }
 
 test "a SessionEnd hook that outlives the exit budget is stopped at it, and its group is gone" {
@@ -1940,7 +2111,7 @@ test "a SessionEnd hook that outlives the exit budget is stopped at it, and its 
 
     const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < exit_limit_ms);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(test_signal.groupGone(pid));
 }
 
 test "endSession with reason exit runs its SessionEnd hook under the same budget" {
@@ -1962,7 +2133,7 @@ test "endSession with reason exit runs its SessionEnd hook under the same budget
 
     const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < exit_limit_ms);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(test_signal.groupGone(pid));
 }
 
 test "endSession with reason other returns at once, and deinit stops its SessionEnd hook" {
@@ -1988,7 +2159,7 @@ test "endSession with reason other returns at once, and deinit stops its Session
 
     // The hook does run: it writes its pid, then sleeps, so its group is alive when the switch has returned.
     const pid = try waitForHookPid(&pid_signal);
-    try std.testing.expect(!groupGone(pid));
+    try std.testing.expect(!test_signal.groupGone(pid));
 
     // Exit cancels the background run at once, and the hook's group is gone.
     const started = std.Io.Clock.awake.now(io).toMilliseconds();
@@ -1996,7 +2167,7 @@ test "endSession with reason other returns at once, and deinit stops its Session
     runtime_live = false;
     const exit_elapsed = std.Io.Clock.awake.now(io).toMilliseconds() - started;
     try std.testing.expect(exit_elapsed < exit_limit_ms);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(test_signal.groupGone(pid));
 }
 
 /// What the shared-budget test allows on top of one budget, for the hook's start-up and the trace lines.
@@ -2024,7 +2195,7 @@ test "exit SessionEnd runs of one runtime share one budget, not one budget each"
 
     const pid = try waitForHookPid(&pid_signal);
     try std.testing.expect(elapsed < session_end_exit_budget_ms + exit_budget_margin_ms);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(test_signal.groupGone(pid));
 }
 
 test "queued session notes reach one session's next turn, in order, and are taken once" {

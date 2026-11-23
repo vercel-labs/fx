@@ -304,7 +304,7 @@ describe("fx hook", () => {
       ["trust ID", "Trust a hook so it runs; --all trusts every hook waiting for trust"],
       ["enable ID", "Let a disabled hook run again in this workspace"],
       ["disable ID", "Stop a hook from running in this workspace"],
-      ["test EVENT", "Run the hooks for an event on a sample input and show what they answered; the hook commands really run"],
+      ["test EVENT", "Run the matching hooks for an event on a sample input, trusted or not, and show what they answered; the hook commands really run"],
       ["log", "Show the most recent hook runs: the event, how many hooks ran, and what they decided"],
     ];
     for (const [usage, description] of subcommands) {

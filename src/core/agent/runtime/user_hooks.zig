@@ -39,7 +39,7 @@ pub const PromptSubmitApplied = struct {
     blocked_notice: ?[]const u8 = null,
     /// A hook's replacement prompt, which the model sees in place of the person's text.
     prompt: ?[]const u8 = null,
-    /// Framed context for this turn's model-visible user message.
+    /// Framed context for this turn, sent as one fx message after the prompt.
     context: ?[]const u8 = null,
 };
 
@@ -501,7 +501,7 @@ pub const TurnHooks = struct {
 
     /// Runs the user's UserPromptSubmit hooks on one prompt a person sent. A block or stop
     /// gives the notice the person sees; a rewrite gives the prompt the model sees instead;
-    /// added context gives a framed note for the turn's model-visible message.
+    /// added context becomes the turn's fx message after the prompt (`turnStartContext`).
     pub fn userPromptSubmit(self: *TurnHooks, arena: std.mem.Allocator, prompt: []const u8) PromptSubmitApplied {
         if (comptime host_target.is_wasm) return .{};
         if (!self.active()) return .{};
@@ -1410,10 +1410,10 @@ fn noticeText(arena: std.mem.Allocator, notice: hooks_engine.answer.Notice) std.
     };
 }
 
-/// The tone a hook notice shows with: a failure or a dropped answer is a warning, a message or a cut is neutral.
+/// The tone a hook notice shows with: a failure, a dropped answer, or a hook that changed since it was trusted is a warning, a message or a cut is neutral.
 fn hookNoticeTone(kind: hooks_engine.answer.NoticeKind) deps_mod.HookNoticeTone {
     return switch (kind) {
-        .failure, .dropped => .warning,
+        .failure, .dropped, .changed => .warning,
         .message, .cut => .neutral,
     };
 }
@@ -2764,12 +2764,6 @@ fn waitForPid(signal: *hooks_host.test_signal.Signal) !std.posix.pid_t {
     return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line, " \n"), 10);
 }
 
-/// Whether a process group has no members left, by the kernel's answer to signal 0.
-fn groupGone(group: std.posix.pid_t) bool {
-    std.posix.kill(-group, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
-    return false;
-}
-
 /// A ConfigChange event for a setting, as `configChange` builds it. `source` is also the match value.
 fn settingEvent(fixture: *const HookFixtures, source: []const u8, fields: []const hooks_engine.Field) hooks_engine.Event {
     return .{
@@ -2908,7 +2902,7 @@ test "requestCancel stops the hooks, and take returns cancelled once they are go
     defer result.deinit();
     try std.testing.expectEqual(HookGate.Outcome.cancelled, result.outcome);
     try std.testing.expect(result.refusal == null);
-    try std.testing.expect(groupGone(pid));
+    try std.testing.expect(hooks_host.test_signal.groupGone(pid));
 }
 
 test "deinit stops an open gate's hooks, so a late write never happens" {

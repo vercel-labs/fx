@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -1495,6 +1496,7 @@ pub fn requestPermissionOutcome(
 
 /// The PreToolUse hook's answer for this call; `none` when no hook answered.
 fn hookPermissionOf(input: Input) permission_auto_classifier.HookPermission {
+    if (comptime host_target.is_wasm) return .none;
     return if (input.permission_review_turn) |turn| turn.hook_permission else .none;
 }
 
@@ -1505,6 +1507,7 @@ fn permissionRequestVerdictOf(
     call: ToolCall,
     label: []const u8,
 ) ?permission_auto_classifier.PermissionRequestVerdict {
+    if (comptime host_target.is_wasm) return null;
     const turn = input.permission_review_turn orelse return null;
     const hook = turn.permission_request_hook orelse return null;
     return hook.run(hook.context, arena, call, label);

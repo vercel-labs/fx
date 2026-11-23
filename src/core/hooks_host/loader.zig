@@ -46,6 +46,10 @@ pub const Snapshot = struct {
     sources: [][]const u8 = &.{},
     problems: []Problem = &.{},
     watched: []Watched = &.{},
+    /// The workspace and home the files were read from. A later check computes each digest from the same two,
+    /// so the digest it compares with the stored one is the digest the loader made.
+    workspace_root: []u8 = &.{},
+    home: ?[]u8 = null,
     claude_settings: bool = false,
     /// Set when the trust file was refused. No hook runs then, whatever the trust rule or the disabled list.
     trust_refused: bool = false,
@@ -56,6 +60,8 @@ pub const Snapshot = struct {
         if (self.hooks.len > 0) alloc.free(self.hooks);
         if (self.trusted.len > 0) alloc.free(self.trusted);
         if (self.disabled.len > 0) alloc.free(self.disabled);
+        if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
+        if (self.home) |text| alloc.free(text);
         if (self.digests.len > 0) alloc.free(self.digests);
         if (self.sources.len > 0) alloc.free(self.sources);
         for (self.problems) |problem| {
@@ -166,6 +172,14 @@ pub fn load(alloc: std.mem.Allocator, paths: Paths) std.mem.Allocator.Error!Snap
                     "other users can write this file; fx runs no hook until you run chmod go-w on it",
                 );
             },
+            error.TrustFileNotRegular => {
+                trust_refused = true;
+                try builder.problem(
+                    trust_file,
+                    "",
+                    "this is not a regular file; fx runs no hook until you replace it with a file",
+                );
+            },
             error.TrustFileInvalid => {
                 trust_refused = true;
                 try builder.problem(
@@ -274,6 +288,8 @@ const Builder = struct {
         snapshot.sources = try self.sources.toOwnedSlice(self.alloc);
         snapshot.problems = try self.problems.toOwnedSlice(self.alloc);
         snapshot.watched = try self.watched.toOwnedSlice(self.alloc);
+        snapshot.workspace_root = try self.alloc.dupe(u8, self.paths.workspace_root);
+        snapshot.home = if (self.paths.home) |home| try self.alloc.dupe(u8, home) else null;
         // Borrowed paths only; the buffer has no owner after the file list is gone.
         self.file_paths.deinit(self.alloc);
         return snapshot;
@@ -776,6 +792,27 @@ test "a trust file others can write trusts nothing" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.hooks.len);
     try std.testing.expect(!snapshot.trusted[0]);
     try std.testing.expect(findProblem(&snapshot, "fx runs no hook"));
+}
+
+test "a trust path that is not a regular file trusts nothing and says so" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.init(alloc);
+    defer fixture.deinit(alloc);
+    try writeProfile(alloc, &fixture, "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"./p.sh\"}]}]}}");
+    const trust_file = try trust.path(alloc, fixture.home);
+    defer alloc.free(trust_file);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), trust_file);
+
+    var snapshot = try load(alloc, .{ .home = fixture.home, .workspace_root = fixture.workspace });
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.hooks.len);
+    try std.testing.expect(!snapshot.trusted[0]);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.problems.len);
+    try std.testing.expectEqualStrings(
+        "this is not a regular file; fx runs no hook until you replace it with a file",
+        snapshot.problems[0].message,
+    );
 }
 
 test "a refused trust file stops every hook, whatever the trust rule" {

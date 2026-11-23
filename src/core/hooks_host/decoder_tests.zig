@@ -114,6 +114,8 @@ fn fuzzReadOutput(_: void, smith: *testing.Smith) !void {
             const looks_json = trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}';
             if (code == 0 and !looks_json) try expectWithin(stdout, context);
         },
+        // readOutput only reads a process's output, so it never reports a hook that did not start.
+        .changed => return error.TestUnexpectedResult,
     }
 }
 
@@ -147,7 +149,7 @@ fn fuzzTrustLoad(_: void, smith: *testing.Smith) !void {
 
     var store = trust.load(alloc, file_path) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        error.TrustFileUnsafe, error.TrustFileInvalid, error.TrustFileUnreadable => return,
+        error.TrustFileUnsafe, error.TrustFileNotRegular, error.TrustFileInvalid, error.TrustFileUnreadable => return,
     };
     defer store.deinit(alloc);
     try expectWithinTrustInput(&store, bytes.len);

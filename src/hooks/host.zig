@@ -2,6 +2,7 @@
 //! processes, reads the clock, and writes debug lines only through it.
 
 const std = @import("std");
+const config = @import("config.zig");
 
 /// One environment variable fx adds for a hook process.
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
@@ -51,4 +52,7 @@ pub const Host = struct {
     now_ms: *const fn (ctx: *anyopaque) u64,
     /// Writes one debug line. Must not block for long.
     trace: *const fn (ctx: *anyopaque, line: []const u8) void,
+    /// Whether a trusted hook changed since it was trusted, so it must not start. The engine asks right
+    /// before each hook's process starts. Null when the host does not check. The host reads the files.
+    hook_changed: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, hook: *const config.Hook) std.mem.Allocator.Error!bool = null,
 };

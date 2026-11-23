@@ -196,6 +196,21 @@ pub fn merge(
                 }
                 effective[index] = eff;
             },
+            .changed => {
+                try builder.addFormatted(.changed, result.hook_id, "{s}: its command or a file it runs changed since you trusted it. Run fx hook trust {s} to trust it again.", .{
+                    result.hook_id,
+                    result.hook_id,
+                });
+                // On an event that can deny, a hook that changed since it was trusted stops the action, since the
+                // trust that let its command run is gone. Other events only warn.
+                if (caps.deny) {
+                    const reason = try builder.format("hook {s} changed since you trusted it. Run fx hook trust {s} to trust it again.", .{
+                        result.hook_id,
+                        result.hook_id,
+                    });
+                    effective[index] = .{ .decision = .deny, .reason = reason };
+                }
+            },
         }
     }
 
@@ -275,7 +290,15 @@ pub fn merge(
         }
     }
 
-    outcome.ran = results.len;
+    // A hook that did not start is not a hook that ran.
+    var ran: usize = 0;
+    for (results) |result| {
+        switch (result.result) {
+            .changed => {},
+            .answer, .failure => ran += 1,
+        }
+    }
+    outcome.ran = ran;
     if (builder.pending.items.len > 0) outcome.notices = try buildNotices(alloc, builder.pending.items);
 
     return outcome;
@@ -351,6 +374,43 @@ test "merge takes the strictest decision from the first hook that made it" {
     try std.testing.expectEqualStrings("no", outcome.reason.?);
     try std.testing.expectEqual(@as(usize, 3), outcome.ran);
     try std.testing.expectEqual(@as(usize, 0), outcome.notices.len);
+}
+
+test "a hook that changed since it was trusted denies on an event that can deny, with the reason and the warning" {
+    const alloc = std.testing.allocator;
+    const results = [_]answer.HandlerResult{
+        .{ .hook_id = "guard", .result = .changed },
+        answered("B", .{}),
+    };
+    var outcome = try merge(alloc, .pre_tool_use, &results);
+    defer outcome.deinit(alloc);
+
+    try std.testing.expectEqual(answer.Decision.deny, outcome.decision);
+    try std.testing.expectEqualStrings("guard", outcome.decided_by.?);
+    try std.testing.expectEqualStrings("hook guard changed since you trusted it. Run fx hook trust guard to trust it again.", outcome.reason.?);
+    try std.testing.expectEqual(@as(usize, 1), outcome.ran);
+    try std.testing.expectEqual(@as(usize, 1), outcome.notices.len);
+    try std.testing.expectEqual(answer.NoticeKind.changed, outcome.notices[0].kind);
+    try std.testing.expectEqualStrings("guard", outcome.notices[0].hook_id);
+    try std.testing.expectEqualStrings(
+        "guard: its command or a file it runs changed since you trusted it. Run fx hook trust guard to trust it again.",
+        outcome.notices[0].text,
+    );
+}
+
+test "a hook that changed since it was trusted gives a warning and no deny on an event that cannot deny" {
+    const alloc = std.testing.allocator;
+    const results = [_]answer.HandlerResult{
+        .{ .hook_id = "guard", .result = .changed },
+    };
+    var outcome = try merge(alloc, .post_tool_use, &results);
+    defer outcome.deinit(alloc);
+
+    try std.testing.expectEqual(answer.Decision.proceed, outcome.decision);
+    try std.testing.expect(outcome.reason == null);
+    try std.testing.expectEqual(@as(usize, 0), outcome.ran);
+    try std.testing.expectEqual(@as(usize, 1), outcome.notices.len);
+    try std.testing.expectEqual(answer.NoticeKind.changed, outcome.notices[0].kind);
 }
 
 test "merge keeps the reason of the first hook at the strongest decision" {

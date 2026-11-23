@@ -174,7 +174,7 @@ const hook_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "trust ID", .description = "Trust a hook so it runs; --all trusts every hook waiting for trust", .options = &hook_trust_options },
     .{ .usage = "enable ID", .description = "Let a disabled hook run again in this workspace", .options = &hook_options },
     .{ .usage = "disable ID", .description = "Stop a hook from running in this workspace", .options = &hook_options },
-    .{ .usage = "test EVENT", .description = "Run the hooks for an event on a sample input and show what they answered; the hook commands really run", .options = &hook_test_options },
+    .{ .usage = "test EVENT", .description = "Run the matching hooks for an event on a sample input, trusted or not, and show what they answered; the hook commands really run", .options = &hook_test_options },
     .{ .usage = "log", .description = "Show the most recent hook runs: the event, how many hooks ran, and what they decided", .options = &hook_log_options },
 };
 

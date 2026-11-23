@@ -7,6 +7,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const cli_flags = @import("cli_flags.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
@@ -745,6 +746,16 @@ fn lockTrustFile(
     return .{ .locked = lock };
 }
 
+/// The message `fx hook trust` and `fx hook enable` show when the trust file cannot be saved.
+fn trustSaveMessage(arena: Allocator, trust_file: []const u8, err: anyerror) ![]const u8 {
+    if (err == error.NoFreeTempName) {
+        const folder = std.Io.Dir.path.dirname(trust_file) orelse trust_file;
+        return arena.print("could not save the trust file: no free temporary name in {f}", .{text_utils.terminalSafe(folder)});
+    }
+    var words: [128]u8 = undefined;
+    return arena.print("could not save the trust file: {s}", .{types.plainErrorText(@errorName(err), &words)});
+}
+
 /// `fx hook trust ID` and `fx hook trust --all`. Saves the trust file only when it changes.
 fn runHookTrust(
     alloc: Allocator,
@@ -784,7 +795,7 @@ fn runHookTrust(
     }
     if (store.entries.items.len != before) {
         hooks_host.trust.save(alloc, trust_file, &store) catch |err| {
-            const message = try arena.print("could not save the trust file: {s}", .{@errorName(err)});
+            const message = try trustSaveMessage(arena, trust_file, err);
             return writeHookFailure(alloc, ctx, json, "hook_trust", @errorName(err), message);
         };
     }
@@ -821,7 +832,7 @@ fn runHookState(
     if (store.isDisabled(workspace_root, id) != disabled) {
         try store.setDisabled(alloc, workspace_root, id, disabled);
         hooks_host.trust.save(alloc, trust_file, &store) catch |err| {
-            const message = try arena.print("could not save the trust file: {s}", .{@errorName(err)});
+            const message = try trustSaveMessage(arena, trust_file, err);
             return writeHookFailure(alloc, ctx, json, "hook_state", @errorName(err), message);
         };
     }
@@ -843,6 +854,24 @@ test "fx hook log reads --limit and --json, and refuses a limit below one" {
     try std.testing.expectError(error.InvalidHookLimit, parseHookArgs(&.{ "log", "--limit", "0" }));
     try std.testing.expectError(error.InvalidHookLimit, parseHookArgs(&.{ "log", "--limit", "many" }));
     try std.testing.expectError(error.InvalidHookFlag, parseHookArgs(&.{ "list", "--limit", "5" }));
+}
+
+test "a failed trust save says why in plain words, and names the folder when no temp name is free" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "could not save the trust file: no free temporary name in /Users/example/.fx",
+        try trustSaveMessage(arena, "/Users/example/.fx/hooks-trust.json", error.NoFreeTempName),
+    );
+    try std.testing.expectEqualStrings(
+        "could not save the trust file: permission denied",
+        try trustSaveMessage(arena, "/Users/example/.fx/hooks-trust.json", error.AccessDenied),
+    );
+    try std.testing.expectEqualStrings(
+        "could not save the trust file: path already exists",
+        try trustSaveMessage(arena, "/Users/example/.fx/hooks-trust.json", error.PathAlreadyExists),
+    );
 }
 
 test "fx hook test accepts only user events" {

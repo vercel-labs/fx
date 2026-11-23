@@ -53,8 +53,9 @@ pub const FailureKind = enum { spawn_failed, timed_out, cancelled, exit_code, si
 /// `detail` is borrowed.
 pub const Failure = struct { kind: FailureKind, exit_code: ?u8 = null, signal: ?u32 = null, detail: []const u8 = "" };
 
-/// What one hook produced.
-pub const Result = union(enum) { answer: Answer, failure: Failure };
+/// What one hook produced. `changed` is a trusted hook that did not start: its command or a file it
+/// runs changed since the person trusted it. It gives no answer and does not count as run.
+pub const Result = union(enum) { answer: Answer, failure: Failure, changed };
 
 /// One handler's result, with the policy to apply when it failed. All slices are borrowed.
 pub const HandlerResult = struct {
@@ -65,8 +66,9 @@ pub const HandlerResult = struct {
 };
 
 /// What a notice tells the user. Message is a hook's system message; failure is a hook
-/// that failed; cut is text fx shortened; dropped is a field the event does not accept.
-pub const NoticeKind = enum { message, failure, cut, dropped };
+/// that failed; cut is text fx shortened; dropped is a field the event does not accept;
+/// changed is a trusted hook that did not start because it changed since it was trusted.
+pub const NoticeKind = enum { message, failure, cut, dropped, changed };
 
 /// One user-facing notice. Owned by the Outcome.
 pub const Notice = struct { kind: NoticeKind, hook_id: []u8, text: []u8 };

@@ -6,6 +6,12 @@ const io_mod = @import("../shared/io.zig");
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
+/// Whether a process group has no members left, by the kernel's answer to signal 0.
+pub fn groupGone(group: std.posix.pid_t) bool {
+    std.posix.kill(-group, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
+    return false;
+}
+
 pub const Signal = struct {
     path: [:0]u8,
     file: std.Io.File,

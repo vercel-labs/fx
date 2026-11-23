@@ -365,13 +365,13 @@ fn writeJson(arena: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.
 fn answerOf(result: answer.Result) !answer.Answer {
     return switch (result) {
         .answer => |value| value,
-        .failure => error.ExpectedAnswer,
+        .failure, .changed => error.ExpectedAnswer,
     };
 }
 
 fn failureOf(result: answer.Result) !answer.Failure {
     return switch (result) {
-        .answer => error.ExpectedFailure,
+        .answer, .changed => error.ExpectedFailure,
         .failure => |value| value,
     };
 }
