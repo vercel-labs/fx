@@ -1,7 +1,9 @@
 ---- MODULE AcpSessionStaysOpen ----
 (*
-A session that stays open after its first client leaves. This model is design
-work and is not landed in src/acp/. The rules it checks are the rules of four
+A session that stays open after its first client leaves. Design B of this model
+is built in src/acp/: the session's members are kept in join order, and the first
+of them is the main client. Designs A and current are kept for comparison. The
+rules it checks are the rules of four
 sections of src/protocol/spec/sh-fx.md, as the change extends them: "Following
 a session", "Steering and queued prompts" (with "Stopping and withdrawing"),
 "Permission requests", and "Keeping turns after a disconnect".
@@ -14,21 +16,23 @@ permission request, or set the mode. The turn asks for permission. The process
 may crash, and it exits once stdin has ended and nothing is left to serve.
 
 Designs, selected by the constant Design:
-- "current": the session belongs to O's connection (closeSession and
-  closeAllSessions in src/acp/server.zig). O's leave closes the session for
+- "current": the session belongs to O's connection, as src/acp/server.zig did
+  before design B (closeSession and closeAllSessions). O's leave closes the session for
   every client. The followers stay listed until they leave, and their requests
   get -32002 meanwhile. A leaving follower's waiting input is withdrawn, as
   src/acp/server.zig does today.
 - "A": hand-off. The owner pointer moves to the oldest remaining member when
   the owner leaves, and is cleared when no member is left. A turn asks the
   current owner each time.
-- "B": process-owned members in join order. The main is the first member, and
+- "B", built: process-owned members in join order. The main is the first member, and
   each request asks the first member at that moment.
 
 Rules the model checks, in plain words:
 - Leaving while another member remains ("Stopping and withdrawing"): the
   leaver's queued prompts and untaken steers are withdrawn. A close answers
-  them as cancelled, and an input end traces them. A running turn that the
+  them as cancelled, and an input end traces them. The built code also traces
+  them without an answer when the main client closes while another member
+  remains; the spec's "Leaving a session" section says so. A running turn that the
   leaver's prompt started goes on, and its permission requests go to the next
   main. The model keeps steers in the queue with prompts, so the queue stands
   for both.
