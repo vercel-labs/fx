@@ -181,8 +181,6 @@ pub fn buildInputLineForRow(input: []const u8, cursor: usize, line_index: usize,
 
 const build_channel = update_target.Channel.parse(build_options.update_channel) orelse .stable;
 const welcome_build_label_bytes: usize = 96;
-const dev_revision_bytes: usize = 7;
-
 /// Dev builds ship on every merged PR, so the version alone cannot identify the
 /// binary: the header carries the commit and a brighter `[dev]` tag.
 fn writeBuildLabel(
@@ -192,15 +190,15 @@ fn writeBuildLabel(
     revision: []const u8,
 ) ![]const u8 {
     if (channel != .dev) return std.mem.print(out, "v{s}", .{version_text});
-    if (revision.len < dev_revision_bytes or std.mem.eql(u8, revision, "unknown")) {
-        return std.mem.print(out, "v{s} {s}[dev]{s}", .{ version_text, hint_style, dim_style });
+    if (update_target.displayRevision(revision)) |display| {
+        return std.mem.print(out, "v{s}-{s} {s}[dev]{s}", .{
+            version_text,
+            display,
+            hint_style,
+            dim_style,
+        });
     }
-    return std.mem.print(out, "v{s}-{s} {s}[dev]{s}", .{
-        version_text,
-        revision[0..dev_revision_bytes],
-        hint_style,
-        dim_style,
-    });
+    return std.mem.print(out, "v{s} {s}[dev]{s}", .{ version_text, hint_style, dim_style });
 }
 
 pub const AskHeader = struct {
