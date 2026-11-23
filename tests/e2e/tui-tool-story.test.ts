@@ -149,6 +149,22 @@ const NESTED_WITHOUT_END: StoryStep[] = [
   { at: 1, text: "The shell refused the request." },
 ];
 
+// A command of twenty thousand steps that each set a variable from a `$( )`,
+// in a request the shell refuses before it runs anything.
+const MANY_SET_STEPS: StoryStep[] = [
+  {
+    at: 0,
+    calls: [{
+      name: "shell",
+      input: {
+        command: `${"a=$(b);".repeat(20_000)} echo done`,
+        shell: { kind: "executable", path: "/bin/sh", clean_start: true },
+      },
+    }],
+  },
+  { at: 1, text: "The shell refused the long request." },
+];
+
 // Two commands whose steps read the same, with a read between them.
 const SAID_AGAIN: StoryStep[] = [
   { at: 0, calls: [sh("sed -n 1,2p desktop/src/main.ts; grep -c export desktop/src/window.ts")] },
@@ -587,6 +603,42 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The shell refused the request.", TIMEOUT);
     expectRow(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a command of twenty thousand steps gets its row within seconds, also after resume",
+  async () => {
+    // The short form takes time and memory in step with the command's
+    // length, so the row shows as soon as the turn ends.
+    const drawnWithinMs = 10_000;
+    const liveStarted = Date.now();
+    const { root, gateway, session, pane } = await runStory(MANY_SET_STEPS, {
+      prompt: "set them",
+      finalText: "The shell refused the long request.",
+    });
+    expect(Date.now() - liveStarted).toBeLessThan(drawnWithinMs);
+    const expectRow = (lines: string[]) => {
+      expect(lines.some((line) => line.startsWith("● Couldn't run b, echo"))).toBe(true);
+    };
+    expectRow(paneLines(pane));
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumeStarted = Date.now();
+    const resumed = await TmuxSession.create({
+      cmd: `${FX_BIN} --resume last`,
+      cwd: root.workspace,
+      env: storyEnv(root, gateway),
+      width: 110,
+      height: 60,
+    });
+    sessions.push(resumed);
+    await resumed.waitForText("The shell refused the long request.", TIMEOUT);
+    const resumedPane = await resumed.waitForComposer(TIMEOUT);
+    expect(Date.now() - resumeStarted).toBeLessThan(drawnWithinMs);
+    expectRow(paneLines(resumedPane));
   },
   TIMEOUT * 3,
 );

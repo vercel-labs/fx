@@ -2084,17 +2084,27 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
 /// that order. The newest few show and the older ones are counted before
 /// them, so the last step is the newest call's, which may still run.
 fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const ToolDetailRecord) !ShortCommand {
-    var all: std.ArrayList([]const u8) = .empty;
+    var ran: std.ArrayList([]const u8) = .empty;
     for (records) |record| {
         const source = storyArgString(scratch, record, "command") orelse record.command_display orelse continue;
-        var steps: std.ArrayList([]const u8) = .empty;
+        const before = ran.items.len;
         var raw_steps: usize = 0;
-        if (try collectShortSteps(scratch, source, &steps, &raw_steps, 0) and steps.items.len > 0) {
-            for (steps.items) |step| try StoryTally.addLatest(&all, scratch, step);
-        } else {
-            try StoryTally.addLatest(&all, scratch, unnamedCommandName((try shortText(scratch, source)).text));
+        if (!try collectShortSteps(scratch, source, &ran, &raw_steps, 0) or ran.items.len == before) {
+            ran.shrinkRetainingCapacity(before);
+            try ran.append(scratch, unnamedCommandName((try shortText(scratch, source)).text));
         }
     }
+    // Each step once, where it last ran: a walk back keeps the first of each
+    // it meets.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var all: std.ArrayList([]const u8) = .empty;
+    var index = ran.items.len;
+    while (index > 0) {
+        index -= 1;
+        if ((try seen.getOrPut(scratch, ran.items[index])).found_existing) continue;
+        try all.append(scratch, ran.items[index]);
+    }
+    std.mem.reverse([]const u8, all.items);
     const kept = @min(all.items.len, short_command_max_steps);
     return .{ .steps = all.items[all.items.len - kept ..], .more = 0, .earlier = all.items.len - kept };
 }
@@ -3021,21 +3031,19 @@ fn collectStoryRows(
 /// subagent's report keeps its own line, and so does a subagent wait or
 /// status, whose row tells what main did while its subagents worked.
 fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) !void {
-    const keys = try scratch.alloc(?[]const u8, rows.items.len);
-    for (rows.items, keys) |*row, *key| key.* = try repeatKey(scratch, row);
+    // Where the first row with each key went among the kept rows.
+    var firsts: std.StringHashMapUnmanaged(usize) = .empty;
     var kept: usize = 0;
-    for (rows.items, 0..) |row, index| {
-        if (keys[index]) |key| {
-            const first = for (rows.items[0..kept], keys[0..kept]) |*earlier, earlier_key| {
-                if (earlier_key) |known| if (std.mem.eql(u8, known, key)) break earlier;
-            } else null;
-            if (first) |target| {
-                target.joined_calls += rowCalls(&row);
+    for (rows.items) |row| {
+        if (try repeatKey(scratch, &row)) |key| {
+            const first = try firsts.getOrPut(scratch, key);
+            if (first.found_existing) {
+                rows.items[first.value_ptr.*].joined_calls += rowCalls(&row);
                 continue;
             }
+            first.value_ptr.* = kept;
         }
         rows.items[kept] = row;
-        keys[kept] = keys[index];
         kept += 1;
     }
     rows.shrinkRetainingCapacity(kept);
@@ -4283,26 +4291,15 @@ fn isEnvValueOption(value: []const u8) bool {
     return false;
 }
 
-/// A variable a command sets, so a later step that runs `$NAME` shows the
-/// program it holds.
-const ShortVariable = struct { name: []const u8, value: []const u8 };
-
 /// The program a step runs through a variable the command set, as
 /// `R=~/bin/review; $R status` runs `review`: the variable's value, whose
-/// base name the step shows. Null when `value` is no variable, or the
-/// command did not set it to a program path.
-fn variableProgram(variables: []const ShortVariable, value: []const u8) ?[]const u8 {
-    if (value.len < 2 or value[0] != '$') return null;
-    const name = value[1..];
-    var index = variables.len;
-    while (index > 0) {
-        index -= 1;
-        const variable = variables[index];
-        if (!std.mem.eql(u8, variable.name, name)) continue;
-        const program = shortProgramName(variable.value);
-        return if (program.len > 0 and program[0] != '$') variable.value else null;
-    }
-    return null;
+/// base name the step shows. Null when `word` is no variable, or the command
+/// did not set it to a program path.
+fn variableProgram(scope: *const ShortScope, word: []const u8) ?[]const u8 {
+    if (word.len < 2 or word[0] != '$') return null;
+    const value = scope.variable(word[1..]) orelse return null;
+    const program = shortProgramName(value);
+    return if (program.len > 0 and program[0] != '$') value else null;
 }
 
 /// The errors of the short-form step walk, which recurses into `sh -c`
@@ -4315,9 +4312,10 @@ fn finishShortStep(
     raw_steps: *usize,
     step: ShortStep,
     depth: usize,
-    scope: ShortScope,
-    /// The command's `$( )` scripts, and where the step's last token ends.
-    substitutions: []const ShortSubstitution,
+    scope: *const ShortScope,
+    /// The command's `$( )` scripts that no earlier step had, and where the
+    /// step's last token ends.
+    substitutions: *ShortSubstitutions,
     end: usize,
 ) ShortStepError!void {
     // A step that only sets variables, as `mb=$(git merge-base …)`, and a
@@ -4325,11 +4323,10 @@ fn finishShortStep(
     // `$( )` in a program's own arguments stays part of them.
     const sets_only = step.program.len == 0 and !step.after_wrapper;
     const loop_list = std.mem.eql(u8, step.program, "for") or std.mem.eql(u8, step.program, "select");
-    if (step.start) |start| if ((sets_only or loop_list) and depth < short_command_max_depth) {
-        for (substitutions) |substitution| if (substitution.at >= start and substitution.at < end) {
-            _ = try collectScopedSteps(scratch, substitution.script, steps, raw_steps, depth + 1, scope);
-        };
-    };
+    const own = substitutions.take(step.start, end);
+    if ((sets_only or loop_list) and depth < short_command_max_depth) {
+        for (own) |substitution| _ = try collectScopedSteps(scratch, substitution.script, steps, raw_steps, depth + 1, scope);
+    }
     if (sets_only) return;
     // A `sh -c` step shows the steps of its script, when they lex.
     if (step.inline_script) |script| if (depth < short_command_max_depth) {
@@ -4339,7 +4336,7 @@ fn finishShortStep(
     raw_steps.* += 1;
     if (step.dropped or step.program.len == 0 or step.program_roles.shell_setup) return;
     // A call to a function the command defined runs its body, which shows.
-    for (scope.defined) |name| if (std.mem.eql(u8, step.program, name)) return;
+    if (scope.defines(step.program)) return;
     if (step.after_pipe and step.program_roles.output_filter) return;
     // Words past `word_count` are empty, so they add nothing.
     try steps.append(scratch, try std.mem.concat(scratch, u8, &.{
@@ -4489,14 +4486,55 @@ fn collectShortSteps(
     raw_steps: *usize,
     depth: usize,
 ) ShortStepError!bool {
-    return collectScopedSteps(scratch, command, steps, raw_steps, depth, .{});
+    return collectScopedSteps(scratch, command, steps, raw_steps, depth, null);
 }
 
-/// The functions and variables a command set before the script it runs in a
-/// `$( )` or with `sh -c`, which the script can use.
+/// The functions and variables a script sets, which its later steps and the
+/// scripts it runs in a `$( )` or with `sh -c` can use. A script looks in
+/// the scope of the command around it after its own, so no scope copies
+/// another's.
 const ShortScope = struct {
-    defined: []const []const u8 = &.{},
-    variables: []const ShortVariable = &.{},
+    /// Functions the script defines, such as `p() { sed -n "$1"p f; }`.
+    defined: std.StringHashMapUnmanaged(void) = .empty,
+    /// The value the script last gave each variable, such as `R=~/bin/review`.
+    variables: std.StringHashMapUnmanaged([]const u8) = .empty,
+    outer: ?*const ShortScope = null,
+
+    fn defines(self: *const ShortScope, name: []const u8) bool {
+        var scope: ?*const ShortScope = self;
+        while (scope) |current| {
+            if (current.defined.contains(name)) return true;
+            scope = current.outer;
+        }
+        return false;
+    }
+
+    fn variable(self: *const ShortScope, name: []const u8) ?[]const u8 {
+        var scope: ?*const ShortScope = self;
+        while (scope) |current| {
+            if (current.variables.get(name)) |value| return value;
+            scope = current.outer;
+        }
+        return null;
+    }
+};
+
+/// A command's `$( )` scripts, which its steps take in order, each the ones
+/// inside its own words.
+const ShortSubstitutions = struct {
+    all: []const ShortSubstitution,
+    next: usize = 0,
+
+    /// The scripts whose `$()` is between `start` and `end`, after it skips
+    /// the ones before `start`. A later step's range starts past `end`, so
+    /// each script is looked at once.
+    fn take(self: *ShortSubstitutions, start: ?usize, end: usize) []const ShortSubstitution {
+        const from = start orelse end;
+        while (self.next < self.all.len and self.all[self.next].at < from) self.next += 1;
+        const first = self.next;
+        while (self.next < self.all.len and self.all[self.next].at < end) self.next += 1;
+        return self.all[first..self.next];
+    }
 };
 
 /// collectShortSteps for a script that runs inside a command with `outer`.
@@ -4506,7 +4544,7 @@ fn collectScopedSteps(
     steps: *std.ArrayList([]const u8),
     raw_steps: *usize,
     depth: usize,
-    outer: ShortScope,
+    outer: ?*const ShortScope,
 ) ShortStepError!bool {
     const lexable = try shortText(scratch, command);
     const source = lexable.text;
@@ -4517,12 +4555,8 @@ fn collectScopedSteps(
     const tokens = argv.tokens;
 
     var step: ShortStep = .{};
-    // Functions the command defines, such as `p() { sed -n "$1"p f; }`.
-    var defined: std.ArrayList([]const u8) = .empty;
-    try defined.appendSlice(scratch, outer.defined);
-    // Variables the command sets, such as `R=~/bin/review`.
-    var variables: std.ArrayList(ShortVariable) = .empty;
-    try variables.appendSlice(scratch, outer.variables);
+    var scope: ShortScope = .{ .outer = outer };
+    var substitutions: ShortSubstitutions = .{ .all = lexable.substitutions };
     // The `case` blocks still open, and whether the words up to the next
     // `)` are a branch's pattern, which runs nothing.
     var open_cases: usize = 0;
@@ -4569,7 +4603,7 @@ fn collectScopedSteps(
         // `name() { ...; }` defines a function: its body shows, and calls to
         // it are not steps of their own.
         if (!at_end and step.program.len > 0 and step.word_count == 0 and !step.dropped and isFunctionParens(tokens, index)) {
-            try defined.append(scratch, step.program);
+            try scope.defined.put(scratch, step.program, {});
             step.dropped = true;
             index += 1;
             continue;
@@ -4579,8 +4613,7 @@ fn collectScopedSteps(
         const new_line = if (token) |t| index > 0 and gapHasNewline(source, tokens[index - 1].end, t.start) else false;
         if (at_end or operator or new_line) {
             const end = if (index > 0) tokens[index - 1].end else 0;
-            const scope: ShortScope = .{ .defined = defined.items, .variables = variables.items };
-            try finishShortStep(scratch, steps, raw_steps, step, depth, scope, lexable.substitutions, end);
+            try finishShortStep(scratch, steps, raw_steps, step, depth, &scope, &substitutions, end);
             // `;;` ends a `case` branch, so the words up to the next `)`
             // are the next branch's pattern.
             if (operator and open_cases > 0 and std.mem.eql(u8, token.?.value, ";") and index > 0 and
@@ -4592,7 +4625,7 @@ fn collectScopedSteps(
         if (step.start == null) step.start = t.start;
         if (isRedirectionFd(tokens, index)) continue;
         if (step.program.len == 0 and !t.quoted and std.mem.eql(u8, t.value, "function") and index + 1 < tokens.len) {
-            try defined.append(scratch, tokens[index + 1].value);
+            try scope.defined.put(scratch, tokens[index + 1].value, {});
             step.program = "function";
             step.dropped = true;
             step.closed = true;
@@ -4617,9 +4650,9 @@ fn collectScopedSteps(
             if (isEnvAssignment(t.value)) {
                 const eq = findByte(t.value, '=').?;
                 const name = std.mem.trimEnd(u8, t.value[0..eq], "+");
-                try variables.append(scratch, .{ .name = name, .value = t.value[eq + 1 ..] });
+                try scope.variables.put(scratch, name, t.value[eq + 1 ..]);
             }
-            if (variableProgram(variables.items, t.value)) |program| {
+            if (variableProgram(&scope, t.value)) |program| {
                 var through_variable = t;
                 // A token value the lexer made in `scratch`; nothing writes it.
                 through_variable.value = @constCast(program);
@@ -9358,6 +9391,61 @@ test "the short form of a command nested without end still names its program" {
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.short, (try shortCommand(arena, case.command)) orelse return error.TestExpectedShortForm);
     }
+}
+
+/// How many steps the short-form budget tests give a command.
+const budget_test_steps = 20_000;
+
+/// A command for the short-form budget tests: `head`, then `step`
+/// budget_test_steps times, with its number when `numbered`, then `tail`.
+fn budgetTestCommand(scratch: std.mem.Allocator, head: []const u8, comptime step: []const u8, comptime numbered: bool, tail: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try out.writer.writeAll(head);
+    for (0..budget_test_steps) |index| {
+        if (numbered) try out.writer.print(step, .{index}) else try out.writer.writeAll(step);
+    }
+    try out.writer.writeAll(tail);
+    return out.written();
+}
+
+/// Checks that `command`'s short form is `short`, made within 64 MiB of
+/// memory, every allocation counted, and one second.
+fn expectShortWithinBudget(command: []const u8, short: []const u8) !void {
+    const budget = try std.testing.allocator.alloc(u8, 64 << 20);
+    defer std.testing.allocator.free(budget);
+    var fixed = std.heap.FixedBufferAllocator.init(budget);
+    const started = std.Io.Timestamp.now(std.testing.io, .awake);
+    const got = try shortCommand(fixed.allocator(), command) orelse return error.TestExpectedShortForm;
+    const took_ms = @divFloor(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - started.nanoseconds, std.time.ns_per_ms);
+    try std.testing.expectEqualStrings(short, got);
+    errdefer std.debug.print("took {d} ms\n", .{took_ms});
+    try std.testing.expect(took_ms < 1000);
+}
+
+test "the short form of many steps that set variables from a $( ) stays within a fixed time and memory" {
+    // Each step reads only its own `$( )` scripts, and a script looks up
+    // what the command set without a copy of it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try expectShortWithinBudget(try budgetTestCommand(arena_state.allocator(), "", "a=$(b); ", false, "echo done"), "b, echo");
+}
+
+test "the short form of many runs of a program through a variable stays within a fixed time and memory" {
+    // `$R` finds the value the command last gave `R` without a walk back
+    // over every variable set before it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const assignments = try budgetTestCommand(arena, "R=/opt/tools/bin/review; ", "v{d}=1; ", true, "");
+    try expectShortWithinBudget(try budgetTestCommand(arena, assignments, "$R status; ", false, ""), "review status");
+}
+
+test "the short form of many function definitions stays within a fixed time and memory" {
+    // A call finds the function it runs without a walk over every function
+    // defined before it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try expectShortWithinBudget(try budgetTestCommand(arena_state.allocator(), "", "f{d}() {{ make; }}; ", true, "f1; f2; ls -la"), "make, ls");
 }
 
 test "the short form names only the commands a shell command runs" {
