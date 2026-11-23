@@ -1558,8 +1558,15 @@ fn runNonInteractiveWithDeps(
             try writeStderr(deps, version_usage);
             return usage_failure;
         }
-        try writeStdout(deps, cfg.version);
-        try writeStdout(deps, "\n");
+        var line_buf: [update_target.max_version_label_bytes + 1]u8 = undefined;
+        const build: update_target.CurrentBuild = .{
+            .channel = cfg.build_channel,
+            .version = cfg.version,
+            .revision = cfg.revision,
+        };
+        const label = try build.writeVersionLabel(line_buf[0..update_target.max_version_label_bytes]);
+        line_buf[label.len] = '\n';
+        try writeStdout(deps, line_buf[0 .. label.len + 1]);
         return .handled_success;
     }
 
@@ -6314,6 +6321,53 @@ test "runIfRequested version flags write configured version" {
         try std.testing.expectEqual(RunResult.handled_success, result);
         try std.testing.expectEqualStrings("0.0.0\n", capture.stdout.written());
         try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+}
+
+test "runIfRequested version flags write dev build label with short revision" {
+    const cases = [_][]const [:0]const u8{
+        &.{@constCast("--version")},
+        &.{@constCast("-v")},
+    };
+
+    for (cases) |args| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+
+        var cfg = testConfig();
+        cfg.version = "0.0.17";
+        cfg.build_channel = .dev;
+        cfg.revision = "f1862c5061f5";
+
+        const result = try runIfRequestedWithDeps(std.testing.allocator, args, cfg, capture.deps());
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expectEqualStrings("0.0.17-f1862c5 (dev)\n", capture.stdout.written());
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+}
+
+test "runIfRequested version flags omit unresolved revision on dev build" {
+    const revisions = [_][]const u8{ "unknown", "", "abc123", "123456g" };
+    const cases = [_][]const [:0]const u8{
+        &.{@constCast("--version")},
+        &.{@constCast("-v")},
+    };
+
+    for (revisions) |revision| {
+        for (cases) |args| {
+            var capture = CaptureOutput.init(std.testing.allocator);
+            defer capture.deinit();
+
+            var cfg = testConfig();
+            cfg.version = "0.0.17";
+            cfg.build_channel = .dev;
+            cfg.revision = revision;
+
+            const result = try runIfRequestedWithDeps(std.testing.allocator, args, cfg, capture.deps());
+            try std.testing.expectEqual(RunResult.handled_success, result);
+            try std.testing.expectEqualStrings("0.0.17 (dev)\n", capture.stdout.written());
+            try std.testing.expectEqualStrings("", capture.stderr.written());
+        }
     }
 }
 
