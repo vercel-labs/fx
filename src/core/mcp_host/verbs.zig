@@ -7,6 +7,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_depth = @import("../shared/json_depth.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -512,6 +513,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
 const not_plain_words = "isn't a plain file; replace it with one";
 const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
 const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+const too_deep_words = std.fmt.comptimePrint("is nested more than {d} levels deep; flatten it by hand first", .{json_depth.max_depth});
 
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
@@ -564,6 +566,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
+        error.TooDeep => "the file " ++ too_deep_words,
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
         error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
