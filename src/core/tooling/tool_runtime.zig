@@ -2984,6 +2984,7 @@ fn executeSubagentProvider(
     return .{
         .status = if (output.success) .success else .failure,
         .body = output.body,
+        .started = output.started,
     };
 }
 

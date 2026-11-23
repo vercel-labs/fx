@@ -8683,8 +8683,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await waitForCondition(() => started.size === 2, "both sibling subagents started");
         // Both messages are sent at once, and the parent's turn ends.
         // Each row names its subagent; Ctrl+O shows the task.
-        await session.waitForText("Messaged first", TIMEOUT);
-        await session.waitForText("Messaged second", TIMEOUT);
+        await session.waitForText("Started first", TIMEOUT);
+        await session.waitForText("Started second", TIMEOUT);
         await session.waitForText("PARALLEL_SUBAGENTS_SENT", TIMEOUT);
 
         releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
@@ -8781,7 +8781,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // Every message is sent at once, while the children still work.
         await session.waitForText(finalText, TIMEOUT);
         // A row names the action and the subagent; the task is in Ctrl+O.
-        const rowSent = (index: number) => `Messaged ${rowAgents[index]}`;
+        // Each message makes its subagent, so its row says it started one.
+        const rowSent = (index: number) => `Started ${rowAgents[index]}`;
         await session.waitForPane((pane) => tasks.every((_, index) => pane.includes(rowSent(index))), TIMEOUT);
         const sentRows = await session.captureFullScrollback();
         for (let index = 0; index < tasks.length; index += 1) {
@@ -8806,7 +8807,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.resizeWindow(45, 30);
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const narrow = await session.captureFullScrollback();
-        expect(narrow).toContain("Messaged checker");
+        expect(narrow).toContain("Started checker");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
         await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
@@ -8831,8 +8832,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const resumed = await session.captureFullScrollback();
         expect(resumed).toContain("● Started subagents, read a file");
         expect(resumed).toContain("Couldn't message Invalid Agent");
-        expect(resumed).toContain("Messaged helper");
-        expect(resumed).toContain("Messaged checker");
+        expect(resumed).toContain("Started helper");
+        expect(resumed).toContain("Started checker");
         for (const agent of rowAgents) {
           expect(countOccurrences(resumed, `${agent} finished`)).toBe(1);
         }

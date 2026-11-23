@@ -420,6 +420,83 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "a command check row stays on Ran in every frame while the model checks the ended command again",
+  async () => {
+    const fixture = createFixture("fx-shell-recheck-");
+    const tapePath = join(fixture.root, "recheck.fxtape");
+    const rechecks = 200;
+    let sessionId = "";
+    const check = (id: string, wait: number) => (body: string) => {
+      sessionId = sessionId || (findSessionId(JSON.parse(body)) ?? "");
+      if (!sessionId) return new Response("missing session id", { status: 500 });
+      return fakeGatewayToolCall(id, "shell", {
+        request: { action: "interact", session_id: sessionId, yield_time_ms: wait },
+      });
+    };
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_recheck_run", "shell", {
+        request: { action: "run", command: "sleep 1; printf done", profile: "clean", yield_time_ms: 0 },
+      }),
+      // The first check waits until the command ends; each later check
+      // finds it ended at once.
+      check("shell_recheck_end", 10_000),
+      ...Array.from({ length: rechecks }, (_, index) => check(`shell_recheck_${index}`, 1_000)),
+      fakeGatewayFinalText("RECHECK_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_RECORD: tapePath,
+      },
+      width: 100,
+      height: 36,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run the command and keep checking it.");
+    await session.waitForText("RECHECK_DONE", TIMEOUT);
+    expect(gateway.requests).toHaveLength(rechecks + 3);
+    expect(toolResultEnvelope(gateway.requests[2]!.body, "shell_recheck_end")).toContain('\\"state\\":\\"completed\\"');
+    await session.waitForText(`● Ran sleep, printf · ${rechecks + 2} calls ✓`, TIMEOUT);
+
+    // Every frame the terminal drew: once the row says the command ran, it
+    // never says it waits for it again while a later check runs.
+    const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const sessionRows = replay
+      .split(/^--- frame \d+ .*---$/m)
+      .slice(1)
+      .map((frame) =>
+        frame
+          .split("\n")
+          .filter((line) => line.startsWith("|"))
+          .map((line) => line.slice(1).replace(/\|$/, "").trimEnd())
+          .find((line) => line.includes("sleep, printf"))
+      )
+      .filter((line): line is string => line !== undefined);
+    const firstRan = sessionRows.findIndex((line) => line.startsWith("● Ran sleep, printf"));
+    expect(firstRan).toBeGreaterThanOrEqual(0);
+    expect(sessionRows.slice(firstRan).filter((line) => !/^● Ran sleep, printf · \d+ calls ✓$/.test(line))).toEqual([]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "running shell survives a model-completed turn without handoff policy",
   async () => {
     const fixture = createFixture("fx-shell-cross-turn-");

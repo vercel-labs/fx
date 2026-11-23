@@ -11,6 +11,7 @@ import {
   createStoryRoot,
   sh,
   startStoryGateway,
+  storyReply,
   type StoryRoot,
   type StoryStep,
 } from "./fixtures/story-model";
@@ -18,6 +19,8 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeGatewayToolCall,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -881,7 +884,7 @@ test.skipIf(!tmuxAvailable())(
       // Main's calls share a group; the report is a line of its own after
       // it, not a row of that group.
       const calls = treeRows(group(lines, /^● /));
-      expect(calls).toEqual(["├ Messaged reviewer", "└ Read main.ts"]);
+      expect(calls).toEqual(["├ Started reviewer", "└ Read main.ts"]);
       expect(lines.filter((line) => /^● reviewer finished\b/.test(line))).toHaveLength(1);
       expect(lines.some((line) => /^(├|└) reviewer finished\b/.test(line))).toBe(false);
     };
@@ -899,6 +902,247 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The reviewer is done.", TIMEOUT);
     expectOwnLine(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+type StoryPrompt = Array<{ role?: string; content?: unknown }>;
+
+function storyPrompt(body: string): StoryPrompt {
+  return (JSON.parse(body) as { prompt?: StoryPrompt }).prompt ?? [];
+}
+
+function storyText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => (part && typeof part === "object" && (part as { type?: string }).type === "text" ? String((part as { text?: unknown }).text ?? "") : "")).join("");
+}
+
+/** The latest user message's text, without the list of subagents fx adds to it. */
+function latestUserText(prompt: StoryPrompt): string {
+  const latest = prompt.findLast((message) => message.role === "user");
+  return storyText(latest?.content).replace(/\s*<fx-context-update>[\s\S]*?<\/fx-context-update>/g, "");
+}
+
+/** How many tool results come after the user message that holds `marker`; -1 when none holds it. */
+function toolResultsAfter(prompt: StoryPrompt, marker: string): number {
+  const start = prompt.findLastIndex((message) => message.role === "user" && storyText(message.content).includes(marker));
+  if (start < 0) return -1;
+  return JSON.stringify(prompt.slice(start + 1)).split('"type":"tool-result"').length - 1;
+}
+
+/** A reply that streams a tool call's first bytes, `head`, and holds there until `release`. */
+function heldToolCall(id: string, name: string, input: Record<string, unknown>, head: string) {
+  const encoder = new TextEncoder();
+  const whole = JSON.stringify(input);
+  if (!whole.startsWith(head)) throw new Error(`${head} does not start ${whole}`);
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let sendRest: (() => void) | undefined;
+  let opened = () => {};
+  const streaming = new Promise<void>((resolve) => (opened = resolve));
+  const response = () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          send({ type: "tool-input-start", id, toolName: name });
+          send({ type: "tool-input-delta", id, delta: head });
+          timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+          sendRest = () => {
+            clearInterval(timer);
+            send({ type: "tool-input-delta", id, delta: whole.slice(head.length) });
+            send({ type: "tool-input-end", id });
+            send({ type: "tool-call", toolCallId: id, toolName: name, input });
+            send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          };
+          opened();
+        },
+        cancel() {
+          clearInterval(timer);
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  return { response, streaming, release: () => sendRest?.() };
+}
+
+/** The pane's tool lines, the ones that start with ●, ├, or └, at each frame until `done` holds. */
+async function rowFrames(session: TmuxSession, done: (pane: string) => boolean, frames: string[][], minimum = 0) {
+  for (let i = 0; i < 400; i += 1) {
+    const pane = await session.capturePane();
+    frames.push(paneLines(pane).filter((line) => /^(●|├|└) /.test(line)));
+    if (i + 1 >= minimum && done(pane)) return;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  throw new Error("the story never reached its end");
+}
+
+/** The tool lines of a frame after the line that holds `marker`, such as a prompt. */
+function rowsAfter(frame: string[], pane: string[], marker: string): string[] {
+  const at = pane.findIndex((line) => line.includes(marker));
+  return at < 0 ? [] : frame.filter((line) => pane.indexOf(line, at) > at);
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a subagent row keeps one pair of verbs from its start to its end, and its header says what the rows did, also after resume",
+  async () => {
+    const head = '{"action":"message","agent":"scout","message":"';
+    const start = heldToolCall("start_scout", "subagent", { action: "message", agent: "scout", message: `${CHILD_MARKER} Map the window code.` }, head);
+    const again = heldToolCall("again_scout", "subagent", { action: "message", agent: "scout", message: `${CHILD_MARKER} Map the tray code too.` }, head);
+    let openFirstReply = () => {};
+    const firstReply = new Promise<void>((resolve) => (openFirstReply = resolve));
+    let session: TmuxSession | undefined;
+    let reports = 0;
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const prompt = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        if (latestUserText(prompt).includes("Map the window code")) {
+          await firstReply;
+          return fakeGatewayFinalText("Mapped the window.");
+        }
+        // The second work ends while main waits for it.
+        await session?.waitForText("Waiting for scout", TIMEOUT);
+        return fakeGatewayFinalText("Mapped the tray.");
+      }
+      const second = toolResultsAfter(prompt, "AGAIN_SCOUT");
+      if (second === 0) return fakeGatewayToolCall("again_check", "shell", { action: "run", command: "sh check.sh status" });
+      if (second === 1) return again.response();
+      if (second === 2) return fakeGatewayToolCall("again_wait", "subagent", { action: "wait" });
+      if (second >= 3) return fakeGatewayFinalText("AGAIN_DONE");
+      if (latestUserText(prompt).startsWith("Subagent report")) {
+        reports += 1;
+        return fakeGatewayFinalText(`REPORT_READ_${reports}`);
+      }
+      if (toolResultsAfter(prompt, "START_SCOUT") === 0) return start.response();
+      return fakeGatewayFinalText("SCOUT_STARTED");
+    });
+    gateways.push(gateway);
+    const root = createStoryRoot();
+    roots.push(root);
+    session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+
+    // A message that makes its subagent: "Starting scout", then "Started scout".
+    await session.sendText("START_SCOUT");
+    await start.streaming;
+    const started: string[][] = [];
+    await rowFrames(session, () => true, started, 15);
+    start.release();
+    await rowFrames(session, (pane) => pane.includes("SCOUT_STARTED"), started);
+    openFirstReply();
+    await session.waitForText("REPORT_READ_1", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const startRows = started.flat().filter((line) => line.includes("scout"));
+    expect(new Set(startRows)).toEqual(new Set(["● Starting scout", "● Started scout"]));
+    expect(started.at(-1)).toContain("● Started scout");
+
+    // A message to the subagent that exists: "Messaging scout", then
+    // "Messaged scout", never back, under a header that says the same.
+    await session.sendText("AGAIN_SCOUT");
+    await again.streaming;
+    const messaged: string[][] = [];
+    const track = async (done: (pane: string) => boolean, minimum = 0) => {
+      for (let i = 0; i < 400; i += 1) {
+        const pane = paneLines(await session!.capturePane());
+        messaged.push(rowsAfter(pane.filter((line) => /^(●|├|└) /.test(line)), pane, "AGAIN_SCOUT"));
+        if (i + 1 >= minimum && done(pane.join("\n"))) return;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      throw new Error("the second message never ended");
+    };
+    await track(() => true, 15);
+    again.release();
+    await track((pane) => pane.includes("AGAIN_DONE"));
+    const lines = messaged.flat();
+    expect(lines.some((line) => line === "└ Messaging scout")).toBe(true);
+    for (const line of lines) {
+      expect(line).not.toContain("Managing");
+      expect(line).not.toContain("scout working");
+      expect(line).not.toMatch(/[Ss]tart/);
+      expect(line).not.toContain("used a subagent");
+    }
+    const firstMessaged = messaged.findIndex((frame) => frame.some((line) => line.includes("Messaged scout")));
+    expect(firstMessaged).toBeGreaterThan(0);
+    expect(messaged.slice(firstMessaged).some((frame) => frame.some((line) => line.includes("Messaging scout")))).toBe(false);
+    const finalPane = paneLines(await session.waitForComposer(TIMEOUT));
+    const finalGroup = group(finalPane, /^● Messaged a subagent, ran a command ✓$/);
+    expect(treeRows(finalGroup)).toEqual(["├ Ran sh check.sh status", "├ Messaged scout", "└ Waited for scout"]);
+    const liveRows = finalPane.filter((line) => /^(●|├|└) /.test(line));
+    expect(liveRows.filter((line) => line === "● Started scout")).toHaveLength(1);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("AGAIN_DONE", TIMEOUT);
+    const resumedRows = paneLines(await resumed.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+    expect(resumedRows).toEqual(liveRows);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "waits and the messages a subagent sends while main waits read as one line, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    const until = async (what: string, ready: () => boolean) => {
+      for (let i = 0; i < 3000 && !ready(); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+      if (!ready()) throw new Error(`never: ${what}`);
+    };
+    const notes = ["On the model checks.", "Fixes pushed."];
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const prompt = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        const sent = toolResultsAfter(prompt, CHILD_MARKER);
+        // Each message, and the report, goes while main waits for it.
+        await until(`main's wait ${sent + 1}`, () => waitsBegun() > sent);
+        if (sent < notes.length) {
+          return fakeGatewayToolCall(`lander_note_${sent}`, "subagent", { request: { action: "message", agent: "parent", message: notes[sent] } });
+        }
+        return fakeGatewayFinalText("Landed block B.");
+      }
+      const step = toolResultsAfter(prompt, "LAND_IT");
+      if (step === 0) return fakeGatewayToolCall("land", "subagent", { action: "message", agent: "lander", message: `${CHILD_MARKER} Land block B.` });
+      if (step === 1) return storyReply({ text: "I will wait for lander.", calls: [{ name: "subagent", input: { action: "wait" } }] });
+      if (step <= 3) return fakeGatewayToolCall(`wait_${step}`, "subagent", { action: "wait" });
+      return fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox" };
+    const session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("LAND_IT");
+    await session.waitForText("LANDED", TIMEOUT);
+    const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+    // One line for the waits and the messages they took; the report keeps
+    // a line of its own.
+    expect(live).toEqual(["● Started lander", "● Waited for lander · 2 messages", "● lander finished"]);
+    expect(waitsBegun()).toBe(3);
+
+    // Ctrl+O still shows each message.
+    await session.sendKeys("C-o");
+    await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+    let details = await session.capturePane();
+    for (let page = 0; page < 12 && !notes.every((note) => details.includes(note)); page += 1) {
+      await session.sendKeys("PPage");
+      details += await session.capturePane();
+    }
+    for (const note of notes) expect(details).toContain(note);
+    await session.sendKeys("C-o");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(paneLines(await resumed.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line))).toEqual(live);
   },
   TIMEOUT * 3,
 );
@@ -1033,8 +1277,8 @@ test.skipIf(!tmuxAvailable())(
     expect(rows).toHaveLength(4);
     // Each row names the action and the subagent, with no message; Ctrl+O
     // shows the message.
-    expect(rows[0]).toBe("├ Messaged reviewer");
-    expect(rows[1]).toBe("├ Messaged tester");
+    expect(rows[0]).toBe("├ Started reviewer");
+    expect(rows[1]).toBe("├ Started tester");
     expect(lines.join("\n")).not.toContain("Review the createWindow change");
     expect(rows.filter((row) => row.includes("Waited for"))).toHaveLength(1);
     expect(rows[3]).toContain("Checked");
