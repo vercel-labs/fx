@@ -193,6 +193,28 @@ const controls: { name: string; module: string; constants: Record<string, never>
     ],
     badAt: 1,
   },
+  {
+    name: "subagent access", module: "SubagentAccess",
+    constants: { ObsServers: ["a"], ObsMaxRuns: 1, ObsMaxViews: 1, ObsBridge: true },
+    good: [
+      { event: "init", data: { usable: ["a"] } },
+      { event: "create" },
+      { event: "shell" },
+      { event: "bridge", data: { server: "a", n: 1, ran: false } },
+      { event: "end" },
+      { event: "load", data: { server: "a" } },
+      { event: "shell" },
+      { event: "bridge", data: { server: "a", n: 1, ran: true } },
+    ],
+    // A command's `fx mcp call` runs a tool whose list was not loaded when the command began.
+    bad: [
+      { event: "init", data: { usable: ["a"] } },
+      { event: "create" },
+      { event: "shell" },
+      { event: "bridge", data: { server: "a", n: 1, ran: true } },
+    ],
+    badAt: 3,
+  },
 ];
 
 for (const c of controls) {

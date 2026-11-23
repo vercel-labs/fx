@@ -249,6 +249,9 @@ pub const Context = struct {
     nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
+    /// What a subagent's tool call runs under: null for the main agent. A call that the tool makes for itself,
+    /// the `fx mcp call` of a shell command, is held to it as a direct call is (`liveAuthorityHolds`).
+    live_authority: ?tool_contracts.LiveToolAuthority = null,
     /// The built-in tools this agent offers through toolbox.
     toolbox_behind: []const []const u8 = &.{},
     /// The MCP servers the toolbox menu lists.
@@ -430,6 +433,13 @@ pub fn checkToolAvailability(ctx: Context, arena: Allocator, call: ToolCall) !?[
     );
 }
 
+/// Whether a subagent's live authority holds `name`, one of its tools or MCP integrations. A direct call and
+/// the `fx mcp call` of its shell command are both refused for a name it does not hold
+/// (`tests/tla/mcp_host/SubagentAccess.tla` `BridgeHoldsIntegration`).
+fn liveAuthorityHolds(authority: tool_contracts.LiveToolAuthority, name: []const u8) bool {
+    return containsName(authority.tools, name) or containsName(authority.integrations, name);
+}
+
 pub fn executeToolCallAuthorized(
     ctx: Context,
     request: tool_contracts.ToolExecutionRequest,
@@ -447,13 +457,12 @@ pub fn executeToolCallAuthorized(
         execution_ctx.permission_mode = permission_mode;
     }
     if (request.live_authority) |authority| {
-        if (!containsName(authority.tools, request.call.name) and
-            !containsName(authority.integrations, request.call.name))
-        {
+        if (!liveAuthorityHolds(authority, request.call.name)) {
             return tool_contracts.failToolExecutionResult(
                 error.LiveToolAuthorityUnavailable,
             );
         }
+        execution_ctx.live_authority = authority;
         execution_ctx.permission_mode = authority.permission_mode;
         execution_ctx.permission_grants = authority.grants;
         execution_ctx.session_grants = authority.grants;
@@ -1051,9 +1060,13 @@ const McpCallBridgeState = struct {
 };
 
 /// Checks a bridge call as the agent's own call of an MCP tool it never
-/// selected: the tool must resolve for this agent, and the call then meets
-/// the configured and saved rules, the prompt, and automatic review, which
-/// sees exactly this call.
+/// selected: a subagent must hold the tool as it would for a direct call, the
+/// tool must resolve for this agent, and the call then meets the configured
+/// and saved rules, the prompt, and automatic review, which sees exactly this
+/// call. The subagent's check comes first, so a tool it does not hold never
+/// starts a server to load its list. It holds what the command's own tool call
+/// began with, so a tool whose list loads while the command runs, as a search of
+/// its own does, is held from the agent's next call.
 fn authorizeBridgeCall(
     raw: *anyopaque,
     arena: Allocator,
@@ -1066,14 +1079,22 @@ fn authorizeBridgeCall(
     if (ctx.tool_registry.lookup(tool) != null) {
         return .{ .deny = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
     }
+    if (ctx.live_authority) |authority| {
+        if (!liveAuthorityHolds(authority, tool)) return .{ .deny = try bridgeToolUnavailable(arena, tool) };
+    }
     const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with toolbox search.", .{text_utils.terminalSafe(tool)}) };
+        return .{ .deny = try bridgeToolUnavailable(arena, tool) };
     };
     const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
     return switch (try checkNestedCall(ctx, arena, call, resolved)) {
         .allow => .{ .allow = .{ .binding = resolved.mcp_binding } },
         .deny => |why| .{ .deny = why },
     };
+}
+
+/// What a bridge call is told when the tool is not one this agent may use.
+fn bridgeToolUnavailable(arena: Allocator, tool: []const u8) Allocator.Error![]const u8 {
+    return arena.print("No MCP tool named {f} is available to this agent. Find tool names with toolbox search.", .{text_utils.terminalSafe(tool)});
 }
 
 const NestedCheck = union(enum) {
@@ -1604,6 +1625,81 @@ test "a bridge call's row ends, then keeps its shell call, tool, and outcome for
     var rowless_state = McpCallBridgeState{ .runtime = ok_runtime.context() };
     _ = try runBridgeCall(@ptrCast(&rowless_state), arena, "fx-mcp-call-10", "mcp_fs_read", secret_arguments, .{}, &cancel);
     try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+}
+
+/// How many times an MCP schema was asked for, to show that a refused `fx mcp call` never loads a server's list.
+const SchemaCalls = struct { count: usize = 0 };
+
+fn countingEchoMcpSchema(raw: *anyopaque, arena: Allocator, name: []const u8, rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    const calls: *SchemaCalls = @ptrCast(@alignCast(raw));
+    calls.count += 1;
+    return echoMcpSchema(raw, arena, name, rules, limits, access, cancel);
+}
+
+fn liveAuthorityOf(tools: []const []const u8, integrations: []const []const u8) tool_contracts.LiveToolAuthority {
+    return .{ .generation = 1, .root_id = "root", .tools = tools, .integrations = integrations, .rules = .{}, .grants = &.{} };
+}
+
+test "a live authority holds a tool of its own or an integration, and nothing else" {
+    const authority = liveAuthorityOf(&.{"shell"}, &.{"mcp_fixture_echo"});
+    try std.testing.expect(liveAuthorityHolds(authority, "shell"));
+    try std.testing.expect(liveAuthorityHolds(authority, "mcp_fixture_echo"));
+    try std.testing.expect(!liveAuthorityHolds(authority, "mcp_fixture_other"));
+    try std.testing.expect(!liveAuthorityHolds(authority, "mcp_fixture_ech"));
+    try std.testing.expect(!liveAuthorityHolds(liveAuthorityOf(&.{}, &.{}), "shell"));
+}
+
+test "a subagent's direct call of a tool its live authority does not hold is refused" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    const result = executeToolCallAuthorized(rt.context(), .{
+        .call_allocator = std.testing.allocator,
+        .result_allocator = std.testing.allocator,
+        .call = .{ .id = "direct", .name = "mcp_fixture_echo", .arguments_json = "{}" },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .live_authority = liveAuthorityOf(&.{"shell"}, &.{"mcp_fixture_other"}),
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = rt.max_tool_result_bytes,
+    });
+    try std.testing.expectError(error.LiveToolAuthorityUnavailable, result);
+}
+
+test "a subagent's fx mcp call needs a tool its live authority holds, as its direct call does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls: SchemaCalls = .{};
+    var rt = TestRuntime{
+        .tool_registry = bridge_test_registry,
+        .permission_mode = .yolo,
+        .interactive = false,
+        .mcp_ctx = &calls,
+        .mcp_tool_schema = countingEchoMcpSchema,
+    };
+    defer rt.deinit(std.testing.allocator);
+    var ctx = rt.context();
+
+    // The main agent has no live authority: it may call any tool its access allows, selected or not.
+    var main_state = McpCallBridgeState{ .runtime = ctx };
+    const main_call = try authorizeBridgeCall(@ptrCast(&main_state), arena, "call-1", "mcp_fixture_echo", "{}");
+    try std.testing.expect(main_call == .allow);
+
+    // A subagent whose integrations hold the tool may call it.
+    ctx.live_authority = liveAuthorityOf(&.{"shell"}, &.{"mcp_fixture_echo"});
+    var held_state = McpCallBridgeState{ .runtime = ctx };
+    const held_call = try authorizeBridgeCall(@ptrCast(&held_state), arena, "call-2", "mcp_fixture_echo", "{}");
+    try std.testing.expect(held_call == .allow);
+
+    // One whose integrations do not hold it is refused with the words of any tool that is not available to it,
+    // and the server's tool list is never asked for.
+    ctx.live_authority = liveAuthorityOf(&.{"shell"}, &.{"mcp_fixture_other"});
+    var other_state = McpCallBridgeState{ .runtime = ctx };
+    const asked = calls.count;
+    const refused = try authorizeBridgeCall(@ptrCast(&other_state), arena, "call-3", "mcp_fixture_echo", "{}");
+    try std.testing.expect(refused == .deny);
+    try std.testing.expectEqualStrings("No MCP tool named mcp_fixture_echo is available to this agent. Find tool names with toolbox search.", refused.deny);
+    try std.testing.expectEqual(asked, calls.count);
 }
 
 const RunCommandBackendState = struct {

@@ -13,8 +13,20 @@
   },
   {
     "description": "a child may call a server's tool before its list loads",
-    "old": "    /\\ t[1] \\in loaded\n    /\\ (t",
+    "old": "    /\\ t[1] \\in lists\n    /\\ (t",
     "new": "    /\\ (t",
     "invariant": "ChildWithinParent"
+  },
+  {
+    "description": "A child's `fx mcp call` skips the integrations check: a tool whose list was not loaded when its command began runs",
+    "old": "    /\\ IF t[1] \\in shell.snap\n       THEN LET lists",
+    "new": "    /\\ IF TRUE\n       THEN LET lists",
+    "invariant": "BridgeHoldsIntegration"
+  },
+  {
+    "description": "A child's refused `fx mcp call` is checked after the server's list is asked for: it starts a server to load it",
+    "old": "       ELSE /\\ UNCHANGED <<loaded, ran, startedByRefusal>>",
+    "new": "       ELSE /\\ loaded' = IF t[1] \\in usable THEN loaded \\cup {t[1]} ELSE loaded\n            /\\ startedByRefusal' = (startedByRefusal \\/ (t[1] \\in usable /\\ t[1] \\notin loaded))\n            /\\ UNCHANGED ran",
+    "invariant": "RefusalStartsNothing"
   }
 ]

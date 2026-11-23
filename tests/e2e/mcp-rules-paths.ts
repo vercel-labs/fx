@@ -48,6 +48,8 @@ export interface PathsOptions {
   readOnly?: boolean;
   /** The small server never starts (it exits at once). */
   down?: boolean;
+  /** Run only these steps, in their usual order, such as a subagent's `fx mcp call` with no search or open before it. */
+  only?: { path: PathName; tool: string }[];
   /** An extra scratch folder name. */
   label?: string;
 }
@@ -121,7 +123,9 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
       ...(options.childMode ? { permission_mode: options.childMode === "full" ? "full-access" : options.childMode } : {}),
     }),
   );
-  const all = steps(options.bin).filter((s) => !options.readOnly || s.name === "toolbox" && !("run" in s.args));
+  const all = steps(options.bin)
+    .filter((s) => !options.readOnly || s.name === "toolbox" && !("run" in s.args))
+    .filter((s) => !options.only || options.only.some((o) => o.path === s.path && o.tool === s.tool));
   const texts: Record<string, string> = {};
   // The parent's turn waits until the subagent's last step, so fx ask stays alive for it.
   let releaseParent: (response: Response) => void = () => {};

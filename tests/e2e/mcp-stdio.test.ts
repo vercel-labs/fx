@@ -5309,9 +5309,12 @@ describe("fx mcp call", () => {
 
   // A subagent's command reaches the bridge through its own shell call, with
   // the subagent's access, under the same permission rules as its parent.
-  const runSubagentCommand = async (root: FixtureRoot, mode: "--full-access" | "--auto") => {
+  // `found` is whether the subagent opens the tool in toolbox first. That loads its server's tool list, which makes the tool
+  // one of the subagent's integrations: a direct call of a tool it does not hold is refused, and so is the command's.
+  const runSubagentCommand = async (root: FixtureRoot, mode: "--full-access" | "--auto", found = true) => {
     let seen = "";
     let childRanCommand = false;
+    const shellCall = () => fakeGatewayToolCall("child_call", "shell", { action: "run", command });
     const activeGateway = startDynamicFakeGateway(async (body) => {
       // The parent's turn after the subagent's receipt, and the turn its
       // report starts.
@@ -5322,8 +5325,9 @@ describe("fx mcp call", () => {
         childRanCommand = body.includes("BRIDGE_CHILD_TASK") && !body.includes("BRIDGE_PARENT_TASK");
         return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
       }
+      if (body.includes('"toolCallId":"child_open"')) return shellCall();
       if (body.includes("BRIDGE_CHILD_TASK")) {
-        return fakeGatewayToolCall("child_call", "shell", { action: "run", command });
+        return found ? fakeGatewayToolCall("child_open", "toolbox", { open: TOOL_NAME }) : shellCall();
       }
       if (body.includes("BRIDGE_PARENT_TASK")) {
         return fakeGatewayToolCall("create_bridge_child", "subagent", {
@@ -5357,6 +5361,15 @@ describe("fx mcp call", () => {
     const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
     expect(saved.length).toBeGreaterThan(1536 * 1024);
     expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a subagent's command is refused a tool its integrations do not hold, and the server gets no call", async () => {
+    const root = bridgeRoot("bridge-subagent-unfound");
+    const seen = await runSubagentCommand(root, "--full-access", false);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
   test("a subagent's call meets the same deny rule as its parent's", async () => {
