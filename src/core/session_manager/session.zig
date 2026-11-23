@@ -568,6 +568,7 @@ pub const Session = struct {
         errdefer s.closeDir(dir);
         if (comptime pack.enabled) {
             if (source_dir) |source| pack.copyInto(s, source, dir, env.gpa) catch |err| return packWriteError(err);
+            session.pack_present = packInFolder(s, dir) catch |err| return storage.ioFault(err);
         }
         {
             const blobs = s.ensureDir(dir, "blobs") catch |io_err| return storage.ioFault(io_err);
@@ -1453,6 +1454,12 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
     };
     session.written_seq.store(session.env.s.io, session.state.last_seq);
     session.setSyncFile(parts.log.file, session.state.last_seq);
+    if (comptime pack.enabled) {
+        session.pack_present = packInFolder(session.env.s, parts.dir) catch |err| {
+            session.abandon();
+            return storage.ioFault(err);
+        };
+    }
     session.recoverPack() catch |err| {
         session.abandon();
         return err;
@@ -2109,6 +2116,17 @@ pub const PackCache = struct {
     }
 };
 
+/// Whether a session folder holds a pack: one stat of `blobs.pack`, taken
+/// when a writer opens or stages the session, so every line it writes from
+/// then on is version 2 (D102). A folder without a pack is false.
+fn packInFolder(s: storage.Storage, dir: storage.Dir) storage.Error!bool {
+    _ = s.stat(dir, pack.file_name) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
 /// The body at `loc`, checked against its blob name. `Corrupt` when the bytes
 /// do not hash to `hash`. The caller owns the result.
 fn readNamedBody(s: storage.Storage, file: storage.File, gpa: std.mem.Allocator, loc: pack.Loc, hash: []const u8) pack.ReadError![]u8 {
@@ -2297,6 +2315,11 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
         session.phase = .closed;
         session.destroy();
     }
+    if (comptime pack.enabled) {
+        // The copy's pack comes from the source, so every line this fork
+        // writes, from its first, is version 2 (D102).
+        session.pack_present = packInFolder(s, src_dir) catch |err| return storage.ioFault(err);
+    }
     const copies = try gpa.alloc(*Session, children.len);
     var made: usize = 0;
     errdefer {
@@ -2408,6 +2431,10 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     errdefer {
         session.phase = .closed;
         session.destroy();
+    }
+    if (comptime pack.enabled) {
+        // As a fork's copy: the child copy's pack comes from its source (D102).
+        session.pack_present = packInFolder(env.s, src_dir) catch |err| return storage.ioFault(err);
     }
     session.batch.clearRetainingCapacity();
     session.bounds.clearRetainingCapacity();
@@ -3376,6 +3403,134 @@ const session_tests = struct {
         try closeAndDestroy(s);
         try testing.expectError(error.NotFound, blobExists(&t.env, id, &small_hash));
         try blobExists(&t.env, id, &large_hash);
+    }
+
+    /// From the first line that names `hash` on, every line is version 2, and
+    /// at least three lines follow it (D102, R3.5). Copied history before that
+    /// line keeps the version it was written at.
+    fn expectVersion2FromLineNaming(log: []const u8, hash: []const u8) !void {
+        var named: ?usize = null;
+        var lines: usize = 0;
+        var at: usize = 0;
+        while (std.mem.findScalarPos(u8, log, at, '\n')) |end| {
+            const line = log[at..end];
+            if (named == null and std.mem.find(u8, line, hash) != null) named = lines;
+            if (named != null) try testing.expect(std.mem.startsWith(u8, line, "{\"v\":2,"));
+            lines += 1;
+            at = end + 1;
+        }
+        try testing.expect(named != null);
+        try testing.expect(lines > named.? + 3);
+    }
+
+    test "a fork of a pack session writes version 2 on every later line, snapshots included" {
+        var t: TestEnv = undefined;
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const shared = try s.putSmall("shared pack body");
+        const refs = [_][]const u8{&shared};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const source = try gpa.dupe(u8, s.id());
+        defer gpa.free(source);
+        try closeAndDestroy(s);
+
+        const f = try session_mod.openFork(&t.env, .{ .source = source, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        const fork = try gpa.dupe(u8, f.id());
+        defer gpa.free(fork);
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        try closeAndDestroy(f);
+
+        const log = (try readSessionLog(&t, fork)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.startsWith(u8, log, "{\"v\":2,"));
+        try expectVersion2FromLineNaming(log, &shared);
+    }
+
+    test "a recover fork of a pack session writes version 2 on every later line" {
+        var t: TestEnv = undefined;
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const shared = try s.putSmall("recovered pack body");
+        const refs = [_][]const u8{&shared};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const source = try gpa.dupe(u8, s.id());
+        defer gpa.free(source);
+        try closeAndDestroy(s);
+
+        const f = try session_mod.openFork(&t.env, .{ .source = source, .at = .last_good, .workspace = "/w", .host = .app });
+        const fork = try gpa.dupe(u8, f.id());
+        defer gpa.free(fork);
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        _ = try f.append(&.{ .turn_started, .turn_committed });
+        try closeAndDestroy(f);
+
+        const log = (try readSessionLog(&t, fork)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.startsWith(u8, log, "{\"v\":2,"));
+        try expectVersion2FromLineNaming(log, &shared);
+    }
+
+    test "a child copy of a pack child writes version 2 on every later line" {
+        var t: TestEnv = undefined;
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const parent = try newRoot(&t);
+        const parent_id = try gpa.dupe(u8, parent.id());
+        defer gpa.free(parent_id);
+        try closeAndDestroy(parent);
+
+        const c = try session_mod.openNew(&t.env, .{ .workspace = "/w", .host = .child, .role = .child, .parent = parent_id });
+        _ = try c.append(&.{.turn_started});
+        const shared = try c.putSmall("child pack body");
+        const refs = [_][]const u8{&shared};
+        _ = try c.append(&.{ itemWith(&refs), .turn_committed });
+        const child = try gpa.dupe(u8, c.id());
+        defer gpa.free(child);
+        try closeAndDestroy(c);
+
+        const copy = try openChildCopy(&t.env, .{ .source = child, .parent = parent_id, .workspace = "/w", .cut_ms = std.math.maxInt(u64) });
+        const copy_id = try gpa.dupe(u8, copy.id());
+        defer gpa.free(copy_id);
+        _ = try copy.append(&.{ .turn_started, .turn_committed });
+        _ = try copy.append(&.{ .turn_started, .turn_committed });
+        _ = try copy.append(&.{ .turn_started, .turn_committed });
+        try closeAndDestroy(copy);
+
+        const log = (try readSessionLog(&t, copy_id)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.startsWith(u8, log, "{\"v\":2,"));
+        try expectVersion2FromLineNaming(log, &shared);
+    }
+
+    test "a resumed session whose folder holds a pack writes version 2 on every later line" {
+        var t: TestEnv = undefined;
+        t.init(.{ .snapshot_every_bytes = 1 });
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const shared = try s.putSmall("resumed pack body");
+        const refs = [_][]const u8{&shared};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const r = try resumeRoot(&t, id);
+        _ = try r.append(&.{ .turn_started, .turn_committed });
+        _ = try r.append(&.{ .turn_started, .turn_committed });
+        _ = try r.append(&.{ .turn_started, .turn_committed });
+        try closeAndDestroy(r);
+
+        const log = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try expectVersion2FromLineNaming(log, &shared);
     }
 
     test "a non-pack build writes files: a small body is a blob file, and no pack is made" {
