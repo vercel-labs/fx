@@ -59,6 +59,11 @@ pub const Client = struct {
     reader: ?std.Io.Future(std.Io.Cancelable!void) = null,
     closed: bool = false,
     last_spawn_ms: i64 = 0,
+    /// The owners this session started that it has not reaped yet. An owner
+    /// that exits while the session lives stays a zombie until someone waits
+    /// for it (`RULES.md` R3.9), so each start is kept here and reaped in
+    /// `reapSpawned`.
+    spawned: std.ArrayList(std.c.pid_t) = .empty,
 
     pub fn init(io: std.Io, gpa: Allocator, fx_home: []const u8, spawn_owner: bool, wake: Wake) Error!Client {
         const socket_path = try std.Io.Dir.path.join(gpa, &.{ fx_home, owner.run_dir_name, owner.socket_name });
@@ -74,6 +79,9 @@ pub const Client = struct {
 
     pub fn deinit(c: *Client) void {
         c.close();
+        // An owner this session started may have exited since the last check.
+        c.reapSpawned();
+        c.spawned.deinit(c.gpa);
         c.gpa.free(c.socket_path);
         if (c.queue.items.len != 0) {
             // The session ended with frames it had not read: a call's end or a
@@ -93,6 +101,10 @@ pub const Client = struct {
     /// Connected, or `SharingUnavailable`: one attempt is connect, else start
     /// an owner, then connect again, every `retry_ms` until the timeout.
     pub fn ensureReady(c: *Client, startup_timeout_ms: u32) Error!void {
+        // An owner started before this point may have exited: its process is
+        // reaped here, so a session that outlives many owners leaves no
+        // zombies behind it.
+        c.reapSpawned();
         if (c.stream != null) {
             if (!c.isClosed()) return;
             // The owner went away: this connection closes, and one attempt
@@ -103,7 +115,7 @@ pub const Client = struct {
         while (true) {
             // A refused or missing socket is expected here: the loop below
             // starts an owner when it may, and tries again until the deadline.
-            c.connect() catch {};
+            c.connect(deadline) catch {};
             if (c.stream != null) return;
             if (c.spawn_owner and c.now() - c.last_spawn_ms >= spawn_retry_ms) {
                 c.last_spawn_ms = c.now();
@@ -138,11 +150,39 @@ pub const Client = struct {
             debug_trace.logf("mcp-owner", "owner not started err={s}", .{@errorName(err)});
             return;
         };
-        debug_trace.logf("mcp-owner", "owner started pid={d}", .{child.id orelse 0});
+        const pid = child.id orelse {
+            debug_trace.logf("mcp-owner", "owner started without a pid", .{});
+            return;
+        };
+        // Kept until it exits, so a session that outlives its owner reaps it
+        // rather than leaving a zombie in its process table.
+        c.spawned.append(c.gpa, pid) catch |err| {
+            debug_trace.logf("mcp-owner", "owner pid not kept reason={s} pid={d}", .{ @errorName(err), pid });
+        };
+        debug_trace.logf("mcp-owner", "owner started pid={d}", .{pid});
     }
 
-    /// Connects, sends hello, and checks the owner's welcome version.
-    fn connect(c: *Client) !void {
+    /// Reaps the owners this session started that have exited, so none stays a
+    /// zombie (`RULES.md` R3.9). One still running is checked again next time,
+    /// and one already reaped, or that no longer waits for its parent, is
+    /// dropped: either way nothing waits for it any more.
+    fn reapSpawned(c: *Client) void {
+        var i: usize = 0;
+        while (i < c.spawned.items.len) {
+            const pid: std.c.pid_t = @intCast(c.spawned.items[i]);
+            if (std.c.waitpid(pid, null, std.c.W.NOHANG) == 0) {
+                i += 1;
+                continue;
+            }
+            _ = c.spawned.swapRemove(i);
+        }
+    }
+
+    /// Connects, sends hello, and checks the owner's welcome version. The
+    /// welcome is read only once `poll` says the socket has bytes, each wait
+    /// bounded by `deadline`: a peer that accepts the connection and never
+    /// answers ends as `SharingUnavailable` instead of hanging the session.
+    fn connect(c: *Client, deadline: i64) !void {
         const address = std.Io.net.UnixAddress.init(c.socket_path) catch return error.SharingUnavailable;
         const stream = address.connect(c.io) catch return error.SharingUnavailable;
         errdefer stream.close(c.io);
@@ -153,10 +193,12 @@ pub const Client = struct {
         try sent;
         // The welcome names the owner, and its version must match ours.
         var header: [wire.header_bytes]u8 = undefined;
+        try c.waitReadable(stream, deadline);
         readExact(c.io, stream, &header) catch return error.SharingUnavailable;
         const length = wire.readLength(&header) catch return error.SharingUnavailable;
         var buffer: [1024]u8 = undefined;
         if (length > buffer.len) return error.SharingUnavailable;
+        try c.waitReadable(stream, deadline);
         readExact(c.io, stream, buffer[0..length]) catch return error.SharingUnavailable;
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
@@ -181,11 +223,26 @@ pub const Client = struct {
         debug_trace.logf("mcp-owner", "owner connected socket={s}", .{c.socket_path});
     }
 
+    /// Waits until the socket has bytes to read or `deadline` passes.
+    fn waitReadable(c: *Client, stream: std.Io.net.Stream, deadline: i64) !void {
+        while (true) {
+            const left = deadline - c.now();
+            if (left <= 0) return error.SharingUnavailable;
+            var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, @intCast(@min(left, std.math.maxInt(i32)))) catch return error.SharingUnavailable;
+            if (ready > 0) return;
+        }
+    }
+
     /// Writes one message. The caller has called `ensureReady`.
     pub fn send(c: *Client, message: wire.ClientMessage) Error!void {
-        const stream = c.stream orelse return error.Closed;
         c.write_mutex.lockUncancelable(c.io);
         defer c.write_mutex.unlock(c.io);
+        // A connection the reader saw end carries nothing more: saying so here
+        // lets the session take the close in now, not after a write that never
+        // lands.
+        if (c.isClosed()) return error.Closed;
+        const stream = c.stream orelse return error.Closed;
         return c.sendOn(stream, message);
     }
 
@@ -227,6 +284,10 @@ pub const Client = struct {
         c.mutex.lockUncancelable(c.io);
         c.closed = true;
         c.mutex.unlock(c.io);
+        // The runtime's owner thread may be waiting on its engine: a close ends
+        // the calls the owner held, so it hears now rather than at its next
+        // timer.
+        c.wake.wake(c.wake.context);
     }
 
     /// Closes the connection; the next need or call connects again.
@@ -412,6 +473,21 @@ fn staleWelcome(io: std.Io, path: []const u8) void {
     io.sleep(.fromMilliseconds(500), .awake) catch {};
 }
 
+/// A peer that accepts a client and never writes the welcome it waits for.
+/// Holds the connection open past the client's deadline, then goes.
+fn silentPeer(io: std.Io, path: []const u8) void {
+    const address = std.Io.net.UnixAddress.init(path) catch return;
+    var server = address.listen(io, .{}) catch return;
+    defer server.deinit(io);
+    // The first connection is `waitForSocket`'s probe for the socket: it sends
+    // nothing and is closed here, so the next one is the client's.
+    const probe = server.accept(io) catch return;
+    probe.close(io);
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    io.sleep(.fromMilliseconds(2_000), .awake) catch {};
+}
+
 fn wakeNothing(_: *anyopaque) void {}
 
 test "closing a client whose reader waits for a frame returns at once" {
@@ -512,6 +588,86 @@ test "a session that stops taking frames caps its queue and stops sharing" {
     var bytes: usize = 0;
     for (frames.items) |frame| bytes += frame.len;
     try testing.expect(bytes <= max_queue_bytes);
+}
+
+test "a peer that never welcomes the client makes it give up by its deadline" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "silent");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run);
+    try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
+    defer alloc.free(path);
+    const peer = try std.Thread.spawn(.{}, silentPeer, .{ testing.io, path });
+    defer peer.join();
+    try waitForSocket(path);
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, false, wake);
+    defer client.deinit();
+
+    // The deadline is the only thing that ends the wait for a welcome that
+    // never comes: the attempt runs on its own thread so a client that ignores
+    // the deadline fails this test instead of hanging it.
+    const Attempt = struct {
+        client: *Client,
+        ready: *std.atomic.Value(bool),
+        fn attempt(a: @This()) void {
+            a.client.ensureReady(300) catch {};
+            a.ready.store(true, .release);
+        }
+    };
+    var ready = std.atomic.Value(bool).init(false);
+    const attempt = try std.Thread.spawn(.{}, Attempt.attempt, .{Attempt{ .client = &client, .ready = &ready }});
+    defer attempt.join();
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    while (!ready.load(.acquire)) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() - started > 1_000) return error.WelcomeWaitNeverEnded;
+        // Polls for the attempt to hit its deadline, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    // It gave up rather than talking to a peer that said nothing.
+    try testing.expect(client.stream == null);
+}
+
+test "an owner the session starts is reaped once it exits, so none stays a zombie" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "reap");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run);
+    try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
+
+    var woken: u8 = 0;
+    const wake: Wake = .{ .context = &woken, .wake = wakeNothing };
+    var client = try Client.init(testing.io, alloc, home, true, wake);
+    defer client.deinit();
+    client.spawn();
+    // The owner starts on the same fx home and exits on its own: it has no
+    // client, so it goes after its grace period.
+    if (client.spawned.items.len != 1) return error.OwnerNotStarted;
+    const pid = client.spawned.items[0];
+
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 20_000;
+    while (client.spawned.items.len != 0) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) return error.OwnerNeverReaped;
+        // Polls for the owner to exit and be reaped, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        client.reapSpawned();
+    }
+    // Nothing waits for that process any more: a second wait finds no child,
+    // which a zombie would still be.
+    const again = std.c.waitpid(@intCast(pid), null, std.c.W.NOHANG);
+    try testing.expectEqual(@as(std.c.pid_t, -1), again);
+    try testing.expectEqual(std.c.E.CHILD, std.c.errno(again));
 }
 
 test "an fx home whose socket path is too long cannot share" {

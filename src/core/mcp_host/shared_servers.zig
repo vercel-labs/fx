@@ -209,6 +209,10 @@ pub const Shared = struct {
         const i = s.index(name) orelse return error.SharingUnavailable;
         const slot = &s.slots.items[i];
         if (slot.refused) return error.SharingUnavailable;
+        // A connection that closed since the last `take` is taken in first: its
+        // calls end, every slot registers again, and the register below goes to
+        // the next owner rather than a connection that is gone.
+        s.handleDisconnect();
         if (slot.registered and !s.disconnected) return slot;
         s.client.ensureReady(owner_start_wait_ms) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -353,12 +357,8 @@ pub const Shared = struct {
             s.client.takeFrames(&frames);
             defer frames.deinit(s.gpa);
             if (frames.items.len == 0) {
-                if (s.client.isClosed() and !s.disconnected) {
-                    s.disconnected = true;
-                    for (s.slots.items) |*slot| slot.registered = false;
-                    s.buildSlackEvents();
-                    if (s.pending.items.len > 0) continue;
-                }
+                s.handleDisconnect();
+                if (s.pending.items.len > 0) continue;
                 return null;
             }
             for (frames.items) |payload| {
@@ -366,6 +366,21 @@ pub const Shared = struct {
                 s.frame(payload);
             }
         }
+    }
+
+    /// The connection ended and the adapter has not taken it in yet: every
+    /// slot registers again on the next owner, each call in flight may have
+    /// run, and each listing in flight failed. Both `take` and `ensure` run
+    /// it, so a server asked for before the next `take` never leaves another
+    /// slot's call waiting on a connection that is gone.
+    fn handleDisconnect(s: *Shared) void {
+        if (!s.client.isClosed() or s.disconnected) return;
+        s.disconnected = true;
+        for (s.slots.items) |*slot| slot.registered = false;
+        s.buildSlackEvents();
+        // The lost calls are the runtime's to end: it hears now, not at its
+        // next timer.
+        s.options.wake.wake(s.options.wake.context);
     }
 
     /// A dropped connection: each call in flight may have run, and each
@@ -864,6 +879,85 @@ test "a refused tool list's words reach this session's status, and an accepted l
     const accepted: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
     try feedOwner(&shared, a, accepted);
     try testing.expectEqual(@as(?[]const u8, null), shared.status("fake").list_refusal);
+}
+
+test "a call in flight when the connection closes ends as lost, and its server registers again on the next owner" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "redial");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const first_owner = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop });
+    var first_joined = false;
+    defer if (!first_joined) {
+        stop.store(true, .release);
+        first_owner.join();
+    };
+    const path = try waitForSocket(alloc, home);
+    defer alloc.free(path);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{fixture.server};
+    // Two servers with two keys, so the second one's registration can come
+    // after the connection that carried the first one's call is gone.
+    try shared.add("a", .{ .name = "a", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try shared.add("b", .{ .name = "b", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try shared.needTools("a");
+    try testing.expect(try takeTools(&shared, "a"));
+
+    // A call that never answers, so it is in flight when the owner goes.
+    const handle = try shared.call("a", "slow", "{}");
+    const slow_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (fixture.slowCalls() == 0) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > slow_deadline) return error.CallNeverReachedServer;
+        // Polls for the fake server to note the call, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+
+    // The owner goes away with the call in flight.
+    stop.store(true, .release);
+    first_owner.join();
+    first_joined = true;
+    const closed_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (!shared.client.isClosed()) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > closed_deadline) return error.ClientNeverClosed;
+        // Polls for the reader to see the socket end, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+
+    // A new owner serves the same fx home.
+    var stop_next = std.atomic.Value(bool).init(false);
+    const next_owner = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop_next });
+    defer {
+        stop_next.store(true, .release);
+        next_owner.join();
+    }
+    const next_path = try waitForSocket(alloc, home);
+    alloc.free(next_path);
+
+    // The session asks for the other server first: the closed connection is
+    // taken in before it registers, so this slot's call ends now.
+    try shared.needTools("b");
+    var ended = false;
+    for (0..100) |_| {
+        const event = takeFor(&shared, "a", 200) orelse continue;
+        if (event.kind != .called) continue;
+        if (event.kind.called.call != handle) continue;
+        ended = event.kind.called.outcome == .lost;
+        break;
+    }
+    try testing.expect(ended);
+
+    // The first server registers again on the new owner, which lists it.
+    try shared.needTools("a");
+    try testing.expect(try takeTools(&shared, "a"));
 }
 
 test "a call through the owner answers, and two sessions get one process" {

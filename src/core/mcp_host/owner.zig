@@ -77,6 +77,9 @@ pub fn run(alloc: Allocator, fx_home: []const u8, client_version: []const u8) !v
 /// owned, because the frame's arena goes before the owner thread reads them.
 const ShellEvent = union(enum) {
     core: core.Event,
+    /// A registration, with the config it will run: kept until the route
+    /// table accepts the key, because a refused key stores nothing.
+    register: struct { registered: core.Registered, config: OwnedConfig },
     call: struct { client: core.ClientId, id: u32, key: core.Key, tool: []u8, arguments: ?[]u8 },
     respond: struct { client: core.ClientId, id: u32, values: []u8 },
     answer: struct { client: core.ClientId, key: core.Key, slot: u8, n: u32, action: mcp.elicitation.Action, content: ?[]u8 },
@@ -84,15 +87,33 @@ const ShellEvent = union(enum) {
     fn event(e: *const ShellEvent) core.Event {
         return switch (e.*) {
             .core => |only| only,
+            .register => |register| .{ .registered = register.registered },
             .call => |call| .{ .call = .{ .client = call.client, .id = call.id, .key = call.key, .tool = call.tool, .arguments = call.arguments } },
             .respond => |respond| .{ .respond = .{ .client = respond.client, .id = respond.id, .values = respond.values } },
             .answer => |answer| .{ .answer = .{ .client = answer.client, .key = answer.key, .slot = answer.slot, .n = answer.n, .action = answer.action, .content = answer.content } },
         };
     }
 
+    /// The config this event carried, when the route table took its key
+    /// (`register_slot`): the only case that stores one.
+    fn acceptedConfig(e: *ShellEvent, effects: []const core.Effect) ?*OwnedConfig {
+        const register = switch (e.*) {
+            .register => |*r| r,
+            else => return null,
+        };
+        for (effects) |effect| switch (effect) {
+            .register_slot => |slot| {
+                if (std.mem.eql(u8, &slot.key, &register.registered.key)) return &register.config;
+            },
+            else => {},
+        };
+        return null;
+    }
+
     fn deinit(e: *ShellEvent, gpa: Allocator) void {
         switch (e.*) {
             .core => {},
+            .register => |*register| register.config.deinit(gpa),
             .call => |call| {
                 gpa.free(call.tool);
                 if (call.arguments) |arguments| gpa.free(arguments);
@@ -232,6 +253,7 @@ const Owner = struct {
             .call => |c| c.client,
             .respond => |r| r.client,
             .answer => |a| a.client,
+            .register => |r| r.registered.client,
             .core => |e| switch (e) {
                 .hello => |id| id,
                 .registered => |r| r.client,
@@ -338,11 +360,20 @@ const Owner = struct {
                 o.disconnect(conn);
             },
             .writer => {
-                _ = conn.running.fetchSub(1, .acq_rel);
-                o.disconnect(conn);
+                // The writer never started, so it is not a task that can end
+                // itself: `running` still counts it while the group is
+                // cancelled, which keeps the reaper from freeing the
+                // connection under the cancel. Marked as the cancel `markLeft`
+                // would run, so the leave never cancels the group twice.
+                o.mutex.lockUncancelable(o.io);
+                const cancel = !conn.cancelled;
+                conn.cancelled = true;
+                o.mutex.unlock(o.io);
                 // The reader is blocked in the socket: cancel ends it there,
                 // and its own end drops `running` to 0.
-                conn.tasks.cancel(o.io);
+                if (cancel) conn.tasks.cancel(o.io);
+                _ = conn.running.fetchSub(1, .acq_rel);
+                o.disconnect(conn);
             },
         }
     }
@@ -436,7 +467,10 @@ const Owner = struct {
             conn.changed.broadcast(o.io);
             conn.mutex.unlock(o.io);
             o.gpa.free(frame);
-            if (over and !conn.gone) o.disconnect(conn);
+            // A queue over its cap ends this client's connection; `disconnect`
+            // reads `gone` under its own lock, so two writers never tell the
+            // route table twice.
+            if (over) o.disconnect(conn);
             return;
         }
         conn.queue.append(o.gpa, frame) catch |err| {
@@ -476,6 +510,22 @@ const Owner = struct {
             o.gpa.destroy(conn);
         }
     }
+
+    /// Frees what the owner holds at exit, including the events its loop never
+    /// took: each carries strings owned here, and a stop can leave any number
+    /// waiting.
+    fn deinit(o: *Owner) void {
+        const gpa = o.gpa;
+        o.engine_configs.deinit(gpa);
+        for (o.events.items) |*event| event.deinit(gpa);
+        o.events.deinit(gpa);
+        var iterator = o.configs.iterator();
+        while (iterator.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(gpa);
+        }
+        o.configs.deinit(gpa);
+    }
 };
 
 /// A registered server's config, owned by the owner process.
@@ -507,6 +557,14 @@ const OwnedConfig = struct {
         }
         gpa.free(c.auth.client_name);
         c.* = undefined;
+    }
+
+    /// Empties this config and returns what it held, so exactly one owner
+    /// frees it: `deinit` on the emptied value frees nothing.
+    fn take(c: *OwnedConfig) OwnedConfig {
+        const held = c.*;
+        c.* = .{ .argv = &.{}, .env = &.{}, .cwd = null, .timeouts = null, .auth = .{ .client_name = &.{} } };
+        return held;
     }
 };
 
@@ -583,33 +641,32 @@ fn slotOf(owner: *Owner, key: core.Key) ?usize {
     return null;
 }
 
-fn rememberConfig(owner: *Owner, key: core.Key, config: wire.ServerConfig) void {
-    // A reader thread of each connection registers here, so two clients may
-    // arrive at once; the map and its entries are shared with the owner loop.
-    const owned = ownConfig(owner.gpa, config) catch {
-        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory", .{});
-        return;
-    };
+/// Stores a config whose key the route table accepted, taking ownership of its
+/// strings. Only `register_slot` reaches this, so a registration the route
+/// table refused, or one for a key it already runs, stores nothing: the map
+/// cannot grow past the key limits.
+fn storeConfig(owner: *Owner, key: core.Key, config: OwnedConfig) void {
     const name = owner.gpa.dupe(u8, &key) catch {
-        var copy = owned;
+        var copy = config;
         copy.deinit(owner.gpa);
+        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
         return;
     };
     owner.configs_mutex.lockUncancelable(owner.io);
     defer owner.configs_mutex.unlock(owner.io);
     if (owner.configs.contains(&key)) {
         owner.gpa.free(name);
-        var copy = owned;
+        var copy = config;
         copy.deinit(owner.gpa);
         return;
     }
-    owner.configs.put(owner.gpa, name, owned) catch {
+    owner.configs.put(owner.gpa, name, config) catch {
         owner.gpa.free(name);
-        var copy = owned;
+        var copy = config;
         copy.deinit(owner.gpa);
+        debug_trace.logf("mcp-owner", "owner config dropped reason=out of memory key={s}", .{key[0..]});
     };
 }
-
 /// Serves until the last client has been gone for `exit_grace_ms` or `stop`
 /// is set. `error.LockBusy` means another owner holds the lock.
 pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.Value(bool), client_version: []const u8) !void {
@@ -682,14 +739,7 @@ pub fn serve(io: std.Io, gpa: Allocator, fx_home: []const u8, stop: *std.atomic.
     // The owner is stopping: the socket it served may already be gone, and the
     // next owner deletes any file left here before it listens.
     std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    var iterator = owner.configs.iterator();
-    while (iterator.next()) |entry| {
-        gpa.free(entry.key_ptr.*);
-        entry.value_ptr.deinit(gpa);
-    }
-    owner.configs.deinit(gpa);
-    owner.engine_configs.deinit(gpa);
-    owner.events.deinit(gpa);
+    owner.deinit();
 }
 
 fn ownerLoopTask(owner: *Owner) std.Io.Cancelable!void {
@@ -728,6 +778,9 @@ fn ownerLoop(owner: *Owner) void {
                 if (event == .gone) owner.markLeft(event.gone);
                 var output: core.Output = .{};
                 core.step(&state, event, &output);
+                // A key the route table took stores its config now, before the
+                // engine config is built from it; a refused key stores none.
+                if (shell_event.acceptedConfig(output.effects())) |config| storeConfig(owner, shell_event.register.registered.key, config.take());
                 _ = scratch.reset(.retain_capacity);
                 apply(owner, &state, &engine_value, &scratch, output.effects());
                 shell_event.deinit(gpa);
@@ -1082,8 +1135,17 @@ fn readerLoop(conn: *Connection) !void {
             .client => |client| switch (client) {
                 .hello => owner.push(.{ .core = .{ .hello = conn.id } }),
                 .register => |register| {
-                    rememberConfig(owner, register.key, register.config);
-                    owner.push(.{ .core = .{ .registered = .{ .client = conn.id, .key = register.key, .ask_form = register.ask_form, .ask_url = register.ask_url } } });
+                    // The config travels with the event: it is stored only
+                    // when the route table takes the key, so a refused or
+                    // over-limit registration never grows `configs`.
+                    const owned = ownConfig(owner.gpa, register.config) catch {
+                        debug_trace.logf("mcp-owner", "owner registration dropped reason=out of memory client={d}", .{@backingInt(conn.id)});
+                        return error.OutOfMemory;
+                    };
+                    owner.push(.{ .register = .{
+                        .registered = .{ .client = conn.id, .key = register.key, .ask_form = register.ask_form, .ask_url = register.ask_url },
+                        .config = owned,
+                    } });
                 },
                 .need => |need| owner.push(.{ .core = .{ .need = .{ .client = conn.id, .key = need.key } } }),
                 .unregister => |left| owner.push(.{ .core = .{ .unregister = .{ .client = conn.id, .key = left.key } } }),
@@ -1458,10 +1520,7 @@ test "the event list's cap drops the frame and still takes the connection's leav
     var stop = std.atomic.Value(bool).init(false);
     var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
     defer owner.engine_arena.deinit();
-    defer {
-        for (owner.events.items) |*event| event.deinit(alloc);
-        owner.events.deinit(alloc);
-    }
+    defer owner.deinit();
     const pair = try testSocketPair("cap");
     defer pair.peer.close(testing.io);
     const conn = try alloc.create(Connection);
@@ -1502,10 +1561,7 @@ test "a connection whose reader cannot start is reaped, not freed under the tabl
     var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
     owner.fail_task_start = .reader;
     defer owner.engine_arena.deinit();
-    defer {
-        for (owner.events.items) |*event| event.deinit(alloc);
-        owner.events.deinit(alloc);
-    }
+    defer owner.deinit();
     const pair = try testSocketPair("no-reader");
     defer pair.peer.close(testing.io);
 
@@ -1526,16 +1582,16 @@ test "a connection whose writer cannot start ends its reader and is reaped" {
     var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
     owner.fail_task_start = .writer;
     defer owner.engine_arena.deinit();
-    defer {
-        for (owner.events.items) |*event| event.deinit(alloc);
-        owner.events.deinit(alloc);
-    }
+    defer owner.deinit();
     const pair = try testSocketPair("no-writer");
     defer pair.peer.close(testing.io);
 
     try owner.addConnection(pair.server);
     const conn = owner.connections[0] orelse return error.ConnectionGone;
     try testing.expect(conn.gone and conn.closed);
+    // The writer failure cancelled the group itself, and marked that cancel,
+    // so the leave below never cancels it a second time.
+    try testing.expect(conn.cancelled);
     // The reader task ended by the group's cancel: no task runs, and the
     // reader never read from the stream after it was freed.
     try testing.expectEqual(@as(u8, 0), conn.running.load(.acquire));
@@ -1549,10 +1605,7 @@ test "a client the owner disconnects is ended, reaped, and its id used again" {
     var stop = std.atomic.Value(bool).init(false);
     var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
     defer owner.engine_arena.deinit();
-    defer {
-        for (owner.events.items) |*event| event.deinit(alloc);
-        owner.events.deinit(alloc);
-    }
+    defer owner.deinit();
     const first = try testSocketPair("owner-drop-1");
     defer first.peer.close(testing.io);
     try owner.addConnection(first.server);
@@ -1595,6 +1648,48 @@ test "a client the owner disconnects is ended, reaped, and its id used again" {
     owner.markLeft(next.id);
     owner.reapConnections();
     try testing.expect(owner.connections[0] == null);
+}
+
+test "a registration the route table refuses stores no config, so the map stays at the key limit" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    defer owner.engine_arena.deinit();
+    defer owner.deinit();
+    const id: core.ClientId = @fromBackingInt(1);
+    var state: core.State = .{};
+    var hello: core.Output = .{};
+    core.step(&state, .{ .hello = id }, &hello);
+    // Two keys past the limit: the route table refuses those, and a refused
+    // registration must store nothing, or one client could grow `configs`
+    // without a cap.
+    for (0..core.max_keys_per_client + 2) |n| {
+        var key: core.Key = undefined;
+        @memcpy(&key, &test_key);
+        std.mem.writeInt(u32, key[28..32], @intCast(n), .big);
+        var event: ShellEvent = .{ .register = .{
+            .registered = .{ .client = id, .key = key, .ask_form = true, .ask_url = true },
+            .config = try ownConfig(alloc, .{ .argv = &.{"server"} }),
+        } };
+        var output: core.Output = .{};
+        core.step(&state, event.event(), &output);
+        if (event.acceptedConfig(output.effects())) |config| storeConfig(&owner, key, config.take());
+        event.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, core.max_keys_per_client), owner.configs.count());
+}
+
+test "an event still queued when the owner stops is freed with its strings" {
+    const alloc = testing.allocator;
+    var stop = std.atomic.Value(bool).init(false);
+    var owner: Owner = .{ .io = testing.io, .gpa = alloc, .stop = &stop, .client_version = test_client_version, .engine_arena = .init(alloc) };
+    defer owner.engine_arena.deinit();
+    const tool = try alloc.dupe(u8, "echo");
+    const arguments = try alloc.dupe(u8, "{}");
+    owner.push(.{ .call = .{ .client = @fromBackingInt(1), .id = 1, .key = test_key, .tool = tool, .arguments = arguments } });
+    // A stop can land with events the loop never takes: their strings are this
+    // allocator's, so one left behind fails this test as a leak.
+    owner.deinit();
 }
 
 test "two clients registered for one key share one server process" {
