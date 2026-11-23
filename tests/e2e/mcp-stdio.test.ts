@@ -2739,10 +2739,14 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       });
       await tui.waitForComposer(15_000);
       await tui.waitForText("MCP failure detail complete.", 15_000);
-      // The row has no reason after a resume: core's resumed status keeps no
-      // cause, and the row does not read one from the call's saved MCP
-      // result. On main the resumed row has no reason either.
-      expect(compactRows(await tui.captureFullScrollback())).toEqual([...live.slice(0, -1), `└ Couldn't use ${TOOL_ROW}`]);
+      // The row keeps its reason after a resume: core's resumed line reads
+      // the cause from the call's saved result, as the live line did, and
+      // Ctrl+O shows that line.
+      expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
+      await tui.sendKeys("C-o");
+      await tui.waitForText(`Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`, 10_000);
+      await tui.sendKeys("Escape");
+      await tui.waitForComposer(10_000);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
       await tui.kill();
       tui = null;
@@ -2827,8 +2831,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   );
 
   // A server whose name holds a "_" or a space gives an alias that could be
-  // another server's tool, as my_srv's echo could be my's srv_echo. With no
-  // result to name the server, the row names none rather than the wrong one.
+  // another server's tool, as my_srv's echo could be my's srv_echo. The
+  // session records the server and tool of each call it makes, so its rows
+  // name them in every state, live and after a resume, before the server
+  // connects again.
   function renameFixtureServer(root: FixtureRoot, name: string): string {
     const configPath = join(root.home, ".fx", "mcp.json");
     const config = JSON.parse(readFileSync(configPath, "utf8")) as { mcp: Record<string, unknown> };
@@ -2851,6 +2857,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
   for (const server of ["my_srv", "Team notes"]) {
     const label = server.replace(/[^A-Za-z0-9]/g, "-").toLowerCase();
+    const serverName = server.charAt(0).toUpperCase() + server.slice(1);
 
     test.skipIf(!tmuxAvailable())(
       `the TUI names ${server} once a call's result names it, live and after a resume`,
@@ -2870,7 +2877,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         await tui.waitForText(finalText, 20_000);
         await tui.waitForStableComposer(10_000);
         const live = compactRows(await tui.captureFullScrollback());
-        const serverName = server.charAt(0).toUpperCase() + server.slice(1);
         expect(live).toContain(`└ Used ${serverName} to echo`);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await tui.sendText("/quit");
@@ -2889,27 +2895,27 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     );
 
     test.skipIf(!tmuxAvailable())(
-      `the TUI names no server for a held call on ${server}, whose alias could be another server's`,
+      `the TUI names ${server} for a held call, whose alias could be another server's, live and after a resume`,
       async () => {
         const root = createRoot(`tui-held-${label}`, MODERN_FIXTURE, { expectedElicitation: "both" });
         const alias = renameFixtureServer(root, server);
-        const finalText = "HELD_UNNAMED_SERVER_COMPLETE";
+        const finalText = "HELD_NAMED_SERVER_COMPLETE";
         const activeGateway = startAliasGateway(alias, finalText, "caution");
         gateway = activeGateway;
-        await expectUnrunCallRows(root, activeGateway, finalText, "Didn't use an MCP tool · safety caution", { alias });
+        await expectUnrunCallRows(root, activeGateway, finalText, `Didn't use ${serverName} to echo · safety caution`, { alias });
       },
       45_000,
     );
 
     test.skipIf(!tmuxAvailable())(
-      `the TUI names no server for a denied call on ${server}, whose alias could be another server's`,
+      `the TUI names ${server} for a denied call, whose alias could be another server's, live and after a resume`,
       async () => {
         const root = createRoot(`tui-denied-${label}`, MODERN_FIXTURE, { expectedElicitation: "both" });
         const alias = renameFixtureServer(root, server);
-        const finalText = "DENIED_UNNAMED_SERVER_COMPLETE";
+        const finalText = "DENIED_NAMED_SERVER_COMPLETE";
         const activeGateway = startAliasGateway(alias, finalText);
         gateway = activeGateway;
-        await expectUnrunCallRows(root, activeGateway, finalText, "Didn't use an MCP tool · denied", {
+        await expectUnrunCallRows(root, activeGateway, finalText, `Didn't use ${serverName} to echo · denied`, {
           alias,
           env: { FX_PERMISSION_MODE: "ask" },
           answer: async (session) => {
@@ -2922,7 +2928,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     );
 
     test.skipIf(!tmuxAvailable())(
-      `the TUI names no server for a running, then cancelled, call on ${server}`,
+      `the TUI names ${server} for a running, then cancelled, call`,
       async () => {
         const root = createRoot(`tui-cancel-${label}`, MODERN_FIXTURE, {
           mode: "stall_operation",
@@ -2930,7 +2936,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
           expectedElicitation: "both",
         });
         const alias = renameFixtureServer(root, server);
-        const activeGateway = startAliasGateway(alias, "CANCELLED_UNNAMED_SERVER_COMPLETE");
+        const activeGateway = startAliasGateway(alias, "CANCELLED_NAMED_SERVER_COMPLETE");
         gateway = activeGateway;
         const compactRows = (screen: string) =>
           screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
@@ -2939,16 +2945,16 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
         await tui.waitForComposer(15_000);
         await tui.sendText("Call the stalled MCP fixture.");
-        await tui.waitForText("└ Using an MCP tool", 20_000);
+        await tui.waitForText(`└ Using ${serverName} to echo`, 20_000);
         // The call reaches the server, so the session keeps it for the resume.
         await tui.waitForPane(() => readWire(root.wireLogPath).some((entry) => entry.message.method === "tools/call"), 15_000);
         await tui.sendInterruptEscapePair(10_000);
-        await tui.waitForText("Cancelled using an MCP tool", 10_000);
+        await tui.waitForText(`Cancelled using ${serverName} to echo`, 10_000);
         await tui.waitForStableComposer(10_000);
         const live = compactRows(await tui.captureFullScrollback());
-        expect(live).toContain("└ Cancelled using an MCP tool");
-        expect(live).toContain("▪ Cancelled using an MCP tool · What can fx do differently?");
-        expect(live.filter((line) => / to (srv|notes) /.test(line) || line.includes("My to") || line.includes("Team to"))).toEqual([]);
+        expect(live).toContain(`└ Cancelled using ${serverName} to echo`);
+        expect(live).toContain(`▪ Cancelled using ${serverName} to echo · What can fx do differently?`);
+        expect(live.filter((line) => line.includes("an MCP tool"))).toEqual([]);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await tui.sendText("/quit");
         expect(await tui.waitForSessionEnd(10_000)).toBe(true);
@@ -2956,9 +2962,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         const resumedStderrPath = join(root.root, "resumed-stderr.log");
         tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
         await tui.waitForComposer(15_000);
-        // A resume shows no row for a call cancelled while it ran: core keeps
-        // no line for it, as Ctrl+O shows too. Only the turn's notice comes
-        // back, so no row can name a server either.
+        // A resume shows no row yet for a call cancelled while it ran: core's
+        // replay writes no line for any such call, as Ctrl+O shows too, and
+        // only the turn's notice comes back.
         await tui.waitForText("▪ Cancelled · What can fx do differently?", 15_000);
         expect(compactRows(await tui.captureFullScrollback())).toEqual([`● Opened ${alias}`, "▪ Cancelled · What can fx do differently?"]);
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -2968,6 +2974,125 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       45_000,
     );
   }
+
+  // The alias of `tool` on `server`, as fx spells it: every byte outside
+  // letters, digits, "_", and "-" becomes "_", cut at 64 bytes
+  // (src/core/mcp/tool_names.zig).
+  function aliasOf(server: string, tool: string): string {
+    const spell = (text: string) => Array.from(new TextEncoder().encode(text)).map((byte) => (byte < 128 && /[A-Za-z0-9_-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : "_")).join("");
+    return `mcp_${spell(server)}_${spell(tool)}`.slice(0, 64);
+  }
+
+  // Serves the fixture as `server`, with `environment` added to its own.
+  function configureFixtureServer(root: FixtureRoot, server: string, environment: Record<string, string>) {
+    const configPath = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { mcp: Record<string, { environment: Record<string, string> }> };
+    const entry = config.mcp.fixture;
+    entry.environment = { ...entry.environment, ...environment };
+    config.mcp = { [server]: entry };
+    writeFileSync(configPath, JSON.stringify(config));
+  }
+
+  // Runs one call of `alias`, then checks its row live, the same rows after a
+  // resume, and that Ctrl+O still shows core's own line with the alias.
+  async function expectNamedCallRow(root: FixtureRoot, alias: string, decision: "clear" | "caution", row: string, coreLine: string) {
+    const finalText = "NAMED_CALL_DONE";
+    const activeGateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: alias }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: alias, arguments: { text: "hello" } }),
+      fakeGatewayFinalText(finalText),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }], classifierDecision: decision });
+    gateway = activeGateway;
+    const compactRows = (screen: string) => screen.split("\n").map((line) => line.trim()).filter((line) => /^[●├└▪] /.test(line));
+    const stderrPath = join(root.root, "stderr.log");
+    const env = fixtureEnv(root, activeGateway);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MCP tool.");
+    await tui.waitForText(finalText, 25_000);
+    await tui.waitForStableComposer(10_000);
+    const live = compactRows(await tui.captureFullScrollback());
+    expect(live).toContain(row);
+    // A group's header counts "an MCP tool"; no call's row names one.
+    expect(live.filter((line) => /^[├└] /.test(line) && line.includes("an MCP tool") && !row.includes("an MCP tool"))).toEqual([]);
+    // No byte of a server's name reaches the terminal as a control.
+    expect(await tui.capturePaneEscapes()).not.toContain("\u001b]0;PWN");
+    await tui.sendKeys("C-o");
+    expect(await tui.waitForText(coreLine, 10_000)).toContain(coreLine);
+    await tui.sendKeys("Escape");
+    await tui.waitForComposer(10_000);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await tui.sendText("/quit");
+    expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+
+    const resumedStderrPath = join(root.root, "resumed-stderr.log");
+    tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
+    await tui.waitForComposer(15_000);
+    await tui.waitForText(finalText, 15_000);
+    expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
+    expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    await tui.kill();
+    tui = null;
+  }
+
+  // Names a review found read wrong, or as no server, before each call's
+  // server and tool were recorded.
+  const namedCalls: Array<{ label: string; server: string; tool: string; decision: "clear" | "caution"; row: string }> = [
+    { label: "a server with a _", server: "my_srv", tool: "echo", decision: "clear", row: "└ Used My_srv to echo" },
+    { label: "a server with a _, held", server: "my_srv", tool: "echo", decision: "caution", row: "└ Didn't use My_srv to echo · safety caution" },
+    { label: "a server with a space, held", server: "Team notes", tool: "echo", decision: "caution", row: "└ Didn't use Team notes to echo · safety caution" },
+    { label: "a camelCase tool", server: "fixture", tool: "getHTTPStatus", decision: "clear", row: "└ Used Fixture to get http status" },
+    { label: "a tool named as its server", server: "fixture", tool: "fixture", decision: "clear", row: "└ Used Fixture to fixture" },
+    { label: "a tool that repeats its server", server: "fixture", tool: "fixture_list_items", decision: "clear", row: "└ Used Fixture to list items" },
+    { label: "digits", server: "1password", tool: "item2Get_v3", decision: "clear", row: "└ Used 1password to item2 get v3" },
+    { label: "a unicode tool", server: "fixture", tool: "café_list", decision: "clear", row: "└ Used Fixture to café list" },
+    { label: "a unicode server", server: "ünï", tool: "echo", decision: "clear", row: "└ Used ünï to echo" },
+    { label: "a unicode server, held", server: "ünï", tool: "echo", decision: "caution", row: "└ Didn't use ünï to echo · safety caution" },
+    { label: "a tool whose alias is cut at 64 bytes", server: "fixture", tool: "a_very_long_tool_name_that_goes_well_beyond_the_sixty_four_byte_alias_limit", decision: "clear", row: "└ Used Fixture to a very long tool name that goes well beyond the sixty four byte alias limit" },
+  ];
+  for (const call of namedCalls) {
+    test.skipIf(!tmuxAvailable())(
+      `the TUI names the server and tool of a call for ${call.label}, live and after a resume`,
+      async () => {
+        const root = createRoot("tui-named-call", MODERN_FIXTURE, { expectedElicitation: "both" });
+        configureFixtureServer(root, call.server, { FX_MCP_INITIAL_TOOL_NAME: call.tool });
+        const alias = aliasOf(call.server, call.tool);
+        await expectNamedCallRow(root, alias, call.decision, call.row, `${call.decision === "caution" ? "Safety caution" : "Ran MCP"} ${alias}`);
+      },
+      60_000,
+    );
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI names a server whose name the terminal would act on, escaped, and sends no control",
+    async () => {
+      const root = createRoot("tui-named-call-hostile", MODERN_FIXTURE, { expectedElicitation: "both" });
+      const server = "bad\u001b]0;PWN\u0007srv";
+      configureFixtureServer(root, server, {});
+      const alias = aliasOf(server, "echo");
+      // fx serves no tool of a server with that name, so the call fails and
+      // its row, which no catalog or record names, names no server.
+      await expectNamedCallRow(root, alias, "clear", `└ Couldn't use an MCP tool · No tool named ${alias} is in the toolbox`, `Failed ${alias}`);
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI names a tool whose alias took a _2 for a name another tool had, live and after a resume",
+    async () => {
+      const root = createRoot("tui-named-call-collision", MODERN_FIXTURE, { expectedElicitation: "both" });
+      // get.item and get_item both spell mcp_fixture_get_item, so the second
+      // in the list is mcp_fixture_get_item_2.
+      const tool = (name: string) => ({ name, description: "Echo text", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } });
+      const list = { resultType: "complete", tools: [tool("get.item"), tool("get_item")], ttlMs: 60_000, cacheScope: "public" };
+      configureFixtureServer(root, "fixture", { FX_MCP_LIST_REPLY: `"result":${JSON.stringify(list)}` });
+      await expectNamedCallRow(root, "mcp_fixture_get_item_2", "clear", "└ Used Fixture to get item", "Ran MCP mcp_fixture_get_item_2");
+      const calls = readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call");
+      expect(calls.map((entry) => (entry.message.params as { name?: string }).name)).toEqual(["get_item"]);
+    },
+    60_000,
+  );
+
 
   test.skipIf(!tmuxAvailable())(
     "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",

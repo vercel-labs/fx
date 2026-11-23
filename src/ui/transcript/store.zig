@@ -1978,6 +1978,10 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .call_id = try alloc.dupe(u8, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const mcp_server = if (source.mcp_server) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (mcp_server) |value| alloc.free(value);
+    const mcp_tool = if (source.mcp_tool) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (mcp_tool) |value| alloc.free(value);
 
     return .{
         .entry_id = source.entry_id,
@@ -2003,6 +2007,8 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .subagent_report = source.subagent_report,
         .check_found_command_ended = source.check_found_command_ended,
         .subagent_started = source.subagent_started,
+        .mcp_server = mcp_server,
+        .mcp_tool = mcp_tool,
     };
 }
 
@@ -2035,6 +2041,24 @@ test "a snapshot copy of a shell check keeps whether it found its command ended"
         defer copy.deinit(alloc);
         try std.testing.expectEqual(ended, copy.check_found_command_ended);
     }
+}
+
+test "a snapshot copy of an MCP call keeps the server and tool core named" {
+    const alloc = std.testing.allocator;
+    var copy = try cloneToolDetailForSnapshot(alloc, .{
+        .entry_id = 5,
+        .tool_name = @constCast("toolbox"),
+        .activity_kind = .mcp,
+        .arguments_json = @constCast("{\"run\":\"mcp_my_srv_echo\"}"),
+        .mcp_server = @constCast("my_srv"),
+        .mcp_tool = @constCast("echo"),
+    });
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("my_srv", copy.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", copy.mcp_tool.?);
+    var unnamed = try cloneToolDetailForSnapshot(alloc, .{ .entry_id = 6, .tool_name = @constCast("read_file") });
+    defer unnamed.deinit(alloc);
+    try std.testing.expect(unnamed.mcp_server == null and unnamed.mcp_tool == null);
 }
 
 test "a snapshot copy of a tool detail keeps its subagent start mark" {

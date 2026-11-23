@@ -2801,6 +2801,10 @@ const App = struct {
         try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
+    pub fn attachHistoricalMcpToolName(self: *App, entry_id: u32, name: types.McpToolName) !void {
+        try self.shell.attachHistoricalMcpToolName(self.alloc, entry_id, name);
+    }
+
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {
         self.shell.attachHistoricalCommandOutput(self.alloc, entry_id);
     }
