@@ -476,10 +476,10 @@ pub const Runtime = struct {
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
-    /// A fetch is running. Only the first load for an access shows as
-    /// `.loading`; a revalidation or retry leaves the state readers see alone.
-    /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
-    /// catalog's retry, and on nothing else but a first load.
+    /// A fetch is running. The first load sets `.loading`. A retry keeps
+    /// `.failed`, so a request waits only `failed_catalog_retry_wait_ms` for
+    /// it; `isLoading` reports the retry to the picker. A revalidation of a
+    /// ready catalog leaves the state alone.
     fetch_in_flight: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
@@ -776,11 +776,18 @@ pub const Runtime = struct {
         diagnostics.recordModelCatalogEvent(false, .load, "outcome=adopted entries={d}", .{entries});
     }
 
+    /// True while a fetch runs and no catalog is ready to show: the first load,
+    /// or a retry of a failed catalog. A revalidation of a ready catalog is not
+    /// loading, so readers keep showing the models they have.
     pub fn isLoading(self: *Self) bool {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        return self.state == .loading;
+        return switch (self.state) {
+            .loading => true,
+            .failed => self.fetch_in_flight,
+            .idle, .ready => false,
+        };
     }
 
     pub fn openMenu(self: *Self) !void {
@@ -1613,7 +1620,7 @@ test "model cache retries a failed catalog behind the failed state so requests w
     runtime.startWarmup(source.provider(), public, .activity);
     try std.testing.expect(fetchInFlight(&runtime));
     try std.testing.expect(runtime.isFailed());
-    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expect(runtime.isLoading());
 
     // A set cancel flag fails any wait at once, so the error proves the
     // request waits on the retry.
@@ -1635,6 +1642,72 @@ test "model cache retries a failed catalog behind the failed state so requests w
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
     try std.testing.expectEqualStrings("first", runtime.catalogModelCompletion("first").?);
     try std.testing.expectEqual(@as(u32, 0), runtime.failure_streak);
+}
+
+test "model catalog loading follows each fetch: first load, failed retry, and background refresh" {
+    const public: credentials.CatalogAccess = .{ .public_only = .no_credential };
+    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    defer runtime.deinit();
+    var source = GatedCatalog{ .fail = true };
+
+    // The first load is loading while it runs, then fails with no retry in flight.
+    source.open.store(false, .seq_cst);
+    runtime.startWarmup(source.provider(), public, .activity);
+    try std.testing.expectEqual(ModelCacheState.loading, runtime.state);
+    try std.testing.expect(runtime.isLoading());
+    try std.testing.expect(!runtime.isFailed());
+    source.open.store(true, .seq_cst);
+    try waitForFetchToSettle(&runtime);
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expectEqual(ModelCacheState.failed, runtime.state);
+    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expect(runtime.isFailed());
+
+    // A retry from failed keeps the failed state, so requests keep their bounded
+    // wait, and the picker shows loading while it runs. The retry fails again.
+    source.open.store(false, .seq_cst);
+    runtime.retry_not_before_ms = model_catalog.clockMs();
+    runtime.startWarmup(source.provider(), public, .activity);
+    try std.testing.expect(fetchInFlight(&runtime));
+    try std.testing.expectEqual(ModelCacheState.failed, runtime.state);
+    try std.testing.expect(runtime.isLoading());
+    try std.testing.expect(runtime.isFailed());
+    source.open.store(true, .seq_cst);
+    try waitForFetchToSettle(&runtime);
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expectEqual(ModelCacheState.failed, runtime.state);
+    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expect(runtime.isFailed());
+    try std.testing.expectEqual(@as(u32, 2), runtime.failure_streak);
+
+    // The next retry succeeds: the catalog lands and the picker stops loading.
+    source.fail = false;
+    source.open.store(false, .seq_cst);
+    runtime.retry_not_before_ms = model_catalog.clockMs();
+    runtime.startWarmup(source.provider(), public, .activity);
+    try std.testing.expect(runtime.isLoading());
+    source.open.store(true, .seq_cst);
+    try waitForFetchToSettle(&runtime);
+    try std.testing.expect(try runtime.pollLoadTransition());
+    try std.testing.expectEqual(ModelCacheState.ready, runtime.state);
+    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expect(!runtime.isFailed());
+    try std.testing.expectEqualStrings("first", runtime.catalogModelCompletion("first").?);
+
+    // A background refresh of the ready catalog is not loading: the loaded models
+    // stay on screen until the refresh lands.
+    source.model_id = "second";
+    source.open.store(false, .seq_cst);
+    runtime.last_attempt_ms -= picker_revalidate_floor_ms;
+    runtime.startWarmup(source.provider(), public, .picker_open);
+    try std.testing.expect(fetchInFlight(&runtime));
+    try std.testing.expectEqual(ModelCacheState.ready, runtime.state);
+    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expectEqualStrings("first", runtime.catalogModelCompletion("first").?);
+    source.open.store(true, .seq_cst);
+    try waitForFetchToSettle(&runtime);
+    try std.testing.expect(try runtime.pollLoadTransition());
+    try std.testing.expectEqualStrings("second", runtime.catalogModelCompletion("second").?);
 }
 
 test "model catalog failures back off every trigger until a success or access change" {
