@@ -2269,40 +2269,11 @@ as it was sent):
   `fx ask` and through ACP; the fx E2E session suite and
   `sdk/tests/test-term-session-resume.mjs`.
 - **Regression:** the E2E suite; the startup benchmark unchanged.
-- **D102 Decision (amends D44 and D48):** a small body that a tool result,
-  a command's output, a compaction record, or a moved side file keeps is
-  packed in its session's pack, `blobs.pack`, and gets no blob file of its
-  own. A body is small when it is at most 4 KiB. A pack record is a 44-byte
-  header (magic, the body's SHA-256, its length, its CRC-32C) and the body.
-  A larger body, and every body a tool or the model opens by path (a prompt
-  image, a web-fetch download, D49), stays a blob file. A line that names a
-  packed body is written at format version 2, so an older reader opens that
-  session read-only and never rewrites it (R3.5). The pack is synced before
-  any line that names one of its records, so no durable line names a record
-  that a crash can lose (`tests/tla/session_store/SmallBlobs.tla`
-  `Dangling`). A writable open cuts only a torn tail: an incomplete last
-  record, or a last record whose CRC fails with nothing after it. A damaged
-  body in the middle is reported by verify and is never cut, and the later
-  bodies still read. A damaged header in the middle (bad magic) makes the
-  session read-only: the writer refuses to open it and cuts nothing, and
-  readers keep the bodies before the damage. A fork copies the pack, and an
-  append to either side never reaches the other. Readers build one index
-  per session from the record headers and read each body with one seek.
-  Reason: a small body under D44 costs a file and two syncs; the pack costs
-  one sync per batch.
-  A damaged record is classified on the writable open only. When the walk
-  stops at a bad header, a length past EOF, or a zeroed tail, the open looks
-  for a complete record after it. None means a torn tail, and the pack is
-  cut there. A complete record after it makes the log decide: if a durable
-  line names a body that the good prefix lacks and that is not a blob file,
-  the open is refused read-only and nothing is cut. Otherwise the batch was
-  unsynced, and it is cut. Readers that miss a body in a cached index rebuild
-  that index once and retry before they report it, so a pack cut and regrown
-  to the same length cannot produce a false damage report.
-  A moved side file that the move copies from disk stays a blob file: no
-  pack copy of it exists yet. The moved bodies the adapter already holds in
-  memory, and their map, are packed. Forks copy the pack with a byte copy;
-  `clonefile` is a follow-up.
+- **D102 Decision (amends D44 and D48):** a small body that a tool result, a command's output, a compaction record, or a moved body held in memory keeps is packed in its session's pack, `blobs.pack`, and gets no blob file of its own. A body is small when it is at most 4 KiB. A pack record is a 44-byte header (magic, the body's SHA-256, its length, its CRC-32C) and the body. A larger body stays a blob file, and so does every body a tool or the model opens by path: a prompt image, a web-fetch download (D49), a command replay (its reader opens it as a file), and a moved side file that the move copies from disk. Every line that a session writes once it has a pack is written at format version 2, snapshots included, so an older reader opens such a session read-only and never rewrites it (R3.5). The pack is synced before any line that names one of its records, so no durable line names a record that a crash can lose (`tests/tla/session_store/SmallBlobs.tla`, `Dangling`).
+  On a writable open the walk stops at the first record it cannot read whole: a bad header, a length past EOF, a zeroed tail, or a last record whose CRC fails. A damaged body in the middle, with a sane header, is reported by verify and never cut, and later bodies still read. At the stop the log decides. If a durable line names a body that the good prefix lacks and that is not a blob file, the open is refused read-only and nothing is cut (`pack_refused`, with the record's offset). The next step is `fx session recover <id>`. Otherwise no line names anything at or after the damage, so it is a torn or unsynced batch and the pack is cut there (`pack_cut`, with the bytes cut). Names come only from the `blobs` lists of parsed lines, read through the log's chunked reader. A line that cannot be parsed refuses the cut. A reader that finds an incomplete trailing record treats it as not written yet and cuts nothing.
+  Readers keep one index per session. A read that misses a packed body in a cached index rebuilds that index once per pack length and retries. A second miss at that length reports at once, so a missing hash costs one walk. A fork's search checks every reference through one index, so the pack is walked once per search, not once per reference. A fork copies the pack with a byte copy; `clonefile` is a follow-up.
+  A build without packs, the wasm core, which has no session folder (its JS host keeps sessions, and its WASI shim has no preopened folder), stores every body as a blob file and compiles the pack out.
+  Reason: a small body under D44 costs a file and two syncs; the pack costs one sync per batch.
 
 ## Implementation Freedom
 

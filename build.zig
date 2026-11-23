@@ -131,7 +131,7 @@ pub fn build(b: *std.Build) void {
     const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
     // And with its fault and trace hooks, whose tests fx's build leaves out.
     const session_manager_hook_tests = b.addTest(.{
-        .root_module = sessionManagerModule(b, target, optimize, null, true, fuzz_corpora),
+        .root_module = sessionManagerModule(b, target, optimize, null, true, true, fuzz_corpora),
     });
     session_manager_hook_tests.root_module.sanitize_thread = sanitize_thread;
     if (sanitize_thread and target.result.os.tag == .linux and
@@ -161,6 +161,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
     test_step.dependOn(&run_session_manager_hook_tests.step);
+    // A build without packs, as the wasm core is: only its test that checks
+    // the file path runs here, since the rest of the suite checks the pack.
+    const session_manager_nopack_tests = b.addTest(.{
+        .root_module = sessionManagerModule(b, target, optimize, null, false, false, fuzz_corpora),
+        .filters = &.{"a non-pack build"},
+    });
+    const run_session_manager_nopack_tests = b.addRunArtifact(session_manager_nopack_tests);
+    session_manager_test_step.dependOn(&run_session_manager_nopack_tests.step);
+    test_step.dependOn(&run_session_manager_nopack_tests.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
 
     const fuzz_step = b.step(
@@ -528,22 +537,28 @@ fn addSessionManager(
     single_threaded: ?bool,
     fuzz_corpora: []const FuzzCorpus,
 ) *std.Build.Module {
-    const module = sessionManagerModule(b, target, optimize, single_threaded, false, fuzz_corpora);
+    // The wasm core has no session folder, so it builds without packs.
+    const packs = !target.result.cpu.arch.isWasm();
+    const module = sessionManagerModule(b, target, optimize, single_threaded, false, packs, fuzz_corpora);
     importer.addImport("session_manager", module);
     return module;
 }
 
 /// `hooks` compiles in the fault and trace hooks, which only tests use.
+/// `packs` compiles in the small-body pack (`pack.zig`); without it every
+/// body is a file.
 fn sessionManagerModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     single_threaded: ?bool,
     hooks: bool,
+    packs: bool,
     fuzz_corpora: []const FuzzCorpus,
 ) *std.Build.Module {
     const options = b.addOptions();
     options.addOption(bool, "hooks", hooks);
+    options.addOption(bool, "session_packs", packs);
     options.addOptionPathUntracked("trace_dir", b.graph.path(.install_prefix, "session-manager-traces"));
     options.addOptionPathUntracked("src_dir", b.path("src/core/session_manager"));
     for (fuzz_corpora) |corpus| {

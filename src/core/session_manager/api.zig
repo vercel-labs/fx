@@ -812,6 +812,7 @@ test {
     _ = @import("log.zig");
     _ = @import("fold.zig");
     _ = @import("session.zig");
+    _ = @import("pack.zig");
     _ = @import("catalog.zig");
     // Fault injection and traces exist only with -Dhooks=true.
     if (storage.hooks) {

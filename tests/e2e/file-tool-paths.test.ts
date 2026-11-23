@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -698,6 +697,9 @@ describe("filesystem path handling", () => {
       const firstGateway = startFakeGateway(
         [
           toolCall("read_image_1", "read_file", { path: "pixel.png" }),
+          // A later packed result keeps the image record mid-pack. Damage at
+          // the end of the pack would open the session read-only instead.
+          toolCall("read_note_1", "read_file", { path: "note.txt" }),
           finalText("image stored"),
         ],
         { modelTags: ["tool-use", "vision", "file-input"], contextWindow: 4_000_000 },
@@ -709,6 +711,7 @@ describe("filesystem path handling", () => {
           join(root.workspace, "pixel.png"),
           Buffer.from(pngBase64, "base64"),
         );
+        writeFileSync(join(root.workspace, "note.txt"), "a later note\n");
         const first = await runFx(
           ["ask", "--auto", "--json", "Read pixel.png once, then stop."],
           {
@@ -725,13 +728,17 @@ describe("filesystem path handling", () => {
       } finally {
         firstGateway.stop();
       }
-      // The stored image is one of the session's blobs; damage it on disk.
-      const blobs = join(sessionDir(root.home, sessionId), "blobs");
-      const stored = readdirSync(blobs).filter((name) => readFileSync(join(blobs, name), "utf8").includes(pngBase64));
-      expect(stored).toHaveLength(1);
-      const artifact = join(blobs, stored[0]!);
-      chmodSync(artifact, 0o600);
-      writeFileSync(artifact, "this is not valid stored image json");
+      // A stored result this small is packed in the session's `blobs.pack`,
+      // not a file: nothing reads a tool image by path (its handle is read
+      // through `get`), so the damage goes into the packed record in place.
+      const pack = join(sessionDir(root.home, sessionId), "blobs.pack");
+      const packed = readFileSync(pack);
+      const at = packed.indexOf(pngBase64);
+      expect(at).toBeGreaterThan(0);
+      expect(packed.indexOf(pngBase64, at + 1)).toBe(-1);
+      chmodSync(pack, 0o600);
+      packed.fill("X", at, at + 8);
+      writeFileSync(pack, packed);
 
       const secondGateway = startFakeGateway(
         [finalText("looked for the earlier image")],

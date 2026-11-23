@@ -5,10 +5,18 @@
 
 const std = @import("std");
 const testing = std.testing;
+const build_options = @import("build_options");
 const log_mod = @import("log.zig");
 const storage = @import("storage.zig");
 
 const crc32c = log_mod.crc32c;
+
+/// Whether this build packs small bodies. The one switch: a build without
+/// packs (the wasm core) stores every body as a file and never reads a pack,
+/// so the compiler drops this file's code from it. The wasm core has no
+/// session folder: its JS host keeps sessions, and its WASI shim has no
+/// preopened folder.
+pub const enabled = build_options.session_packs;
 
 pub const file_name = "blobs.pack";
 pub const magic = "FXB1";
@@ -70,7 +78,7 @@ pub fn parseHeader(bytes: []const u8) error{Corrupt}!?Header {
 
 /// The end of the last complete record in `bytes`. A record cut short by a
 /// crash is torn and is not counted. Damage followed by more data is corrupt.
-pub fn walkBytes(bytes: []const u8) error{Corrupt}!u64 {
+fn walkBytes(bytes: []const u8) error{Corrupt}!u64 {
     var pos: usize = 0;
     while (bytes.len - pos >= header_len) {
         const header = (try parseHeader(bytes[pos..])) orelse {

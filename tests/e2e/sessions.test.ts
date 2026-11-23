@@ -1137,6 +1137,51 @@ test("a long command output is kept as one read-only blob, and the model pages i
   }
 }, TIMEOUT * 3);
 
+test("a short command output is kept as one blob file, and the model pages it after a restart (D102)", async () => {
+  const fixture = createFixture("fx-v2-small-replay-");
+  // A plain restart check: a short output's replay is paged after a resume.
+  // The shell's capture spools its output, so this test does not reach the
+  // inline path that writes a replay as one blob file. The unit test "a v2
+  // session keeps a replay as one blob named by its hash" in
+  // src/core/session/command_replay_store.zig is the guard for that rule (D102).
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("Page the short output again.")) {
+      if (body.includes("small-read-1")) return fakeGatewayFinalText("SMALL_PAGED_DONE");
+      const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(body)?.[0] ?? "missing-handle";
+      return fakeGatewayToolCall("small-read-1", "read_tool_result", {
+        request: { handle, query: "2" },
+      });
+    }
+    if (body.includes("small-run-1")) return fakeGatewayFinalText("SMALL_RUN_DONE");
+    return fakeShellRun("small-run-1", "seq 1 3");
+  });
+  try {
+    const created = await ask(fixture, gateway, ["Run the short command."]);
+    expect(created.code).toBe(0);
+    expect(JSON.parse(created.stdout).output).toBe("SMALL_RUN_DONE");
+    const id = JSON.parse(created.stdout).session_id;
+
+    const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(JSON.stringify(logLines(fixture.home, id)))?.[0] ?? "";
+    expect(handle).toMatch(/^fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin$/);
+    const hash = /-([a-f0-9]{64})\./.exec(handle)![1]!;
+    expect(blobNames(fixture, id)).toContain(hash);
+    const replay = readFileSync(blobPath(fixture, id, handle));
+    expect(replay.subarray(0, 8).toString("latin1")).toBe("FXRPLY01");
+
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Page the short output again."]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).not.toContain("panic");
+    expect(JSON.parse(resumed.stdout).output).toBe("SMALL_PAGED_DONE");
+    const afterRead = gateway.requests.findLast((request: any) => request.body.includes("small-read-1"))!.body;
+    expect(afterRead).toContain("<command_output_query handle=");
+    expect(afterRead).toContain("2\\\\x0a");
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask killed in the middle of a turn resumes with that turn interrupted", async () => {
   const fixture = createFixture("fx-v2-kill-");
   let stalled: () => void = () => {};
@@ -5219,8 +5264,12 @@ test("an older session moves off its side folder on its next open, and the model
     expect(existsSync(join(fixture.home, ".fx", "terminal", id, "terminal", "state", "note.json"))).toBe(true);
     const moved = logLines(fixture.home, id).filter((line) => line.kind === "set" && line.key === "moved_files");
     expect(moved).toHaveLength(1);
-    // The moved bodies are small, so the session packs them (D102).
-    expect(existsSync(join(storeRoot(fixture.home), id, "blobs.pack"))).toBe(true);
+    // The moved map is small, so the session packs it (D102). The side-folder
+    // copy comes from disk, so it stays a blob file named by its hash (D102).
+    expect(readFileSync(join(storeRoot(fixture.home), id, "blobs.pack"), "utf8")).toContain(oldHandle);
+    const movedHash = new Bun.CryptoHasher("sha256").update("MOVED_OLD_BODY_3301").digest("hex");
+    expect(blobNames(fixture, id)).toContain(movedHash);
+    expect(blobBytes(fixture.home, id, movedHash).toString("utf8")).toBe("MOVED_OLD_BODY_3301");
     expectWholeLog(fixture, id);
 
     // Opened again, nothing moves twice.

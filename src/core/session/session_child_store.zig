@@ -608,6 +608,7 @@ pub const MemoryBlobsForTesting = struct {
     dir: ?[]const u8 = null,
     mutex: std.Io.Mutex = .init,
     bodies: std.StringHashMapUnmanaged([]u8) = .empty,
+    packed_bodies: std.StringHashMapUnmanaged(void) = .empty,
     records: std.array_hash_map.String(Blobs.Hash) = .empty,
     refs: usize = 0,
     closed: bool = false,
@@ -615,7 +616,7 @@ pub const MemoryBlobsForTesting = struct {
 
     const vtable: Blobs.VTable = .{
         .put = put,
-        .put_small = put,
+        .put_small = putSmall,
         .put_file = putFile,
         .put_record = putRecord,
         .record_names = recordNames,
@@ -643,6 +644,9 @@ pub const MemoryBlobsForTesting = struct {
             self.alloc.free(entry.value_ptr.*);
         }
         self.bodies.deinit(self.alloc);
+        var packed_it = self.packed_bodies.keyIterator();
+        while (packed_it.next()) |key| self.alloc.free(key.*);
+        self.packed_bodies.deinit(self.alloc);
         for (self.records.keys()) |name| self.alloc.free(name);
         self.records.deinit(self.alloc);
         self.* = undefined;
@@ -663,7 +667,16 @@ pub const MemoryBlobsForTesting = struct {
     }
 
     fn put(ctx: *anyopaque, bytes: []const u8) BlobError!Blobs.Hash {
-        const self = from(ctx);
+        return storeBody(from(ctx), bytes, true);
+    }
+
+    /// As `put` for a small body the real store packs: held in memory with no
+    /// file, so `path` refuses it, the way a packed body has no file to open.
+    fn putSmall(ctx: *anyopaque, bytes: []const u8) BlobError!Blobs.Hash {
+        return storeBody(from(ctx), bytes, false);
+    }
+
+    fn storeBody(self: *MemoryBlobsForTesting, bytes: []const u8, as_file: bool) BlobError!Blobs.Hash {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const hash = std.fmt.bytesToHex(digest, .lower);
@@ -676,15 +689,22 @@ pub const MemoryBlobsForTesting = struct {
         errdefer self.alloc.free(key);
         const body = try self.alloc.dupe(u8, bytes);
         errdefer self.alloc.free(body);
-        if (self.dir) |dir| {
-            const file_path = try std.Io.Dir.path.join(self.alloc, &.{ dir, &hash });
-            defer self.alloc.free(file_path);
-            var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
-                .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o400),
-            }) catch return error.BlobStoreFailed;
-            defer file.close(io_mod.getIo());
-            file.writeStreamingAll(io_mod.getIo(), bytes) catch return error.BlobStoreFailed;
+        if (!as_file) {
+            const packed_key = try self.alloc.dupe(u8, &hash);
+            errdefer self.alloc.free(packed_key);
+            try self.packed_bodies.put(self.alloc, packed_key, {});
+        }
+        if (as_file) {
+            if (self.dir) |dir| {
+                const file_path = try std.Io.Dir.path.join(self.alloc, &.{ dir, &hash });
+                defer self.alloc.free(file_path);
+                var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
+                    .exclusive = true,
+                    .permissions = std.Io.File.Permissions.fromMode(0o400),
+                }) catch return error.BlobStoreFailed;
+                defer file.close(io_mod.getIo());
+                file.writeStreamingAll(io_mod.getIo(), bytes) catch return error.BlobStoreFailed;
+            }
         }
         try self.bodies.put(self.alloc, key, body);
         return hash;
@@ -744,7 +764,7 @@ pub const MemoryBlobsForTesting = struct {
         const self = from(ctx);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (!self.bodies.contains(hash)) return error.BlobNotFound;
+        if (!self.bodies.contains(hash) or self.packed_bodies.contains(hash)) return error.BlobNotFound;
         const dir = self.dir orelse return error.BlobStoreFailed;
         return std.Io.Dir.path.join(alloc, &.{ dir, hash });
     }

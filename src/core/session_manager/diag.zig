@@ -11,6 +11,13 @@ pub const Kind = enum {
     /// A damaged line before the final one, or a newer format version: the
     /// session is readable only up to `offset`.
     opened_read_only,
+    /// A pack's torn or unnamed damaged tail was cut on open. `count`: bytes
+    /// cut; `offset`: the pack's new end.
+    pack_cut,
+    /// A pack record that a durable line names is damaged, so the session is
+    /// read-only and nothing is cut. `offset`: the damaged record's byte offset
+    /// in `blobs.pack`. The next step is `fx session recover <id>`.
+    pack_refused,
     /// A session closed before its first turn: `count` held lines were never
     /// written, by design (D2).
     held_lines_dropped,
