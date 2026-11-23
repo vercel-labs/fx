@@ -19,8 +19,8 @@
   },
   {
     "description": "The write comes before the check: a refused add has already changed the file",
-    "old": "       THEN /\\ UNCHANGED <<st, ent, added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = TRUE",
-    "new": "       THEN /\\ st' = [st EXCEPT ![f] = \"ok\"]\n            /\\ ent' = [ent EXCEPT ![f][n] = c]\n            /\\ UNCHANGED <<added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = FALSE",
+    "old": "       THEN /\\ UNCHANGED <<st, ent, added, wroteTypo, wroteDeep>>\n            /\\ last' = \"refused\"\n            /\\ same' = TRUE",
+    "new": "       THEN /\\ st' = [st EXCEPT ![f] = \"ok\"]\n            /\\ ent' = [ent EXCEPT ![f][n] = c]\n            /\\ UNCHANGED <<added, wroteTypo, wroteDeep>>\n            /\\ last' = \"refused\"\n            /\\ same' = FALSE",
     "invariant": "RefusedLeavesFile"
   },
   {
@@ -49,8 +49,20 @@
   },
   {
     "description": "A remove of a name that only the misspelled key holds takes it out of that key and writes the profile",
-    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"\n            /\\ heldHit' = HintFor(f, n)\n            /\\ same' = TRUE\n            /\\ others' = TRUE\n            /\\ UNCHANGED <<st, ent, added, wroteTypo>>",
-    "new": "       THEN /\\ last' = IF HintFor(f, n) THEN \"removed\" ELSE \"missing\"\n            /\\ heldHit' = FALSE\n            /\\ same' = ~HintFor(f, n)\n            /\\ others' = TRUE\n            /\\ wroteTypo' = (wroteTypo \\/ HintFor(f, n))\n            /\\ UNCHANGED <<st, ent, added>>",
+    "old": "       THEN /\\ last' = IF HintFor(f, n) THEN \"hinted\" ELSE \"missing\"\n            /\\ heldHit' = HintFor(f, n)\n            /\\ same' = TRUE\n            /\\ others' = TRUE\n            /\\ UNCHANGED <<st, ent, added, wroteTypo, wroteDeep>>",
+    "new": "       THEN /\\ last' = IF HintFor(f, n) THEN \"removed\" ELSE \"missing\"\n            /\\ heldHit' = FALSE\n            /\\ same' = ~HintFor(f, n)\n            /\\ others' = TRUE\n            /\\ wroteTypo' = (wroteTypo \\/ HintFor(f, n))\n            /\\ UNCHANGED <<st, ent, added, wroteDeep>>",
     "invariant": "NoRewriteOfMisspelled"
+  },
+  {
+    "description": "An add never looks at how deep the file is: it renders a file nested past the limit, where the JSON writer aborts",
+    "old": "BaseRefused(f, n) == st[f] \\in {\"broken\", \"deep\"} \\/ (f = \"profile\" /\\ both) \\/ ent[f][n] # NoEntry",
+    "new": "BaseRefused(f, n) == st[f] = \"broken\" \\/ (f = \"profile\" /\\ both) \\/ ent[f][n] # NoEntry",
+    "invariant": "NoWriteOfDeep"
+  },
+  {
+    "description": "A remove never looks at how deep the file is: it renders a file nested past the limit, where the JSON writer aborts",
+    "old": "       ELSE IF st[f] = \"deep\"",
+    "new": "       ELSE IF FALSE",
+    "invariant": "NoWriteOfDeep"
   }
 ]
