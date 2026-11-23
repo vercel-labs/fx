@@ -1846,8 +1846,8 @@ const StoryRow = struct {
     /// Whether the row's latest call is a message that makes its subagent
     /// (`messageStarts`).
     starts: bool = false,
-    /// The messages its subagent sent main while main waited, which join a
-    /// wait's row (`joinWaitChain`).
+    /// The messages the group's waits took, which the row of its last wait
+    /// counts (`joinWaitChain`).
     received_messages: usize = 0,
 };
 
@@ -3631,7 +3631,7 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
+    wait_messages: WaitMessages,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3654,8 +3654,8 @@ fn formatGroupBlock(
 
 /// Writes a group's header and, unless `collapse_tool_calls`, its rows to
 /// `out`, and their provenance to `lines`. `wait_messages` are the messages
-/// that joined the row of the group's last call, a wait (`joinWaitChain`).
-/// Returns the header, which lives in `scratch`.
+/// the group's waits took, which the row of its last wait counts
+/// (`joinWaitChain`). Returns the header, which lives in `scratch`.
 fn writeGroupBlock(
     alloc: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -3667,7 +3667,7 @@ fn writeGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
+    wait_messages: WaitMessages,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -3693,8 +3693,8 @@ fn writeGroupBlock(
         try tally.observe(scratch, entry, detail);
     }
     try tally.subagent_rows.note(scratch, rows.items);
-    if (wait_messages > 0) if (lastStatusRow(entries, status_indices, rows.items)) |row| {
-        row.received_messages = wait_messages;
+    if (wait_messages.count > 0) if (try waitMessagesRow(scratch, entries, details, detail_indices, wait_messages.last_wait, rows.items)) |row| {
+        row.received_messages = wait_messages.count;
     };
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
@@ -5010,11 +5010,27 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
-/// The row that shows the call of the group's last status entry.
-fn lastStatusRow(entries: []const TranscriptEntry, status_indices: []const usize, rows: []StoryRow) ?*StoryRow {
-    if (status_indices.len == 0) return null;
-    const entry_id = toolStatusEntryId(entries[status_indices[status_indices.len - 1]]) orelse return null;
-    for (rows) |*row| if (row.entry_id == entry_id) return row;
+/// The row that counts the messages a group's waits took: the last row that
+/// reads as a wait, or, when later calls to the subagents took over every
+/// wait's row, the row of the group's last wait, so no message it hid goes
+/// uncounted.
+fn waitMessagesRow(
+    scratch: std.mem.Allocator,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    last_wait: usize,
+    rows: []StoryRow,
+) !?*StoryRow {
+    var latest_wait_row: ?*StoryRow = null;
+    for (rows) |*row| {
+        if (!isWaitCall(scratch, row.detail)) continue;
+        if (latest_wait_row == null or row.status_index > latest_wait_row.?.status_index) latest_wait_row = row;
+    }
+    if (latest_wait_row) |row| return row;
+    const identity = try storyIdentity(scratch, statusDetail(entries, details, detail_indices, last_wait));
+    if (identity.kind == .single) return null;
+    for (rows) |*row| if (sharesStoryRow(row.identity, identity)) return row;
     return null;
 }
 
@@ -5072,17 +5088,25 @@ fn callIsAloneInGroup(
     return true;
 }
 
-/// Lets a group whose last call is a wait take in the messages its
-/// subagents sent main while main waited, and the waits that took them, so
-/// "Waited for lander", "Message from lander", "Waited for lander" show as
-/// one row, "Waited for lander · 1 message". After the group's first wait
-/// that shares the last one's row, it takes each message from a subagent
-/// the wait before it lists. After the group, it takes such messages and
-/// each wait that would be alone in its group and share that row, and stops
-/// at anything else, such as a report like "lander finished", which keeps a
-/// line of its own, or text. Ctrl+O still shows every message. The entries
-/// it takes are hidden, and the waits join `status_indices` and `summary`.
-/// Returns how many messages it took.
+/// The messages a group's waits took (`joinWaitChain`), which the row of
+/// its last wait counts (`waitMessagesRow`).
+const WaitMessages = struct {
+    count: usize = 0,
+    /// The status entry of the group's last wait.
+    last_wait: usize = 0,
+};
+
+/// Lets a group's waits take in the messages their subagents sent main
+/// while main waited, so "Waited for lander", "Message from lander",
+/// "Waited for lander" show as one row, "Waited for lander · 1 message".
+/// After the group's first wait, it takes each message from a subagent the
+/// wait before it lists, whatever row that wait shares, and the row of the
+/// group's last wait counts them all. When the group ends on a wait, it
+/// goes on after the group: it takes such messages and each wait that
+/// would be alone in its group and share that row, and stops at anything
+/// else, such as a report like "lander finished", which keeps a line of
+/// its own, or text. Ctrl+O still shows every message. The entries it takes
+/// are hidden, and the waits join `status_indices` and `summary`.
 fn joinWaitChain(
     alloc: std.mem.Allocator,
     projection: *Projection,
@@ -5093,28 +5117,28 @@ fn joinWaitChain(
     presentation_groups: []const PresentationGroup,
     status_indices: *std.ArrayList(usize),
     summary: *Summary,
-) !usize {
+) !WaitMessages {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     // The waits it takes go after these, so the group's own calls stay here.
     const member_count = status_indices.items.len;
-    if (member_count == 0) return 0;
+    if (member_count == 0) return .{};
+    const first_wait = for (status_indices.items) |member| {
+        if (isWaitCall(scratch, statusDetail(entries, details, detail_indices, member))) break member;
+    } else return .{};
     const last_index = status_indices.items[member_count - 1];
     const last_detail = statusDetail(entries, details, detail_indices, last_index);
-    if (!isWaitCall(scratch, last_detail)) return 0;
-    const wait_identity = try storyIdentity(scratch, last_detail);
-    const first_wait = for (status_indices.items) |member| {
-        const detail = statusDetail(entries, details, detail_indices, member);
-        if (isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail))) break member;
-    } else last_index;
+    const ends_on_wait = isWaitCall(scratch, last_detail);
+    const wait_identity: StoryIdentity = if (ends_on_wait) try storyIdentity(scratch, last_detail) else .{};
+    var taken: WaitMessages = .{ .last_wait = first_wait };
     var roster = waitRoster(try entryStatus(scratch, entries[first_wait]) orelse "");
-    var messages: usize = 0;
     var index = first_wait + 1;
     while (index < entries.len) : (index += 1) {
         const entry = entries[index];
         if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const in_group = index <= last_index;
+        if (!in_group and !ends_on_wait) break;
         const entry_id = toolStatusEntryId(entry) orelse {
             if (in_group or isAttachedEntry(entry) or isTransparentCompactEntry(entry)) continue;
             break;
@@ -5123,17 +5147,20 @@ fn joinWaitChain(
         if (isSubagentUpdateRow(detail)) {
             if (try isMessageFrom(scratch, entry, roster)) {
                 projection.entry_actions.items[index] = .hide;
-                messages += 1;
+                taken.count += 1;
                 continue;
             }
             if (in_group) continue;
             break;
         }
-        const takes_row = isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail));
         if (in_group) {
-            if (takes_row and std.mem.findScalar(usize, status_indices.items[0..member_count], index) != null) roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+            if (isWaitCall(scratch, detail) and std.mem.findScalar(usize, status_indices.items[0..member_count], index) != null) {
+                roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+                taken.last_wait = index;
+            }
             continue;
         }
+        const takes_row = isWaitCall(scratch, detail) and sharesStoryRow(wait_identity, try storyIdentity(scratch, detail));
         if (!takes_row or projection.entry_actions.items[index] != .keep) break;
         if (!callIsAloneInGroup(entries, details, detail_indices, presentation_group_indices, presentation_groups, index)) break;
         projection.entry_actions.items[index] = .hide;
@@ -5141,8 +5168,9 @@ fn joinWaitChain(
         try status_indices.append(alloc, index);
         observeTool(summary, detail);
         roster = waitRoster(try entryStatus(scratch, entry) orelse "");
+        taken.last_wait = index;
     }
-    return messages;
+    return taken;
 }
 
 /// The detail of the call whose status entry is at `index`.
@@ -9509,7 +9537,8 @@ test "resumed waits keep the group they have live, with the messages and reports
                 "● lander finished",
         );
     }
-    // A wait that names lander, then a bare wait.
+    // A wait that names lander, then a bare wait: the bare wait's row counts
+    // the message the named wait took too.
     {
         const entries = [_]TranscriptEntry{
             waitChainEntryForTest(1, "sent to lander · Land block B"),
@@ -9534,8 +9563,7 @@ test "resumed waits keep the group they have live, with the messages and reports
             &details,
             "● Waited for a subagent\n" ++
                 "├ Waited for lander\n" ++
-                "└ Waited for lander · 1 message\n" ++
-                "● Message from lander\n" ++
+                "└ Waited for lander · 2 messages\n" ++
                 "● lander finished",
         );
     }
@@ -9607,6 +9635,164 @@ test "resumed waits keep the group they have live, with the messages and reports
                 "└ Waited for lander · 1 message\n" ++
                 "● scout finished\n" ++
                 "● lander finished",
+        );
+    }
+}
+
+test "the row of a group's last wait counts every message the group's waits took" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const wait_for_lander = "{\"action\":\"wait\",\"agent\":\"lander\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    // A bare wait, then a wait that names lander: lander's row holds the
+    // last wait, so it counts both messages.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait_for_lander, .completed),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Waited for a subagent\n" ++
+                "├ Waited for lander · 2 messages\n" ++
+                "└ Waited for lander",
+        );
+    }
+    // A group that goes on after its wait: the wait's row still counts the
+    // message it took, and a message that came after the group's last call
+    // was not a wait's, so it keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "Read desktop/src/main.ts"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            storyReadDetailForTest(4, "desktop/src/main.ts"),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent, read a file\n" ++
+                "├ Started lander\n" ++
+                "├ Waited for lander · 1 message\n" ++
+                "└ Read main.ts\n" ++
+                "● Message from lander",
+        );
+    }
+    // A later message to lander takes over the row the named wait shared,
+    // so the last row that still reads as a wait counts the messages.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · Fixes pushed."),
+            waitChainEntryForTest(6, "sent to lander · Merge it"),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait_for_lander, .completed),
+            reportDetailForTest(5),
+            subagentDetailForTest(6, "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Merge it\"}", .completed),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Messaged a subagent\n" ++
+                "├ Messaged lander\n" ++
+                "└ Waited for lander · 2 messages",
+        );
+        // With no row left that reads as a wait, the last wait's row still
+        // counts them, so no message it hid goes unseen.
+        const named_only = [_]TranscriptEntry{ entries[0], entries[3], entries[4], entries[5] };
+        const named_details = [_]ToolDetailRecord{ details[0], details[3], details[4], details[5] };
+        try expectLiveAndResumedRowsForTest(alloc, &named_only, &named_details, "● Messaged lander · 1 message");
+    }
+    // Each wait lists whom it waited for, whatever row it shares, so the
+    // bare wait after scout starts takes scout's message too.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the model checks."),
+            waitChainEntryForTest(4, "sent to scout · Map the tray"),
+            waitChainEntryForTest(5, "waited for lander, scout"),
+            waitChainEntryForTest(6, "from scout · Half mapped."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait_for_lander, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the tray\"}", .completed),
+            subagentDetailForTest(5, wait, .completed),
+            reportDetailForTest(6),
+        };
+        details[0].subagent_started = true;
+        details[3].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent\n" ++
+                "├ Waited for lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for lander, scout · 2 messages",
+        );
+    }
+    // A message that came before the group's first wait, while main read a
+    // file, was not a wait's, so it keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "Read desktop/src/main.ts"),
+            waitChainEntryForTest(3, "from lander · Starting now."),
+            waitChainEntryForTest(4, "waited for lander"),
+            waitChainEntryForTest(5, "from lander · On the model checks."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            storyReadDetailForTest(2, "desktop/src/main.ts"),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait, .completed),
+            reportDetailForTest(5),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent, read a file\n" ++
+                "├ Started lander\n" ++
+                "├ Read main.ts\n" ++
+                "└ Waited for lander · 1 message\n" ++
+                "● Message from lander",
         );
     }
 }
