@@ -9809,6 +9809,7 @@ fn processQueuedPromptLoop(
             }
 
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+            try runtime_assistant_stream.finishAssistantTail(&stream_ctx);
 
             const partial_assistant = if (attempt_disposition == .completed)
                 stream_ctx.accepted_source_or(attempt_completion.content orelse "")

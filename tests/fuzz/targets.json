@@ -59,6 +59,8 @@
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
     {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},
+    {"name": "inline_open_end", "module": "fx", "test": "inline open end matches committed text when no open-end rule applies", "iterations": 500000},
+    {"name": "provisional_previews", "module": "fx", "test": "provisional previews keep committed output for fuzzed splits", "iterations": 100000},
     {"name": "url_policy", "module": "fx", "test": "url policy admits only URLs it reads back the same way", "iterations": 2400000},
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},

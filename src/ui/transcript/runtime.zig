@@ -40,6 +40,7 @@ const types = @import("../../core/shared/types.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
+const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
 const captured_command = @import("../../core/tooling/captured_command.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
@@ -4982,6 +4983,9 @@ pub const TranscriptNotebook = struct {
 /// painted and committed. Each agent keeps one set, and the screen holds the
 /// set of the agent on it (`TranscriptRuntime.swapSlot`).
 const transcript_slot_fields = [_][:0]const u8{
+    "staged_assistant_tail",
+    "staged_assistant_tail_id",
+    "assistant_tail",
     "notebook",
     "cursor_row",
     "cursor_col",
@@ -5113,7 +5117,18 @@ pub const TranscriptSlot = blk: {
     break :blk @Struct(.auto, null, &transcript_slot_fields, &slot_types, &slot_attrs);
 };
 
+/// The assistant tail the pacer has not reached yet. The runtime owns `events`.
+pub const StagedAssistantTail = struct {
+    id: u64,
+    events: []assistant_presentation.Event,
+    alloc: Allocator,
+};
+
 pub const TranscriptRuntime = struct {
+    staged_assistant_tail: ?StagedAssistantTail = null,
+    staged_assistant_tail_id: u64 = 0,
+    /// The unfinished assistant text and blocks, drawn after the committed rows.
+    assistant_tail: std.ArrayList(render_engine.transcript_blocks.TranscriptEntry) = .empty,
     stdout_file: std.Io.File = std.Io.File.stdout(),
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
@@ -5403,6 +5418,56 @@ pub const TranscriptRuntime = struct {
         self.transcript_commit_state.deinit(alloc);
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
+        self.discardStagedAssistantTail();
+        transcript_store.freeAssistantTail(self, alloc);
+    }
+
+    /// Holds the assistant tail until the pacer reaches it, and returns its id.
+    /// Takes ownership of `events`. A tail staged before is freed.
+    pub fn stageAssistantTail(self: *TranscriptRuntime, alloc: Allocator, events: []assistant_presentation.Event) u64 {
+        self.discardStagedAssistantTail();
+        self.staged_assistant_tail_id += 1;
+        self.staged_assistant_tail = .{ .id = self.staged_assistant_tail_id, .events = events, .alloc = alloc };
+        return self.staged_assistant_tail_id;
+    }
+
+    /// Gives up the staged tail only when `id` is its id. The caller owns the events.
+    pub fn takeStagedAssistantTail(self: *TranscriptRuntime, id: u64) ?[]assistant_presentation.Event {
+        const staged = self.staged_assistant_tail orelse return null;
+        if (staged.id != id) return null;
+        self.staged_assistant_tail = null;
+        return staged.events;
+    }
+
+    /// The pacer reports a due tail: its events become the transcript's tail.
+    pub fn applyStagedAssistantTail(self: *TranscriptRuntime, alloc: Allocator, id: u64) void {
+        const staged = self.staged_assistant_tail orelse return;
+        if (staged.id != id) return;
+        self.staged_assistant_tail = null;
+        defer assistant_presentation.freeEventSlice(staged.alloc, staged.events);
+        const entries = transcript_store.tailEntriesFromEvents(alloc, staged.events) catch |err| {
+            debug_trace.logf("transcript", "assistant tail not applied err={s}", .{@errorName(err)});
+            transcript_store.clearAssistantTail(self, alloc);
+            return;
+        };
+        debug_trace.logf("transcript", "assistant tail applied entries={d}", .{entries.len});
+        transcript_store.setAssistantTail(self, alloc, entries);
+    }
+
+    /// A committed append or a cancel drops the tail that showed before it.
+    pub fn clearAssistantTail(self: *TranscriptRuntime, alloc: Allocator) void {
+        transcript_store.clearAssistantTail(self, alloc);
+    }
+
+    /// A cancelled turn keeps the text it showed, as committed entries.
+    pub fn freezeAssistantTail(self: *TranscriptRuntime, alloc: Allocator, reason: []const u8) !void {
+        try transcript_store.freezeAssistantTail(self, alloc, reason);
+    }
+
+    fn discardStagedAssistantTail(self: *TranscriptRuntime) void {
+        const staged = self.staged_assistant_tail orelse return;
+        self.staged_assistant_tail = null;
+        assistant_presentation.freeEventSlice(staged.alloc, staged.events);
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
@@ -5532,6 +5597,14 @@ pub const TranscriptRuntime = struct {
             .stable => |anchor| anchor.flow,
             .recovering => |receipt| receipt.flow,
         };
+    }
+
+    /// The committed entries' prefix of the committed flow, stopping before
+    /// any provisional tail so an append does not look like a rewrite.
+    pub fn committedTranscriptFlowBeforeTail(self: *const TranscriptRuntime) ?[]const u8 {
+        const flow = self.committedTranscriptFlow() orelse return null;
+        const identity = self.committedRetentionIdentity() orelse return flow;
+        return flowPrefixBeforeTail(flow, identity.lines);
     }
 
     /// How much of a recovering commit's flow is materialized, or null when
@@ -6454,6 +6527,7 @@ pub const TranscriptRuntime = struct {
         finished: types.TurnFinished,
         preserve_normal_buffer_anchor: bool,
     ) !?types.ToolActivityKind {
+        self.clearAssistantTail(alloc);
         if (finished.turn_id == 0) return error.InvalidTurnId;
         if (!self.notebook.lifecycle_state.shouldApplyTurnFinished(finished.turn_id)) return null;
 
@@ -10228,6 +10302,30 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    fn flowPrefixBeforeTail(
+        flow: []const u8,
+        lines: []const transcript_blocks.LineProvenance,
+    ) []const u8 {
+        var committed_lines: usize = 0;
+        while (committed_lines < lines.len) : (committed_lines += 1) {
+            if (lines[committed_lines] == .entry and
+                lines[committed_lines].entry.entry_id == transcript_store.tail_entry_id) break;
+        } else return flow;
+        while (committed_lines > 0 and lines[committed_lines - 1] == .block_separator) {
+            committed_lines -= 1;
+        }
+        if (committed_lines == 0) return flow[0..0];
+        var pos: usize = 0;
+        var count: usize = 0;
+        while (pos < flow.len) : (pos += 1) {
+            if (flow[pos] == '\n') {
+                count += 1;
+                if (count == committed_lines) return flow[0 .. pos + 1];
+            }
+        }
+        return flow;
+    }
+
     fn compatibleCommittedHistoryReplayRange(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -10237,11 +10335,12 @@ pub const TranscriptRuntime = struct {
     ) ?TransitionHistoryReplay {
         if (!self.committedLayoutMatches(anchor)) return null;
         if (self.resize_history_row_delta != null) return null;
+        const committed_flow = flowPrefixBeforeTail(anchor.flow, anchor.retention_identity.lines);
         return compatibleHistoryReplayRange(
             prepared,
             self.layout.cols,
             target_flow,
-            anchor.flow,
+            committed_flow,
             anchor.history_visual_offset,
             target_history_visual_offset,
         );
@@ -10393,7 +10492,8 @@ pub const TranscriptRuntime = struct {
                     self.committed_frame_layout.terminal_rows == self.layout.rows and
                     !self.terminal_reset_pending)
                 {
-                    if (compatibleHistoryReplayRange(prepared, self.layout.cols, target_flow, receipt.flow, receipt.accepted_history_visual_offset, target_history_visual_offset)) |replay| {
+                    const committed_flow = flowPrefixBeforeTail(receipt.flow, receipt.retention_identity.lines);
+                    if (compatibleHistoryReplayRange(prepared, self.layout.cols, target_flow, committed_flow, receipt.accepted_history_visual_offset, target_history_visual_offset)) |replay| {
                         return .{
                             .flow_len = replay.flow_start,
                             .history_replay = replay,
@@ -12147,16 +12247,21 @@ pub const TranscriptRuntime = struct {
         if (self.notebook.pending_resume_source != null) {
             return self.prepareTranscriptSource(alloc, null);
         }
-        if (self.notebook.compact_transcript_source_cache.find(
-            self.notebook.full_transcript_content_revision,
-            self.layout.cols,
-            self.has_committed_frame,
-        )) |source| {
-            source.preview.cursor_row = self.cursor_row;
-            source.preview.cursor_col = self.cursor_col;
-            source.preview.replaceable_row = self.replaceable_row;
-            source.replaceable_row = self.replaceable_row;
-            return source.clone(alloc);
+        // A provisional tail changes without a content revision, so a source
+        // built while one shows is neither read from nor stored in the cache.
+        const tail_shown = self.assistant_tail.items.len > 0;
+        if (!tail_shown) {
+            if (self.notebook.compact_transcript_source_cache.find(
+                self.notebook.full_transcript_content_revision,
+                self.layout.cols,
+                self.has_committed_frame,
+            )) |source| {
+                source.preview.cursor_row = self.cursor_row;
+                source.preview.cursor_col = self.cursor_col;
+                source.preview.replaceable_row = self.replaceable_row;
+                source.replaceable_row = self.replaceable_row;
+                return source.clone(alloc);
+            }
         }
 
         var source = try source_preparation.prepareTranscriptSourceInterruptible(
@@ -12169,6 +12274,7 @@ pub const TranscriptRuntime = struct {
         );
         errdefer source.deinit(alloc);
         try source.ensureLineIndexInterruptible(alloc, checkpoint);
+        if (tail_shown) return source;
         const cached = self.notebook.compact_transcript_source_cache.insert(alloc, .{
             .source = source,
             .content_revision = self.notebook.full_transcript_content_revision,
@@ -16033,4 +16139,100 @@ test "changed stored result retires stale full transcript geometry" {
         try std.testing.expect(try runtime.pollFullTranscriptPageLoad());
         try std.testing.expect(runtime.full_transcript_installed_page == null);
     }
+}
+
+fn tailEventsWithText(alloc: Allocator, text: []const u8) ![]assistant_presentation.Event {
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    errdefer alloc.free(events);
+    events[0] = .{ .text = try alloc.dupe(u8, text) };
+    return events;
+}
+
+test "staged assistant tail gives up only the id it was staged under" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+
+    const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
+    const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
+    try std.testing.expect(first != second);
+    try std.testing.expect(runtime.takeStagedAssistantTail(first) == null);
+
+    const events = runtime.takeStagedAssistantTail(second) orelse return error.TestExpectedStagedTail;
+    defer assistant_presentation.freeEventSlice(alloc, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("two", events[0].text);
+    try std.testing.expect(runtime.takeStagedAssistantTail(second) == null);
+}
+
+test "staged assistant tail is freed when a newer tail replaces it and when the runtime deinits" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    _ = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "old"));
+    _ = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "new"));
+    runtime.deinit(alloc);
+}
+
+test "a non-assistant append and a finished turn each clear the assistant tail" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("streaming") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    _ = try transcript_store.appendRawTranscriptEntry(&runtime, alloc, "tool status");
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    // The tail is cleared before the turn's own checks, so their failure does not matter here.
+    _ = runtime.applyTurnFinishedLifecycle(alloc, .{ .turn_id = 7, .outcome = .interrupted }, false) catch {};
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "freezing a shown tail makes it committed entries with new ids and an empty tail" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming bold") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    const first_id = runtime.notebook.next_entry_id;
+    try runtime.freezeAssistantTail(alloc, "cancel");
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    const frozen = runtime.notebook.entries.items[0].assistant_turn;
+    try std.testing.expectEqual(first_id, frozen.id);
+    try std.testing.expectEqual(first_id +% 1, runtime.notebook.next_entry_id);
+    try std.testing.expectEqualStrings("Streaming bold", frozen.segments.text.items);
+}
+
+test "a frozen tail continues the trailing committed turn in place" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var metrics = Metrics{};
+    _ = try runtime.streamAssistantChunk(alloc, &metrics, "Committed line\n");
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming bold") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try runtime.freezeAssistantTail(alloc, "cancel");
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.entries.items.len);
+    const text = runtime.notebook.entries.items[0].assistant_turn.segments.text.items;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Committed line"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "Streaming bold"));
+}
+
+test "an assistant block append clears the shown tail through the committed mutation" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("streaming") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    _ = try runtime.appendAssistantThematicRule(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
 }

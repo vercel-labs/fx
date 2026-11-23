@@ -660,6 +660,10 @@ pub fn pruneOrphanedCommandStateAndReport(self: anytype, alloc: Allocator) !bool
 }
 
 fn committedFlowPrefix(self: anytype, bytes: []const u8) bool {
+    if (comptime @hasDecl(@TypeOf(self.*), "committedTranscriptFlowBeforeTail")) {
+        const flow = self.committedTranscriptFlowBeforeTail() orelse return true;
+        return std.mem.startsWith(u8, bytes, flow);
+    }
     if (comptime @hasDecl(@TypeOf(self.*), "committedTranscriptFlow")) {
         const flow = self.committedTranscriptFlow() orelse return true;
         return std.mem.startsWith(u8, bytes, flow);
@@ -935,6 +939,7 @@ fn appendSemanticNoticeEntry(
     const owned = try types.dupeSemanticNotice(alloc, notice);
     errdefer types.freeSemanticNotice(alloc, owned);
     const entry_id = self.notebook.next_entry_id;
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, .{ .semantic_notice = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
@@ -1719,6 +1724,7 @@ fn commitAuthoritativeRecordedMutationStateKeepingSource(
     if (rebased) debug_trace.logf("scroll", "transcript_source_publication_rebased reason={s}", .{reason});
     commitMutationStateWithReconciliationSource(
         self,
+        alloc,
         shadow,
         reason,
         if (rebased) .preserve_same_epoch else rewrite_mode,
@@ -1735,6 +1741,7 @@ fn commitAuthoritativeRecordedMutationStateKeepingSource(
 
 fn commitMutationStateWithReconciliationSource(
     self: anytype,
+    alloc: Allocator,
     shadow: anytype,
     reason: []const u8,
     rewrite_mode: TranscriptSourceRewriteMode,
@@ -1750,6 +1757,9 @@ fn commitMutationStateWithReconciliationSource(
         shadow.render_requests.hasReason(.transcript)
     else
         shadow.transcript_band_dirty;
+    // A shadow commit swaps only the notebook, so the shown tail is dropped
+    // here when the commit appends an entry. Replacements keep it.
+    if (shadow.notebook.entries.items.len > self.notebook.entries.items.len) clearAssistantTail(self, alloc);
     std.mem.swap(@TypeOf(self.notebook.entries), &self.notebook.entries, &shadow.notebook.entries);
     std.mem.swap(@TypeOf(self.notebook.tool_details), &self.notebook.tool_details, &shadow.notebook.tool_details);
     std.mem.swap(
@@ -2197,6 +2207,7 @@ pub fn appendRawBytesEntryClassifiedAt(
 ) !u32 {
     const entry_id = self.notebook.next_entry_id;
     self.notebook.next_entry_id +%= 1;
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = created_at_ms, .bytes = bytes, .class = class } });
     return entry_id;
 }
@@ -2219,6 +2230,7 @@ pub fn insertRawBytesEntryClassifiedAfter(
             .class = class,
         },
     };
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.insert(alloc, anchor_index + 1, entry);
     return entry_id;
 }
@@ -2239,6 +2251,7 @@ pub fn insertRawBytesEntryClassifiedAt(
             .class = class,
         },
     };
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.insert(alloc, @min(index, self.notebook.entries.items.len), entry);
     self.notebook.next_entry_id +%= 1;
     return entry_id;
@@ -2273,6 +2286,7 @@ pub fn appendRawTranscriptEntryClassified(
 
     const entry_id = self.notebook.next_entry_id;
     self.notebook.next_entry_id +%= 1;
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .bytes = dup, .class = class } });
     entry_owns_dup = true;
     var rollback_entry = true;
@@ -2483,6 +2497,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
     owned_skill_tokens = try dupeSkillTokenSpans(alloc, skill_tokens);
     const entry_id = self.notebook.next_entry_id;
     self.notebook.next_entry_id +%= 1;
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, .{ .user_turn = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
@@ -2500,6 +2515,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
 pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     const entry_id = self.notebook.next_entry_id;
     self.notebook.next_entry_id +%= 1;
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, .{ .assistant_turn = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .segments = .{} } });
     try pruneOrphanedCommandState(self, alloc);
     return entry_id;
@@ -2514,20 +2530,13 @@ fn appendAssistantBlockInPlace(
     rebuild_reason: []const u8,
 ) !u32 {
     const entry_id = entry.id();
+    clearAssistantTail(self, alloc);
     try self.notebook.entries.append(alloc, entry);
     errdefer {
         _ = self.notebook.entries.pop();
     }
 
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, rebuild_reason);
-    try pruneOrphanedCommandState(self, alloc);
+    try rebuildTranscriptForEntries(self, alloc, rebuild_reason);
     requestTranscriptPaint(self);
     self.notebook.next_entry_id +%= 1;
     return entry_id;
@@ -2609,6 +2618,168 @@ pub fn tailAssistantSegments(self: anytype) ?*AssistantTurnSegments {
         .assistant_turn => |*e| if (e.inline_hidden) null else &e.segments,
         else => null,
     };
+}
+
+/// Entry id of every tail entry. A committed entry never has it, so a cache
+/// keyed by entry id cannot hold a tail block as a committed one.
+pub const tail_entry_id: u32 = std.math.maxInt(u32);
+
+/// Replaces the assistant tail with `entries`. Takes ownership of `entries`.
+pub fn setAssistantTail(self: anytype, alloc: Allocator, entries: []TranscriptEntry) void {
+    freeAssistantTail(self, alloc);
+    self.assistant_tail = .fromOwnedSlice(entries);
+    requestTranscriptPaint(self);
+}
+
+/// Drops the assistant tail, as a committed append or a cancel does.
+pub fn clearAssistantTail(self: anytype, alloc: Allocator) void {
+    if (self.assistant_tail.items.len == 0) return;
+    freeAssistantTail(self, alloc);
+    requestTranscriptPaint(self);
+}
+
+/// Frees the assistant tail without a paint request.
+pub fn freeAssistantTail(self: anytype, alloc: Allocator) void {
+    for (self.assistant_tail.items) |*entry| entry.deinit(alloc);
+    self.assistant_tail.deinit(alloc);
+    self.assistant_tail = .empty;
+}
+
+/// Freezes the shown tail into committed entries, as it was drawn, when a turn
+/// is cancelled. Text joins the trailing assistant turn; other tail entries
+/// become entries of their own. The tail is empty afterwards.
+pub fn freezeAssistantTail(self: anytype, alloc: Allocator, reason: []const u8) !void {
+    if (self.assistant_tail.items.len == 0) return;
+    const tail_count = self.assistant_tail.items.len;
+    var shadow = try cloneRecordedMutationState(self, alloc);
+    defer shadow.deinit(alloc);
+    var text_bytes: usize = 0;
+    var first_id: u32 = 0;
+    for (self.assistant_tail.items, 0..) |tail_entry, index| {
+        const id = try appendFrozenTailEntry(&shadow, alloc, tail_entry, &text_bytes);
+        if (index == 0) first_id = id;
+    }
+    try rebuildTranscriptForEntries(&shadow, alloc, "assistant_tail_freeze");
+    requestTranscriptPaint(&shadow);
+    try commitAuthoritativeRecordedMutationStateFromEntry(
+        self,
+        &shadow,
+        alloc,
+        "assistant_tail_freeze",
+        .preserve_same_epoch,
+        first_id,
+    );
+    freeAssistantTail(self, alloc);
+    requestTranscriptPaint(self);
+    debug_trace.logf(
+        "transcript",
+        "assistant tail frozen entries={d} text_bytes={d} reason={s}",
+        .{ tail_count, text_bytes, reason },
+    );
+}
+
+fn appendFrozenTailEntry(
+    shadow: anytype,
+    alloc: Allocator,
+    tail_entry: TranscriptEntry,
+    text_bytes: *usize,
+) !u32 {
+    if (std.meta.activeTag(tail_entry) == .assistant_turn) {
+        const text = tail_entry.assistant_turn.segments.text.items;
+        text_bytes.* += text.len;
+        const count = shadow.notebook.entries.items.len;
+        if (count > 0 and std.meta.activeTag(shadow.notebook.entries.items[count - 1]) == .assistant_turn) {
+            const trailing = &shadow.notebook.entries.items[count - 1].assistant_turn;
+            try trailing.segments.text.appendSlice(alloc, text);
+            return trailing.id;
+        }
+    }
+    var copy = try cloneEntryForSnapshot(alloc, tail_entry);
+    errdefer copy.deinit(alloc);
+    const id = shadow.notebook.next_entry_id;
+    setEntryId(&copy, id);
+    try shadow.notebook.entries.append(alloc, copy);
+    shadow.notebook.next_entry_id +%= 1;
+    return id;
+}
+
+fn setEntryId(entry: *TranscriptEntry, id: u32) void {
+    switch (entry.*) {
+        .assistant_turn => |*turn| turn.id = id,
+        .assistant_table => |*table| table.id = id,
+        .assistant_code_block => |*block| block.id = id,
+        .assistant_thematic_rule => |*rule| rule.id = id,
+        else => unreachable,
+    }
+}
+
+fn rebuildTranscriptForEntries(self: anytype, alloc: Allocator, rebuild_reason: []const u8) !void {
+    const rendered = try renderPlainEntries(
+        self,
+        alloc,
+        self.transcriptWrapCols(),
+    );
+    defer alloc.free(rendered);
+    try ensurePaintReservation(self, alloc);
+    try rebuildTranscriptFromRendered(self, alloc, rendered, rebuild_reason);
+    try pruneOrphanedCommandState(self, alloc);
+}
+
+/// Copies `events` into tail entries. Text becomes the same entry kind as
+/// committed text, so it continues the trailing assistant turn.
+pub fn tailEntriesFromEvents(alloc: Allocator, events: []const assistant_presentation.Event) ![]TranscriptEntry {
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    for (events) |event| switch (event) {
+        .text => |text| {
+            var segments: AssistantTurnSegments = .{};
+            errdefer segments.deinit(alloc);
+            try segments.text.appendSlice(alloc, text);
+            try entries.append(alloc, .{ .assistant_turn = .{ .id = tail_entry_id, .segments = segments } });
+        },
+        .table => |table| {
+            var owned = try table.clone(alloc);
+            errdefer owned.deinit(alloc);
+            try entries.append(alloc, .{ .assistant_table = .{ .id = tail_entry_id, .table = owned } });
+        },
+        .code_block => |block| {
+            var owned = try block.clone(alloc);
+            errdefer owned.deinit(alloc);
+            try entries.append(alloc, .{ .assistant_code_block = .{ .id = tail_entry_id, .block = owned } });
+        },
+        .thematic_rule => try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = tail_entry_id } }),
+        .attempt_start, .attempt_restart, .assistant_tail => {},
+    };
+    return entries.toOwnedSlice(alloc);
+}
+
+const FakeTailShell = struct {
+    assistant_tail: std.ArrayList(TranscriptEntry) = .empty,
+    transcript_band_dirty: bool = false,
+};
+
+test "assistant tail replaces the old entries, requests a paint, and clears" {
+    const alloc = std.testing.allocator;
+    var shell = FakeTailShell{};
+    var events = [_]assistant_presentation.Event{ .{ .text = @constCast("one") }, .thematic_rule };
+
+    setAssistantTail(&shell, alloc, try tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 2), shell.assistant_tail.items.len);
+    try std.testing.expectEqual(tail_entry_id, shell.assistant_tail.items[0].assistant_turn.id);
+    try std.testing.expectEqualStrings("one", shell.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expect(shell.transcript_band_dirty);
+
+    shell.transcript_band_dirty = false;
+    setAssistantTail(&shell, alloc, try tailEntriesFromEvents(alloc, events[0..1]));
+    try std.testing.expectEqual(@as(usize, 1), shell.assistant_tail.items.len);
+    try std.testing.expect(shell.transcript_band_dirty);
+
+    clearAssistantTail(&shell, alloc);
+    try std.testing.expectEqual(@as(usize, 0), shell.assistant_tail.items.len);
+    freeAssistantTail(&shell, alloc);
 }
 
 const AssistantStreamAdmission = struct {
@@ -2871,12 +3042,22 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, check
     try build_checkpoint.poll(checkpoint);
     var retained = try cloneMutationState(next, alloc);
     defer retained.deinit(alloc);
+    defer if (comptime @hasField(@TypeOf(self.*), "assistant_tail")) {
+        retained.assistant_tail = .empty;
+    };
     retained.layout.cols = cols;
     retained.full_transcript.depth = .inline_mode;
     var previous_ids: EntryIdSet = .empty;
     defer previous_ids.deinit(alloc);
     for (committed_identity.lines) |identity| {
         if (identity == .entry) try previous_ids.put(alloc, identity.entry.entry_id, {});
+    }
+    if (comptime @hasField(@TypeOf(self.*), "assistant_tail")) {
+        if (next.notebook.entries.items.len <= self.notebook.entries.items.len and
+            previous_ids.contains(tail_entry_id))
+        {
+            retained.assistant_tail = self.assistant_tail;
+        }
     }
     const CommittedText = struct { bytes: usize, index: ?usize = null };
     var committed_texts: std.AutoHashMapUnmanaged(u32, CommittedText) = .empty;
@@ -2967,6 +3148,7 @@ pub fn streamAssistantChunk(
     text: []const u8,
 ) !u32 {
     if (text.len > 0) try self.assertCanMutateTranscript();
+    if (text.len > 0) clearAssistantTail(self, alloc);
 
     const prior_entry_count = self.notebook.entries.items.len;
     const prior_tail_kind: []const u8 = if (prior_entry_count == 0)

@@ -16,10 +16,12 @@ pub fn writeInlineNoBold(
     restore_underline_after_link: bool,
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
+    mode: Mode,
 ) !void {
     try renderInline(alloc, text, out, .{
         .restore_underline_after_link = restore_underline_after_link,
         .suppress_bold = true,
+        .mode = mode,
     }, footnotes, link_id);
 }
 
@@ -30,15 +32,39 @@ pub fn writeInline(
     restore_underline_after_link: bool,
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
+    mode: Mode,
 ) !void {
     try renderInline(alloc, text, out, .{
         .restore_underline_after_link = restore_underline_after_link,
+        .mode = mode,
     }, footnotes, link_id);
 }
+
+/// open_end shows an unfinished line as if the stream ended now, so no raw mark shows (tests/tla/assistant_stream/StreamTail.tla NoRawMarkInTail).
+pub const Mode = union(enum) {
+    committed,
+    /// Set to true when an open-end rule changes the text.
+    open_end: *bool,
+
+    pub fn isOpenEnd(self: Mode) bool {
+        return switch (self) {
+            .committed => false,
+            .open_end => true,
+        };
+    }
+
+    fn noteFired(self: Mode) void {
+        switch (self) {
+            .committed => {},
+            .open_end => |fired| fired.* = true,
+        }
+    }
+};
 
 const InlineOptions = struct {
     restore_underline_after_link: bool = false,
     suppress_bold: bool = false,
+    mode: Mode = .committed,
 };
 
 /// Inline rendering runs in three passes over one line:
@@ -62,13 +88,17 @@ fn renderInline(
 ) !void {
     var tokens: std.ArrayList(Token) = .empty;
     defer tokens.deinit(alloc);
-    try tokenize(alloc, text, &tokens, footnotes);
+    const scan = try tokenize(alloc, text, &tokens, footnotes, options.mode);
 
     var matches: std.ArrayList(Match) = .empty;
     defer matches.deinit(alloc);
-    try matchDelimiters(alloc, tokens.items, &matches);
+    var end_closes: std.ArrayList(u32) = .empty;
+    defer end_closes.deinit(alloc);
+    try matchDelimiters(alloc, tokens.items, &matches, &end_closes, options.mode);
+    if (scan.rule_fired or end_closes.items.len > 0 or finalRunLeftLiteral(tokens.items, scan.end)) options.mode.noteFired();
 
-    try emitTokens(alloc, text, tokens.items, matches.items, out, options, link_id);
+    const matched: Matched = .{ .matches = matches.items, .end_closes = end_closes.items, .end = scan.end };
+    try emitTokens(alloc, text, tokens.items, matched, out, options, link_id);
 }
 
 const Style = enum { bold, italic, strike };
@@ -106,15 +136,34 @@ const Match = struct {
     next_close: ?u32 = null,
 };
 
+const Scan = struct {
+    /// Index just past the last byte the tokens cover.
+    end: usize,
+    /// True when an open-end rule changed the tokens.
+    rule_fired: bool,
+};
+
+const Matched = struct {
+    matches: []const Match,
+    /// Open-end matches that close at the end of the text, innermost first.
+    end_closes: []const u32,
+    end: usize,
+};
+
+const StackEntry = struct { token: u32, seq: u32 };
+
 fn tokenize(
     alloc: Allocator,
     text: []const u8,
     tokens: *std.ArrayList(Token),
     footnotes: ?*const payload.FootnoteSink,
-) !void {
+    mode: Mode,
+) !Scan {
     var i: usize = 0;
     var literal_start: usize = 0;
     var link_admission_suppressed_until: usize = 0;
+    var limit = text.len;
+    var rule_fired = false;
     // Every bracket construct starting at `i` ends at the first `]` at or
     // after `i`, so that position is found once and shared: a `[` whose `]`
     // is not followed by `(` cannot be a link or image, and a footnote label
@@ -127,7 +176,7 @@ fn tokenize(
     // rather than a second flanking rule inside the URL parser.
     var opening_delimiter_end: usize = 0;
 
-    while (i < text.len) {
+    while (i < limit) {
         const c = text[i];
         const after_opening_delimiter = i > 0 and opening_delimiter_end == i;
         if (last_close_bracket != null and i <= last_close_bracket.? and (next_close_bracket == null or next_close_bracket.? < i)) {
@@ -144,8 +193,18 @@ fn tokenize(
                 literal_start = i;
                 continue;
             }
+            const run = backtickRunLength(text, i);
+            if (mode.isOpenEnd()) {
+                // An unpartnered run opens a code span that runs to the end of the text.
+                try flushLiteral(alloc, text, tokens, literal_start, i);
+                try tokens.append(alloc, .{ .code = text[i + run .. limit] });
+                literal_start = limit;
+                i = limit;
+                rule_fired = true;
+                continue;
+            }
             // A backtick run without a partner is literal text.
-            i += backtickRunLength(text, i);
+            i += run;
             continue;
         }
 
@@ -157,6 +216,15 @@ fn tokenize(
                 literal_start = i;
                 continue;
             }
+        }
+
+        if (c == '\\' and i + 1 == limit and mode.isOpenEnd()) {
+            // A lone backslash at the end would escape the next byte, so it shows nothing yet.
+            try flushLiteral(alloc, text, tokens, literal_start, i);
+            literal_start = limit;
+            i = limit;
+            rule_fired = true;
+            continue;
         }
 
         if (c == '\\' and i + 1 < text.len and tu.isEscapedPunctuationAt(text, i + 1)) {
@@ -226,6 +294,17 @@ fn tokenize(
             }
         }
 
+        if (mode.isOpenEnd()) {
+            if (openEndLinkOpener(text, i, next_close_bracket)) |opener| {
+                try flushLiteral(alloc, text, tokens, literal_start, i);
+                i = opener.end;
+                literal_start = i;
+                if (opener.limit) |close| limit = close;
+                rule_fired = true;
+                continue;
+            }
+        }
+
         if (i >= link_admission_suppressed_until and c == '<') {
             if (parseAngleAutolink(text, i)) |link| {
                 try flushLiteral(alloc, text, tokens, literal_start, i);
@@ -257,6 +336,11 @@ fn tokenize(
                 try tokens.append(alloc, .{ .delimiter = delimiter });
                 literal_start = run_end;
                 if (delimiter.can_open) opening_delimiter_end = run_end;
+            } else if (mode.isOpenEnd() and run_end == limit) {
+                // A final run that cannot be classified yet shows nothing.
+                try flushLiteral(alloc, text, tokens, literal_start, i);
+                literal_start = run_end;
+                rule_fired = true;
             }
             i = run_end;
             continue;
@@ -264,11 +348,54 @@ fn tokenize(
 
         i += 1;
     }
-    try flushLiteral(alloc, text, tokens, literal_start, text.len);
+    try flushLiteral(alloc, text, tokens, literal_start, limit);
+    return .{ .end = limit, .rule_fired = rule_fired };
 }
 
 fn flushLiteral(alloc: Allocator, text: []const u8, tokens: *std.ArrayList(Token), start: usize, end: usize) !void {
     if (end > start) try tokens.append(alloc, .{ .text = text[start..end] });
+}
+
+const OpenEndOpener = struct {
+    /// Index just past the `[` (or `![`) that is dropped.
+    end: usize,
+    /// Set when the destination is unfinished: the text stops at its `]`.
+    limit: ?usize = null,
+};
+
+/// Open-end mode: a `[` or `![` whose link is still unfinished shows only its
+/// text. `close` is the first `]` at or after `i`.
+fn openEndLinkOpener(text: []const u8, i: usize, close: ?usize) ?OpenEndOpener {
+    const bracket = if (text[i] == '!') i + 1 else i;
+    if (bracket >= text.len or text[bracket] != '[') return null;
+    const end = bracket + 1;
+    if (close == null or close.? < bracket) return .{ .end = end };
+    const close_at = close.?;
+    if (close_at + 1 >= text.len or text[close_at + 1] != '(') return null;
+    if (!destinationStillOpen(text, close_at + 1)) return null;
+    return .{ .end = end, .limit = close_at };
+}
+
+/// True when no `)` at depth zero closes the `(` at `open_paren`, so the
+/// destination is still being typed. A closing `)` makes the link complete or
+/// invalid, and then the committed rules decide.
+fn destinationStillOpen(text: []const u8, open_paren: usize) bool {
+    var depth: usize = 0;
+    var k = open_paren + 1;
+    while (k < text.len) : (k += 1) {
+        switch (text[k]) {
+            '\\' => {
+                k += 1;
+            },
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return true;
 }
 
 /// End of the run of `text[i]` bytes starting at `i`.
@@ -347,10 +474,18 @@ fn isFlankingPunctuation(cp: u21) bool {
 /// and popped at most once, and `openers_bottom` records, per closer kind,
 /// how deep a failed search reached so the same entries are never rescanned
 /// for that kind, which keeps the pass linear.
-fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Match)) !void {
-    const StackEntry = struct { token: u32, seq: u32 };
+fn matchDelimiters(
+    alloc: Allocator,
+    tokens: []Token,
+    matches: *std.ArrayList(Match),
+    end_closes: *std.ArrayList(u32),
+    mode: Mode,
+) !void {
     var stack: std.ArrayList(StackEntry) = .empty;
     defer stack.deinit(alloc);
+    // Open-end mode only: openers a closer pops while they still hold marks.
+    var unspent: std.ArrayList(u32) = .empty;
+    defer unspent.deinit(alloc);
     var next_seq: u32 = 1;
     // Sequence number of the top entry when a search for this closer kind
     // last failed; entries at or below it stay unusable for that kind.
@@ -377,11 +512,8 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
                 if (opener.marker != closer.marker) continue;
                 if (opener.marker != '~' and violatesRuleOfThree(opener.*, closer.*)) continue;
 
-                const use_len: usize = if (opener.marker == '~' or (opener.remaining >= 2 and closer.remaining >= 2)) 2 else 1;
-                const style: Style = switch (opener.marker) {
-                    '~' => .strike,
-                    else => if (use_len == 2) .bold else .italic,
-                };
+                const use_len = spanLength(opener.marker, opener.remaining, closer.remaining);
+                const style = styleFor(opener.marker, use_len);
                 const match_index: u32 = @intCast(matches.items.len);
                 try matches.append(alloc, .{ .style = style, .next_open = opener.open_head });
                 opener.open_head = match_index;
@@ -396,6 +528,7 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
 
                 // Everything above the opener sat between the pair.
                 const keep = if (opener.remaining == 0) depth else depth + 1;
+                if (mode.isOpenEnd()) try keepUnspent(alloc, tokens, stack.items[keep..], &unspent);
                 stack.shrinkRetainingCapacity(keep);
                 depth = stack.items.len;
                 matched_in_search = closer.remaining == 0;
@@ -408,6 +541,60 @@ fn matchDelimiters(alloc: Allocator, tokens: []Token, matches: *std.ArrayList(Ma
             next_seq += 1;
         }
     }
+    if (mode.isOpenEnd()) {
+        try closeLeftOpeners(alloc, tokens, stack.items, unspent.items, matches, end_closes);
+    }
+}
+
+/// Open-end mode: records the popped openers that still hold marks, so they close at the end too.
+fn keepUnspent(alloc: Allocator, tokens: []const Token, popped: []const StackEntry, unspent: *std.ArrayList(u32)) !void {
+    for (popped) |entry| {
+        if (tokens[entry.token].delimiter.remaining > 0) try unspent.append(alloc, entry.token);
+    }
+}
+
+/// Open-end mode: every opener left open at the end of the text closes there,
+/// innermost first, and the marks it still holds become part of that span.
+fn closeLeftOpeners(
+    alloc: Allocator,
+    tokens: []Token,
+    stack: []const StackEntry,
+    unspent: []const u32,
+    matches: *std.ArrayList(Match),
+    end_closes: *std.ArrayList(u32),
+) !void {
+    var left: std.ArrayList(u32) = .empty;
+    defer left.deinit(alloc);
+    try left.appendSlice(alloc, unspent);
+    for (stack) |entry| try left.append(alloc, entry.token);
+    std.mem.sort(u32, left.items, {}, laterTokenFirst);
+    for (left.items) |token_index| {
+        const opener = &tokens[token_index].delimiter;
+        while (opener.remaining > 0) {
+            const use_len = spanLength(opener.marker, opener.remaining, opener.remaining);
+            const match_index: u32 = @intCast(matches.items.len);
+            try matches.append(alloc, .{ .style = styleFor(opener.marker, use_len), .next_open = opener.open_head });
+            opener.open_head = match_index;
+            try end_closes.append(alloc, match_index);
+            opener.remaining -= use_len;
+        }
+    }
+}
+
+fn laterTokenFirst(_: void, a: u32, b: u32) bool {
+    return a > b;
+}
+
+/// Marks one span takes from its opener: two when both sides still have two.
+fn spanLength(marker: u8, opener_remaining: usize, closer_remaining: usize) usize {
+    return if (marker == '~' or (opener_remaining >= 2 and closer_remaining >= 2)) 2 else 1;
+}
+
+fn styleFor(marker: u8, use_len: usize) Style {
+    return switch (marker) {
+        '~' => .strike,
+        else => if (use_len == 2) .bold else .italic,
+    };
 }
 
 fn markerSlot(marker: u8) usize {
@@ -431,7 +618,7 @@ fn emitTokens(
     alloc: Allocator,
     text: []const u8,
     tokens: []const Token,
-    matches: []const Match,
+    matched: Matched,
     out: *std.ArrayList(u8),
     options: InlineOptions,
     link_id: *u32,
@@ -462,16 +649,27 @@ fn emitTokens(
         .footnote => |number| try writeFootnoteMarker(alloc, out, number),
         .delimiter => |delimiter| {
             var close = delimiter.close_head;
-            while (close) |index| : (close = matches[index].next_close) {
-                try emitStyle(alloc, out, matches[index].style, false, &depth, options);
+            while (close) |index| : (close = matched.matches[index].next_close) {
+                try emitStyle(alloc, out, matched.matches[index].style, false, &depth, options);
             }
-            try out.appendSlice(alloc, text[delimiter.start .. delimiter.start + delimiter.remaining]);
+            if (!hidesFinalRun(delimiter, matched.end, options.mode)) {
+                try out.appendSlice(alloc, text[delimiter.start .. delimiter.start + delimiter.remaining]);
+            }
             var open = delimiter.open_head;
-            while (open) |index| : (open = matches[index].next_open) {
-                try emitStyle(alloc, out, matches[index].style, true, &depth, options);
+            while (open) |index| : (open = matched.matches[index].next_open) {
+                try emitStyle(alloc, out, matched.matches[index].style, true, &depth, options);
             }
         },
     };
+    for (matched.end_closes) |index| {
+        try emitStyle(alloc, out, matched.matches[index].style, false, &depth, options);
+    }
+}
+
+/// True when the final run of the line keeps marks that open-end hides.
+/// An open line's final run may still become a mark, so it shows nothing.
+fn hidesFinalRun(delimiter: Delimiter, end: usize, mode: Mode) bool {
+    return mode.isOpenEnd() and delimiter.start + delimiter.orig_len == end;
 }
 
 fn emitStyle(alloc: Allocator, out: *std.ArrayList(u8), style: Style, opening: bool, depth: *[3]usize, options: InlineOptions) !void {
@@ -950,6 +1148,178 @@ test "emphasis after a truncated UTF-8 sequence renders instead of panicking" {
     var link_id: u32 = 0;
     // The delimiter follows a three-byte lead with only one continuation
     // byte, so the code point before the run has a mismatched length.
-    try writeInline(alloc, "\xe4\x80*bold*", &out, false, null, &link_id);
+    try writeInline(alloc, "\xe4\x80*bold*", &out, false, null, &link_id, .committed);
     try std.testing.expect(std.mem.find(u8, out.items, "bold") != null);
+}
+
+fn renderMode(alloc: Allocator, text: []const u8, open: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var link_id: u32 = 1;
+    var fired = false;
+    const mode: Mode = if (open) .{ .open_end = &fired } else .committed;
+    try writeInline(alloc, text, &out, false, null, &link_id, mode);
+    return out.toOwnedSlice(alloc);
+}
+
+test "open end closes an open span at the end of the text" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "Text with **bold", true);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, ansi.bold_open ++ "bold" ++ ansi.bold_close) != null);
+}
+
+test "open end closes nested open spans innermost first" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "*a **b", true);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, "b" ++ ansi.bold_close ++ ansi.italic_close) != null);
+}
+
+test "open end opens a triple mark as bold and italic to the end" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "***x", true);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, ansi.bold_open ++ "x") != null);
+    try std.testing.expect(std.mem.find(u8, out, "x" ++ ansi.bold_close) != null);
+}
+
+test "open end hides a final run that cannot be classified yet" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "word**", "word" },
+        .{ "hello~", "hello" },
+        .{ "trailing mark *", "trailing mark " },
+        .{ "Text with **", "Text with " },
+    };
+    for (cases) |case| {
+        const out = try renderMode(alloc, case[0], true);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(case[1], out);
+    }
+}
+
+test "open end runs an unpartnered backtick run to the end of the text" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "a `b *c", true);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, ansi.inline_code_open) != null);
+    try std.testing.expect(std.mem.find(u8, out, "b *c") != null);
+}
+
+test "open end shows an unclosed link or image as its text only" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "Check [this lin", "Check this lin" },
+        .{ "![alt", "alt" },
+        .{ "[w](https://en.wikipedia.org/wiki/Foo_(bar", "w" },
+    };
+    for (cases) |case| {
+        const out = try renderMode(alloc, case[0], true);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(case[1], out);
+    }
+}
+
+test "committed mode keeps unclosed marks, brackets, and backticks as text" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{ "Text with **bold", "Text with `code", "Check [this lin" };
+    for (cases) |input| {
+        const out = try renderMode(alloc, input, false);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(input, out);
+    }
+}
+
+test "open end keeps a complete link the same as committed text" {
+    const alloc = std.testing.allocator;
+    const input = "[a](https://x.com) b";
+    const committed = try renderMode(alloc, input, false);
+    defer alloc.free(committed);
+    const open = try renderMode(alloc, input, true);
+    defer alloc.free(open);
+    try std.testing.expectEqualStrings(committed, open);
+}
+
+test "open end drops a lone trailing backslash, which would escape the next byte" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "a \\", true);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("a ", out);
+}
+
+test "open end keeps a double-mark closer with no opener as literal text" {
+    const alloc = std.testing.allocator;
+    const out = try renderMode(alloc, "word** end", true);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("word** end", out);
+}
+
+const max_fuzz_bytes = 256;
+
+test "inline open end matches committed text when no open-end rule applies" {
+    try std.testing.fuzz({}, fuzzInlineOpenEnd, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "**bold",
+            "[a](b",
+            "`code",
+            "x ** y",
+            "~~s",
+            "snake_case *a* _b_",
+            "```sh",
+        }) ++ @import("fuzz_corpus").inline_open_end.*),
+    });
+}
+
+fn fuzzInlineOpenEnd(_: void, smith: *std.testing.Smith) !void {
+    var input: [max_fuzz_bytes]u8 = undefined;
+    const len = smith.slice(&input);
+    try expectOpenEndProperties(std.testing.allocator, input[0..len]);
+}
+
+/// Checks the open-end promises for one line. (i) Rendering in both modes must
+/// not panic. (ii) When the committed matcher leaves no opener open and no
+/// open-end rule fires, both modes render the same bytes. (iii) After open-end
+/// matching, no opener keeps marks that would show as text.
+fn expectOpenEndProperties(alloc: Allocator, text: []const u8) !void {
+    var committed_tokens: std.ArrayList(Token) = .empty;
+    defer committed_tokens.deinit(alloc);
+    _ = try tokenize(alloc, text, &committed_tokens, null, .committed);
+    const committed_left_open = try matchesLeaveOpener(alloc, committed_tokens.items, .committed);
+
+    var open_tokens: std.ArrayList(Token) = .empty;
+    defer open_tokens.deinit(alloc);
+    var fired = false;
+    const open_scan = try tokenize(alloc, text, &open_tokens, null, .{ .open_end = &fired });
+    if (try matchesLeaveOpener(alloc, open_tokens.items, .{ .open_end = &fired })) return error.OpenerLeftOpen;
+
+    const committed_out = try renderMode(alloc, text, false);
+    defer alloc.free(committed_out);
+    const open_out = try renderMode(alloc, text, true);
+    defer alloc.free(open_out);
+    if (committed_left_open or open_scan.rule_fired or finalRunLeftLiteral(open_tokens.items, open_scan.end)) return;
+    try std.testing.expectEqualStrings(committed_out, open_out);
+}
+
+/// Runs the delimiter matcher on `tokens` and reports whether an opener keeps unspent marks.
+fn matchesLeaveOpener(alloc: Allocator, tokens: []Token, mode: Mode) !bool {
+    var matches: std.ArrayList(Match) = .empty;
+    defer matches.deinit(alloc);
+    var end_closes: std.ArrayList(u32) = .empty;
+    defer end_closes.deinit(alloc);
+    try matchDelimiters(alloc, tokens, &matches, &end_closes, mode);
+    for (tokens) |token| switch (token) {
+        .delimiter => |delimiter| if (delimiter.can_open and delimiter.remaining > 0) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn finalRunLeftLiteral(tokens: []const Token, end: usize) bool {
+    for (tokens) |token| switch (token) {
+        .delimiter => |delimiter| if (delimiter.start + delimiter.orig_len == end and delimiter.remaining > 0) return true,
+        else => {},
+    };
+    return false;
 }

@@ -140,7 +140,7 @@ pub const ChildAgent = struct {
     /// pace out in `pacer`, the pacer that holds its text: its own slot's
     /// while it is hidden, the app's while it is on screen (`pacerOf`).
     fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
-        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending() or pacer.hasTail();
     }
 };
 

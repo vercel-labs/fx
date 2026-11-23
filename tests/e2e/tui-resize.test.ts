@@ -3026,7 +3026,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.sendText("stream across a resize");
       await session.waitForText("Generating", 30_000);
       const activeStage = await session.captureFullScrollback();
-      expect(activeStage).not.toContain(markers[0]);
+      expect(activeStage.split(markers[0]).length - 1).toBeLessThanOrEqual(1);
       expect(activeStage).not.toContain(markers[1]);
       expect(activeStage).not.toContain(markers[2]);
       writeFileSync(join(root, "scrollback-active-stream.txt"), activeStage);
@@ -3038,7 +3038,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await waitForCommittedResizeFrame(tracePath, resizeCount);
       const shrinkStage = await session.captureFullScrollback();
       expectOrderedMarkersWithoutBlankHole(shrinkStage, markers.slice(0, 1));
-      expect(shrinkStage).not.toContain(markers[1]);
+      expect(shrinkStage.split(markers[1]).length - 1).toBeLessThanOrEqual(1);
       expect(shrinkStage).not.toContain(markers[2]);
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -3047,7 +3047,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await waitForCommittedResizeFrame(tracePath, resizeCount);
       const growStage = await session.captureFullScrollback();
       expectOrderedMarkersWithoutBlankHole(growStage, markers.slice(0, 1));
-      expect(growStage).not.toContain(markers[1]);
+      expect(growStage.split(markers[1]).length - 1).toBeLessThanOrEqual(1);
       expect(growStage).not.toContain(markers[2]);
       writeFileSync(join(root, "scrollback-after-grow.txt"), growStage);
 

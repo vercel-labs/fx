@@ -40,6 +40,7 @@ import {
   fakeGatewayToolCall,
   fakeShellRun,
   hasEmptyComposer,
+  heldFakeGatewayFinalText,
   isEmptyComposerLine,
   isComposerLine,
   startDynamicFakeGateway,
@@ -2509,8 +2510,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (value) => {
           const outputTokens = streamingOutputTokens(value);
           return outputTokens !== null &&
-            outputTokens > firstOutputTokens &&
-            !value.includes(finalSentinel);
+            outputTokens > firstOutputTokens;
         },
         "increasing estimated live token progress",
       );
@@ -2531,6 +2531,126 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       expect(finalScrollback).toContain(finalSentinel);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "TUI shows streamed words formatted before their line ends",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-streamed-words-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const prompt = "Stream the formatted reply.";
+      const calibration = "Calibration **bold** line.\n\n";
+      const streamedLine = "Streaming **bold";
+      const streamedRest = " words** and `code` here.\n\n| a | b |";
+      const ending = "\n|---|---|\n| 1 | 2 |\n\nDone.\n";
+      const fullReply = `${calibration}${streamedLine}${streamedRest}${ending}`;
+      const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
+      const sgrBeforeBold = (row: string) =>
+        row.slice(0, row.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
+      const summaryRow = /^\s*\d+(?:h\d+m\d+s|m\d+s|s) \(↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?\)\s*$/m;
+      const rowsOf = (text: string) =>
+        text
+          .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
+          .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
+          .split("\n")
+          .map((row) => row.trimEnd());
+      const sessionEnv = (
+        sessionHome: string,
+        url: { baseUrl: string; chatUrl: string },
+      ) => ({
+        HOME: sessionHome,
+        AI_GATEWAY_API_KEY: "fake-tui-streamed-words-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: url.baseUrl,
+        FX_GATEWAY_CHAT_URL: url.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: url.chatUrl,
+        FX_MODEL: MODEL,
+      });
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      const held = heldFakeGatewayFinalText();
+      const streamGateway = startGateway(() => held.response);
+      gateway = streamGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 40,
+        stderrPath,
+        env: sessionEnv(home, streamGateway),
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(prompt);
+      held.send(calibration);
+      await session.waitForText("Calibration bold line.", TIMEOUT);
+      held.send(streamedLine);
+      await session.waitForText("Streaming bold", 5_000);
+
+      const escapedMid = await session.captureFullScrollbackEscapes();
+      const plainMid = await session.captureFullScrollback();
+      expect(plainMid).not.toContain("**");
+      const calibrationRow =
+        escapedMid.split("\n").find((row) => row.includes("Calibration")) ?? "";
+      const streamedRow =
+        escapedMid.split("\n").find((row) => row.includes("Streaming")) ?? "";
+      expect(sgrBeforeBold(calibrationRow)).toMatch(boldSgr);
+      expect(sgrBeforeBold(streamedRow)).toBe(sgrBeforeBold(calibrationRow));
+
+      held.send(streamedRest);
+      await session.waitForText("words", TIMEOUT);
+      await session.waitForText("code", TIMEOUT);
+      const plainPartial = await session.captureFullScrollback();
+      expect(plainPartial).not.toContain("**");
+      expect(plainPartial).not.toContain("`");
+      expect(
+        plainPartial.split("\n").some((row) => row.trimStart().startsWith("| a")),
+      ).toBe(false);
+
+      held.send(ending);
+      held.release("");
+      await session.waitForText("Done.", TIMEOUT);
+      await waitForScrollback(
+        session,
+        (value) => summaryRow.test(value),
+        "turn summary after the streamed reply",
+      );
+      const streamed = await session.captureFullScrollback();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+      gateway?.stop();
+      gateway = null;
+
+      const onePieceHome = join(root, "one-piece-home");
+      mkdirSync(join(onePieceHome, ".fx"), { recursive: true });
+      writeFileSync(join(onePieceHome, ".fx", "settings.json"), "{}");
+      const onePieceGateway = startGateway(() => fakeGatewayFinalText(fullReply));
+      gateway = onePieceGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 40,
+        stderrPath: join(root, "one-piece-stderr.log"),
+        env: sessionEnv(onePieceHome, onePieceGateway),
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(prompt);
+      await session.waitForText("Done.", TIMEOUT);
+      await waitForScrollback(
+        session,
+        (value) => summaryRow.test(value),
+        "turn summary after the one-piece reply",
+      );
+      const onePiece = await session.captureFullScrollback();
+      expect(rowsOf(streamed)).toEqual(rowsOf(onePiece));
     },
     TIMEOUT * 2,
   );
@@ -4480,6 +4600,123 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a stream error after a partial line leaves no tail text on screen",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-midline-error-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const finalText = "A complete replacement response.";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "Streaming **bold" },
+          { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 2_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-midline-error-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Fail mid line.");
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => !pane.includes("Generating"), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).not.toContain("Streaming");
+      expect(scrollback).not.toContain("**");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape on a partial line keeps the shown words once, formatted, before what follows",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-midline-cancel-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const partial = "Streaming **bold";
+      const holdState: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      gateway = startFakeGateway([
+        () =>
+          heldGatewayResponse(holdState, [
+            { type: "text-delta", id: "cancelled_partial", delta: partial },
+          ]),
+        fakeGatewayFinalText("After cancel answer."),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 2_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-midline-cancel-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Cancel mid line.");
+      await session.waitForText("Streaming bold", TIMEOUT);
+      expect(await session.capturePane()).not.toContain("**");
+      await session.sendInterruptEscapePair();
+      await session.waitForPane((pane) => !pane.includes("Generating"), TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Next prompt.");
+      await session.waitForText("After cancel answer.", TIMEOUT);
+      await session.waitForPane((pane) => !pane.includes("Generating"), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const escaped = await session.captureFullScrollbackEscapes();
+      const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
+      const streamedRow = escaped.split("\n").find((row) => row.includes("Streaming")) ?? "";
+      const sgrBeforeBold =
+        streamedRow.slice(0, streamedRow.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
+
+      expect(scrollback.split("Streaming bold").length - 1).toBe(1);
+      expect(scrollback).not.toContain("**");
+      expect(sgrBeforeBold).toMatch(boldSgr);
+      expect(scrollback.indexOf("Streaming bold")).toBeLessThan(scrollback.indexOf("Next prompt."));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "provider error after streamed tool start regenerates without a recovery modal",
     async () => {
       const finalText = "Recovered after unstarted tool activity.";
@@ -5329,7 +5566,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Start the cancelled response fixture.");
       await session.waitForText(visiblePrefix, TIMEOUT);
-      expect(await session.captureFullScrollback()).not.toContain(bufferedTail);
+      await session.waitForText(bufferedTail, TIMEOUT);
+      const beforeSteering = await session.captureFullScrollback();
+      expect(beforeSteering.indexOf(bufferedTail)).toBeGreaterThan(
+        beforeSteering.indexOf(visiblePrefix),
+      );
 
       await session.sendText(steering);
       await waitForScrollback(

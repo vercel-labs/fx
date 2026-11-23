@@ -16,6 +16,9 @@ pub const ToolTurnFloor = struct {
 pub const Candidates = struct {
     mutation_pin_start: ?usize = null,
     assistant_tail_start: ?usize = null,
+    /// The first byte of the provisional tail. It is never final, whatever the
+    /// assistant tail's writability, because the tail is still changing.
+    tail_start: ?usize = null,
     tool_turn_floors: []const ToolTurnFloor = &.{},
 
     pub fn deinit(self: *Candidates, alloc: std.mem.Allocator) void {
@@ -27,6 +30,7 @@ pub const Candidates = struct {
         return .{
             .mutation_pin_start = self.mutation_pin_start,
             .assistant_tail_start = self.assistant_tail_start,
+            .tail_start = self.tail_start,
             .tool_turn_floors = if (self.tool_turn_floors.len == 0)
                 &.{}
             else
@@ -53,7 +57,8 @@ pub const State = struct {
         finalized_tool_turn_watermark: u64,
         replaceable_start: ?usize,
     ) ?usize {
-        if (self.policy == .append_only) return null;
+        // Append-only output is final except for the provisional tail, which is never final.
+        if (self.policy == .append_only) return candidates.tail_start;
 
         var floor = candidates.mutation_pin_start;
         for (candidates.tool_turn_floors) |turn_floor| {
@@ -66,6 +71,7 @@ pub const State = struct {
                 floor = earlier(floor, start);
             }
         }
+        if (candidates.tail_start) |start| floor = earlier(floor, start);
         return floor;
     }
 };
@@ -112,6 +118,23 @@ test "transcript release ignores final producers and preserves append-only outpu
         @as(?usize, null),
         (State{ .policy = .append_only }).finality_floor(candidates, 0, 3),
     );
+}
+
+test "append-only output still holds a provisional tail" {
+    const candidates = Candidates{ .tail_start = 20 };
+    try std.testing.expectEqual(
+        @as(?usize, 20),
+        (State{ .policy = .append_only }).finality_floor(candidates, 0, null),
+    );
+}
+
+test "transcript release holds a provisional tail even when the assistant tail is closed" {
+    const candidates = Candidates{ .tail_start = 20 };
+    try std.testing.expectEqual(
+        @as(?usize, 20),
+        (State{ .assistant_tail_writable = false }).finality_floor(candidates, 0, null),
+    );
+    try std.testing.expectEqual(@as(?usize, null), (State{}).finality_floor(.{}, 0, null));
 }
 
 test "assistant tail writability returns a new state" {

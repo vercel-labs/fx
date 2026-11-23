@@ -2499,6 +2499,779 @@ test "streamed paragraphs keep words together through shrink and grow" {
     _ = try findRowContaining(&h, "alpha beta gamma delta epsilon");
 }
 
+fn applyProvisionalTail(h: *Harness, processor: *const assistant_presentation.MarkdownProcessor) !void {
+    var events: std.ArrayList(assistant_presentation.Event) = .empty;
+    defer events.deinit(h.alloc);
+    _ = try processor.renderProvisional(h.alloc, &events);
+    const id = h.shell.stageAssistantTail(h.alloc, try events.toOwnedSlice(h.alloc));
+    h.shell.applyStagedAssistantTail(h.alloc, id);
+}
+
+fn countRowsContaining(h: *Harness, needle: []const u8) !usize {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var count: usize = 0;
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowText(row, &buf);
+        if (std.mem.find(u8, buf.items, needle) != null) count += 1;
+    }
+    return count;
+}
+
+test "a provisional tail draws its open bold run formatted before the line ends" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Streaming **bold", &committed);
+    try std.testing.expectEqual(@as(usize, 0), committed.items.len);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const row = try findRowContaining(&h, "Streaming bold");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    try h.vt.rowText(row, &buf);
+    try std.testing.expect(std.mem.find(u8, buf.items, "**") == null);
+    const bold_index = std.mem.find(u8, buf.items, "bold") orelse return error.TestMissingBoldWord;
+    const bold_cell = h.vt.cellAt(row, @intCast(bold_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.codepoint == 'b' and bold_cell.style.flags.bold);
+    const plain_index = std.mem.find(u8, buf.items, "Streaming") orelse return error.TestMissingPlainWord;
+    const plain_cell = h.vt.cellAt(row, @intCast(plain_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(plain_cell.codepoint == 'S' and !plain_cell.style.flags.bold);
+}
+
+test "a cancelled tail freezes into the same bold row it showed" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Streaming **bold", &committed);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const shown_row = try findRowContaining(&h, "Streaming bold");
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(h.alloc);
+    try h.vt.rowText(shown_row, &shown);
+
+    try h.shell.freezeAssistantTail(h.alloc, "cancel");
+    try std.testing.expectEqual(@as(usize, 0), h.shell.assistant_tail.items.len);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const frozen_row = try findRowContaining(&h, "Streaming bold");
+    try std.testing.expectEqual(shown_row, frozen_row);
+    var frozen: std.ArrayList(u8) = .empty;
+    defer frozen.deinit(h.alloc);
+    try h.vt.rowText(frozen_row, &frozen);
+    try std.testing.expectEqualStrings(shown.items, frozen.items);
+    const bold_index = std.mem.find(u8, frozen.items, "bold") orelse return error.TestMissingBoldWord;
+    const bold_cell = h.vt.cellAt(frozen_row, @intCast(bold_index + 1)) orelse return error.TestMissingCell;
+    try std.testing.expect(bold_cell.codepoint == 'b' and bold_cell.style.flags.bold);
+}
+
+test "an open line with control bytes draws the row its committed line draws" {
+    const line = "Streaming \x1b[31mred\x1b[0m \x1b]0;title\x07 done";
+    var open = try Harness.init(std.testing.allocator, 80, 24, 4);
+    defer open.deinit();
+    try open.shell.initViewport(&open.metrics, 1);
+    var open_processor = assistant_presentation.MarkdownProcessor{};
+    defer open_processor.deinit(open.alloc);
+    var open_committed: std.ArrayList(u8) = .empty;
+    defer open_committed.deinit(open.alloc);
+    try open_processor.push(open.alloc, line, &open_committed);
+    try applyProvisionalTail(&open, &open_processor);
+    try open.renderTranscriptFrame();
+    try open.flush();
+    const open_row = try findRowContaining(&open, "Streaming");
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(open.alloc);
+    try open.vt.rowText(open_row, &open_text);
+
+    var done = try Harness.init(std.testing.allocator, 80, 24, 4);
+    defer done.deinit();
+    try done.shell.initViewport(&done.metrics, 1);
+    var done_processor = assistant_presentation.MarkdownProcessor{};
+    defer done_processor.deinit(done.alloc);
+    var done_committed: std.ArrayList(u8) = .empty;
+    defer done_committed.deinit(done.alloc);
+    try done_processor.push(done.alloc, line ++ "\n", &done_committed);
+    _ = try done.shell.streamAssistantChunk(done.alloc, &done.metrics, done_committed.items);
+    try done.renderTranscriptFrame();
+    try done.flush();
+    const done_row = try findRowContaining(&done, "Streaming");
+    var done_text: std.ArrayList(u8) = .empty;
+    defer done_text.deinit(done.alloc);
+    try done.vt.rowText(done_row, &done_text);
+
+    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, done_text.items, " "), std.mem.trimEnd(u8, open_text.items, " "));
+    try std.testing.expect(std.mem.find(u8, open_text.items, "\x1b") == null);
+    const red_index = std.mem.find(u8, open_text.items, "red") orelse return error.TestMissingRedWord;
+    const red_cell = open.vt.cellAt(open_row, @intCast(red_index)) orelse return error.TestMissingCell;
+    try std.testing.expect(!red_cell.style.flags.bold);
+}
+
+test "an open line of block markers draws no rule row" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "w1\n", &committed);
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+    committed.clearRetainingCapacity();
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const rules_before = try countRowsContaining(&h, "─");
+
+    try processor.push(h.alloc, "** **", &committed);
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    try std.testing.expectEqual(rules_before, try countRowsContaining(&h, "─"));
+    try std.testing.expectEqual(@as(usize, 0), try countRowsContaining(&h, "** **"));
+    _ = try findRowContaining(&h, "w1");
+}
+
+test "a long open tail never enters native history and its line commits once" {
+    const alloc = std.testing.allocator;
+    const early = "EARLY_01\nEARLY_02\nEARLY_03\nEARLY_04\nEARLY_05\nEARLY_06\nEARLY_07\nEARLY_08\n" ++
+        "EARLY_09\nEARLY_10\nEARLY_11\nEARLY_12\nEARLY_13\nEARLY_14\nEARLY_15\nEARLY_16\nEARLY_17\nEARLY_18\n" ++
+        "EARLY_19\nEARLY_20\n";
+    const words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike " ++
+        "november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu ";
+    const line = words ++ words ++ "TAIL_END";
+    const early_rows: u32 = 20;
+
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, early);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const history_before = h.shell.transcriptCommitDiagnostic().history_visual_offset;
+    try std.testing.expect(history_before > 0);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, line, &committed);
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    _ = try findRowContaining(&h, "TAIL_END");
+    try std.testing.expectEqual(early_rows, h.shell.transcriptCommitDiagnostic().history_visual_offset);
+
+    try processor.push(alloc, "\n", &committed);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, committed.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    var reference = try Harness.init(alloc, 40, 12, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    _ = try reference.shell.appendRawTranscriptEntry(alloc, early);
+    try reference.renderTranscriptFrame();
+    try reference.flush();
+    var reference_processor = assistant_presentation.MarkdownProcessor{};
+    defer reference_processor.deinit(alloc);
+    var reference_committed: std.ArrayList(u8) = .empty;
+    defer reference_committed.deinit(alloc);
+    try reference_processor.push(alloc, line ++ "\n", &reference_committed);
+    _ = try reference.shell.streamAssistantChunk(alloc, &reference.metrics, reference_committed.items);
+    try reference.renderTranscriptFrame();
+    try reference.flush();
+
+    try std.testing.expectEqual(
+        reference.shell.transcriptCommitDiagnostic().history_visual_offset,
+        h.shell.transcriptCommitDiagnostic().history_visual_offset,
+    );
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(alloc);
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(alloc);
+        try h.vt.rowText(row, &got);
+        try reference.vt.rowText(row, &want);
+        try std.testing.expectEqualStrings(want.items, got.items);
+    }
+}
+
+test "a provisional tail continues the committed text of its turn without a second block" {
+    var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Committed line\nsecond line\n", &committed);
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+    committed.clearRetainingCapacity();
+    try processor.push(h.alloc, "third words", &committed);
+
+    try applyProvisionalTail(&h, &processor);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "Committed line"));
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "second line"));
+    try std.testing.expectEqual(@as(usize, 1), try countRowsContaining(&h, "third words"));
+    const second_row = try findRowContaining(&h, "second line");
+    try expectRowTrimmedEquals(&h, second_row + 1, "  third words");
+}
+
+test "a provisional tail after a user prompt keeps the footer gap of its committed text" {
+    var h = try Harness.init(std.testing.allocator, 96, 10, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(h.alloc);
+    var approval: approval_prompt.ApprovalPrompt = .{};
+    defer approval.deinit(h.alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    const prompt = try h.alloc.dupe(u8, "Explain it");
+    _ = try h.shell.appendUserTurnOwned(h.alloc, .{ .text = prompt, .images = &.{} });
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(h.alloc);
+    try processor.push(h.alloc, "Tail answer", &committed);
+    try applyProvisionalTail(&h, &processor);
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const tail_row = try findRowContaining(&h, "Tail answer");
+    const footer_row = try findFirstDividerRowAfter(&h, tail_row);
+    try expectExactlyOneBlankRowBetween(&h, tail_row, footer_row);
+}
+
+const DocumentStream = struct {
+    h: *Harness,
+    processor: assistant_presentation.MarkdownProcessor = .{},
+    formatted: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *DocumentStream) void {
+        self.processor.deinit(self.h.alloc);
+        self.formatted.deinit(self.h.alloc);
+    }
+
+    fn push(self: *DocumentStream, chunk: []const u8) !void {
+        var table = assistant_presentation.TableCompletion{ .ctx = self, .deliver = deliverTable };
+        var code = assistant_presentation.CodeBlockCompletion{ .ctx = self, .deliver = deliverCode };
+        const completions = assistant_presentation.MarkdownCompletions{ .table = &table, .code = &code };
+        try self.processor.pushWithCompletions(self.h.alloc, chunk, &self.formatted, completions);
+        try self.show();
+    }
+
+    fn finish(self: *DocumentStream) !void {
+        var table = assistant_presentation.TableCompletion{ .ctx = self, .deliver = deliverTable };
+        var code = assistant_presentation.CodeBlockCompletion{ .ctx = self, .deliver = deliverCode };
+        const completions = assistant_presentation.MarkdownCompletions{ .table = &table, .code = &code };
+        try self.processor.flushWithCompletions(self.h.alloc, &self.formatted, completions);
+        try self.show();
+    }
+
+    fn show(self: *DocumentStream) !void {
+        try self.commitText(&self.formatted);
+        try applyProvisionalTail(self.h, &self.processor);
+        try self.h.renderTranscriptFrame();
+        try self.h.flush();
+    }
+
+    fn commitText(self: *DocumentStream, out: *std.ArrayList(u8)) !void {
+        if (out.items.len == 0) return;
+        _ = try self.h.shell.streamAssistantChunk(self.h.alloc, &self.h.metrics, out.items);
+        out.clearRetainingCapacity();
+    }
+
+    fn deliverTable(ctx: *anyopaque, table: assistant_presentation.TablePayload, out: *std.ArrayList(u8)) !void {
+        const self: *DocumentStream = @ptrCast(@alignCast(ctx));
+        try self.commitText(out);
+        _ = try self.h.shell.appendAssistantTableOwned(self.h.alloc, table);
+    }
+
+    fn deliverCode(ctx: *anyopaque, block: assistant_presentation.CodeBlockPayload, out: *std.ArrayList(u8)) !void {
+        const self: *DocumentStream = @ptrCast(@alignCast(ctx));
+        try self.commitText(out);
+        _ = try self.h.shell.appendAssistantCodeBlockOwned(self.h.alloc, block);
+    }
+};
+
+fn historyOffset(h: *Harness) u32 {
+    return h.shell.transcriptCommitDiagnostic().history_visual_offset;
+}
+
+fn appendScreenText(h: *Harness, out: *std.ArrayList(u8)) !void {
+    var row: u16 = 1;
+    while (row <= h.vt.rows) : (row += 1) {
+        try h.vt.rowTextTrimmed(row, out);
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn appendRows(h: *Harness, first: u16, count: u16, out: *std.ArrayList(u8)) !void {
+    var row = first;
+    while (row < first + count) : (row += 1) {
+        try h.vt.rowTextTrimmed(row, out);
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn appendStyledRows(h: *Harness, first: u16, count: u16, out: *std.ArrayList(u8)) !void {
+    var row = first;
+    while (row < first + count) : (row += 1) {
+        var line: std.Io.Writer.Allocating = .init(h.alloc);
+        defer line.deinit();
+        try h.vt.rowStyledTextTrimmed(row, &line.writer);
+        try out.appendSlice(h.alloc, line.written());
+        try out.append(h.alloc, '\n');
+    }
+}
+
+fn nonBlankRunLength(h: *Harness, first: u16) !u16 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    var count: u16 = 0;
+    var row = first;
+    while (row <= h.vt.rows) : (row += 1) {
+        buf.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(row, &buf);
+        if (buf.items.len == 0) break;
+        count += 1;
+    }
+    return count;
+}
+
+test "an open table draws its rows as the committed table does" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("| name | value |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n| c | 3");
+
+    const first = try findRowContaining(&h, "name");
+    const count = try nonBlankRunLength(&h, first);
+    try std.testing.expect(count >= 4);
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(alloc);
+    try appendRows(&h, first, count, &open_text);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "| --- |") == null);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "| a |") == null);
+    var open_styled: std.ArrayList(u8) = .empty;
+    defer open_styled.deinit(alloc);
+    try appendStyledRows(&h, first, count, &open_styled);
+
+    try open.push("\n\nDone.\n");
+    try std.testing.expectEqual(first, try findRowContaining(&h, "name"));
+    var committed_text: std.ArrayList(u8) = .empty;
+    defer committed_text.deinit(alloc);
+    try appendRows(&h, first, count, &committed_text);
+    try std.testing.expectEqualStrings(committed_text.items, open_text.items);
+    var committed_styled: std.ArrayList(u8) = .empty;
+    defer committed_styled.deinit(alloc);
+    try appendStyledRows(&h, first, count, &committed_styled);
+    try std.testing.expectEqualStrings(committed_styled.items, open_styled.items);
+}
+
+test "a table header with no delimiter yet draws as a header, never as raw pipes" {
+    var h = try Harness.init(std.testing.allocator, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("| name | value |");
+
+    const row = try findRowContaining(&h, "name");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(h.alloc);
+    try h.vt.rowTextTrimmed(row, &buf);
+    try std.testing.expect(std.mem.find(u8, buf.items, "|") == null);
+    try std.testing.expect(std.mem.find(u8, buf.items, "value") != null);
+}
+
+test "an open code fence draws its lines as the committed block does" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 30, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("```zig\nconst a = 1;\nconst b = 2;\nconst c = 3");
+
+    const open_top = (try findRowContaining(&h, "const a")) - 1;
+    const open_bottom = try findRowContaining(&h, "const c");
+    var open_text: std.ArrayList(u8) = .empty;
+    defer open_text.deinit(alloc);
+    try appendRows(&h, open_top, open_bottom - open_top + 1, &open_text);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "const c = 3") != null);
+    try std.testing.expect(std.mem.find(u8, open_text.items, "```") == null);
+    var open_styled: std.ArrayList(u8) = .empty;
+    defer open_styled.deinit(alloc);
+    try appendStyledRows(&h, open_top, open_bottom - open_top + 1, &open_styled);
+    try std.testing.expect(std.mem.find(u8, open_styled.items, "\x1b[") != null);
+
+    try open.push("\n```\n\nDone.\n");
+    const committed_top = (try findRowContaining(&h, "const a")) - 1;
+    try std.testing.expectEqual(open_top, committed_top);
+    const committed_bottom = try findRowContaining(&h, "const c");
+    var committed_text: std.ArrayList(u8) = .empty;
+    defer committed_text.deinit(alloc);
+    try appendRows(&h, committed_top, committed_bottom - committed_top + 1, &committed_text);
+    try std.testing.expectEqualStrings(committed_text.items, open_text.items);
+    var committed_styled: std.ArrayList(u8) = .empty;
+    defer committed_styled.deinit(alloc);
+    try appendStyledRows(&h, committed_top, committed_bottom - committed_top + 1, &committed_styled);
+    try std.testing.expectEqualStrings(committed_styled.items, open_styled.items);
+}
+
+const tall_table_header = "| n | v |\n| --- | --- |\n";
+const tall_table_rows = blk: {
+    @setEvalBranchQuota(2000000);
+    var rows: [60][]const u8 = undefined;
+    for (&rows, 0..) |*row, index| {
+        row.* = std.fmt.comptimePrint("| row {d} | {d} |\n", .{ index + 1, index + 1 });
+    }
+    break :blk rows;
+};
+const tall_table_text = blk: {
+    @setEvalBranchQuota(2000000);
+    var text: []const u8 = "";
+    for (tall_table_rows) |row| text = text ++ row;
+    break :blk text;
+};
+
+test "a tall open table shows its newest rows and enters no history until it commits" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 24, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var open = DocumentStream{ .h = &h };
+    defer open.deinit();
+    try open.push("Intro\n");
+    try open.push(tall_table_header);
+    for (tall_table_rows) |row| try open.push(row);
+
+    try std.testing.expect(historyOffset(&h) <= 1);
+    const newest = try findRowContaining(&h, "row 60");
+    try std.testing.expect(newest + 2 >= h.shell.layout.content_bottom);
+    try std.testing.expect(newest <= h.shell.layout.content_bottom);
+
+    try open.push("\n\nDone.\n");
+
+    var reference = try Harness.init(alloc, 80, 24, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    var whole = DocumentStream{ .h = &reference };
+    defer whole.deinit();
+    try whole.push("Intro\n" ++ tall_table_header ++ tall_table_text ++ "\n\nDone.\n");
+    try whole.finish();
+
+    try std.testing.expectEqual(historyOffset(&reference), historyOffset(&h));
+    var live_text: std.ArrayList(u8) = .empty;
+    defer live_text.deinit(alloc);
+    var reference_text: std.ArrayList(u8) = .empty;
+    defer reference_text.deinit(alloc);
+    try appendScreenText(&h, &live_text);
+    try appendScreenText(&reference, &reference_text);
+    try std.testing.expectEqualStrings(reference_text.items, live_text.items);
+}
+
+const s4_chunks = blk: {
+    @setEvalBranchQuota(2000000);
+    var chunks: [105][]const u8 = undefined;
+    var n: usize = 0;
+    chunks[n] = "| name | value |\n";
+    n += 1;
+    chunks[n] = "| --- | --- |\n";
+    n += 1;
+    for (1..51) |i| {
+        chunks[n] = std.fmt.comptimePrint("| row {d} | {d} |\n", .{ i, i });
+        n += 1;
+    }
+    chunks[n] = "```zig\n";
+    n += 1;
+    for (1..51) |i| {
+        chunks[n] = std.fmt.comptimePrint("const v_{d} = {d};\n", .{ i, i });
+        n += 1;
+    }
+    chunks[n] = "```\n";
+    n += 1;
+    chunks[n] = "Done.\n";
+    n += 1;
+    break :blk chunks;
+};
+const s4_text = blk: {
+    @setEvalBranchQuota(2000000);
+    var text: []const u8 = "";
+    for (s4_chunks) |chunk| text = text ++ chunk;
+    break :blk text;
+};
+
+test "a streamed table and code block match their one-push commit with no extra blank rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var live = DocumentStream{ .h = &h };
+    defer live.deinit();
+    for (s4_chunks) |chunk| try live.push(chunk);
+    try live.finish();
+
+    var reference = try Harness.init(alloc, 120, 40, 4);
+    defer reference.deinit();
+    try reference.shell.initViewport(&reference.metrics, 1);
+    var whole = DocumentStream{ .h = &reference };
+    defer whole.deinit();
+    try whole.push(s4_text);
+    try whole.finish();
+
+    try std.testing.expect(historyOffset(&reference) > 0);
+    try std.testing.expect(historyOffset(&h) > 0);
+    try std.testing.expectEqual(historyOffset(&reference), historyOffset(&h));
+    var live_text: std.ArrayList(u8) = .empty;
+    defer live_text.deinit(alloc);
+    var reference_text: std.ArrayList(u8) = .empty;
+    defer reference_text.deinit(alloc);
+    try appendScreenText(&h, &live_text);
+    try appendScreenText(&reference, &reference_text);
+    try std.testing.expectEqualStrings(reference_text.items, live_text.items);
+}
+
+fn countPresentTableRows(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    row_count: usize,
+) !usize {
+    const screen = try captureTrimmedGrid(h, alloc);
+    defer alloc.free(screen);
+    var present: usize = 0;
+    for (1..row_count + 1) |i| {
+        var marker_buf: [16]u8 = undefined;
+        const marker = try std.mem.print(&marker_buf, "row {d:0>2}", .{i});
+        if (std.mem.find(u8, probe.history.items, marker) != null or
+            std.mem.find(u8, screen, marker) != null)
+        {
+            present += 1;
+        }
+    }
+    return present;
+}
+
+test "a 49-row open table never loses visible rows when it commits" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const renderFrame = struct {
+        fn call(
+            harness: *Harness,
+            p: *PhysicalHistoryProbe,
+            inp: *const InputRuntime,
+            app: *const approval_prompt.ApprovalPrompt,
+            generating: bool,
+        ) !void {
+            var ctx = defaultFooterContext(inp);
+            ctx.transcript_depth = harness.shell.transcriptPresentationDepth();
+            if (generating) ctx.activity = .{ .turn_thinking = .{ .label = "Generating" } };
+            harness.frame_redraw = true;
+            try renderTestFooterWithContext(harness, app, &harness.frame_redraw, ctx);
+            try capturePhysicalFrame(harness, p);
+        }
+    }.call;
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+
+    for (1..42) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "intro {d:0>2}\n", .{i}));
+        if (i % 4 == 0 or i == 41) try renderFrame(&h, &probe, &input, &approval, false);
+    }
+    try renderFrame(&h, &probe, &input, &approval, false);
+    try std.testing.expect(historyOffset(&h) > 0);
+    try std.testing.expect(probe.history.items.len > 0);
+
+    var stream = DocumentStream{ .h = &h };
+    defer stream.deinit();
+    var table_cb = assistant_presentation.TableCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverTable };
+    var code_cb = assistant_presentation.CodeBlockCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverCode };
+    const completions = assistant_presentation.MarkdownCompletions{ .table = &table_cb, .code = &code_cb };
+
+    try stream.processor.pushWithCompletions(alloc, "| name | value |\n| --- | --- |\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+
+    var max_seen: usize = 0;
+    var saw_table = false;
+    for (1..49) |i| {
+        var row_buf: [32]u8 = undefined;
+        const chunk = try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i });
+        try stream.processor.pushWithCompletions(alloc, chunk, &stream.formatted, completions);
+        try stream.commitText(&stream.formatted);
+        try applyProvisionalTail(&h, &stream.processor);
+        try renderFrame(&h, &probe, &input, &approval, true);
+        const present = try countPresentTableRows(alloc, &h, &probe, 49);
+        if (present > 0) saw_table = true;
+        try std.testing.expect(!saw_table or present >= max_seen);
+        max_seen = @max(max_seen, present);
+    }
+    try std.testing.expect(saw_table);
+
+    try stream.processor.pushWithCompletions(alloc, "| row 49 | 49 |\n\nDone.\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+    const at_commit = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(at_commit >= max_seen);
+    max_seen = @max(max_seen, at_commit);
+
+    try stream.processor.flushWithCompletions(alloc, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    const after_finish = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(after_finish >= max_seen);
+    try std.testing.expectEqual(@as(usize, 49), after_finish);
+}
+
+test "a 49-row open table committing mid-growth into a code block never loses visible rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const renderFrame = struct {
+        fn call(
+            harness: *Harness,
+            p: *PhysicalHistoryProbe,
+            inp: *const InputRuntime,
+            app: *const approval_prompt.ApprovalPrompt,
+            generating: bool,
+        ) !void {
+            var ctx = defaultFooterContext(inp);
+            ctx.transcript_depth = harness.shell.transcriptPresentationDepth();
+            if (generating) ctx.activity = .{ .turn_thinking = .{ .label = "Generating" } };
+            harness.frame_redraw = true;
+            try renderTestFooterWithContext(harness, app, &harness.frame_redraw, ctx);
+            try capturePhysicalFrame(harness, p);
+        }
+    }.call;
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+
+    for (1..42) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "intro {d:0>2}\n", .{i}));
+        if (i % 4 == 0 or i == 41) try renderFrame(&h, &probe, &input, &approval, false);
+    }
+    try renderFrame(&h, &probe, &input, &approval, false);
+
+    var stream = DocumentStream{ .h = &h };
+    defer stream.deinit();
+    var table_cb = assistant_presentation.TableCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverTable };
+    var code_cb = assistant_presentation.CodeBlockCompletion{ .ctx = &stream, .deliver = DocumentStream.deliverCode };
+    const completions = assistant_presentation.MarkdownCompletions{ .table = &table_cb, .code = &code_cb };
+
+    try stream.processor.pushWithCompletions(alloc, "| name | value |\n| --- | --- |\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+
+    var max_seen: usize = 0;
+    var saw_table = false;
+    for (1..21) |i| {
+        var row_buf: [32]u8 = undefined;
+        const chunk = try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i });
+        try stream.processor.pushWithCompletions(alloc, chunk, &stream.formatted, completions);
+        try stream.commitText(&stream.formatted);
+        try applyProvisionalTail(&h, &stream.processor);
+        try renderFrame(&h, &probe, &input, &approval, true);
+        const present = try countPresentTableRows(alloc, &h, &probe, 49);
+        if (present > 0) saw_table = true;
+        try std.testing.expect(!saw_table or present >= max_seen);
+        max_seen = @max(max_seen, present);
+    }
+    try std.testing.expect(saw_table);
+
+    var rest: std.ArrayList(u8) = .empty;
+    defer rest.deinit(alloc);
+    for (21..50) |i| {
+        var row_buf: [32]u8 = undefined;
+        try rest.appendSlice(alloc, try std.mem.print(&row_buf, "| row {d:0>2} | {d} |\n", .{ i, i }));
+    }
+    try rest.appendSlice(alloc, "```zig\nconst v_1 = 1;\nconst v_2 = 2;\nconst v_3 = 3;\nconst v_4 = 4;\nconst v_5 = 5;\n");
+    try stream.processor.pushWithCompletions(alloc, rest.items, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, true);
+    const at_commit = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(at_commit >= max_seen);
+    max_seen = @max(max_seen, at_commit);
+
+    try stream.processor.pushWithCompletions(alloc, "```\n\nDone.\n", &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    try stream.processor.flushWithCompletions(alloc, &stream.formatted, completions);
+    try stream.commitText(&stream.formatted);
+    try applyProvisionalTail(&h, &stream.processor);
+    try renderFrame(&h, &probe, &input, &approval, false);
+    const after_finish = try countPresentTableRows(alloc, &h, &probe, 49);
+    try std.testing.expect(after_finish >= max_seen);
+    try std.testing.expectEqual(@as(usize, 49), after_finish);
+}
+
 test "entry-bound shimmer resolves to the painted status row without moving footer" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
