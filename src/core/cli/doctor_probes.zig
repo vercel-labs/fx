@@ -1214,13 +1214,11 @@ const StopWatchdog = struct {
     }
 };
 
-/// Fails the test, saying that `what` was still blocked when the watchdog
-/// killed the processes it waited on.
-fn expectNotHung(watchdog: *StopWatchdog, what: []const u8) !void {
-    if (!watchdog.disarm()) return;
-    std.debug.print("{s} had not returned after {d} ms, so the watchdog killed the processes it waited on: the stop path did not end them\n", .{ what, stop_bound_ms });
-    return error.StopPathHung;
-}
+/// What a test prints, with the call that was blocked and `stop_bound_ms`,
+/// when its watchdog had to kill. The test prints it itself: the direct-write
+/// audit lists the `std.debug.print` sites outside test blocks one by one
+/// (`tests/e2e/render-lab/audit-direct-writes.ts`).
+const stop_path_hung_fmt = "{s} had not returned after {d} ms, so the watchdog killed the processes it waited on: the stop path did not end them\n";
 
 /// Kills each of `pids` and its group. A pid of 0 or 1 would signal the test's
 /// own group or every process, so it is skipped.
@@ -1257,7 +1255,10 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     try watchdog.arm();
     defer _ = watchdog.disarm();
     try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters, &servers).?);
-    try expectNotHung(&watchdog, "wait");
+    if (watchdog.disarm()) {
+        std.debug.print(stop_path_hung_fmt, .{ "wait", stop_bound_ms });
+        return error.StopPathHung;
+    }
     // It stopped at the signal, not at the deadline, and never started the
     // check that waited in the queue.
     try std.testing.expect(io_mod.milliTimestamp() - started < reap_grace_ms);
@@ -1559,7 +1560,10 @@ test "stopping a check that keeps starting processes in groups of their own leav
         try watchdog.arm();
         defer _ = watchdog.disarm();
         waiters.cancel(io_mod.getIo());
-        try expectNotHung(&watchdog, "cancelling the forker's waiter");
+        if (watchdog.disarm()) {
+            std.debug.print(stop_path_hung_fmt, .{ "cancelling the forker's waiter", stop_bound_ms });
+            return error.StopPathHung;
+        }
         // Only after the stop, so a test that fails here does not leave the
         // forker starting processes.
         try std.testing.expect(started_one);
