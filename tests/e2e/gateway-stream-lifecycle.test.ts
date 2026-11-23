@@ -4256,6 +4256,82 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("late scoped instructions defer a same-batch read until it is reissued", async () => {
+    const root = createFixtureRoot("late-scoped-read");
+    const tracePath = join(root.root, "trace.log");
+    // The shell joins each marker from two parts, so a marker in a request
+    // comes from a file fx read, not from the command's own arguments.
+    const nestedRule = "LATE_SCOPED_READ_NESTED_RULE";
+    const payload = "LATE_SCOPED_READ_PAYLOAD";
+    const creationsPath = join(root.workspace, "creations.log");
+    const createCommand =
+      "mkdir -p pkg/nested" +
+      " && printf '%s_%s\\n' LATE_SCOPED_READ NESTED_RULE > pkg/nested/AGENTS.md" +
+      " && printf '%s_%s\\n' LATE_SCOPED_READ PAYLOAD > pkg/nested/data.txt" +
+      " && printf 'once\\n' >> creations.log";
+    const pendingReason =
+      "Not executed: new scoped project instructions apply to this path. " +
+      "Reissue this tool call so fx can load them before execution.";
+    const responses = [
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "late_scope_create",
+          toolName: "shell",
+          input: { request: { action: "run", command: createCommand, profile: "clean" } },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "late_scope_read",
+          toolName: "read_file",
+          input: { path: "pkg/nested/data.txt" },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayToolCall("late_scope_reissue", "read_file", { path: "pkg/nested/data.txt" }),
+      fakeGatewayFinalText("late scoped read complete"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Create the nested fixture and read it."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(creationsPath, "utf8")).toBe("once\n");
+
+      const skippedBody = gateway.requests[1]!.body;
+      expect(toolResultOutput(skippedBody, "late_scope_read")).toBe(pendingReason);
+      expect(skippedBody).not.toContain(nestedRule);
+      expect(skippedBody).not.toContain("were added before execution");
+      expect(skippedBody).not.toContain(payload);
+
+      const reissuedBody = gateway.requests[2]!.body;
+      expect(toolResultOutput(reissuedBody, "late_scope_read")).toBe(pendingReason);
+      expect(reissuedBody).toContain(nestedRule);
+      expect(toolResultOutput(reissuedBody, "late_scope_reissue")).toContain(payload);
+      for (const request of gateway.classifierRequests) {
+        expect(request.body).not.toContain("late_scope_read");
+      }
+      expect(parseAskJson(result.stdout).output).toContain("late scoped read complete");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("text and JSON ask execute external reads on the first call", async () => {
     const variants = [
       { name: "text", json: false },

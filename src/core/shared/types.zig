@@ -1358,6 +1358,7 @@ pub const TerminalActionPresentation = union(enum) {
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
 pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
+pub const scoped_instructions_pending_tool_result_output = "Not executed: new scoped project instructions apply to this path. Reissue this tool call so fx can load them before execution.";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -1367,7 +1368,8 @@ pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
 pub fn isDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
         (std.mem.eql(u8, result.output, deferred_tool_result_output) or
-            std.mem.eql(u8, result.output, context_deferred_tool_result_output));
+            std.mem.eql(u8, result.output, context_deferred_tool_result_output) or
+            std.mem.eql(u8, result.output, scoped_instructions_pending_tool_result_output));
 }
 
 test "persisted deferred tool result classifier is exact" {
@@ -1400,6 +1402,17 @@ test "persisted deferred tool result classifier is exact" {
     result.output = @constCast(context_deferred_tool_result_output);
     try std.testing.expect(isDeferredToolResult(result));
     try std.testing.expect(isContextDeferredToolResult(result));
+
+    result.output = @constCast(scoped_instructions_pending_tool_result_output);
+    try std.testing.expect(isDeferredToolResult(result));
+    try std.testing.expect(!isContextDeferredToolResult(result));
+
+    result.output = @constCast(scoped_instructions_pending_tool_result_output ++ "\n");
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.status = .success;
+    result.output = @constCast(scoped_instructions_pending_tool_result_output);
+    try std.testing.expect(!isDeferredToolResult(result));
 }
 
 pub const ToolResultMemory = struct {
