@@ -8,7 +8,7 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
-const host = @import("../core/hosts/host.zig");
+const host_module = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const token_pass = @import("../core/gateway/token_pass.zig");
@@ -212,15 +212,15 @@ const ToolCallCard = enum {
 /// reconfigured session cannot issue an ultrafast request unless the current
 /// Gateway catalog still verifies the selected model capability.
 fn ultrafastPromptAllowed(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *const server.ActiveSessionState,
 ) bool {
     if (!session.ultrafast_mode) return true;
-    server.lockCatalog(state.host);
-    defer server.unlockCatalog(state.host);
-    const catalog_ready = state.host.capability_resolver.catalogEntries() != null;
-    const bundle = state.host.cfg.provider_set.select(session.provider);
-    const capabilities = state.host.capability_resolver.available(
+    server.lockCatalog(host);
+    defer server.unlockCatalog(host);
+    const catalog_ready = host.capability_resolver.catalogEntries() != null;
+    const bundle = host.cfg.provider_set.select(session.provider);
+    const capabilities = host.capability_resolver.available(
         session.model,
         bundle.fallbackModelCapabilities(session.model),
     );
@@ -585,7 +585,9 @@ const AcpContext = struct {
         errdefer self.alloc.free(owned_id);
         // Without `follow_supported` no follower takes the other card, so only the owner's is built.
         if (comptime !server.follow_supported) {
-            const meta: ?acp_types.ToolCallMeta = if (server.sessionMain(self.session).extensions.contains(.tool_call)) presentation.meta else null;
+            const main_record = server.holdMain(self.session);
+            defer main_record.drop();
+            const meta: ?acp_types.ToolCallMeta = if (main_record.extensions.contains(.tool_call)) presentation.meta else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, meta);
@@ -715,7 +717,9 @@ const AcpContext = struct {
         defer arena_state.deinit();
         // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
         if (comptime !server.follow_supported) {
-            const command_result = if (server.sessionMain(self.session).extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            const second_main_record = server.holdMain(self.session);
+            defer second_main_record.drop();
+            const command_result = if (second_main_record.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result);
@@ -752,7 +756,9 @@ const AcpContext = struct {
         defer arena_state.deinit();
         // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
         if (comptime !server.follow_supported) {
-            const command_result = if (server.sessionMain(self.session).extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            const third_main_record = server.holdMain(self.session);
+            defer third_main_record.drop();
+            const command_result = if (third_main_record.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result);
@@ -781,6 +787,10 @@ const AcpContext = struct {
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
+        const fourth_main_record = server.holdMain(self.session);
+        defer fourth_main_record.drop();
+        const fifth_main_record = server.holdMain(self.session);
+        defer fifth_main_record.drop();
         const session = self.session;
         const provider_capabilities = self.host.cfg.provider_set.select(self.turn.provider).capabilities;
         // A subagent's turn leaves the session's runtime alone: the runtime would keep a pointer into
@@ -836,7 +846,7 @@ const AcpContext = struct {
             .subagent_host = session.subagent_host,
             .subagent_caller_id = session.session_id,
             .worker = &session.worker,
-            .permission_prompter = if (server.sessionMain(self.session).initialized) .{
+            .permission_prompter = if (fifth_main_record.initialized) .{
                 .observer = self.observer,
                 .cancel_flag = &session.cancel_flag,
                 .context = @ptrCast(self),
@@ -855,7 +865,7 @@ const AcpContext = struct {
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
             .session_child_capability = sessionChildCapability(session),
-            .terminal_client = &server.sessionMain(self.session).terminal_client,
+            .terminal_client = &fourth_main_record.terminal_client,
             .managed_executions = &self.host.managed_executions,
             .ephemeral_command_replay = self.host.managed_executions.replayStore(),
             .web_fetch_runtime = &self.host.web_fetch_runtime,
@@ -891,12 +901,14 @@ const AcpContext = struct {
     }
 
     fn toolRegistry(self: *const AcpContext) tool_dispatch.Registry {
-        return activeToolSet(server.sessionMain(self.session)).registry;
+        return activeToolSet(self.session).registry;
     }
 };
 
-fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    return tool_call_presentation.activeToolSet(state);
+fn activeToolSet(session: *server.ActiveSessionState) tool_set_contract.ToolSet {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    return tool_call_presentation.activeToolSet(main_record);
 }
 
 /// Runs again, through the host, the calls of a resumed turn the host asked
@@ -963,7 +975,9 @@ const ResumeRerun = struct {
 };
 
 fn hostToolProvider(session: *server.ActiveSessionState) ?tool_dispatch.HostToolProvider {
-    if (session.server.host_tools.tools.len == 0) return null;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    if (main_record.host_tools.tools.len == 0) return null;
     return .{
         .context = @ptrCast(session),
         .call_fn = callHostToolWithSchemaTypes,
@@ -984,7 +998,9 @@ fn callHostToolWithSchemaTypes(
     const session: *server.ActiveSessionState = @ptrCast(@alignCast(raw_session));
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const sent = try hostToolArguments(arena_state.allocator(), session.server.host_tools.dynamic_tools, name, arguments_json);
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const sent = try hostToolArguments(arena_state.allocator(), main_record.host_tools.dynamic_tools, name, arguments_json);
     if (comptime host_target.is_wasm) {
         return js_host_tools.provider().call(alloc, name, call_id, sent, max_result_bytes, cancel_flag);
     }
@@ -1057,7 +1073,9 @@ fn callHostTool(
     cancel_flag: ?*std.atomic.Value(bool),
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const session: *server.ActiveSessionState = @ptrCast(@alignCast(raw_session));
-    const state = session.server;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(session, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse {
@@ -1134,11 +1152,11 @@ fn callHostTool(
         if (parsed.value.object.get("contentType")) |kind| {
             if (kind == .string and std.mem.eql(u8, kind.string, "rich")) {
                 const failed = if (parsed.value.object.get("isError")) |value| value == .bool and value.bool else false;
-                return @import("../core/tooling/tool_content.zig").parseRichResult(alloc, content.string, @min(state.max_tool_result_bytes, max_result_bytes), failed);
+                return @import("../core/tooling/tool_content.zig").parseRichResult(alloc, content.string, @min(session.max_tool_result_bytes, max_result_bytes), failed);
             }
         }
     }
-    if (content != .string or content.string.len > @min(state.max_tool_result_bytes, max_result_bytes)) {
+    if (content != .string or content.string.len > @min(session.max_tool_result_bytes, max_result_bytes)) {
         return .{ .failure = try alloc.dupe(u8, "Host tool result exceeded the configured limit") };
     }
     const owned = try alloc.dupe(u8, content.string);
@@ -1169,7 +1187,9 @@ const AcpElicitationResponderContext = struct {
         for (self.accepted_url_ids.items) |id| self.acp.host.alloc.free(id);
         self.accepted_url_ids.deinit(self.acp.host.alloc);
         for (self.accepted_legacy_urls.items) |*accepted| {
-            server.removeLegacyUrl(server.sessionMain(self.acp.session), accepted.acp_id);
+            const main_record = server.holdMain(self.acp.session);
+            defer main_record.drop();
+            server.removeLegacyUrl(main_record, accepted.acp_id);
             accepted.deinit(self.acp.host.alloc);
         }
         self.accepted_legacy_urls.deinit(self.acp.host.alloc);
@@ -1177,7 +1197,9 @@ const AcpElicitationResponderContext = struct {
     }
 
     fn responder(self: *AcpElicitationResponderContext) ?tool_mcp_runtime.InputResponder {
-        const capabilities = server.sessionMain(self.acp.session).client_elicitation;
+        const second_main_record = server.holdMain(self.acp.session);
+        defer second_main_record.drop();
+        const capabilities = second_main_record.client_elicitation;
         if (!capabilities.any()) return null;
         return .{
             .context = @ptrCast(self),
@@ -1269,9 +1291,9 @@ const TurnSignIn = struct {
     /// publishes a credential holds while it replaces and frees the key, the
     /// account and the team (`server.publishRefreshedCredential`), so the
     /// result is one whole credential.
-    fn capture(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
-        state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
+    fn capture(alloc: Allocator, host: *server.Host, session: *const server.ActiveSessionState) !TurnSignIn {
+        host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer host.subagent_authority_mutex.unlock(io_mod.getIo());
         const api_key = try alloc.dupe(u8, session.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -1310,7 +1332,7 @@ const TurnSignIn = struct {
 /// connection that sent the prompt; the other clients are told of it as the turn
 /// starts. Null when the turn's input is shown another way (a steer group).
 pub fn handlePrompt(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
@@ -1325,7 +1347,9 @@ pub fn handlePrompt(
     session.settings_mutex.lockUncancelable(io_mod.getIo());
     var settings_locked = true;
     defer if (settings_locked) session.settings_mutex.unlock(io_mod.getIo());
-    if (!try server.selectCredentialForSession(state, session)) {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    if (!try server.selectCredentialForSession(main_record, session)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
@@ -1336,7 +1360,7 @@ pub fn handlePrompt(
                 credentials.missing_credential_message,
         } };
     }
-    if (!ultrafastPromptAllowed(state, session)) {
+    if (!ultrafastPromptAllowed(host, session)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = "Ultrafast mode requires a verified compatible Gateway model",
@@ -1373,7 +1397,7 @@ pub fn handlePrompt(
         alloc,
         params,
         next_image_id,
-        state.host.cfg.host_attachments,
+        host.cfg.host_attachments,
     ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
@@ -1383,7 +1407,7 @@ pub fn handlePrompt(
             if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
-            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(host.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1419,7 +1443,7 @@ pub fn handlePrompt(
 
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
-    try refreshProjectContext(state, session, alloc);
+    try refreshProjectContext(host, session, alloc);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1427,7 +1451,7 @@ pub fn handlePrompt(
 
     var ctx = AcpContext{
         .alloc = alloc,
-        .host = state.host,
+        .host = host,
         .session = session,
         .turn = &turn_settings,
         .session_id = session.session_id,
@@ -1456,7 +1480,7 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        try journal.endUnplaced(alloc, state.alloc, session.session_id);
+        try journal.endUnplaced(alloc, host.alloc, session.session_id);
     }
     if (prompt_input.continue_recovery and session.journal != null) {
         // A journaled libfx session resumes the turn its journal left open.
@@ -1470,7 +1494,7 @@ pub fn handlePrompt(
         // Inputs the crashed turn accepted and never placed go to the model
         // with the resume, and its first progress places them.
         const inputs = journal.takePendingInputs();
-        defer journal_events.freePendingInputs(state.alloc, inputs);
+        defer journal_events.freePendingInputs(host.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs, journal.pending_resume_yielded);
         const answered_step = journal.pending_resume_answered;
         {
@@ -1479,9 +1503,9 @@ pub fn handlePrompt(
             const ids = try alloc.alloc([]const u8, inputs.len);
             defer alloc.free(ids);
             for (inputs, ids) |input, *id| id.* = input.id;
-            try journal.notePlaced(state.alloc, ids);
+            try journal.notePlaced(host.alloc, ids);
         }
-        journal.dropPendingResume(state.alloc);
+        journal.dropPendingResume(host.alloc);
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
         // that they may have partly run.
@@ -1506,7 +1530,7 @@ pub fn handlePrompt(
         if (journal.pending_resume) |pending| {
             // An earlier turn that a new prompt ends: the copy holds this turn's updates, not its, so it stays.
             try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null, false);
-            journal.dropPendingResume(state.alloc);
+            journal.dropPendingResume(host.alloc);
         }
     }
 
@@ -1527,7 +1551,7 @@ pub fn handlePrompt(
                 .text = prompt_input.text,
                 .kind = .follow_up,
             } });
-            try journal.placeFollowUp(state.alloc, input_id);
+            try journal.placeFollowUp(host.alloc, input_id);
         }
     }
 
@@ -1550,7 +1574,7 @@ pub fn handlePrompt(
         }
     }
 
-    var tool_projection = try state.host.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try host.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(session), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = session.subagent_host != null,
@@ -1623,7 +1647,7 @@ pub fn handlePrompt(
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialDynamicTools(&ctx, dynamic_tool_arena.allocator());
-    var agent_config = buildAgentConfig(state, session, &turn_settings, .{
+    var agent_config = buildAgentConfig(host, session, &turn_settings, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
         .initial_dynamic_tools = initial_dynamic_tools,
@@ -1640,10 +1664,10 @@ pub fn handlePrompt(
         const toolbox_arena = dynamic_tool_arena.allocator();
         agent_config.toolbox_mcp_servers = try h.catalog.serverNames(toolbox_arena);
     };
-    maybeStartAcpTitleTask(state, session, &turn_settings, owned_prompt, recovery_checkpoint != null, ctx.observer);
-    defer if (session.title_task != null) completeAcpTitleTask(state, session);
+    maybeStartAcpTitleTask(host, session, &turn_settings, owned_prompt, recovery_checkpoint != null, ctx.observer);
+    defer if (session.title_task != null) completeAcpTitleTask(session);
     const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
-        .view = state.host.lifecycle_view,
+        .view = host.lifecycle_view,
         .scope = .{
             .kind = .acp,
             .workspace_root = session.workspace_root,
@@ -1669,24 +1693,24 @@ pub fn handlePrompt(
             // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
             // If the commit fails, the turn still ends below.
-            commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
+            commitCancelledJournalTurn(alloc, host.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
         } else {
             // The turn's own failure is the one to report.
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            endJournalTurn(alloc, host.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             return promptExecutionFailure(err);
         }
     };
-    try endJournalTurn(alloc, state.alloc, session);
-    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
+    try endJournalTurn(alloc, host.alloc, session);
+    if (try runReportTurns(host, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
         prompt_input.retainImageSnapshots();
         return outcome;
     }
     prompt_input.retainImageSnapshots();
-    completeAcpTitleTask(state, session);
+    completeAcpTitleTask(session);
     try sessions.sendTurnSessionInfoUpdate(session, alloc, true);
     try sessions.sendTurnSessionUsageUpdate(session, turn_settings.model, turn_settings.provider, alloc);
 
@@ -1704,7 +1728,7 @@ pub fn handlePrompt(
 /// `completeAcpTitleTask` before the session info update goes out. The locally
 /// derived title remains when generation is skipped or unavailable.
 fn maybeStartAcpTitleTask(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     turn: *const TurnSettings,
     prompt_text: []const u8,
@@ -1719,7 +1743,7 @@ fn maybeStartAcpTitleTask(
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
-    const bundle = state.host.cfg.provider_set.select(turn.provider);
+    const bundle = host.cfg.provider_set.select(turn.provider);
     const provider_title_model = bundle.title_model orelse return;
     // A Token Pass session of a team with Token Pass titles itself with a
     // Token Pass model.
@@ -1755,8 +1779,7 @@ fn maybeStartAcpTitleTask(
 /// generated title unless the session already carries a user-set title. A
 /// title still pending after the grace is dropped, and the session keeps the
 /// title derived from its first prompt. No-op without a pending task.
-fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
-    _ = state;
+fn completeAcpTitleTask(session: *server.ActiveSessionState) void {
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
@@ -1786,7 +1809,9 @@ pub fn runSubagentChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const active: *server.ActiveSessionState = @ptrCast(@alignCast(raw.?));
-    const state = active.server;
+    const main_record = server.holdMain(active);
+    defer main_record.drop();
+    const state = main_record;
     const subagent_host = active.subagent_host orelse return error.ProviderFailed;
     const alloc = state.alloc;
     state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
@@ -1867,7 +1892,7 @@ pub fn runSubagentChild(
 
 /// Gathers `session`'s project context again from its own workspace.
 fn refreshProjectContext(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
 ) context_contract.ProviderError!void {
@@ -1875,13 +1900,13 @@ fn refreshProjectContext(
     {
         // A subagent's turn copies the snapshot under this lock when it starts, so what this frees
         // is nobody's but the workspace's.
-        state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
+        host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer host.subagent_authority_mutex.unlock(io_mod.getIo());
         workspace.context_snapshot.deinit(alloc);
     }
     if (!session.context_enabled) return;
 
-    const gathered = state.host.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
+    const gathered = host.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = workspace.root,
         .access_scope = workspace.access.scope(workspace.root),
         .context_limits = session.context_limits,
@@ -1889,8 +1914,8 @@ fn refreshProjectContext(
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
     };
-    state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
+    host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer host.subagent_authority_mutex.unlock(io_mod.getIo());
     workspace.context_snapshot = gathered;
 }
 
@@ -1901,7 +1926,9 @@ fn initialDynamicTools(
     ctx: *AcpContext,
     arena: Allocator,
 ) ![]const agent_stream_provider.DynamicFunctionTool {
-    const host_tools = server.sessionMain(ctx.session).host_tools.dynamic_tools;
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
+    const host_tools = main_record.host_tools.dynamic_tools;
     if (comptime host_target.is_wasm) return host_tools;
     const session = ctx.session;
     const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
@@ -1933,22 +1960,24 @@ const AgentConfigSections = struct {
 };
 
 fn buildAgentConfig(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     turn: *const TurnSettings,
     sections: AgentConfigSections,
 ) agent_runtime.Config {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
     return .{
-        .system_prompt = state.host.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .system_prompt = host.cfg.prompt_policy.systemPromptFor(main_record.terminal_ui),
         .host_instructions = sections.host_instructions,
-        .model_prompt_overlay = state.host.cfg.prompt_policy.modelPromptOverlay(turn.model),
+        .model_prompt_overlay = host.cfg.prompt_policy.modelPromptOverlay(turn.model),
         .skill_catalog = sections.skill_catalog,
-        .gateway_retry_count = state.host.cfg.gateway_retry_count,
-        .gateway_chat_url = state.host.cfg.gateway_chat_url,
+        .gateway_retry_count = host.cfg.gateway_retry_count,
+        .gateway_chat_url = host.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
-        .initial_dynamic_tools = sections.initial_dynamic_tools orelse state.host_tools.dynamic_tools,
-        .provider_capabilities = state.host.cfg.provider_set.select(turn.provider).capabilities,
+        .initial_dynamic_tools = sections.initial_dynamic_tools orelse main_record.host_tools.dynamic_tools,
+        .provider_capabilities = host.cfg.provider_set.select(turn.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
@@ -1960,7 +1989,7 @@ fn buildAgentConfig(
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = session.workspace_root,
         .access_scope = session.workspace.access.scope(session.workspace_root),
-        .enforce_response_language = !state.host.cfg.minimal_kernel,
+        .enforce_response_language = !host.cfg.minimal_kernel,
         .context_limits = session.context_limits,
     };
 }
@@ -2443,6 +2472,8 @@ fn acpCacheWarmer(proc: *server.Host, session: *server.ActiveSessionState) ?*@im
 }
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
     const session = ctx.session;
     session.capture_home = if (!ctx.session.workspace_capture)
         null
@@ -2503,7 +2534,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .propagate_grant = retainAcpGrant,
-        .compaction_activity = if (server.sessionMain(ctx.session).client_compaction) .{
+        .compaction_activity = if (main_record.client_compaction) .{
             .begin = compactionBegin,
             .running = compactionRunning,
             .settle = compactionSettle,
@@ -2658,7 +2689,9 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
     const message_id = acp_types.generateMessageId(&message_id_storage);
     // Without `follow_supported` no follower takes the other version: the owner's own steer setting picks it.
     if (comptime !server.follow_supported) {
-        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, server.sessionMain(ctx.session).sendsSteerInput());
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, main_record.sendsSteerInput());
         defer ctx.alloc.free(params);
         var audience = server.lockAudience(ctx.session);
         defer audience.unlock();
@@ -2876,7 +2909,7 @@ fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const mode = ctx.captured_mode orelse ctx.session.mode;
-    if (try ctx.host.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(server.sessionMain(ctx.session)), mode, call.name)) |reason| {
+    if (try ctx.host.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.session), mode, call.name)) |reason| {
         return .{ .failure = reason };
     }
     return tool_runtime.validateToolCall(ctx.toolContext(), arena, call);
@@ -2974,7 +3007,7 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.session) orelse {
+    var request_id = server.beginPermissionRequest(ctx.session) orelse {
         if (!server.clientInputEnded(ctx.session)) return error.PermissionRequestAlreadyPending;
         debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
         return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
@@ -3020,24 +3053,46 @@ fn requestAcpPermission(
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
     try params.writer.writeAll("]}");
 
-    ctx.session.client_writer.writeRequest(
-        alloc,
-        .{ .integer = @intCast(request_id.id) },
-        "session/request_permission",
-        params.writer.buffered(),
-    ) catch |err| switch (err) {
-        error.BrokenPipe => {
-            // Returning a value skips the errdefer above, so the pending request
-            // is ended here: the client closed its output and can't answer.
-            server.cancelPermissionRequest(ctx.session, request_id);
-            _ = server.awaitPermissionDecision(ctx.session, request_id);
-            debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
+    // A permission follows the main client through at most this many hand-offs. Each
+    // hand-off asks the new main again, with the same request, under a new id.
+    const max_asks: usize = 8;
+    var asks: usize = 0;
+    while (true) {
+        asks += 1;
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        const main = main_record;
+        const written = server.writeRequestToMain(ctx.session, request_id, alloc, "session/request_permission", params.writer.buffered());
+        if (written) |_| {
+            switch (server.awaitPermissionAnswer(ctx.session, request_id)) {
+                .decided => |decision| return permission_request.OwnedPermissionResponse.init(alloc, decision, null),
+                .moved => {},
+            }
+        } else |err| switch (err) {
+            // The main changed after the request began. The hand-off already answered the
+            // request `moved`, so waiting for it only takes that answer.
+            error.MainChanged => _ = server.awaitPermissionAnswer(ctx.session, request_id),
+            error.BrokenPipe => {
+                // Returning a value skips the errdefer above, so the pending request
+                // is ended here: the client closed its output and can't answer.
+                server.cancelPermissionRequest(ctx.session, request_id);
+                _ = server.awaitPermissionDecision(ctx.session, request_id);
+                if (!server.mainWriteFailed(ctx.session, main)) {
+                    debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
+                    return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+                }
+            },
+            else => return err,
+        }
+        if (asks >= max_asks) {
+            debug_trace.logf("acp", "event=permission_denied reason=too_many_main_changes tool={s}", .{call.name});
             return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        },
-        else => return err,
-    };
-    const decision = server.awaitPermissionDecision(ctx.session, request_id);
-    return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
+        }
+        request_id = server.beginPermissionRequest(ctx.session) orelse {
+            debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
+            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+        };
+    }
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
@@ -3074,11 +3129,13 @@ fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, dis
 
 fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
     return tool_presentation.resolveTerminalDisplayTarget(
         arena,
         ctx.toolRegistry(),
         ctx.session.workspace_root,
-        &server.sessionMain(ctx.session).terminal_client,
+        &main_record.terminal_client,
         &ctx.host.managed_executions,
         call,
     );
@@ -3461,9 +3518,11 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
 
 /// Where a subagent's captures go: the store's home and the active
 /// session's folder, while captures are on.
-fn childCaptureTarget(session: *const server.ActiveSessionState) ?turn_capture.Target {
+fn childCaptureTarget(session: *server.ActiveSessionState) ?turn_capture.Target {
     if (comptime !turn_capture.supported) return null;
-    const state = session.server;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     if (!session.workspace_capture) return null;
     const store = server.sessionsStore(state.host) orelse return null;
     return .{ .home = store.home, .path = session.workspace_root };
@@ -3622,7 +3681,7 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// stays the user's own request. Returns the prompt's outcome when a turn
 /// ends it early. Each turn's usage is added to `usage_total` when it ends.
 fn runReportTurns(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     ctx: *AcpContext,
@@ -3675,7 +3734,7 @@ fn runReportTurns(
         // current one, as a turn the user starts does. A session that changed
         // provider during the turn holds another provider's sign-in, so the
         // turn keeps its own.
-        var sign_in = try TurnSignIn.capture(alloc, state, session);
+        var sign_in = try TurnSignIn.capture(alloc, host, session);
         defer sign_in.deinit(alloc);
         var job = base;
         if (sign_in.provider.eql(job.provider)) sign_in.apply(&job);
@@ -3693,7 +3752,7 @@ fn runReportTurns(
         job.recovery_source_already_presented = false;
         debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
         const report_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
-            .view = state.host.lifecycle_view,
+            .view = host.lifecycle_view,
             .scope = .{
                 .kind = .acp,
                 .workspace_root = session.workspace_root,
@@ -3703,7 +3762,7 @@ fn runReportTurns(
         }, agent_config, job);
         usage_total.add(session.session_rt.agent.turn_usage);
         report_turn catch |err| {
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            endJournalTurn(alloc, host.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             if (err == error.NonInteractivePermissionRequired) {
@@ -3713,7 +3772,7 @@ fn runReportTurns(
             if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
             return try promptExecutionFailure(err);
         };
-        try endJournalTurn(alloc, state.alloc, session);
+        try endJournalTurn(alloc, host.alloc, session);
     }
 }
 
@@ -4221,7 +4280,9 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     // Without `follow_supported` no follower can take the other version, so only the owner's is sent:
     // its notice when it lists notices, otherwise its message, as before the audience.
     if (comptime !server.follow_supported) {
-        if (server.sessionMain(ctx.session).client_notices) {
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        if (main_record.client_notices) {
             const with = ctx.noticeParams(text) catch return;
             defer ctx.alloc.free(with);
             var audience = server.lockAudience(session);
@@ -4242,8 +4303,8 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     // The message fallback takes the operational id, as before, when a member lacks
     // notices. When none does, a fresh id leaves the owner's id state unchanged.
     var fresh: acp_types.MessageIdBuffer = undefined;
-    var some_member_lacks_notices = !server.sessionMain(ctx.session).client_notices;
-    for (session.followers.items) |member| {
+    var some_member_lacks_notices = !server.mainLocked(ctx.session).?.client_notices;
+    for (session.members.items) |member| {
         if (!member.client_notices) some_member_lacks_notices = true;
     }
     const message_id = if (some_member_lacks_notices) ctx.operationalMessageId() else acp_types.generateMessageId(&fresh);
@@ -4340,7 +4401,9 @@ fn respondToAcpMcpInput(
                 .elicitation_create => |value| value,
                 else => return error.McpInputRequired,
             };
-            if (!server.sessionMain(responder.acp.session).client_elicitation.supports(input_request.mode)) {
+            const main_record = server.holdMain(responder.acp.session);
+            defer main_record.drop();
+            if (!main_record.client_elicitation.supports(input_request.mode)) {
                 return error.McpInputRequired;
             }
             const direct = try requestAcpElicitation(
@@ -4380,7 +4443,9 @@ fn requestAcpElicitation(
 ) ![]u8 {
     const session = responder.acp.session;
     // The client's own state (its legacy URLs and its allocator) is read from the session's main.
-    const state = server.sessionMain(session);
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     const outbound_id = (try server.beginOutboundRequest(session, .elicitation)) orelse {
         if (server.clientInputEnded(responder.acp.session)) {
             debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
@@ -4661,7 +4726,9 @@ fn awaitAcpElicitationResponse(
         while (select.cancel()) |item| switch (item) {
             .response => |maybe_response| if (maybe_response) |owned| {
                 var response = owned;
-                response.deinit(server.sessionMain(session).alloc);
+                const main_record = server.holdMain(session);
+                defer main_record.drop();
+                response.deinit(main_record.alloc);
             },
             .watch => {},
         };
@@ -4715,7 +4782,9 @@ fn finishAcpUrlElicitations(
     responder.accepted_url_ids.clearRetainingCapacity();
     for (responder.accepted_legacy_urls.items) |*accepted| {
         if (outcome != .completed) {
-            server.removeLegacyUrl(server.sessionMain(responder.acp.session), accepted.acp_id);
+            const main_record = server.holdMain(responder.acp.session);
+            defer main_record.drop();
+            server.removeLegacyUrl(main_record, accepted.acp_id);
         }
         accepted.deinit(responder.acp.host.alloc);
     }
@@ -5697,7 +5766,7 @@ fn testServerConfig() server.Config {
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
         .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
-        .secret_store = host.unavailable_secret_store,
+        .secret_store = host_module.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",
             .model_prompt_overlay_fn = testModelPromptOverlay,
@@ -6236,19 +6305,19 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = server.firstSession(&state).?.workspace.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = server.firstSession(&state).?.workspace.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
     server.firstSession(&state).?.context_enabled = false;
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(server.firstSession(&state).?.workspace.context_snapshot.contribution == null);
 
@@ -6256,7 +6325,7 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, server.firstSession(&state).?, alloc),
+        refreshProjectContext(state.host, server.firstSession(&state).?, alloc),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(server.firstSession(&state).?.workspace.context_snapshot.contribution == null);
@@ -6271,7 +6340,7 @@ test "a copy of the project context keeps its bytes when the next prompt gathers
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     const session = server.firstSession(&state).?;
-    try refreshProjectContext(&state, session, alloc);
+    try refreshProjectContext(state.host, session, alloc);
 
     // What a subagent's turn takes when it starts.
     var copy = try session.workspace.context_snapshot.dupe(alloc);
@@ -6279,7 +6348,7 @@ test "a copy of the project context keeps its bytes when the next prompt gathers
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 
     // The next prompt gathers the context again and frees the snapshot the copy was made from.
-    try refreshProjectContext(&state, session, alloc);
+    try refreshProjectContext(state.host, session, alloc);
     try std.testing.expectEqualStrings("ACP registry context 2", session.workspace.context_snapshot.modelVisibleBytes());
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 }
@@ -6308,7 +6377,7 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
+            handlePrompt(state.host, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(server.firstSession(&state).?.pending_prompt_id == null);
@@ -6326,7 +6395,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
 
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
 
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
@@ -6968,7 +7037,7 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     const session = server.firstSession(&state).?;
     session.gateway_team = try alloc.dupe(u8, "team_before");
 
-    var first = try TurnSignIn.capture(alloc, &state, session);
+    var first = try TurnSignIn.capture(alloc, state.host, session);
     defer first.deinit(alloc);
     var job: worker_runtime.QueuedPrompt = .{
         .prompt = &.{},
@@ -6997,7 +7066,7 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     try std.testing.expectEqualStrings("team_before", job.gateway_team.?);
 
     // The report turn after it sends the published one.
-    var next = try TurnSignIn.capture(alloc, &state, session);
+    var next = try TurnSignIn.capture(alloc, state.host, session);
     defer next.deinit(alloc);
     var report_job = job;
     next.apply(&report_job);
@@ -7041,7 +7110,7 @@ const SignInRace = struct {
     fn runCapturer(self: *SignInRace) void {
         const alloc = std.testing.allocator;
         while (!self.publisher_done.load(.acquire)) {
-            var sign_in = TurnSignIn.capture(alloc, self.state, server.firstSession(self.state).?) catch {
+            var sign_in = TurnSignIn.capture(alloc, self.state.host, server.firstSession(self.state).?) catch {
                 _ = self.torn.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -7114,7 +7183,7 @@ test "ACP prompt agent config carries request options from active session" {
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    const config = buildAgentConfig(&state, session, &turn_settings, .{
+    const config = buildAgentConfig(state.host, session, &turn_settings, .{
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
@@ -7184,7 +7253,7 @@ test "an audience member gets each update in the owner's bytes, and turn progres
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
     };
-    try session.followers.append(alloc, &follower);
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
@@ -7221,7 +7290,7 @@ test "an audience member whose write fails is dropped, and the owner still gets 
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(null, refuseWrite),
     };
-    try session.followers.append(alloc, &follower);
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
@@ -7230,7 +7299,7 @@ test "an audience member whose write fails is dropped, and the owner still gets 
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"owner\"}}");
     try std.testing.expect(owner_wire.bytes.items.len > 0);
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
 }
 
 test "an audience member whose writer has stopped is dropped after the next update, and the owner still gets it" {
@@ -7254,7 +7323,7 @@ test "an audience member whose writer has stopped is dropped after the next upda
     };
     // Its client closed: the writer drops later notifications without an error.
     follower.writer.dropping = true;
-    try session.followers.append(alloc, &follower);
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
@@ -7262,7 +7331,7 @@ test "an audience member whose writer has stopped is dropped after the next upda
     defer ctx.deinitPublishedToolCalls();
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"after\"}}");
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
     try std.testing.expectEqual(@as(usize, 0), follower_wire.bytes.items.len);
     try std.testing.expect(owner_wire.bytes.items.len > 0);
 }

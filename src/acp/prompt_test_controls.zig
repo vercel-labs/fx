@@ -138,6 +138,38 @@ pub fn noteJoinPassed() void {
     }
 }
 
+/// Set by a unit test. A permission request's write parks before it takes the session's
+/// audience lock, and before it checks that its main client is still the one the request was
+/// made to (`writeRequestToMain`). Null outside a test.
+pub var permission_write_gate: ?*Gate = null;
+
+pub fn notePermissionWrite() void {
+    if (comptime builtin.is_test) {
+        if (permission_write_gate) |gate| gate.park();
+    }
+}
+
+/// Set by a unit test. A member's leave parks after its record has left the audience and before
+/// the requests it still owes are answered `moved` (`removeMemberLocked`). Null outside a test.
+pub var leave_gate: ?*Gate = null;
+
+pub fn noteMemberRemoved() void {
+    if (comptime builtin.is_test) {
+        if (leave_gate) |gate| gate.park();
+    }
+}
+
+/// Set by a unit test. A session request parks after its first target decision, before it checks
+/// what its connection follows (`requireParsedSessionTarget`). A leave in that window can make the
+/// connection the main, and then the decision is read again. Null outside a test.
+pub var target_decided_gate: ?*Gate = null;
+
+pub fn noteTargetDecided() void {
+    if (comptime builtin.is_test) {
+        if (target_decided_gate) |gate| gate.park();
+    }
+}
+
 /// Set by a unit test. An outbound request's wait marks `outbound_waiting` while it
 /// holds the session's lock, just before it waits. An answer the test sends after that
 /// mark can only be taken once the wait has released the lock, so the answer always

@@ -21,6 +21,9 @@ pub fn SessionTable(comptime Session: type) type {
 
         mutex: std.Io.Mutex = .init,
         sessions: std.ArrayList(*Session) = .empty,
+        /// Signaled when the last listed session leaves the table, so the process can
+        /// exit once no session is open to a member (the exit rule).
+        emptied: std.Io.Condition = .init,
 
         /// Adds `session`. `unregister` removes it when the session starts to close.
         pub fn register(self: *Self, alloc: Allocator, session: *Session) Allocator.Error!void {
@@ -37,8 +40,17 @@ pub fn SessionTable(comptime Session: type) type {
             for (self.sessions.items, 0..) |listed, index| {
                 if (listed != session) continue;
                 _ = self.sessions.orderedRemove(index);
+                if (self.sessions.items.len == 0) self.emptied.broadcast(io_mod.getIo());
                 return;
             }
+        }
+
+        /// Waits until no session is listed. The caller's connection has ended, so the
+        /// wait ends when the last session's member leaves or its close starts.
+        pub fn waitUntilEmpty(self: *Self) void {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            while (self.sessions.items.len > 0) self.emptied.waitUncancelable(io_mod.getIo(), &self.mutex);
         }
 
         /// The open session that `session_id` names, or null. The caller holds `mutex`.

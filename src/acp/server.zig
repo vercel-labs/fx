@@ -287,9 +287,79 @@ pub const Workspace = struct {
     }
 };
 
+/// One client of a session. A turn reads and writes its client through this record and never
+/// through the client's connection, so no turn touches a connection frame. The session owns
+/// each record until the session is freed, so a turn that holds a record never reads freed
+/// memory, even after the client left. The values are copies taken when the client joined.
+/// `writer` is the connection's writer. It is used only under `audience_mutex` and only while
+/// `gone` is false: the connection's leave sets `gone` under that lock before its frame ends.
+pub const Member = struct {
+    connection_id: ConnectionId,
+    /// The process host, which outlives every connection.
+    host: *Host,
+    gone: bool = false,
+    writer: *jsonrpc.Writer,
+    initialized: bool,
+    terminal_ui: bool,
+    client_notices: bool,
+    client_compaction: bool,
+    client_elicitation: elicitation.Capabilities,
+    extensions: sh_fx.Set,
+    host_tools: host_tool_runtime.Runtime,
+    terminal_client: terminal_client_runtime.Runtime,
+    /// The connection default credential, copied when the client joined. A turn that changes it
+    /// changes this copy, never the connection's.
+    gateway_source_preference: ?types.CredentialSource = null,
+    credential_source: ?types.CredentialSource = null,
+    /// The process allocator. It owns this record and everything the record holds.
+    alloc: Allocator,
+    /// Guards `next_outbound_request_id` and `input_ended`. Taken alone or before a
+    /// session's `outbound.mutex`.
+    outbound_mutex: std.Io.Mutex = .init,
+    next_outbound_request_id: u64 = 1,
+    /// Set when the client's input ends. Guarded by `outbound_mutex`.
+    input_ended: bool = false,
+    legacy_url_mutex: std.Io.Mutex = .init,
+    pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
+    /// Holders of this record: the session's member list (one), each connection membership
+    /// (one), and each read that takes a hold (`holdMain`). The last `drop` frees it.
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+    /// Adds a holder. The caller holds the session's `audience_mutex`, so the record is still listed or held.
+    pub fn hold(self: *Member) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drops a holder, and frees the record with the last one.
+    pub fn drop(self: *Member) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.destroy();
+    }
+
+    pub fn sendsSteerInput(self: *const Member) bool {
+        return self.extensions.contains(.prompt_delivery) or self.extensions.contains(.host_steering);
+    }
+
+    /// Frees the record and what it holds. `drop` calls it with the last holder, and a record that
+    /// was never listed is freed here directly.
+    pub fn destroy(self: *Member) void {
+        self.host_tools.deinit();
+        self.terminal_client.deinit();
+        self.pending_legacy_urls.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+};
+
 pub const ActiveSessionState = struct {
-    /// The connection the session is open on.
-    server: *ServerState = undefined,
+    /// The live members, in join order. The first one is the main client. Each listed
+    /// record holds one reference. Changed only under `audience_mutex`.
+    members: std.ArrayList(*Member) = .empty,
+    /// The record of the last member that left. It keeps the list's reference while the session
+    /// has no member, so a kept turn can still read the main client. Null while `members` is not empty.
+    last_main: ?*Member = null,
+    /// How many connection memberships list this session. Under `audience_mutex`.
+    holders: usize = 0,
+    /// Set when the session closes. A closed session is freed by its last holder. Under `audience_mutex`.
+    closed: bool = false,
     /// The turns running in this session, or null when none runs.
     prompt: ?*ActivePrompt = null,
     /// `&own_workspace`, or the launch workspace for the one session of the
@@ -331,11 +401,7 @@ pub const ActiveSessionState = struct {
     client_writer: jsonrpc.Writer = undefined,
     /// The client requests this session's turns have open, with their answers.
     outbound: SessionOutbound = .{},
-    /// The connections that follow this session, besides its owner `server`.
-    /// A turn sends each update to them as well, so a follower sees what the
-    /// owner sees. Changed only under `audience_mutex`.
-    followers: std.ArrayList(*ServerState) = .empty,
-    /// Guards `followers`, and keeps one turn's updates in order across every
+    /// Guards `members`, and keeps one turn's updates in order across every
     /// member of the audience. Taken after `session_write_mutex`; nothing else
     /// is taken while it is held, except a member's writer lock.
     audience_mutex: std.Io.Mutex = .init,
@@ -448,10 +514,21 @@ pub const ActiveSessionState = struct {
 };
 
 const ActivePrompt = struct {
-    state: *ServerState,
+    /// The process host, which outlives every connection, so a turn never holds
+    /// the frame of the connection that started it.
+    host: *Host,
     /// The session whose turns this worker runs. It stays open until the
     /// worker is reaped.
     session: *ActiveSessionState,
+    /// Whether the client that sent the prompt listed `sh.fx/usage` and
+    /// `sh.fx/promptDelivery` when the turn started. The answer keeps that shape
+    /// when the sender has left.
+    usage_shown: bool = false,
+    delivery_shown: bool = false,
+    /// Whether the sender listed `sh.fx/keepTurnOnDisconnect` when the turn
+    /// started. Such a turn finishes and is saved when the last client leaves,
+    /// even if that client did not list it.
+    keep_turn: bool = false,
     alloc: Allocator,
     msg: jsonrpc.Message,
     /// The connection that sent the prompt this turn runs; its answer goes there. A turn
@@ -496,6 +573,13 @@ pub fn testHost(alloc: Allocator) Host {
 }
 
 const LeaderInfo = process_host.LeaderInfo;
+
+/// One session a connection has open, as its main client or as a follower. The membership
+/// holds one reference to the connection's record, so the record outlives the membership.
+pub const Membership = struct {
+    session: *ActiveSessionState,
+    member: *Member,
+};
 
 pub const ServerState = struct {
     configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
@@ -558,17 +642,13 @@ pub const ServerState = struct {
     cache_warming: bool = true,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
-    /// The sessions open on this connection, oldest first. Heap-allocated so
-    /// a running turn keeps its pointer while others open and close. Only the
-    /// reader thread changes the list; a session's own threads use only its
-    /// pointer (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
-    sessions: std.ArrayList(*ActiveSessionState) = .empty,
+    /// This connection's memberships, oldest first: each session it has open, as its main
+    /// client or as a follower. Only this connection's reader thread changes the list, so it has no lock.
+    memberships: std.ArrayList(Membership) = .empty,
     terminal_client: terminal_client_runtime.Runtime = .{},
-    /// The ids of the sessions this connection follows: it joined them while
-    /// another connection of the process owned them. Only this connection's
-    /// reader thread changes the list. Each id is owned by the list, and each
-    /// follow ends at `session/close` for it or at the connection's end.
-    following: std.ArrayList([]u8) = .empty,
+    /// The record this connection has before a session it opens or loads adopts it. Only the
+    /// reader thread uses it.
+    pending_member: ?*Member = null,
     terminate_connection: bool = false,
     host_tools: host_tool_runtime.Runtime = .{},
     /// The extensions that both fx and the client list at `initialize`. fx
@@ -584,8 +664,6 @@ pub const ServerState = struct {
     /// What a socket connection answers `initialize` with beyond the stdio answer:
     /// this process's pid and the sessions it leads. Null on stdio, whose answer is unchanged.
     leader_info: ?LeaderInfo = null,
-    legacy_url_mutex: std.Io.Mutex = .init,
-    pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     /// Whether steering updates carry `sh.fx/steerInput`: `fx acp`'s clients
     /// list `sh.fx/promptDelivery`, and a libfx host lists `sh.fx/hostSteering`.
@@ -594,26 +672,31 @@ pub const ServerState = struct {
     }
 
     pub fn deinit(self: *ServerState) void {
-        // Followers are listed by their owners' sessions, so this connection leaves them
-        // before anything it owns is freed: no session may keep a pointer to it.
-        if (comptime follow_supported) {
-            for (self.following.items) |session_id| {
-                detachFollower(self, session_id, .left);
-                self.alloc.free(session_id);
-            }
+        if (self.pending_member) |member| {
+            markMemberGone(member);
+            member.drop();
         }
-        self.following.deinit(self.alloc);
         if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
-        for (self.sessions.items) |session| reapSessionPrompt(session, true);
+        // Every session this connection's end closes (`endsSession`): a session it left keeps its
+        // kept turn, which these loops wait for. A session another member still leads is not this
+        // connection's to wait for.
+        for (self.memberships.items) |membership| {
+            if (!endsSession(membership)) continue;
+            reapSessionPrompt(membership.session, true);
+        }
         // A subagent inside a command uses the host's managed executions until it stops, so the
         // subagents stop first, as in `fx ask`. The host ends its runtimes only after every session
         // has closed, when `closeAllSessions` no longer waits for a subagent.
-        for (self.sessions.items) |session| disableSubagentHost(session);
+        for (self.memberships.items) |membership| {
+            if (!endsSession(membership)) continue;
+            disableSubagentHost(membership.session);
+        }
         self.terminal_client.deinit();
         closeAllSessions(self);
+        self.memberships.deinit(self.alloc);
         self.launch.deinit(self.alloc);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
         if (self.gateway_team) |team| self.alloc.free(team);
@@ -622,8 +705,6 @@ pub const ServerState = struct {
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
         self.host_tools.deinit();
-        clearPendingLegacyUrls(self, null);
-        self.pending_legacy_urls.deinit(self.alloc);
         self.configured_providers.deinit(self.alloc);
     }
 };
@@ -734,8 +815,12 @@ fn takeSessionCredential(session: *ActiveSessionState) TakenCredential {
 /// worker model, under `subagent_authority_mutex`, when a prompt's turn ends
 /// and frees the copy it pointed the runtime at.
 pub fn pointWebSearchBackAtSession(session: *ActiveSessionState) void {
-    session.server.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer session.server.host.subagent_authority_mutex.unlock(io_mod.getIo());
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    main_record.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    const second_main_record = holdMain(session);
+    defer second_main_record.drop();
+    defer second_main_record.host.subagent_authority_mutex.unlock(io_mod.getIo());
     pointWebSearchAtSession(session);
 }
 
@@ -744,7 +829,9 @@ pub fn pointWebSearchBackAtSession(session: *ActiveSessionState) void {
 /// credential frees what it borrowed. Call with `subagent_authority_mutex`
 /// held.
 fn pointWebSearchAtSession(session: *ActiveSessionState) void {
-    const state = session.server;
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     session.web_search_runtime.configure(.{
         .api_key = session.api_key,
         .credential_source = session.credential_source,
@@ -758,7 +845,7 @@ fn pointWebSearchAtSession(session: *ActiveSessionState) void {
 /// Ensures `session` holds a credential authorized for its provider's
 /// route, changing only that session. Returns false when that route has no
 /// credential.
-pub fn selectCredentialForSession(state: *ServerState, session: *ActiveSessionState) !bool {
+pub fn selectCredentialForSession(state: *Member, session: *ActiveSessionState) !bool {
     if (state.host.cfg.auth_mode == .host_managed) {
         state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
@@ -794,7 +881,7 @@ fn hostManagedCredential() credentials.Credential {
 /// or with no session the default. A session's own turn passes its session,
 /// and never reads the default, which only the reader thread changes.
 pub fn prepareCredentialForProvider(
-    state: *ServerState,
+    state: *Member,
     session: ?*const ActiveSessionState,
     provider: model_provider.ProviderId,
 ) !?credentials.Credential {
@@ -813,13 +900,7 @@ pub fn prepareCredentialForProvider(
                     active.credential_refresh_after_ms,
                     now_ms,
                 )) return null;
-        } else if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
-            credentialReadyAt(
-                state.credential_source,
-                state.api_key,
-                state.credential_refresh_after_ms,
-                now_ms,
-            )) return null;
+        }
     }
 
     return if (provider == .gateway and state.host.cfg.credential_override != null)
@@ -852,7 +933,7 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     state.api_key = try alloc.dupe(u8, "active-token");
     defer secret.zeroAndFree(alloc, state.api_key);
     const borrowed = state.api_key;
-    var prepared = (try prepareCredentialForProvider(&state, null, .gateway)).?;
+    var prepared = (try prepareCredentialForProvider(try pendingMember(&state), null, .gateway)).?;
     defer prepared.deinit(alloc);
     try std.testing.expectEqualStrings("next-token", prepared.token);
     try std.testing.expectEqualStrings("active-token", borrowed);
@@ -877,7 +958,7 @@ test "ACP provider routes are host-managed only when configured and never leak i
     state.gateway_team = null;
 
     // A Codex turn leaves the process host-managed with no token.
-    var codex = (try prepareCredentialForProvider(&state, null, .codex)).?;
+    var codex = (try prepareCredentialForProvider(try pendingMember(&state), null, .codex)).?;
     try std.testing.expectEqual(types.CredentialSource.host_managed, codex.source);
     try std.testing.expectEqual(@as(usize, 0), codex.token.len);
     adoptServerCredential(&state, &codex);
@@ -885,20 +966,20 @@ test "ACP provider routes are host-managed only when configured and never leak i
     try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
 
     // The next Gateway turn gets its own key, not the host-managed source.
-    var gateway = (try prepareCredentialForProvider(&state, null, .gateway)).?;
+    var gateway = (try prepareCredentialForProvider(try pendingMember(&state), null, .gateway)).?;
     defer gateway.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
     try std.testing.expectEqualStrings("gateway-key", gateway.token);
 
     // A Grok turn is host-managed the same way.
-    var grok = (try prepareCredentialForProvider(&state, null, .grok)).?;
+    var grok = (try prepareCredentialForProvider(try pendingMember(&state), null, .grok)).?;
     defer grok.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
     try std.testing.expectEqual(@as(usize, 0), grok.token.len);
 
     // So is a configured provider: the host adds its API key, if any.
     const configured = model_provider.parse("local").?;
-    var custom = (try prepareCredentialForProvider(&state, null, configured)).?;
+    var custom = (try prepareCredentialForProvider(try pendingMember(&state), null, configured)).?;
     defer custom.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
     try std.testing.expectEqual(@as(usize, 0), custom.token.len);
@@ -935,7 +1016,9 @@ pub fn refreshModelCredential(
     rejected_token: ?[]const u8,
 ) !?[]u8 {
     const session: *ActiveSessionState = @ptrCast(@alignCast(raw));
-    const state = session.server;
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
         return null;
@@ -980,7 +1063,9 @@ fn publishRefreshedCredential(
     // A subagent's turn refreshes from its own thread, and a switch of the provider replaces the
     // session's credential, team and account, so the checks, the reads of the team included, and
     // the adoption are one step under both locks, in their order.
-    const state = session.server;
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
     if (!session.provider.eql(expected_provider)) {
@@ -1024,86 +1109,94 @@ pub fn sessionsStore(host: *Host) ?*session_adapter.Store {
     return if (host.store) |*store| store else null;
 }
 
-/// The connection that answers for `session` now. A turn sends its updates and
-/// requests to it, and reads the client's capabilities from it. While the owner
-/// is the only client, that is the connection the session was opened on.
-pub fn sessionMain(session: *ActiveSessionState) *ServerState {
-    return session.server;
+/// The record of the session's main client: the oldest live member, or, once every member has
+/// left, the record of the last one. The caller holds `audience_mutex` and takes no hold.
+pub fn mainLocked(session: *ActiveSessionState) ?*Member {
+    if (session.members.items.len > 0) return session.members.items[0];
+    return session.last_main;
 }
 
-/// The `client_writer` callback: hands one finished frame to the session's main
-/// connection. A session keeps no writer of its own, so the main connection is the
-/// only writer of its frames (R1.8).
+/// The record of the main client, with a hold that the caller drops with `Member.drop` after its
+/// last read. Takes `audience_mutex`, so the caller must not hold it already.
+pub fn holdMain(session: *ActiveSessionState) *Member {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const main = mainLocked(session).?;
+    main.hold();
+    return main;
+}
+
+/// The `client_writer` callback: hands one finished frame to the session's main client,
+/// under `audience_mutex`, so the frame never reaches a client that has left.
 pub fn forwardToMain(context: ?*anyopaque, frame: []const u8) anyerror!void {
     const session: *ActiveSessionState = @ptrCast(@alignCast(context.?));
-    try sessionMain(session).writer.writeBytes(frame);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const main = mainLocked(session).?;
+    if (main.gone) return error.ClientGone;
+    try main.writer.writeBytes(frame);
 }
 
-/// The connections one session's updates reach: its owner, then each follower,
-/// in that order. `lockAudience` holds `audience_mutex` until `unlock`, so the
-/// members cannot change while a turn sends to them.
+/// The clients one session's updates reach: its members, in join order, the main first.
+/// `lockAudience` holds `audience_mutex` until `unlock`, so the members cannot change while
+/// a turn sends to them.
 pub const Audience = struct {
     session: *ActiveSessionState,
-    owner_done: bool = false,
-    next_follower: usize = 0,
+    next_member: usize = 0,
 
-    /// The next member to send to: the owner first, then each follower. Null
-    /// once every member has had its turn.
-    pub fn next(self: *Audience) ?*ServerState {
-        if (!self.owner_done) {
-            self.owner_done = true;
-            return self.session.server;
-        }
-        const followers = self.session.followers.items;
-        if (self.next_follower >= followers.len) return null;
-        defer self.next_follower += 1;
-        return followers[self.next_follower];
+    /// The next member to send to. Null once every member has had its turn.
+    pub fn next(self: *Audience) ?*Member {
+        if (self.next_member >= self.session.members.items.len) return null;
+        defer self.next_member += 1;
+        return self.session.members.items[self.next_member];
     }
 
-    /// Whether the owner or a follower lists `extension`. It does not move `next`.
+    /// Whether a member lists `extension`. It does not move `next`.
     pub fn anyLists(self: *const Audience, extension: sh_fx.Extension) bool {
-        if (self.session.server.extensions.contains(extension)) return true;
-        if (comptime !follow_supported) return false;
-        for (self.session.followers.items) |member| {
+        for (self.session.members.items) |member| {
             if (member.extensions.contains(extension)) return true;
         }
         return false;
     }
 
-    /// Why a follower left the audience. The owner is never dropped.
+    /// Why a follower left the audience. The main client is never dropped this way.
     pub const DropReason = union(enum) {
-        /// The follower's write returned an error.
+        /// The member's write returned an error.
         write_failed: anyerror,
-        /// The follower's writer has stopped writing: its client closed.
+        /// The member's writer has stopped writing: its client closed.
         client_gone,
     };
 
-    /// Writes one notification to `member`. A follower whose write fails, or
-    /// whose writer has stopped (its client closed), is dropped from the
-    /// audience: it loses this update, and the turn goes on. The owner's error
-    /// is returned, as a turn's write always was.
+    /// Writes one notification to `member`. A follower whose write fails, or whose writer has
+    /// stopped (its client closed), is dropped from the audience: it loses this update, and the
+    /// turn goes on. When the main client's write fails, the main client leaves, the oldest
+    /// remaining member becomes the main, and the update is sent to it. With no member left,
+    /// the error reaches the turn.
     pub fn writeNotification(
         self: *Audience,
-        member: *ServerState,
+        member: *Member,
         alloc: Allocator,
         method: []const u8,
         params_json: []const u8,
     ) !void {
         member.writer.writeNotification(alloc, method, params_json) catch |err| {
-            if (member == self.session.server) return err;
-            self.dropFollower(member, method, .{ .write_failed = err });
+            if (member == mainLocked(self.session).?) {
+                if (removeMemberLocked(self.session, member.connection_id)) return self.writeNotification(mainLocked(self.session).?, alloc, method, params_json);
+                return err;
+            }
+            self.dropMember(member, method, .{ .write_failed = err });
             return;
         };
-        // A writer that has stopped after a broken pipe returns no error for a
-        // notification, so it is checked after every follower's write.
-        if (member != self.session.server and memberStopped(member)) {
-            self.dropFollower(member, method, .client_gone);
+        // A writer that has stopped after a broken pipe returns no error for a notification,
+        // so it is checked after every follower's write.
+        if (member != mainLocked(self.session).? and memberStopped(member)) {
+            self.dropMember(member, method, .client_gone);
         }
     }
 
-    /// Sends one notification the turn makes: `with` to each member that `need`
-    /// covers, `without` to the others (none when it is null), owner first. The
-    /// copy keeps the entry in the same hold, so it has the order the members saw.
+    /// Sends one notification the turn makes: `with` to each member that `need` covers,
+    /// `without` to the others (none when it is null), main first. The copy keeps the entry in
+    /// the same hold, so it has the order the members saw.
     pub fn deliver(
         self: *Audience,
         alloc: Allocator,
@@ -1113,7 +1206,7 @@ pub const Audience = struct {
         without: ?[]const u8,
     ) !void {
         try self.writeEach(alloc, method, need, with, without);
-        self.session.running_copy.add(self.session.server.alloc, method, need, with, without);
+        self.session.running_copy.add(mainLocked(self.session).?.alloc, method, need, with, without);
     }
 
     /// The writes of `deliver`, without the copy.
@@ -1125,11 +1218,12 @@ pub const Audience = struct {
         with: []const u8,
         without: ?[]const u8,
     ) !void {
-        // Without `follow_supported` no follower exists, so the owner is the only member:
+        // Without `follow_supported` no follower exists, so the main client is the only member:
         // its version goes straight to its writer, and its error reaches the turn as before.
         if (comptime !follow_supported) {
-            const params = if (memberTakes(self.session.server, need)) with else (without orelse return);
-            try self.session.server.writer.writeNotification(alloc, method, params);
+            const main = mainLocked(self.session).?;
+            const params = if (memberTakes(main, need)) with else (without orelse return);
+            try main.writer.writeNotification(alloc, method, params);
             return;
         }
         while (self.next()) |member| {
@@ -1140,12 +1234,12 @@ pub const Audience = struct {
 
     /// Keeps the turn's latest progress for a joiner. Nothing is sent.
     pub fn keepProgress(self: *Audience, params: []const u8) void {
-        self.session.running_copy.setProgress(self.session.server.alloc, params);
+        self.session.running_copy.setProgress(mainLocked(self.session).?.alloc, params);
     }
 
     /// Whether `member`'s writer has stopped writing. `writeFrame` sets
     /// `dropping` under the writer's own lock, so it is read under that lock too.
-    fn memberStopped(member: *ServerState) bool {
+    fn memberStopped(member: *Member) bool {
         const io = io_mod.getIo();
         member.writer.mutex.lockUncancelable(io);
         defer member.writer.mutex.unlock(io);
@@ -1155,13 +1249,13 @@ pub const Audience = struct {
     /// Removes `member` from the followers, and logs the update it lost and why.
     /// `next` has already passed `member`, so the cursor moves back one place
     /// when the removed entry sat before it.
-    fn dropFollower(self: *Audience, member: *ServerState, method: []const u8, reason: DropReason) void {
-        for (self.session.followers.items, 0..) |listed, index| {
+    fn dropMember(self: *Audience, member: *Member, method: []const u8, reason: DropReason) void {
+        for (self.session.members.items, 0..) |listed, index| {
             if (listed != member) continue;
-            _ = self.session.followers.orderedRemove(index);
-            if (index < self.next_follower) self.next_follower -= 1;
+            if (index < self.next_member) self.next_member -= 1;
             break;
         }
+        _ = removeMemberLocked(self.session, member.connection_id);
         // The member can no longer hear the session, so its waiting input leaves with it.
         withdrawFollowerInput(member, self.session, .left);
         switch (reason) {
@@ -1330,7 +1424,7 @@ pub const RunningCopy = struct {
 };
 
 /// Whether `member` takes the `with` params of an entry that needs `need`.
-fn memberTakes(member: *const ServerState, need: RunningCopy.Need) bool {
+fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
     return switch (need) {
         .none => true,
         .extension => |extension| member.extensions.contains(extension),
@@ -1349,7 +1443,7 @@ pub fn releaseRunningCopy(session: *ActiveSessionState, reason: RunningCopy.Reas
     if (comptime !follow_supported) return;
     session.audience_mutex.lockUncancelable(io_mod.getIo());
     defer session.audience_mutex.unlock(io_mod.getIo());
-    session.running_copy.release(session.server.alloc, reason);
+    session.running_copy.release(mainLocked(session).?.alloc, reason);
 }
 
 /// The params of a steering chunk, with `sh.fx/steerInput` when `steer_input`
@@ -1373,23 +1467,55 @@ pub fn steerChunkParams(
     return try update.toOwnedSlice();
 }
 
-/// The open session `session_id` names, or null.
-pub fn findSession(state: *const ServerState, session_id: []const u8) ?*ActiveSessionState {
-    for (state.sessions.items) |session| {
-        if (std.mem.eql(u8, session.session_id, session_id)) return session;
+/// The open session `session_id` names, when this connection leads it, or null.
+pub fn findSession(state: *ServerState, session_id: []const u8) ?*ActiveSessionState {
+    const index = membershipIndex(state, session_id) orelse return null;
+    const membership = state.memberships.items[index];
+    if (!leadsMembership(membership)) return null;
+    return membership.session;
+}
+
+/// The session at `index` among the sessions this connection leads, oldest first, or null past
+/// its end. A loop that may stop leading the session it is at reads the next index after that.
+pub fn sessionAt(state: *ServerState, index: usize) ?*ActiveSessionState {
+    var led_index: usize = 0;
+    for (state.memberships.items) |membership| {
+        if (!leadsMembership(membership)) continue;
+        if (led_index == index) return membership.session;
+        led_index += 1;
     }
     return null;
 }
 
+/// The newest session this connection leads, or null when none is led.
+pub fn lastSession(state: *ServerState) ?*ActiveSessionState {
+    var index = state.memberships.items.len;
+    while (index > 0) {
+        index -= 1;
+        const membership = state.memberships.items[index];
+        if (leadsMembership(membership)) return membership.session;
+    }
+    return null;
+}
+
+/// How many sessions this connection leads.
+pub fn sessionCount(state: *ServerState) usize {
+    var count: usize = 0;
+    for (state.memberships.items) |membership| {
+        if (leadsMembership(membership)) count += 1;
+    }
+    return count;
+}
+
 /// The oldest open session: the one session of the libfx kernel and the web
 /// core. Null when none is open.
-pub fn firstSession(state: *const ServerState) ?*ActiveSessionState {
-    return if (state.sessions.items.len > 0) state.sessions.items[0] else null;
+pub fn firstSession(state: *ServerState) ?*ActiveSessionState {
+    return sessionAt(state, 0);
 }
 
 /// Whether the connection holds one session at a time, as the libfx kernel
 /// and the web core do: opening a session there closes the open one.
-pub fn holdsOneSession(state: *const ServerState) bool {
+pub fn holdsOneSession(state: *ServerState) bool {
     return host_target.is_wasm or state.host.cfg.minimal_kernel;
 }
 
@@ -1398,12 +1524,30 @@ pub fn holdsOneSession(state: *const ServerState) bool {
 /// copies the default credential; each session then keeps its own. Opening
 /// leaves every other session open (`tests/tla/acp/AcpSessions.tla`
 /// OthersUntouched), except where the connection holds one session.
+/// The record of this connection as a client of a session that is not open yet. The session that
+/// opens next adopts it, so a legacy URL sink built before the open keeps its record.
+pub fn pendingMember(state: *ServerState) !*Member {
+    if (state.pending_member) |member| return member;
+    state.pending_member = try newMember(state.host.alloc, state);
+    return state.pending_member.?;
+}
+
+fn takePendingMember(state: *ServerState) !*Member {
+    if (state.pending_member) |member| {
+        state.pending_member = null;
+        return member;
+    }
+    return newMember(state.host.alloc, state);
+}
+
 pub fn openSession(state: *ServerState, value: ActiveSessionState, binding: ?*workspace_binding.Binding) !*ActiveSessionState {
-    try state.sessions.ensureUnusedCapacity(state.alloc, 1);
+    try state.memberships.ensureUnusedCapacity(state.alloc, 1);
     const session = try state.alloc.create(ActiveSessionState);
     errdefer state.alloc.destroy(session);
     session.* = value;
-    session.server = state;
+    try reserveMemberLocked(session, state.host.alloc);
+    const opener = try takePendingMember(state);
+    errdefer opener.drop();
     session.client_writer = jsonrpc.Writer.initCallback(session, forwardToMain);
     // The connection defaults for new sessions are copied now, so this session keeps them when its main client changes.
     session.context_limits = state.context_limits;
@@ -1427,7 +1571,8 @@ pub fn openSession(state: *ServerState, value: ActiveSessionState, binding: ?*wo
     session.account_id = null;
     session.gateway_team = null;
     try copyDefaultCredential(state, session);
-    state.sessions.appendAssumeCapacity(session);
+    _ = listMemberLocked(session, opener);
+    addMembershipLocked(state, session, opener);
     // Without `follow_supported` no other connection can follow the session.
     if (comptime follow_supported) {
         {
@@ -1466,35 +1611,58 @@ fn freeSessionCredential(alloc: Allocator, session: *ActiveSessionState) void {
     session.gateway_team = null;
 }
 
-/// Closes `session`: stops its turns and answers what waits for them, joins
-/// its subagents, frees it, and removes it from the open sessions. Every
-/// other session runs on (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
+/// Closes `session`: stops its turns and answers what waits for them, joins its subagents, and
+/// ends every member. Its last holder frees it. Every other session runs on
+/// (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
 pub fn closeSession(state: *ServerState, session: *ActiveSessionState) void {
     startClose(state, session);
     cancelAndReapPrompt(state, session);
-    clearPendingLegacyUrls(state, session);
+    clearPendingLegacyUrls(session);
     disableSubagentHost(session);
-    for (state.sessions.items, 0..) |open, index| {
-        if (open == session) {
-            _ = state.sessions.orderedRemove(index);
-            break;
-        }
-    }
-    destroySession(state, session);
+    closeMembers(session);
+    removeMembershipForSession(state, session);
 }
 
-/// Closes every open session, as `fx acp` exits.
+/// Ends every membership this connection holds as `fx acp` exits. A session it left while another
+/// member still leads stays open: only this membership goes.
 fn closeAllSessions(state: *ServerState) void {
-    while (state.sessions.items.len > 0) closeSession(state, state.sessions.items[state.sessions.items.len - 1]);
-    state.sessions.deinit(state.alloc);
+    while (state.memberships.items.len > 0) {
+        const index = state.memberships.items.len - 1;
+        const membership = state.memberships.items[index];
+        switch (standing(membership)) {
+            .follows => detachFollowerAt(state, index, .left),
+            .led => closeSession(state, membership.session),
+            .left => if (sessionHasMembers(membership.session)) {
+                removeMembershipAt(state, index);
+            } else {
+                closeSession(state, membership.session);
+            },
+        }
+    }
+}
+
+/// Whether this connection's end closes the session `membership` names: it leads the session, or it
+/// has left and no member remains. A follow is not closed here, and neither is a session another member leads.
+fn endsSession(membership: Membership) bool {
+    return switch (standing(membership)) {
+        .led => true,
+        .follows => false,
+        .left => !sessionHasMembers(membership.session),
+    };
+}
+
+/// Whether a live member remains in `session`. Takes `audience_mutex`.
+fn sessionHasMembers(session: *ActiveSessionState) bool {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    return session.members.items.len > 0;
 }
 
 /// Closes every open session where the connection holds one, before it
 /// opens another.
 pub fn closeSessionsBeforeOpen(state: *ServerState) void {
     if (holdsOneSession(state)) {
-        while (state.sessions.items.len > 0) {
-            const session = state.sessions.items[0];
+        while (firstSession(state)) |session| {
             startClose(state, session);
             cancelAndReapPrompt(state, session);
             stopSubagentsForSwitch(session);
@@ -1513,7 +1681,7 @@ const partial_copy_notice = "fx kept only the start of this turn's output, so pa
 /// progress when `member` lists `sh.fx/turnProgress`, then one notice when the
 /// copy dropped updates. The caller holds the session's `session_write_mutex`
 /// and `audience_mutex`, so the copy is not changed while it is replayed.
-pub fn replayRunningCopy(member: *ServerState, alloc: Allocator, session: *ActiveSessionState) !void {
+pub fn replayRunningCopy(member: *Member, alloc: Allocator, session: *ActiveSessionState) !void {
     // A joined connection replays the copy, and one exists only where `follow_supported` holds.
     if (comptime !follow_supported) return;
     const copy = &session.running_copy;
@@ -1589,7 +1757,7 @@ fn deliverPromptUpdate(
 
 /// Writes the partial-copy notice to `member`: an ACP notice when its client
 /// shows them, otherwise an agent message.
-fn writePartialCopyNotice(member: *ServerState, alloc: Allocator, session_id: []const u8) !void {
+fn writePartialCopyNotice(member: *Member, alloc: Allocator, session_id: []const u8) !void {
     var update: std.Io.Writer.Allocating = .init(alloc);
     defer update.deinit();
     if (member.client_notices) {
@@ -1605,57 +1773,262 @@ fn writePartialCopyNotice(member: *ServerState, alloc: Allocator, session_id: []
     try member.writer.writeNotification(alloc, "session/update", params.writer.buffered());
 }
 
-/// Makes room for one more follower of `session`, so that listing it cannot
-/// fail. A join calls this before it writes its answer, so the answer goes out
-/// only when the listing is certain to follow. The caller holds
-/// `session.audience_mutex`.
-pub fn reserveFollowerLocked(session: *ActiveSessionState, alloc: Allocator) Allocator.Error!void {
-    try session.followers.ensureUnusedCapacity(alloc, 1);
-}
-
-/// Lists `follower` among `session`'s followers, once. It needs the room that
-/// `reserveFollowerLocked` made. The caller holds `session.audience_mutex`.
-pub fn listFollowerLocked(session: *ActiveSessionState, follower: *ServerState) void {
-    for (session.followers.items) |listed| if (listed == follower) return;
-    session.followers.appendAssumeCapacity(follower);
-}
-
 /// Removes `follower` from `session`'s followers, and reports whether it was
 /// listed. The caller holds `session.audience_mutex`.
-fn removeFollowerLocked(session: *ActiveSessionState, follower: *ServerState) bool {
-    for (session.followers.items, 0..) |listed, index| {
-        if (listed != follower) continue;
-        _ = session.followers.orderedRemove(index);
-        return true;
-    }
-    return false;
+/// Makes the record for `state` as a client of a session, with `alloc`. The values a turn
+/// reads are copied now. The runtimes `state` owned move into the record, because `state`'s
+/// frame may end before the session does.
+pub fn newMember(alloc: Allocator, state: *ServerState) !*Member {
+    const member = try alloc.create(Member);
+    errdefer alloc.destroy(member);
+    member.* = .{
+        .connection_id = state.connection_id,
+        .host = state.host,
+        .writer = &state.writer,
+        .initialized = state.initialized,
+        .terminal_ui = state.terminal_ui,
+        .client_notices = state.client_notices,
+        .client_compaction = state.client_compaction,
+        .client_elicitation = state.client_elicitation,
+        .extensions = state.extensions,
+        .host_tools = state.host_tools,
+        .terminal_client = state.terminal_client,
+        .credential_source = state.credential_source,
+        .gateway_source_preference = state.gateway_source_preference,
+        .alloc = alloc,
+    };
+    state.host_tools = .{};
+    state.terminal_client = .{};
+    return member;
 }
 
-/// Whether `state` follows `session_id`.
-pub fn followsSession(state: *const ServerState, session_id: []const u8) bool {
-    for (state.following.items) |listed| {
-        if (std.mem.eql(u8, listed, session_id)) return true;
-    }
-    return false;
+/// Makes room for one more member of `session`. Call it before the answer that lists the member
+/// goes out, so listing after it cannot fail.
+pub fn reserveMemberLocked(session: *ActiveSessionState, alloc: Allocator) Allocator.Error!void {
+    try session.members.ensureUnusedCapacity(alloc, 1);
 }
 
-/// Records that `state` follows `session_id`. Returns false when it already did.
-pub fn recordFollowing(state: *ServerState, session_id: []const u8) Allocator.Error!bool {
-    if (followsSession(state, session_id)) return false;
-    const owned = try state.alloc.dupe(u8, session_id);
-    errdefer state.alloc.free(owned);
-    try state.following.append(state.alloc, owned);
+/// Lists `member` as the newest member of `session`, and takes over the list's reference to it.
+/// The main client stays the oldest live member. Returns false, listing nothing, when a member for
+/// the same connection is listed. Needs the room `reserveMemberLocked` made, and `audience_mutex`.
+pub fn listMemberLocked(session: *ActiveSessionState, member: *Member) bool {
+    for (session.members.items) |listed| {
+        if (listed.connection_id == member.connection_id) return false;
+    }
+    if (session.last_main) |last| {
+        session.last_main = null;
+        last.drop();
+    }
+    session.members.appendAssumeCapacity(member);
     return true;
 }
 
-/// Forgets that `state` follows `session_id`, if it does.
-pub fn forgetFollowing(state: *ServerState, session_id: []const u8) void {
-    for (state.following.items, 0..) |listed, index| {
-        if (!std.mem.eql(u8, listed, session_id)) continue;
-        state.alloc.free(listed);
-        _ = state.following.orderedRemove(index);
+/// Lists `state` as a follower of a session a test builds by hand, with its membership.
+pub fn joinMemberForTest(session: *ActiveSessionState, state: *ServerState) !void {
+    try reserveMemberLocked(session, state.host.alloc);
+    try state.memberships.ensureUnusedCapacity(state.alloc, 1);
+    const member = try newMember(state.host.alloc, state);
+    if (!listMemberLocked(session, member)) {
+        member.destroy();
         return;
     }
+    addMembershipLocked(state, session, member);
+}
+
+/// The number of sessions this connection follows, for a test.
+pub fn followingCountForTest(state: *ServerState) usize {
+    var count: usize = 0;
+    for (state.memberships.items) |membership| {
+        if (standing(membership) == .follows) count += 1;
+    }
+    return count;
+}
+
+/// The number of followers a test session lists: its members other than the opener.
+pub fn followerCountForTest(session: *const ActiveSessionState) usize {
+    return session.members.items.len -| 1;
+}
+
+/// Adds `state` as the opener of a session that a test builds by hand, with its membership. The
+/// test frees the session with `freeMembers`.
+pub fn attachOpenerForTest(session: *ActiveSessionState, state: *ServerState) !void {
+    session.audience_mutex = .init;
+    session.members = .empty;
+    session.last_main = null;
+    session.holders = 0;
+    session.closed = false;
+    try reserveMemberLocked(session, state.host.alloc);
+    try state.memberships.ensureUnusedCapacity(state.alloc, 1);
+    const opener = try newMember(state.host.alloc, state);
+    _ = listMemberLocked(session, opener);
+    addMembershipLocked(state, session, opener);
+}
+
+/// Drops a test state's memberships and their references, without closing the sessions a test
+/// built by hand. The test frees the session's member list with `freeMembers` first.
+pub fn releaseMembershipsForTest(state: *ServerState) void {
+    for (state.memberships.items) |membership| membership.member.drop();
+    state.memberships.deinit(state.alloc);
+}
+
+/// A turn's write to the main client failed. The main client leaves, and the result says whether a
+/// member remains to take the turn. The caller holds no lock.
+pub fn mainWriteFailed(session: *ActiveSessionState, failed: *Member) bool {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    return removeMemberLocked(session, failed.connection_id);
+}
+
+/// Takes the live member for `connection_id` out of the audience and makes its record gone.
+/// The oldest remaining member becomes the main. Returns whether a member remains; with none,
+/// the main stays the record of the member that left last. The caller holds `audience_mutex`.
+pub fn removeMemberLocked(session: *ActiveSessionState, connection_id: ConnectionId) bool {
+    var was_main = false;
+    for (session.members.items, 0..) |listed, index| {
+        if (listed.connection_id != connection_id) continue;
+        was_main = index == 0;
+        _ = session.members.orderedRemove(index);
+        markMemberGone(listed);
+        releaseLeftLocked(session, listed);
+        break;
+    }
+    prompt_test_controls.noteMemberRemoved();
+    // A main that leaves answers the requests it still owes: `moved` when another member takes
+    // the session, so its turns ask that member again, and `no_client` when none remains.
+    if (session.members.items.len == 0) {
+        if (was_main) markOwedRequests(session, connection_id, false);
+        return false;
+    }
+    if (was_main) markOwedRequests(session, connection_id, true);
+    clearWriterDrop(session);
+    return true;
+}
+
+/// Drops the list's reference to a record that left. The last member to leave hands its reference
+/// to `last_main`, so a kept turn can still read the main client. The caller holds `audience_mutex`.
+fn releaseLeftLocked(session: *ActiveSessionState, left: *Member) void {
+    if (session.members.items.len == 0) {
+        session.last_main = left;
+        return;
+    }
+    left.drop();
+}
+
+/// Marks `member` gone before its connection's frame ends, so nothing writes through its writer
+/// after that. Takes `legacy_url_mutex`, so a completion that is being written finishes first.
+fn markMemberGone(member: *Member) void {
+    member.legacy_url_mutex.lockUncancelable(io_mod.getIo());
+    defer member.legacy_url_mutex.unlock(io_mod.getIo());
+    member.gone = true;
+}
+
+/// Whether the record of `connection_id` is the session's only live member, so that its leave
+/// leaves the session with no member. Takes `audience_mutex`.
+fn isOnlyMember(session: *ActiveSessionState, connection_id: ConnectionId) bool {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    return session.members.items.len == 1 and session.members.items[0].connection_id == connection_id;
+}
+
+/// A client leaves `session`: its input ended, or it closed the session. Its record leaves the
+/// audience under `audience_mutex`. Returns whether a member remains. The caller removes the
+/// session from its own lists, on its own thread.
+pub fn leaveMember(state: *ServerState, session: *ActiveSessionState) bool {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    // The leaver's waiting input is withdrawn only when another member remains to take the turn.
+    if (session.members.items.len > 1) {
+        if (findMemberLocked(session, state.connection_id)) |member| withdrawFollowerInput(member, session, .left);
+    }
+    return removeMemberLocked(session, state.connection_id);
+}
+
+/// Answers each request that `leaver` still owes `session` and nobody has answered yet.
+/// When another member remains (`new_main`), a permission becomes `moved`, so its turn asks
+/// again of the new main. Otherwise, or for any other request, it becomes `no_client`.
+fn markOwedRequests(session: *ActiveSessionState, leaver: ConnectionId, new_main: bool) void {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    var pending = session.outbound.pending.iterator();
+    while (pending.next()) |entry| {
+        if (entry.key_ptr.connection != leaver or entry.value_ptr.response != null) continue;
+        entry.value_ptr.response = if (new_main and entry.value_ptr.kind == .permission) .{ .moved = true } else .{ .no_client = true };
+    }
+    session.outbound.cond.broadcast(io);
+}
+
+/// A new main has not failed, so the forwarding writer's drop flag, which a failed write
+/// to the old main set, is cleared.
+fn clearWriterDrop(session: *ActiveSessionState) void {
+    const io = io_mod.getIo();
+    session.client_writer.mutex.lockUncancelable(io);
+    defer session.client_writer.mutex.unlock(io);
+    session.client_writer.dropping = false;
+}
+
+/// How this connection stands in a session, read once under `audience_mutex`: `led` when its
+/// record is the live main client, `follows` when another record is, and `left` when its record left.
+const Standing = enum { led, follows, left };
+
+fn standing(membership: Membership) Standing {
+    var audience = lockAudience(membership.session);
+    defer audience.unlock();
+    if (membership.member.gone or membership.session.closed) return .left;
+    if (mainLocked(membership.session) == membership.member) return .led;
+    return .follows;
+}
+
+fn leadsMembership(membership: Membership) bool {
+    return standing(membership) == .led;
+}
+
+/// The index of this connection's membership of the session `session_id` names, or null.
+fn membershipIndex(state: *const ServerState, session_id: []const u8) ?usize {
+    for (state.memberships.items, 0..) |membership, index| {
+        if (std.mem.eql(u8, membership.session.session_id, session_id)) return index;
+    }
+    return null;
+}
+
+/// Whether this connection follows `session_id`: it has the session open, and another record leads it.
+pub fn followsSession(state: *ServerState, session_id: []const u8) bool {
+    const index = membershipIndex(state, session_id) orelse return false;
+    return standing(state.memberships.items[index]) == .follows;
+}
+
+/// Adds `member` as this connection's membership of `session`, with a hold on the record. The
+/// caller reserved room in `memberships`, and holds `audience_mutex` or owns a session not yet shared.
+pub fn addMembershipLocked(state: *ServerState, session: *ActiveSessionState, member: *Member) void {
+    member.hold();
+    session.holders += 1;
+    state.memberships.appendAssumeCapacity(.{ .session = session, .member = member });
+}
+
+/// Removes the membership at `index`: this connection stops having the session open. It drops the
+/// membership's hold on the record, and frees the session when it is closed and this was its last
+/// holder. Only this connection's reader thread calls it.
+fn removeMembershipAt(state: *ServerState, index: usize) void {
+    const membership = state.memberships.orderedRemove(index);
+    var audience = lockAudience(membership.session);
+    membership.session.holders -= 1;
+    const freed = membership.session.closed and membership.session.holders == 0;
+    audience.unlock();
+    membership.member.drop();
+    if (freed) destroySession(state, membership.session);
+}
+
+/// Removes this connection's membership of `session`, if it has one.
+pub fn removeMembershipForSession(state: *ServerState, session: *ActiveSessionState) void {
+    for (state.memberships.items, 0..) |membership, index| {
+        if (membership.session == session) return removeMembershipAt(state, index);
+    }
+}
+
+/// Forgets this connection's membership of `session_id`, if it has one.
+pub fn forgetFollowing(state: *ServerState, session_id: []const u8) void {
+    const index = membershipIndex(state, session_id) orelse return;
+    removeMembershipAt(state, index);
 }
 
 /// Why a connection stops following a session. `closed`: it closed the session and
@@ -1663,29 +2036,47 @@ pub fn forgetFollowing(state: *ServerState, session_id: []const u8) void {
 /// it hears nothing more.
 pub const FollowerLeave = enum { closed, left };
 
-/// Ends `state`'s follow of `session_id`: removes `state` from the session's
-/// followers when the session is still in the table, and withdraws the input it
-/// still has waiting (`withdrawFollowerInput`). A session that has left the table
-/// already dropped its followers, and its line was drained when it closed, so there
-/// is nothing left to withdraw.
+/// Ends `state`'s follow of `session_id`: its record leaves the session, and the input it still
+/// has waiting is withdrawn (`withdrawFollowerInput`). Its membership ends too.
 pub fn detachFollower(state: *ServerState, session_id: []const u8, leave: FollowerLeave) void {
     // A follower can exist only where `follow_supported` holds.
     if (comptime !follow_supported) return;
+    const index = membershipIndex(state, session_id) orelse return;
+    detachFollowerAt(state, index, leave);
+}
+
+fn detachFollowerAt(state: *ServerState, index: usize, leave: FollowerLeave) void {
+    const membership = state.memberships.items[index];
     debug_trace.logf("acp", "event=follower_detached session={s} reason={s}", .{
-        session_id,
+        membership.session.session_id,
         switch (leave) {
             .closed => "close",
             .left => "connection_end",
         },
     });
-    const shared = &state.host.shared;
-    shared.mutex.lockUncancelable(io_mod.getIo());
-    defer shared.mutex.unlock(io_mod.getIo());
-    const session = shared.findLocked(session_id) orelse return;
-    session.audience_mutex.lockUncancelable(io_mod.getIo());
-    defer session.audience_mutex.unlock(io_mod.getIo());
-    _ = removeFollowerLocked(session, state);
-    withdrawFollowerInput(state, session, leave);
+    {
+        var audience = lockAudience(membership.session);
+        defer audience.unlock();
+        if (findMemberLocked(membership.session, state.connection_id)) |member| withdrawFollowerInput(member, membership.session, leave);
+        _ = removeMemberLocked(membership.session, state.connection_id);
+    }
+    removeMembershipAt(state, index);
+}
+
+/// The live member record for `connection_id`, or null. The caller holds `audience_mutex`.
+pub fn findMemberLocked(session: *ActiveSessionState, connection_id: ConnectionId) ?*Member {
+    for (session.members.items) |listed| {
+        if (listed.connection_id == connection_id) return listed;
+    }
+    return null;
+}
+
+/// Frees the member lists of `session` a test built by hand, and the references they keep.
+pub fn freeMembers(session: *ActiveSessionState, alloc: Allocator) void {
+    for (session.members.items) |member| member.drop();
+    session.members.deinit(alloc);
+    if (session.last_main) |last| last.drop();
+    session.last_main = null;
 }
 
 /// Withdraws the input that a following connection still has waiting: its late
@@ -1700,7 +2091,7 @@ pub fn detachFollower(state: *ServerState, session_id: []const u8, leave: Follow
 /// and the steering runtime's lock inside that. Nothing takes the line lock and then
 /// the audience or shared lock: the line lock's sections call neither, and the
 /// subagent authority lock's sections reach neither, so this order cannot cycle.
-fn withdrawFollowerInput(state: *ServerState, session: *ActiveSessionState, leave: FollowerLeave) void {
+fn withdrawFollowerInput(state: *Member, session: *ActiveSessionState, leave: FollowerLeave) void {
     // A follower can exist only where `follow_supported` holds.
     if (comptime !follow_supported) return;
     var taken: prompt_line.Drained = .{};
@@ -1730,12 +2121,12 @@ fn withdrawFollowerInput(state: *ServerState, session: *ActiveSessionState, leav
 
 /// Writes the cancelled answer to `state`'s own connection, the answer the owner's
 /// close gives input it drains (`answerCancelled`): `-32800`, "Request cancelled".
-fn writeCancelledAnswer(state: *ServerState, id: jsonrpc.RequestId) void {
+fn writeCancelledAnswer(state: *Member, id: jsonrpc.RequestId) void {
     const answer: Answer = .{ .rpc_error = .{
         .code = ErrorCode.request_cancelled,
         .message = "Request cancelled",
     } };
-    writeAnswer(&state.writer, state.alloc, id, answer) catch |err| debug_trace.logf("acp", "failed to answer withdrawn input err={s}", .{@errorName(err)});
+    writeAnswer(state.writer, state.alloc, id, answer) catch |err| debug_trace.logf("acp", "failed to answer withdrawn input err={s}", .{@errorName(err)});
 }
 
 /// Traces one waiting input that a follower's leave withdraws. The reason says
@@ -1752,17 +2143,22 @@ fn traceWaitingInputDropped(session: *const ActiveSessionState, id: ?jsonrpc.Req
     });
 }
 
-/// Drops the followers of `active` as its session closes. A follower belongs to
-/// its own connection, so only the list is cleared here; each drop is traced.
-fn dropFollowersAtClose(active: *ActiveSessionState) void {
-    // A follower can exist only where `follow_supported` holds.
-    if (comptime !follow_supported) return;
-    active.audience_mutex.lockUncancelable(io_mod.getIo());
-    defer active.audience_mutex.unlock(io_mod.getIo());
-    for (active.followers.items) |_| {
-        debug_trace.logf("acp", "event=follower_dropped session={s} reason=session_closed", .{active.session_id});
+/// Ends the session's membership as it closes: every record leaves the audience, and the
+/// session is marked closed. Its last holder frees it (`removeMembershipAt`).
+fn closeMembers(session: *ActiveSessionState) void {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    session.closed = true;
+    for (session.members.items) |member| {
+        markMemberGone(member);
+        debug_trace.logf("acp", "event=follower_dropped session={s} reason=session_closed", .{session.session_id});
+        member.drop();
     }
-    active.followers.clearRetainingCapacity();
+    session.members.clearRetainingCapacity();
+    if (session.last_main) |last| {
+        session.last_main = null;
+        last.drop();
+    }
 }
 
 /// The client closes `session`, or opens another where the connection holds
@@ -1812,7 +2208,6 @@ fn dropQueuedMail(session: *ActiveSessionState, reason: []const u8) void {
 }
 
 fn destroySession(state: *ServerState, active: *ActiveSessionState) void {
-    dropFollowersAtClose(active);
     // The session's requests end with it. Each answer that nobody took is freed here.
     var pending = active.outbound.pending.valueIterator();
     while (pending.next()) |entry| {
@@ -1860,7 +2255,7 @@ fn destroySession(state: *ServerState, active: *ActiveSessionState) void {
     // The copy goes before the store is freed; a turn's copy is never kept past its session.
     active.running_copy.release(state.alloc, .session_released);
     // Each follower is owned by its own connection; only the list is freed here.
-    active.followers.deinit(state.alloc);
+    active.members.deinit(state.host.alloc);
     active.own_workspace.deinit(state.alloc);
     state.alloc.destroy(active);
 }
@@ -1874,7 +2269,9 @@ pub fn enableSubagentHost(session: *ActiveSessionState) void {
 /// Subagents on v2 keep their state in the session's log (D22). A host that
 /// cannot start leaves them off and says why, as on v1.
 fn enableSubagentHostV2(active: *ActiveSessionState, v2: *session_adapter.Session) void {
-    const alloc = active.server.alloc;
+    const main_record = holdMain(active);
+    defer main_record.drop();
+    const alloc = main_record.alloc;
     const children = alloc.create(subagent_child_state.V2Children) catch |err| {
         debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
         return;
@@ -1995,7 +2392,9 @@ fn resolveSubagentAuthority(
     root_id: []const u8,
 ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
     const active: *ActiveSessionState = @ptrCast(@alignCast(raw.?));
-    const state = active.server;
+    const main_record = holdMain(active);
+    defer main_record.drop();
+    const state = main_record;
     if (!std.mem.eql(u8, active.session_id, root_id)) {
         return error.HostAuthorityUnavailable;
     }
@@ -2048,7 +2447,9 @@ pub fn disableSubagentHost(session: *ActiveSessionState) void {
     }
     if (session.subagent_v2_children) |children| {
         children.deinit();
-        session.server.alloc.destroy(children);
+        const main_record = holdMain(session);
+        defer main_record.drop();
+        main_record.alloc.destroy(children);
         session.subagent_v2_children = null;
     }
 }
@@ -2099,7 +2500,16 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     // the table, so nothing a connection uses is freed while it still runs.
     var host = Host.open(alloc, cfg);
     defer host.deinit();
-    return runServer(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init(), .{ .lead = true, .host = &host });
+    const served = runServer(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init(), .{ .lead = true, .host = &host });
+    waitForSessionsToEnd(&host);
+    return served;
+}
+
+/// The exit rule: once the stdio connection has ended, fx exits when no session has a
+/// member and no turn runs. A session a follower took over stays open until that follower
+/// leaves, and the leader keeps serving it until then.
+fn waitForSessionsToEnd(host: *Host) void {
+    if (comptime follow_supported) host.shared.waitUntilEmpty();
 }
 
 pub fn runWithTransport(
@@ -2190,10 +2600,30 @@ fn runServer(
     // queued prompts. Any other client's turns stop first, as before, so their
     // waiting requests end as cancels. Then the client can't answer any more,
     // so end what fx still waits on and refuse new requests.
-    if (!state.extensions.contains(.keep_turn_on_disconnect)) {
-        for (state.sessions.items) |session| handleCancel(&state, session, false);
+    // A session that a follower still has open goes on with that follower as its main, so
+    // its turn is not cancelled here (the leave rule). Other sessions stop as before.
+    const keep_turns = state.extensions.contains(.keep_turn_on_disconnect);
+    // Once this connection's record leaves a session, it no longer leads it, so the next led
+    // session is always at index 0. A turn that stops because its last client leaves is
+    // cancelled and ends before that client's record leaves, so the client still hears the turn's end.
+    while (sessionAt(&state, 0)) |session| {
+        if (!keep_turns and !runningTurnKeeps(session) and isOnlyMember(session, state.connection_id)) {
+            handleCancel(session, false);
+            // The client can't answer any more, so what the turn waits on ends before the turn is awaited.
+            endClientInput(&state);
+            reapSessionPrompt(session, true);
+        }
+        if (leaveMember(&state, session)) removeMembershipForSession(&state, session);
     }
     endClientInput(&state);
+}
+
+/// Whether the session's running turn was started by a client that listed
+/// `sh.fx/keepTurnOnDisconnect`. The last client to leave does not stop such a
+/// turn, because the turn belongs to its sender, not to the client leaving.
+fn runningTurnKeeps(session: *const ActiveSessionState) bool {
+    const active = session.prompt orelse return false;
+    return active.keep_turn;
 }
 
 /// Starts this process's leader socket and records it in every session lock
@@ -2265,7 +2695,8 @@ fn handleClientResponse(state: *ServerState, alloc: Allocator, msg: *const jsonr
 
     const io = io_mod.getIo();
     const request: OutboundRequest = .{ .connection = state.connection_id, .id = numeric_id };
-    for (state.sessions.items) |session| {
+    var index: usize = 0;
+    while (sessionAt(state, index)) |session| : (index += 1) {
         session.outbound.mutex.lockUncancelable(io);
         const pending = session.outbound.pending.getPtr(request) orelse {
             session.outbound.mutex.unlock(io);
@@ -2308,8 +2739,17 @@ fn parsePermissionDecision(root: std.json.Value) ?types.ToolPermissionDecision {
 /// `max_pending_outbound` of them. The connection's lock is taken before the
 /// session's, the same order `endClientInput` uses.
 pub fn beginOutboundRequest(session: *ActiveSessionState, kind: OutboundKind) !?OutboundRequest {
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const request = (try putOutboundRequest(session, main_record, kind)) orelse return null;
+    answerIfMemberGone(session, main_record, request);
+    return request;
+}
+
+/// Adds a pending request to `session` for the main record `state`, or returns null when that
+/// client's input has ended or the session's pending requests are full.
+fn putOutboundRequest(session: *ActiveSessionState, state: *Member, kind: OutboundKind) !?OutboundRequest {
     const io = io_mod.getIo();
-    const state = sessionMain(session);
     state.outbound_mutex.lockUncancelable(io);
     defer state.outbound_mutex.unlock(io);
     // The client's input has ended, so no answer can arrive.
@@ -2327,10 +2767,30 @@ pub fn beginOutboundRequest(session: *ActiveSessionState, kind: OutboundKind) !?
     return request;
 }
 
+/// Answers `request` `no_client` when its target record has already left. A leave answers only the
+/// requests pending at that moment, so a request put after the leave would wait forever. The check
+/// runs after the put, so a leave that comes later finds the request pending and answers it.
+fn answerIfMemberGone(session: *ActiveSessionState, member: *Member, request: OutboundRequest) void {
+    const io = io_mod.getIo();
+    {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        if (!member.gone) return;
+    }
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    if (session.outbound.pending.getPtr(request)) |entry| {
+        if (entry.response == null) entry.response = .{ .no_client = true };
+    }
+    session.outbound.cond.broadcast(io);
+}
+
 /// Whether the main client's input has ended (`endClientInput`), so a request to
 /// it can't get an answer.
 pub fn clientInputEnded(session: *ActiveSessionState) bool {
-    const state = sessionMain(session);
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
     return state.input_ended;
@@ -2362,7 +2822,9 @@ pub fn awaitOutboundResponse(session: *ActiveSessionState, request: OutboundRequ
 /// that event is the only one outstanding; `select` then has nothing left to
 /// cancel. `select` must hold a `response: ?OutboundResponse` event.
 pub fn takeCancelledResponse(session: *ActiveSessionState, select: anytype) void {
-    const alloc = sessionMain(session).alloc;
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const alloc = main_record.alloc;
     const item = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
         // Only Select.cancel and cancelDiscard close the queue, and they leave
         // nothing outstanding.
@@ -2386,7 +2848,9 @@ pub fn discardOutboundRequest(session: *ActiveSessionState, request: OutboundReq
     if (session.outbound.pending.fetchRemove(request)) |entry| {
         if (entry.value.response) |response| {
             var owned = response;
-            owned.deinit(sessionMain(session).alloc);
+            const main_record = holdMain(session);
+            defer main_record.drop();
+            owned.deinit(main_record.alloc);
         }
     }
 }
@@ -2436,10 +2900,9 @@ fn cancelSessionPending(session: *ActiveSessionState, notify_client: bool) void 
 /// that can't arrive. The sessions this connection leads hold its requests.
 fn endClientInput(state: *ServerState) void {
     const io = io_mod.getIo();
-    state.outbound_mutex.lockUncancelable(io);
-    defer state.outbound_mutex.unlock(io);
-    state.input_ended = true;
-    for (state.sessions.items) |session| {
+    markMembersInputEnded(state);
+    var index: usize = 0;
+    while (sessionAt(state, index)) |session| : (index += 1) {
         session.outbound.mutex.lockUncancelable(io);
         var pending = session.outbound.pending.iterator();
         while (pending.next()) |entry| {
@@ -2452,16 +2915,35 @@ fn endClientInput(state: *ServerState) void {
     }
 }
 
+/// Records that this connection's input ended on each member record it holds, so a turn never
+/// asks it a question once it is the main client. Covers the sessions it leads and follows.
+fn markMembersInputEnded(state: *ServerState) void {
+    for (state.memberships.items) |membership| markMemberInputEnded(membership.session, state.connection_id);
+}
+
+fn markMemberInputEnded(session: *ActiveSessionState, connection_id: ConnectionId) void {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const member = findMemberLocked(session, connection_id) orelse return;
+    const io = io_mod.getIo();
+    member.outbound_mutex.lockUncancelable(io);
+    defer member.outbound_mutex.unlock(io);
+    member.input_ended = true;
+}
+
 /// Tells the client to stop `request`, on the writer of the connection that is main now.
 fn publishRequestCancellation(session: *ActiveSessionState, request: OutboundRequest) void {
-    const state = sessionMain(session);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const state = mainLocked(session).?;
+    if (state.gone) return;
     var params: std.Io.Writer.Allocating = .init(state.alloc);
     defer params.deinit();
     params.writer.print("{{\"requestId\":{d}}}", .{request.id}) catch |err| {
         debug_trace.logf("acp", "request cancellation serialization failed id={d} err={s}", .{ request.id, @errorName(err) });
         return;
     };
-    session.client_writer.writeNotification(
+    state.writer.writeNotification(
         state.alloc,
         "$/cancel_request",
         params.writer.buffered(),
@@ -2471,7 +2953,7 @@ fn publishRequestCancellation(session: *ActiveSessionState, request: OutboundReq
 }
 
 pub fn reserveLegacyUrl(
-    state: *ServerState,
+    state: *Member,
     origin: tool_mcp_runtime.InputOrigin,
     source_id: []const u8,
     acp_id: []const u8,
@@ -2538,7 +3020,7 @@ pub fn reserveLegacyUrl(
 }
 
 pub fn removeLegacyUrl(
-    state: *ServerState,
+    state: *Member,
     acp_id: []const u8,
 ) void {
     state.legacy_url_mutex.lockUncancelable(io_mod.getIo());
@@ -2552,7 +3034,7 @@ pub fn removeLegacyUrl(
 }
 
 pub fn acceptLegacyUrl(
-    state: *ServerState,
+    state: *Member,
     origin: tool_mcp_runtime.InputOrigin,
     acp_id: []const u8,
 ) tool_mcp_runtime.LegacyUrlAcceptTransition {
@@ -2583,24 +3065,30 @@ pub fn acceptLegacyUrl(
     return result;
 }
 
-/// Forgets the URL completions `session`'s MCP servers still owe, or with a
-/// null session every one.
-fn clearPendingLegacyUrls(state: *ServerState, session: ?*const ActiveSessionState) void {
-    state.legacy_url_mutex.lockUncancelable(io_mod.getIo());
-    defer state.legacy_url_mutex.unlock(io_mod.getIo());
+/// Forgets the URL completions that the members of `session` still owe for it. The completions
+/// live in each member's record, so the session's closing clears them there.
+fn clearPendingLegacyUrls(session: *ActiveSessionState) void {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    for (session.members.items) |member| clearMemberPendingLegacyUrls(member, session.session_id);
+}
+
+fn clearMemberPendingLegacyUrls(member: *Member, session_id: []const u8) void {
+    member.legacy_url_mutex.lockUncancelable(io_mod.getIo());
+    defer member.legacy_url_mutex.unlock(io_mod.getIo());
     var index: usize = 0;
-    while (index < state.pending_legacy_urls.items.len) {
-        const pending = &state.pending_legacy_urls.items[index];
-        if (session) |owner| if (!std.mem.eql(u8, pending.session_id, owner.session_id)) {
+    while (index < member.pending_legacy_urls.items.len) {
+        const pending = &member.pending_legacy_urls.items[index];
+        if (!std.mem.eql(u8, pending.session_id, session_id)) {
             index += 1;
             continue;
-        };
-        pending.deinit(state.alloc);
-        _ = state.pending_legacy_urls.orderedRemove(index);
+        }
+        pending.deinit(member.alloc);
+        _ = member.pending_legacy_urls.orderedRemove(index);
     }
 }
 
-pub fn legacyUrlCompletionSink(state: *ServerState) tool_mcp_runtime.LegacyUrlCompletionSink {
+pub fn legacyUrlCompletionSink(state: *Member) tool_mcp_runtime.LegacyUrlCompletionSink {
     return .{
         .context = @ptrCast(state),
         .accept = acceptLegacyUrlFromSink,
@@ -2614,7 +3102,7 @@ fn acceptLegacyUrlFromSink(
     origin: tool_mcp_runtime.InputOrigin,
     acp_id: []const u8,
 ) tool_mcp_runtime.LegacyUrlAcceptTransition {
-    const state: *ServerState = @ptrCast(@alignCast(raw_context));
+    const state: *Member = @ptrCast(@alignCast(raw_context));
     return acceptLegacyUrl(state, origin, acp_id);
 }
 
@@ -2622,7 +3110,7 @@ fn consumeLegacyUrlCompletion(
     raw_context: *anyopaque,
     completion: tool_mcp_runtime.LegacyUrlCompletion,
 ) tool_mcp_runtime.LegacyUrlConsumeTransition {
-    const state: *ServerState = @ptrCast(@alignCast(raw_context));
+    const state: *Member = @ptrCast(@alignCast(raw_context));
     var acp_id: ?[]u8 = null;
     var matched = false;
     state.legacy_url_mutex.lockUncancelable(io_mod.getIo());
@@ -2677,19 +3165,24 @@ fn consumeLegacyUrlCompletion(
 }
 
 fn publishLegacyUrlCompletionFromSink(raw_context: *anyopaque, id: []u8) void {
-    const state: *ServerState = @ptrCast(@alignCast(raw_context));
-    publishLegacyUrlCompletion(state, id);
+    const member: *Member = @ptrCast(@alignCast(raw_context));
+    publishLegacyUrlCompletion(member, id);
 }
 
-fn publishLegacyUrlCompletion(state: *ServerState, id: []u8) void {
-    defer state.alloc.free(id);
-    var params: std.Io.Writer.Allocating = .init(state.alloc);
+/// Writes the completion to the record's client. The write holds `legacy_url_mutex` and checks
+/// `gone` there, so the connection's frame cannot end under it (`markMemberGone`).
+fn publishLegacyUrlCompletion(member: *Member, id: []u8) void {
+    defer member.alloc.free(id);
+    var params: std.Io.Writer.Allocating = .init(member.alloc);
     defer params.deinit();
     params.writer.writeAll("{\"elicitationId\":") catch return;
     std.json.Stringify.value(id, .{}, &params.writer) catch return;
     params.writer.writeByte('}') catch return;
-    state.writer.writeNotification(
-        state.alloc,
+    member.legacy_url_mutex.lockUncancelable(io_mod.getIo());
+    defer member.legacy_url_mutex.unlock(io_mod.getIo());
+    if (member.gone) return;
+    member.writer.writeNotification(
+        member.alloc,
         "elicitation/complete",
         params.writer.buffered(),
     ) catch {};
@@ -2709,16 +3202,53 @@ pub fn beginPermissionRequest(session: *ActiveSessionState) ?OutboundRequest {
     return beginOutboundRequest(session, .permission) catch null;
 }
 
-pub fn awaitPermissionDecision(session: *ActiveSessionState, request: OutboundRequest) types.ToolPermissionDecision {
-    const alloc = sessionMain(session).alloc;
-    var response = awaitOutboundResponse(session, request, .permission) orelse return .deny;
+/// What a permission wait ended with: the client's decision, or `moved` when the main
+/// client left before it answered, so the turn asks the new main again.
+pub const PermissionAnswer = union(enum) {
+    decided: types.ToolPermissionDecision,
+    moved,
+};
+
+pub fn awaitPermissionAnswer(session: *ActiveSessionState, request: OutboundRequest) PermissionAnswer {
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    const alloc = main_record.alloc;
+    var response = awaitOutboundResponse(session, request, .permission) orelse return .{ .decided = .deny };
     defer response.deinit(alloc);
+    if (response.moved) return .moved;
     if (response.no_client) debug_trace.logf("acp", "event=permission_denied reason=client_input_ended", .{});
-    if (response.cancelled or response.error_json != null) return .deny;
-    const raw = response.result_json orelse return .deny;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return .deny;
+    if (response.cancelled or response.error_json != null) return .{ .decided = .deny };
+    const raw = response.result_json orelse return .{ .decided = .deny };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return .{ .decided = .deny };
     defer parsed.deinit();
-    return parsePermissionDecision(parsed.value) orelse .deny;
+    return .{ .decided = parsePermissionDecision(parsed.value) orelse .deny };
+}
+
+/// The decision of a permission wait that cannot move: a move is denied, as a cancel is.
+pub fn awaitPermissionDecision(session: *ActiveSessionState, request: OutboundRequest) types.ToolPermissionDecision {
+    return switch (awaitPermissionAnswer(session, request)) {
+        .decided => |decision| decision,
+        .moved => .deny,
+    };
+}
+
+/// Sends `method` with `params_json` to the session's main client, which must still be the
+/// connection `request` was made to. The check and the write hold the session's audience
+/// lock, so a hand-off cannot land between them. Fails with `error.MainChanged` when it did,
+/// and the caller asks the new main.
+pub fn writeRequestToMain(
+    session: *ActiveSessionState,
+    request: OutboundRequest,
+    alloc: Allocator,
+    method: []const u8,
+    params_json: []const u8,
+) !void {
+    prompt_test_controls.notePermissionWrite();
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const main = mainLocked(session).?;
+    if (main.gone or main.connection_id != request.connection) return error.MainChanged;
+    try main.writer.writeRequest(alloc, .{ .integer = @intCast(request.id) }, method, params_json);
 }
 
 pub fn cancelPermissionRequest(session: *ActiveSessionState, request: OutboundRequest) void {
@@ -2732,7 +3262,7 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
         .request_cancel => handleRequestCancellation(state, alloc, msg.params_raw),
         .session_cancel => {
             if (notificationTargetSession(state, alloc, msg.params_raw)) |session| {
-                handleCancel(state, session, true);
+                handleCancel(session, true);
             } else {
                 _ = try cancelFollowedSession(state, alloc, false, null, msg.params_raw);
             }
@@ -2766,7 +3296,7 @@ pub fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !v
     if (method == .session_cancel) {
         if (try cancelFollowedSession(state, alloc, true, msg.id, msg.params_raw)) return;
         const session = (try requireSessionTarget(state, alloc, msg)) orelse return;
-        handleCancel(state, session, true);
+        handleCancel(session, true);
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
@@ -2868,18 +3398,17 @@ fn handleRequestCancellation(
     const value = parsed.value.object.get("requestId") orelse return;
     const requested = requestIdFromValue(value) orelse return;
     // The request may belong to any open session's turns.
-    for (state.sessions.items) |session| {
+    var open_index: usize = 0;
+    while (sessionAt(state, open_index)) |session| : (open_index += 1) {
         if (withdrawSessionRequest(state, alloc, session, requested)) return;
     }
     // A follower's own waiting input and its own running prompt are in the sessions it
     // follows. Each one is held while it is checked, and only this connection's
     // entries match, so a follower stops only a turn that its own prompt started.
     if (comptime follow_supported) {
-        const shared = &state.host.shared;
-        for (state.following.items) |session_id| {
-            const session = shared.retain(session_id) orelse continue;
-            defer shared.release(session);
-            if (withdrawSessionRequest(state, alloc, session, requested)) return;
+        for (state.memberships.items) |membership| {
+            if (standing(membership) != .follows) continue;
+            if (withdrawSessionRequest(state, alloc, membership.session, requested)) return;
         }
     }
 }
@@ -2910,7 +3439,9 @@ fn withdrawSessionRequest(
         break :outcome .none;
     };
     switch (outcome) {
-        .stop_turn => handleCancel(session.server, session, true),
+        .stop_turn => {
+            handleCancel(session, true);
+        },
         .withdrawn => {
             debug_trace.logf("acp", "withdrew a prompt that hadn't run", .{});
             const answer: Answer = .{ .rpc_error = .{
@@ -3023,7 +3554,9 @@ pub fn takeSteering(
     result_alloc: Allocator,
     close_if_empty: bool,
 ) Allocator.Error!libfx_steering.Drained {
-    return session.steering.takeAll(session.server.alloc, result_alloc, close_if_empty);
+    const main_record = holdMain(session);
+    defer main_record.drop();
+    return session.steering.takeAll(main_record.alloc, result_alloc, close_if_empty);
 }
 
 fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId) !void {
@@ -3122,7 +3655,7 @@ fn cancelFollowedSession(
     const shared = &state.host.shared;
     if (shared.retain(session_id)) |session| {
         defer shared.release(session);
-        handleCancel(session.server, session, true);
+        handleCancel(session, true);
         if (reply) try state.writer.writeResponse(alloc, request_id, "null");
         return true;
     }
@@ -3213,7 +3746,7 @@ fn deliveredDecision(outcome: DeliveryOutcome) ?PromptDecision {
 }
 
 /// Makes the session's turn for a claimed prompt (AcpSessionReaders ClaimNew).
-/// The turn runs on the owner (`session.server`), and its answers go to the sender's
+/// The turn runs on the owner (`sessionMain(session)`), and its answers go to the sender's
 /// connection. The caller holds the line lock. The turn goes into the slot, and
 /// `worker_running` is set in the same hold, so no other prompt can see an empty
 /// slot with no turn. The thread starts later, outside the lock
@@ -3222,13 +3755,16 @@ fn claimTurnLocked(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Me
     const active = try alloc.create(ActivePrompt);
     errdefer alloc.destroy(active);
     active.* = .{
-        .state = session.server,
+        .host = state.host,
         .session = session,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, msg),
         .from = state.connection_id,
         .mode = session.mode,
         .permission_mode = session.permission_mode,
+        .usage_shown = state.extensions.contains(.usage),
+        .delivery_shown = state.extensions.contains(.prompt_delivery),
+        .keep_turn = state.extensions.contains(.keep_turn_on_disconnect),
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
     session.turn_cancel.store(false, .seq_cst);
@@ -3971,13 +4507,13 @@ fn handleKernelSteer(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
-fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) SessionTargetDecision {
+fn parsedSessionTargetDecision(state: *ServerState, root: std.json.Value) SessionTargetDecision {
     const supplied = if (root == .object) root.object.get("sessionId") else null;
-    return decideSessionTarget(state.sessions.items.len, parsedSessionTarget(state, root) != null, supplied);
+    return decideSessionTarget(sessionCount(state), parsedSessionTarget(state, root) != null, supplied);
 }
 
 /// The open session a request's params name, or null.
-fn parsedSessionTarget(state: *const ServerState, root: std.json.Value) ?*ActiveSessionState {
+fn parsedSessionTarget(state: *ServerState, root: std.json.Value) ?*ActiveSessionState {
     const requested = requestedSessionId(root) orelse return null;
     return findSession(state, requested);
 }
@@ -4031,7 +4567,8 @@ pub fn releaseTurnForTest(session: *ActiveSessionState) void {
 fn promptBusy(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) bool {
     if (holdsOneSession(state)) {
         // A stale answer only refuses the request as busy.
-        for (state.sessions.items) |session| if (sessionPromptRunning(session)) return true;
+        var running_index: usize = 0;
+        while (sessionAt(state, running_index)) |session| : (running_index += 1) if (sessionPromptRunning(session)) return true;
         return false;
     }
     const raw = msg.params_raw orelse return false;
@@ -4110,7 +4647,7 @@ fn requireParsedSessionTarget(
     id: ?jsonrpc.RequestId,
     root: std.json.Value,
 ) !?*ActiveSessionState {
-    const decision = parsedSessionTargetDecision(state, root);
+    var decision = parsedSessionTargetDecision(state, root);
     if (decision == .exact) return parsedSessionTarget(state, root).?;
     // A follower changes nothing: the connection that owns the session does. A follower's prompt
     // and cancel never reach this lookup (promptFromFollower and cancelFollowedSession handle
@@ -4118,9 +4655,16 @@ fn requireParsedSessionTarget(
     // and set_config_option.
     if (comptime follow_supported) {
         if (requestedSessionId(root)) |requested| {
+            // The main client can change between the two reads (a leave on another connection's
+            // thread). A connection that became the main then leads the session, so the decision is read again.
+            prompt_test_controls.noteTargetDecided();
             if (followedElsewhere(state, requested)) {
                 try state.writer.writeError(alloc, id, .{ .code = ErrorCode.invalid_request, .message = follower_refusal });
                 return null;
+            }
+            decision = parsedSessionTargetDecision(state, root);
+            if (decision == .exact) {
+                if (parsedSessionTarget(state, root)) |session| return session;
             }
         }
     }
@@ -4175,7 +4719,7 @@ fn requireSessionTarget(
 
 /// The open session a notification names, or null when it names none.
 fn notificationTargetSession(
-    state: *const ServerState,
+    state: *ServerState,
     alloc: Allocator,
     params: ?[]const u8,
 ) ?*ActiveSessionState {
@@ -4196,13 +4740,13 @@ fn notificationTargetSession(
 /// itself reapable before it sends the last answers, so a prompt the client
 /// sends after them starts its own turn.
 fn promptWorkerMain(active: *ActivePrompt) void {
-    const state = active.state;
+    const host = active.host;
     const session = active.session;
     var mode = active.mode;
     var permission_mode = active.permission_mode;
     while (true) {
         const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
-            state,
+            host,
             session,
             active.alloc,
             &active.msg,
@@ -4214,7 +4758,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             .rpc_error = .{
                 .code = ErrorCode.internal_error,
                 // A storage fault is named (D29); the wasm host keeps the error name.
-                .message = if (sessionsStore(state.host) != null)
+                .message = if (sessionsStore(host) != null)
                     sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
                 else
                     @errorName(err),
@@ -4222,11 +4766,11 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         };
         // The turn is over and its updates are either saved or lost with it, so its copy goes.
         releaseRunningCopy(session, .turn_ended);
-        var finished: ?libfx_steering.Finished = session.steering.finishTurn(state.alloc, state.alloc, "turn_finished") catch |err| blk: {
+        var finished: ?libfx_steering.Finished = session.steering.finishTurn(host.alloc, host.alloc, "turn_finished") catch |err| blk: {
             debug_trace.logf("acp", "failed to collect steering prompts at turn end err={s}", .{@errorName(err)});
             break :blk null;
         };
-        defer if (finished) |value| value.deinit(state.alloc);
+        defer if (finished) |value| value.deinit(host.alloc);
 
         // The turn that just ended, answered below once the next one is chosen.
         var ended_msg = active.msg;
@@ -4247,13 +4791,13 @@ fn promptWorkerMain(active: *ActivePrompt) void {
                     cancelled_steers = value.untaken;
                     break :handBack;
                 }
-                line.handBackLocked(state.alloc, value.untaken) catch {
+                line.handBackLocked(host.alloc, value.untaken) catch {
                     debug_trace.logf("acp", "dropped steers the turn never took count={d} reason=out_of_memory", .{value.untaken.len});
                     cancelled_steers = value.untaken;
                     break :handBack;
                 };
                 // The line owns the steers now.
-                state.alloc.free(value.untaken);
+                host.alloc.free(value.untaken);
                 value.untaken = &.{};
             }
             if (!line.closing) if (line.takeNextLocked()) |taken| {
@@ -4261,7 +4805,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
                 if (startNextTurn(active, session, &waiting)) {
                     session.turn_cancel.store(false, .seq_cst);
                     session.cancel_flag.store(false, .seq_cst);
-                    session.steering.open(state.alloc);
+                    session.steering.open(host.alloc);
                     mode = session.mode;
                     permission_mode = session.permission_mode;
                     break :next waiting;
@@ -4283,14 +4827,14 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         };
 
         publishTurnOutcome(active, ended_from, ended_msg.id, ended_group, outcome, finished);
-        for (cancelled_steers) |steer| answerCancelled(state, session, steer.from, steer.request_id);
+        for (cancelled_steers) |steer| answerCancelled(host, session, steer.from, steer.request_id);
         if (dropped_waiting) |*dropped| {
-            answerDroppedWaiting(session, state.alloc, dropped);
-            dropped.input.deinit(state.alloc);
+            answerDroppedWaiting(session, host.alloc, dropped);
+            dropped.input.deinit(host.alloc);
         }
         if (next) |taken| {
             var waiting = taken;
-            defer waiting.deinit(state.alloc);
+            defer waiting.deinit(host.alloc);
             if (waiting == .steers) publishStartingSteers(session, active.alloc, waiting.steers.items);
             // The ended turn's answer carried its usage; the next one sums its own.
             active.usage = .{};
@@ -4366,7 +4910,9 @@ fn publishStartingSteers(session: *ActiveSessionState, alloc: Allocator, steers:
         const message_id = acp_types.generateMessageId(&message_id_storage);
         // Without `follow_supported` no follower takes the other version, so only the owner's is built.
         if (comptime !follow_supported) {
-            const params = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, session.server.sendsSteerInput()) catch {
+            const main_record = holdMain(session);
+            defer main_record.drop();
+            const params = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, main_record.sendsSteerInput()) catch {
                 debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
                 continue;
             };
@@ -4445,9 +4991,13 @@ pub fn noteSteeringBoundary(active: *ActiveSessionState) void {
 /// Records a libfx turn's tool call `call_id` starting or ending.
 pub fn noteSteeringTool(active: *ActiveSessionState, call_id: []const u8, started: bool) void {
     if (started) {
-        active.steering.noteToolStarted(active.server.alloc, call_id);
+        const main_record = holdMain(active);
+        defer main_record.drop();
+        active.steering.noteToolStarted(main_record.alloc, call_id);
     } else {
-        active.steering.noteToolEnded(active.server.alloc, call_id);
+        const second_main_record = holdMain(active);
+        defer second_main_record.drop();
+        active.steering.noteToolEnded(second_main_record.alloc, call_id);
     }
 }
 
@@ -4479,7 +5029,7 @@ fn publishPromptOutcome(active: *ActivePrompt, from: ConnectionId, id: ?jsonrpc.
         .stop_reason => |stop_reason| {
             // Without `follow_supported` the owner is the only member, so only its own shape is built.
             if (comptime !follow_supported) {
-                const body = try stopResponse(active, stop_reason, active.state.extensions.contains(.usage));
+                const body = try stopResponse(active, stop_reason, active.usage_shown);
                 defer active.alloc.free(body);
                 return answerSender(active.session, active.alloc, from, id, .none, .{ .response = body }, .{ .response = body });
             }
@@ -4519,7 +5069,7 @@ fn writeSteeringOutcome(
         .stop_reason => |stop_reason| {
             // Without `follow_supported` the owner is the only member: the delivery is in its response only when it lists `.prompt_delivery`.
             if (comptime !follow_supported) {
-                const delivery_shown: ?acp_types.SteeringDelivery = if (active.state.extensions.contains(.prompt_delivery)) delivery else null;
+                const delivery_shown: ?acp_types.SteeringDelivery = if (active.delivery_shown) delivery else null;
                 const body = try steerResponse(active, stop_reason, delivery_shown);
                 defer active.alloc.free(body);
                 return answerSender(active.session, active.alloc, sender.from, sender.id, .none, .{ .response = body }, .{ .response = body });
@@ -4580,7 +5130,8 @@ fn reapSessionPrompt(session: *ActiveSessionState, wait: bool) void {
 
 /// Joins the worker of every session whose turns ended.
 fn reapPrompts(state: *ServerState) void {
-    for (state.sessions.items) |session| reapSessionPrompt(session, false);
+    var reap_index: usize = 0;
+    while (sessionAt(state, reap_index)) |session| : (reap_index += 1) reapSessionPrompt(session, false);
 }
 
 fn cloneMessage(alloc: Allocator, msg: *const jsonrpc.Message) !jsonrpc.Message {
@@ -4775,7 +5326,7 @@ fn applyTokenPassStartModel(state: *ServerState) void {
     state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
 }
 
-fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
+fn loadConfiguredStartupState(state: *ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.host.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
@@ -5073,7 +5624,7 @@ fn writeInitializeAnswer(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
 /// The capabilities fx answers `initialize` with. A socket connection's answer
 /// adds `leader` (see `writeInitializeAnswer`), and the rest is this same value,
 /// so the two always agree. It reads only `cfg`, never the client's request.
-fn agentCapabilities(state: *const ServerState) acp_types.AgentCapabilities {
+fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
     return .{
         .image_prompts = !host_target.is_wasm,
         .mcp_servers = state.host.cfg.allow_acp_mcp,
@@ -5510,7 +6061,7 @@ test "ACP keeps its model catalog when a due refresh cannot connect" {
 /// Queued prompts still run after it. Held under the waiting prompts' mutex,
 /// so a stop never lands on the turn the worker starts next. Every other
 /// session's turn runs on (`tests/tla/acp/AcpSessions.tla` OthersUntouched).
-fn handleCancel(state: *ServerState, session: *ActiveSessionState, notify_client: bool) void {
+fn handleCancel(session: *ActiveSessionState, notify_client: bool) void {
     debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
     session.waiting_prompts.lock();
     // The flag is set under the line lock, together with the cancel. A claim
@@ -5524,7 +6075,7 @@ fn handleCancel(state: *ServerState, session: *ActiveSessionState, notify_client
     // A prompt waiting for its subagents' reports stops waiting.
     session.worker.nudgeWaiter();
     cancelSessionPending(session, notify_client);
-    clearPendingLegacyUrls(state, session);
+    clearPendingLegacyUrls(session);
 }
 
 /// The first steps of a close (AcpSessionReaders BeginClose, CloseDetach and
@@ -5566,23 +6117,23 @@ pub fn cancelAndReapPrompt(state: *ServerState, session: *ActiveSessionState) vo
             break :drained session.waiting_prompts.drainLocked();
         };
         defer drained.deinit(state.alloc);
-        for (drained.late.items) |steer| answerCancelled(state, session, steer.from, steer.request_id);
-        for (drained.queue.items) |queued| if (queued.msg.id) |id| answerCancelled(state, session, queued.from, id);
+        for (drained.late.items) |steer| answerCancelled(state.host, session, steer.from, steer.request_id);
+        for (drained.queue.items) |queued| if (queued.msg.id) |id| answerCancelled(state.host, session, queued.from, id);
     }
     // AcpSessionReaders CloseCancel: the cancel stops the turn under the line lock.
-    handleCancel(state, session, true);
+    handleCancel(session, true);
     // AcpSessionReaders CloseTakeSlot, CloseJoin and CloseFreeT: the reap takes the
     // turn, joins it, and frees it.
     reapSessionPrompt(session, true);
 }
 
 /// Answers a prompt that never ran with `-32800`, to the connection that sent it.
-fn answerCancelled(state: *ServerState, session: *ActiveSessionState, from: ConnectionId, id: jsonrpc.RequestId) void {
+fn answerCancelled(host: *Host, session: *ActiveSessionState, from: ConnectionId, id: jsonrpc.RequestId) void {
     const answer: Answer = .{ .rpc_error = .{
         .code = ErrorCode.request_cancelled,
         .message = "Request cancelled",
     } };
-    answerSender(session, state.alloc, from, id, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
+    answerSender(session, host.alloc, from, id, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
 }
 
 /// The answer to a client's prompt or steer: a response, or an error.
@@ -5598,7 +6149,7 @@ const DroppedWaiting = struct {
     err: anyerror,
 };
 
-/// Writes `answer` to the connection that sent request `id`: the owner, `session.server`,
+/// Writes `answer` to the connection that sent request `id`: the owner, `sessionMain(session)`,
 /// or the follower in `session.followers` with that connection id. A member that takes
 /// `need` gets `with`, the others get `without`. Without `follow_supported` there is one
 /// connection, the owner, and the caller built the owner's body, which both `with` and
@@ -5620,22 +6171,26 @@ fn answerSender(
 ) !void {
     // Without `follow_supported` the owner is the only member, and the caller built its
     // body into both `with` and `without`, so either one is the owner's.
-    if (comptime !follow_supported) return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    if (comptime !follow_supported) {
+        const main = holdMain(session);
+        defer main.drop();
+        return writeAnswer(main.writer, alloc, id, if (memberTakes(main, need)) with else without);
+    }
     var audience = lockAudience(session);
     defer audience.unlock();
-    if (sameConnection(session.server.connection_id, from)) {
-        return writeAnswer(&session.server.writer, alloc, id, if (memberTakes(session.server, need)) with else without);
+    if (sameConnection(mainLocked(session).?.connection_id, from)) {
+        return writeAnswer(mainLocked(session).?.writer, alloc, id, if (memberTakes(mainLocked(session).?, need)) with else without);
     }
-    for (session.followers.items) |member| {
+    for (session.members.items) |member| {
         if (!sameConnection(member.connection_id, from)) continue;
-        writeAnswer(&member.writer, alloc, id, if (memberTakes(member, need)) with else without) catch |err| {
+        writeAnswer(member.writer, alloc, id, if (memberTakes(member, need)) with else without) catch |err| {
             traceDroppedAnswer(session, id, "write_failed", err);
-            audience.dropFollower(member, "session/prompt", .{ .write_failed = err });
+            audience.dropMember(member, "session/prompt", .{ .write_failed = err });
             return;
         };
         if (Audience.memberStopped(member)) {
             traceDroppedAnswer(session, id, "client_gone", null);
-            audience.dropFollower(member, "session/prompt", .client_gone);
+            audience.dropMember(member, "session/prompt", .client_gone);
         }
         return;
     }
@@ -5719,13 +6274,18 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     if (comptime follow_supported) {
         if (followsSession(state, session_id)) {
             detachFollower(state, session_id, .closed);
-            forgetFollowing(state, session_id);
             return state.writer.writeResponse(alloc, msg.id, "{}");
         }
     }
     // Closing is idempotent in ACP v1: a session that isn't open, or doesn't exist, closes with the
     // same empty result, and every open session stays open.
     const session = findSession(state, session_id) orelse return state.writer.writeResponse(alloc, msg.id, "{}");
+    // The main client closes a session a follower still has open. The follower becomes its
+    // main, and the session, its turn and the follower's input stay open (the leave rule).
+    if (leaveMember(state, session)) {
+        removeMembershipForSession(state, session);
+        return state.writer.writeResponse(alloc, msg.id, "{}");
+    }
     startClose(state, session);
     cancelAndReapPrompt(state, session);
     stopSubagentsForSwitch(session);
@@ -5776,6 +6336,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Invalid session model",
             });
         if (comptime !host_target.is_wasm) {
+            const main = holdMain(session);
+            defer main.drop();
             if (session.provider != .gateway) {
                 if (session.provider != .configured) {
                     const model_available = available: {
@@ -5795,7 +6357,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                         });
                     }
                 }
-                if (!try selectCredentialForSession(state, session)) {
+                if (!try selectCredentialForSession(main, session)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
@@ -6792,7 +7354,7 @@ test "an ACP steer that cuts the reply short is no turn cancel, and the client's
     };
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
     defer session.outbound.pending.deinit(alloc);
-    session.server = &state;
+    try attachOpenerForTest(&session, &state);
     session.steering.open(alloc);
     defer session.steering.deinit(alloc);
     _ = session.steering.notePhase(1, .reply, &session.cancel_flag);
@@ -6801,7 +7363,7 @@ test "an ACP steer that cuts the reply short is no turn cancel, and the client's
     try std.testing.expect(session.cancel_flag.load(.seq_cst));
     // The turn's workspace captures keep running (D98).
     try std.testing.expect(!session.turn_cancel.load(.seq_cst));
-    handleCancel(&state, &session, false);
+    handleCancel(&session, false);
     try std.testing.expect(session.turn_cancel.load(.seq_cst));
 }
 
@@ -6828,7 +7390,7 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     };
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-    session.server = &state;
+    try attachOpenerForTest(&session, &state);
     session.outbound = .{};
     defer session.outbound.pending.deinit(state.alloc);
 
@@ -6858,11 +7420,10 @@ test "ACP client input end gives a pending request no client and refuses new one
     };
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-    session.server = &state;
+    try attachOpenerForTest(&session, &state);
     session.outbound = .{};
     defer session.outbound.pending.deinit(alloc);
-    try state.sessions.append(alloc, &session);
-    defer state.sessions.deinit(alloc);
+    try attachOpenerForTest(&session, &state);
 
     const request = (try beginOutboundRequest(&session, .elicitation)).?;
     endClientInput(&state);
@@ -6885,11 +7446,10 @@ test "ACP outbound responses correlate out of order and ignore unknown ids" {
     };
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-    session.server = &state;
+    try attachOpenerForTest(&session, &state);
     session.outbound = .{};
     defer session.outbound.pending.deinit(alloc);
-    try state.sessions.append(alloc, &session);
-    defer state.sessions.deinit(alloc);
+    try attachOpenerForTest(&session, &state);
 
     const first = (try beginOutboundRequest(&session, .elicitation)).?;
     const second = (try beginOutboundRequest(&session, .elicitation)).?;
@@ -6937,11 +7497,10 @@ test "ACP client requests of every kind get their own answer, a cancel, or the c
         };
         var session: ActiveSessionState = undefined;
         session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-        session.server = &state;
+        try attachOpenerForTest(&session, &state);
         session.outbound = .{};
         defer session.outbound.pending.deinit(alloc);
-        try state.sessions.append(alloc, &session);
-        defer state.sessions.deinit(alloc);
+        try attachOpenerForTest(&session, &state);
 
         const answered = (try beginOutboundRequest(&session, kind)).?;
         handleClientResponse(&state, alloc, &.{
@@ -7011,11 +7570,10 @@ test "ACP a waiter blocked on the client wakes for each kind of answer, cancel, 
         };
         var session: ActiveSessionState = undefined;
         session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-        session.server = &state;
+        try attachOpenerForTest(&session, &state);
         session.outbound = .{};
         defer session.outbound.pending.deinit(alloc);
-        try state.sessions.append(alloc, &session);
-        defer state.sessions.deinit(alloc);
+        try attachOpenerForTest(&session, &state);
 
         var waiting = prompt_test_controls.Gate{};
         prompt_test_controls.outbound_waiting = &waiting;
@@ -7045,6 +7603,336 @@ test "ACP a waiter blocked on the client wakes for each kind of answer, cancel, 
     };
 }
 
+/// Counts the frames a test writer receives that contain `needle`.
+const CountingWriter = struct {
+    needle: []const u8,
+    count: usize = 0,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        const self: *CountingWriter = @ptrCast(@alignCast(raw.?));
+        if (std.mem.find(u8, frame, self.needle) != null) self.count += 1;
+    }
+};
+
+/// Opens a session on `state` for the hand-off tests.
+fn openHandOffTestSession(state: *ServerState, session_id: []const u8) !*ActiveSessionState {
+    const alloc = state.alloc;
+    state.host.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(test_builtin_gateway.provider_bundle);
+    const id = try alloc.dupe(u8, session_id);
+    const model = try alloc.dupe(u8, "test-model");
+    return openSession(state, .{
+        .session_id = id,
+        .model = model,
+        .mode = "normal",
+        .workspace_root = &.{},
+        .api_key = &.{},
+        .agent_step_limit = 4,
+        .max_tool_result_bytes = 1024 * 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 8 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    }, null);
+}
+
+const HandOffRun = struct {
+    fn run(state: *ServerState, session: *ActiveSessionState, moved: *bool) void {
+        moved.* = leaveMember(state, session);
+    }
+};
+
+const JoinRun = struct {
+    fn run(session: *ActiveSessionState, joiner: *ServerState, joined: *bool) void {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        _ = listMemberLocked(session, try newMember(joiner.host.alloc, joiner));
+        joined.* = true;
+    }
+};
+
+const PermissionWriteRun = struct {
+    fn run(session: *ActiveSessionState, request: OutboundRequest, alloc: Allocator, write_error: *?anyerror) void {
+        writeRequestToMain(session, request, alloc, "session/request_permission", "{}") catch |err| {
+            write_error.* = err;
+        };
+    }
+};
+
+test "a permission write parked while the opener leaves reaches no client, and the turn asks the new main" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var leaver_frames = CountingWriter{ .needle = "session/request_permission" };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&leaver_frames, CountingWriter.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower_frames = CountingWriter{ .needle = "session/request_permission" };
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_frames, CountingWriter.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    const session = try openHandOffTestSession(&state, "session_permission_held");
+    try joinMemberForTest(session, &follower);
+
+    const request = beginPermissionRequest(session) orelse return error.TestExpectedEqual;
+    var gate = prompt_test_controls.Gate{};
+    prompt_test_controls.permission_write_gate = &gate;
+    defer prompt_test_controls.permission_write_gate = null;
+    var write_error: ?anyerror = null;
+    const writing = try std.Thread.spawn(.{}, PermissionWriteRun.run, .{ session, request, alloc, &write_error });
+    gate.awaitReached();
+
+    const moved = leaveMember(&state, session);
+    gate.release();
+    writing.join();
+
+    try std.testing.expect(moved);
+    try std.testing.expect(write_error != null and write_error.? == error.MainChanged);
+    try std.testing.expectEqual(@as(usize, 0), leaver_frames.count);
+    try std.testing.expectEqual(@as(usize, 0), follower_frames.count);
+
+    const again = beginPermissionRequest(session) orelse return error.TestExpectedEqual;
+    try writeRequestToMain(session, again, alloc, "session/request_permission", "{}");
+    try std.testing.expectEqual(@as(usize, 0), leaver_frames.count);
+    try std.testing.expectEqual(@as(usize, 1), follower_frames.count);
+
+    cancelPermissionRequest(session, again);
+    var answered_again = awaitOutboundResponse(session, again, .permission) orelse return error.TestExpectedEqual;
+    defer answered_again.deinit(alloc);
+    var answered_first = awaitOutboundResponse(session, request, .permission) orelse return error.TestExpectedEqual;
+    defer answered_first.deinit(alloc);
+    try std.testing.expect(answered_first.moved);
+}
+
+const LeaveRun = struct {
+    fn run(state: *ServerState, session: *ActiveSessionState, moved: *bool) void {
+        moved.* = leaveMember(state, session);
+    }
+};
+
+const MemberJoinRun = struct {
+    fn run(session: *ActiveSessionState, joiner: *ServerState, member: *Member, joined: *bool) void {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        joined.* = listMemberLocked(session, member);
+        if (joined.*) addMembershipLocked(joiner, session, member);
+    }
+};
+
+const HoldReadRun = struct {
+    fn run(session: *ActiveSessionState, gate: *prompt_test_controls.Gate, read: *ConnectionId) void {
+        const held = holdMain(session);
+        defer held.drop();
+        gate.park();
+        read.* = held.connection_id;
+    }
+};
+
+/// Whether the connection `owner_id` has an outbound request that somebody already answered.
+fn anyOutboundAnsweredFor(session: *ActiveSessionState, owner_id: ConnectionId) bool {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    var pending = session.outbound.pending.iterator();
+    while (pending.next()) |entry| {
+        if (entry.key_ptr.connection == owner_id and entry.value_ptr.response != null) return true;
+    }
+    return false;
+}
+
+test "a main's leave parked after its record leaves answers the owed permission only when it finishes" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var leaver_frames = CountingWriter{ .needle = "session/request_permission" };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&leaver_frames, CountingWriter.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    const session = try openHandOffTestSession(&state, "session_leave_parked");
+    try joinMemberForTest(session, &follower);
+    const request = beginPermissionRequest(session) orelse return error.TestExpectedEqual;
+
+    var gate = prompt_test_controls.Gate{};
+    prompt_test_controls.leave_gate = &gate;
+    defer prompt_test_controls.leave_gate = null;
+    var moved = false;
+    const leaving = try std.Thread.spawn(.{}, LeaveRun.run, .{ &state, session, &moved });
+    gate.awaitReached();
+
+    const audience_free = session.audience_mutex.tryLock();
+    if (audience_free) session.audience_mutex.unlock(io_mod.getIo());
+    const follower_is_main = mainLocked(session).?.connection_id == follower.connection_id;
+    const answered_while_parked = anyOutboundAnsweredFor(session, state.connection_id);
+
+    gate.release();
+    leaving.join();
+
+    try std.testing.expect(!audience_free);
+    try std.testing.expect(follower_is_main);
+    try std.testing.expect(!answered_while_parked);
+    try std.testing.expect(moved);
+    var answer = awaitOutboundResponse(session, request, .permission) orelse return error.TestExpectedEqual;
+    defer answer.deinit(alloc);
+    try std.testing.expect(answer.moved);
+}
+
+test "a join during a parked leave waits for it, and is listed after the new main" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    var joiner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 3,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer joiner.deinit();
+    const session = try openHandOffTestSession(&state, "session_join_parked");
+    try joinMemberForTest(session, &follower);
+    try reserveMemberLocked(session, alloc);
+    try joiner.memberships.ensureUnusedCapacity(alloc, 1);
+    const joiner_member = try newMember(alloc, &joiner);
+
+    var gate = prompt_test_controls.Gate{};
+    prompt_test_controls.leave_gate = &gate;
+    defer prompt_test_controls.leave_gate = null;
+    var moved = false;
+    const leaving = try std.Thread.spawn(.{}, LeaveRun.run, .{ &state, session, &moved });
+    gate.awaitReached();
+
+    const audience_free = session.audience_mutex.tryLock();
+    if (audience_free) session.audience_mutex.unlock(io_mod.getIo());
+    var joined = false;
+    const joining = try std.Thread.spawn(.{}, MemberJoinRun.run, .{ session, &joiner, joiner_member, &joined });
+    gate.release();
+    leaving.join();
+    joining.join();
+
+    try std.testing.expect(!audience_free);
+    try std.testing.expect(moved);
+    try std.testing.expect(joined);
+    try std.testing.expect(mainLocked(session).?.connection_id == follower.connection_id);
+    try std.testing.expectEqual(@as(usize, 2), session.members.items.len);
+    try std.testing.expect(session.members.items[1] == joiner_member);
+}
+
+test "a session request that reads its target before a leave and its follow after it still finds the session" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    const session = try openHandOffTestSession(&state, "session_target_leave");
+    try joinMemberForTest(session, &follower);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"sessionId\":\"session_target_leave\"}", .{});
+    defer parsed.deinit();
+    var gate = prompt_test_controls.Gate{};
+    prompt_test_controls.target_decided_gate = &gate;
+    defer prompt_test_controls.target_decided_gate = null;
+    var found: ?*ActiveSessionState = null;
+    const targeting = try std.Thread.spawn(.{}, TargetRun.run, .{ &follower, alloc, parsed.value, &found });
+    gate.awaitReached();
+
+    const moved = leaveMember(&state, session);
+    gate.release();
+    targeting.join();
+
+    try std.testing.expect(moved);
+    try std.testing.expect(found == session);
+}
+
+test "a turn that holds the main record reads its client field after the member left and the frame ended" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    const session = try openHandOffTestSession(&state, "session_record_read");
+    const expected_connection = state.connection_id;
+
+    var gate = prompt_test_controls.Gate{};
+    var read: ConnectionId = 0;
+    const reading = try std.Thread.spawn(.{}, HoldReadRun.run, .{ session, &gate, &read });
+    gate.awaitReached();
+
+    _ = leaveMember(&state, session);
+    state.deinit();
+    @memset(std.mem.asBytes(&state), 0xaa);
+    gate.release();
+    reading.join();
+
+    try std.testing.expectEqual(expected_connection, read);
+}
+
+const TargetRun = struct {
+    fn run(state: *ServerState, alloc: Allocator, root: std.json.Value, found: *?*ActiveSessionState) void {
+        found.* = requireParsedSessionTarget(state, alloc, .{ .integer = 7 }, root) catch null;
+    }
+};
+
 test "ACP a moved request reaches its waiter as moved, not as an answer" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
@@ -7056,7 +7944,11 @@ test "ACP a moved request reaches its waiter as moved, not as an answer" {
     };
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
-    session.server = &state;
+    try attachOpenerForTest(&session, &state);
+    defer {
+        freeMembers(&session, alloc);
+        releaseMembershipsForTest(&state);
+    }
     session.outbound = .{};
     defer session.outbound.pending.deinit(alloc);
 
@@ -7082,12 +7974,8 @@ test "ACP legacy URL publication owns partial allocations" {
                 .host = &test_host,
                 .writer = jsonrpc.Writer.init(),
             };
-            defer {
-                clearPendingLegacyUrls(&state, null);
-                state.pending_legacy_urls.deinit(alloc);
-            }
             const reserved = try reserveLegacyUrl(
-                &state,
+                try pendingMember(&state),
                 .{
                     .wire = .legacy_mcp_2025_11,
                     .server_name = "fixture",
@@ -7119,10 +8007,6 @@ test "ACP legacy URL state requires consent and completion" {
         .host = &test_host,
         .writer = jsonrpc.Writer.init(),
     };
-    defer {
-        clearPendingLegacyUrls(&state, null);
-        state.pending_legacy_urls.deinit(alloc);
-    }
     const origin = tool_mcp_runtime.InputOrigin{
         .wire = .legacy_mcp_2025_11,
         .server_name = "fixture",
@@ -7136,14 +8020,14 @@ test "ACP legacy URL state requires consent and completion" {
         .deadline_ms = std.math.maxInt(i64),
     };
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         origin,
         "early",
         "acp-early",
         "session",
         "call",
     ));
-    const sink = legacyUrlCompletionSink(&state);
+    const sink = legacyUrlCompletionSink(try pendingMember(&state));
     _ = sink.consume(sink.context, .{
         .server_name = "fixture",
         .elicitation_id = "early",
@@ -7152,8 +8036,8 @@ test "ACP legacy URL state requires consent and completion" {
         .client_generation = 1,
         .auth_generation = 4,
     });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
+    try std.testing.expectEqual(@as(usize, 1), (try pendingMember(&state)).pending_legacy_urls.items.len);
+    try std.testing.expect(!(try pendingMember(&state)).pending_legacy_urls.items[0].completed);
     _ = sink.consume(sink.context, .{
         .server_name = "fixture",
         .elicitation_id = "early",
@@ -7162,8 +8046,8 @@ test "ACP legacy URL state requires consent and completion" {
         .client_generation = 2,
         .auth_generation = 5,
     });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
+    try std.testing.expectEqual(@as(usize, 1), (try pendingMember(&state)).pending_legacy_urls.items.len);
+    try std.testing.expect(!(try pendingMember(&state)).pending_legacy_urls.items[0].completed);
     _ = sink.consume(sink.context, .{
         .server_name = "fixture",
         .elicitation_id = "early",
@@ -7172,14 +8056,14 @@ test "ACP legacy URL state requires consent and completion" {
         .client_generation = 2,
         .auth_generation = 5,
     });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(state.pending_legacy_urls.items[0].completed);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].accepted);
-    removeLegacyUrl(&state, "acp-early");
-    try std.testing.expectEqual(@as(usize, 0), state.pending_legacy_urls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), (try pendingMember(&state)).pending_legacy_urls.items.len);
+    try std.testing.expect((try pendingMember(&state)).pending_legacy_urls.items[0].completed);
+    try std.testing.expect(!(try pendingMember(&state)).pending_legacy_urls.items[0].accepted);
+    removeLegacyUrl(try pendingMember(&state), "acp-early");
+    try std.testing.expectEqual(@as(usize, 0), (try pendingMember(&state)).pending_legacy_urls.items.len);
 
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         origin,
         "late",
         "acp-late",
@@ -7188,14 +8072,14 @@ test "ACP legacy URL state requires consent and completion" {
     ));
     try std.testing.expectEqual(
         tool_mcp_runtime.LegacyUrlAcceptTransition.awaiting_completion,
-        acceptLegacyUrl(&state, origin, "acp-late"),
+        acceptLegacyUrl(try pendingMember(&state), origin, "acp-late"),
     );
-    try std.testing.expect(state.pending_legacy_urls.items[0].accepted);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
-    removeLegacyUrl(&state, "acp-late");
+    try std.testing.expect((try pendingMember(&state)).pending_legacy_urls.items[0].accepted);
+    try std.testing.expect(!(try pendingMember(&state)).pending_legacy_urls.items[0].completed);
+    removeLegacyUrl(try pendingMember(&state), "acp-late");
 
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         origin,
         "publish",
         "acp-publish",
@@ -7204,7 +8088,7 @@ test "ACP legacy URL state requires consent and completion" {
     ));
     try std.testing.expectEqual(
         tool_mcp_runtime.LegacyUrlAcceptTransition.awaiting_completion,
-        acceptLegacyUrl(&state, origin, "acp-publish"),
+        acceptLegacyUrl(try pendingMember(&state), origin, "acp-publish"),
     );
     const publication = sink.consume(sink.context, .{
         .server_name = "fixture",
@@ -7216,10 +8100,10 @@ test "ACP legacy URL state requires consent and completion" {
     }).consumed.?;
     defer alloc.free(publication);
     try std.testing.expectEqualStrings("acp-publish", publication);
-    try std.testing.expectEqual(@as(usize, 0), state.pending_legacy_urls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), (try pendingMember(&state)).pending_legacy_urls.items.len);
 
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         origin,
         "old-a",
         "acp-old-a",
@@ -7227,7 +8111,7 @@ test "ACP legacy URL state requires consent and completion" {
         "call",
     ));
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         origin,
         "old-b",
         "acp-old-b",
@@ -7237,32 +8121,32 @@ test "ACP legacy URL state requires consent and completion" {
     var refreshed_catalog = origin;
     refreshed_catalog.catalog_generation = 4;
     try std.testing.expect(!try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         refreshed_catalog,
         "old-a",
         "acp-old-a-refresh",
         "session",
         "call",
     ));
-    try std.testing.expectEqual(@as(usize, 2), state.pending_legacy_urls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), (try pendingMember(&state)).pending_legacy_urls.items.len);
     var recovered = origin;
     recovered.runtime_generation = 2;
     recovered.catalog_generation = 4;
     try std.testing.expect(try reserveLegacyUrl(
-        &state,
+        try pendingMember(&state),
         recovered,
         "old-a",
         "acp-new",
         "session",
         "call",
     ));
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expectEqual(@as(u64, 2), state.pending_legacy_urls.items[0].binding.runtime_generation);
-    try std.testing.expectEqual(@as(u64, 1), state.pending_legacy_urls.items[0].binding.connection_generation);
-    removeLegacyUrl(&state, "acp-old-a");
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expectEqualStrings("acp-new", state.pending_legacy_urls.items[0].acp_id);
-    removeLegacyUrl(&state, "acp-new");
+    try std.testing.expectEqual(@as(usize, 1), (try pendingMember(&state)).pending_legacy_urls.items.len);
+    try std.testing.expectEqual(@as(u64, 2), (try pendingMember(&state)).pending_legacy_urls.items[0].binding.runtime_generation);
+    try std.testing.expectEqual(@as(u64, 1), (try pendingMember(&state)).pending_legacy_urls.items[0].binding.connection_generation);
+    removeLegacyUrl(try pendingMember(&state), "acp-old-a");
+    try std.testing.expectEqual(@as(usize, 1), (try pendingMember(&state)).pending_legacy_urls.items.len);
+    try std.testing.expectEqualStrings("acp-new", (try pendingMember(&state)).pending_legacy_urls.items[0].acp_id);
+    removeLegacyUrl(try pendingMember(&state), "acp-new");
 }
 
 test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
@@ -7388,7 +8272,7 @@ fn testCodexSession(state: *ServerState, alloc: Allocator, token: []const u8) !A
     // must be set; `undefined` would leave them as garbage.
     session.settings_mutex = .init;
     session.provider = .codex;
-    session.server = state;
+    try attachOpenerForTest(&session, state);
     session.model = &.{};
     session.web_search_runtime = web_search_runtime.Runtime.init(.{});
     session.api_key = try alloc.dupe(u8, token);
@@ -7599,7 +8483,7 @@ test "a session is in the shared table until it closes, and a follower is droppe
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
     };
-    try session.followers.append(alloc, &follower);
+    try joinMemberForTest(session, &follower);
 
     // Closing frees the session. The table lets go of it first, and the follower is dropped with it.
     closeSession(&state, session);
@@ -7651,14 +8535,14 @@ fn openAnswerSession(alloc: Allocator, owner: *ServerState, follower: *ServerSta
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     }, null);
-    try session.followers.append(alloc, follower);
+    try joinMemberForTest(session, follower);
     return session;
 }
 
 /// A turn that a prompt sent by connection `from` started, as the worker holds it.
 fn answerTestPrompt(owner: *ServerState, session: *ActiveSessionState, from: ConnectionId) ActivePrompt {
     return .{
-        .state = owner,
+        .host = owner.host,
         .session = session,
         .alloc = owner.alloc,
         .msg = .{ .method = "session/prompt", .id = .{ .integer = 7 } },
@@ -7765,7 +8649,7 @@ test "an answer to a connection that has left the session is dropped, and no con
     // Connection 3 is not a member: it sent the prompt and then left.
     var active = answerTestPrompt(&state, session, 3);
     publishTurnOutcome(&active, 3, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
-    answerCancelled(&state, session, 3, .{ .integer = 8 });
+    answerCancelled(state.host, session, 3, .{ .integer = 8 });
 
     try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
     try std.testing.expectEqual(follower_before, follower_wire.bytes.items.len);
@@ -7848,7 +8732,7 @@ test "a write that fails to a follower drops it and is traced, and the owner's t
 
     var follower_turn = answerTestPrompt(&state, session, 2);
     publishTurnOutcome(&follower_turn, 2, .{ .integer = 7 }, &.{}, .{ .stop_reason = .end_turn }, null);
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), followerCountForTest(session));
 
     var owner_turn = answerTestPrompt(&state, session, 1);
     publishTurnOutcome(&owner_turn, 1, .{ .integer = 8 }, &.{}, .{ .stop_reason = .end_turn }, null);
@@ -8102,7 +8986,7 @@ test "a claim waits while a finished turn is being joined, and claims the slot o
     const first_msg = sessionPromptTestMessage(1);
     const first = try alloc.create(ActivePrompt);
     first.* = .{
-        .state = &state,
+        .host = state.host,
         .session = session,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, &first_msg),
@@ -8225,7 +9109,7 @@ test "a reap that finds a join under way waits for it, and joins nothing once th
     const first_msg = sessionPromptTestMessage(1);
     const first = try alloc.create(ActivePrompt);
     first.* = .{
-        .state = &state,
+        .host = state.host,
         .session = session,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, &first_msg),
@@ -8423,7 +9307,7 @@ fn giveBackClaims(session: *ActiveSessionState, calls: []const *const DecisionCa
     }
 }
 
-test "a follower's prompt on an idle session starts a turn that runs on the owner's state, and its answer goes to the follower only" {
+test "a follower's prompt on an idle session starts a turn on that session, and its answer goes to the follower only" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
     defer test_host.deinit();
@@ -8462,7 +9346,7 @@ test "a follower's prompt on an idle session starts a turn that runs on the owne
     const won = turn orelse return error.TestUnexpectedResult;
 
     // The turn runs on the owner's state, and its answer goes to the follower's connection.
-    try std.testing.expect(won.state == &state);
+    try std.testing.expect(won.session == session);
     try std.testing.expectEqual(@as(ConnectionId, 2), won.from);
     publishTurnOutcome(won, 2, .{ .integer = 4 }, &.{}, .{ .stop_reason = .end_turn }, null);
     try std.testing.expectEqual(owner_before, owner_wire.bytes.items.len);
@@ -8575,9 +9459,6 @@ test "a follower's $/cancel_request withdraws its own queued prompt, and not the
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The follower's list buffer is freed last (defers run in reverse), after the entry is forgotten.
-    defer follower.following.deinit(alloc);
-    _ = try recordFollowing(&follower, "session_answers");
-    defer forgetFollowing(&follower, "session_answers");
 
     // The owner's turn runs. The owner and the follower each queue a prompt with request id 5.
     const owner_turn_msg = sessionPromptTestMessage(1);
@@ -8691,7 +9572,7 @@ test "two prompts that arrive together on an idle session start one turn, and th
         .claimed => |turn| turn,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(won.state == &state);
+    try std.testing.expect(won.session == session);
 
     // The other prompt is delivered into that turn, and gets the delivery path's answer on its own writer.
     const loser_state: *ServerState = if (owner_claims) &follower else &state;
@@ -8732,9 +9613,6 @@ test "a follower's $/cancel_request with its own running prompt's id stops that 
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
-    defer follower.following.deinit(alloc);
-    _ = try recordFollowing(&follower, "session_answers");
-    defer forgetFollowing(&follower, "session_answers");
 
     // The follower's own prompt starts the turn, with request id 4.
     const msg = sessionPromptTestMessage(4);
@@ -8788,9 +9666,6 @@ test "a follower's $/cancel_request with the same request id number as the owner
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
-    defer follower.following.deinit(alloc);
-    _ = try recordFollowing(&follower, "session_answers");
-    defer forgetFollowing(&follower, "session_answers");
 
     // The owner's prompt starts the turn, with request id 1.
     const owner_msg = sessionPromptTestMessage(1);
@@ -8847,12 +9722,9 @@ const CancelPair = struct {
         };
         self.follower.host.cfg.minimal_kernel = false;
         self.session = try openAnswerSession(alloc, &self.state, &self.follower);
-        _ = try recordFollowing(&self.follower, "session_answers");
     }
 
-    fn close(self: *CancelPair, alloc: Allocator) void {
-        forgetFollowing(&self.follower, "session_answers");
-        self.follower.following.deinit(alloc);
+    fn close(self: *CancelPair) void {
         self.state.deinit();
         self.host.deinit();
         self.follower_wire.deinit();
@@ -8864,7 +9736,7 @@ test "a follower's session/cancel request stops the owner's running turn, and th
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The owner's prompt starts the turn, with request id 1.
     const owner_msg = sessionPromptTestMessage(1);
@@ -8903,7 +9775,7 @@ test "a follower's session/cancel sends $/cancel_request to the owner's client f
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The owner's turn runs, and it waits for the client's answer to a permission request.
     const owner_msg = sessionPromptTestMessage(1);
@@ -8939,7 +9811,7 @@ test "a follower's session/cancel notification stops the owner's running turn, a
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const owner_msg = sessionPromptTestMessage(1);
     var turn: ?*ActivePrompt = null;
@@ -8971,7 +9843,7 @@ test "a session/cancel for a session this connection neither owns nor follows ge
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // A third connection of the process, which neither opened nor follows the session.
     var stranger_wire = AnswerWire{ .alloc = alloc };
@@ -9000,7 +9872,7 @@ test "a follower's cancel on an idle session does not stop the next turn" {
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The cancel arrives while no turn runs. It sets the flag, and the follower gets its answer.
     var cancel_msg = jsonrpc.Message{
@@ -9039,7 +9911,7 @@ const CancelCall = struct {
     session: *ActiveSessionState,
 
     fn run(self: *CancelCall) void {
-        handleCancel(self.state, self.session, true);
+        handleCancel(self.session, true);
     }
 };
 
@@ -9047,7 +9919,7 @@ test "a cancel that waits for a claim stops that turn, and both flags agree" {
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // A claim works under the line lock, so this test takes the lock too, and the
     // cancel starts on another thread and waits for it.
@@ -9084,7 +9956,7 @@ test "the owner's prompt reaches the follower's client as its turn starts, and t
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const msg = sessionPromptTestMessage(1);
     var turn: ?*ActivePrompt = null;
@@ -9108,7 +9980,7 @@ test "a follower's prompt reaches the owner's client as its turn starts, and the
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const msg = sessionPromptTestMessage(4);
     var turn: ?*ActivePrompt = null;
@@ -9132,7 +10004,7 @@ test "a follower's prompt queued behind the owner's turn reaches the owner's cli
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const owner_msg = sessionPromptTestMessage(1);
     var turn: ?*ActivePrompt = null;
@@ -9182,7 +10054,7 @@ test "an image in a prompt reaches the other client as a replay sends it" {
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const png = "\x89PNG\r\n\x1a\nimage-bytes";
     const image = try image_attachments.captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
@@ -9212,7 +10084,7 @@ test "a follower's session/close withdraws its waiting input, answers it cancell
     const alloc = std.testing.allocator;
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The owner's turn runs, and its claim opens the steering runtime to take input.
     const owner_msg = sessionPromptTestMessage(1);
@@ -9312,7 +10184,7 @@ test "a follower's disconnect withdraws its queued prompt with no write, and the
 
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     const owner_msg = sessionPromptTestMessage(1);
     var turn: ?*ActivePrompt = null;
@@ -9360,7 +10232,7 @@ test "a follower that leaves while its own prompt's turn runs: the turn goes on,
 
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The follower's own prompt starts the turn.
     const follower_msg = sessionPromptTestMessage(3);
@@ -9405,7 +10277,7 @@ test "a steer that waits for a turn whose worker cannot start is answered to its
 
     var pair: CancelPair = undefined;
     try pair.open(alloc);
-    defer pair.close(alloc);
+    defer pair.close();
 
     // The owner's prompt is claimed, and the claim opens the steering runtime. No worker runs yet.
     const owner_msg = sessionPromptTestMessage(1);

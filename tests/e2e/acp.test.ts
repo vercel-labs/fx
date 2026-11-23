@@ -15960,9 +15960,17 @@ describe("acp: model-independent", () => {
         second = await followSession(started.socket, started.sessionId, root);
 
         owner.endStdin();
-        const accepted = await first.request("session/set_mode", { sessionId: started.sessionId, modeId: "plan" });
+        // The opener's input end is handled on its own thread, so the follower's first request can
+        // arrive before the hand-off. Until then the opener is still the main, and the answer is the
+        // same refusal; ask again until the follower is the main.
+        let accepted = await first.request("session/set_mode", { sessionId: started.sessionId, modeId: "auto" });
+        const handOffDeadline = Date.now() + TIMEOUT;
+        while (accepted.answer.error?.code === -32600 && Date.now() < handOffDeadline) {
+          await Bun.sleep(20);
+          accepted = await first.request("session/set_mode", { sessionId: started.sessionId, modeId: "auto" });
+        }
         expect(accepted.answer.error).toBeUndefined();
-        const refused = await second.request("session/set_mode", { sessionId: started.sessionId, modeId: "plan" });
+        const refused = await second.request("session/set_mode", { sessionId: started.sessionId, modeId: "auto" });
         expect(refused.answer.error).toEqual({
           code: -32600,
           message: "This session is open on another connection; only that connection can change it.",

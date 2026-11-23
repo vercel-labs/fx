@@ -456,7 +456,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         &mcp_configs,
         workspace_root,
         state.client_elicitation,
-        server.legacyUrlCompletionSink(state),
+        server.legacyUrlCompletionSink(try server.pendingMember(state)),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -651,8 +651,11 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     if (server.findSession(state, session_id)) |active| {
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
-        for (active.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, active, alloc, &sources, turn, index + 1);
-        try sendSessionInfoUpdate(state, active, alloc, !server.sessionPromptRunning(active));
+        // Only this connection's session can be open here, so it is the main record.
+        const member = server.holdMain(active);
+        defer member.drop();
+        for (active.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(member, active, alloc, &sources, turn, index + 1);
+        try sendSessionInfoUpdate(member, active, alloc, !server.sessionPromptRunning(active));
         return writeLoadSessionResponse(state, alloc, msg, active, observer_hooks);
     }
 
@@ -711,8 +714,11 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     session_rt_owned = false;
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
-    for (session.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(state, session, alloc, &sources, turn, index + 1);
-    try sendSessionInfoUpdate(state, session, alloc, true);
+    // The session was just opened by this connection, so it is the main record.
+    const member = server.holdMain(session);
+    defer member.drop();
+    for (session.session_rt.agent.history.items, 0..) |turn, index| try sendHistoryTurnAsUpdates(member, session, alloc, &sources, turn, index + 1);
+    try sendSessionInfoUpdate(member, session, alloc, true);
     try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
@@ -802,7 +808,9 @@ fn followSharedSession(
         server.forgetFollowing(state, session_id);
         return false;
     };
-    if (session.server == state) return false;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    if (main_record.connection_id == state.connection_id) return false;
     if (requested_system_prompt) |text| switch (commitClientSystemPrompt(session, text)) {
         .unchanged, .applied => {},
         .save_failed => |err| {
@@ -818,7 +826,7 @@ fn followSharedSession(
     // Built before the join takes `session_write_mutex`: building takes `settings_mutex`, which comes first in the lock order.
     const answer = try buildSessionAnswer(state, alloc, session, session.workspace_root);
     defer alloc.free(answer);
-    try joinSession(state, alloc, msg, session, session_id, kind, answer);
+    try joinSession(state, alloc, msg, session, kind, answer);
     return true;
 }
 
@@ -840,7 +848,6 @@ fn joinSession(
     alloc: Allocator,
     msg: *jsonrpc.Message,
     session: *server.ActiveSessionState,
-    session_id: []const u8,
     kind: RestoreKind,
     answer: []const u8,
 ) !void {
@@ -850,20 +857,25 @@ fn joinSession(
     defer if (kind.replaysHistory()) session.session_write_mutex.unlock(io_mod.getIo());
     session.audience_mutex.lockUncancelable(io_mod.getIo());
     defer session.audience_mutex.unlock(io_mod.getIo());
+    // The joiner's record is made first: the replay writes through it while the audience lock is held.
+    try server.reserveMemberLocked(session, state.host.alloc);
+    try state.memberships.ensureUnusedCapacity(state.alloc, 1);
+    const joiner = try server.newMember(state.host.alloc, state);
+    errdefer joiner.destroy();
     if (kind.replaysHistory()) {
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
-        try sendActiveHistoryUpdates(state, session, alloc, &sources);
+        try sendActiveHistoryUpdates(joiner, session, alloc, &sources);
         // The running turn owns the history a title may be derived from, so only a saved title goes out here.
-        try sendSessionInfoUpdate(state, session, alloc, false);
-        try server.replayRunningCopy(state, alloc, session);
+        try sendSessionInfoUpdate(joiner, session, alloc, false);
+        try server.replayRunningCopy(joiner, alloc, session);
     }
-    const newly_following = try server.recordFollowing(state, session_id);
-    errdefer if (newly_following) server.forgetFollowing(state, session_id);
-    // The room is made before the answer goes out, so the listing after it cannot fail.
-    try server.reserveFollowerLocked(session, alloc);
     try state.writer.writeResponse(alloc, msg.id, answer);
-    server.listFollowerLocked(session, state);
+    if (!server.listMemberLocked(session, joiner)) {
+        joiner.destroy();
+        return;
+    }
+    server.addMembershipLocked(state, session, joiner);
 }
 
 fn handleRestoreSession(
@@ -958,7 +970,7 @@ fn handleRestoreSession(
         &mcp_configs,
         workspace_root,
         state.client_elicitation,
-        server.legacyUrlCompletionSink(state),
+        server.legacyUrlCompletionSink(try server.pendingMember(state)),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -983,7 +995,7 @@ fn handleRestoreSession(
     });
     {
         // Converting a v1 session can be slow; the client is told why (D61).
-        var notice: ConversionNotice = .{ .state = state, .alloc = alloc, .session_id = session_id };
+        var notice: ConversionNotice = .{ .state = try server.pendingMember(state), .alloc = alloc, .session_id = session_id };
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
@@ -1004,7 +1016,7 @@ fn handleRestoreSession(
         state.selected_model
     else
         durable.preferences.model;
-    var staged_credential = server.prepareCredentialForProvider(state, null, effective_provider) catch |err| {
+    var staged_credential = server.prepareCredentialForProvider(try server.pendingMember(state), null, effective_provider) catch |err| {
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -1086,9 +1098,13 @@ fn handleRestoreSession(
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
     if (kind.replaysHistory()) {
-        try sendActiveHistoryUpdates(state, session, alloc, &sources);
+        const main = server.holdMain(session);
+        defer main.drop();
+        try sendActiveHistoryUpdates(main, session, alloc, &sources);
     }
-    try sendSessionInfoUpdate(state, session, alloc, true);
+    const info_main = server.holdMain(session);
+    defer info_main.drop();
+    try sendSessionInfoUpdate(info_main, session, alloc, true);
 
     try writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
@@ -1116,7 +1132,9 @@ fn commitClientSystemPrompt(session: *server.ActiveSessionState, text: []const u
     session.session_write_mutex.lockUncancelable(io);
     defer session.session_write_mutex.unlock(io);
     if (std.mem.eql(u8, session.client_system_prompt, text)) return .unchanged;
-    const owner_alloc = session.server.alloc;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const owner_alloc = main_record.alloc;
     const owned = owner_alloc.dupe(u8, text) catch |err| return .{ .save_failed = err };
     if (session.v2) |v2| v2.setClientPrompt(text) catch |err| {
         owner_alloc.free(owned);
@@ -1153,6 +1171,8 @@ fn reuseOpenSession(
     observer_hooks: ?libfx_hooks.Config,
     requested_system_prompt: *?[]u8,
 ) !void {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
     const root = workspace_binding.resolveRoot(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -1214,7 +1234,7 @@ fn reuseOpenSession(
             mcp_configs,
             session.workspace_root,
             state.client_elicitation,
-            server.legacyUrlCompletionSink(state),
+            server.legacyUrlCompletionSink(main_record),
         );
         defer preparation.deinit(alloc);
         switch (preparation) {
@@ -1236,13 +1256,15 @@ fn reuseOpenSession(
     if (session.subagent_host == null) server.enableSubagentHost(session);
     if (kind.replaysHistory()) {
         // A turn may have started since the check above, so the replay checks again.
-        const replayed = try replayHistoryIfIdle(state, session, alloc, &sources);
+        const replayed = try replayHistoryIfIdle(session, alloc, &sources);
         if (!replayed) return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Prompt already in progress",
         });
     }
-    try sendSessionInfoUpdate(state, session, alloc, !server.sessionPromptRunning(session));
+    const info_main = server.holdMain(session);
+    defer info_main.drop();
+    try sendSessionInfoUpdate(info_main, session, alloc, !server.sessionPromptRunning(session));
     return writeLoadSessionResponse(state, alloc, msg, session, observer_hooks);
 }
 
@@ -1252,7 +1274,9 @@ fn setObserverHooks(session: *server.ActiveSessionState, observer_hooks: ?libfx_
     session.waiting_prompts.lock();
     defer session.waiting_prompts.unlock();
     // The session's subagents read them under the authority lock.
-    const state = session.server;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
     session.observer_hooks = observer_hooks;
@@ -1603,7 +1627,7 @@ test "a v2 storage fault reads as its cause, and other errors have no such messa
 /// A v2 store's notice that converting a v1 session is slow, sent to the
 /// client as the session's agent text, as fx's other notices are.
 const ConversionNotice = struct {
-    state: *server.ServerState,
+    state: *server.Member,
     alloc: Allocator,
     session_id: []const u8,
 
@@ -1836,20 +1860,23 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
 /// replay writes to the client under that hold, so a reader that waits for the lock
 /// also waits for the replay. Returns false, without replaying, when a turn holds the
 /// slot.
-fn replayHistoryIfIdle(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator, sources: *runtime_tool_presentation.ReplayedSavedOutputSources) !bool {
+fn replayHistoryIfIdle(session: *server.ActiveSessionState, alloc: Allocator, sources: *runtime_tool_presentation.ReplayedSavedOutputSources) !bool {
+    // The hold is taken before the line lock: the audience lock must not be taken under it.
+    const main = server.holdMain(session);
+    defer main.drop();
     if (session.v2 != null) {
-        try sendActiveHistoryUpdates(state, session, alloc, sources);
+        try sendActiveHistoryUpdates(main, session, alloc, sources);
         return true;
     }
     session.waiting_prompts.lock();
     defer session.waiting_prompts.unlock();
     if (session.prompt != null) return false;
-    try sendActiveHistoryUpdates(state, session, alloc, sources);
+    try sendActiveHistoryUpdates(main, session, alloc, sources);
     return true;
 }
 
 fn sendActiveHistoryUpdates(
-    state: *server.ServerState,
+    state: *server.Member,
     active: *server.ActiveSessionState,
     alloc: Allocator,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
@@ -1857,7 +1884,7 @@ fn sendActiveHistoryUpdates(
     // Every saved turn, not only those in memory.
     if (active.v2) |v2| {
         const Visitor = struct {
-            state: *server.ServerState,
+            state: *server.Member,
             session: *server.ActiveSessionState,
             alloc: Allocator,
             sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
@@ -1917,7 +1944,7 @@ test "a replayed message takes its turn and place as its id" {
 }
 
 fn sendHistoryTurnAsUpdates(
-    state: *server.ServerState,
+    state: *server.Member,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
@@ -1955,7 +1982,7 @@ fn sendHistoryTurnAsUpdates(
 }
 
 fn sendUserHistoryTurn(
-    state: *server.ServerState,
+    state: *server.Member,
     alloc: Allocator,
     session_id: []const u8,
     ids: *ReplayIds,
@@ -2011,7 +2038,7 @@ fn sendUserHistoryTurn(
 }
 
 fn sendUserHistoryChunk(
-    state: *server.ServerState,
+    state: *server.Member,
     alloc: Allocator,
     session_id: []const u8,
     message_id: []const u8,
@@ -2032,7 +2059,7 @@ fn sendUserHistoryChunk(
 }
 
 fn sendExecutionHistory(
-    state: *server.ServerState,
+    state: *server.Member,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
@@ -2267,7 +2294,7 @@ fn appendSteeringReplay(
 }
 
 fn sendHistoryToolCall(
-    state: *server.ServerState,
+    state: *server.Member,
     alloc: Allocator,
     session_id: []const u8,
     call: ReplayToolCall,
@@ -2293,7 +2320,7 @@ fn sendHistoryToolCall(
 
 /// Replays absorbed steering. The original request ID is not persisted, so the
 /// frame carries a null `requestId`.
-fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
+fn sendSteeringHistoryChunk(state: *server.Member, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
@@ -2314,7 +2341,7 @@ fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, sessio
 /// A saved compaction, replayed in its place as one `completed` update with
 /// the id it had live, for a client that lists ACP's `session.compaction`
 /// (`src/protocol/spec/sh-fx.md` "Turn events").
-fn sendCompactionHistory(state: *server.ServerState, alloc: Allocator, session_id: []const u8, number: usize) !void {
+fn sendCompactionHistory(state: *server.Member, alloc: Allocator, session_id: []const u8, number: usize) !void {
     if (!state.client_compaction) return;
     var id: [32]u8 = undefined;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2327,7 +2354,7 @@ fn sendCompactionHistory(state: *server.ServerState, alloc: Allocator, session_i
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
-fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
+fn sendAgentHistoryChunk(state: *server.Member, alloc: Allocator, session_id: []const u8, ids: *ReplayIds, text: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"sessionId\":");
@@ -2391,7 +2418,7 @@ fn sessionInfoUpdate(alloc: Allocator, active: *server.ActiveSessionState, owns_
 
 /// Sends `active`'s title and time to the connection that loads it, `state`,
 /// and only to it. `session/load` and `session/resume` use this.
-pub fn sendSessionInfoUpdate(state: *server.ServerState, active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
+pub fn sendSessionInfoUpdate(state: *server.Member, active: *server.ActiveSessionState, alloc: Allocator, owns_history: bool) !void {
     const json = (try sessionInfoUpdate(alloc, active, owns_history)) orelse return;
     defer alloc.free(json);
     try state.writer.writeNotification(alloc, "session/update", json);
@@ -2410,7 +2437,7 @@ pub fn sendTurnSessionInfoUpdate(active: *server.ActiveSessionState, alloc: Allo
 /// `owner`'s catalog, or null when it reports none. The caller frees the bytes.
 fn sessionUsageUpdate(
     alloc: Allocator,
-    owner: *server.ServerState,
+    owner: *server.Member,
     active: *server.ActiveSessionState,
     model: []const u8,
     provider: model_provider.ProviderId,
@@ -2448,7 +2475,9 @@ pub fn sendTurnSessionUsageUpdate(
     provider: model_provider.ProviderId,
     alloc: Allocator,
 ) !void {
-    const json = (try sessionUsageUpdate(alloc, active.server, active, model, provider)) orelse return;
+    const main_record = server.holdMain(active);
+    defer main_record.drop();
+    const json = (try sessionUsageUpdate(alloc, main_record, active, model, provider)) orelse return;
     defer alloc.free(json);
     try sendToAudience(active, alloc, json);
 }
@@ -2876,7 +2905,7 @@ test "ACP load of the active session keeps its subagent host and the session it 
         try request.handler(&state, arena, &msg);
 
         // The session, its host, its children, and the log they append to are the ones that were there.
-        try std.testing.expectEqual(@as(usize, 1), state.sessions.items.len);
+        try std.testing.expectEqual(@as(usize, 1), server.sessionCount(&state));
         try std.testing.expect(server.firstSession(&state).? == active);
         try std.testing.expect(active.subagent_host.? == subagents);
         try std.testing.expect(active.subagent_v2_children.? == children);
@@ -3257,7 +3286,7 @@ test "execution replay plan interleaves assistant text and orphan results" {
 fn testReplaySession(state: *server.ServerState, session_id: []const u8) server.ActiveSessionState {
     var session: server.ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, server.forwardToMain);
-    session.server = state;
+    server.attachOpenerForTest(&session, state) catch unreachable;
     session.session_id = @constCast(session_id);
     session.workspace = &state.launch;
     session.workspace_root = state.launch.root;
@@ -3271,7 +3300,7 @@ fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id:
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
     var session = testReplaySession(state, session_id);
-    return sendHistoryTurnAsUpdates(state, &session, alloc, &sources, turn, null);
+    return sendHistoryTurnAsUpdates(try server.pendingMember(state), &session, alloc, &sources, turn, null);
 }
 
 test "execution replay titles reads with the call whose saved output they read" {
@@ -3364,12 +3393,12 @@ test "ACP load titles a read with the call from an earlier turn" {
     var replay_session = testReplaySession(&state, "session-1");
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(arena);
-    try sendHistoryTurnAsUpdates(&state, &replay_session, arena, &sources, .{ .assistant = .{
+    try sendHistoryTurnAsUpdates(try server.pendingMember(&state), &replay_session, arena, &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("run the tests") },
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = run_steps[0..] },
     } }, null);
-    try sendHistoryTurnAsUpdates(&state, &replay_session, arena, &sources, .{ .assistant = .{
+    try sendHistoryTurnAsUpdates(try server.pendingMember(&state), &replay_session, arena, &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("find the failure") },
         .assistant = @constCast("found it"),
         .execution = .{ .tool_steps = read_steps[0..] },
@@ -3919,12 +3948,12 @@ test "a switch away from a session drops the reports its host queued and closes 
     try std.testing.expectEqual(@as(usize, 0), session.worker.queuedPromptCount());
     try std.testing.expectEqual(@as(usize, 0), session.report_calls.items.len);
     // The session stays until it closes.
-    try std.testing.expectEqual(@as(usize, 1), state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount(&state));
     // With no host left, a second call has nothing to do.
     server.stopSubagentsForSwitch(session);
     try std.testing.expect(session.subagent_host == null);
     server.closeSession(&state, session);
-    try std.testing.expectEqual(@as(usize, 0), state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount(&state));
 }
 
 test "a reload under another cwd is refused and keeps the queue, and a libfx/new drops what the host it replaces queued" {
@@ -3984,7 +4013,7 @@ test "a reload under another cwd is refused and keeps the queue, and a libfx/new
         .params_raw = reload_params.writer.buffered(),
     };
     try handleLoadSession(&state, arena, &reload_msg);
-    try std.testing.expectEqual(@as(usize, 1), state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount(&state));
     try std.testing.expect(server.firstSession(&state).? == session);
     try std.testing.expect(session.subagent_host.? == subagents);
     try std.testing.expectEqual(@as(usize, 3), session.worker.queuedPromptCount());
@@ -4007,7 +4036,7 @@ test "a reload under another cwd is refused and keeps the queue, and a libfx/new
         .params_raw = "{}",
     };
     try handleNewLibfxSession(&state, arena, &libfx_msg);
-    try std.testing.expectEqual(@as(usize, 1), state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount(&state));
     const next = server.firstSession(&state).?;
     try std.testing.expectEqual(@as(usize, 0), next.worker.queuedPromptCount());
     try std.testing.expectEqual(@as(usize, 0), next.report_calls.items.len);
@@ -4217,7 +4246,7 @@ test "a follower's session/close detaches it, the session stays open for its own
         .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
     };
     try handleLoadSession(&joiner, alloc, &load_msg);
-    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.followerCountForTest(session));
 
     var close_msg = jsonrpc.Message{
         .id = .{ .integer = 4 },
@@ -4225,8 +4254,8 @@ test "a follower's session/close detaches it, the session stays open for its own
         .params_raw = "{\"sessionId\":\"session_joined\"}",
     };
     try server.handleCloseSession(&joiner, alloc, &close_msg);
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
-    try std.testing.expectEqual(@as(usize, 0), joiner.following.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
+    try std.testing.expectEqual(@as(usize, 0), server.followingCountForTest(&joiner));
 
     // The owner's session is still open, and the owner gets the next update alone.
     try std.testing.expect(server.findSession(&owner, "session_joined") != null);
@@ -4254,11 +4283,11 @@ test "a follower connection that ends detaches from the session it followed" {
         .params_raw = "{\"sessionId\":\"session_joined\",\"mcpServers\":[]}",
     };
     try handleLoadSession(&joiner, alloc, &load_msg);
-    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.followerCountForTest(session));
 
     // The connection ends: its deinit leaves the session before anything it owns is freed.
     joiner.deinit();
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
 
     try deliverOwnerThought(alloc, session, "after end");
     try expectOccurrences(owner_frames.bytes.items, "after end", 1);
@@ -4427,8 +4456,8 @@ test "a repeat session/load of a followed session replays again and adds no seco
     };
     try handleLoadSession(&joiner, alloc, &repeat_msg);
 
-    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), joiner.following.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.followerCountForTest(session));
+    try std.testing.expectEqual(@as(usize, 1), server.followingCountForTest(&joiner));
     try expectOccurrences(joiner_frames.bytes.items, "question one", 2 * once);
     try expectOccurrences(joiner_frames.bytes.items, "thought before join", 2);
     try expectOccurrences(joiner_frames.bytes.items, "\"sh.fx/cwd\"", 2);
@@ -4491,7 +4520,7 @@ test "a follower's set_mode and set_config_option get -32600, and the owner's se
     try std.testing.expectEqual(owner_bytes_before, owner_frames.bytes.items.len);
     try std.testing.expectEqualStrings(mode_before, session.mode);
     try std.testing.expect(session.prompt == null);
-    try std.testing.expectEqual(@as(usize, 1), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server.followerCountForTest(session));
 }
 
 test "a client that joins while a prompt's turn runs gets the prompt once, in the replay" {
