@@ -275,6 +275,12 @@ pub const ToolLifecycleEvent = union(enum) {
         /// src/core/agent/runtime/tool_presentation.zig). Only the
         /// transcript's compact rows read it.
         check_found_command_ended: bool = false,
+        /// The file an edit or write changed, as core resolved it: its
+        /// absolute path, the same for every way the call named the file
+        /// (`finishCommittedFileStatus` in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        changed_path: ?[]const u8 = null,
     },
     turn_finished: TurnFinished,
 };

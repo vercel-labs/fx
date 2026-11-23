@@ -1915,6 +1915,9 @@ pub fn finishCommittedFileStatus(
     status_started: bool,
     display_target: ?[]const u8,
     preview: diff.FileChangePreview,
+    /// The file the change wrote, resolved: `CommittedFileHandoff`'s
+    /// tracker path.
+    changed_path: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
@@ -1939,8 +1942,31 @@ pub fn finishCommittedFileStatus(
                 .kind = .completed,
                 .summary = line,
             },
+            .changed_path = changed_path,
         },
     });
+}
+
+test "a committed file change tells the transcript the file core resolved" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{ .id = "edit", .name = "edit_file", .arguments_json = "{\"path\":\"./tsec/x.tse\"}" };
+    try finishCommittedFileStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{
+        .path = "./tsec/x.tse",
+        .lines = &.{},
+        .additions = 1,
+        .deletions = 2,
+        .truncated = false,
+    }, "/w/tsec/x.tse", &.{});
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", terminal.changed_path.?);
+    // What Ctrl+O, ACP, and `fx ask` show of the call does not change.
+    try std.testing.expect(terminal.result == null);
+    try std.testing.expect(std.mem.startsWith(u8, terminal.outcome.summary, "started edit_file"));
 }
 
 fn renderedSubagentSummary(

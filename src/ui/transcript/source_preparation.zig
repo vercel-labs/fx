@@ -1603,6 +1603,7 @@ fn buildCompactTranscriptProjectionInterruptible(
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
             .failure_style = ui_render.failure_style,
+            .file_root = if (@hasField(@TypeOf(self.*), "file_link_root")) self.file_link_root else null,
         },
         self.command_output_render.styles,
         checkpoint,

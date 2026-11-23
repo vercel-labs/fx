@@ -1169,6 +1169,8 @@ test("generated lifecycle wrapper uses POSIX sh syntax", () => {
 function normalizedPaneText(pane: string): string {
   return pane
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    // The links file names carry.
+    .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }

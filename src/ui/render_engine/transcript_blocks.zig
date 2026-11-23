@@ -84,6 +84,12 @@ pub const ToolDetailRecord = struct {
     /// which its status (`Observed`) does not say when the command passed
     /// (`checkFoundCommandEnded` in src/core/agent/runtime/tool_presentation.zig).
     check_found_command_ended: bool = false,
+    /// The file an edit or write changed, as core resolved it, the same for
+    /// every way the call named the file: live, its absolute path from the
+    /// terminal event; on resume, the path its saved result names, in the
+    /// project or absolute outside it. Only the compact rows read it, to
+    /// join a file's changes and to link to it.
+    changed_path: ?[]u8 = null,
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
@@ -105,6 +111,7 @@ pub const ToolDetailRecord = struct {
         if (self.command_output_replay) |replay| {
             types.freeCommandOutputReplay(alloc, replay);
         }
+        if (self.changed_path) |value| alloc.free(value);
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
         self.* = undefined;
     }

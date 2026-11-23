@@ -3,7 +3,7 @@
 // repeat one task, a reason line under a failed call, and a recap on the turn
 // summary.
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
@@ -247,11 +247,12 @@ function treeRows(block: string[]): string[] {
 test.skipIf(!tmuxAvailable())(
   "a failing build tells its story in the default view and after resume",
   async () => {
-    const { root, gateway, session, pane } = await runStory(FAILING_BUILD, {
+    const { root, gateway, session } = await runStory(FAILING_BUILD, {
       prompt: "the desktop build is broken, can you fix it?",
       finalText: "Fixed the build.",
     });
-    const lines = paneLines(pane);
+    // The turn's recap shows just after its last words.
+    const lines = paneLines(await session.waitForText(/^ {2}1 file changed \+1 -1 · ran 4 commands · /m, TIMEOUT));
 
     const checks = group(lines, "● Ran commands ✗");
     // The two passing checks share a row by their step; the failure keeps
@@ -290,6 +291,121 @@ test.skipIf(!tmuxAvailable())(
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
     expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
     expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
+  },
+  TIMEOUT * 3,
+);
+
+/** Every saved session log under `home`. */
+function savedSessionLogs(home: string): string[] {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  return readdirSync(sessions).map((id) => join(sessions, id, "log.jsonl")).filter((log) => existsSync(log));
+}
+
+/** A file URL's path as fx writes one: each byte but [A-Za-z0-9/._~-] percent-encoded. */
+function fileUrlPath(path: string): string {
+  return [...Buffer.from(path)]
+    .map((byte) => /[A-Za-z0-9/._~-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`)
+    .join("");
+}
+
+/**
+ * The file URL path of the last link fx wrote around `name`, read from the
+ * bytes it recorded to `tape`, or undefined when it wrote none. A running
+ * row can link a name to the path its call named before the call ends.
+ */
+function lastLinkTarget(tape: string, name: string): string | undefined {
+  const bytes = readFileSync(tape).toString("latin1");
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // The name, then any style resets, then the link's close.
+  const link = new RegExp(`\\x1b\\]8;;file://([^\\x1b]*)\\x1b\\\\${escaped}(?:\\x1b\\[[0-9;]*m)*\\x1b\\]8;;\\x1b\\\\`, "g");
+  return [...bytes.matchAll(link)].at(-1)?.[1];
+}
+
+async function resumeStory(root: StoryRoot, gateway: { baseUrl: string; chatUrl: string }, finalText: string, tape?: string) {
+  const env = tape ? { ...storyEnv(root, gateway), FX_RECORD: tape } : storyEnv(root, gateway);
+  const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env, width: 110, height: 60 });
+  sessions.push(resumed);
+  await resumed.waitForText(finalText, TIMEOUT);
+  await resumed.waitForComposer(TIMEOUT);
+  return { resumed, lines: paneLines(await resumed.waitForText(/^ {2}\d+ files? changed /m, TIMEOUT)) };
+}
+
+test.skipIf(!tmuxAvailable())(
+  "edits of one file named in several ways share one row, and file names link to their files, also after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const main = join(root.workspace, "desktop", "src", "main.ts");
+    // A folder outside the workspace and a symlink to it, as /tmp is to
+    // /private/tmp on macOS.
+    mkdirSync(join(root.root, "real"));
+    writeFileSync(join(root.root, "real", "notes.md"), "a\nb\n");
+    symlinkSync(join(root.root, "real"), join(root.root, "link"));
+    const notes = realpathSync(join(root.root, "real", "notes.md"));
+    const edit = (path: string, from: string, to: string) => ({ name: "edit_file", input: { path, old_string: from, new_string: to } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will tidy main.ts.", calls: [edit("desktop/src/main.ts", "const url", "const appUrl")] },
+      { at: 1, calls: [edit("./desktop/src/main.ts", "createTray()", "createTray({})")] },
+      { at: 2, calls: [edit(main, "return win;", "return win ?? null;")] },
+      { at: 3, calls: [edit(join(root.root, "link", "notes.md"), "a", "A")] },
+      { at: 4, calls: [edit(notes, "b", "B")] },
+      { at: 5, calls: [{ name: "read_file", input: { path: "desktop/src/window.ts" } }] },
+      { at: 6, text: "Tidied main.ts." },
+    ];
+    const gateway = startStoryGateway(steps);
+    gateways.push(gateway);
+    const tape = join(root.root, "live.fxtape");
+    const session = await TmuxSession.create({ cwd: root.workspace, env: { ...storyEnv(root, gateway), FX_RECORD: tape }, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("tidy main.ts");
+    await session.waitForText("Tidied main.ts.", TIMEOUT);
+    await session.waitForComposer(TIMEOUT);
+    const lines = paneLines(await session.waitForText(/^ {2}2 files changed /m, TIMEOUT));
+
+    // Each file's ways of naming it are one file: one row and one count.
+    const story = group(lines, /^● Edited /);
+    expect(treeRows(story)).toEqual(["├ Edited main.ts +3/-3 · 3 edits", "├ Edited notes.md +2/-2 · 2 edits", "└ Read window.ts"]);
+    expect(lines.some((line) => /^ {2}2 files changed \+5 -5 · /.test(line))).toBe(true);
+    // Each name links to its file, so Cmd+click opens it: a relative path in
+    // the workspace, and a symlinked one where it resolves.
+    const targets = { "main.ts": fileUrlPath(main), "notes.md": fileUrlPath(notes), "window.ts": fileUrlPath(join(root.workspace, "desktop", "src", "window.ts")) };
+    for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(tape, name)).toBe(target);
+    // What the model gets and what the session saves stay as they were.
+    for (const request of gateway.requests) expect(request.body).not.toContain("changed_path");
+    expect(gateway.requests.at(-1)!.body).toContain("edited desktop/src/main.ts (");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Tidied main.ts.", resumedTape);
+    expect(group(resumedLines, /^● Edited /)).toEqual(story);
+    for (const [name, target] of Object.entries(targets)) expect(lastLinkTarget(resumedTape, name)).toBe(target);
+    for (const log of savedSessionLogs(root.home)) expect(readFileSync(log, "utf8")).not.toContain("changed_path");
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "edits run through toolbox keep their counts after resume",
+  async () => {
+    const run = (from: string, to: string) => ({ name: "toolbox", input: { run: "edit_file", arguments: { path: "desktop/src/main.ts", old_string: from, new_string: to } } });
+    const steps: StoryStep[] = [
+      { at: 0, text: "I will tidy main.ts through toolbox.", calls: [run("const url", "const appUrl")] },
+      { at: 1, calls: [run("return win;", "return win ?? null;")] },
+      { at: 2, text: "Tidied main.ts." },
+    ];
+    const { root, gateway, session } = await runStory(steps, { prompt: "tidy main.ts", finalText: "Tidied main.ts." });
+    const lines = paneLines(await session.waitForText(/^ {2}1 file changed /m, TIMEOUT));
+    const row = lines.find((line) => line.startsWith("● Edited main.ts"));
+    expect(row).toBe("● Edited main.ts +2/-2 · 2 edits");
+    expect(lines.some((line) => /^ {2}1 file changed \+2 -2 · /.test(line))).toBe(true);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const { lines: resumedLines } = await resumeStory(root, gateway, "Tidied main.ts.");
+    expect(resumedLines.find((line) => line.startsWith("● Edited main.ts"))).toBe(row);
+    expect(resumedLines.some((line) => /^ {2}1 file changed \+2 -2 · /.test(line))).toBe(true);
   },
   TIMEOUT * 3,
 );

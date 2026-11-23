@@ -5,6 +5,7 @@ const transcript_window_shell = @import("transcript_window_shell.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const agent_tool_presentation = @import("../../core/agent/runtime/tool_presentation.zig");
+const file_mutation_execution = @import("../../core/tooling/file_mutation_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -3244,6 +3245,50 @@ test "a subagent message's start mark reaches its detail live and on resume" {
     try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
 }
 
+test "an edit's changed file reaches its detail live and on resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"path\":\"/w/tsec/x.tse\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const call: types.ToolCall = .{ .id = "resumed-edit", .name = "edit_file", .arguments_json = arguments };
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    const saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("resumed-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited tsec/x.tse (2 bytes)"),
+        .output_bytes = 27,
+        .stored_output_bytes = 27,
+        .committed_file_presentation = .{ .path = "/w/tsec/x.tse", .kind = .edited, .lines = &.{}, .additions = 1, .deletions = 1, .truncated = false },
+    };
+    try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .edit, saved);
+    try std.testing.expectEqualStrings("tsec/x.tse", runtime.toolDetailForEntry(entry_id).?.changed_path.?);
+    // A saved result with no file change kept has none.
+    var bare = saved;
+    bare.committed_file_presentation = null;
+    const bare_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, bare_id, call, .edit, bare);
+    try std.testing.expect(runtime.toolDetailForEntry(bare_id).?.changed_path == null);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-edit" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "edit_file",
+        .activity_kind = .edit,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.changed_path == null);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Edited /w/tsec/x.tse +1 / -1" },
+        .changed_path = "/w/tsec/x.tse",
+    } });
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.changed_path.?);
+}
+
 test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -4922,6 +4967,7 @@ const transcript_screen_fields = [_][:0]const u8{
     "transcript_archive_boundary",
     "transcript_archive_land_index",
     "collapse_tool_calls",
+    "file_link_root",
     "painting",
     "footer_viewport",
     "extra_input_rows",
@@ -5103,6 +5149,10 @@ pub const TranscriptRuntime = struct {
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
+    /// The folder the session's tools resolve a relative path in, which a
+    /// compact row's file link takes a relative path from. The app owns it
+    /// and keeps it while the transcript lives; null when it has none.
+    file_link_root: ?[]const u8 = null,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -5359,6 +5409,7 @@ pub const TranscriptRuntime = struct {
         self.replaceable_row = source.replaceable_row;
         self.command_output_render = source.command_output_render;
         self.collapse_tool_calls = source.collapse_tool_calls;
+        self.file_link_root = source.file_link_root;
         self.full_transcript = source.full_transcript;
         self.transcript_band_dirty = source.transcript_band_dirty;
     }
@@ -5516,6 +5567,7 @@ pub const TranscriptRuntime = struct {
                 terminal.result_memory,
                 terminal.command_artifact_handle,
                 terminal.check_found_command_ended,
+                terminal.changed_path,
             ),
             .turn_finished => |finished| self.applyTurnFinishedLifecycle(
                 alloc,
@@ -6200,6 +6252,7 @@ pub const TranscriptRuntime = struct {
         result_memory: ?types.ToolResultMemory,
         command_artifact_handle: ?[]const u8,
         check_found_command_ended: bool,
+        changed_path: ?[]const u8,
     ) !?types.ToolActivityKind {
         const record = self.notebook.lifecycle_state.recordPtr(id) orelse {
             if (self.notebook.lifecycle_state.isFenced(id.turn_id)) {
@@ -6245,6 +6298,8 @@ pub const TranscriptRuntime = struct {
             @as(u32, @intFromBool(append_turn_cancellation)),
         );
         defer detail_update.deinit(alloc);
+        var owned_changed_path = if (changed_path) |path| try alloc.dupe(u8, path) else null;
+        defer if (owned_changed_path) |path| alloc.free(path);
         if (!try transcript_store.replacePinnedToolStatusForTerminalAtomic(
             self,
             alloc,
@@ -6279,7 +6334,14 @@ pub const TranscriptRuntime = struct {
             outcome.kind,
             &detail_update,
         );
-        if (self.toolDetailPtr(record.entry_id)) |detail| detail.check_found_command_ended = check_found_command_ended;
+        if (self.toolDetailPtr(record.entry_id)) |detail| {
+            detail.check_found_command_ended = check_found_command_ended;
+            if (owned_changed_path) |path| {
+                if (detail.changed_path) |old| alloc.free(old);
+                detail.changed_path = path;
+                owned_changed_path = null;
+            }
+        }
         return null;
     }
 
@@ -6688,6 +6750,15 @@ pub const TranscriptRuntime = struct {
             detail.created_at_ms = result.created_at_ms;
             detail.origin = .recorded;
             detail.check_found_command_ended = check_found_command_ended;
+            // The saved change keeps the path as the call named it; its
+            // result names the file core resolved, as live.
+            if (result.status == .success and result.committed_file_presentation != null) {
+                const saved = if (result.output.len > 0) result.output else result.preview orelse "";
+                if (file_mutation_execution.changedPathOfResult(saved)) |path| {
+                    if (detail.changed_path) |old| alloc.free(old);
+                    detail.changed_path = try alloc.dupe(u8, path);
+                }
+            }
         }
     }
 
