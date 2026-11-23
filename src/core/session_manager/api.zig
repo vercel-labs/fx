@@ -24,6 +24,11 @@ const log_mod = @import("log.zig");
 const session_mod = @import("session.zig");
 const catalog_mod = @import("catalog.zig");
 const diag = @import("diag.zig");
+const prune_mod = @import("prune.zig");
+
+/// The folder and file that hold a cleanup's kept original.
+pub const prune_kept_dir_name = prune_mod.kept_dir_name;
+pub const prune_log_name = prune_mod.log_name;
 
 pub const Role = schema.Role;
 pub const Host = schema.Host;
@@ -533,6 +538,48 @@ pub const Manager = struct {
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
             else => |io_err| storage.ioFault(io_err),
         };
+    }
+
+    pub const PruneError = prune_mod.Error || storage.IoFault || error{ InvalidArgument, NotFound };
+
+    /// The folder of root session `id`, which the caller closes. Missing is NotFound.
+    fn sessionFolder(m: *Manager, id: []const u8) PruneError!storage.Dir {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return m.env.s.openDir(m.env.root, id);
+    }
+
+    /// Cleanup of one session's log: `prune.zig`. Busy while another fx has the session open.
+    pub fn prune(m: *Manager, id: []const u8, options: prune_mod.Options) PruneError!prune_mod.Report {
+        const dir = try m.sessionFolder(id);
+        defer m.env.s.closeDir(dir);
+        return prune_mod.prune(m.gpa, m.env.s, dir, options);
+    }
+
+    /// What a cleanup left in the session's folder, read without the lock.
+    pub fn pruneStatus(m: *Manager, id: []const u8) PruneError!prune_mod.Status {
+        const dir = try m.sessionFolder(id);
+        defer m.env.s.closeDir(dir);
+        return prune_mod.status(m.gpa, m.env.s, dir);
+    }
+
+    /// Puts the kept original back as the log, with every turn written since.
+    pub fn restore(m: *Manager, id: []const u8) PruneError!prune_mod.RestoreReport {
+        const dir = try m.sessionFolder(id);
+        defer m.env.s.closeDir(dir);
+        return prune_mod.restore(m.gpa, m.env.s, dir);
+    }
+
+    /// Deletes the kept original of a finished cleanup; returns the bytes freed.
+    pub fn discardOriginal(m: *Manager, id: []const u8) PruneError!u64 {
+        const dir = try m.sessionFolder(id);
+        defer m.env.s.closeDir(dir);
+        return prune_mod.discard(m.gpa, m.env.s, dir);
+    }
+
+    /// The absolute path of a session's kept original, as the store names it.
+    pub fn keptOriginalPath(m: *Manager, gpa: std.mem.Allocator, id: []const u8) ![]u8 {
+        return std.Io.Dir.path.join(gpa, &.{ m.root_path, id, prune_mod.kept_dir_name, prune_mod.log_name });
     }
 
     /// Doctor: re-derives the index and sweeps leftovers.
@@ -2313,4 +2360,5 @@ const api_tests = struct {
 
 test {
     _ = api_tests;
+    _ = @import("prune.zig");
 }

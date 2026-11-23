@@ -1,0 +1,8 @@
+flowchart TD
+  A["flock the session's lock file<br/>busy: exit 1, nothing written"] --> B["verify the log and plan:<br/>superseded usage and snapshots"]
+  B --> C["write log.jsonl.pruning: placeholders keep seq and ts,<br/>newest valid snapshot gets its offset; fsync"]
+  C --> D["replay check on the new file:<br/>fold, item stream, stateAt, snapshots"]
+  D -->|mismatch| X["delete the temp file, exit 1, log unchanged"]
+  D -->|match| E["hard link log.jsonl to pruned/log.jsonl; fsync dir"]
+  E --> F["rename log.jsonl.pruning over log.jsonl; fsync dir"]
+  F --> G["unlock; print sizes only"]

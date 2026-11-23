@@ -38,6 +38,11 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
+
+/// Names the prune actions need, re-exported so their callers import only this file.
+pub const ListCursor = sm.ListCursor;
+pub const prune_kept_dir_name = sm.prune_kept_dir_name;
+pub const prune_log_name = sm.prune_log_name;
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
 /// The session manager's rule for a session id, for code that may not
@@ -476,6 +481,8 @@ pub const CommandError = error{
     UnsupportedSessionSchema,
     SessionRecoveryBoundaryInvalid,
     SessionRecoveryNotNeeded,
+    SessionNotPruned,
+    SessionReplayMismatch,
     SessionStoreUnavailable,
     DurablePathUnsafe,
     HomeNotSet,
@@ -499,6 +506,10 @@ pub fn commandError(err: anyerror) CommandError {
         error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
         error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
         error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
+        // `prune`'s cleanup has no finished cleanup to restore or discard, or
+        // its staged log did not match the one it replaces.
+        error.NotPruned => error.SessionNotPruned,
+        error.ReplayMismatch => error.SessionReplayMismatch,
         // A v1 file others can write, say: unsafe, not damaged.
         error.DurablePathUnsafe, error.SessionPathUnsafe, error.PrivateStatePermissionsUnsupported => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
