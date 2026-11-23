@@ -525,6 +525,10 @@ const App = struct {
         return self.providerSet().select(provider).model_catalog;
     }
 
+    pub fn providerCredits(self: *const Self, provider: model_provider.ProviderId) ?gateway_provider.CreditsProvider {
+        return self.providerSet().select(provider).credits;
+    }
+
     pub fn cooperativeTransportPulse(self: *Self, agent: *agents.Agent) !void {
         if (comptime !host_target.is_wasm) return;
         if (try event_loop.pump_ready_input(

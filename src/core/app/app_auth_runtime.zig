@@ -18,6 +18,7 @@ const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_check = @import("token_pass_check.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -80,11 +81,14 @@ const TeamCatalogValidation = union(enum) {
     rejected,
     /// fx could not connect to load the team's catalog.
     catalog_unreachable,
-    accepted: ?[]u8,
+    accepted: struct {
+        model: ?[]u8 = null,
+        has_token_pass_marks: bool = false,
+    },
 
     fn deinit(self: *TeamCatalogValidation, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .accepted => |model| if (model) |owned| alloc.free(owned),
+            .accepted => |accepted| if (accepted.model) |owned| alloc.free(owned),
             .rejected, .catalog_unreachable => {},
         }
         self.* = undefined;
@@ -1712,6 +1716,12 @@ pub fn Runtime(comptime App: type) type {
                     .intent = .{ .team = .{ .index = index, .activate_gateway = provider_runtime.providerOf(app, agent) != .gateway } },
                     .preferred_model = io_mod.getenv("FX_MODEL") orelse settings.models.get(.gateway),
                     .catalog_provider = catalog_provider,
+                    .credits_provider = if (comptime @hasDecl(App, "providerCredits"))
+                        app.providerCredits(.gateway)
+                    else if (comptime @hasDecl(App, "creditsProvider"))
+                        app.creditsProvider()
+                    else
+                        null,
                     .models_path = app.model_cache.models_path,
                     .candidate = candidate,
                 });
@@ -1719,7 +1729,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var validation = try validateTeamCredential(app, candidate);
                 defer validation.deinit(app.alloc);
-                return finishTeamChoice(app, agent, index, validation, null);
+                return finishTeamChoice(app, agent, index, validation, null, false);
             }
         }
 
@@ -1740,10 +1750,17 @@ pub fn Runtime(comptime App: type) type {
             }
             var validation: TeamCatalogValidation = if (task.catalog) |catalog| try validateTeamCatalog(app, catalog) else .rejected;
             defer validation.deinit(app.alloc);
-            return finishTeamChoice(app, agent, request.index, validation, if (request.activate_gateway) task else null);
+            return finishTeamChoice(app, agent, request.index, validation, task, request.activate_gateway);
         }
 
-        fn finishTeamChoice(app: *App, agent: *AppAgent, index: usize, validation: TeamCatalogValidation, activation: ?*auth_runtime.ProviderPreparation) !bool {
+        fn finishTeamChoice(
+            app: *App,
+            agent: *AppAgent,
+            index: usize,
+            validation: TeamCatalogValidation,
+            prepared: ?*auth_runtime.ProviderPreparation,
+            activate_gateway: bool,
+        ) !bool {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
@@ -1783,20 +1800,34 @@ pub fn Runtime(comptime App: type) type {
             };
             defer selected_team.deinit(app.alloc);
 
+            const catalog_has_marks = validation.accepted.has_token_pass_marks;
+            const credits_snapshot = if (prepared) |task| task.credits else null;
+            const credits_answer = if (credits_snapshot) |snapshot| token_pass_check.answerOf(snapshot) else null;
+            const remaining = if (credits_snapshot) |snapshot|
+                if (snapshot.token_pass) |credit| credit.remaining else null
+            else
+                null;
+            const team_notice = token_pass.resolveTeamNotice(credits_answer, remaining, catalog_has_marks);
+            const detail = try token_pass.formatTeamNotice(app.alloc, team_notice, .osc8);
+            defer if (detail) |line| app.alloc.free(line);
+
             if (comptime provider_runtime.supported(App) and @hasDecl(App, "providerCatalog") and @hasDecl(@TypeOf(app.auth), "beginProviderPreparation")) {
-                if (activation) |task| {
-                    task.input.intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } };
-                    if (!try finishProviderSwitch(app, agent, task)) return false;
-                    rememberCredentialSource(app, .fx_login);
-                    app.auth.closePicker(app.alloc);
-                    try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body, .detail = tokenPassOffer(app) }, true);
-                    return true;
+                if (activate_gateway) {
+                    if (prepared) |task| {
+                        task.input.intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } };
+                        if (!try finishProviderSwitch(app, agent, task)) return false;
+                        rememberCredentialSource(app, .fx_login);
+                        app.auth.closePicker(app.alloc);
+                        try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = body, .detail = detail orelse "" }, true);
+                        try token_pass_check.Runtime(App).adoptPrepared(app, credits_answer, catalog_has_marks);
+                        return true;
+                    }
                 }
             }
 
             var model_persistence_failed = false;
             if (comptime provider_runtime.supported(App)) {
-                if (validation.accepted) |selected_model| {
+                if (validation.accepted.model) |selected_model| {
                     try provider_runtime.replaceModel(app, selected_model);
                     if (comptime @hasDecl(App, "persistRuntimePreferences")) {
                         var persistence = app.persistRuntimePreferences(agent, .{
@@ -1829,6 +1860,17 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return false;
             }
+            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "adoptOwnedCatalog") and @hasDecl(@TypeOf(app.auth), "modelCatalogAccess")) {
+                if (prepared) |task| {
+                    if (task.catalog) |*fetched| switch (fetched.*) {
+                        .catalog => |*catalog| {
+                            app.model_cache.adoptOwnedCatalog(app.auth.modelCatalogAccess(), catalog);
+                            task.catalog = null;
+                        },
+                        .failure => {},
+                    };
+                }
+            }
             rememberCredentialSource(app, .fx_login);
             app.auth.closePicker(app.alloc);
             try app.writeDomainNotice(if (model_persistence_failed) .{
@@ -1839,19 +1881,11 @@ pub fn Runtime(comptime App: type) type {
                 .topic = "",
                 .tone = .neutral,
                 .body = body,
-                .detail = tokenPassOffer(app),
+                .detail = detail orelse "",
             }, true);
+            try token_pass_check.Runtime(App).adoptPrepared(app, credits_answer, catalog_has_marks);
             try resumePromptAfterAuth(app, agent);
             return true;
-        }
-
-        /// The Token Pass offer under the team notice, or "" when fx already
-        /// knows this team has an active Token Pass.
-        fn tokenPassOffer(app: *App) []const u8 {
-            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "tokenPassStatus")) {
-                if (app.model_cache.tokenPassStatus() == .active) return "";
-            }
-            return token_pass.offer_line;
         }
 
         /// Whether fx already sends with an fx login on this team, so choosing
@@ -1879,7 +1913,7 @@ pub fn Runtime(comptime App: type) type {
             candidate: credentials.Credential,
         ) std.mem.Allocator.Error!TeamCatalogValidation {
             if (comptime !@hasDecl(App, "providerCatalog")) {
-                return .{ .accepted = null };
+                return .{ .accepted = .{} };
             }
             const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
             if (access.authorizationCredential() == null) return .rejected;
@@ -1911,18 +1945,28 @@ pub fn Runtime(comptime App: type) type {
                 .catalog => |catalog_value| result: {
                     const catalog = catalog_value;
                     if (catalog.items.len == 0) break :result .rejected;
+                    var has_token_pass_marks = false;
+                    for (catalog.items) |entry| {
+                        if (entry.token_pass) {
+                            has_token_pass_marks = true;
+                            break;
+                        }
+                    }
                     if (comptime provider_runtime.supported(App)) {
                         const current_model = provider_runtime.model(app);
                         for (catalog.items) |entry| {
                             if (std.mem.eql(u8, entry.id, current_model)) {
-                                break :result .{ .accepted = null };
+                                break :result .{ .accepted = .{ .has_token_pass_marks = has_token_pass_marks } };
                             }
                         }
                         break :result .{
-                            .accepted = try app.alloc.dupe(u8, catalog.items[0].id),
+                            .accepted = .{
+                                .model = try app.alloc.dupe(u8, catalog.items[0].id),
+                                .has_token_pass_marks = has_token_pass_marks,
+                            },
                         };
                     }
-                    break :result .{ .accepted = null };
+                    break :result .{ .accepted = .{ .has_token_pass_marks = has_token_pass_marks } };
                 },
             };
         }
