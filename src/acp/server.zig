@@ -8304,14 +8304,14 @@ fn testCredentialServer(host: *Host, alloc: Allocator) ServerState {
     };
 }
 
-fn testCodexSession(state: *ServerState, alloc: Allocator, token: []const u8) !ActiveSessionState {
-    var session: ActiveSessionState = undefined;
-    session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
+fn testCodexSession(state: *ServerState, session: *ActiveSessionState, alloc: Allocator, token: []const u8) !void {
+    session.* = undefined;
+    session.client_writer = jsonrpc.Writer.initCallback(session, forwardToMain);
     // Publishing locks the settings mutex and checks the provider, so both
     // must be set; `undefined` would leave them as garbage.
     session.settings_mutex = .init;
     session.provider = .codex;
-    try attachOpenerForTest(&session, state);
+    try attachOpenerForTest(session, state);
     session.model = &.{};
     session.web_search_runtime = web_search_runtime.Runtime.init(.{});
     session.api_key = try alloc.dupe(u8, token);
@@ -8320,7 +8320,6 @@ fn testCodexSession(state: *ServerState, alloc: Allocator, token: []const u8) !A
     session.gateway_team = null;
     session.credential_source = .chatgpt_subscription;
     session.credential_refresh_after_ms = 1;
-    return session;
 }
 
 test "ACP gives a refreshed Codex token to the session whose turn refreshed it, and no other" {
@@ -8328,9 +8327,13 @@ test "ACP gives a refreshed Codex token to the session whose turn refreshed it, 
     var test_host = testHost(alloc);
     defer test_host.deinit();
     var state = testCredentialServer(&test_host, alloc);
-    var refreshing = try testCodexSession(&state, alloc, "stale-token");
+    var refreshing: ActiveSessionState = undefined;
+    try testCodexSession(&state, &refreshing, alloc, "stale-token");
+    defer releaseTestSession(&state, &refreshing);
     defer freeSessionCredential(alloc, &refreshing);
-    var other = try testCodexSession(&state, alloc, "other-token");
+    var other: ActiveSessionState = undefined;
+    try testCodexSession(&state, &other, alloc, "other-token");
+    defer releaseTestSession(&state, &other);
     defer freeSessionCredential(alloc, &other);
 
     var refreshed = credentials.Credential{
@@ -8362,7 +8365,9 @@ test "ACP rejects a refreshed Gateway login for another team and takes one for t
     var test_host = testHost(alloc);
     defer test_host.deinit();
     var state = testCredentialServer(&test_host, alloc);
-    var session = try testCodexSession(&state, alloc, "stale-token");
+    var session: ActiveSessionState = undefined;
+    try testCodexSession(&state, &session, alloc, "stale-token");
+    defer releaseTestSession(&state, &session);
     defer freeSessionCredential(alloc, &session);
     alloc.free(session.account_id.?);
     session.account_id = null;
@@ -8397,7 +8402,9 @@ test "ACP rejects refreshed Codex tokens for another account" {
     var test_host = testHost(alloc);
     defer test_host.deinit();
     var state = testCredentialServer(&test_host, alloc);
-    var session = try testCodexSession(&state, alloc, "stale-token");
+    var session: ActiveSessionState = undefined;
+    try testCodexSession(&state, &session, alloc, "stale-token");
+    defer releaseTestSession(&state, &session);
     defer freeSessionCredential(alloc, &session);
 
     var refreshed = credentials.Credential{
@@ -8423,7 +8430,9 @@ test "ACP keeps a renewed credential out of a session that changed provider duri
     var test_host = testHost(alloc);
     defer test_host.deinit();
     var state = testCredentialServer(&test_host, alloc);
-    var session = try testCodexSession(&state, alloc, "stale-token");
+    var session: ActiveSessionState = undefined;
+    try testCodexSession(&state, &session, alloc, "stale-token");
+    defer releaseTestSession(&state, &session);
     defer freeSessionCredential(alloc, &session);
     const before = session.api_key;
 
