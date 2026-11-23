@@ -1502,10 +1502,14 @@ const forker_rounds: usize = 5;
 /// after the other, so no process may take longer than before.
 const forker_reap_ms: i64 = 1_000;
 
-/// Ends the forkers and every process still alive that one of them recorded in
-/// `dir`, so a test that fails leaves none of them sleeping on.
-fn killForkerLeftovers(dir: std.Io.Dir, forkers: []const std.posix.pid_t) void {
-    killStarted(forkers);
+/// Ends the forkers still running and every process still alive that one of
+/// them recorded in `dir`, so a test that fails leaves none of them sleeping
+/// on. A forker whose waiter has reaped it is left alone: its pid may be reused.
+fn killForkerLeftovers(dir: std.Io.Dir, forkers: []const ?*ProcessProbe) void {
+    for (forkers) |forker| {
+        const probe = forker orelse continue;
+        if (!probe.done.load(.acquire)) killStarted(&.{probe.pid});
+    }
     var it = dir.iterate();
     while (it.next(io_mod.getIo()) catch null) |entry| {
         const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
@@ -1521,7 +1525,7 @@ test "stopping a check that keeps starting processes in groups of their own leav
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    var forkers: [forker_rounds]std.posix.pid_t = @splat(0);
+    var forkers: [forker_rounds]?*ProcessProbe = @splat(null);
     defer killForkerLeftovers(tmp.dir, &forkers);
     // Each process it starts moves to a group of its own and writes its pid,
     // like a stdio server an `fx mcp show` child starts. It starts one about
@@ -1543,7 +1547,7 @@ test "stopping a check that keeps starting processes in groups of their own leav
         const before = try entryCount(tmp.dir);
         const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir, forker_start_cap_arg }, null);
         probe.spawn(&waiters, null);
-        forker.* = probe.pid;
+        forker.* = probe;
         // Once it has started one, so the stop meets it while it starts more.
         // On a loaded machine that takes longer than any fixed wait.
         const started_one = for (0..1_000) |_| {
