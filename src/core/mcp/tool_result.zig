@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const elicitation = @import("elicitation.zig");
@@ -289,9 +290,9 @@ fn withoutData(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
 
 /// `text` without the one-line marker `truncateText` ends a cut text with.
 fn withoutCutMarker(text: []const u8) []const u8 {
-    const start = std.mem.findLast(u8, text, tool_result_limits.cut_marker_start) orelse return text;
+    const start = std.mem.findLast(u8, text, tool_result_cut_marker.cut_marker_start) orelse return text;
     const marker = text[start..];
-    if (!std.mem.endsWith(u8, marker, tool_result_limits.cut_marker_end)) return text;
+    if (!std.mem.endsWith(u8, marker, tool_result_cut_marker.cut_marker_end)) return text;
     if (std.mem.findScalar(u8, marker[1 .. marker.len - 1], '\n') != null) return text;
     return text[0..start];
 }
@@ -1000,7 +1001,7 @@ test "a protocol error without its data keeps the code and the message, for any 
             try std.testing.expectEqualStrings(text[0..end], head);
         }
         // A text the result cap cut, with its marker.
-        const cut = try arena.print("{s}{s}mcp_srv_tool: original 3299 bytes; cap is 2000{s}", .{ text[0 .. first + 20], tool_result_limits.cut_marker_start, tool_result_limits.cut_marker_end });
+        const cut = try arena.print("{s}{s}mcp_srv_tool: original 3299 bytes; cap is 2000{s}", .{ text[0 .. first + 20], tool_result_cut_marker.cut_marker_start, tool_result_cut_marker.cut_marker_end });
         try std.testing.expectEqualStrings(message, try protocolErrorWithoutData(arena, cut));
     }
     // Without data, and without the words of a protocol error, the text comes back as it is.
@@ -1108,7 +1109,7 @@ test "an invalid-params cause reads the same from a text the result cap cut, mar
         // Caps that cut inside the label's neighbourhood and deep in the data.
         for ([_]usize{ 200, 260, 400, 1000 }) |cap| {
             const output = try tool_result_limits.prepareModelOutput(arena, "mcp_srv_tool", text, cap);
-            try std.testing.expect(std.mem.find(u8, output, tool_result_limits.cut_marker_start ++ "mcp_srv_tool: original ") != null);
+            try std.testing.expect(std.mem.find(u8, output, tool_result_cut_marker.cut_marker_start ++ "mcp_srv_tool: original ") != null);
             try std.testing.expectEqualStrings(alone, (try invalidParamsCause(arena, output)).?);
         }
     }
@@ -1224,7 +1225,7 @@ fn fuzzDataLaw(arena: Allocator, bytes: []const u8) !void {
     if (bytes.len == 0) return;
     const message = bytes[1..];
     if (std.mem.find(u8, message, data_label) != null) return;
-    if (std.mem.find(u8, message, tool_result_limits.cut_marker_start) != null) return;
+    if (std.mem.find(u8, message, tool_result_cut_marker.cut_marker_start) != null) return;
     const selector = bytes[0];
     var hint: std.Io.Writer.Allocating = .init(arena);
     try hint.writer.writeAll(message);

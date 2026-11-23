@@ -684,7 +684,7 @@ fn statusGeometryUnchanged(cols: u16, previous: []const u8, next: []const u8) bo
 /// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
 /// with the same cleanup the byte-cap retention runs after it prunes. Ids no
 /// longer present are skipped; a pinned entry is never removed.
-/// The drop runs on a copy and commits only when every step succeeds, so a failed allocation leaves the transcript and its entries as they were.
+/// With a `transcript_commit_state`, the drop runs on a copy and commits only when every step succeeds, so a failed allocation leaves the transcript and its entries as they were.
 pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     if (ids.len == 0) return false;
     if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
@@ -698,7 +698,7 @@ pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !boo
 }
 
 /// Drops in place, so a failed allocation can leave the runtime half changed.
-/// Only a caller that discards the runtime on failure may use it; every other caller uses `dropEntriesAtomic`.
+/// Outside `dropEntriesAtomic`, call it only when the caller discards the runtime on failure.
 pub fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
@@ -2001,6 +2001,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
+        .check_found_command_ended = source.check_found_command_ended,
     };
 }
 
@@ -2016,6 +2017,22 @@ test "a snapshot copy of a tool detail keeps its subagent report mark" {
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(marked, copy.subagent_report);
+    }
+}
+
+test "a snapshot copy of a shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |ended| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
+            .outcome = .completed,
+            .check_found_command_ended = ended,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(ended, copy.check_found_command_ended);
     }
 }
 
@@ -2454,7 +2471,7 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
 }
 
 /// Changes the runtime in place, so a failed allocation can leave the transcript
-/// showing an entry the notebook no longer holds. Only `appendAssistantBlockAtomic` calls it, on a copy.
+/// showing an entry the notebook no longer holds. Only `appendAssistantBlockAtomic` calls it.
 fn appendAssistantBlockInPlace(
     self: anytype,
     alloc: Allocator,
@@ -2481,8 +2498,8 @@ fn appendAssistantBlockInPlace(
     return entry_id;
 }
 
-/// Appends on a copy and commits only when every step succeeds, so a failed allocation leaves
-/// the transcript and its entries as they were, and the caller keeps the payload on error.
+/// With a `transcript_commit_state`, appends on a copy and commits only when every step succeeds,
+/// so a failed allocation leaves the transcript and its entries as they were. The caller keeps the payload on error.
 fn appendAssistantBlockAtomic(
     self: anytype,
     alloc: Allocator,
@@ -2687,6 +2704,8 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
             .activity_kind = .command,
             .arguments_json = "{\"command\":\"printf committed\"}",
         } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running printf committed" } });
         try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, .{}, id, .stdout, "COMMITTED_RAW\n", true);
     } else {
         _ = try runtime.appendRawTranscriptEntryClassified(alloc, "COMMITTED_RAW", .unknown_raw);

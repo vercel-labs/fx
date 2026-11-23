@@ -1145,6 +1145,76 @@ describe("modern MCP Streamable HTTP", () => {
     ]);
   }, 30_000);
 
+  test("an HTTP server that loses two calls in a row is started again, and the third call works", async () => {
+    const lostArgument = "lost-call-argument-text";
+    const bearerToken = "lost-restart-bearer-secret";
+    fixture = startModernMcpHttpFixture("json", undefined, 2);
+    const root = createRoot("lost-restart", fixture);
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          fixture: {
+            type: "http",
+            url: fixture.url,
+            bearer_token_env: "MCP_LOST_RESTART_BEARER",
+          },
+        },
+      }),
+    );
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("lost_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("lost_call_1", "toolbox", { run: TOOL_NAME, arguments: { text: lostArgument } }),
+      fakeGatewayToolCall("lost_call_2", "toolbox", { run: TOOL_NAME, arguments: { text: lostArgument } }),
+      fakeGatewayToolCall("lost_call_3", "toolbox", { run: TOOL_NAME, arguments: { text: "after-restart-argument" } }),
+      fakeGatewayFinalText("LOST_CALLS_RESTARTED"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the echo tool three times."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), MCP_LOST_RESTART_BEARER: bearerToken },
+        timeoutMs: 30_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("LOST_CALLS_RESTARTED");
+    expect(toolResultText(gateway.requests[2]!.body, "lost_call_1", "error-text")).toContain("the server went away");
+    expect(toolResultText(gateway.requests[3]!.body, "lost_call_2", "error-text")).toContain("the server went away");
+    expect(toolResultText(gateway.requests[4]!.body, "lost_call_3")).toContain(MODERN_HTTP_TOOL_RESULT);
+    // The second detection comes after the second broken call, and call 3 goes out after it.
+    expect(
+      fixture.requests
+        .map((entry) => entry.message.method)
+        .filter((method) => method === "server/discover" || method === "tools/call"),
+    ).toEqual(["server/discover", "tools/call", "tools/call", "server/discover", "tools/call"]);
+    expect(fixture.brokenCalls).toBe(2);
+    for (const request of fixture.requests) {
+      expect(request.headers.authorization).toBe(`Bearer ${bearerToken}`);
+    }
+
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(
+      trace
+        .split("\n")
+        .filter((line) => line.includes("MCP call lost"))
+        .map((line) => line.slice(line.indexOf("MCP call lost"))),
+    ).toEqual([
+      "MCP call lost server=fixture transport=http why=stream_ended protocol=2026-07-28 status=200 restarted=false",
+      "MCP call lost server=fixture transport=http why=stream_ended protocol=2026-07-28 status=200 restarted=true",
+    ]);
+    expect(trace).not.toContain("why=unknown");
+    expect(trace).not.toContain(bearerToken);
+    expect(trace).not.toContain(lostArgument);
+    expect(trace).not.toContain("after-restart-argument");
+    expect(result.stdout).not.toContain(bearerToken);
+    expect(result.stderr).not.toContain(bearerToken);
+  }, 60_000);
+
   test("matching final SSE response closes a held-open response body", async () => {
     fixture = startModernMcpHttpFixture("held_open_final");
     const root = createRoot("held-open-final", fixture, 1_000);

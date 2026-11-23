@@ -120,3 +120,14 @@ test "render diagnostics are bounded and reset without enabling file tracing" {
     try std.testing.expectEqual(@as(usize, 1), snapshot(&events));
     try std.testing.expectEqual(@as(u64, 1), events[0].sequence);
 }
+
+test "render diagnostics keep the frame_error line for the crash report" {
+    reset();
+    defer reset();
+    record(.commit, "frame_error err={s} reasons={s} pending_reasons={d}", .{ "TestPreparationFailure", "footer", 2 });
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), snapshot(&events));
+    try std.testing.expectEqual(Kind.commit, events[0].kind);
+    try std.testing.expect(!events[0].truncated);
+    try std.testing.expectEqualStrings("frame_error err=TestPreparationFailure reasons=footer pending_reasons=2", events[0].detail());
+}
