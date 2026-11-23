@@ -9774,6 +9774,7 @@ const CancelPair = struct {
     }
 
     fn close(self: *CancelPair) void {
+        self.follower.deinit();
         self.state.deinit();
         self.host.deinit();
         self.follower_wire.deinit();
