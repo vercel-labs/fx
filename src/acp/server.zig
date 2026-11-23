@@ -10401,7 +10401,7 @@ test "a follower's disconnect withdraws its queued prompt with no write, and the
     try std.testing.expect(std.mem.find(u8, trace, "event=waiting_input_dropped session=session_answers request=4 reason=follower_left") != null);
 }
 
-test "a follower that leaves while its own prompt's turn runs: the turn goes on, and its answer is dropped and traced" {
+test "a follower that closes while its own prompt's turn runs: it is answered cancelled, the turn goes on, and the turn's answer is dropped and traced" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10430,6 +10430,8 @@ test "a follower that leaves while its own prompt's turn runs: the turn goes on,
     // The follower closes the session while its turn runs.
     var close_msg = jsonrpc.Message{ .id = .{ .integer = 9 }, .method = "session/close", .params_raw = "{\"sessionId\":\"session_answers\"}" };
     try handleCloseSession(&pair.follower, alloc, &close_msg);
+    // The close answers the follower's own prompt first, so that answer is on its wire already.
+    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "\"stopReason\":\"cancelled\"") != null);
 
     // The turn goes on: it still holds the slot, and its worker still runs.
     pair.session.waiting_prompts.lock();
@@ -10437,13 +10439,14 @@ test "a follower that leaves while its own prompt's turn runs: the turn goes on,
     pair.session.waiting_prompts.unlock();
     try std.testing.expect(still_running);
 
-    // The turn ends. Its answer has no member to reach, so it is dropped and traced.
+    // The turn ends. The close already answered the prompt, so the turn's answer is dropped and
+    // traced, and the follower's wire holds exactly one answer.
     publishTurnOutcome(running, pair.follower.connection_id, .{ .integer = 3 }, &.{}, .{ .stop_reason = .end_turn }, null);
-    try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "stopReason") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, pair.follower_wire.bytes.items, "stopReason"));
 
     const trace = try readTraceFile(alloc, trace_path);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "event=answer_dropped session=session_answers request=3 reason=sender_left") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=answer_dropped session=session_answers request=3 reason=answered_at_close") != null);
 }
 
 test "a steer that waits for a turn whose worker cannot start is answered to its sender, and traced" {
