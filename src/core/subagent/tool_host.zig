@@ -2237,7 +2237,7 @@ pub const Runtime = struct {
         defer self.setWaiter(null);
         if (worker.queuedPromptCount() == 0 and !self.anyWorking()) {
             debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=quiet", .{self.ownerName()});
-            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so nothing more will arrive. Continue, or end your turn." });
+            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so no report or message will arrive. If shell returned running, call shell with action interact and the session_id from that result. Otherwise continue, or end your turn." });
         }
         // The ones it waits for, named in its result for its row.
         var roster_arena = std.heap.ArenaAllocator.init(alloc);
@@ -6884,8 +6884,13 @@ test "wait returns at once when nothing works, and when a report arrives" {
     defer runtime.deinit();
 
     const quiet = try callTool(runtime, arena, .wait, "call-1", &worker);
-    try std.testing.expect(std.mem.find(u8, quiet, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "no report or message will arrive") != null);
     try std.testing.expect(std.mem.find(u8, quiet, "\"subagents\"") == null);
+    // A model often waits here for a shell command that returned running,
+    // so the reply points it at that command's own session_id.
+    try std.testing.expect(std.mem.find(u8, quiet, "call shell with action interact and the session_id from that result") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "shell-") == null);
 
     _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-2", &worker);
     try waitForRuns(&fixture, 1);
@@ -6903,6 +6908,7 @@ test "wait returns at once when nothing works, and when a report arrives" {
     try std.testing.expect(std.mem.find(u8, woken, "It starts your next turn once this one ends, so end your turn to read it.") != null);
     // It names the subagent that was working when it began.
     try std.testing.expect(std.mem.find(u8, woken, "\"subagents\":[\"reviewer\"]") != null);
+    try std.testing.expect(std.mem.find(u8, woken, "shell") == null);
     try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
     const queued = worker.takeQueuedPrompt(alloc).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);
@@ -7462,7 +7468,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
 
     const said = try boundedWait(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, said, "no report or message will arrive") != null);
     try std.testing.expect(!registryLists(gap.runtime, child_id));
 }
 

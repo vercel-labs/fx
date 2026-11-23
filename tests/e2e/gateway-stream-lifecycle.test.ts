@@ -11504,6 +11504,81 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  // A model that calls subagent wait after shell returned running learns how
+  // to resume that command, and the command runs once.
+  test("a mistaken subagent wait after a running shell points to shell interact", async () => {
+    const root = createFixtureRoot("subagent-wait-running-shell");
+    const releasePath = join(root.root, "release");
+    const effectPath = join(root.root, "effect.log");
+    const command = `while [ ! -e '${releasePath}' ]; do sleep 0.05; done; printf 'RAN\\n' >> '${effectPath}'; printf 'WAIT_SHELL_DONE\\n'`;
+    let sessionId = "";
+    let waitResult: Record<string, unknown> = {};
+    let interactResult: ShellResult | null = null;
+    const failures: string[] = [];
+    const steps: Array<(body: string) => Response> = [
+      () => fakeShellRun("mistaken_wait_run", command, { profile: "clean", yield_time_ms: 300 }),
+      (body) => {
+        const started = shellResult(body, "mistaken_wait_run");
+        expect(started.state).toBe("running");
+        sessionId = started.session_id ?? "";
+        expect(sessionId).not.toBe("");
+        return fakeGatewayToolCall("mistaken_wait", "subagent", { request: { action: "wait" } });
+      },
+      (body) => {
+        waitResult = JSON.parse(toolResultOutput(body, "mistaken_wait")) as Record<string, unknown>;
+        writeFileSync(releasePath, "");
+        return fakeGatewayToolCall("mistaken_wait_interact", "shell", {
+          request: { action: "interact", session_id: sessionId, yield_time_ms: 20_000 },
+        });
+      },
+      (body) => {
+        interactResult = shellResult(body, "mistaken_wait_interact");
+        return fakeGatewayFinalText("MISTAKEN_WAIT_DONE");
+      },
+    ];
+    let requests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      const step = steps[requests];
+      requests += 1;
+      if (failures.length > 0 || !step) return fakeGatewayFinalText("Fixture failed.");
+      try {
+        return step(body);
+      } catch (error) {
+        failures.push(`step ${requests - 1}: ${error instanceof Error ? error.message : String(error)}`);
+        return fakeGatewayFinalText("Fixture failed.");
+      }
+    }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const run = await runFx(["ask", "--json", "--yolo", "Run the command and wait for it."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(failures).toEqual([]);
+      expect(run.code, run.stderr).toBe(0);
+      expect(waitResult.ok).toBe(true);
+      expect(waitResult.subagents).toBeUndefined();
+      const advice = String(waitResult.result);
+      expect(advice).toContain("interact");
+      expect(advice).toContain("session_id");
+      expect(advice).toContain("shell");
+      expect(advice).not.toContain(sessionId);
+      expect(advice).toContain("no report or message will arrive");
+      expect(interactResult).not.toBeNull();
+      expect(interactResult!.state).toBe("completed");
+      expect(interactResult!.exit_code).toBe(0);
+      expect(interactResult!.output_delta).toContain("WAIT_SHELL_DONE");
+      expect(readFileSync(effectPath, "utf8")).toBe("RAN\n");
+      expect(parseAskJson(run.stdout).output).toContain("MISTAKEN_WAIT_DONE");
+      expect(requests).toBe(steps.length);
+      expect(run.stderr).not.toMatch(/panic:|error:|unreachable/);
+    } finally {
+      writeFileSync(releasePath, "");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   // Main sees its subagents at the start of each turn: what each is for and
   // whether it works or is idle, with the call to keep, close, or ask the
   // user. The list holds still within a turn. Each purpose survives a
