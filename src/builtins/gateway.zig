@@ -2534,12 +2534,14 @@ fn parseSortedModelIds(alloc: std.mem.Allocator, json_text: []const u8) !std.Arr
 const ModelCatalogView = model_catalog.View;
 
 fn fetchCatalogForProvider(
-    _: ?*anyopaque,
+    raw_ctx: ?*anyopaque,
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const shared_pool: ?*http_pool.HttpPool = if (raw_ctx) |ptr| @ptrCast(@alignCast(ptr)) else null;
     const response = fetchModelCatalogResponse(
         alloc,
+        shared_pool,
         input.access,
         input.endpoint,
         input.cancel_flag,
@@ -2583,7 +2585,7 @@ fn fetchModelCatalogForView(
     cancel_flag: ?*std.atomic.Value(bool),
     view: ModelCatalogView,
 ) !std.ArrayList(ModelCatalogEntry) {
-    const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag, null);
+    const response = try fetchModelCatalogResponse(alloc, null, access, path, cancel_flag, null);
     const json_text = switch (response) {
         .success => |body| body,
         .http_status => |status| return model_catalog.failureForHttpStatus(status).asError(),
@@ -2595,6 +2597,7 @@ fn fetchModelCatalogForView(
 
 fn fetchModelCatalogResponse(
     alloc: std.mem.Allocator,
+    shared_pool: ?*http_pool.HttpPool,
     access: credentials.CatalogAccess,
     path: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
@@ -2623,8 +2626,9 @@ fn fetchModelCatalogResponse(
     const gateway_team = modelCatalogHeaderTeam(access);
     // One-shot fetches pass no flag but still get the size cap and deadline.
     var never_cancelled = std.atomic.Value(bool).init(false);
-    return gateway_client.fetchGatewayJsonCancellable(
+    return gateway_client.fetchGatewayJsonWithPoolCancellable(
         alloc,
+        shared_pool,
         api_key,
         gateway_team,
         model_catalog_url,

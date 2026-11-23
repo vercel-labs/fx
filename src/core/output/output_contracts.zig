@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -4672,4 +4673,70 @@ test "slack text reads the access expiry in the local zone" {
     const unknown_text = try snapshot.render(alloc, .text);
     defer alloc.free(unknown_text);
     try std.testing.expect(std.mem.find(u8, unknown_text, "Access expiration time is unavailable.\n") != null);
+}
+
+pub const plain_build_label_bytes: usize = 96;
+const dev_revision_bytes: usize = 7;
+
+pub fn writePlainBuildLabel(
+    out: []u8,
+    channel: update_target.Channel,
+    version_text: []const u8,
+    revision: []const u8,
+) ![]const u8 {
+    if (channel != .dev) return std.mem.print(out, "v{s}", .{version_text});
+    if (revision.len < dev_revision_bytes or std.mem.eql(u8, revision, "unknown")) {
+        return std.mem.print(out, "v{s} [dev]", .{version_text});
+    }
+    return std.mem.print(out, "v{s}-{s} [dev]", .{
+        version_text,
+        revision[0..dev_revision_bytes],
+    });
+}
+
+/// Caller owns the returned slice.
+pub fn oneOffHeaderMessageStyled(alloc: Allocator, color: bool) ![]u8 {
+    const channel = update_target.Channel.parse(build_options.update_channel) orelse .stable;
+    var label_buf: [plain_build_label_bytes]u8 = undefined;
+    const build_label = try writePlainBuildLabel(
+        &label_buf,
+        channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+    if (!color) return alloc.print("𝒇x {s}\n", .{build_label});
+    return alloc.print("\x1b[1m𝒇x\x1b[0m {s}\n", .{build_label});
+}
+
+test "writePlainBuildLabel keeps dev builds free of embedded dim escapes" {
+    var buf: [plain_build_label_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("v0.0.5", try writePlainBuildLabel(&buf, .stable, "0.0.5", "abcdef123456"));
+    try std.testing.expectEqualStrings("v0.0.5-abcdef1 [dev]", try writePlainBuildLabel(&buf, .dev, "0.0.5", "abcdef123456"));
+    try std.testing.expectEqualStrings("v0.0.5 [dev]", try writePlainBuildLabel(&buf, .dev, "0.0.5", "unknown"));
+}
+
+test "oneOffHeaderMessageStyled uses adaptive bold brand without help hint" {
+    const alloc = std.testing.allocator;
+    const channel = update_target.Channel.parse(build_options.update_channel) orelse .stable;
+    var label_buf: [plain_build_label_bytes]u8 = undefined;
+    const build_label = try writePlainBuildLabel(
+        &label_buf,
+        channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+
+    const styled = try oneOffHeaderMessageStyled(alloc, true);
+    defer alloc.free(styled);
+    const expected_styled = try alloc.print("\x1b[1m𝒇x\x1b[0m {s}\n", .{build_label});
+    defer alloc.free(expected_styled);
+    try std.testing.expectEqualStrings(expected_styled, styled);
+    try std.testing.expect(std.mem.find(u8, styled, "Run /help for commands") == null);
+
+    const plain = try oneOffHeaderMessageStyled(alloc, false);
+    defer alloc.free(plain);
+    const expected_plain = try alloc.print("𝒇x {s}\n", .{build_label});
+    defer alloc.free(expected_plain);
+    try std.testing.expectEqualStrings(expected_plain, plain);
+    try std.testing.expect(std.mem.findScalar(u8, plain, '\x1b') == null);
 }

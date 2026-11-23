@@ -303,6 +303,24 @@ pub const CapabilityResolver = struct {
         return self.resolve(alloc, provider, input, model, fallback);
     }
 
+    /// Starts loading the catalog in the background without blocking so later
+    /// `resolveWithin` calls join the in-flight load instead of starting over.
+    pub fn startBackgroundLoad(
+        self: *CapabilityResolver,
+        alloc: Allocator,
+        provider: model_catalog.Provider,
+        input: model_catalog.FetchInput,
+    ) void {
+        if (comptime builtin.single_threaded) return;
+        if (!provider.reports_connection) return;
+        if (self.state != .idle or self.pending_load != null) return;
+        self.freeEndedAbandonedLoads(alloc);
+        self.pending_load = CatalogLoad.start(alloc, provider, input) catch |err| {
+            debug_trace.logf("gateway", "model catalog background load skipped err={s}", .{@errorName(err)});
+            return;
+        };
+    }
+
     /// `refreshIfDue` for a caller that must not wait out a refresh that
     /// cannot reach the catalog. A due load runs as `loadWithin` describes;
     /// one given up on fails as any failed refresh does, so the catalog
@@ -1218,4 +1236,22 @@ test "a catalog refresh after one given up on starts its own load and frees the 
     try std.testing.expect(resolver.abandoned_loads.?.next == null);
     try std.testing.expectEqual(@as(usize, 3), gated.calls.load(.seq_cst));
     try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
+}
+
+test "CapabilityResolver pre-warms catalog in background and joins without duplicate fetch" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{};
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    const provider = gated.provider();
+    resolver.startBackgroundLoad(alloc, provider, .{ .endpoint = "/v1/models" });
+    try std.testing.expect(resolver.pending_load != null);
+
+    const releaser = try gated.releaseAfter(20);
+    defer releaser.join();
+
+    const caps = try resolver.resolveWithin(alloc, provider, .{ .endpoint = "/v1/models" }, "provider/model", .{}, 500);
+    try std.testing.expect(caps.supports_vision);
+    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
 }

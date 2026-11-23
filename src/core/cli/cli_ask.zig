@@ -33,7 +33,6 @@ const http_pool = @import("../shared/http_pool.zig");
 const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
-const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const select_watch = @import("../shared/select_watch.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
@@ -722,7 +721,6 @@ const AskContext = struct {
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     active_turn_id: u64 = 0,
-    notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
@@ -756,82 +754,11 @@ const AskContext = struct {
         };
     }
 
-    fn configureNotifications(
-        self: *AskContext,
-        turn_end: bool,
-        attention_required: bool,
-    ) !void {
-        self.notification_player = notification_sound.Player.init(.{
-            .ctx = self,
-            .emit = emitAskNotificationBell,
-        });
-        if (turn_end) {
-            try self.lifecycle_runtime.registerPostTurnEnd(.{
-                .name = "fx.sound.turn_end",
-                .ctx = self,
-                .run = postTurnEndNotification,
-            });
-        }
-        if (attention_required) {
-            try self.lifecycle_runtime.registerAttentionRequired(.{
-                .name = "fx.sound.attention_required",
-                .ctx = self,
-                .run = attentionRequiredNotification,
-            });
-        }
-        self.lifecycle_view = self.lifecycle_runtime.freeze();
-    }
-
     fn dispatchAttentionRequired(self: *AskContext, kind: hooks.AttentionKind) void {
         agent_runtime.dispatchAttentionRequiredCheckpoint(self.lifecycleContext(), .{
             .turn_id = self.active_turn_id,
             .kind = kind,
         });
-    }
-
-    fn postTurnEndNotification(
-        raw: *anyopaque,
-        input: hooks.PostTurnEndInput,
-    ) hooks.HandlerError!void {
-        const self: *AskContext = @ptrCast(@alignCast(raw));
-        if (input.invocation.scope.kind != .ask) return;
-        const cue: notification_sound.Cue = switch (input.outcome) {
-            .completed => .success,
-            .failed => .@"error",
-            .interrupted, .paused => return,
-        };
-        self.playNotification(.turn_end, cue);
-    }
-
-    fn attentionRequiredNotification(
-        raw: *anyopaque,
-        input: hooks.AttentionRequiredInput,
-    ) hooks.HandlerError!void {
-        const self: *AskContext = @ptrCast(@alignCast(raw));
-        if (input.invocation.scope.kind != .ask) return;
-        self.playNotification(.attention_required, .success);
-    }
-
-    fn playNotification(
-        self: *AskContext,
-        kind: notification_sound.Kind,
-        cue: notification_sound.Cue,
-    ) void {
-        const player = if (self.notification_player) |*configured|
-            configured
-        else {
-            debug_trace.logf(
-                "notifications",
-                "notification delivery dropped kind={s} reason=player_not_configured",
-                .{@tagName(kind)},
-            );
-            return;
-        };
-        debug_trace.logf("notifications", "sound play kind={s} cue={s}", .{ @tagName(kind), @tagName(cue) });
-        switch (kind) {
-            .attention_required => player.playAttention(cue),
-            .turn_end => player.play(cue),
-        }
     }
 
     fn deinit(self: *AskContext) void {
@@ -1660,6 +1587,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 stamped.context = pool;
                 cfg.provider_set.gateway.agent_stream = stamped;
             }
+            if (cfg.provider_set.gateway.model_catalog) |catalog| {
+                var stamped = catalog;
+                stamped.context = pool;
+                cfg.provider_set.gateway.model_catalog = stamped;
+            }
             pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
         } else |_| {}
     }
@@ -1748,17 +1680,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
-    if (options.output_mode.isTerminal()) {
-        presenter = try ask_presentation.Runtime.init(alloc, .{
-            .text = owned_prompt,
-            .images = @constCast(options.images),
-        }, options.output_mode == .terminal_no_color);
-        ctx.presenter = &presenter.?;
-    }
-    try ctx.configureNotifications(
-        startup.notification_turn_end,
-        startup.notification_attention_required,
-    );
     ctx.workspace_capture = startup.workspace_capture;
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
@@ -1817,6 +1738,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.provider_strict = strict;
     }
 
+    if (options.output_mode.isTerminal()) {
+        presenter = try ask_presentation.Runtime.init(alloc, .{
+            .model = ctx.model,
+            .effort = if (ctx.effort.isDefault()) "" else ctx.effort.displayLabel(),
+            .fast_mode = ctx.fast_mode,
+            .ultrafast_mode = ctx.ultrafast_mode,
+        }, options.output_mode == .terminal_no_color);
+        ctx.presenter = &presenter.?;
+    }
+
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(alloc);
     if (cfg.auth_mode == .host_managed) {
@@ -1859,6 +1790,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.accountId(),
         );
     }
+    maybeStartCatalogPrewarm(&ctx);
 
     // A team with Token Pass starts a new session on the Token Pass default
     // when nothing chose the model. The check refreshes the saved answer
@@ -2310,6 +2242,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .save_recovery_record = if (ctx.v2 != null) saveRecoveryRecord else null,
         .save_route_recovery_status = if (ctx.v2 != null) saveRouteRecoveryStatus else null,
         .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
@@ -2411,6 +2344,18 @@ fn adoptRefreshedAskCredential(
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
+}
+
+fn maybeStartCatalogPrewarm(ctx: *AskContext) void {
+    if (comptime std_builtin.is_test) return;
+    if (io_mod.getenv("FX_BENCH") != null) return;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const catalog = bundle.model_catalog orelse return;
+    ctx.capability_resolver.startBackgroundLoad(ctx.alloc, catalog, .{
+        .access = ctx.model_catalog_access,
+        .endpoint = ctx.cfg.gateway_models_path,
+        .cancel_flag = ctx.cancelFlag(),
+    });
 }
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
@@ -2760,18 +2705,6 @@ fn promptCliPermissionApproval(
 fn notifyAskPermissionAttention(raw: ?*anyopaque) void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
     ctx.dispatchAttentionRequired(.permission);
-}
-
-fn emitAskNotificationBell(raw: *anyopaque) void {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw));
-    if (!ctx.deps.stderr_is_tty(ctx.deps.stderr_ctx)) return;
-    ctx.writeStderr("\x07") catch |err| {
-        debug_trace.logf(
-            "notifications",
-            "fx ask terminal bell write failed err={s}",
-            .{@errorName(err)},
-        );
-    };
 }
 
 fn cliPermissionPromptAllowed(
@@ -3279,12 +3212,27 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
+    v2.appendProgressWithRecord(
+        progress.user,
+        progress.execution,
+        .{ .calls = progress.running_calls, .assistant = progress.running_assistant },
+        progress.recovery_record,
+    ) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
         return;
     };
     // The log now refers to this prompt's images.
     ctx.prompt_snapshot_committed = true;
+}
+
+/// `AgentRuntimeDeps.save_recovery_record` on v2: writes or clears the
+/// recovery checkpoint on an open turn so resumed runs keep retry state.
+fn saveRecoveryRecord(raw_ctx: *anyopaque, record: types.RecoveryRecordWrite) !bool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return false;
+    return v2.saveRecovery(record);
 }
 
 /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
@@ -3350,6 +3298,13 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
         .provider_resolved => |slug| {
             if (ctx.resolved_provider) |old| ctx.alloc.free(old);
             ctx.resolved_provider = try ctx.alloc.dupe(u8, slug);
+        },
+        .turn_phase_update => |update| {
+            if (ctx.presenter) |presenter| {
+                presenter.setThinking(update.phase == .thinking) catch |err| {
+                    debug_trace.logf("cli_ask", "ask thinking indicator update failed err={s}", .{@errorName(err)});
+                };
+            }
         },
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
@@ -3686,6 +3641,13 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
+    if (ctx.presenter) |presenter| {
+        const was_finished = presenter.finished;
+        presenter.finish() catch |err| {
+            debug_trace.logf("cli_ask", "ask presenter finish before http error failed err={s}", .{@errorName(err)});
+        };
+        if (!was_finished) try ctx.writeStderr("\n");
+    }
     try ctx.writeStderr("fx ask: ");
     try ctx.writeStderr(message);
     try ctx.writeStderr("\n");
@@ -6909,55 +6871,80 @@ test "fx ask permission attention fires once after a prompt is published" {
     try std.testing.expectEqual(@as(usize, 1), capture.calls);
 }
 
-test "fx ask bell writes only to TTY stderr" {
+test "fx ask skips sound notification handlers and terminal bells even when sound settings are enabled" {
     const alloc = std.testing.allocator;
+    const Fixture = struct {
+        var calls: usize = 0;
+        var saw_post_turn_end: bool = false;
+        var saw_attention_required: bool = false;
+
+        fn loadStartup(
+            gpa: Allocator,
+            transport: oauth_transport.Provider,
+            secret_store: host.SecretStore,
+            default_model: []const u8,
+            default_agent_step_limit: usize,
+            provider_override: ?model_provider.ProviderId,
+            model_override: ?[]const u8,
+            settings_overrides: []const config_runtime.SettingOverride,
+        ) !app_lifecycle.StartupState {
+            var state = try testPresentKeyStartup(
+                gpa,
+                transport,
+                secret_store,
+                default_model,
+                default_agent_step_limit,
+                provider_override,
+                model_override,
+                settings_overrides,
+            );
+            state.notification_turn_end = true;
+            state.notification_attention_required = true;
+            return state;
+        }
+
+        fn process(
+            _: *agent_runtime.Agent,
+            runtime_deps: *const agent_runtime.AgentRuntimeDeps,
+            _: ?agent_runtime.SemanticPresentationSink,
+            lifecycle: agent_runtime.LifecycleContext,
+            _: agent_runtime.Config,
+            job: worker_runtime.QueuedPrompt,
+        ) !void {
+            calls += 1;
+            saw_post_turn_end = lifecycle.view.hasPostTurnEnd();
+            saw_attention_required = lifecycle.view.hasAttentionRequired();
+            lifecycle.view.runAttentionRequired(.{
+                .invocation = .{ .scope = lifecycle.scope, .turn_id = job.turn_id },
+                .kind = .permission,
+            });
+            lifecycle.view.runPostTurnEnd(.{
+                .invocation = .{ .scope = lifecycle.scope, .turn_id = job.turn_id },
+                .outcome = .completed,
+            });
+            try runtime_deps.push_text(runtime_deps.ctx, .{ .assistant_source = "silent\n" });
+        }
+    };
+    Fixture.calls = 0;
+    Fixture.saw_post_turn_end = false;
+    Fixture.saw_attention_required = false;
+
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(alloc);
-    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, Fixture.loadStartup);
     deps.stderr_is_tty = TestTty.yes;
-    var ctx = AskContext.init(alloc, testConfig(), deps, "/tmp/workspace");
-    defer ctx.deinit();
+    deps.process_queued_prompt = Fixture.process;
 
-    emitAskNotificationBell(&ctx);
-    try std.testing.expectEqualStrings("\x07", stderr_capture.bytes.items);
-    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-
-    stderr_capture.bytes.clearRetainingCapacity();
-    ctx.deps.stderr_is_tty = TestTty.no;
-    emitAskNotificationBell(&ctx);
+    const exit_code = try runWithDeps(alloc, &.{ "--no-save", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.calls);
+    try std.testing.expect(!Fixture.saw_post_turn_end);
+    try std.testing.expect(!Fixture.saw_attention_required);
+    try std.testing.expectEqualStrings("silent\n", stdout_capture.bytes.items);
+    try std.testing.expect(std.mem.findScalar(u8, stderr_capture.bytes.items, '\x07') == null);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
-    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-}
-
-test "fx ask registers notification handlers only when configured" {
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(std.testing.allocator);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(std.testing.allocator);
-    var disabled = AskContext.init(
-        std.testing.allocator,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        "/tmp/workspace",
-    );
-    defer disabled.deinit();
-    try disabled.configureNotifications(false, false);
-    try std.testing.expect(!disabled.lifecycle_view.hasPostTurnEnd());
-    try std.testing.expect(!disabled.lifecycle_view.hasAttentionRequired());
-
-    var enabled = AskContext.init(
-        std.testing.allocator,
-        testConfig(),
-        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
-        "/tmp/workspace",
-    );
-    defer enabled.deinit();
-    try enabled.configureNotifications(true, true);
-
-    try std.testing.expect(enabled.lifecycle_view.hasPostTurnEnd());
-    try std.testing.expect(enabled.lifecycle_view.hasAttentionRequired());
 }
 
 test "fx ask captured and quiet permission paths bypass terminal prompt" {
@@ -9693,4 +9680,62 @@ test "CLI output mode selection preserves machine output precedence" {
     try std.testing.expectEqual(OutputMode.raw, selectOutputMode(false, false, false, true));
     try std.testing.expectEqual(OutputMode.terminal, selectOutputMode(false, false, true, false));
     try std.testing.expectEqual(OutputMode.terminal_no_color, selectOutputMode(false, false, true, true));
+}
+
+test "fx ask persists recovery checkpoints via save_recovery_record and append_turn_piece" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var session_id: []u8 = &.{};
+    defer alloc.free(session_id);
+    const rec1: [32]u8 = @splat(0x11);
+    const rec2: [32]u8 = @splat(0x22);
+
+    {
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), workspace);
+        defer ctx.deinit();
+
+        var store = try session_adapter.Store.open(alloc, home);
+        defer store.deinit(alloc);
+        var permission_state = try ctx.session.snapshotPermissionState(alloc);
+        defer permission_state.deinit(alloc);
+        const v2 = try session_adapter.Session.create(alloc, &store, workspace, .ask, .{
+            .preferences = .{ .provider = .gateway, .model = @constCast("model"), .effort = .auto, .fast_mode = false, .ultrafast_mode = false },
+            .language = ctx.session.languageSnapshot(),
+            .permission_state = permission_state,
+        });
+        defer v2.close();
+        session_id = try alloc.dupe(u8, v2.id());
+        ctx.v2 = v2;
+        defer ctx.v2 = null;
+
+        const deps = agentRuntimeDeps(&ctx);
+        const save_rec = deps.save_recovery_record orelse return error.TestUnexpectedResult;
+        try deps.append_turn_piece.?(deps.ctx, .{
+            .user = .{ .text = @constCast("resume me") },
+            .execution = .{},
+            .recovery_record = .{ .save = rec1 },
+        });
+        try std.testing.expect(try save_rec(deps.ctx, .{ .save = rec2 }));
+        try std.testing.expect(try save_rec(deps.ctx, .clear));
+        try std.testing.expect(try save_rec(deps.ctx, .{ .save = rec2 }));
+    }
+
+    var reopened_store = try session_adapter.Store.open(alloc, home);
+    defer reopened_store.deinit(alloc);
+    const reopened = try session_adapter.Session.resumeSession(alloc, &reopened_store, .{ .id = session_id }, workspace, .ask);
+    defer reopened.close();
+    const interrupted = (try reopened.interruptedRequest()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &rec2, &(interrupted.record orelse return error.TestUnexpectedResult));
 }
