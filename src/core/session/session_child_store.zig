@@ -4,6 +4,10 @@ const io_mod = @import("../shared/io.zig");
 const artifact_digest = @import("artifact_digest.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// The largest body the session pack holds (`pack.max_body_bytes`). A small
+/// body put with `putSmallBlob` is packed, a larger one stays a file.
+pub const max_small_body_bytes: usize = 4 << 10;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -88,6 +92,9 @@ pub const Blobs = struct {
 
     pub const VTable = struct {
         put: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
+        /// As `put`, for a body the caller reads back through `get`: a small one
+        /// may be packed with the session (`src/core/session_manager/pack.zig`).
+        put_small: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
         /// The first `len` bytes of an open file outside the session.
         put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
         /// Keeps `bytes` as the compactor record `name`, replacing any record
@@ -608,6 +615,7 @@ pub const MemoryBlobsForTesting = struct {
 
     const vtable: Blobs.VTable = .{
         .put = put,
+        .put_small = put,
         .put_file = putFile,
         .put_record = putRecord,
         .record_names = recordNames,
@@ -804,6 +812,13 @@ pub const SessionChildCapability = struct {
     pub fn putBlob(self: *SessionChildCapability, bytes: []const u8) BlobError!Blobs.Hash {
         const blobs = try self.writableBlobs();
         return blobs.vtable.put(blobs.ctx, bytes);
+    }
+
+    /// As `putBlob`, for a body the caller reads back through `get`; a small
+    /// one may be packed with the session.
+    pub fn putSmallBlob(self: *SessionChildCapability, bytes: []const u8) BlobError!Blobs.Hash {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put_small(blobs.ctx, bytes);
     }
 
     /// As `putBlob`, for the first `len` bytes of an open file.

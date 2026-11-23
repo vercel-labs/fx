@@ -443,7 +443,7 @@ fn storeLargeResultAtHandleManaged(
     text: []const u8,
 ) !void {
     if (capability.holdsBlobs()) {
-        const hash = try capability.putBlob(text);
+        const hash = try capability.putSmallBlob(text);
         // `handleFor` names the handle after this very blob.
         std.debug.assert(std.mem.eql(u8, artifact_digest.blobHash(handle).?, &hash));
         return;
@@ -811,13 +811,25 @@ fn readCompactorFile(context: *anyopaque, arena: Allocator, name: []const u8, ma
 
 /// Up to `max_bytes` from the start of a v2 record's read-only blob file,
 /// which may be far larger than what the compactor searches (D50).
-fn readRecordBlob(capability: *session_child_store.SessionChildCapability, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
-    session_child_store.SessionChildCapability.validateManagedName(name) catch |err| return compactorStoreError("read", name, err);
-    const io = io_mod.getIo();
-    var file = capability.openBlobFile(arena, .tool_results, name) catch |err| return compactorStoreError("open", name, switch (err) {
+/// A record with no blob file is a small body packed in the session (D50). It is
+/// read whole through `get`, which checks it against its name, and cut to
+/// `max_bytes`. No scan of the pack happens here: `get` reads through the
+/// manager's pack cache.
+fn readPackedRecord(capability: *session_child_store.SessionChildCapability, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
+    const bytes = capability.readBlob(arena, .tool_results, name, session_child_store.max_small_body_bytes) catch |err| return compactorStoreError("read", name, switch (err) {
         error.BlobNotFound => error.FileNotFound,
         else => err,
     });
+    return bytes[0..@min(bytes.len, max_bytes)];
+}
+
+fn readRecordBlob(capability: *session_child_store.SessionChildCapability, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
+    session_child_store.SessionChildCapability.validateManagedName(name) catch |err| return compactorStoreError("read", name, err);
+    const io = io_mod.getIo();
+    var file = capability.openBlobFile(arena, .tool_results, name) catch |err| switch (err) {
+        error.BlobNotFound => return readPackedRecord(capability, arena, name, max_bytes),
+        else => return compactorStoreError("open", name, err),
+    };
     defer file.close(io);
     const size = (file.stat(io) catch |err| return compactorStoreError("stat", name, err)).size;
     const bytes = try arena.alloc(u8, std.math.cast(usize, @min(size, max_bytes)) orelse return error.OutOfMemory);

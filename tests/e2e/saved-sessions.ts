@@ -205,13 +205,27 @@ export function childWork(home: string, parent: string) {
 
 /// The blob of the compactor record `name` (D50): the newest
 /// `compaction_records` line names the blob mapping record names to blobs.
-export function compactionRecordPath(home: string, id: string, name: string): string | undefined {
+export function compactionRecordText(home: string, id: string, name: string): string | undefined {
   const line = (readLog(home, id) as any[]).filter((l) => l.kind === "set" && l.key === "compaction_records").at(-1);
   if (!line) return undefined;
   expect(line.blobs).toContain(line.value.map);
-  const blobs = join(sessionDir(home, id), "blobs");
-  const hash = JSON.parse(readFileSync(join(blobs, line.value.map), "utf8"))[name];
-  return hash ? join(blobs, hash) : undefined;
+  const hash = JSON.parse(blobBytes(home, id, line.value.map).toString("utf8"))[name];
+  return hash ? blobBytes(home, id, hash).toString("utf8") : undefined;
+}
+
+/// A blob's bytes: its file, or its record in the session's pack when it is a
+/// small body (D102). A pack record is a 44-byte header (magic, the SHA-256 of
+/// the body, its length, its CRC-32C) and the body.
+export function blobBytes(home: string, id: string, hash: string): Buffer {
+  const file = join(sessionDir(home, id), "blobs", hash);
+  if (existsSync(file)) return readFileSync(file);
+  const pack = readFileSync(join(sessionDir(home, id), "blobs.pack"));
+  for (let at = 0; at + 44 <= pack.length; ) {
+    const len = pack.readUInt32LE(at + 36);
+    if (pack.subarray(at + 4, at + 36).toString("hex") === hash) return Buffer.from(pack.subarray(at + 44, at + 44 + len));
+    at += 44 + len;
+  }
+  throw new Error(`no blob ${hash} in session ${id}`);
 }
 
 /// The command replays session `id` kept: each is one of its blobs, named in

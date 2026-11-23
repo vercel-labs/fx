@@ -172,6 +172,8 @@ pub const Manager = struct {
     root_mutex: std.Io.Mutex = .init,
     root_open: bool = false,
     index_lock: catalog_mod.IndexLock = .{},
+    /// The packs that `getBlob` reads, indexed once per session.
+    pack_cache: session_mod.PackCache,
 
     /// No disk I/O happens here; the root opens on first use. `gpa` must be
     /// thread-safe when Sessions are used from several threads. The Manager
@@ -182,6 +184,7 @@ pub const Manager = struct {
         errdefer gpa.destroy(m);
         m.* = .{
             .gpa = gpa,
+            .pack_cache = .{ .gpa = gpa, .s = .{ .io = io } },
             .root_path = try gpa.dupe(u8, options.root),
             .env = .{
                 .gpa = gpa,
@@ -202,6 +205,7 @@ pub const Manager = struct {
     pub fn deinit(m: *Manager) void {
         m.index_lock.close(m.env.s);
         if (m.root_open) m.env.s.closeDir(m.env.root);
+        m.pack_cache.deinit();
         m.gpa.free(m.root_path);
         m.gpa.destroy(m);
     }
@@ -472,7 +476,7 @@ pub const Manager = struct {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
         if (!try readyToRead(m)) return error.NotFound;
-        return session_mod.readBlob(&m.env, gpa, id, hash);
+        return session_mod.readBlobCached(&m.env, gpa, &m.pack_cache, id, hash);
     }
 
     /// The path of a durable blob of session `id`, for a tool that opens
@@ -589,6 +593,12 @@ pub const Session = struct {
     /// Stores a large body and returns its hash, once it is durable (D6).
     pub fn putBlob(s: Session, bytes: []const u8) AppendError!BlobHash {
         return s.inner.putBlob(bytes);
+    }
+
+    /// As `putBlob`, for a body the caller reads back through `Manager.getBlob`:
+    /// a body of at most `pack.max_body_bytes` is packed with the session.
+    pub fn putSmall(s: Session, bytes: []const u8) AppendError!BlobHash {
+        return s.inner.putSmall(bytes);
     }
 
     /// As `putBlob`, for the first `len` bytes of an open file outside the

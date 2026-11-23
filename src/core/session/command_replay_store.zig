@@ -696,7 +696,7 @@ pub const Capture = struct {
         const backing = self.backing orelse return error.ReplayStoreUnavailable;
         if (backing == .blobs) {
             // Already whole in memory: the blob needs no spool.
-            const hash = try backing.blobs.putBlob(buffered.items);
+            const hash = try backing.blobs.putSmallBlob(buffered.items);
             const handle = try blobReplayHandle(alloc, hash);
             const framed_bytes = buffered.items.len;
             buffered.deinit(alloc);

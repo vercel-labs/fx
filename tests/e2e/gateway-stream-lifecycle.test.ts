@@ -34,7 +34,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordText, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -8956,7 +8956,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(pages).toHaveLength(1);
           expect(savedText(root.home, sessionId)).toContain(pages[0]!.hash);
           // The compacted command is saved as T1 with the handle of its whole output.
-          expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
+          expect(compactionRecordText(root.home, sessionId, "compacted-T1.txt")!).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
@@ -9220,7 +9220,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(secondSummary).toContain("The user sent two sentinel prompts and restarted fx.");
         // The first compaction, its notes included, is saved whole as L1.
         expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
-        const firstLedger = readFileSync(compactionRecordPath(root.home, sessionId, "compacted-L1.txt")!, "utf8");
+        const firstLedger = compactionRecordText(root.home, sessionId, "compacted-L1.txt")!;
         expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(firstLedger).toContain("Continue the compacted session.");
       } finally {
@@ -9342,7 +9342,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const saved = readFileSync(logPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
           expect(compactionCount(saved)).toBe(1);
-          const savedTool = readFileSync(compactionRecordPath(root.home, sessionId, `compacted-${diagnosticHandle}.txt`)!, "utf8");
+          const savedTool = compactionRecordText(root.home, sessionId, `compacted-${diagnosticHandle}.txt`)!;
           expect(savedTool.startsWith("T2 subagent: wait")).toBe(true);
           expect(savedTool).toContain("\nResult:\naborted by user\n");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");

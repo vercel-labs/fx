@@ -981,7 +981,7 @@ Settled on 2026-09-28:
   change: side files are outside the specs.
 
 Settled while moving off the side folder (2026-10-01):
-- **D44 Decision:** a v2 session's large bodies are blobs of that session,
+- **D44 Decision (small bodies amended by D102):** a v2 session's large bodies are blobs of that session,
   realizing D6 for fx's stores: tool results and tool images, command
   replay and web-fetch downloads (an edit's diff stays inside its item, as
   v2 already keeps it). Each handle keeps its store's
@@ -2269,6 +2269,40 @@ as it was sent):
   `fx ask` and through ACP; the fx E2E session suite and
   `sdk/tests/test-term-session-resume.mjs`.
 - **Regression:** the E2E suite; the startup benchmark unchanged.
+- **D102 Decision (amends D44 and D48):** a small body that a tool result,
+  a command's output, a compaction record, or a moved side file keeps is
+  packed in its session's pack, `blobs.pack`, and gets no blob file of its
+  own. A body is small when it is at most 4 KiB. A pack record is a 44-byte
+  header (magic, the body's SHA-256, its length, its CRC-32C) and the body.
+  A larger body, and every body a tool or the model opens by path (a prompt
+  image, a web-fetch download, D49), stays a blob file. A line that names a
+  packed body is written at format version 2, so an older reader opens that
+  session read-only and never rewrites it (R3.5). The pack is synced before
+  any line that names one of its records, so no durable line names a record
+  that a crash can lose (`tests/tla/session_store/SmallBlobs.tla`
+  `Dangling`). A writable open cuts only a torn tail: an incomplete last
+  record, or a last record whose CRC fails with nothing after it. A damaged
+  body in the middle is reported by verify and is never cut, and the later
+  bodies still read. A damaged header in the middle (bad magic) makes the
+  session read-only: the writer refuses to open it and cuts nothing, and
+  readers keep the bodies before the damage. A fork copies the pack, and an
+  append to either side never reaches the other. Readers build one index
+  per session from the record headers and read each body with one seek.
+  Reason: a small body under D44 costs a file and two syncs; the pack costs
+  one sync per batch.
+  A damaged record is classified on the writable open only. When the walk
+  stops at a bad header, a length past EOF, or a zeroed tail, the open looks
+  for a complete record after it. None means a torn tail, and the pack is
+  cut there. A complete record after it makes the log decide: if a durable
+  line names a body that the good prefix lacks and that is not a blob file,
+  the open is refused read-only and nothing is cut. Otherwise the batch was
+  unsynced, and it is cut. Readers that miss a body in a cached index rebuild
+  that index once and retry before they report it, so a pack cut and regrown
+  to the same length cannot produce a false damage report.
+  A moved side file that the move copies from disk stays a blob file: no
+  pack copy of it exists yet. The moved bodies the adapter already holds in
+  memory, and their map, are packed. Forks copy the pack with a byte copy;
+  `clonefile` is a follow-up.
 
 ## Implementation Freedom
 

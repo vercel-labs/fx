@@ -42,6 +42,8 @@ pub const Options = struct {
 };
 
 /// What every Session of one manager shares. Owned by L4; outlives them.
+const pack = @import("pack.zig");
+
 pub const Env = struct {
     /// Thread-safe when Sessions are used from several threads.
     gpa: std.mem.Allocator,
@@ -205,6 +207,14 @@ pub const Session = struct {
     env: *const Env,
     mutex: std.Io.Mutex = .init,
     sync_mutex: std.Io.Mutex = .init,
+    /// The session's pack of small bodies (`pack.zig`): the open file, the
+    /// index over it, and the append point. `pack_dirty` means records were
+    /// written since the last sync; the next line that names one syncs first.
+    pack_file: ?storage.File = null,
+    pack_index: pack.Index = .{},
+    pack_end: u64 = 0,
+    pack_loaded: bool = false,
+    pack_dirty: bool = false,
 
     identity: Identity,
     /// Under `mutex`.
@@ -394,6 +404,7 @@ pub const Session = struct {
                 }
             },
             .live => |*live| {
+                try session.syncPack();
                 try session.checkBlobRefs(live, bodies);
                 try session.writeBodies(live, bodies, ts, .host);
                 try session.maybeSnapshot(live, bodies, ts);
@@ -469,7 +480,7 @@ pub const Session = struct {
         defer session.mutex.unlock(io);
         if (!session.import or session.phase != .held or session.bounds.items.len < 2) return error.InvalidTransition;
         // Nothing is visible; later calls name the cause (D40).
-        const live = session.stage(null) catch |err| {
+        const live = session.stage(null, null) catch |err| {
             session.phase = .{ .failed = null };
             if (session.fault == null) session.fault = asIoFault(err);
             return err;
@@ -519,7 +530,7 @@ pub const Session = struct {
         const first_batch_seq = 2 + session.held_lines;
         for (bodies, 0..) |body, i| try session.frameMarked(first_batch_seq + i, ts, body);
 
-        const live = try session.stage(null);
+        const live = try session.stage(null, null);
 
         // Fold the batch; line 1 has no state and the held lines are folded.
         for (bodies, 0..) |body, i| {
@@ -543,7 +554,7 @@ pub const Session = struct {
     /// source, a synced log, the lock, a synced folder, the rename into
     /// place, and a synced root. Only then is the session visible, always
     /// with a durable first line (`tests/tla/session_manager/Lifecycle.tla`).
-    fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
+    fn stage(session: *Session, source_blobs: ?storage.Dir, source_dir: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
         const tmp = s.ensureDir(env.root, ".tmp") catch |io_err| return storage.ioFault(io_err);
@@ -552,6 +563,7 @@ pub const Session = struct {
         const dir = if (session.staged) |staged| staged else try session.makeStaging(tmp);
         session.staged = null;
         errdefer s.closeDir(dir);
+        if (source_dir) |source| pack.copyInto(s, source, dir, env.gpa) catch |err| return packWriteError(err);
         {
             const blobs = s.ensureDir(dir, "blobs") catch |io_err| return storage.ioFault(io_err);
             defer s.closeDir(blobs);
@@ -646,6 +658,228 @@ pub const Session = struct {
         return session.storeBlob(.{ .file = .{ .file = file, .len = len } });
     }
 
+    /// Stores a body of at most `pack.max_body_bytes` in the session's pack.
+    /// Its record is appended now; the next line that names it syncs the
+    /// pack first, so one sync covers a whole batch. A larger body is a file,
+    /// as `putBlob` stores it.
+    pub fn putSmall(session: *Session, bytes: []const u8) AppendError![schema.blob_hash_len]u8 {
+        if (bytes.len > pack.max_body_bytes) return session.putBlob(bytes);
+        const io = session.env.s.io;
+        session.mutex.lockUncancelable(io);
+        if (std.meta.activeTag(session.phase) == .live) {
+            defer session.mutex.unlock(io);
+            try session.appendPackRecord(bytes);
+        } else {
+            session.mutex.unlock(io);
+            return session.putBlob(bytes);
+        }
+        return schema.blobHash(bytes);
+    }
+
+    fn appendPackRecord(session: *Session, bytes: []const u8) AppendError!void {
+        const env = session.env;
+        const digest = pack.digestOf(bytes);
+        const file = try session.packFile();
+        if (session.pack_index.lookup(digest) != null) return;
+        const offset = session.pack_end;
+        const end = pack.appendRecord(env.s, file, offset, digest, bytes) catch |err| return storage.ioFault(err);
+        session.pack_end = end;
+        session.pack_dirty = true;
+        if (session.pack_index.end == offset) {
+            session.pack_index.insert(env.gpa, digest, .{
+                .offset = offset + @as(u64, pack.header_len),
+                .len = @intCast(bytes.len),
+                .crc = log_mod.crc32c(bytes),
+            }) catch return error.OutOfMemory;
+            session.pack_index.end = end;
+        }
+    }
+
+    /// The bytes of a blob the session holds, as a file or a packed body,
+    /// checked against the name. The caller owns the result.
+    pub fn blob(session: *Session, gpa: std.mem.Allocator, hash: []const u8) BlobError![]u8 {
+        const io = session.env.s.io;
+        session.mutex.lockUncancelable(io);
+        defer session.mutex.unlock(io);
+        const live = switch (session.phase) {
+            .live => |*l| l,
+            else => return readBlob(session.env, gpa, session.identity.id, hash),
+        };
+        const s = session.env.s;
+        const blobs = s.openDir(live.dir, "blobs") catch |err| return notFoundOr(err);
+        defer s.closeDir(blobs);
+        return readBlobIn(s, blobs, gpa, hash) catch |err| switch (err) {
+            error.NotFound => session.readPacked(gpa, live.dir, hash),
+            else => |e| e,
+        };
+    }
+
+    /// A packed body of the live session, read through its index.
+    fn readPacked(session: *Session, gpa: std.mem.Allocator, dir: storage.Dir, hash: []const u8) BlobError![]u8 {
+        const s = session.env.s;
+        const key = pack.keyOf(hash) orelse return error.NotFound;
+        const file = (session.openPack(dir) catch |err| return storage.ioFault(err)) orelse return error.NotFound;
+        const len = s.length(file) catch |err| return storage.ioFault(err);
+        session.pack_index.extend(gpa, s, file, len) catch |err| return packReadError(err);
+        const loc = (session.pack_index.find(key) catch return error.Corrupt) orelse return error.NotFound;
+        const body = pack.readBody(s, file, gpa, loc) catch |err| return packReadError(err);
+        const actual = schema.blobHash(body);
+        if (!std.mem.eql(u8, &actual, hash)) {
+            gpa.free(body);
+            return error.Corrupt;
+        }
+        return body;
+    }
+
+    /// The pack in the live folder `dir`, opened once and kept by the
+    /// session; null when the session has none yet.
+    fn openPack(session: *Session, dir: storage.Dir) storage.Error!?storage.File {
+        if (session.pack_file) |file| return file;
+        const file = session.env.s.openFile(dir, pack.file_name, .read_write) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => |e| return e,
+        };
+        session.pack_file = file;
+        return file;
+    }
+
+    /// The pack open for appends, created on first use. The first use also
+    /// measures the good prefix and cuts a torn tail after it, so an append
+    /// never lands behind damage (RULES.md R3.4).
+    fn packFile(session: *Session) AppendError!storage.File {
+        const live = switch (session.phase) {
+            .live => |*l| l,
+            else => return error.InvalidTransition,
+        };
+        const s = session.env.s;
+        const file = (session.openPack(live.dir) catch |err| return storage.ioFault(err)) orelse blk: {
+            const created = s.createFile(live.dir, pack.file_name) catch |err| return storage.ioFault(err);
+            session.pack_file = created;
+            break :blk created;
+        };
+        session.loadPack(live.dir, file) catch |err| switch (err) {
+            error.Corrupt => return error.Io,
+            else => |e| return e,
+        };
+        return file;
+    }
+
+    /// The writable open's share of the pack: cuts a torn tail. A session
+    /// without a pack has nothing to cut.
+    fn recoverPack(session: *Session) OpenPackError!void {
+        const live = switch (session.phase) {
+            .live => |*l| l,
+            else => return,
+        };
+        const file = (session.openPack(live.dir) catch |err| return storage.ioFault(err)) orelse {
+            session.pack_loaded = true;
+            return;
+        };
+        try session.loadPack(live.dir, file);
+    }
+
+    /// Measures the good prefix of a writable pack once per session, and cuts
+    /// what follows it. The one rule: a record that a durable log line names
+    /// is never cut. Before any cut at a damaged record, the log is checked,
+    /// and a named body the good prefix lacks refuses the open with nothing
+    /// cut. A torn tail from a crash is never named, so it is cut.
+    fn loadPack(session: *Session, dir: storage.Dir, file: storage.File) OpenPackError!void {
+        if (session.pack_loaded) return;
+        const s = session.env.s;
+        const walked = pack.walk(s, file) catch |err| return packOpenError(err);
+        if (walked.bad_at) |bad| {
+            if (try session.logNamesPastDamage(dir, file, bad)) return error.Corrupt;
+        }
+        session.pack_end = walked.end;
+        const len = s.length(file) catch |err| return storage.ioFault(err);
+        if (len > walked.end) {
+            s.setLength(file, walked.end) catch |err| return storage.ioFault(err);
+            s.sync(file) catch |err| return storage.ioFault(err);
+            session.pack_index.deinit(session.env.gpa);
+            session.pack_index = .{};
+        }
+        session.pack_loaded = true;
+    }
+
+    /// Whether a durable log line names a body that the pack's good prefix,
+    /// which ends at `bad`, does not hold, and that is not a blob file. Such a
+    /// body lies at or after the damage, so the cut would lose it.
+    fn logNamesPastDamage(session: *Session, dir: storage.Dir, file: storage.File, bad: u64) OpenPackError!bool {
+        const s = session.env.s;
+        const gpa = session.env.gpa;
+        var good: pack.Index = .{};
+        defer good.deinit(gpa);
+        good.extend(gpa, s, file, bad) catch |err| return packOpenError(err);
+        const log_file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return storage.ioFault(err);
+        defer s.closeFile(log_file);
+        const log_len = s.length(log_file) catch |err| return storage.ioFault(err);
+        const log = try gpa.alloc(u8, @intCast(log_len));
+        defer gpa.free(log);
+        const got = pack.readExact(s, log_file, log, 0) catch |err| return storage.ioFault(err);
+        if (got != log.len) return error.Io;
+        const blobs = s.openDir(dir, "blobs") catch |err| return storage.ioFault(err);
+        defer s.closeDir(blobs);
+        var at: usize = 0;
+        while (at < log.len) {
+            if (!isLowerHex(log[at])) {
+                at += 1;
+                continue;
+            }
+            var end = at;
+            while (end < log.len and isLowerHex(log[end])) end += 1;
+            if (end - at == schema.blob_hash_len) {
+                const name = log[at..end];
+                if (pack.keyOf(name)) |key| {
+                    if (good.lookup(key) == null) {
+                        if (!try blobFileExists(s, blobs, name)) return true;
+                    }
+                }
+            }
+            at = end;
+        }
+        return false;
+    }
+
+    /// Syncs the pack when records were appended since its last sync. A
+    /// failed sync leaves them pending, and no line names them.
+    fn syncPack(session: *Session) AppendError!void {
+        if (!session.pack_dirty) return;
+        const file = session.pack_file orelse return;
+        session.env.s.sync(file) catch |err| return storage.ioFault(err);
+        session.pack_dirty = false;
+    }
+
+    /// The record of a packed body named `hash`, or null when the live
+    /// session's pack does not hold it. The index is extended to the file's
+    /// current length first, so a read walks only records it has not seen.
+    fn packLookup(session: *Session, hash: []const u8) AppendError!?pack.Loc {
+        const live = switch (session.phase) {
+            .live => |*l| l,
+            else => return null,
+        };
+        const key = pack.keyOf(hash) orelse return null;
+        const s = session.env.s;
+        const file = (session.openPack(live.dir) catch |err| return storage.ioFault(err)) orelse return null;
+        const len = s.length(file) catch |err| return storage.ioFault(err);
+        session.pack_index.extend(session.env.gpa, s, file, len) catch |err| return packWriteError(err);
+        return session.pack_index.lookup(key);
+    }
+
+    /// The version of a line that names `body`'s blobs: `pack_version` when
+    /// one of them is packed, so an older reader stops at the line.
+    fn lineVersion(session: *Session, body: schema.Body) AppendError!u32 {
+        for (body.blobRefs()) |hash| {
+            if (try session.packLookup(hash) != null) return schema.pack_version;
+        }
+        return schema.plain_version;
+    }
+
+    /// Records this handle's index has read from the pack, for the tests
+    /// that count the walk.
+    pub fn packWalked(session: *const Session) u64 {
+        return session.pack_index.walked;
+    }
+
     const BlobSource = union(enum) {
         bytes: []const u8,
         file: struct { file: std.Io.File, len: u64 },
@@ -718,7 +952,8 @@ pub const Session = struct {
         defer s.closeDir(dir);
         for (bodies) |body| for (body.blobRefs()) |hash| {
             if (!schema.validBlobHash(hash)) return error.InvalidTransition;
-            _ = s.stat(dir, hash) catch return error.InvalidTransition;
+            if (s.stat(dir, hash)) |_| continue else |_| {}
+            if (try session.packLookup(hash) == null) return error.InvalidTransition;
         };
     }
 
@@ -819,7 +1054,8 @@ pub const Session = struct {
         var fields: std.ArrayList(u8) = .empty;
         defer fields.deinit(gpa);
         try schema.appendBody(gpa, &fields, body);
-        log_mod.appendLine(gpa, out, seq, ts, std.meta.activeTag(body), fields.items) catch |err| switch (err) {
+        const v = try session.lineVersion(body);
+        log_mod.appendLineAt(gpa, out, v, seq, ts, std.meta.activeTag(body), fields.items) catch |err| switch (err) {
             error.TooLarge => return error.TooLarge,
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -931,6 +1167,9 @@ pub const Session = struct {
             },
             .live => |*live| {
                 var result: AppendError!void = {};
+                session.syncPack() catch |err| {
+                    result = err;
+                };
                 var bodies_buffer: [2]schema.Body = undefined;
                 var n: usize = 0;
                 if (session.state.open_turn) |turn| {
@@ -957,6 +1196,12 @@ pub const Session = struct {
 
     fn release(session: *Session, live: Live) void {
         const s = session.env.s;
+        if (session.pack_file) |file| {
+            s.closeFile(file);
+            session.pack_file = null;
+        }
+        session.pack_index.deinit(session.env.gpa);
+        session.pack_index = .{};
         session.setSyncFile(null, session.synced_seq);
         var log = live.log;
         s.unlock(live.lock);
@@ -1192,6 +1437,10 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
     };
     session.written_seq.store(session.env.s.io, session.state.last_seq);
     session.setSyncFile(parts.log.file, session.state.last_seq);
+    session.recoverPack() catch |err| {
+        session.abandon();
+        return err;
+    };
     repair(session, options.workspace) catch |err| {
         session.abandon();
         return switch (err) {
@@ -1659,7 +1908,240 @@ pub fn readBlob(env: *const Env, gpa: std.mem.Allocator, id_: []const u8, hash: 
     defer s.closeDir(dir);
     const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
     defer s.closeDir(blobs);
-    return readBlobIn(s, blobs, gpa, hash);
+    return readBlobIn(s, blobs, gpa, hash) catch |err| switch (err) {
+        error.NotFound => readPackedIn(s, dir, gpa, hash),
+        else => |e| e,
+    };
+}
+
+/// A packed body of the session in folder `dir`, through a transient index:
+/// one header walk per call, for callers with no open session. Readers of a
+/// session they hold use `Session.blob`.
+fn readPackedIn(s: storage.Storage, dir: storage.Dir, gpa: std.mem.Allocator, hash: []const u8) BlobError![]u8 {
+    const key = pack.keyOf(hash) orelse return error.NotFound;
+    const file = s.openFile(dir, pack.file_name, .read_only) catch |err| return notFoundOr(err);
+    defer s.closeFile(file);
+    const len = s.length(file) catch |err| return storage.ioFault(err);
+    var index: pack.Index = .{};
+    defer index.deinit(gpa);
+    index.extend(gpa, s, file, len) catch |err| return packReadError(err);
+    const loc = (index.find(key) catch return error.Corrupt) orelse return error.NotFound;
+    const body = pack.readBody(s, file, gpa, loc) catch |err| return packReadError(err);
+    const actual = schema.blobHash(body);
+    if (!std.mem.eql(u8, &actual, hash)) {
+        gpa.free(body);
+        return error.Corrupt;
+    }
+    return body;
+}
+
+/// `readBlob` for readers with no open session, such as `Manager.getBlob`.
+/// Packed bodies are found through `cache`, which keeps one index and one open
+/// file per session between reads, so a read walks only the records appended
+/// since the last. A small body is tried in the pack first.
+pub fn readBlobCached(env: *const Env, gpa: std.mem.Allocator, cache: *PackCache, id_: []const u8, hash: []const u8) BlobError![]u8 {
+    const s = env.s;
+    if (!schema.validId(id_) or !schema.validBlobHash(hash)) return error.NotFound;
+    const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
+    defer s.closeDir(dir);
+    if (try cache.readPacked(gpa, id_, dir, hash, false)) |bytes| return bytes;
+    const blobs = s.openDir(dir, "blobs") catch |err| return notFoundOr(err);
+    defer s.closeDir(blobs);
+    return readBlobIn(s, blobs, gpa, hash) catch |err| switch (err) {
+        error.NotFound => {
+            const found = try cache.readPacked(gpa, id_, dir, hash, true);
+            return found orelse error.NotFound;
+        },
+        else => |e| e,
+    };
+}
+
+/// The packs that lock-free readers have indexed, one per session. An entry
+/// is trusted while the pack is not shorter than its index and the header of
+/// its last record is unchanged (a cut pack, grown again, is rebuilt).
+pub const PackCache = struct {
+    gpa: std.mem.Allocator,
+    s: storage.Storage,
+    mutex: std.Io.Mutex = .init,
+    entries: std.StringHashMapUnmanaged(Cached) = .empty,
+
+    const Cached = struct {
+        index: pack.Index = .{},
+        last_header: [pack.header_len]u8 = @splat(0),
+        /// Records read for this session, kept across rebuilds of `index`.
+        walked: u64 = 0,
+        /// The pack's length when it was last read. An unchanged length means
+        /// nothing was appended or cut since, so the index is current.
+        len: u64 = 0,
+        /// The pack length at which a strict miss last rebuilt `index`. A second
+        /// miss at that length reports at once: the rebuild already saw the file.
+        rebuilt_len: ?u64 = null,
+        /// The pack, open for the reads of this session until it is evicted.
+        file: ?storage.File = null,
+    };
+
+    pub fn deinit(cache: *PackCache) void {
+        var it = cache.entries.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.index.deinit(cache.gpa);
+            if (kv.value_ptr.file) |file| cache.s.closeFile(file);
+            cache.gpa.free(kv.key_ptr.*);
+        }
+        cache.entries.deinit(cache.gpa);
+    }
+
+    /// Records read from packs so far, summed over the cached sessions.
+    fn walked(cache: *const PackCache) u64 {
+        var total: u64 = 0;
+        var it = cache.entries.valueIterator();
+        while (it.next()) |entry| total += entry.walked;
+        return total;
+    }
+
+    /// The body of `hash` from session `id`'s pack, or null when the pack does
+    /// not index it. `strict` makes a miss in a damaged pack corrupt, since the
+    /// body may lie past the damage.
+    /// A body whose index entry is stale (the pack was cut and regrown to the
+    /// same length) misses or fails its name. A strict miss drops the index and
+    /// rebuilds it from the file, at most once per pack length, so a stale index
+    /// never reports a body missing or damaged, and a missing body costs one
+    /// walk per length, not one per read. A pack-first read never rebuilds: a
+    /// body it misses is usually a blob file.
+    fn readPacked(cache: *PackCache, gpa: std.mem.Allocator, id: []const u8, dir: storage.Dir, hash: []const u8, strict: bool) BlobError!?[]u8 {
+        const key = pack.keyOf(hash) orelse return null;
+        const s = cache.s;
+        cache.mutex.lockUncancelable(s.io);
+        defer cache.mutex.unlock(s.io);
+        while (true) {
+            const entry = cache.refresh(id, dir) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => |e| return e,
+            };
+            var corrupt = false;
+            if (cache.lookupBody(entry, gpa, key, hash)) |found| {
+                if (found) |bytes| return bytes;
+            } else |err| switch (err) {
+                error.Corrupt => corrupt = true,
+                else => |e| return e,
+            }
+            if (!strict) return null;
+            if (entry.rebuilt_len == entry.len) {
+                if (corrupt or entry.index.damaged) return error.Corrupt;
+                return null;
+            }
+            entry.rebuilt_len = entry.len;
+            cache.forget(entry);
+        }
+    }
+
+    fn lookupBody(cache: *PackCache, entry: *Cached, gpa: std.mem.Allocator, key: [32]u8, hash: []const u8) BlobError!?[]u8 {
+        const loc = entry.index.lookup(key) orelse return null;
+        const body = pack.readBody(cache.s, entry.file.?, gpa, loc) catch |err| return packReadError(err);
+        const actual = schema.blobHash(body);
+        if (!std.mem.eql(u8, &actual, hash)) {
+            gpa.free(body);
+            return error.Corrupt;
+        }
+        return body;
+    }
+
+    /// Drops a session's index, so its next refresh rebuilds it from the file.
+    fn forget(cache: *PackCache, entry: *Cached) void {
+        entry.index.deinit(cache.gpa);
+        entry.index = .{};
+        entry.len = 0;
+    }
+
+    /// The session's entry, with its index brought up to the pack's length.
+    /// Caller holds the mutex. NotFound when the session has no pack.
+    fn refresh(cache: *PackCache, id: []const u8, dir: storage.Dir) BlobError!*Cached {
+        const s = cache.s;
+        const entry = try cache.entryFor(id);
+        if (entry.file == null) {
+            entry.file = s.openFile(dir, pack.file_name, .read_only) catch |err| return notFoundOr(err);
+        }
+        const file = entry.file.?;
+        const len = s.length(file) catch |err| return storage.ioFault(err);
+        if (len == entry.len) return entry;
+        if (entry.index.end > 0) {
+            var header: [pack.header_len]u8 = undefined;
+            const n = pack.readExact(s, file, &header, entry.index.last) catch |err| return storage.ioFault(err);
+            if (n != header.len or !std.mem.eql(u8, &header, &entry.last_header)) {
+                entry.index.deinit(cache.gpa);
+                entry.index = .{};
+            }
+        }
+        const before = entry.index.walked;
+        entry.index.extend(cache.gpa, s, file, len) catch |err| return packReadError(err);
+        entry.walked += entry.index.walked - before;
+        if (entry.index.end > 0) {
+            const n = pack.readExact(s, file, &entry.last_header, entry.index.last) catch |err| return storage.ioFault(err);
+            if (n != entry.last_header.len) return error.Corrupt;
+        }
+        entry.len = len;
+        return entry;
+    }
+
+    fn entryFor(cache: *PackCache, id: []const u8) BlobError!*Cached {
+        if (cache.entries.getPtr(id)) |entry| return entry;
+        if (cache.entries.count() >= pack.max_cached_sessions) cache.evictOne();
+        const key = try cache.gpa.dupe(u8, id);
+        errdefer cache.gpa.free(key);
+        try cache.entries.put(cache.gpa, key, .{});
+        return cache.entries.getPtr(key).?;
+    }
+
+    fn evictOne(cache: *PackCache) void {
+        var it = cache.entries.iterator();
+        const first = it.next() orelse return;
+        const removed = cache.entries.fetchRemove(first.key_ptr.*) orelse return;
+        var index = removed.value.index;
+        index.deinit(cache.gpa);
+        if (removed.value.file) |file| cache.s.closeFile(file);
+        cache.gpa.free(removed.key);
+    }
+};
+
+fn packReadError(err: pack.ReadError) BlobError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        else => |e| storage.ioFault(e),
+    };
+}
+
+/// A pack failure on the append path. A damaged pack cannot take the
+/// append, so it is reported as an I/O fault.
+/// The writable open's share of the pack. A damaged pack refuses the open:
+/// the writer cuts nothing, and readers still reach the bodies before the damage.
+const OpenPackError = error{ Corrupt, OutOfMemory } || storage.IoFault;
+
+fn packOpenError(err: pack.ReadError) OpenPackError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        else => |e| storage.ioFault(e),
+    };
+}
+
+fn isLowerHex(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+}
+
+fn blobFileExists(s: storage.Storage, blobs: storage.Dir, name: []const u8) OpenPackError!bool {
+    _ = s.stat(blobs, name) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => |e| return storage.ioFault(e),
+    };
+    return true;
+}
+
+fn packWriteError(err: pack.ReadError) (error{OutOfMemory} || storage.IoFault) {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Io,
+        else => |e| storage.ioFault(e),
+    };
 }
 
 /// `readBlob` within a session's open blobs folder. The caller owns the
@@ -1860,7 +2342,7 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
         else => |io_err| return storage.ioFault(io_err),
     };
     defer if (blobs) |b| s.closeDir(b);
-    const live = session.stage(blobs) catch |err| return forkError(err);
+    const live = session.stage(blobs, src_dir) catch |err| return forkError(err);
     session.phase = .{ .live = live };
     session.wrote(created);
     session.written_seq.store(session.env.s.io, seq);
@@ -1939,7 +2421,7 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
         else => |io_err| return storage.ioFault(io_err),
     };
     defer if (blobs) |b| s.closeDir(b);
-    const live = session.stage(blobs) catch |err| return forkError(err);
+    const live = session.stage(blobs, src_dir) catch |err| return forkError(err);
     session.phase = .{ .live = live };
     session.wrote(created);
     session.written_seq.store(session.env.s.io, seq);
@@ -2363,6 +2845,8 @@ const BlobChecker = struct {
     s: storage.Storage,
     session_dir: storage.Dir,
     mode: @FieldType(VerifyOptions, "blobs"),
+    pack_file: ?storage.File = null,
+    pack_index: pack.Index = .{},
     folder: union(enum) { unopened, missing, open: storage.Dir } = .unopened,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     names: std.heap.ArenaAllocator,
@@ -2372,9 +2856,39 @@ const BlobChecker = struct {
     }
 
     fn deinit(c: *BlobChecker, gpa: std.mem.Allocator) void {
+        if (c.pack_file) |file| c.s.closeFile(file);
+        c.pack_index.deinit(gpa);
         if (c.folder == .open) c.s.closeDir(c.folder.open);
         c.seen.deinit(gpa);
         c.names.deinit();
+    }
+
+    /// `whole` for a body packed in the session: null when no pack holds it.
+    fn packedWhole(c: *BlobChecker, gpa: std.mem.Allocator, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!?bool {
+        const key = pack.keyOf(hash) orelse return null;
+        if (c.pack_file == null) {
+            c.pack_file = c.s.openFile(c.session_dir, pack.file_name, .read_only) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => |e| return storage.ioFault(e),
+            };
+        }
+        const file = c.pack_file.?;
+        const len = c.s.length(file) catch |err| return storage.ioFault(err);
+        c.pack_index.extend(gpa, c.s, file, len) catch |err| switch (err) {
+            error.Corrupt => return false,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return storage.ioFault(e),
+        };
+        const loc = (c.pack_index.find(key) catch return false) orelse return null;
+        if (c.mode == .exists) return true;
+        const body = pack.readBody(c.s, file, gpa, loc) catch |err| switch (err) {
+            error.Corrupt => return false,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| return storage.ioFault(e),
+        };
+        defer gpa.free(body);
+        const actual = schema.blobHash(body);
+        return std.mem.eql(u8, &actual, hash);
     }
 
     /// Whether the blob is present and, in `hash` mode, matches its name.
@@ -2383,6 +2897,7 @@ const BlobChecker = struct {
         if (c.seen.contains(hash)) return true;
         try c.seen.put(gpa, try c.names.allocator().dupe(u8, hash), {});
         if (!schema.validBlobHash(hash)) return false;
+        if (try c.packedWhole(gpa, hash)) |present| return present;
         const blobs = switch (c.folder) {
             .open => |dir| dir,
             .missing => return false,
@@ -2573,6 +3088,601 @@ const session_tests = struct {
     };
 
     /// fx dies: nothing more is written, and the kernel drops the flock.
+    fn readPack(t: *TestEnv, id: []const u8) !?[]u8 {
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/{s}", .{ id, pack.file_name });
+        return t.tmp.dir.readFileAlloc(io, visible, gpa, .limited(8 << 20)) catch null;
+    }
+
+    test "a lock-free read through the cache walks only the records appended since its last read" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("first");
+        const refs = [_][]const u8{&first};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        var cache: PackCache = .{ .gpa = gpa, .s = t.env.s };
+        defer cache.deinit();
+        const one = try readBlobCached(&t.env, gpa, &cache, id, &first);
+        defer gpa.free(one);
+        const walked = cache.walked();
+
+        const writer = try resumeRoot(&t, id);
+        const second = try writer.putSmall("second");
+        const more = [_][]const u8{&second};
+        _ = try writer.append(&.{ .turn_started, itemWith(&more), .turn_committed });
+        try closeAndDestroy(writer);
+
+        const two = try readBlobCached(&t.env, gpa, &cache, id, &second);
+        defer gpa.free(two);
+        try testing.expectEqualStrings("second", two);
+        try testing.expectEqual(walked + 1, cache.walked());
+    }
+
+    fn writePack(t: *TestEnv, id: []const u8, bytes: []const u8) !void {
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/{s}", .{ id, pack.file_name });
+        try t.tmp.dir.writeFile(io, .{ .sub_path = visible, .data = bytes });
+    }
+
+    fn setPackU32(t: *TestEnv, id: []const u8, offset: usize, value: u32) !void {
+        const bytes = (try readPack(t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(bytes);
+        std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
+        try writePack(t, id, bytes);
+    }
+
+    test "an unsynced batch whose first record is torn and whose second is complete, named by no line, is cut on a writable open" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const named = try s.putSmall("one body");
+        const refs = [_][]const u8{&named};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const whole = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(whole);
+        // The batch's first record never reached the disk; its second did.
+        const second = pack.encodeHeader(pack.digestOf("new body"), "new body");
+        const torn_len = pack.header_len + "new body".len;
+        const bytes = try gpa.alloc(u8, whole.len + torn_len + pack.header_len + "new body".len);
+        defer gpa.free(bytes);
+        @memcpy(bytes[0..whole.len], whole);
+        @memset(bytes[whole.len..][0..torn_len], 0);
+        @memcpy(bytes[whole.len + torn_len ..][0..pack.header_len], &second);
+        @memcpy(bytes[whole.len + torn_len + pack.header_len ..], "new body");
+        try writePack(&t, id, bytes);
+
+        try closeAndDestroy(try resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, whole, after);
+    }
+
+    test "a mid-pack length flip with later bodies named by lines opens read-only, cuts nothing, and earlier bodies still read" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const third = try s.putSmall("three body");
+        const refs = [_][]const u8{ &first, &second, &third };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        // The second record's length now runs 3000 bytes past the end of the pack.
+        const length_at = pack.header_len + "one body".len + 36;
+        try setPackU32(&t, id, length_at, @intCast("two body".len + 3000));
+        const flipped = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(flipped);
+        try testing.expectError(error.Corrupt, resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, flipped, after);
+
+        const one = try readBlob(&t.env, gpa, id, &first);
+        defer gpa.free(one);
+        try testing.expectEqualStrings("one body", one);
+        const verified = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 2), verified.bad_blobs);
+    }
+
+    test "a same-length regrow is found: a stale cached index is rebuilt before a missing body is reported" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        var cache: PackCache = .{ .gpa = gpa, .s = t.env.s };
+        defer cache.deinit();
+        const one = try readBlobCached(&t.env, gpa, &cache, id, &first);
+        gpa.free(one);
+        const two = try readBlobCached(&t.env, gpa, &cache, id, &second);
+        gpa.free(two);
+
+        // The pack is cut back to its first record, then regrown to the same
+        // length with another body: the cache sees no change in length.
+        const whole = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(whole);
+        const regrown = try gpa.alloc(u8, whole.len);
+        defer gpa.free(regrown);
+        const first_len = pack.header_len + "one body".len;
+        @memcpy(regrown[0..first_len], whole[0..first_len]);
+        const fresh = pack.encodeHeader(pack.digestOf("new body"), "new body");
+        @memcpy(regrown[first_len..][0..pack.header_len], &fresh);
+        @memcpy(regrown[first_len + pack.header_len ..], "new body");
+        try writePack(&t, id, regrown);
+
+        const fresh_name = schema.blobHash("new body");
+        const found = try readBlobCached(&t.env, gpa, &cache, id, &fresh_name);
+        defer gpa.free(found);
+        try testing.expectEqualStrings("new body", found);
+        const gone = schema.blobHash("two body");
+        try testing.expectError(error.NotFound, readBlobCached(&t.env, gpa, &cache, id, &gone));
+    }
+
+    fn corruptPackByte(t: *TestEnv, id: []const u8, offset: usize) !void {
+        const bytes = (try readPack(t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(bytes);
+        bytes[offset] ^= 1;
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/{s}", .{ id, pack.file_name });
+        try t.tmp.dir.writeFile(io, .{ .sub_path = visible, .data = bytes });
+    }
+
+    fn readSessionLog(t: *TestEnv, id: []const u8) !?[]u8 {
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/log.jsonl", .{id});
+        return t.tmp.dir.readFileAlloc(io, visible, gpa, .limited(8 << 20)) catch null;
+    }
+
+    test "a body of at most 4 KiB is packed, and a larger one stays a file" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const small: [pack.max_body_bytes]u8 = @splat('s');
+        const small_hash = try s.putSmall(&small);
+        const large: [pack.max_body_bytes + 1]u8 = @splat('l');
+        const large_hash = try s.putSmall(&large);
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+        try testing.expectError(error.NotFound, blobExists(&t.env, id, &small_hash));
+        try blobExists(&t.env, id, &large_hash);
+    }
+
+    test "a small body is packed, read back by its name, and its line is v2" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putSmall("a small tool output");
+        const refs = [_][]const u8{&hash};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const body = try readBlob(&t.env, gpa, id, &hash);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("a small tool output", body);
+        const pack_bytes = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(pack_bytes);
+        const log = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.indexOf(u8, log, "\"v\":2") != null);
+        try testing.expect(std.mem.indexOf(u8, log, "\"v\":1") != null);
+    }
+
+    test "a crash after a packed body and before its line leaves the body unreferenced" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putSmall("staged, never named");
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        crash(&t, s);
+
+        const log = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.indexOf(u8, log, &hash) == null);
+        try closeAndDestroy(try resumeRoot(&t, id));
+        const verified = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 0), verified.bad_blobs);
+    }
+
+    test "a torn pack tail is cut on a writable open, after the last good record" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const whole = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(whole);
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/{s}", .{ id, pack.file_name });
+        // A record cut off in the middle of its header, as a crash mid-append leaves it.
+        const torn = try gpa.alloc(u8, whole.len + 7);
+        defer gpa.free(torn);
+        @memcpy(torn[0..whole.len], whole);
+        @memcpy(torn[whole.len..], "FXB1\x00\x00\x00");
+        try t.tmp.dir.writeFile(io, .{ .sub_path = visible, .data = torn });
+
+        try closeAndDestroy(try resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqual(whole.len, after.len);
+        const body = try readBlob(&t.env, gpa, id, &second);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("two body", body);
+    }
+
+    test "a named last record whose body fails its CRC opens read-only, and nothing is cut" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        try corruptPackByte(&t, id, 2 * pack.header_len + "one body".len + 1);
+        const flipped = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(flipped);
+        try testing.expectError(error.Corrupt, resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, flipped, after);
+    }
+
+    test "an unnamed last record whose body fails its CRC is cut on a writable open" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const refs = [_][]const u8{&first};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        _ = try s.putSmall("two body");
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        try corruptPackByte(&t, id, pack.header_len + "one body".len + pack.header_len + 1);
+        try closeAndDestroy(try resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqual(pack.header_len + "one body".len, after.len);
+    }
+
+    test "two reads of a missing hash rebuild the index once: the second reports at once, with no walk" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        var cache: PackCache = .{ .gpa = gpa, .s = t.env.s };
+        defer cache.deinit();
+        const one = try readBlobCached(&t.env, gpa, &cache, id, &first);
+        gpa.free(one);
+        const missing = schema.blobHash("no such body");
+        try testing.expectError(error.NotFound, readBlobCached(&t.env, gpa, &cache, id, &missing));
+        const after_first = cache.walked();
+        try testing.expectError(error.NotFound, readBlobCached(&t.env, gpa, &cache, id, &missing));
+        try testing.expectEqual(after_first, cache.walked());
+    }
+
+    test "a reader sees an incomplete trailing record as not there yet: it reads every earlier body and cuts nothing" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        // A writer mid-append: a whole header for a third body, and only four
+        // of its body bytes so far.
+        const whole = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(whole);
+        const header = pack.encodeHeader(pack.digestOf("three body"), "three body");
+        const torn = try gpa.alloc(u8, whole.len + header.len + 4);
+        defer gpa.free(torn);
+        @memcpy(torn[0..whole.len], whole);
+        @memcpy(torn[whole.len..][0..header.len], &header);
+        @memcpy(torn[whole.len + header.len ..], "thre");
+        var path: [300]u8 = undefined;
+        const visible = try std.mem.print(&path, "{s}/{s}", .{ id, pack.file_name });
+        try t.tmp.dir.writeFile(io, .{ .sub_path = visible, .data = torn });
+
+        var cache: PackCache = .{ .gpa = gpa, .s = t.env.s };
+        defer cache.deinit();
+        const one = try readBlobCached(&t.env, gpa, &cache, id, &first);
+        defer gpa.free(one);
+        try testing.expectEqualStrings("one body", one);
+        const two = try readBlob(&t.env, gpa, id, &second);
+        defer gpa.free(two);
+        try testing.expectEqualStrings("two body", two);
+        const third_name = schema.blobHash("three body");
+        try testing.expectError(error.NotFound, readBlob(&t.env, gpa, id, &third_name));
+        try testing.expectEqual(@as(u64, 2), cache.walked());
+        const verified = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 0), verified.bad_blobs);
+
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, torn, after);
+    }
+
+    test "a mid-pack body that fails its CRC is reported alone: later bodies still read and nothing is cut" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const third = try s.putSmall("three body");
+        const refs = [_][]const u8{ &first, &second, &third };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        try corruptPackByte(&t, id, 2 * pack.header_len + "one body".len + 1);
+        const flipped = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(flipped);
+        try closeAndDestroy(try resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, flipped, after);
+
+        const one = try readBlob(&t.env, gpa, id, &first);
+        defer gpa.free(one);
+        try testing.expectEqualStrings("one body", one);
+        const last = try readBlob(&t.env, gpa, id, &third);
+        defer gpa.free(last);
+        try testing.expectEqualStrings("three body", last);
+        try testing.expectError(error.Corrupt, readBlob(&t.env, gpa, id, &second));
+        const verified = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 1), verified.bad_blobs);
+    }
+
+    test "a damaged record header in the middle opens read-only: readers keep the bodies before it, the writer refuses, and nothing is cut" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one body");
+        const second = try s.putSmall("two body");
+        const third = try s.putSmall("three body");
+        const refs = [_][]const u8{ &first, &second, &third };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        // The middle record's magic: the walk cannot step past it, since its length is unknown.
+        try corruptPackByte(&t, id, pack.header_len + "one body".len);
+        const damaged = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(damaged);
+        try testing.expectError(error.Corrupt, resumeRoot(&t, id));
+        const after = (try readPack(&t, id)) orelse return error.TestExpectedPack;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, damaged, after);
+
+        const one = try readBlob(&t.env, gpa, id, &first);
+        defer gpa.free(one);
+        try testing.expectEqualStrings("one body", one);
+        try testing.expectError(error.Corrupt, readBlob(&t.env, gpa, id, &third));
+        const verified = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 2), verified.bad_blobs);
+    }
+
+    test "a packed body that fails its name's check is refused as corrupt" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putSmall("checked body");
+        const refs = [_][]const u8{&hash};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        try corruptPackByte(&t, id, pack.header_len + 3);
+        try testing.expectError(error.Corrupt, readBlob(&t.env, gpa, id, &hash));
+    }
+
+    test "a line naming a packed body is not written when the pack does not sync" {
+        if (!hooks) return error.SkipZigTest;
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putSmall("durable first");
+        const refs = [_][]const u8{&hash};
+        if (hooks) t.fault.fail_next_sync = true;
+        if (s.append(&.{ itemWith(&refs), .turn_committed })) |_| {
+            return error.TestExpectedSyncFailure;
+        } else |_| {}
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        crash(&t, s);
+
+        const log = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(log);
+        try testing.expect(std.mem.indexOf(u8, log, &hash) == null);
+    }
+
+    test "an older reader stops at the first line naming a packed body, and leaves the session unwritten" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putSmall("read by an older build");
+        const refs = [_][]const u8{&hash};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const before = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(before);
+        var older = log_mod.Scanner.init(0, null);
+        older.max_version = schema.plain_version;
+        var offset: usize = 0;
+        while (std.mem.findScalarPos(u8, before, offset, '\n')) |end| {
+            if (!older.line(before[offset .. end + 1], offset)) break;
+            offset = end + 1;
+        }
+        switch (older.stopped orelse return error.TestExpectedVerdict) {
+            .newer_version => |newer| try testing.expectEqual(schema.pack_version, newer.v),
+            else => return error.TestUnexpectedVerdict,
+        }
+        const after = (try readSessionLog(&t, id)) orelse return error.TestExpectedLog;
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
+
+    test "a fork copies the pack, and an append on either side never reaches the other" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const shared = try s.putSmall("shared pack body");
+        const refs = [_][]const u8{&shared};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const source = try gpa.dupe(u8, s.id());
+        defer gpa.free(source);
+        try closeAndDestroy(s);
+
+        const f = try session_mod.openFork(&t.env, .{ .source = source, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        const fork = try gpa.dupe(u8, f.id());
+        defer gpa.free(fork);
+        const forked_body = try readBlob(&t.env, gpa, fork, &shared);
+        defer gpa.free(forked_body);
+        try testing.expectEqualStrings("shared pack body", forked_body);
+        const fork_log = (try readSessionLog(&t, fork)) orelse return error.TestExpectedLog;
+        defer gpa.free(fork_log);
+        try testing.expect(std.mem.indexOf(u8, fork_log, "\"v\":2") != null);
+        const fork_only = try f.putSmall("only in the fork");
+        try closeAndDestroy(f);
+
+        const src = try resumeRoot(&t, source);
+        const source_only = try src.putSmall("only in the source");
+        try closeAndDestroy(src);
+        try testing.expectError(error.NotFound, readBlob(&t.env, gpa, source, &fork_only));
+        try testing.expectError(error.NotFound, readBlob(&t.env, gpa, fork, &source_only));
+    }
+
+    test "verify resolves refs against the pack, and a hash check counts a damaged packed body" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("one");
+        const second = try s.putSmall("two");
+        const refs = [_][]const u8{ &first, &second };
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+
+        const clean = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 0), clean.bad_blobs);
+        // The second record's body starts after the first record (header plus "one") and its own header.
+        try corruptPackByte(&t, id, 2 * pack.header_len + 3);
+        const damaged = try verifySession(&t.env, id, .{});
+        try testing.expectEqual(@as(u64, 1), damaged.bad_blobs);
+    }
+
+    test "a read after its own append walks no pack records" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{.turn_started});
+        const first = try s.putSmall("first");
+        const refs = [_][]const u8{&first};
+        _ = try s.append(&.{ itemWith(&refs), .turn_committed });
+        const one = try s.blob(gpa, &first);
+        defer gpa.free(one);
+        const walked = s.packWalked();
+
+        _ = try s.append(&.{.turn_started});
+        const second = try s.putSmall("second");
+        const more = [_][]const u8{&second};
+        _ = try s.append(&.{ itemWith(&more), .turn_committed });
+        const two = try s.blob(gpa, &second);
+        defer gpa.free(two);
+        try testing.expectEqualStrings("second", two);
+        try testing.expectEqual(walked, s.packWalked());
+        try closeAndDestroy(s);
+    }
+
     fn crash(t: *TestEnv, s: *Session) void {
         t.crashed = true;
         s.abandon();

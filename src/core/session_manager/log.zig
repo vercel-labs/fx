@@ -79,10 +79,23 @@ pub fn appendLine(
     kind: schema.Kind,
     body: []const u8,
 ) FrameError!void {
+    return appendLineAt(gpa, out, schema.plain_version, seq, ts_ms, kind, body);
+}
+
+/// `appendLine` at format version `v`.
+pub fn appendLineAt(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    v: u32,
+    seq: u64,
+    ts_ms: u64,
+    kind: schema.Kind,
+    body: []const u8,
+) FrameError!void {
     std.debug.assert(body.len == 0 or body[0] == ',');
     const start = out.items.len;
     errdefer out.shrinkRetainingCapacity(start);
-    try schema.appendHeader(gpa, out, seq, ts_ms, kind);
+    try schema.appendHeader(gpa, out, v, seq, ts_ms, kind);
     try out.appendSlice(gpa, body);
     try sealFrame(gpa, out, start);
 }
@@ -175,6 +188,9 @@ pub const Scanner = struct {
     /// A complete line that failed its checks: torn if nothing follows it.
     suspect: ?u64 = null,
     stopped: ?Verdict = null,
+    /// The newest format version this reader opens. A line above it stops
+    /// the scan, as an older build meets a newer session.
+    max_version: u32 = schema.version,
 
     pub fn init(offset: u64, next_seq: ?u64) Scanner {
         return .{ .next_seq = next_seq, .good_end = offset };
@@ -191,7 +207,7 @@ pub const Scanner = struct {
             sc.suspect = offset;
             return true;
         };
-        if (header.v > schema.version) {
+        if (header.v > sc.max_version) {
             sc.stopped = .{ .newer_version = .{ .at = offset, .v = header.v } };
             return false;
         }

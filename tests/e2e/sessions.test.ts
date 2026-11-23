@@ -40,7 +40,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, blobBytes, compactionRecordText, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -975,9 +975,8 @@ for (const userHeavy of [false, true]) {
       expect(compactions).toHaveLength(1);
       const data = typeof compactions[0].data === "string" ? JSON.parse(compactions[0].data) : compactions[0].data;
       expect(data.summary.startsWith("fx-compactor-v1\n")).toBe(true);
-      const turnPath = compactionRecordPath(fixture.home, id, "compacted-M1.txt");
-      expect(turnPath).toBeDefined();
-      const savedTurn = readFileSync(turnPath!, "utf8");
+      const savedTurn = compactionRecordText(fixture.home, id, "compacted-M1.txt");
+      expect(savedTurn).toBeDefined();
       expect(savedTurn).toContain(originalUser);
       expect(savedTurn).toContain("Assistant reference 7000:");
       expect(savedTurn).toContain("PENDING_CHECK=transport-resume");
@@ -1056,8 +1055,11 @@ test("a tool turn keeps its result as a blob of the session", async () => {
     const handle = /result-[a-f0-9]{64}\.txt/.exec(JSON.stringify(itemData(result)))?.[0] ?? "";
     expect(handle).toMatch(/^result-[a-f0-9]{64}\.txt$/);
     const hash = /-([a-f0-9]{64})\./.exec(handle)![1]!;
-    expect(blobNames(fixture, id)).toContain(hash);
-    expect(readFileSync(blobPath(fixture, id, handle), "utf8")).toContain("V2_TOOL_OUTPUT_7731");
+    // A small result is packed with its session (D102): no blob file, and the
+    // pack holds its bytes.
+    expect(blobNames(fixture, id)).not.toContain(hash);
+    expect(readFileSync(join(storeRoot(fixture.home), id, "blobs.pack"), "utf8")).toContain("V2_TOOL_OUTPUT_7731");
+    expect(blobBytes(fixture.home, id, hash).toString("utf8")).toContain("V2_TOOL_OUTPUT_7731");
     expect((lines as any[]).some((line) => (line.blobs ?? []).includes(hash))).toBe(true);
 
     const resumed = await ask(fixture, gateway, ["--resume", "last", "What did the tool print?"]);
@@ -5217,7 +5219,8 @@ test("an older session moves off its side folder on its next open, and the model
     expect(existsSync(join(fixture.home, ".fx", "terminal", id, "terminal", "state", "note.json"))).toBe(true);
     const moved = logLines(fixture.home, id).filter((line) => line.kind === "set" && line.key === "moved_files");
     expect(moved).toHaveLength(1);
-    expect(blobNames(fixture, id).length).toBeGreaterThanOrEqual(2);
+    // The moved bodies are small, so the session packs them (D102).
+    expect(existsSync(join(storeRoot(fixture.home), id, "blobs.pack"))).toBe(true);
     expectWholeLog(fixture, id);
 
     // Opened again, nothing moves twice.
@@ -6962,3 +6965,93 @@ for (const exit of GRID_EXITS) {
     define(`fault grid: a session ${exit}, entered by ${entry}, under every fault`, () => gridRow(exit, entry), TIMEOUT * 10);
   }
 }
+
+/// A gateway whose model reads `note.txt`, then answers from the tool result.
+/// The note is a small tool result, so its session packs it (D102).
+function packedNoteGateway() {
+  return startDynamicFakeGateway((body) => {
+    if (body.includes("after restart")) {
+      return fakeGatewayFinalText(body.includes("packed note") ? "RESTART_SAW_NOTE" : "RESTART_MISSING");
+    }
+    if (body.includes("packed note")) return fakeGatewayFinalText("FIRST_DONE");
+    return fakeGatewayToolCall("pack-note-1", "read_file", { path: "note.txt" });
+  });
+}
+
+test("a small tool result is packed in its session, and a restarted fx reads it back (D102)", async () => {
+  const fixture = createFixture("fx-pack-restart-");
+  const gateway = packedNoteGateway();
+  try {
+    writeFileSync(join(fixture.workspace, "note.txt"), "packed note\n");
+    const first = await ask(fixture, gateway, ["Read the note."]);
+    expect(first.code).toBe(0);
+    expect(JSON.parse(first.stdout).output).toBe("FIRST_DONE");
+    const id = JSON.parse(first.stdout).session_id as string;
+    const folder = join(storeRoot(fixture.home), id);
+    expect(blobNames(fixture, id)).toEqual([]);
+    expect(existsSync(join(folder, "blobs.pack"))).toBe(true);
+    expect(readFileSync(join(folder, "log.jsonl"), "utf8")).toContain('"v":2');
+
+    const restarted = await ask(fixture, gateway, ["--resume", id, "after restart"]);
+    expect(restarted.code).toBe(0);
+    expect(JSON.parse(restarted.stdout).output).toBe("RESTART_SAW_NOTE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("a half-written pack record left by a crash is cut on resume, and the packed body still reads (D102)", async () => {
+  const fixture = createFixture("fx-pack-torn-");
+  const gateway = packedNoteGateway();
+  try {
+    writeFileSync(join(fixture.workspace, "note.txt"), "packed note\n");
+    const first = await ask(fixture, gateway, ["Read the note."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id as string;
+    const pack = join(storeRoot(fixture.home), id, "blobs.pack");
+    const before = readFileSync(pack);
+
+    // A record whose header is whole and whose body stops after four bytes.
+    const header = Buffer.alloc(44);
+    header.write("FXB1", 0, "ascii");
+    header.writeUInt32LE(9, 36);
+    appendFileSync(pack, Buffer.concat([header, Buffer.from("part")]));
+
+    const resumed = await ask(fixture, gateway, ["--resume", id, "after restart"]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("RESTART_SAW_NOTE");
+    expect(readFileSync(pack).equals(before)).toBe(true);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("a reader process reads a session while another fx process holds a turn whose packed body is stored (D102)", async () => {
+  const fixture = createFixture("fx-pack-two-");
+  const release = join(fixture.root, "release");
+  let held = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (!body.includes("packed note")) return fakeGatewayToolCall("two-note-1", "read_file", { path: "note.txt" });
+    held = true;
+    while (!existsSync(release)) await Bun.sleep(20);
+    return fakeGatewayFinalText("TWO_DONE");
+  });
+  try {
+    writeFileSync(join(fixture.workspace, "note.txt"), "packed note\n");
+    const writer = ask(fixture, gateway, ["Read the note."]);
+    while (!held) await Bun.sleep(20);
+    const root = storeRoot(fixture.home);
+    const id = readdirSync(root).find((name) => existsSync(join(root, name, "blobs.pack")))!;
+    const reader = await command(fixture, gateway, ["session", id]);
+    expect(reader.code).toBe(0);
+    writeFileSync(release, "");
+    const done = await writer;
+    expect(done.code).toBe(0);
+    expect(JSON.parse(done.stdout).output).toBe("TWO_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);

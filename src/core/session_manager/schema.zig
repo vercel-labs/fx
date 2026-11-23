@@ -8,9 +8,17 @@
 
 const std = @import("std");
 
+/// The version of a line that names no packed body. Every reader of this
+/// format opens it.
+pub const plain_version: u32 = 1;
+
+/// The version of a line that names a packed body (`pack.zig`). A reader
+/// older than this stops at the line and opens the session read-only.
+pub const pack_version: u32 = 2;
+
 /// The format version this manager writes and fully understands. A line
 /// with a newer `v` makes the session read-only.
-pub const version: u32 = 1;
+pub const version: u32 = pack_version;
 
 /// Every kind the manager knows. The manager owns this set; fx content
 /// lives inside `data` and `value` fields and is never interpreted here.
@@ -48,12 +56,13 @@ const max_kind_name_bytes = 32;
 pub fn appendHeader(
     gpa: std.mem.Allocator,
     out: *std.ArrayList(u8),
+    v: u32,
     seq: u64,
     ts_ms: u64,
     kind: Kind,
 ) error{OutOfMemory}!void {
     try out.print(gpa, "{{\"v\":{d},\"seq\":{d},\"ts\":{d},\"kind\":\"{s}\"", .{
-        version, seq, ts_ms, @tagName(kind),
+        v, seq, ts_ms, @tagName(kind),
     });
 }
 
@@ -655,7 +664,7 @@ const testing = std.testing;
 test "header round trip" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    try appendHeader(testing.allocator, &out, 7, 1727400000000, .turn_committed);
+    try appendHeader(testing.allocator, &out, plain_version, 7, 1727400000000, .turn_committed);
     try testing.expectEqualStrings(
         "{\"v\":1,\"seq\":7,\"ts\":1727400000000,\"kind\":\"turn_committed\"",
         out.items,

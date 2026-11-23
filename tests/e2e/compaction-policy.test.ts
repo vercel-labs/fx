@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compactionRecordPath, logLines, logLinesAfterCompaction, sessionDir } from "./saved-sessions";
+import { compactionRecordText, logLines, logLinesAfterCompaction, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway } = await import("./tmux-helpers");
@@ -101,7 +101,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     expect(continuedText).toContain("Saved word for word: turn M1.");
     expect(continuedText).not.toContain("Assistant reference 7000:");
     // Either way the whole turn is saved word for word as M1.
-    const record = readFileSync(compactionRecordPath(home, seed.session_id, "compacted-M1.txt")!, "utf8");
+    const record = compactionRecordText(home, seed.session_id, "compacted-M1.txt")!;
     expect(record).toContain(`User 1:\n${originalUser}\n`);
     expect(record).toContain("Assistant reference 7000:");
     expect(record).toContain("PENDING_CHECK=transport-resume");

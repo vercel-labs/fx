@@ -1497,6 +1497,7 @@ const BlobHost = struct {
 
     const vtable: session_child_store.Blobs.VTable = .{
         .put = put,
+        .put_small = putSmall,
         .put_file = putFile,
         .put_record = putRecord,
         .record_names = recordNames,
@@ -1558,6 +1559,17 @@ const BlobHost = struct {
         return hash;
     }
 
+    fn putSmall(ctx: *anyopaque, bytes: []const u8) session_child_store.BlobError!Hash {
+        const host = from(ctx);
+        const io = io_mod.getIo();
+        host.life.lockUncancelable(io);
+        defer host.life.unlock(io);
+        const handle = host.session orelse return error.BlobStoreClosed;
+        const hash = handle.putSmall(bytes) catch |err| return host.storeFailed(err);
+        try host.remember(hash);
+        return hash;
+    }
+
     fn putFile(ctx: *anyopaque, file: std.Io.File, len: u64) session_child_store.BlobError!Hash {
         const host = from(ctx);
         const io = io_mod.getIo();
@@ -1575,7 +1587,7 @@ const BlobHost = struct {
         host.life.lockUncancelable(io);
         defer host.life.unlock(io);
         const handle = host.session orelse return error.BlobStoreClosed;
-        const hash = handle.putBlob(bytes) catch |err| return host.storeFailed(err);
+        const hash = handle.putSmall(bytes) catch |err| return host.storeFailed(err);
         host.mutex.lockUncancelable(io);
         defer host.mutex.unlock(io);
         try host.records_added.ensureUnusedCapacity(host.alloc, 1);
@@ -2098,7 +2110,7 @@ pub const Session = struct {
     /// The `compaction_records` lines for `due`: its map as one more blob,
     /// listed with the records it adds, in chunks as the move's are (D50).
     fn recordLines(self: *Session, a: Allocator, due: BlobHost.RecordsDue) sm.AppendError![]const sm.Event {
-        const map_hash = try a.dupe(u8, &(try self.handle.putBlob(due.map_json)));
+        const map_hash = try a.dupe(u8, &(try self.handle.putSmall(due.map_json)));
         const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
         var refs: std.ArrayList([]const u8) = .empty;
         try refs.ensureTotalCapacity(a, due.added.len + 1);
@@ -3875,10 +3887,10 @@ fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, fo
     var moved: std.array_hash_map.String([]const u8) = .empty;
     try moved.ensureTotalCapacity(a, bodies.items.len + stored.len);
     for (bodies.items) |body| moved.putAssumeCapacity(body.key, try a.dupe(u8, &body.hash));
-    for (stored) |body| moved.putAssumeCapacity(body.key, try a.dupe(u8, &(try handle.putBlob(body.bytes))));
+    for (stored) |body| moved.putAssumeCapacity(body.key, try a.dupe(u8, &(try handle.putSmall(body.bytes))));
     var map_json: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
-    const map_hash = try a.dupe(u8, &(try handle.putBlob(map_json.written())));
+    const map_hash = try a.dupe(u8, &(try handle.putSmall(map_json.written())));
 
     var events: std.ArrayList(sm.Event) = .empty;
     const value = try a.print("{{\"map\":\"{s}\"}}", .{map_hash});
@@ -10701,6 +10713,16 @@ test "-c resumes the session this host last opened" {
     try testing.expectError(error.NoRememberedSession, Session.resumeSession(testing.allocator, &t.store, .last_opened, "/w", .acp));
 }
 
+/// Flips one bit of a session's pack at `offset`, as bit rot would.
+fn corruptPackByte(t: *TestHome, id: []const u8, offset: usize) !void {
+    const path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "blobs.pack" });
+    defer testing.allocator.free(path);
+    const bytes = try t.tmp.dir.readFileAlloc(io_mod.getIo(), path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    bytes[offset] ^= 1;
+    try t.tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = path, .data = bytes });
+}
+
 fn pathExists(t: *TestHome, parts: []const []const u8) bool {
     const path = std.Io.Dir.path.join(testing.allocator, parts) catch return false;
     defer testing.allocator.free(path);
@@ -10732,7 +10754,7 @@ fn toolTurn(user: []const u8, results: []types.PersistedToolResult, steps: []typ
     } };
 }
 
-test "a v2 session keeps its bodies as blobs its items list, and never makes a side folder (D44, D48)" {
+test "a v2 session packs a small body into its session, lists it on its item, and never makes a side folder (D44, D48, D102)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -10765,6 +10787,8 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
 
     try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name }));
     const hash = artifact_digest.blobHash(handle).?;
+    // Packed with the session: no blob file of its own.
+    try testing.expectError(error.NotFound, t.store.manager.blobPath(testing.allocator, id, hash));
     const body = try t.store.manager.getBlob(testing.allocator, id, hash);
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("a body kept as a blob", body);
@@ -10787,11 +10811,47 @@ test "a v2 session keeps its bodies as blobs its items list, and never makes a s
         try testing.expect(std.mem.find(u8, page, "kept as a blob") != null);
     }
 
-    // Because an item lists it, a lost body damages the session (D39).
-    const blob_path = try t.store.manager.blobPath(testing.allocator, id, hash);
-    defer testing.allocator.free(blob_path);
-    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
+    // Because an item lists it, a damaged body damages the session (D39): its
+    // record is in the pack, so the damage is a byte flipped in the first
+    // record's body, after its 44-byte header.
+    try corruptPackByte(&t, id, 44 + 2);
     try testing.expectEqual(@as(u64, 1), (try t.store.manager.verify(id)).bad_blobs);
+}
+
+test "a tool result over 4 KiB stays a blob file, and reads back through the session (D44, D102)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("run it") };
+    var big: [5000]u8 = @splat('x');
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = &big,
+        .output_bytes = big.len,
+        .stored_output_bytes = big.len,
+    }};
+    var steps: [1]types.ToolExecutionStep = undefined;
+    var turn = toolTurn("run it", &results, &steps);
+    try s.appendProgress(user, turn.assistant.execution, .{});
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    const handle = results[0].output_handle.?;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const hash = artifact_digest.blobHash(handle).?;
+    const path = try t.store.manager.blobPath(testing.allocator, id, hash);
+    defer testing.allocator.free(path);
+    const body = try t.store.manager.getBlob(testing.allocator, id, hash);
+    defer testing.allocator.free(body);
+    try testing.expectEqual(big.len, body.len);
 }
 
 test "a body is stored only while its session is on disk, and a child opens its turn to store one (D44)" {
