@@ -2956,11 +2956,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         const resumedStderrPath = join(root.root, "resumed-stderr.log");
         tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
         await tui.waitForComposer(15_000);
-        // A resume shows no row for a call cancelled while it ran: core keeps
-        // no line for it, as Ctrl+O shows too. Only the turn's notice comes
-        // back, so no row can name a server either.
-        await tui.waitForText("▪ Cancelled · What can fx do differently?", 15_000);
-        expect(compactRows(await tui.captureFullScrollback())).toEqual([`● Opened ${alias}`, "▪ Cancelled · What can fx do differently?"]);
+        // A resume shows the call's row as live did, so no row names a
+        // server there either.
+        await tui.waitForText("▪ Cancelled using an MCP tool · What can fx do differently?", 15_000);
+        expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
         await tui.kill();
         tui = null;
@@ -4526,7 +4525,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       );
       await tui.waitForStableComposer(5_000);
       const live = toolRows(await tui.captureFullScrollback());
-      expect(live.some((line) => line.includes(`Cancelled ${TOOL_NAME}`))).toBe(true);
+      expect(live.some((line) => line.includes(`Cancelled using ${TOOL_ROW}`))).toBe(true);
       await expectFullTranscriptShows(tui);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd()).toBe(true);
