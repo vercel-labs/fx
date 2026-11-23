@@ -4282,10 +4282,12 @@ test "a follower connection that ends detaches from the session it followed" {
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
     var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
         .method = "session/load",
