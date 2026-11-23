@@ -346,6 +346,7 @@ pub const Member = struct {
     pub fn destroy(self: *Member) void {
         self.host_tools.deinit();
         self.terminal_client.deinit();
+        for (self.pending_legacy_urls.items) |*pending| pending.deinit(self.alloc);
         self.pending_legacy_urls.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -8018,6 +8019,7 @@ test "ACP legacy URL publication owns partial allocations" {
                 .host = &test_host,
                 .writer = jsonrpc.Writer.init(),
             };
+            defer state.deinit();
             const reserved = try reserveLegacyUrl(
                 try pendingMember(&state),
                 .{
