@@ -1,5 +1,6 @@
 const std = @import("std");
 const execution_observation = @import("../agent/runtime/observation.zig");
+const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const reports = @import("reports.zig");
@@ -43,6 +44,226 @@ const types = @import("../shared/types.zig");
 const usage_ledger = @import("usage_ledger.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Who wrote the mail that ended a `wait`.
+const MailSenders = std.EnumSet(types.MessageAuthor);
+
+/// When the model reads the mail that ended a `wait`: right after the result,
+/// when it joined the running turn, or in the next turn.
+const MailRead = enum { this_turn, next_turn };
+
+const sender_sentences = std.EnumArray(types.MessageAuthor, []const u8).init(.{
+    .user = "The user sent a message.",
+    .parent = "The agent that started you sent a message.",
+    .child = "A report or message arrived.",
+});
+const reads_now_one = "It follows this result.";
+const reads_now_several = "They follow this result.";
+const reads_next_one = "It starts your next turn once this one ends, so end your turn to read it.";
+const reads_next_several = "They start your next turn once this one ends, so end your turn to read them.";
+const answer_user_first = "Answer the user in text first, then call wait again if you still need a report.";
+const answer_owed = "You have not answered the user's message yet, so wait returned at once. " ++ answer_user_first;
+/// How the result of a `wait` held back for the user's answer starts, as
+/// `encodeManaged` writes it.
+const held_wait_prefix = "{\"ok\":true,\"result\":\"" ++ answer_owed ++ "\"";
+
+/// What `wait` says about the mail that ended it: who sent it, when the
+/// model reads it, that a user's message needs an answer before the next
+/// wait, and when no subagent sent any. The user's words must not read as a
+/// subagent's report, or the model looks for a report that never came instead
+/// of answering the user. The caller owns the result.
+fn mailArrivedText(alloc: Allocator, senders: MailSenders, read: MailRead) ![]u8 {
+    // The queue can empty between the wake and this read, when a stop drops
+    // what waited; then say what `wait` said before it named senders.
+    const named: MailSenders = if (senders.count() == 0) .initOne(.child) else senders;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    var authors = named.iterator();
+    while (authors.next()) |author| {
+        try text.appendSlice(alloc, sender_sentences.get(author));
+        try text.append(alloc, ' ');
+    }
+    const several = named.count() > 1;
+    try text.appendSlice(alloc, switch (read) {
+        .this_turn => if (several) reads_now_several else reads_now_one,
+        .next_turn => if (several) reads_next_several else reads_next_one,
+    });
+    if (read == .this_turn and named.contains(.user)) {
+        try text.append(alloc, ' ');
+        try text.appendSlice(alloc, answer_user_first);
+    }
+    if (!named.contains(.child)) try text.appendSlice(alloc, " No subagent report arrived.");
+    return text.toOwnedSlice(alloc);
+}
+
+/// Whether the user's latest steering in `turn_messages` has no answer yet:
+/// no reply with visible text came after it, and no model step has followed
+/// the result of a `wait` fx held back for it. fx knows that result by its
+/// own record, `held_wait_id`, since a tool result's words alone are data
+/// (R4.4). So every `wait` is held back until the model writes visible text
+/// or a model step follows a held result, whether a step's calls run one by
+/// one or together. After fx resumes an interrupted session it has no
+/// record, so it can hold back once more.
+fn userAnswerOwed(turn_messages: []const types.ChatMessage, held_wait_id: ?[]const u8) bool {
+    var replied_since = false;
+    var index = turn_messages.len;
+    while (index > 0) {
+        index -= 1;
+        const message = turn_messages[index];
+        switch (message.role) {
+            .assistant => {
+                if (std.mem.trim(u8, message.content orelse "", " \t\r\n").len > 0) return false;
+                replied_since = true;
+            },
+            .tool => if (replied_since and isHeldWait(message, held_wait_id)) return false,
+            .user => if (runtime_execution_memory.isUserSteering(message)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether a tool result is the `wait` fx held back: the call fx recorded,
+/// `subagent`'s own or one toolbox carried, which keeps the call's id, and
+/// the held result itself, since a provider can reuse an id in a later step.
+fn isHeldWait(message: types.ChatMessage, held_wait_id: ?[]const u8) bool {
+    const held = held_wait_id orelse return false;
+    const id = message.tool_call_id orelse return false;
+    if (!std.mem.eql(u8, id, held)) return false;
+    return std.mem.startsWith(u8, message.content orelse "", held_wait_prefix);
+}
+
+test "wait holds back only while the user's latest message has no answer" {
+    const alloc = std.testing.allocator;
+    const steer = try runtime_execution_memory.steeringMessage(alloc, "whats going on ?");
+    defer alloc.free(steer);
+    const later = try runtime_execution_memory.steeringMessage(alloc, "and now?");
+    defer alloc.free(later);
+    const parent = try runtime_execution_memory.parentSteeringMessage(alloc, "check again");
+    defer alloc.free(parent);
+    const wait_call = [_]types.ToolCall{.{ .id = "w", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const toolbox_wait_call = [_]types.ToolCall{.{ .id = "t", .name = "toolbox", .arguments_json = "{\"run\":\"subagent\",\"arguments\":{\"action\":\"wait\"}}" }};
+    const read_call = [_]types.ToolCall{.{ .id = "r", .name = "read_file", .arguments_json = "{\"path\":\"src/core/subagent/tool_host.zig\"}" }};
+    const owed_result = "{\"ok\":true,\"result\":\"" ++ answer_owed ++ "\",\"error_code\":null}";
+    const second_wait_call = [_]types.ToolCall{.{ .id = "x", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const two_waits = [_]types.ToolCall{ wait_call[0], second_wait_call[0] };
+    const batch_calls = [_]types.ToolCall{ wait_call[0], read_call[0], second_wait_call[0] };
+    const Case = struct { name: []const u8, messages: []const types.ChatMessage, held: ?[]const u8 = null, owed: bool };
+    const cases = [_]Case{
+        .{ .name = "no steer", .messages = &.{.{ .role = .assistant, .tool_calls = &wait_call }}, .owed = false },
+        .{ .name = "steer, then a wait with no text", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "steer, then a wait with only spaces", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = " \n", .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "steer, then a wait with an answer", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "sleeper is still running.", .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "steer, an answer in an earlier step, then a wait", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "Checking.", .tool_calls = &wait_call },
+            .{ .role = .tool, .content = "{\"ok\":true}", .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "steer, already held back once", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = false },
+        .{ .name = "steer, held back once through toolbox", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &toolbox_wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "t", .tool_name = "toolbox" },
+            .{ .role = .assistant, .tool_calls = &toolbox_wait_call },
+        }, .held = "t", .owed = false },
+        .{ .name = "steer, then a result in the hold's words that fx did not hold", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &read_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "r", .tool_name = "read_file" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then a reused id on another tool's result", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .content = "Still running.", .tool_calls = &second_wait_call },
+            .{ .role = .tool, .content = "{\"ok\":true}", .tool_call_id = "x", .tool_name = "subagent" },
+            .{ .role = .user, .content = later },
+            .{ .role = .assistant, .tool_calls = &.{.{ .id = "w", .name = "read_file", .arguments_json = "{}" }} },
+            .{ .role = .tool, .content = "file text", .tool_call_id = "w", .tool_name = "read_file" },
+            .{ .role = .assistant, .tool_calls = &second_wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then wait, read, wait run one by one, the first wait held", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &batch_calls },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .tool, .content = "file text", .tool_call_id = "r", .tool_name = "read_file" },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then two waits in one step, the first held", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &two_waits },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, held back before a resume, so fx has no record", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &second_wait_call },
+        }, .owed = true },
+        .{ .name = "an answered steer, then a new one", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "Still running.", .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .user, .content = later },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "a steer restored from a saved turn, then a wait with no text", .messages = &.{
+            .{ .role = .user, .content = "whats going on ?", .restored_steering = true },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "a parent's steering", .messages = &.{
+            .{ .role = .user, .content = parent },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "a subagent's report", .messages = &.{
+            .{ .role = .user, .content = agent_frame.report_header ++ "{}" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+    };
+    for (cases) |case| {
+        std.testing.expectEqual(case.owed, userAnswerOwed(case.messages, case.held)) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "wait names who sent the mail that ended it" {
+    const alloc = std.testing.allocator;
+    const Case = struct { senders: []const types.MessageAuthor, read: MailRead, text: []const u8 };
+    const cases = [_]Case{
+        .{ .senders = &.{.child}, .read = .this_turn, .text = "A report or message arrived. It follows this result." },
+        .{ .senders = &.{.child}, .read = .next_turn, .text = "A report or message arrived. It starts your next turn once this one ends, so end your turn to read it." },
+        .{ .senders = &.{.user}, .read = .this_turn, .text = "The user sent a message. It follows this result. Answer the user in text first, then call wait again if you still need a report. No subagent report arrived." },
+        // Read in the next turn, the message starts that turn, which answers it.
+        .{ .senders = &.{.user}, .read = .next_turn, .text = "The user sent a message. It starts your next turn once this one ends, so end your turn to read it. No subagent report arrived." },
+        .{ .senders = &.{.parent}, .read = .this_turn, .text = "The agent that started you sent a message. It follows this result. No subagent report arrived." },
+        .{ .senders = &.{ .child, .user }, .read = .this_turn, .text = "The user sent a message. A report or message arrived. They follow this result. Answer the user in text first, then call wait again if you still need a report." },
+        .{ .senders = &.{ .user, .parent }, .read = .next_turn, .text = "The user sent a message. The agent that started you sent a message. They start your next turn once this one ends, so end your turn to read them. No subagent report arrived." },
+        // Nothing left in the queue to name.
+        .{ .senders = &.{}, .read = .this_turn, .text = "A report or message arrived. It follows this result." },
+    };
+    for (cases) |case| {
+        const text = try mailArrivedText(alloc, .initMany(case.senders), case.read);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(case.text, text);
+    }
+}
+
 /// Bounds how long a parent wait takes to observe cancellation or steering,
 /// and how long the polling loops take to see a child change. The terminal
 /// result wait also wakes on child state changes. Status publishing is rate
@@ -183,6 +404,9 @@ pub const ExecuteOptions = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     /// The caller's own worker, which `wait` blocks on.
     caller_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// The caller's turn so far, oldest first, ending with the reply that
+    /// made this call. `wait` reads it for a user message with no answer.
+    turn_messages: []const types.ChatMessage = &.{},
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
@@ -254,6 +478,9 @@ pub const Runtime = struct {
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
+    /// The id of the last `wait` call held back for the user's answer
+    /// (`holdForUserAnswer`). Owned; guarded by `waiter_mutex`.
+    held_wait_id: ?[]u8 = null,
     /// Whether this host's owner is itself a subagent, so a message to its
     /// parent has somewhere to go. Set by its runtime.
     owner_has_parent: bool = false,
@@ -338,6 +565,7 @@ pub const Runtime = struct {
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
         self.start_waits.deinit(self.alloc);
+        if (self.held_wait_id) |id| self.alloc.free(id);
         self.usage_ledger.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
@@ -1025,6 +1253,19 @@ pub const Runtime = struct {
     /// mailbox trace contract reads it, or the owner's own id.
     fn ownerName(self: *const Runtime) []const u8 {
         return if (self.owner_has_parent) self.root_id else "main";
+    }
+
+    /// Whether this `wait` must return at once for the user's answer
+    /// (`userAnswerOwed`). Records its call when it does, so the next `wait`
+    /// finds the hold by its id.
+    fn holdForUserAnswer(self: *Runtime, options: ExecuteOptions) Allocator.Error!bool {
+        self.waiter_mutex.lockUncancelable(io_mod.getIo());
+        defer self.waiter_mutex.unlock(io_mod.getIo());
+        if (!userAnswerOwed(options.turn_messages, self.held_wait_id)) return false;
+        const id = try self.alloc.dupe(u8, options.invocation_id);
+        if (self.held_wait_id) |old| self.alloc.free(old);
+        self.held_wait_id = id;
+        return true;
     }
 
     fn setWaiter(self: *Runtime, worker: ?*worker_runtime.WorkerRuntime) void {
@@ -1986,6 +2227,10 @@ pub const Runtime = struct {
     /// caller is stopped. Returns at once when nothing can still arrive.
     fn waitForMail(self: *Runtime, alloc: Allocator, options: ExecuteOptions) !ManagedExecutionResult {
         const worker = options.caller_worker orelse return self.refuse(alloc, .wait_unavailable);
+        if (try self.holdForUserAnswer(options)) {
+            debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=user_answer_owed", .{self.ownerName()});
+            return self.encodeManaged(alloc, .{ .ok = true, .result = answer_owed });
+        }
         // Registered first, so a child that ends before the wait starts
         // still ends it.
         self.setWaiter(worker);
@@ -2004,15 +2249,20 @@ pub const Runtime = struct {
         // turns; elsewhere, as in ACP, it starts the next one, and the owner
         // must end this turn to read it (`tests/tla/subagent/MainMail.tla`
         // WaitHonest).
-        const follows = wake == .posted and worker.queuedMailJoinsTurn();
-        debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s} said={s}", .{ self.ownerName(), @tagName(wake), if (follows) "follows" else "next" });
+        const read: MailRead = if (wake == .posted and worker.queuedMailJoinsTurn()) .this_turn else .next_turn;
+        const senders: MailSenders = if (wake == .posted) worker.queuedAuthors() else .empty;
+        debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s} said={s} user={} parent={} child={}", .{
+            self.ownerName(),
+            @tagName(wake),
+            if (read == .this_turn) "follows" else "next",
+            senders.contains(.user),
+            senders.contains(.parent),
+            senders.contains(.child),
+        });
         return switch (wake) {
             .posted => self.encodeManaged(alloc, .{
                 .ok = true,
-                .result = if (follows)
-                    "A report or message arrived. It follows this result."
-                else
-                    "A report or message arrived. It starts your next turn once this one ends, so end your turn to read it.",
+                .result = try mailArrivedText(roster_arena.allocator(), senders, read),
                 .subagents = waited_for,
             }),
             .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
@@ -6657,6 +6907,174 @@ test "wait returns at once when nothing works, and when a report arrives" {
     const queued = worker.takeQueuedPrompt(alloc).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);
     try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+}
+
+test "wait asks the model to answer the user's message first, once, before it waits" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const steer = try runtime_execution_memory.steeringMessage(arena, "whats going on ?");
+    const first_wait = [_]types.ToolCall{.{ .id = "w1", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const second_wait = [_]types.ToolCall{.{ .id = "w2", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const unanswered = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+    };
+    const held = try waitWithTurn(runtime, arena, "w1", &worker, &unanswered);
+    try std.testing.expect(std.mem.startsWith(u8, held, held_wait_prefix));
+
+    // Told once, the next wait waits as usual: here nothing works, so it returns.
+    const told = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+        .{ .role = .tool, .content = held, .tool_call_id = "w1", .tool_name = "subagent" },
+        .{ .role = .assistant, .tool_calls = &second_wait },
+    };
+    const next = try waitWithTurn(runtime, arena, "w2", &worker, &told);
+    try std.testing.expect(std.mem.find(u8, next, answer_owed) == null);
+    try std.testing.expect(std.mem.find(u8, next, "nothing more will arrive") != null);
+
+    // A wait toolbox ran keeps its call's id, under toolbox's name.
+    const told_through_toolbox = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+        .{ .role = .tool, .content = held, .tool_call_id = "w1", .tool_name = "toolbox" },
+        .{ .role = .assistant, .tool_calls = &second_wait },
+    };
+    const after_toolbox = try waitWithTurn(runtime, arena, "w2", &worker, &told_through_toolbox);
+    try std.testing.expect(std.mem.find(u8, after_toolbox, answer_owed) == null);
+
+    // Another result in the hold's very words is not fx's record of a hold.
+    const read_call = [_]types.ToolCall{.{ .id = "r1", .name = "read_file", .arguments_json = "{}" }};
+    const third_wait = [_]types.ToolCall{.{ .id = "w3", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const look_alike = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &read_call },
+        .{ .role = .tool, .content = held, .tool_call_id = "r1", .tool_name = "read_file" },
+        .{ .role = .assistant, .tool_calls = &third_wait },
+    };
+    const after_look_alike = try waitWithTurn(runtime, arena, "w3", &worker, &look_alike);
+    try std.testing.expect(std.mem.find(u8, after_look_alike, answer_owed) != null);
+
+    // Each wait in the step right after the steer is held back.
+    const pair = [_]types.ToolCall{
+        .{ .id = "w4", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+        .{ .id = "w5", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+    };
+    const one_step = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &pair },
+    };
+    const first_of_pair = try waitWithTurn(runtime, arena, "w4", &worker, &one_step);
+    try std.testing.expect(std.mem.find(u8, first_of_pair, answer_owed) != null);
+    const second_of_pair = try waitWithTurn(runtime, arena, "w5", &worker, &one_step);
+    try std.testing.expect(std.mem.find(u8, second_of_pair, answer_owed) != null);
+
+    // Run one by one, wait, read, wait: the first held result is in the turn
+    // before the second wait runs, which is still held back.
+    const batch = [_]types.ToolCall{
+        .{ .id = "w6", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+        .{ .id = "r2", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "w7", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+    };
+    const batch_start = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+    };
+    const held_first = try waitWithTurn(runtime, arena, "w6", &worker, &batch_start);
+    try std.testing.expect(std.mem.find(u8, held_first, answer_owed) != null);
+    const batch_middle = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+        .{ .role = .tool, .content = held_first, .tool_call_id = "w6", .tool_name = "subagent" },
+        .{ .role = .tool, .content = "file text", .tool_call_id = "r2", .tool_name = "read_file" },
+    };
+    const held_second = try waitWithTurn(runtime, arena, "w7", &worker, &batch_middle);
+    try std.testing.expect(std.mem.find(u8, held_second, answer_owed) != null);
+    // Once the model replies after the held results, its next wait waits.
+    const after_batch_wait = [_]types.ToolCall{.{ .id = "w8", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const after_batch = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+        .{ .role = .tool, .content = held_first, .tool_call_id = "w6", .tool_name = "subagent" },
+        .{ .role = .tool, .content = "file text", .tool_call_id = "r2", .tool_name = "read_file" },
+        .{ .role = .tool, .content = held_second, .tool_call_id = "w7", .tool_name = "subagent" },
+        .{ .role = .assistant, .tool_calls = &after_batch_wait },
+    };
+    const after_batch_result = try waitWithTurn(runtime, arena, "w8", &worker, &after_batch);
+    try std.testing.expect(std.mem.find(u8, after_batch_result, answer_owed) == null);
+}
+
+fn waitWithTurn(runtime: *Runtime, arena: Allocator, invocation_id: []const u8, worker: *worker_runtime.WorkerRuntime, turn: []const types.ChatMessage) ![]const u8 {
+    var request = try model_contract.validateRequest(std.testing.allocator, .wait);
+    defer request.deinit(std.testing.allocator);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = runtime.root_id,
+        .invocation_id = invocation_id,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = worker,
+        .turn_messages = turn,
+    });
+    return result.body;
+}
+
+test "a user's message that ends a wait reads as the user's, not as a subagent's report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", &worker);
+    try waitForRuns(&fixture, 1);
+    try worker.enqueuePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "whats going on ?"),
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    });
+    const steered = try callTool(runtime, arena, .wait, "call-2", &worker);
+    try std.testing.expect(std.mem.find(u8, steered, "The user sent a message.") != null);
+    try std.testing.expect(std.mem.find(u8, steered, "No subagent report arrived.") != null);
+    // No turn runs here, so the message waits for the next turn, which answers it.
+    try std.testing.expect(std.mem.find(u8, steered, "Answer the user") == null);
+    try std.testing.expect(std.mem.find(u8, steered, "A report or message arrived") == null);
+    const typed = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, typed);
+    try std.testing.expectEqual(types.MessageAuthor.user, typed.author);
+
+    // The reviewer's report, once it comes, still reads as a report.
+    fixture.release.set(io_mod.getIo());
+    const reported = try callTool(runtime, arena, .wait, "call-3", &worker);
+    try std.testing.expect(std.mem.find(u8, reported, "A report or message arrived.") != null);
+    try std.testing.expect(std.mem.find(u8, reported, "The user sent a message") == null);
+    const report = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, report);
+    try std.testing.expectEqual(types.MessageAuthor.child, report.author);
 }
 
 test "a subagent that reports never stays quiet when its work completes" {
