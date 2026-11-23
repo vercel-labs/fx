@@ -284,6 +284,28 @@ describe("fx hook", () => {
     expect(limited.entries).toHaveLength(1);
   });
 
+  test("a Stop hook that asks for another reply shows decision continue, in fx hook test and in the log", async () => {
+    const root = createRoot({
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: "echo 'run the tests' >&2; exit 2", id: "tests" }] }],
+      },
+    });
+    expect((await hook(root, ["hook", "trust", "tests"])).code).toBe(0);
+    const stopInput = JSON.stringify({ last_assistant_message: "Done." });
+
+    const text = await hook(root, ["hook", "test", "Stop", "--input", stopInput]);
+    expect(text.code).toBe(0);
+    expect(text.stdout).toContain("decision: continue");
+    expect(text.stdout).not.toContain("decision: proceed");
+
+    const asJson = await hook(root, ["hook", "test", "Stop", "--input", stopInput, "--json"]);
+    expect(JSON.parse(asJson.stdout)).toMatchObject({ kind: "hook_test", decision: "continue" });
+
+    const log = await hook(root, ["hook", "log"]);
+    expect(log.code).toBe(0);
+    expect(log.stdout).toMatch(/Stop\s+-\s+1\s+continue\s/);
+  });
+
   test("a trust file that others can write stops every hook", async () => {
     const root = createRoot();
     expect((await hook(root, ["hook", "trust", "guard"])).code).toBe(0);

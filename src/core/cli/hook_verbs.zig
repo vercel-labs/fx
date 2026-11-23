@@ -518,7 +518,7 @@ fn runHookTest(
         .ran = outcome.ran,
         .trust_refused = trust_refused,
         .skipped_waiting = skipped_waiting,
-        .decision = @tagName(outcome.decision),
+        .decision = outcome.decisionName(),
         .reason = outcome.reason,
         .decided_by = outcome.decided_by,
         .updated_input = outcome.updated_input,

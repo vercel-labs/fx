@@ -108,12 +108,36 @@ pub const Outcome = struct {
         if (self.notices.len > 0) alloc.free(self.notices);
         self.* = undefined;
     }
+
+    /// The decision as people and logs read it. A Stop or SubagentStop outcome that asks for another reply
+    /// has decision `proceed` and a continue reason, and fx keeps the turn going, so it is named `continue`.
+    /// Every view of an outcome takes its decision name from here.
+    pub fn decisionName(self: *const Outcome) []const u8 {
+        if (self.decision == .proceed and self.continue_reason != null) return "continue";
+        return @tagName(self.decision);
+    }
 };
 
 test "strictness orders deny above ask above allow above proceed" {
     try std.testing.expect(Decision.deny.strictness() > Decision.ask.strictness());
     try std.testing.expect(Decision.ask.strictness() > Decision.allow.strictness());
     try std.testing.expect(Decision.allow.strictness() > Decision.proceed.strictness());
+}
+
+test "a Stop outcome with a continue reason is named continue" {
+    var reason = "check the tests".*;
+    const outcome = Outcome{ .decision = .proceed, .continue_reason = &reason };
+    try std.testing.expectEqualStrings("continue", outcome.decisionName());
+}
+
+test "a Stop outcome without a continue reason is named proceed" {
+    const outcome = Outcome{ .decision = .proceed };
+    try std.testing.expectEqualStrings("proceed", outcome.decisionName());
+}
+
+test "a PreToolUse deny is named deny" {
+    const outcome = Outcome{ .decision = .deny, .reason = @constCast("no rm") };
+    try std.testing.expectEqualStrings("deny", outcome.decisionName());
 }
 
 test "Outcome.deinit frees every owned slice" {

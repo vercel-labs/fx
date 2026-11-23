@@ -802,7 +802,7 @@ fn runLogLine(alloc: std.mem.Allocator, ev: hooks.Event, outcome: *const hooks.O
     try writeOptionalJsonText(w, ev.match_value);
     try w.print(",\"surface\":\"{s}\",\"session_id\":", .{@tagName(ev.scope.surface)});
     try writeOptionalJsonText(w, ev.scope.session_id);
-    try w.print(",\"ran\":{d},\"decision\":\"{s}\",\"decided_by\":", .{ outcome.ran, @tagName(outcome.decision) });
+    try w.print(",\"ran\":{d},\"decision\":\"{s}\",\"decided_by\":", .{ outcome.ran, outcome.decisionName() });
     try writeOptionalJsonText(w, outcome.decided_by);
     try w.writeAll(",\"reason\":");
     if (outcome.reason) |reason| {
