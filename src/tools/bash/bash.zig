@@ -210,6 +210,9 @@ fn callRun(
     };
     const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
     if (swept > 0) debug_trace.logf("bash", "removed {d} bash session folders that ended processes left", .{swept});
+    // Set by the prepare above. Looked up before the program is set, so a missing
+    // text fails the call without running a program with no saved state.
+    const after_startup = session.afterStartupText() orelse return runtimeFailure(ctx, error.SessionNotPrepared);
     // A background program may have ended since the approval and left another folder.
     session.refreshStartFolder(io_mod.getIo());
     const folder = session.startFolder() orelse ctx.workspace_root;
@@ -244,8 +247,6 @@ fn callRun(
     defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
     var variables: std.ArrayList(managed_execution.EnvironmentVariable) = .empty;
     if (bridge_registration) |registration| try variables.appendSlice(request_arena, registration.environment());
-    const bash_env = session.bashEnv() orelse return runtimeFailure(ctx, error.SessionNotPrepared);
-    try variables.append(request_arena, .{ .name = bash_session.env_var, .value = bash_env });
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -253,6 +254,7 @@ fn callRun(
         .environment = environment,
         .authority = authority,
         .extra_environment = variables.items,
+        .after_startup = after_startup,
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .timeout_ms = ctx.command_timeout_ms,
@@ -361,8 +363,10 @@ fn tmpRoot() []const u8 {
 }
 
 /// `raw` when it is an absolute path without trailing slashes, else `/tmp`. A
-/// relative path would fail every call, and `$`, a backquote, or a backslash
-/// would be expanded by bash from `BASH_ENV`, so `/tmp` stands in for both.
+/// relative path would fail every call. `$`, a backquote, or a backslash also
+/// falls back to `/tmp`, as a plain guard: the session quotes its path in the
+/// shell text, so bash does not expand it, but an unusual temp root should not
+/// reach that text at all.
 fn tmpRootFor(raw: []const u8) []const u8 {
     if (!std.Io.Dir.path.isAbsolute(raw)) return "/tmp";
     const trimmed = std.mem.trimEnd(u8, raw, "/");

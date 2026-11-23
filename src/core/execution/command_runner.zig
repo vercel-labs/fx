@@ -43,6 +43,10 @@ pub const Config = struct {
     /// Variables added to the command's environment after `AI_AGENT`,
     /// such as the `fx mcp call` bridge's address. Borrowed for the run.
     extra_environment: []const EnvironmentVariable = &.{},
+    /// Shell text that the command's own shell runs after the user's startup
+    /// definitions are applied and before the command. Empty for every caller
+    /// but the bash tool. Borrowed for the run, like `extra_environment`.
+    after_startup: []const u8 = "",
 };
 
 pub const EnvironmentVariable = struct {
@@ -825,7 +829,7 @@ pub fn executeCommandInEnvironment(
         },
         else => {},
     }
-    const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
+    const invocation = try shell_resolver.capturedInvocation(scratch, environment, effective_cfg.after_startup, command);
     debug_trace.logf(
         "core",
         "command runner explicit environment={s} shell={s}",
@@ -912,7 +916,7 @@ fn executeWithSnapshot(
     });
     const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
     const kind = shell_resolver.shellKind(generation.shell_path) orelse return error.UnsupportedShell;
-    const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, command);
+    const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, cfg.after_startup, command);
     debug_trace.logf(
         "core",
         "command runner snapshot generation={d} shell={s} replay_bytes={d}",
@@ -2835,6 +2839,80 @@ test "zsh commands keep words that start with = literal in every captured profil
     const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
     try std.testing.expectEqualStrings(expected, full_startup.output);
     try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "startup text runs before the command on the snapshot path" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "alias fxsnap_rc='printf rc'\n");
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .after_startup = "alias fxsnap_after='printf after-ok'",
+    };
+
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const result = try executeCommandInEnvironment(config, arena, "fxsnap_after; echo", paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nafter-ok\n</stdout>\n", result.output);
+}
+
+test "startup text runs before the command on the full-startup path" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "alias fxsnap_rc='printf rc'\n");
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .after_startup = "alias fxsnap_after='printf after-ok'",
+    };
+
+    // A replay that cannot load sends the command down the full-startup path.
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const result = try executeCommandInEnvironment(config, arena, "fxsnap_after; echo", paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nafter-ok\n</stdout>\n", result.output);
+}
+
+test "a startup text with a syntax error sends the command to full startup, where the error shows" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
+    // The text's second line is a syntax error. On the snapshot path it stops the
+    // script before the restored flag, so the replay counts as failed and the
+    // marker stays hidden. On full startup its first line runs, then the error
+    // stops the `bash -c` string, so the command itself does not run.
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .after_startup = "echo text-line\n)",
+    };
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const result = try executeCommandInEnvironment(config, arena, "echo command-ran", paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=2\n"));
+    try std.testing.expect(std.mem.find(u8, result.output, "text-line\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "syntax error") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "command-ran") == null);
+    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
 }
 
 test "a startup file's builtin function never runs in place of fx's shell setup" {

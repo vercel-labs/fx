@@ -1371,6 +1371,53 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(existsSync(join(root.workspace, "sub", "made"))).toBe(true);
   }, TIMEOUT);
 
+  test("in auto mode a bash program is reviewed even when a saved function would make its command routine", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-define", "bash", { command: "git() { echo SAVED-GIT-RAN; }" }),
+        fakeGatewayToolCall("bash-git", "bash", { command: "git status --short" }),
+        fakeGatewayFinalText("Saved function reviewed.\n"),
+      ],
+      { classifierResponses: [fakeGatewayPermissionDecision(), fakeGatewayPermissionDecision()] },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Define git and run it."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.classifierRequests).toHaveLength(2);
+    expect(gateway.classifierRequests.some(({ body }) => body.includes("git status --short"))).toBe(true);
+    expect(toolResultText(gateway.requests[2]!.body, "bash-git")).toContain("SAVED-GIT-RAN");
+  }, TIMEOUT);
+
+  test("in auto mode a bash program's alias for a name the startup files define carries to the next program", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.home, ".bash_profile"), "alias ll='echo RC-LL'\n");
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-set", "bash", { command: "alias ll='echo MINE-LL'" }),
+        fakeGatewayToolCall("bash-ll", "bash", { command: "ll" }),
+        fakeGatewayFinalText("Alias carried.\n"),
+      ],
+      { classifierResponses: [fakeGatewayPermissionDecision(), fakeGatewayPermissionDecision()] },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Define ll and run it."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const ll = toolResultText(gateway.requests[2]!.body, "bash-ll");
+    expect(ll).toContain("MINE-LL");
+    expect(ll).not.toContain("RC-LL");
+  }, TIMEOUT);
+
   test("wait_more with nothing running says so", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([

@@ -99,6 +99,14 @@ fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
     return input.tool_registry.lookup(name);
 }
 
+/// A bash program can run functions, aliases, and a PATH that earlier programs
+/// saved, which the startup-snapshot check cannot see, so the routine-command
+/// shortcut never applies to it.
+fn runsInBashSession(input: Input, name: []const u8) bool {
+    const tool = registeredTool(input, name) orelse return false;
+    return tool.captured_command_host == .bash_session;
+}
+
 fn accessScope(input: Input) workspace_access.AccessScope {
     return input.access_scope orelse workspace_access.AccessScope.primaryOnly(input.workspace_root);
 }
@@ -1303,6 +1311,7 @@ fn resolveOrdinaryPermissionOutcome(
             // so those commands go to review instead, as does every command
             // while a failed capture hides which names are redefined.
             if (command.execution_mode == .captured and
+                !runsInBashSession(input, call.name) and
                 !(command.environment == .user and
                     (shell_snapshot.processOwner().definesAnyWord(command.command) or
                         shell_snapshot.processOwner().startupNamesUnknown())) and
@@ -4924,6 +4933,57 @@ test "bash tool command calls use the bash environment" {
         .user => |path| try std.testing.expectEqualStrings(expected_shell, path),
         else => return error.TestExpectedUserEnvironment,
     }
+}
+
+test "in auto mode a bash program is reviewed even when its command is routine" {
+    // The shell tool's routine shortcut takes `git status --short`; the bash tool's must not.
+    shell_snapshot.resetProcessOwnerForTest(npmAliasSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const lease = (try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    lease.release();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+
+    input.tool_registry = bash_registry;
+    const bash_call = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "bash-status", .name = "bash", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        bash_call.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    // The same text in the shell tool still takes the shortcut, with no review.
+    input.tool_registry = test_admission_registry;
+    const shell_call = try requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "shell-status", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_mode,
+        shell_call.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "bash tool wait calls are terminal calls, not commands" {

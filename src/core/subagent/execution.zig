@@ -410,6 +410,10 @@ pub const TurnContext = struct {
 
     pub fn deinit(self: *TurnContext) void {
         if (self.hosted_release) |hosted| hosted.release();
+        // Read before the runtime is torn down: the trace says whether the turn's last bash program was still running.
+        debug_trace.logf("bash", "bash state reset at the end of a subagent run had_program={}", .{
+            tool_dispatch.bashProgramRunning(&self.bash_session, &self.managed_executions),
+        });
         self.managed_executions.deinit();
         self.bash_session.deinit(io_mod.getIo());
         self.worker.deinit(self.alloc);

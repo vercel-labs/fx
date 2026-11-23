@@ -214,9 +214,15 @@ const bash_unshadow_builtin = "\\unset -f builtin; ";
 /// snapshot replay have run.
 const zsh_command_prelude = zsh_unshadow_builtin ++ "\\builtin unsetopt equals; ";
 
+/// Builds the argv for a captured command. `after_startup` is shell text that
+/// runs before `command` in the same shell, after the user's startup
+/// definitions. It goes on its own line before `command`, because bash expands
+/// an alias only on a line after the one that defines it. Empty text leaves the
+/// argv exactly as it was.
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
+    after_startup: []const u8,
     command: []const u8,
 ) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
@@ -227,10 +233,11 @@ pub fn capturedInvocation(
                 .clean_start = true,
             } });
             removeInteractiveFlag(&invocation);
+            const with_startup = try startupCommand(alloc, after_startup, command);
             invocation.setCommand(if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, command })
+                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, with_startup })
             else
-                command);
+                with_startup);
             return invocation;
         },
         .user => |path| {
@@ -240,14 +247,22 @@ pub fn capturedInvocation(
                 invocation.append("-O");
                 invocation.append("expand_aliases");
             }
+            const with_startup = try startupCommand(alloc, after_startup, command);
             const effective_command = if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, captured_zsh_user_prelude, command })
+                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, captured_zsh_user_prelude, with_startup })
             else
-                command;
+                with_startup;
             invocation.setCommand(effective_command);
             return invocation;
         },
     }
+}
+
+/// `command` with `after_startup` in front of it on its own line, or `command`
+/// itself when there is no text.
+fn startupCommand(alloc: Allocator, after_startup: []const u8, command: []const u8) Allocator.Error![]const u8 {
+    if (after_startup.len == 0) return command;
+    return std.mem.concat(alloc, u8, &.{ after_startup, "\n", command });
 }
 
 /// Stderr marker, followed by a nonce, that a snapshot bootstrap writes with
@@ -321,8 +336,14 @@ pub fn snapshotInvocation(
     return invocation;
 }
 
-/// Builds the stdin script for a snapshot run: the replay, the restored flag
-/// the bootstrap checks, and the command. The command is single-quoted so it
+/// Builds the stdin script for a snapshot run: the replay, the startup text, the
+/// restored flag the bootstrap checks, and the command. The startup text is
+/// grouped with stdin from /dev/null, so no command in it can read the rest of
+/// the script. The flag comes after the text, so a syntax error in the text stops
+/// the script before the flag is set. The bootstrap then reports a failed replay,
+/// and the command runs on the full-startup path, where the same text runs as
+/// lines of `bash -c` and its error stops the command with a message.
+/// The command is single-quoted so it
 /// is parsed only when `eval` runs, after the replayed aliases exist, and it
 /// runs with stdin from /dev/null so it cannot read the rest of the script.
 /// Its stderr is the one `snapshotInvocation` saved on fd 9, which it does
@@ -332,12 +353,18 @@ pub fn snapshotScript(
     alloc: Allocator,
     kind: ShellKind,
     replay: []const u8,
+    after_startup: []const u8,
     command: []const u8,
 ) Allocator.Error![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
     try output.appendSlice(alloc, replay);
     if (replay.len != 0 and replay[replay.len - 1] != '\n') try output.append(alloc, '\n');
+    if (after_startup.len != 0) {
+        try output.appendSlice(alloc, "{ ");
+        try output.appendSlice(alloc, after_startup);
+        try output.appendSlice(alloc, "\n} </dev/null 2>&9\n");
+    }
     try output.appendSlice(alloc, "__fx_snapshot_restored=1\n");
     if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
     try output.appendSlice(alloc, "\\builtin eval -- ");
@@ -667,19 +694,19 @@ test "captured profiles use exact non-PTY argv" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "printf clean");
+    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "", "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "", "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "", "printf clean");
     const expected_zsh_clean = [_][]const u8{
         "/bin/zsh",
         "-f",
@@ -690,7 +717,7 @@ test "captured profiles use exact non-PTY argv" {
     for (&expected_zsh_clean, zsh_clean.argv()) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
-    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "printf user");
+    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "", "printf user");
     const expected_zsh_user = [_][]const u8{
         "/bin/zsh",
         "-l",
@@ -708,7 +735,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const invocation = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
+    const invocation = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "", "printf '%s' ok");
     const command = try formatInvocationCommand(arena, &invocation);
     try std.testing.expectEqualStrings(
         "'/bin/zsh' '-f' '-c' '(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; printf '\"'\"'%s'\"'\"' ok'",
@@ -717,7 +744,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
 }
 
 test "snapshot script turns off zsh equals expansion after the replay" {
-    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "echo ======");
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", "", "echo ======");
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
@@ -725,11 +752,63 @@ test "snapshot script turns off zsh equals expansion after the replay" {
         zsh,
     );
 
-    const bash = try snapshotScript(std.testing.allocator, .bash, "", "echo ======");
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", "", "echo ======");
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
         "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
         bash,
+    );
+}
+
+test "snapshot script runs the startup text in a group before the restored flag" {
+    const text = "alias ll=\"echo NEW\"";
+    const zsh = try snapshotScript(std.testing.allocator, .zsh, "builtin setopt equals", text, "ll");
+    defer std.testing.allocator.free(zsh);
+    try std.testing.expectEqualStrings(
+        "builtin setopt equals\n{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
+            "__fx_snapshot_restored=1\n" ++ zsh_command_prelude ++
+            "\\builtin eval -- 'll' </dev/null 2>&9 9>&-\n",
+        zsh,
+    );
+
+    const bash = try snapshotScript(std.testing.allocator, .bash, "", text, "ll");
+    defer std.testing.allocator.free(bash);
+    try std.testing.expectEqualStrings(
+        "{ " ++ text ++ "\n} </dev/null 2>&9\n" ++
+            "__fx_snapshot_restored=1\n" ++
+            "\\builtin eval -- 'll' </dev/null 2>&9 9>&-\n",
+        bash,
+    );
+}
+
+test "captured argv puts the startup text on its own line before the command" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "alias ll=\"echo NEW\"";
+    // Strings are compared by content: the command is an arena copy, and
+    // expectEqualSlices on []const u8 compares the slice pointers.
+    const expectArgv = struct {
+        fn check(expected: []const []const u8, actual: []const []const u8) !void {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |want, got| try std.testing.expectEqualStrings(want, got);
+        }
+    }.check;
+
+    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, text, "ll");
+    try expectArgv(
+        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", text ++ "\nll" },
+        bash_user.argv(),
+    );
+    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, text, "ll");
+    try expectArgv(
+        &.{ "/bin/bash", "--noprofile", "--norc", "-c", text ++ "\nll" },
+        bash_clean.argv(),
+    );
+    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, text, "ll");
+    try std.testing.expectEqualStrings(
+        zsh_command_prelude ++ captured_zsh_user_prelude ++ text ++ "\nll",
+        zsh_user.argv()[zsh_user.argv().len - 1],
     );
 }
 
@@ -783,8 +862,8 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     try std.testing.expect(user_environment.eql(.{ .user = fallback }));
     try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
 
-    const user_invocation = try capturedInvocation(arena, user_environment, "printf user");
-    const clean_invocation = try capturedInvocation(arena, clean_environment, "printf clean");
+    const user_invocation = try capturedInvocation(arena, user_environment, "", "printf user");
+    const clean_invocation = try capturedInvocation(arena, clean_environment, "", "printf clean");
     try std.testing.expectEqualStrings(fallback, user_invocation.path);
     try std.testing.expectEqualStrings(fallback, clean_invocation.path);
 

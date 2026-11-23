@@ -1,16 +1,14 @@
 //! One agent's saved bash state for the one bash tool. Each bash tool program
-//! is one captured bash command. Its BASH_ENV script loads the state the last
-//! program saved and saves it again when the program ends, so a program killed
-//! by a signal saves nothing (`tests/tla/bash_tool/ResultStore.tla` `Finish`,
-//! `StateNeverTorn`, `EndedSaves`). The state never holds the MCP token. This
-//! module imports only `std`, so `zig test` runs its tests alone.
+//! is one captured bash command. Its after-startup text, `. '<dir>/env.sh'`,
+//! makes the program's own shell load the state the last program saved and save
+//! it again when the program ends, so a program killed by a signal saves nothing
+//! (`tests/tla/bash_tool/ResultStore.tla` `Finish`, `StateNeverTorn`,
+//! `EndedSaves`). The state never holds the MCP token. This module imports only
+//! `std`, so `zig test` runs its tests alone.
 const std = @import("std");
 
 /// The whole code a program sends to wait for the program that is running.
 pub const wait_word = "wait_more";
-
-/// The variable bash reads its startup script from; its value is `Session.bashEnv`.
-pub const env_var = "BASH_ENV";
 
 /// The largest bash state one program saves (R3.7). A larger state is not
 /// saved: the last complete state stays, and the program's output says so
@@ -42,11 +40,16 @@ const env_header =
 /// ended in. The state never holds a folder: fx starts each program there.
 const folder_file = "folder";
 
-/// Appends `name='<path>'` and a newline. A `'` in `path` becomes `'\''`, so the
-/// path stays one shell word.
-fn appendQuotedAssignment(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, path: []const u8) !void {
-    try out.appendSlice(alloc, name);
-    try out.appendSlice(alloc, "='");
+/// The files, next to the state, where the script records the startup
+/// definitions. `prepare` makes them owner-only, and the script fills them with
+/// `>`, which keeps that mode.
+const startup_functions_file = "startup-functions";
+const startup_aliases_file = "startup-aliases";
+
+/// Appends `path` in single quotes. A `'` in `path` becomes `'\''`, so the path
+/// stays one shell word.
+fn appendQuotedWord(alloc: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8) !void {
+    try out.append(alloc, '\'');
     for (path) |byte| {
         if (byte == '\'') {
             try out.appendSlice(alloc, "'\\''");
@@ -54,7 +57,15 @@ fn appendQuotedAssignment(alloc: std.mem.Allocator, out: *std.ArrayList(u8), nam
             try out.append(alloc, byte);
         }
     }
-    try out.appendSlice(alloc, "'\n");
+    try out.append(alloc, '\'');
+}
+
+/// Appends `name='<path>'` and a newline.
+fn appendQuotedAssignment(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, path: []const u8) !void {
+    try out.appendSlice(alloc, name);
+    try out.append(alloc, '=');
+    try appendQuotedWord(alloc, out, path);
+    try out.append(alloc, '\n');
 }
 
 /// Whether `name` is a plain variable name: letters, digits, and `_`, not empty.
@@ -67,16 +78,25 @@ fn isVariableName(name: []const u8) bool {
     return true;
 }
 
-/// The BASH_ENV script for a session whose state file is `state_path`. The
-/// caller owns the result. A `'` in the path becomes `'\''`, so the path stays
-/// one shell word. `fx_variables` are the names fx adds to every program; the
-/// script skips them when it saves, so they never reach the saved state.
-fn envScript(alloc: std.mem.Allocator, state_path: []const u8, folder_path: []const u8, fx_variables: []const []const u8) ![]u8 {
+/// The env.sh script for a session whose state file is `state_path`. The caller
+/// owns the result. Its paths are single-quoted, so each stays one shell word.
+/// `fx_variables` are the names fx adds to every program; the script skips them
+/// when it saves, so they never reach the saved state.
+fn envScript(
+    alloc: std.mem.Allocator,
+    state_path: []const u8,
+    folder_path: []const u8,
+    startup_functions_path: []const u8,
+    startup_aliases_path: []const u8,
+    fx_variables: []const []const u8,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, env_header);
     try appendQuotedAssignment(alloc, &out, "__fx_state", state_path);
     try appendQuotedAssignment(alloc, &out, "__fx_folder", folder_path);
+    try appendQuotedAssignment(alloc, &out, "__fx_startup_functions", startup_functions_path);
+    try appendQuotedAssignment(alloc, &out, "__fx_startup_aliases", startup_aliases_path);
     try out.appendSlice(alloc, std.fmt.comptimePrint("__fx_max={d}\n", .{max_state_bytes}));
     try out.appendSlice(alloc, body_before_skip);
     for (fx_variables) |name| {
@@ -87,16 +107,16 @@ fn envScript(alloc: std.mem.Allocator, state_path: []const u8, folder_path: []co
     return out.toOwnedSlice(alloc);
 }
 
-/// One agent's bash session: its private folder and its BASH_ENV script. The
-/// folder is made by `prepare` and deleted by `deinit`.
+/// One agent's bash session: its private folder and the text that loads its
+/// state. The folder is made by `prepare` and deleted by `deinit`.
 pub const Session = struct {
     /// Makes and frees this session's paths; it lives as long as the session.
     alloc: std.mem.Allocator,
     /// The private folder, `<tmp_root>/fx-bash-<pid>-<16 hex digits>`, where
     /// `<pid>` is this process's id. Owned.
     dir: ?[]u8 = null,
-    /// `<dir>/env.sh`, the BASH_ENV script. Owned.
-    env_path: ?[]u8 = null,
+    /// The after-startup text of every program: `. '<dir>/env.sh'`. Owned.
+    after_startup: ?[]u8 = null,
     /// The id of this session's last program, so a new program waits its
     /// turn and wait_more finds it. Owned.
     program_id: ?[]u8 = null,
@@ -110,9 +130,9 @@ pub const Session = struct {
 
     /// Makes the folder and writes its script, once. `tmp_root` must be an
     /// absolute path, because the script names the state file by its full
-    /// path. It must not hold `$`, a backquote, or a backslash: bash expands
-    /// `BASH_ENV`, so one of them would run code or change the path, and such a
-    /// root is refused with `error.UnsafeTmpRoot`. `fx_variables` are the names fx adds to every program, which the
+    /// path. It must not hold `$`, a backquote, or a backslash. The script
+    /// quotes its paths, so bash does not expand them, and such a root is still
+    /// refused with `error.UnsafeTmpRoot` as a plain guard. `fx_variables` are the names fx adds to every program, which the
     /// script never saves; a name that is not a plain variable name is refused
     /// with `error.InvalidVariableName` before anything is made. Before it makes
     /// the folder, it removes the folders that dead processes left in `tmp_root`
@@ -134,27 +154,36 @@ pub const Session = struct {
         const dir = try alloc.print("{s}/{s}{d}-{s}", .{ tmp_root, folder_prefix, processId(), &hex });
         errdefer alloc.free(dir);
         const env_path = try alloc.print("{s}/env.sh", .{dir});
-        errdefer alloc.free(env_path);
+        defer alloc.free(env_path);
         const state_path = try alloc.print("{s}/state.sh", .{dir});
         defer alloc.free(state_path);
         const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
         defer alloc.free(folder_path);
-        const script = try envScript(alloc, state_path, folder_path, fx_variables);
+        const startup_functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
+        defer alloc.free(startup_functions_path);
+        const startup_aliases_path = try alloc.print("{s}/{s}", .{ dir, startup_aliases_file });
+        defer alloc.free(startup_aliases_path);
+        const script = try envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, fx_variables);
         defer alloc.free(script);
+        const after_startup = try startupTextFor(alloc, env_path);
+        errdefer alloc.free(after_startup);
 
         try std.Io.Dir.cwd().createDir(io, dir, .fromMode(0o700));
         errdefer removeTree(io, dir);
         try writeScript(io, dir, script);
+        try makeStartupRecord(io, dir, startup_functions_file);
+        try makeStartupRecord(io, dir, startup_aliases_file);
 
         self.dir = dir;
-        self.env_path = env_path;
+        self.after_startup = after_startup;
         return swept;
     }
 
-    /// The BASH_ENV value for this session's programs, or null before `prepare`.
-    pub fn bashEnv(self: *const Session) ?[]const u8 {
-        const path = self.env_path orelse return null;
-        return path;
+    /// The text every program's shell runs after the user's startup definitions and
+    /// before the program's command, or null before `prepare`. The slice is valid
+    /// until `deinit`.
+    pub fn afterStartupText(self: *const Session) ?[]const u8 {
+        return self.after_startup;
     }
 
     /// Stores `id` as the id of this session's last program, freeing the one
@@ -207,7 +236,7 @@ pub const Session = struct {
             removeTree(io, dir);
             alloc.free(dir);
         }
-        if (self.env_path) |path| alloc.free(path);
+        if (self.after_startup) |text| alloc.free(text);
         if (self.program_id) |id| alloc.free(id);
         if (self.start_folder) |folder| alloc.free(folder);
         self.* = .{ .alloc = alloc };
@@ -277,6 +306,28 @@ fn writeScript(io: std.Io, dir: []const u8, script: []const u8) !void {
     try folder.rename("env.sh.tmp", folder, "env.sh", io);
 }
 
+/// The after-startup text for the script at `env_path`: `. '<env_path>'`. The
+/// caller owns the result.
+fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "\\builtin . ");
+    try appendQuotedWord(alloc, &out, env_path);
+    return out.toOwnedSlice(alloc);
+}
+
+/// Makes an empty, owner-only startup record. The script fills it with `>`,
+/// which keeps the mode.
+fn makeStartupRecord(io: std.Io, dir: []const u8, name: []const u8) !void {
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    var file = try folder.createFile(io, name, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    file.close(io);
+}
+
 /// Deletes `dir` and everything in it. A failed delete is ignored because the
 /// caller is already failing or ending, and nothing here can report it.
 fn removeTree(io: std.Io, dir: []const u8) void {
@@ -290,90 +341,138 @@ fn removeTree(io: std.Io, dir: []const u8) void {
 /// that test on purpose. A multiline string has no newline after its last line,
 /// so the empty last line of `body_after_skip` supplies the final one.
 ///
-/// The first line unsets BASH_ENV. Only the program's own shell loads and saves
-/// the state: a child bash, from `bash -c` or a script, then gets no BASH_ENV, so
-/// it loads no saved `set -u` and saves nothing at its own exit.
+/// fx runs `. '<dir>/env.sh'` as the after-startup text of each program, so the
+/// program's own shell sources this script after the user's startup definitions
+/// and before the program's command. No child process gets it: no environment
+/// variable names it, so a `bash -c` or a script loads no saved `set -u` and
+/// saves nothing at its own exit.
+///
+/// The first line turns off alias expansion while the script runs, so an alias
+/// the user's startup files define cannot rewrite the script's own words (a `for`
+/// alias would break its loop). The startup definitions are recorded before the
+/// state loads, and expansion is turned back on after it.
+///
+/// The save and the `trap` wrapper are defined before the state loads and before
+/// aliases expand. Every command word in them is `builtin`, `command`, or `[[`,
+/// which no function can replace, so a function or alias the program defined with
+/// a word's name cannot run in its place. A program that redefines `builtin` or
+/// `command` is out of scope.
 const body_before_skip =
-    \\unset BASH_ENV
+    \\\builtin shopt -u expand_aliases
     \\__fx_env_n=0
-    \\for __fx_name in $(compgen -e); do
+    \\for __fx_name in $(builtin compgen -e); do
     \\  __fx_env_names[__fx_env_n]=$__fx_name
     \\  __fx_env_values[__fx_env_n]="${!__fx_name}"
     \\  __fx_env_n=$((__fx_env_n + 1))
     \\done
-    \\if [ -r "$__fx_state" ]; then . "$__fx_state" >/dev/null 2>&1; fi
-    \\shopt -s expand_aliases
+    \\builtin declare -f >"$__fx_startup_functions" 2>/dev/null
+    \\builtin alias -p >"$__fx_startup_aliases" 2>/dev/null
     \\__fx_inherited() {
-    \\  local __fx_i=0
-    \\  while [ "$__fx_i" -lt "$__fx_env_n" ]; do
-    \\    if [ "${__fx_env_names[__fx_i]}" = "$1" ]; then
-    \\      [ "${__fx_env_values[__fx_i]}" = "${!1-}" ]
-    \\      return
+    \\  builtin local __fx_i=0
+    \\  while [[ "$__fx_i" -lt "$__fx_env_n" ]]; do
+    \\    if [[ "${__fx_env_names[__fx_i]}" = "$1" ]]; then
+    \\      [[ "${__fx_env_values[__fx_i]}" = "${!1-}" ]]
+    \\      builtin return
     \\    fi
     \\    __fx_i=$((__fx_i + 1))
     \\  done
-    \\  return 1
+    \\  builtin return 1
     \\}
     \\__fx_save() {
-    \\  local __fx_rc=$? __fx_name __fx_decl __fx_size __fx_tmp="$__fx_state.$$.tmp" __fx_keep_n=0 __fx_keep=()
-    \\  [ "${BASH_SUBSHELL:-0}" -eq 0 ] || return $__fx_rc
-    \\  for __fx_name in $(compgen -v); do
+    \\  builtin local __fx_rc=$? __fx_name __fx_decl __fx_size __fx_tmp="$__fx_state.$$.tmp" __fx_defs_fn="$__fx_state.$$.functions" __fx_defs_al="$__fx_state.$$.aliases" __fx_keep_n=0 __fx_saved=0
+    \\  __fx_keep=()
+    \\  [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || builtin return $__fx_rc
+    \\  for __fx_name in $(\builtin compgen -v); do
     \\    case $__fx_name in
     \\        BASH|BASH_*|BASHOPTS|BASHPID|COLUMNS|COMP_*|DIRSTACK|EPOCHREALTIME|EPOCHSECONDS|EUID|FUNCNAME|GROUPS|HISTCMD|HOSTNAME|HOSTTYPE|IFS|LINENO|LINES|MACHTYPE|OLDPWD|OPTERR|OPTIND|OSTYPE|PIPESTATUS|PPID|PS4|PWD|RANDOM|SECONDS|SHELLOPTS|SHLVL|SRANDOM|UID|_|__fx_*
 ;
 
-/// The rest of the script, after the names fx adds to every program.
+/// The rest of the script, after the names fx adds to every program. The save
+/// writes each function and alias the program has, and then `command awk` keeps
+/// only the blocks whose exact text is not in the startup record. A function block
+/// starts at its `name () ` line and runs to the next block's first line. An alias
+/// is one record that starts with `alias `. So a definition the user's startup
+/// files make, which the program leaves alone, is never saved, and the next
+/// program's startup files decide it.
 const body_after_skip =
-    \\) continue ;;
+    \\) builtin continue ;;
     \\    esac
-    \\    __fx_inherited "$__fx_name" && continue
+    \\    __fx_inherited "$__fx_name" && builtin continue
     \\    __fx_keep[__fx_keep_n]=$__fx_name
     \\    __fx_keep_n=$((__fx_keep_n + 1))
     \\  done
-    \\  (
-    \\    umask 077
+    \\  if (
+    \\    builtin umask 077
     \\    {
-    \\      if [ "$__fx_keep_n" -gt 0 ]; then declare -p "${__fx_keep[@]}" || exit 1; fi
-    \\    for __fx_name in $(compgen -A function); do
-    \\      case $__fx_name in
-    \\        __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|.) continue ;;
-    \\      esac
-    \\      declare -f "$__fx_name"
-    \\    done
-    \\    alias -p
-    \\    shopt -p
-    \\    set +o | while read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix') ;; *) printf '%s\n' "$__fx_decl" ;; esac; done
+    \\      if [[ "$__fx_keep_n" -gt 0 ]]; then builtin declare -p "${__fx_keep[@]}" || builtin exit 1; fi
+    \\      {
+    \\        for __fx_name in $(\builtin compgen -A function); do
+    \\          case $__fx_name in
+    \\            __fx_*|alias|builtin|cd|command|declare|eval|exec|exit|printf|set|shopt|source|trap|unalias|unset|.) builtin continue ;;
+    \\          esac
+    \\          builtin declare -f "$__fx_name"
+    \\        done
+    \\      } >"$__fx_defs_fn"
+    \\      builtin alias -p >"$__fx_defs_al"
+    \\      command awk -v startup_functions="$__fx_startup_functions" -v startup_aliases="$__fx_startup_aliases" '
+    \\function starts(line) { return line ~ /^alias / || line ~ /^[^ ].* [(][)] $/ }
+    \\function learn(path,   line, block) {
+    \\    block = ""
+    \\    while ((getline line < path) > 0) {
+    \\        if (starts(line) && block != "") { known[block] = 1; block = "" }
+    \\        block = block line "\n"
+    \\    }
+    \\    close(path)
+    \\    if (block != "") known[block] = 1
+    \\}
+    \\BEGIN { learn(startup_functions); learn(startup_aliases) }
+    \\{
+    \\    if (starts($0) && block != "") { if (!(block in known)) printf "%s", block; block = "" }
+    \\    block = block $0 "\n"
+    \\}
+    \\END { if (block != "" && !(block in known)) printf "%s", block }' "$__fx_defs_fn" "$__fx_defs_al" || builtin exit 1
+    \\      builtin shopt -p
+    \\      builtin shopt -p
+    \\      builtin set +o | while builtin read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix') ;; *) builtin printf '%s\n' "$__fx_decl" ;; esac; done
     \\    } 2>/dev/null >"$__fx_tmp"
-    \\  ) || { rm -f "$__fx_tmp" 2>/dev/null; return $__fx_rc; }
-    \\  __fx_size=$(( $(wc -c <"$__fx_tmp") ))
-    \\  if [ "$__fx_size" -gt "$__fx_max" ]; then
-    \\    rm -f "$__fx_tmp" 2>/dev/null
-    \\    printf "fx: this program's bash state is %s bytes, over the %s-byte limit, so it was not saved; the next program starts from the last saved state.\n" "$__fx_size" "$__fx_max" >&2
-    \\  else
-    \\    if ( umask 077; printf '%s' "$PWD" >"$__fx_folder.$$.tmp" ) 2>/dev/null; then
-    \\      mv -f "$__fx_tmp" "$__fx_state" && mv -f "$__fx_folder.$$.tmp" "$__fx_folder" || rm -f "$__fx_folder.$$.tmp" 2>/dev/null
-    \\    else
-    \\      rm -f "$__fx_tmp" "$__fx_folder.$$.tmp" 2>/dev/null
+    \\  ); then
+    \\    __fx_size=$(( $(\command wc -c <"$__fx_tmp") ))
+    \\    if [[ "$__fx_size" -gt "$__fx_max" ]]; then
+    \\      command rm -f "$__fx_tmp" 2>/dev/null
+    \\      builtin printf "fx: this program's bash state is %s bytes, over the %s-byte limit, so it was not saved; the next program starts from the last saved state.\n" "$__fx_size" "$__fx_max" >&2
+    \\      __fx_saved=1
+    \\    elif ( builtin umask 077; builtin printf '%s' "$PWD" >"$__fx_folder.$$.tmp" ) 2>/dev/null &&
+    \\      command mv -f "$__fx_tmp" "$__fx_state" && command mv -f "$__fx_folder.$$.tmp" "$__fx_folder"; then
+    \\      __fx_saved=1
     \\    fi
     \\  fi
-    \\  return $__fx_rc
-    \\}
-    \\trap __fx_save EXIT
-    \\trap() {
-    \\  builtin trap "$@" || return $?
-    \\  local __fx_line
-    \\  __fx_line=$(builtin trap -p EXIT)
-    \\  if [ -z "$__fx_line" ]; then
-    \\    builtin trap __fx_save EXIT
-    \\    return 0
+    \\  command rm -f "$__fx_defs_fn" "$__fx_defs_al" 2>/dev/null
+    \\  if [[ "$__fx_saved" -eq 0 ]]; then
+    \\    command rm -f "$__fx_tmp" "$__fx_folder.$$.tmp" 2>/dev/null
+    \\    if [[ -d "${__fx_state%/*}" ]]; then
+    \\      builtin printf "fx: this program's bash state could not be saved; the next program starts from the last saved state.\n" >&2
+    \\    fi
     \\  fi
-    \\  eval "set -- $__fx_line"
+    \\  builtin return $__fx_rc
+    \\}
+    \\trap() {
+    \\  builtin trap "$@" || builtin return $?
+    \\  builtin local __fx_line
+    \\  __fx_line=$(\builtin trap -p EXIT)
+    \\  if [[ -z "$__fx_line" ]]; then
+    \\    builtin trap __fx_save EXIT
+    \\    builtin return 0
+    \\  fi
+    \\  builtin eval "\builtin set -- $__fx_line"
     \\  case $3 in
-    \\    __fx_save|__fx_save$'\n'*) return 0 ;;
+    \\    __fx_save|__fx_save$'\n'*) builtin return 0 ;;
     \\  esac
     \\  builtin trap "__fx_save
     \\$3" EXIT
     \\}
+    \\if [[ -r "$__fx_state" ]]; then builtin . "$__fx_state" >/dev/null 2>&1; fi
+    \\\builtin shopt -s expand_aliases
+    \\\builtin trap __fx_save EXIT
     \\
 ;
 
@@ -394,24 +493,26 @@ test "bashPath keeps an absolute bash and falls back to /bin/bash" {
 
 test "envScript quotes the state path, keeps the header, and installs the save trap" {
     const alloc = std.testing.allocator;
-    const script = try envScript(alloc, "/tmp/a'b/state.sh", "/tmp/a'b/folder", &test_fx_variables);
+    const script = try envScript(alloc, "/tmp/a'b/state.sh", "/tmp/a'b/folder", "/tmp/a'b/startup-functions", "/tmp/a'b/startup-aliases", &test_fx_variables);
     defer alloc.free(script);
     var lines = std.mem.splitScalar(u8, script, '\n');
     try std.testing.expectEqualStrings("# fx bash tool: load the bash state the last program saved, and save it again", lines.next().?);
     try std.testing.expectEqualStrings("# when this program ends (tests/tla/bash_tool/ResultStore.tla Finish).", lines.next().?);
     try std.testing.expectEqualStrings("__fx_state='/tmp/a'\\''b/state.sh'", lines.next().?);
     try std.testing.expectEqualStrings("__fx_folder='/tmp/a'\\''b/folder'", lines.next().?);
+    try std.testing.expectEqualStrings("__fx_startup_functions='/tmp/a'\\''b/startup-functions'", lines.next().?);
+    try std.testing.expectEqualStrings("__fx_startup_aliases='/tmp/a'\\''b/startup-aliases'", lines.next().?);
     try std.testing.expect(std.mem.find(u8, script, "trap __fx_save EXIT\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, script, "}\n"));
+    try std.testing.expect(std.mem.endsWith(u8, script, "\\builtin trap __fx_save EXIT\n"));
 }
 
 test "the bash script keeps the reviewed bytes" {
-    const script = try envScript(std.testing.allocator, "/tmp/fx-pinned/state.sh", "/tmp/fx-pinned/folder", &test_fx_variables);
+    const script = try envScript(std.testing.allocator, "/tmp/fx-pinned/state.sh", "/tmp/fx-pinned/folder", "/tmp/fx-pinned/startup-functions", "/tmp/fx-pinned/startup-aliases", &test_fx_variables);
     defer std.testing.allocator.free(script);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("a8c6fc836e32fea15ebda279cd4473ddd7a98c9e131d65402eb88ab949662c96", &hex);
+    try std.testing.expectEqualStrings("337399ba816061bac12826dd4ed1c0340f955d39a075c9d958eb37acb44ebf75", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -433,7 +534,7 @@ test "deinit deletes the session folder" {
     const dir = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(dir);
     session.deinit(io);
-    try std.testing.expect(session.dir == null and session.env_path == null);
+    try std.testing.expect(session.dir == null and session.after_startup == null);
     if (std.Io.Dir.cwd().openDir(io, dir, .{})) |opened| {
         var folder = opened;
         folder.close(io);
@@ -456,23 +557,33 @@ const program_four =
 const expected_two = "x=two words Y=exported arr1=b c pwd=sub dir\nf says hi\nalias-ok\nnullglob-on\nnounset-on\nerrexit-off\ntoken=t2\n";
 
 /// Runs `program` as one bash tool program of `session`, in `cwd`, with the
-/// environment a program gets: PATH, BASH_ENV, and the call token. The caller
-/// frees the result with `freeRun`.
+/// environment a program gets: PATH and the call token. The caller frees the
+/// result with `freeRun`.
 fn runProgram(alloc: std.mem.Allocator, io: std.Io, session: *const Session, cwd: []const u8, token: []const u8, program: []const u8) !std.process.RunResult {
-    return runProgramWithEnv(alloc, io, session, cwd, token, &.{}, program);
+    return runProgramAfterStartup(alloc, io, session, cwd, token, "", &.{}, program);
 }
 
 /// Runs `program` like `runProgram`, with `extra` added to the environment the
 /// program inherits, as fx's own environment would pass it.
 fn runProgramWithEnv(alloc: std.mem.Allocator, io: std.Io, session: *const Session, cwd: []const u8, token: []const u8, extra: []const [2][]const u8, program: []const u8) !std.process.RunResult {
+    return runProgramAfterStartup(alloc, io, session, cwd, token, "", extra, program);
+}
+
+/// Runs `program` as fx runs a bash tool program: one `bash -c` string, with
+/// `expand_aliases`, that holds `startup` (which stands in for the user's startup
+/// definitions), then the session's after-startup text, then the program. The
+/// caller frees the result with `freeRun`.
+fn runProgramAfterStartup(alloc: std.mem.Allocator, io: std.Io, session: *const Session, cwd: []const u8, token: []const u8, startup: []const u8, extra: []const [2][]const u8, program: []const u8) !std.process.RunResult {
+    const after = session.afterStartupText() orelse return error.TestNoAfterStartup;
+    const script = try alloc.print("{s}\n{s}\n{s}", .{ startup, after, program });
+    defer alloc.free(script);
     var environ = std.process.Environ.Map.init(alloc);
     defer environ.deinit();
     try environ.put("PATH", "/usr/bin:/bin");
-    try environ.put(env_var, session.bashEnv().?);
     try environ.put("FX_MCP_CALL_TOKEN", token);
     for (extra) |pair| try environ.put(pair[0], pair[1]);
     return std.process.run(alloc, io, .{
-        .argv = &.{ "/bin/bash", "--noprofile", "--norc", "-c", program },
+        .argv = &.{ "/bin/bash", "--noprofile", "--norc", "-O", "expand_aliases", "-c", script },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
     });
@@ -920,7 +1031,7 @@ test "a background child that ends after its program changes neither the saved s
     // the subshell reads it, and `read -t` bounds the wait to 10 seconds. The test
     // never sleeps and never blocks.
     const release = try alloc.print(
-        "unset BASH_ENV; exec 4<>'{s}' && echo go >&4 && exec 3<>'{s}' && read -t 10 ok <&3",
+        "exec 4<>'{s}' && echo go >&4 && exec 3<>'{s}' && read -t 10 ok <&3",
         .{ gate, done },
     );
     defer alloc.free(release);
@@ -939,6 +1050,251 @@ test "a background child that ends after its program changes neither the saved s
     const sub = try alloc.print("{s}/sub", .{dir});
     defer alloc.free(sub);
     try std.testing.expectEqualStrings(sub, saved_folder);
+}
+
+/// Fails when the session folder holds a file whose name ends in `.tmp`: a save
+/// that works renames its temporary file away.
+fn expectNoTmpFile(io: std.Io, dir: []const u8) !void {
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer folder.close(io);
+    var entries = folder.iterate();
+    while (try entries.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) return error.TmpFileLeftBehind;
+    }
+}
+
+test "a program's functions and aliases named like the save's words do not stop the save" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // Each word the save uses is a function that does nothing, and an alias that
+    // would print. `wc` prints a size over the cap, which would be a false notice.
+    const shadow =
+        "mv() { :; }; rm() { :; }; wc() { echo 9999999; }; read() { :; }; printf() { :; }; " ++
+        "compgen() { :; }; declare() { :; }; alias() { :; }; shopt() { :; }; set() { :; }; " ++
+        "umask() { :; }; test() { :; }; [() { :; }; " ++
+        "builtin alias mv='echo hijacked' rm='echo hijacked' wc='echo hijacked' read='echo hijacked' " ++
+        "printf='echo hijacked' compgen='echo hijacked' declare='echo hijacked' alias='echo hijacked' " ++
+        "shopt='echo hijacked' set='echo hijacked' umask='echo hijacked' test='echo hijacked' " ++
+        "'['='echo hijacked'; kept=1";
+    const first = try runProgram(alloc, io, &session, dir, "shadow", shadow);
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    const second = try runProgram(alloc, io, &session, dir, "after-shadow", "echo \"kept=$kept\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("kept=1\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+    try expectNoTmpFile(io, dir);
+}
+
+test "a state that cannot be written is not saved, and the program says so" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgram(alloc, io, &session, dir, "first", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    // A directory where the save writes its temporary file makes the write fail,
+    // while the session folder still exists.
+    const second = try runProgram(alloc, io, &session, dir, "blocked", "x=2; mkdir \"$__fx_state.$$.tmp\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings(
+        "fx: this program's bash state could not be saved; the next program starts from the last saved state.\n",
+        second.stderr,
+    );
+
+    const third = try runProgram(alloc, io, &session, dir, "after-blocked", "echo \"x=$x\"");
+    defer freeRun(alloc, third);
+    try expectExit(third, 0);
+    try std.testing.expectEqualStrings("x=1\n", third.stdout);
+}
+
+test "a program's alias for a name the startup defines carries to the next program" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const startup = "alias ll='echo RC'";
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "alias1", startup, &.{}, "alias ll='echo MINE'");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "alias2", startup, &.{}, "ll");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("MINE\n", second.stdout);
+}
+
+test "a startup function the program leaves alone is not saved" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const startup = "f() { echo RC; }";
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "keep1", startup, &.{}, "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    const state = try folder.readFileAlloc(io, "state.sh", alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "x=\"1\"") != null);
+    try std.testing.expect(std.mem.find(u8, state, "f () ") == null);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "keep2", startup, &.{}, "f; echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("RC\nx=1\n", second.stdout);
+}
+
+test "a startup function the program never defined takes the next startup's definition" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "startup-a", "g() { echo A; }", &.{}, "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "startup-b", "g() { echo B; }", &.{}, "g");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("B\n", second.stdout);
+}
+
+test "a startup alias named like a word of the script does not stop the save" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // Without the first line of the script, this alias would expand the script's
+    // own `for` loop, the script would not load, and nothing would be saved.
+    const startup = "alias for='echo H'";
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "reserved1", startup, &.{}, "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "reserved2", startup, &.{}, "echo \"x=$x\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("x=1\n", second.stdout);
+}
+
+test "prepare makes the startup records owner-only, and the after-startup text sources env.sh" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    inline for (.{ startup_functions_file, startup_aliases_file }) |name| {
+        const stat = try folder.statFile(io, name, .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+    const want = try alloc.print("\\builtin . '{s}/env.sh'", .{dir});
+    defer alloc.free(want);
+    try std.testing.expectEqualStrings(want, session.afterStartupText() orelse return error.TestNoAfterStartup);
+}
+
+test "startup aliases named like the script's own words do not stop the save" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // Each alias would print BAD wherever the script let it expand: the after-startup
+    // `.`, the script's own lines and `$()` words, and the trap wrapper, which the
+    // program reaches with `\trap`.
+    const startup = "alias builtin='echo BAD'; alias command='echo BAD'; alias .='echo BAD'; alias shopt='echo BAD'; alias trap='echo BAD'";
+    const first = try runProgramAfterStartup(alloc, io, &session, dir, "words1", startup, &.{}, "\\trap 'true' EXIT; kept=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expectEqualStrings("", first.stdout);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    const second = try runProgramAfterStartup(alloc, io, &session, dir, "words2", startup, &.{}, "echo \"kept=$kept\"");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("kept=1\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
 }
 
 test "setting a program twice frees the first id" {

@@ -91,6 +91,10 @@ pub const StartCapturedInput = struct {
     /// Added to the command's environment. Copied before `startCaptured`
     /// returns.
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
+    /// Shell text the command's shell runs after the user's startup
+    /// definitions, before the command (`command_runner.Config.after_startup`).
+    /// Copied before `startCaptured` returns.
+    after_startup: []const u8 = "",
     /// While this count is above zero, `startCaptured` waits past
     /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
     /// owner is this call, which must not end before the answer does.
@@ -275,6 +279,7 @@ const Entry = struct {
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
+    after_startup: []const u8 = "",
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -323,6 +328,7 @@ const Entry = struct {
         for (input.extra_environment, extra_environment) |source, *target| {
             target.* = .{ .name = try owned.dupe(u8, source.name), .value = try owned.dupe(u8, source.value) };
         }
+        const after_startup = try owned.dupe(u8, input.after_startup);
         const command_artifact_dir = if (input.command_artifact_dir) |path|
             try owned.dupe(u8, path)
         else
@@ -379,6 +385,7 @@ const Entry = struct {
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
+            .after_startup = after_startup,
         };
         entry.started_ms = io_mod.milliTimestamp();
         entry.last_output_ms = entry.started_ms;
@@ -629,6 +636,7 @@ const Entry = struct {
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
             .extra_environment = self.extra_environment,
+            .after_startup = self.after_startup,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);
