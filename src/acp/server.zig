@@ -9013,6 +9013,7 @@ test "a claim waits while a finished turn is being joined, and claims the slot o
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
     const line = &session.waiting_prompts;
 
@@ -9226,6 +9227,7 @@ test "a close waits while a follower holds a use, and frees the session only aft
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
 
     // A follower takes a use while the session is still listed.
@@ -9505,6 +9507,7 @@ test "a follower's $/cancel_request withdraws its own queued prompt, and not the
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The follower's list buffer is freed last (defers run in reverse), after the entry is forgotten.
@@ -9659,6 +9662,7 @@ test "a follower's $/cancel_request with its own running prompt's id stops that 
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
@@ -9712,6 +9716,7 @@ test "a follower's $/cancel_request with the same request id number as the owner
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     // The list buffer is freed last (defers run in reverse), after the entry is forgotten.
