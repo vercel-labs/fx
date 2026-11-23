@@ -708,7 +708,7 @@ const live_scan_page = 4096;
 /// subagents (`tests/tla/session/LiveSessions.tla`). A session is live while
 /// a process holds its writer lock, which the kernel frees however the
 /// process ends. The scan tries each lock without waiting and lets a free
-/// one go at once (`isBusy`), then reads the live session's log without the
+/// one go at once (`lockStatus`), then reads the live session's log without the
 /// lock (D37). It writes nothing. A session whose lock can't be tried is not
 /// live, and one whose log can't be read is listed as `unknown`; both are
 /// traced. The caller frees the list with `deinit`.
@@ -726,16 +726,19 @@ pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !sessio
         defer page.deinit();
         for (page.items) |item| {
             if (item.role != .root) continue;
-            const live = store.manager.isBusy(item.id) catch |err| switch (err) {
+            const status = store.manager.lockStatus(item.id) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     debug_trace.logf("session", "event=live_probe_failed session={s} err={s}", .{ item.id, @errorName(err) });
                     continue;
                 },
             };
-            if (!live) continue;
+            const pid = switch (status) {
+                .free => continue,
+                .busy => |owner| owner,
+            };
             _ = scratch.reset(.retain_capacity);
-            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item));
+            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item, pid));
         }
         cursor = page.next orelse break;
     }
@@ -743,14 +746,15 @@ pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !sessio
     return list;
 }
 
-/// Live root session `item`, read from its log into `arena`.
-fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary) !session_store.LiveSession {
+/// Live root session `item`, read from its log into `arena`, holding its
+/// writer lock as `pid` names it.
+fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary, pid: ?i64) !session_store.LiveSession {
     const summary = try summaryOf(arena, scratch, item);
     const peeked = store.manager.peek(scratch, item.id) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=live_peek_failed session={s} err={s}", .{ item.id, @errorName(err) });
-            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{} };
+            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{}, .pid = pid };
         },
     };
     return .{
@@ -758,6 +762,7 @@ fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Sum
         .saved_model = savedModel(arena, peeked.state.prefs),
         .state = if (peeked.state.open_turn != null) .working else .idle,
         .agents = try liveAgents(store, arena, scratch, item.id, peeked.state.children.items, 1),
+        .pid = pid,
     };
 }
 
