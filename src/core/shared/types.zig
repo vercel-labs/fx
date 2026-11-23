@@ -239,6 +239,13 @@ pub const ToolOutcome = struct {
     summary: []const u8,
 };
 
+/// The MCP server a call's tool is on, by its configured name, and the tool's
+/// own name on it, before fx gives it an alias such as `mcp_slack_read`.
+pub const McpToolName = struct {
+    server: []const u8,
+    tool: []const u8,
+};
+
 pub const ToolLifecycleEvent = union(enum) {
     provisional: struct {
         id: ToolLifecycleId,
@@ -249,6 +256,11 @@ pub const ToolLifecycleEvent = union(enum) {
         /// the call waits to start; null while they still stream in.
         /// Borrowed for this push only.
         arguments_json: ?[]const u8 = null,
+        /// The MCP tool the call runs, from the session's MCP catalog or its
+        /// record of the tools it called (src/core/mcp/tool_call_identities.zig);
+        /// null for any other call, or one neither knows. Borrowed for this
+        /// push only. Only the transcript's compact rows read it.
+        mcp_tool: ?McpToolName = null,
     },
     authoritative_started: struct {
         id: ToolLifecycleId,
@@ -262,6 +274,8 @@ pub const ToolLifecycleEvent = union(enum) {
         /// title a call when it starts. Borrowed for this push only; copies
         /// omit it.
         resolved_display_target: ?[]const u8 = null,
+        /// As `provisional.mcp_tool`.
+        mcp_tool: ?McpToolName = null,
     },
     progress: struct {
         id: ToolLifecycleId,

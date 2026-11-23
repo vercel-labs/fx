@@ -1856,7 +1856,15 @@ fn failureStatusDetail(
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
-    if (safe_result.len == 0 or !mcp_call) return null;
+    if (!mcp_call) return null;
+    return mcpFailureCause(arena, safe_result);
+}
+
+/// Why an MCP call failed, from the result the model got, for its status
+/// line: terminal-safe, and null when the result says nothing. A resume
+/// writes a saved call's line with it too, so the line reads as it did live.
+pub fn mcpFailureCause(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    if (safe_result.len == 0) return null;
     // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
     // The cause comes from that head, as it does in the trace.
     const model_text = result_store.storedPreview(safe_result) orelse safe_result;

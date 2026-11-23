@@ -2172,6 +2172,10 @@ const StoryRow = struct {
     /// The server of an MCP row's tool, from the first of its calls' results
     /// that names it; "" while none does.
     mcp_server: []const u8 = "",
+    /// An MCP row's server and tool as core named them for the first of its
+    /// calls it could (`ToolDetailRecord.mcp_server`); null while it named
+    /// none. It wins over `mcp_server` and the alias, which can only guess.
+    mcp_tool: ?types.McpToolName = null,
     /// The command the run that started the row's session sent, when the
     /// row's latest call is a later call to that session (sessionLaunchCommand).
     launch_command: ?[]const u8 = null,
@@ -3759,6 +3763,44 @@ fn mcpToolWords(scratch: std.mem.Allocator, alias: []const u8, server: []const u
     return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, name), " to ", words });
 }
 
+/// An MCP tool in words from the names core gave it (`StoryRow.mcp_tool`),
+/// as `mcpToolWords` writes them, but sure of the server and whole: no
+/// alias cut short or `_2` it took for a name another tool had. Null when
+/// the tool's name leaves no words.
+fn namedMcpToolWords(scratch: std.mem.Allocator, name: types.McpToolName) !?[]const u8 {
+    if (name.server.len == 0) return null;
+    const tool = withoutServerName(name.tool, name.server);
+    const words = try toolNameWords(scratch, tool);
+    if (words.len == 0) return null;
+    const server = try scratch.dupe(u8, name.server);
+    server[0] = std.ascii.toUpper(server[0]);
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, server), " to ", try terminalSafeText(scratch, words) });
+}
+
+/// `tool` without its repeat of `server`'s name, as slack's slack_read_thread
+/// reads as read_thread: the bytes the alias would spell alike, with case
+/// ignored, then "_" and more.
+fn withoutServerName(tool: []const u8, server: []const u8) []const u8 {
+    if (tool.len <= server.len + 1 or tool[server.len] != '_') return tool;
+    for (server, tool[0..server.len]) |a, b| {
+        if (aliasByte(a) != aliasByte(b)) return tool;
+    }
+    return tool[server.len + 1 ..];
+}
+
+fn aliasByte(byte: u8) u8 {
+    return if (mcp_tool_names.isIdentifierByte(byte)) std.ascii.toLower(byte) else '_';
+}
+
+/// The words for an MCP row's tool: from core's names when it gave them,
+/// else from its alias (`mcpToolWords`).
+fn mcpRowWords(scratch: std.mem.Allocator, alias: []const u8, row: *const StoryRow) !?[]const u8 {
+    if (row.mcp_tool) |name| if (types.isMcpToolName(alias)) {
+        if (try namedMcpToolWords(scratch, name)) |words| return words;
+    };
+    return mcpToolWords(scratch, alias, row.mcp_server);
+}
+
 /// A tool's name as lower-case words: "read thread" for read_thread, and
 /// "get issue" for getIssue. An alias holds only letters, digits, "_", and
 /// "-" (`isIdentifierByte` in src/core/mcp/tool_names.zig).
@@ -3792,7 +3834,7 @@ fn mcpRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Stor
     const record = row.detail orelse return null;
     if (record.activity_kind != .mcp) return null;
     for (mcp_row_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
-        const shown = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const shown = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
         return try std.mem.concat(scratch, u8, &.{ label.shown, shown });
     };
     return null;
@@ -3818,7 +3860,7 @@ fn unrunMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const S
     const record = row.detail orelse return null;
     if (record.outcome != .denied or record.activity_kind != .mcp) return null;
     for (mcp_unrun_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
-        const words = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const words = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
         const body = try std.mem.concat(scratch, u8, &.{ "Didn't use ", words });
         return .{ .display = try std.mem.concat(scratch, u8, &.{ body, label.note }), .body = body, .suffix = label.note };
     };
@@ -3929,6 +3971,79 @@ test "MCP rows say in words which server's tool a call used" {
     try std.testing.expect(std.mem.find(u8, text, "get_account") == null);
     try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
     try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
+}
+
+test "MCP rows name the server and tool core named for the call, in every state" {
+    const alloc = std.testing.allocator;
+    const Case = struct { phrase: []const u8, server: []const u8, tool: []const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
+    const E = "\x1b";
+    const cases = [_]Case{
+        // A server whose name has a "_" or a space, in every state, with no
+        // result to name it.
+        .{ .phrase = "● Running MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = null, .row = "● Using My_srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .completed, .row = "● Used My_srv to echo" },
+        .{ .phrase = "● Failed mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .failed, .row = "● Couldn't use My_srv to echo" },
+        .{ .phrase = "● Safety caution mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .denied, .row = "● Didn't use My_srv to echo · safety caution" },
+        .{ .phrase = "● Denied mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · denied" },
+        .{ .phrase = "● Review unavailable mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · review unavailable" },
+        // A unicode server's alias is all "_" where the alias spells it.
+        .{ .phrase = "● Safety caution mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .denied, .row = "● Didn't use ünï to echo · safety caution" },
+        .{ .phrase = "● Ran MCP mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .completed, .row = "● Used ünï to echo" },
+        // The tool's own name, not the alias's spelling of it.
+        .{ .phrase = "● Ran MCP mcp_fixture_caf___list\n", .server = "fixture", .tool = "café_list", .outcome = .completed, .row = "● Used Fixture to café list" },
+        // An alias cut at 64 bytes, and one with the "_2" of a name another
+        // tool had first.
+        .{ .phrase = "● Ran MCP mcp_fixture_a_very_long_tool_name_that_goes_well_beyond_the_sixt\n", .server = "fixture", .tool = "a_very_long_tool_name_that_goes_well_beyond_the_sixty_four_byte_alias_limit", .outcome = .completed, .row = "● Used Fixture to a very long tool name that goes well beyond the sixty four byte alias limit" },
+        .{ .phrase = "● Ran MCP mcp_a_b_c_2\n", .server = "a", .tool = "b_c", .outcome = .completed, .row = "● Used A to b c" },
+        // A name the terminal would act on shows escaped.
+        .{ .phrase = "● Ran MCP mcp_bad__0_PWN_srv_echo\n", .server = "bad" ++ E ++ "]0;PWN\x07srv", .tool = "echo", .outcome = .completed, .row = "● Used Bad\\x1b]0;PWN\\x07srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_fixture_echo\n", .server = "fixture", .tool = "ec\x07ho", .outcome = .completed, .row = "● Used Fixture to ec\\x07ho" },
+        // The tool repeats its server's name, as the alias spells it.
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture_list_items\n", .server = "fixture", .tool = "fixture_list_items", .outcome = .completed, .row = "● Used Fixture to list items" },
+        .{ .phrase = "● Ran MCP mcp_Team_notes_team_notes_search\n", .server = "Team notes", .tool = "team_notes_search", .outcome = .completed, .row = "● Used Team notes to search" },
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture\n", .server = "fixture", .tool = "fixture", .outcome = .completed, .row = "● Used Fixture to fixture" },
+        .{ .phrase = "● Ran MCP mcp_1password_item2Get_v3\n", .server = "1password", .tool = "item2Get_v3", .outcome = .completed, .row = "● Used 1password to item2 get v3" },
+        .{ .phrase = "● Ran MCP mcp_fixture_getHTTPStatus\n", .server = "fixture", .tool = "getHTTPStatus", .outcome = .completed, .row = "● Used Fixture to get http status" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
+        const alias = std.mem.trimEnd(u8, case.phrase[std.mem.findScalar(u8, case.phrase, 'm').?..], "\n");
+        var arguments: [160]u8 = undefined;
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = 1,
+            .tool_name = @constCast("toolbox"),
+            .activity_kind = .mcp,
+            .arguments_json = try std.mem.print(&arguments, "{{\"run\":\"{s}\",\"arguments\":{{}}}}", .{alias}),
+            .outcome = case.outcome,
+            .mcp_server = @constCast(case.server),
+            .mcp_tool = @constCast(case.tool),
+        }};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A row learns the names from whichever of its calls core named, and a
+    // cancelled call's notice names the call as its row does.
+    const run = "{\"run\":\"mcp_my_srv_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled mcp_Team_notes_echo" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .mcp_server = @constCast("my_srv"), .mcp_tool = @constCast("echo") },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_Team_notes_echo\",\"arguments\":{}}"), .outcome = .cancelled, .mcp_server = @constCast("Team notes"), .mcp_tool = @constCast("echo") },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("rows:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "├ Using My_srv to echo ×2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled using Team notes to echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled using Team notes to echo" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "an MCP tool") == null);
 }
 
 /// A running subagent call's identity by the agent its status names, such
@@ -4194,6 +4309,9 @@ fn collectStoryRows(
         target.tries = retries.tries.get(entry_id) orelse 0;
         if (target.mcp_server.len == 0) if (detail) |record| if (try mcpResultServer(scratch, record)) |server| {
             target.mcp_server = server;
+        };
+        if (target.mcp_tool == null) if (detail) |record| if (record.mcp_server) |server| if (record.mcp_tool) |tool| {
+            target.mcp_tool = .{ .server = server, .tool = tool };
         };
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
