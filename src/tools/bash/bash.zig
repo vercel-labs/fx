@@ -202,11 +202,7 @@ fn callRun(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailableResult(ctx);
     const session = ctx.bash_session orelse return unavailableResult(ctx);
-    if (session.program()) |id| {
-        if (runtime.stateFor(id)) |state| {
-            if (std.meta.activeTag(state) == .running) return failureText(ctx, still_running_text);
-        }
-    }
+    if (tool_dispatch.bashProgramRunning(session, runtime)) return failureText(ctx, still_running_text);
     const execution_authority = ctx.execution_authority orelse return unavailableResult(ctx);
     const authority = switch (execution_authority) {
         .run_command => |value| value,
@@ -359,13 +355,30 @@ fn cancelRequested(ctx: tool_dispatch.DispatchContext) bool {
 }
 
 /// The folder the session's files go in: `$TMPDIR` without trailing slashes, or
-/// `/tmp` when it is unset or holds `$`, a backquote, or a backslash, which bash
-/// would expand from `BASH_ENV`.
+/// `/tmp` when it is unset.
 fn tmpRoot() []const u8 {
-    const raw = io_mod.getenv("TMPDIR") orelse "/tmp";
+    return tmpRootFor(io_mod.getenv("TMPDIR") orelse "/tmp");
+}
+
+/// `raw` when it is an absolute path without trailing slashes, else `/tmp`. A
+/// relative path would fail every call, and `$`, a backquote, or a backslash
+/// would be expanded by bash from `BASH_ENV`, so `/tmp` stands in for both.
+fn tmpRootFor(raw: []const u8) []const u8 {
+    if (!std.Io.Dir.path.isAbsolute(raw)) return "/tmp";
     const trimmed = std.mem.trimEnd(u8, raw, "/");
     if (std.mem.findAny(u8, trimmed, "$`\\") != null) return "/tmp";
     return if (trimmed.len == 0) "/" else trimmed;
+}
+
+test "tmpRoot uses an absolute TMPDIR without trailing slashes, and /tmp otherwise" {
+    try std.testing.expectEqualStrings("/var/folders/fx", tmpRootFor("/var/folders/fx/"));
+    try std.testing.expectEqualStrings("/", tmpRootFor("/"));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor(""));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor("relative/dir"));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor("./tmp"));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor("/bad$dir"));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor("/bad`dir"));
+    try std.testing.expectEqualStrings("/tmp", tmpRootFor("/bad\\dir"));
 }
 
 /// The text the model sees for one snapshot of a bash program: its output, cut

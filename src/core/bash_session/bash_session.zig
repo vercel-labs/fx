@@ -170,8 +170,6 @@ pub const Session = struct {
         return self.program_id;
     }
 
-    /// Deletes the session folder and frees both paths. The session is then
-    /// unprepared, so `prepare` can make a new folder.
     /// The folder the next program starts in, or null for the workspace root.
     /// The slice is valid until the next `refreshStartFolder` or `deinit`.
     pub fn startFolder(self: *const Session) ?[]const u8 {
@@ -201,6 +199,8 @@ pub const Session = struct {
         return folder;
     }
 
+    /// Deletes the session folder and frees what the session holds. The session is
+    /// then unprepared, so `prepare` can make a new folder.
     pub fn deinit(self: *Session, io: std.Io) void {
         const alloc = self.alloc;
         if (self.dir) |dir| {
@@ -244,16 +244,13 @@ fn processGone(pid: std.posix.pid_t) bool {
     return false;
 }
 
-/// Removes the bash session folders that dead processes left in `tmp_root`. A
-/// process killed by a signal cannot run `deinit`, so the folder it made stays
-/// until a later session in the same temp folder clears it. Only a real
-/// directory named `fx-bash-<pid>-...`, whose pid names no process, is removed.
-/// A link or a file is never followed or removed, and this process's own
-/// folders and those of a live process stay. Best effort: whatever cannot be
-/// opened or deleted stays, and a later session tries again.
 /// Deletes the folders in `tmp_root` that dead processes left, and returns how
-/// many it deleted. Best effort: a folder it cannot delete stays for a later
-/// session, and a failure to read the root ends the sweep without an error.
+/// many it deleted. A process killed by a signal cannot run `deinit`, so the
+/// folder it made stays until a later session in the same temp folder clears
+/// it. Only a real directory named `fx-bash-<pid>-...`, whose pid names no
+/// process, is removed. A link or a file is never followed or removed, and this
+/// process's own folders and those of a live process stay. Best effort: whatever
+/// cannot be opened or deleted stays, and a later session tries again.
 fn sweepDeadFolders(io: std.Io, tmp_root: []const u8) usize {
     var removed: usize = 0;
     var root = std.Io.Dir.cwd().openDir(io, tmp_root, .{ .iterate = true }) catch return removed; // Best effort: a later session sweeps again.
@@ -292,7 +289,12 @@ fn removeTree(io: std.Io, dir: []const u8) void {
 /// bytes" pins the whole script by hash, so a change to either part must update
 /// that test on purpose. A multiline string has no newline after its last line,
 /// so the empty last line of `body_after_skip` supplies the final one.
+///
+/// The first line unsets BASH_ENV. Only the program's own shell loads and saves
+/// the state: a child bash, from `bash -c` or a script, then gets no BASH_ENV, so
+/// it loads no saved `set -u` and saves nothing at its own exit.
 const body_before_skip =
+    \\unset BASH_ENV
     \\__fx_env_n=0
     \\for __fx_name in $(compgen -e); do
     \\  __fx_env_names[__fx_env_n]=$__fx_name
@@ -409,7 +411,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("80cec24b9ca8c26bde289d5156d430f203d59e676c085c683497e643c12c9f6a", &hex);
+    try std.testing.expectEqualStrings("a8c6fc836e32fea15ebda279cd4473ddd7a98c9e131d65402eb88ab949662c96", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -827,6 +829,116 @@ test "prepare refuses a temp root with a dollar sign, a backquote, or a backslas
         try std.testing.expectError(error.UnsafeTmpRoot, session.prepare(io, root, &.{}));
         try std.testing.expect(session.dir == null);
     }
+}
+
+test "a child bash of a program does not load the saved state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    const set = try runProgram(alloc, io, &session, dir, "set-u", "set -u");
+    defer freeRun(alloc, set);
+    try expectExit(set, 0);
+
+    // The child would die on the unset name if it had loaded the saved `set -u`.
+    const child = try runProgram(alloc, io, &session, dir, "child", "bash -c 'echo \"${NOT_SET_ANYWHERE}x\"'");
+    defer freeRun(alloc, child);
+    try expectExit(child, 0);
+    try std.testing.expectEqualStrings("x\n", child.stdout);
+}
+
+test "a child bash of a program changes neither the saved state nor the folder" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // The EXIT handler runs after fx saves, so this child is the last thing that could save.
+    const run = try runProgram(alloc, io, &session, dir, "child-exit", "trap \"bash -c 'cd /; Z=child'\" EXIT; echo ran");
+    defer freeRun(alloc, run);
+    try expectExit(run, 0);
+    try std.testing.expectEqualStrings("ran\n", run.stdout);
+
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    const state = try folder.readFileAlloc(io, "state.sh", alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "Z=") == null);
+    const saved_folder = try folder.readFileAlloc(io, folder_file, alloc, .limited(std.Io.Dir.max_path_bytes));
+    defer alloc.free(saved_folder);
+    try std.testing.expectEqualStrings(dir, saved_folder);
+}
+
+test "a background child that ends after its program changes neither the saved state nor the folder" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // The program makes two fifos. A background subshell waits on the first, then
+    // runs a `bash -c` child, then writes the second once that child has ended.
+    const gate = try alloc.print("{s}/gate", .{dir});
+    defer alloc.free(gate);
+    const done = try alloc.print("{s}/done", .{dir});
+    defer alloc.free(done);
+    const start = try alloc.print(
+        "mkfifo '{s}' '{s}'; Y=kept; mkdir -p sub && cd sub; ( read go < '{s}'; bash -c 'cd /; Z=late'; echo ended > '{s}' ) </dev/null >/dev/null 2>&1 &",
+        .{ gate, done, gate, done },
+    );
+    defer alloc.free(start);
+    const started = try runProgram(alloc, io, &session, dir, "late-child", start);
+    defer freeRun(alloc, started);
+    try expectExit(started, 0);
+
+    // Release the child, then wait for it to end. Both fifos are opened read-write,
+    // so no open waits for the other side: the gate's line waits in the pipe until
+    // the subshell reads it, and `read -t` bounds the wait to 10 seconds. The test
+    // never sleeps and never blocks.
+    const release = try alloc.print(
+        "unset BASH_ENV; exec 4<>'{s}' && echo go >&4 && exec 3<>'{s}' && read -t 10 ok <&3",
+        .{ gate, done },
+    );
+    defer alloc.free(release);
+    const released = try std.process.run(alloc, io, .{ .argv = &.{ "/bin/bash", "--noprofile", "--norc", "-c", release } });
+    defer freeRun(alloc, released);
+    try expectExit(released, 0);
+
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    const state = try folder.readFileAlloc(io, "state.sh", alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "Z=") == null);
+    try std.testing.expect(std.mem.find(u8, state, "kept") != null);
+    const saved_folder = try folder.readFileAlloc(io, folder_file, alloc, .limited(std.Io.Dir.max_path_bytes));
+    defer alloc.free(saved_folder);
+    const sub = try alloc.print("{s}/sub", .{dir});
+    defer alloc.free(sub);
+    try std.testing.expectEqualStrings(sub, saved_folder);
 }
 
 test "setting a program twice frees the first id" {

@@ -246,6 +246,14 @@ pub const RunCommandBackend = struct {
     }
 };
 
+/// Whether the session's last program is still running in `runtime`. Every
+/// caller asks through here, so the rule has one definition (RULES.md R1.8).
+pub fn bashProgramRunning(session: *const bash_session.Session, runtime: *managed_execution.Runtime) bool {
+    const id = session.program() orelse return false;
+    const state = runtime.stateFor(id) orelse return false;
+    return std.meta.activeTag(state) == .running;
+}
+
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,

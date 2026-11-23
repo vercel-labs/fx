@@ -1102,14 +1102,6 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Whether the agent's bash session's last program is still running. Only the
-        /// trace line that says what a reset drops reads it.
-        fn bashProgramRunning(agent: *AppAgent) bool {
-            const id = agent.bash_session.program() orelse return false;
-            const state = agent.managed_executions.stateFor(id) orelse return false;
-            return std.meta.activeTag(state) == .running;
-        }
-
         fn retireLiveSessionCompaction(agent: *AppAgent) void {
             // Called after the worker is idle, before installing the next session.
             const observed = agent.worker.compactionActivitySnapshot();
@@ -1164,7 +1156,9 @@ pub fn Runtime(comptime App: type) type {
             // A new conversation starts with a fresh bash state; a program the
             // last one started keeps running, as shell commands do.
             if (comptime agents.hasAgentField(App, "bash_session") and agents.hasAgentField(App, "managed_executions")) {
-                debug_trace.logf("bash", "bash state reset for a new conversation had_program={}", .{bashProgramRunning(agent)});
+                debug_trace.logf("bash", "bash state reset for a new conversation had_program={}", .{
+                    tool_dispatch.bashProgramRunning(&agent.bash_session, &agent.managed_executions),
+                });
             }
             if (comptime agents.hasAgentField(App, "bash_session")) agent.bash_session.deinit(io_mod.getIo());
             agent.change_tracker.clear(std.heap.c_allocator);
