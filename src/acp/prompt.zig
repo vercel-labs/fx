@@ -7239,12 +7239,15 @@ test "an audience member gets each update in the owner's bytes, and turn progres
     defer test_host.deinit();
     var state: server.ServerState = undefined;
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    state.connection_id = 1;
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
     state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
     state.extensions = sh_fx.Set.initMany(&.{.turn_progress});
     const session = server.firstSession(&state).?;
+    // The main client's record copies its extensions when the session opens, before this test sets them.
+    session.members.items[0].extensions = state.extensions;
 
     var follower_wire = WireCapture{ .alloc = alloc };
     defer follower_wire.deinit();
@@ -7252,7 +7255,9 @@ test "an audience member gets each update in the owner's bytes, and turn progres
         .alloc = alloc,
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
+        .connection_id = 2,
     };
+    defer follower.deinit();
     try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
