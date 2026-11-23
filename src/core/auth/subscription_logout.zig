@@ -1,5 +1,5 @@
 //! Signs out of a subscription login (Codex, Grok): deletes the saved login,
-//! keeps its refresh token for a retry, then revokes it.
+//! keeps its refresh token for a retry, then revokes it. Also retries kept sign-outs.
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -46,8 +46,23 @@ pub fn Provider(
             return logoutIn(alloc, pending_revocation.Place.of(source), transport, before_revocation);
         }
 
+        /// Deletes the saved login without contacting the provider; the caller revokes the returned token, then releases it.
         pub fn logoutLocally(alloc: Allocator) !LocalLogout {
             return logoutLocallyIn(alloc, pending_revocation.Place.of(source));
+        }
+
+        /// Revokes the sign-outs that earlier logouts kept because the provider did not confirm them (`pending_revocation.retry`).
+        pub fn retryKeptSignOuts(
+            alloc: Allocator,
+            transport: oauth_transport.Provider,
+            before_revocation: ?oauth.BeforeRevocation,
+        ) pending_revocation.RetryOutcome {
+            return pending_revocation.retry(alloc, source, .{ .context = &transport, .run = revokeKept }, before_revocation);
+        }
+
+        fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+            const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+            return revoke(alloc, transport.*, tokens.refresh_token);
         }
 
         fn logoutIn(

@@ -163,6 +163,11 @@ pub const WorkEnd = struct {
     /// close had counted. The host adds them to what the user's stop or close
     /// dropped, for the work's report or a notice.
     dropped_by_user: usize = 0,
+    /// The user closed the child from the agent list while this work was
+    /// running or had just returned. The host words the notice of
+    /// `dropped_by_user` with it, since a work that ended completed has no
+    /// cause.
+    closed_by_user: bool = false,
     /// Why the work never began, for one that failed because its slot could
     /// not start: its report says the message never ran. A static string.
     start_failure: ?[]const u8 = null,
@@ -1398,6 +1403,7 @@ fn slotMain(slot: *Slot) void {
         // `markNext` set, which a stop or close in the gap must not count again.
         slot.unstarted = 0;
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
+        const closed_by_user = slot.closed_by_user;
         // A stop drops the parent's messages, as do a quit and `/close`.
         var dropped_by_user: usize = 0;
         if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
@@ -1419,6 +1425,7 @@ fn slotMain(slot: *Slot) void {
             .end = end,
             .leftovers = slot.leftovers.items,
             .dropped_by_user = dropped_by_user,
+            .closed_by_user = closed_by_user,
         }) else false;
         publish_test_controls.holdPublish(slot.child_id);
         owner.mutex.lockUncancelable(io_mod.getIo());

@@ -4452,9 +4452,9 @@ test "finishing a detached session leaves cleanup to its supervisor" {
     defer alloc.free(quoted_pid);
     // The descendant leaves the supervisor's process group before it records
     // its PID, so killing that group cannot stop it. Only the supervisor's
-    // own cleanup can.
+    // own cleanup can. It ignores SIGHUP: the kernel's hang-up of an orphaned group could end it.
     const script = try alloc.print(
-        "python3 -c 'import os,sys,time; os.setpgid(0,0); p=sys.argv[1]; " ++
+        "python3 -c 'import os,signal,sys,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); os.setpgid(0,0); p=sys.argv[1]; " ++
             "open(p+\".pending\",\"w\").write(str(os.getpid())); os.rename(p+\".pending\",p); " ++
             "time.sleep(30)' {s} & wait",
         .{quoted_pid},
@@ -6379,12 +6379,13 @@ test "natural command completion stops a same-session process that left the proc
     const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "own-group.pid" });
     defer alloc.free(pid_path);
     // A process group kill cannot reach this child, so only the session
-    // rule stops it.
+    // rule stops it. It ignores SIGHUP: the kernel's hang-up of an orphaned group could end it.
     const command = try alloc.print(
-        "python3 -c 'import os,time\n" ++
+        "python3 -c 'import os,signal,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "if os.fork() == 0:\n" ++
             " os.close(ready_r)\n" ++
+            " signal.signal(signal.SIGHUP,signal.SIG_IGN)\n" ++
             " os.setpgid(0,0)\n" ++
             " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
             " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++

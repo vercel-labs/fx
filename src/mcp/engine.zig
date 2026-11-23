@@ -76,6 +76,9 @@ pub const Event = struct {
         /// The rest as the server says it: tool lists, sign-in,
         /// subscriptions, detection failures, and 2025 elicitations.
         server: server_mod.Event,
+        /// It held nothing for its idle limit, so its process stopped. It
+        /// starts again when something next needs it.
+        stopped_idle,
     },
 };
 
@@ -120,6 +123,8 @@ const Slot = struct {
     backoff_due: ?i64 = null,
     /// When a ready server's tries start over.
     stable_due: ?i64 = null,
+    /// When a server that holds nothing stops.
+    idle_due: ?i64 = null,
     last_error: ?[]const u8 = null,
     /// Dropped by `reload`: freed once it is down and the host read its events.
     retired_at: i64 = 0,
@@ -438,6 +443,10 @@ pub const Engine = struct {
                     slot.stable_due = null;
                     try e.step(slot, .stable);
                 };
+                if (slot.idle_due) |due| if (due <= e.now()) {
+                    slot.idle_due = null;
+                    try e.step(slot, .idle_over);
+                };
                 // What the host should see goes out before that server is
                 // read again, so the slices in it stay valid. What the same
                 // read queued is taken with it, so the gate is current when
@@ -459,6 +468,7 @@ pub const Engine = struct {
             for (e.slots.items) |slot| {
                 if (slot.backoff_due) |due| wait = @min(wait, due);
                 if (slot.stable_due) |due| wait = @min(wait, due);
+                if (slot.idle_due) |due| wait = @min(wait, due);
                 if (slot.server) |s| {
                     if (s.dueMs()) |due| wait = @min(wait, due);
                 }
@@ -488,6 +498,12 @@ pub const Engine = struct {
             .down => {
                 slot.last_error = if (slot.server.?.spawnError()) |err| @errorName(err) else "process";
                 try e.step(slot, .down);
+            },
+            .tools => |result| {
+                // The gate waits for the list too: until it ends the server is
+                // busy and its idle timer stops nothing (Engine.tla).
+                try e.step(slot, .{ .listed = result.ok });
+                e.emit(slot, .{ .server = event });
             },
             .called => |c| {
                 const i = for (slot.calls.items, 0..) |x, i| {
@@ -579,11 +595,17 @@ pub const Engine = struct {
             .refuse_need => e.emit(slot, .{ .server = .{ .tools = .{ .ok = false, .fresh = false, .needs_auth = why == .needs_auth } } }),
             .arm_backoff => |ms| slot.backoff_due = e.now() + ms,
             .arm_stable => |ms| slot.stable_due = e.now() + ms,
+            .arm_idle => |ms| slot.idle_due = e.now() + ms,
+            .list_kept => e.emit(slot, .{ .server = .{ .tools = .{ .ok = true, .fresh = false } } }),
             .teardown => {
                 slot.backoff_due = null;
+                slot.idle_due = null;
                 if (slot.server) |s| try s.reset();
             },
         };
+        // An idle stop is not a failure: the host hears it to log, and the
+        // server starts again when something next needs it (LazyConnect).
+        if (event == .idle_over and !out.ignored) e.emit(slot, .stopped_idle);
         if (slot.gate.phase != before) e.emit(slot, .{ .phase = slot.gate.phase });
     }
 
@@ -643,7 +665,7 @@ pub const Engine = struct {
     fn newSlot(e: *Engine, c: Config) Error!*Slot {
         const slot = try e.gpa.create(Slot);
         errdefer e.gpa.destroy(slot);
-        slot.* = .{ .engine = e, .arena = .init(e.gpa), .config = undefined, .gate = .init(e.options.gate) };
+        slot.* = .{ .engine = e, .arena = .init(e.gpa), .config = undefined, .gate = .init(gateConfig(e.options.gate, c.transport)) };
         errdefer slot.arena.deinit();
         const a = slot.arena.allocator();
         slot.config = .{
@@ -712,6 +734,15 @@ fn free(gpa: std.mem.Allocator, x: Call) void {
     if (x.arguments) |a| gpa.free(a);
 }
 
+/// The gate's limits for one server. An HTTP server never stops by idle: it
+/// holds no process, and stopping it would only drop its connection
+/// (`tests/tla/mcp/Engine.tla` IdleFire covers a server with a process).
+fn gateConfig(gate: core.Config, transport: Transport) core.Config {
+    var config = gate;
+    if (transport == .http) config.idle_ms = 0;
+    return config;
+}
+
 fn dupeAll(a: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
     const copies = try a.alloc([]const u8, items.len);
     for (items, copies) |item, *copy| copy.* = try a.dupe(u8, item);
@@ -737,7 +768,12 @@ fn sameEnv(a: ?*const std.process.Environ.Map, b: ?*const std.process.Environ.Ma
     return true;
 }
 
-fn same(a: Config, b: Config) bool {
+/// Whether two servers launch the same way: the same name, transport, argv,
+/// environment, directory, auth, and limits. A reload keeps the running one
+/// when this holds (`keeps`), and `src/core/mcp_host/share_key.zig` hashes
+/// exactly those fields, the name included, so two sessions agree on what one
+/// copy is.
+pub fn same(a: Config, b: Config) bool {
     if (!std.mem.eql(u8, a.name, b.name) or std.meta.activeTag(a.transport) != std.meta.activeTag(b.transport)) return false;
     switch (a.transport) {
         .stdio => |p| {
@@ -928,6 +964,24 @@ test "the scopes are part of a server's config, so new ones restart it" {
     try std.testing.expect(!same(a, b));
     b.auth.scopes = null;
     try std.testing.expect(!same(a, b));
+}
+
+test "an HTTP server never stops by idle, though a stdio server keeps the limit" {
+    var e: Engine = undefined;
+    const argv = [_][]const u8{"x"};
+    const servers = [_]Config{
+        .{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } },
+        .{ .name = "cli", .transport = .{ .stdio = .{ .argv = &argv } } },
+    };
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+        .gate = .{ .idle_ms = 600_000 },
+    }, &servers);
+    defer e.deinit();
+    // An idle stop saves nothing for a server with no process, and dropping
+    // its connection would only make the next call pay for it.
+    try std.testing.expectEqual(@as(u32, 0), e.slots.items[0].gate.config.idle_ms);
+    try std.testing.expectEqual(@as(u32, 600_000), e.slots.items[1].gate.config.idle_ms);
 }
 
 test "a server's own timeouts replace the engine's, and the others keep the engine's" {
