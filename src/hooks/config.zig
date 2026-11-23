@@ -98,6 +98,11 @@ fn defaultId(hash: [std.crypto.hash.sha2.Sha256.digest_length]u8) [default_id_ha
     return id;
 }
 
+/// Whether the hook has no id of its own: its id is the default one its hash makes.
+pub fn hasDefaultId(hook: *const Hook) bool {
+    return std.mem.eql(u8, hook.id, &defaultId(hook.hash));
+}
+
 /// Frees the memory of one hook.
 fn freeHook(alloc: std.mem.Allocator, hook: *Hook) void {
     alloc.free(hook.id);

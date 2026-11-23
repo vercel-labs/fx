@@ -271,7 +271,8 @@ pub const Runtime = struct {
         return engine.wants(runnable, name, match_value);
     }
 
-    /// Whether an enabled, trusted hook listens for this event, so a run would wait for it. Builtins are left out,
+    /// Whether an enabled hook the person trusted, or one that changed since, listens for this event, so a run would
+    /// wait for its answer; a changed hook answers `changed`, which can deny. Builtins are left out,
     /// since they never wait. Reuses the matching in `Engine.countMatching`, as `countWaiting` does.
     pub fn hasTrustedMatch(self: *Runtime, name: hooks.EventName, match_value: ?[]const u8) std.mem.Allocator.Error!bool {
         if (!self.enabled) return false;
@@ -333,7 +334,7 @@ pub const Runtime = struct {
         if (!engine.wants(runnable, ev.name, ev.match_value)) return null;
         const outcome = try engine.run(alloc, runnable, ev, cancel);
         // Background runs come through here too, so one call logs both.
-        if (outcome.ran > 0) self.logRun(ev, &outcome);
+        if (outcome.ran > 0 or outcome.changed > 0) self.logRun(ev, &outcome);
         return outcome;
     }
 
@@ -784,7 +785,8 @@ pub fn oldLogPath(alloc: std.mem.Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ dir, run_log_old_name });
 }
 
-/// One JSON line for a run: when it happened, the event and match, what decided it, and how many notices.
+/// One JSON line for a run: when it happened, the event and match, what decided it, the hooks that changed since they
+/// were trusted and did not start, and how many notices.
 fn runLogLine(alloc: std.mem.Allocator, ev: hooks.Event, outcome: *const hooks.Outcome) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -803,7 +805,15 @@ fn runLogLine(alloc: std.mem.Allocator, ev: hooks.Event, outcome: *const hooks.O
     } else {
         try w.writeAll("null");
     }
-    try w.print(",\"notices\":{d}}}\n", .{outcome.notices.len});
+    try w.writeAll(",\"changed\":[");
+    var first_changed = true;
+    for (outcome.notices) |notice| {
+        if (notice.kind != .changed) continue;
+        if (!first_changed) try w.writeAll(",");
+        first_changed = false;
+        try std.json.Stringify.value(notice.hook_id, .{}, w);
+    }
+    try w.print("],\"notices\":{d}}}\n", .{outcome.notices.len});
     return try out.toOwnedSlice();
 }
 
@@ -950,7 +960,8 @@ const ChangeGate = struct {
     }
 };
 
-/// Whether a trusted hook changed since the person trusted it: its digest now, from its command and the files it
+/// Whether a hook must not start because it changed since the person trusted it. The loader marks a hook it found
+/// changed (its digest is not in the trust file, but its identity is), and such a hook does not start. A trusted hook whose digest now, from its command and the files it
 /// names, differs from the digest the snapshot stored at load. It reads the hook's files and writes nothing, so it
 /// needs no lock. A hook the person did not trust is not checked: a run that does not need trust runs it as before.
 /// A hook that is not in the snapshot does not run.
@@ -962,6 +973,7 @@ fn changedSinceTrusted(
     const index = for (snapshot.hooks, 0..) |candidate, position| {
         if (candidate == hook) break position;
     } else return true;
+    if (snapshot.changed[index]) return true;
     if (!snapshot.trusted[index]) return false;
     var named = try trust.namedFiles(alloc, hook.command, snapshot.workspace_root, snapshot.home);
     defer named.deinit(alloc);

@@ -7576,7 +7576,7 @@ test "status JSON carries the hooks state the seam reports" {
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
-        ",\"hooks\":{\"enabled\":true,\"count\":2,\"trusted\":1,\"waiting\":1,\"disabled\":0,\"problems\":0,\"trust_refused\":false}}",
+        ",\"hooks\":{\"enabled\":true,\"count\":2,\"trusted\":1,\"waiting\":1,\"changed\":0,\"disabled\":0,\"problems\":0,\"trust_refused\":false}}",
     ) != null);
 }
 

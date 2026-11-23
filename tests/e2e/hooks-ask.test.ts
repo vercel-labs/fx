@@ -347,6 +347,74 @@ describe("fx ask with hooks", () => {
     });
   }, TIMEOUT);
 
+  test("a guard edited after trust blocks the next fx ask's shell call until the person trusts it again", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    const guard = join(root.workspace, "guard.sh");
+    const guardRuns = join(root.workspace, "guard-runs.txt");
+    const keep = join(root.workspace, "keep.txt");
+    // The guard refuses `rm -rf` and leaves one line each time it runs.
+    writeFileSync(guard, "echo ran >> guard-runs.txt\nif grep -q 'rm -rf'; then echo 'no rm' >&2; exit 2; fi\nexit 0\n");
+    writeProjectHooks(root, {
+      hooks: {
+        PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", id: "guard", command: "sh guard.sh" }] }],
+      },
+    });
+    writeFileSync(keep, "keep\n");
+
+    // Run 1: the trusted guard refuses the call, so the file stays.
+    const first = await ask(root, "Remove keep.txt with the shell tool.", [
+      fakeShellRun("shell_rm_1", "rm -rf keep.txt"),
+      fakeGatewayFinalText("the rm was refused"),
+    ]);
+    expect(first.result.code).toBe(0);
+    expect(existsSync(keep)).toBe(true);
+    expect(lineCount(guardRuns)).toBe(1);
+
+    // The person edits the guard so that it allows everything. Nobody trusts the edit, so the guard may not start.
+    writeFileSync(guard, "echo ran >> guard-runs.txt\nexit 0\n");
+    const second = await runAsk(
+      root,
+      "Remove keep.txt with the shell tool.",
+      startFakeGateway([
+        fakeShellRun("shell_rm_2", "rm -rf keep.txt"),
+        fakeGatewayFinalText("the rm was refused again"),
+      ]),
+      ["--yolo", "--no-save"],
+      false,
+    );
+    expect(second.result.code).toBe(0);
+    // The changed guard did not start, so the call is refused and the file stays.
+    expect(lineCount(guardRuns)).toBe(1);
+    expect(existsSync(keep)).toBe(true);
+    expect(second.bodies[1]).toContain("hook guard changed since you trusted it. Run fx hook trust guard to trust it again.");
+    const secondOut = askJson(second.result.stdout);
+    expect(secondOut.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "error" }));
+    expect(secondOut.notices).toContainEqual({
+      topic: "hooks",
+      tone: "warning",
+      text: "Hook guard: its command or a file it runs changed since you trusted it. Run fx hook trust guard to trust it again.",
+    });
+
+    // The person trusts the edited guard. The next run starts it, and the call goes through.
+    const trusted = await runFx(["hook", "trust", "guard"], {
+      cwd: root.workspace,
+      env: { HOME: root.home, AI_AGENT: undefined, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(trusted.code).toBe(0);
+    const third = await runAsk(
+      root,
+      "Remove keep.txt with the shell tool.",
+      startFakeGateway([fakeShellRun("shell_rm_3", "rm -rf keep.txt"), fakeGatewayFinalText("the rm ran")]),
+      ["--yolo", "--no-save"],
+      false,
+    );
+    expect(third.result.code).toBe(0);
+    expect(lineCount(guardRuns)).toBe(2);
+    expect(existsSync(keep)).toBe(false);
+    expect(askJson(third.result.stdout).tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "success" }));
+  }, TIMEOUT * 3);
+
   test("a deny reason with an ESC sequence reaches stderr as visible text, and the model still gets the raw bytes", async () => {
     const root = createRoot({ experimental: { hooks: true } });
     // printf writes an ESC sequence to stderr, and that is the reason the hook gives for the deny.

@@ -38,6 +38,9 @@ pub const Snapshot = struct {
     hooks: []*const hooks.config.Hook = &.{},
     /// Parallel to `hooks`: whether a person trusted the hook.
     trusted: []bool = &.{},
+    /// Parallel to `hooks`: whether the hook changed since a person trusted it. Its digest is not in the trust file,
+    /// but another digest of the same hook is. It never runs; a run reports it as changed.
+    changed: []bool = &.{},
     /// Parallel to `hooks`: whether the person disabled the hook for this workspace. A disabled hook never runs.
     disabled: []bool = &.{},
     /// Parallel to `hooks`: each hook's trust digest.
@@ -59,6 +62,7 @@ pub const Snapshot = struct {
         if (self.files.len > 0) alloc.free(self.files);
         if (self.hooks.len > 0) alloc.free(self.hooks);
         if (self.trusted.len > 0) alloc.free(self.trusted);
+        if (self.changed.len > 0) alloc.free(self.changed);
         if (self.disabled.len > 0) alloc.free(self.disabled);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
         if (self.home) |text| alloc.free(text);
@@ -75,25 +79,27 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 
-    /// The hooks to run. With `trust_required`, only trusted ones; otherwise all.
+    /// The hooks to run. With `trust_required`, only trusted ones and changed ones, which a run reports as changed
+    /// without starting them; otherwise all.
     /// The caller frees the returned slice (not the hooks).
     pub fn runnable(self: *const Snapshot, alloc: std.mem.Allocator, trust_required: bool) std.mem.Allocator.Error![]*const hooks.config.Hook {
         var list: std.ArrayList(*const hooks.config.Hook) = .empty;
         errdefer list.deinit(alloc);
         for (self.hooks, 0..) |hook, index| {
             if (self.trust_refused or self.disabled[index]) continue;
-            if (trust_required and !self.trusted[index]) continue;
+            if (trust_required and !self.trusted[index] and !self.changed[index]) continue;
             try list.append(alloc, hook);
         }
         return list.toOwnedSlice(alloc);
     }
 
-    /// How many hooks wait for trust. A disabled hook never runs, so it does not wait.
+    /// How many hooks wait for trust. A disabled hook never runs, so it does not wait, and a changed hook is
+    /// reported as changed, not as waiting.
     pub fn pending(self: *const Snapshot) usize {
         if (self.trust_refused) return 0;
         var count: usize = 0;
-        for (self.trusted, 0..) |is_trusted, index| {
-            if (!is_trusted and !self.disabled[index]) count += 1;
+        for (self.trusted, self.changed, self.disabled) |is_trusted, is_changed, is_disabled| {
+            if (!is_trusted and !is_changed and !is_disabled) count += 1;
         }
         return count;
     }
@@ -248,6 +254,7 @@ const Builder = struct {
     file_paths: std.ArrayList([]const u8) = .empty,
     hooks: std.ArrayList(*const hooks.config.Hook) = .empty,
     trusted: std.ArrayList(bool) = .empty,
+    changed: std.ArrayList(bool) = .empty,
     /// Parallel to `hooks`: whether the person disabled each hook for this workspace.
     disabled: std.ArrayList(bool) = .empty,
     digests: std.ArrayList([Sha256.digest_length]u8) = .empty,
@@ -264,6 +271,7 @@ const Builder = struct {
         self.file_paths.deinit(alloc);
         self.hooks.deinit(alloc);
         self.trusted.deinit(alloc);
+        self.changed.deinit(alloc);
         self.disabled.deinit(alloc);
         self.digests.deinit(alloc);
         self.sources.deinit(alloc);
@@ -283,6 +291,7 @@ const Builder = struct {
         snapshot.files = try self.files.toOwnedSlice(self.alloc);
         snapshot.hooks = try self.hooks.toOwnedSlice(self.alloc);
         snapshot.trusted = try self.trusted.toOwnedSlice(self.alloc);
+        snapshot.changed = try self.changed.toOwnedSlice(self.alloc);
         snapshot.disabled = try self.disabled.toOwnedSlice(self.alloc);
         snapshot.digests = try self.digests.toOwnedSlice(self.alloc);
         snapshot.sources = try self.sources.toOwnedSlice(self.alloc);
@@ -385,7 +394,7 @@ const Builder = struct {
         }
     }
 
-    /// Records every hook's digest, whether it is trusted, and the files it names.
+    /// Records every hook's digest, whether it is trusted or changed since it was trusted, and the files it names.
     fn markTrusted(self: *Builder, store: *const trust.Store) std.mem.Allocator.Error!void {
         for (self.hooks.items, 0..) |hook, index| {
             var named = try trust.namedFiles(self.alloc, hook.command, self.paths.workspace_root, self.paths.home);
@@ -407,7 +416,11 @@ const Builder = struct {
 
             const value = try trust.digest(self.alloc, hook, self.paths.workspace_root, named.files);
             try self.digests.append(self.alloc, value);
-            try self.trusted.append(self.alloc, store.contains(value));
+            const identity = try trust.identityOf(self.alloc, hook, self.sources.items[index]);
+            defer self.alloc.free(identity);
+            const trusted = store.contains(value);
+            try self.trusted.append(self.alloc, trusted);
+            try self.changed.append(self.alloc, !trusted and store.holdsOtherDigest(identity, value));
         }
     }
 
@@ -566,6 +579,44 @@ test "a profile and a project file both load, in run order" {
     const trusted_only = try snapshot.runnable(alloc, true);
     defer alloc.free(trusted_only);
     try std.testing.expectEqual(@as(usize, 0), trusted_only.len);
+}
+
+test "a hook whose digest changed since it was trusted reads as changed and does not run, and a hook with no entry still waits" {
+    const alloc = std.testing.allocator;
+    var fixture = try Fixture.init(alloc);
+    defer fixture.deinit(alloc);
+    const profile_text = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"./p.sh\"}]}]}}";
+    try writeProfile(alloc, &fixture, profile_text);
+    try writeProject(alloc, &fixture, "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"./s.sh\"}]}]}}");
+
+    // The trust file holds this hook's identity under another digest, as an edit to its command leaves.
+    const profile_path = try profile_paths.rootPath(alloc, fixture.home, &.{"hooks.json"});
+    defer alloc.free(profile_path);
+    var parsed = try hooks.config.parse(alloc, profile_text, .{ .layer = .profile, .workspace_root = fixture.workspace });
+    defer parsed.deinit(alloc);
+    const identity = try trust.identityOf(alloc, &parsed.hooks[0], profile_path);
+    defer alloc.free(identity);
+    var store = trust.Store{};
+    defer store.deinit(alloc);
+    try store.addWithIdentity(alloc, @splat(0x55), "PreToolUse hook ./p.sh", identity);
+    const trust_file = try trust.path(alloc, fixture.home);
+    defer alloc.free(trust_file);
+    try trust.save(alloc, trust_file, &store);
+
+    var snapshot = try load(alloc, .{ .home = fixture.home, .workspace_root = fixture.workspace });
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), snapshot.hooks.len);
+    try std.testing.expect(!snapshot.trusted[0]);
+    try std.testing.expect(snapshot.changed[0]);
+    try std.testing.expect(!snapshot.trusted[1]);
+    try std.testing.expect(!snapshot.changed[1]);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending());
+
+    const runnable_now = try snapshot.runnable(alloc, true);
+    defer alloc.free(runnable_now);
+    try std.testing.expectEqual(@as(usize, 1), runnable_now.len);
+    try std.testing.expectEqualStrings("./p.sh", runnable_now[0].command.shell);
 }
 
 test "a trusted digest runs, an untrusted one waits" {

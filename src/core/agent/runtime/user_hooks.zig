@@ -1067,8 +1067,9 @@ fn decideChange(
     return .{ .refusal = refusal, .notices = notices };
 }
 
-/// Whether an enabled, trusted hook listens for this event, so the change must wait for its answer. It picks up an
-/// edited hook file first, as the synchronous paths do. False means no trusted hook runs: the change applies at once.
+/// Whether an enabled hook the person trusted, or one that changed since, listens for this event, so the change must
+/// wait for its answer. It picks up an edited hook file first, as the synchronous paths do. False means no such hook
+/// runs: the change applies at once.
 pub fn wouldRunFor(lifecycle: runtime_lifecycle.LifecycleContext, name: hooks_engine.EventName, match_value: ?[]const u8) bool {
     if (comptime host_target.is_wasm) return false;
     const runtime = lifecycle.user_hooks orelse return false;

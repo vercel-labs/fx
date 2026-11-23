@@ -89,6 +89,8 @@ pub const Outcome = struct {
     notices: []Notice = &.{},
     /// How many hooks ran.
     ran: usize = 0,
+    /// How many hooks did not start because they changed since they were trusted.
+    changed: usize = 0,
 
     /// Frees every owned slice and the notices. The value is undefined afterwards.
     pub fn deinit(self: *Outcome, alloc: std.mem.Allocator) void {

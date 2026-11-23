@@ -50,8 +50,9 @@ pub const OutputFormat = enum {
 /// that fails after the command line is accepted exits 1.
 pub const usage_exit_code: u8 = 2;
 
-/// Whether a hook runs. `trusted` runs, `waiting` needs the person's trust, `disabled` is switched off by the person.
-pub const HookStatus = enum { trusted, waiting, disabled };
+/// Whether a hook runs. `trusted` runs, `waiting` needs the person's trust, `changed` was trusted but its command or a
+/// file it runs changed since, so it does not run until the person trusts it again, and `disabled` is switched off by the person.
+pub const HookStatus = enum { trusted, waiting, changed, disabled };
 
 /// One hook as `fx hook list` and `fx hook show` report it.
 pub const HookRow = struct {
@@ -631,10 +632,12 @@ fn writeHookTable(arena: Allocator, w: *std.Io.Writer, hooks: []const HookRow) !
 fn writeHookSummary(w: *std.Io.Writer, hooks: []const HookRow, trust_refused: bool) !void {
     var trusted: usize = 0;
     var waiting: usize = 0;
+    var changed: usize = 0;
     var disabled: usize = 0;
     for (hooks) |hook| switch (hook.status) {
         .trusted => trusted += 1,
         .waiting => waiting += 1,
+        .changed => changed += 1,
         .disabled => disabled += 1,
     };
     try w.print("{d} {s}: {d} trusted, {d} waiting for trust", .{
@@ -643,17 +646,27 @@ fn writeHookSummary(w: *std.Io.Writer, hooks: []const HookRow, trust_refused: bo
         trusted,
         waiting,
     });
+    if (changed > 0) try w.print(", {d} changed since trusted", .{changed});
     if (disabled > 0) try w.print(", {d} disabled", .{disabled});
     try w.writeByte('.');
-    // The hint names the first waiting hook. It is left out when the trust file is refused, since the trust command would refuse too.
-    if (waiting > 0 and !trust_refused) {
-        for (hooks) |hook| {
-            if (hook.status != .waiting) continue;
+    // The hint names the first hook that needs the person's trust. A changed hook comes first, since it was trusted
+    // before. It is left out when the trust file is refused, since the trust command would refuse too.
+    if (!trust_refused) {
+        if (firstWithStatus(hooks, .changed)) |hook| {
+            try w.print(" Run fx hook trust {f} to trust it again.", .{text_utils.terminalSafe(hook.id)});
+        } else if (firstWithStatus(hooks, .waiting)) |hook| {
             try w.print(" Run fx hook trust {f} to trust one.", .{text_utils.terminalSafe(hook.id)});
-            break;
         }
     }
     try w.writeByte('\n');
+}
+
+/// The first hook with `status`, or null when no hook has it.
+fn firstWithStatus(hooks: []const HookRow, status: HookStatus) ?HookRow {
+    for (hooks) |hook| {
+        if (hook.status == status) return hook;
+    }
+    return null;
 }
 
 /// A path as the person sees it: `~/.fx` when the profile is the default one.
@@ -1518,6 +1531,8 @@ pub const HooksSummary = struct {
     count: usize,
     trusted: usize,
     waiting: usize,
+    /// Hooks that changed since they were trusted. They do not run until the person trusts them again.
+    changed: usize = 0,
     disabled: usize,
     trust_refused: bool,
     problems: []const HookProblem,
@@ -1538,6 +1553,7 @@ fn writeHooksText(writer: *std.Io.Writer, hooks: HooksStatus) !void {
         .summary => |summary| {
             if (!summary.enabled) return writer.writeAll("[status] hooks=off (experimental.hooks)\n");
             try writer.print("[status] hooks={d} ({d} trusted, {d} waiting for trust", .{ summary.count, summary.trusted, summary.waiting });
+            if (summary.changed > 0) try writer.print(", {d} changed since trusted", .{summary.changed});
             if (summary.disabled > 0) try writer.print(", {d} disabled", .{summary.disabled});
             if (summary.problems.len > 0) try writer.print(", {d} problem{s}", .{ summary.problems.len, if (summary.problems.len == 1) "" else "s" });
             if (summary.trust_refused) try writer.writeAll("; the trust file was refused");
@@ -1851,8 +1867,8 @@ pub const StatusSnapshot = struct {
             .not_checked => {},
             .unavailable => try writer.writeAll(",\"hooks\":null"),
             .summary => |summary| try writer.print(
-                ",\"hooks\":{{\"enabled\":{},\"count\":{d},\"trusted\":{d},\"waiting\":{d},\"disabled\":{d},\"problems\":{d},\"trust_refused\":{}}}",
-                .{ summary.enabled, summary.count, summary.trusted, summary.waiting, summary.disabled, summary.problems.len, summary.trust_refused },
+                ",\"hooks\":{{\"enabled\":{},\"count\":{d},\"trusted\":{d},\"waiting\":{d},\"changed\":{d},\"disabled\":{d},\"problems\":{d},\"trust_refused\":{}}}",
+                .{ summary.enabled, summary.count, summary.trusted, summary.waiting, summary.changed, summary.disabled, summary.problems.len, summary.trust_refused },
             ),
         }
         try writer.writeByte('}');
@@ -3893,8 +3909,21 @@ test "status JSON carries the hook counts, and null when they could not be read"
     try std.testing.expect(std.mem.endsWith(
         u8,
         counted,
-        ",\"hooks\":{\"enabled\":true,\"count\":3,\"trusted\":2,\"waiting\":1,\"disabled\":1,\"problems\":2,\"trust_refused\":true}}",
+        ",\"hooks\":{\"enabled\":true,\"count\":3,\"trusted\":2,\"waiting\":1,\"changed\":0,\"disabled\":1,\"problems\":2,\"trust_refused\":true}}",
     ));
+
+    const changed = try hooksTestStatus(.{ .summary = .{
+        .enabled = true,
+        .count = 1,
+        .trusted = 0,
+        .waiting = 0,
+        .changed = 1,
+        .disabled = 0,
+        .trust_refused = false,
+        .problems = &.{},
+    } }).renderJson(alloc);
+    defer alloc.free(changed);
+    try std.testing.expect(std.mem.endsWith(u8, changed, ",\"hooks\":{\"enabled\":true,\"count\":1,\"trusted\":0,\"waiting\":0,\"changed\":1,\"disabled\":0,\"problems\":0,\"trust_refused\":false}}"));
 
     const unavailable = try hooksTestStatus(.unavailable).renderJson(alloc);
     defer alloc.free(unavailable);

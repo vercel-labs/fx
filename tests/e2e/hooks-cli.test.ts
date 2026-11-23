@@ -156,6 +156,32 @@ describe("fx hook", () => {
     expect(statSync(root.trustFile).mode & 0o777).toBe(0o600);
   });
 
+  test("a hook whose file changed after trust is listed as changed, in text and in JSON, until it is trusted again", async () => {
+    const root = createRoot({
+      hooks: {
+        PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", id: "guard", command: "sh guard.sh" }] }],
+      },
+    });
+    writeFileSync(join(root.workspace, "guard.sh"), "exit 0\n");
+    expect((await hook(root, ["hook", "trust", "guard"])).code).toBe(0);
+    expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("guard", "trusted"));
+
+    writeFileSync(join(root.workspace, "guard.sh"), "exit 2\n");
+    const text = await hook(root, ["hook", "list"]);
+    expect(text.code).toBe(0);
+    expect(text.stdout).toMatch(statusRow("guard", "changed"));
+    expect(text.stdout).toContain(
+      "1 hook: 0 trusted, 0 waiting for trust, 1 changed since trusted. Run fx hook trust guard to trust it again.",
+    );
+
+    const listed = await hook(root, ["hook", "list", "--json"]);
+    expect(listed.code).toBe(0);
+    expect(JSON.parse(listed.stdout).hooks).toEqual([expect.objectContaining({ id: "guard", status: "changed" })]);
+
+    expect((await hook(root, ["hook", "trust", "guard"])).code).toBe(0);
+    expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("guard", "trusted"));
+  });
+
   test("disable stops the hook, and enable lets it run again", async () => {
     const root = createRoot();
     expect((await hook(root, ["hook", "trust", "guard"])).code).toBe(0);
@@ -375,7 +401,7 @@ describe("fx hook", () => {
     expect(doc.reason).toBe("blocker failed and is set to block on failure: exited with code 1: boom");
   });
 
-  test("show lists the files a command names, and a change to one makes the hook wait again", async () => {
+  test("show lists the files a command names, and a change to one makes the hook changed", async () => {
     const root = createRoot({
       hooks: { PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", id: "check", command: "sh ./scripts/check.sh" }] }] },
     });
@@ -392,9 +418,9 @@ describe("fx hook", () => {
     expect((await hook(root, ["hook", "trust", "check"])).code).toBe(0);
     expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("check", "trusted"));
 
-    // The trust covers the script's content: a change to it makes the hook wait for trust again.
+    // The trust covers the script's content: a change to it makes the trusted hook changed, so it does not run until trusted again.
     writeFileSync(script, "echo changed\n");
-    expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("check", "waiting"));
+    expect((await hook(root, ["hook", "list"])).stdout).toMatch(statusRow("check", "changed"));
   });
 
   test(

@@ -755,12 +755,20 @@ fn appendHooksCheck(
     if (!summary.trust_refused and summary.problems.len == 0) {
         const detail = if (summary.count == 0)
             try alloc.dupe(u8, "no hooks for this workspace")
-        else
+        else if (summary.changed == 0)
             try alloc.print("{d} hook{s}: {d} trusted, {d} waiting for trust", .{
                 summary.count,
                 if (summary.count == 1) "" else "s",
                 summary.trusted,
                 summary.waiting,
+            })
+        else
+            try alloc.print("{d} hook{s}: {d} trusted, {d} waiting for trust, {d} changed since trusted", .{
+                summary.count,
+                if (summary.count == 1) "" else "s",
+                summary.trusted,
+                summary.waiting,
+                summary.changed,
             });
         return appendCheckOwned(checks, alloc, "hooks", .ok, detail);
     }

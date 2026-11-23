@@ -299,6 +299,7 @@ fn hookCommandText(arena: Allocator, command: anytype) ![]const u8 {
 fn hookStatus(loaded: *const hooks_host.loader.Snapshot, index: usize) output_contracts.HookStatus {
     if (loaded.disabled[index]) return .disabled;
     if (loaded.trusted[index]) return .trusted;
+    if (loaded.changed[index]) return .changed;
     return .waiting;
 }
 
@@ -338,6 +339,7 @@ pub fn loadSummary(
     for (0..loaded.hooks.len) |index| switch (hookStatus(&loaded, index)) {
         .trusted => summary.trusted += 1,
         .waiting => summary.waiting += 1,
+        .changed => summary.changed += 1,
         .disabled => summary.disabled += 1,
     };
     const problems = try arena.alloc(output_contracts.HookProblem, loaded.problems.len);
@@ -708,11 +710,12 @@ fn trustRefusedMessage(alloc: Allocator, loaded: *const hooks_host.loader.Snapsh
     return alloc.dupe(u8, "The trust file was refused.");
 }
 
-/// Adds one hook's digest to the trust store. The label names the hook in the trust file.
+/// Adds one hook's digest to the trust store, with the hook's identity. The label names the hook in the trust file.
 fn addTrustedHook(alloc: Allocator, arena: Allocator, store: *hooks_host.trust.Store, loaded: *const hooks_host.loader.Snapshot, index: usize) !void {
     const hook = loaded.hooks[index];
     const label = try arena.print("{s} hook {s}", .{ hook.event.fileName(), hook.id });
-    try store.add(alloc, loaded.digests[index], label);
+    const identity = try hooks_host.trust.identityOf(arena, hook, loaded.sources[index]);
+    try store.addWithIdentity(alloc, loaded.digests[index], label, identity);
 }
 
 /// How long a trust command waits for another fx process to release the trust file. Past it,

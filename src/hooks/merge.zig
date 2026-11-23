@@ -292,13 +292,15 @@ pub fn merge(
 
     // A hook that did not start is not a hook that ran.
     var ran: usize = 0;
+    var changed: usize = 0;
     for (results) |result| {
         switch (result.result) {
-            .changed => {},
+            .changed => changed += 1,
             .answer, .failure => ran += 1,
         }
     }
     outcome.ran = ran;
+    outcome.changed = changed;
     if (builder.pending.items.len > 0) outcome.notices = try buildNotices(alloc, builder.pending.items);
 
     return outcome;

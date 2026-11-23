@@ -31,8 +31,9 @@ pub fn path(alloc: std.mem.Allocator, home: []const u8) ![]u8 {
     return profile_paths.rootPath(alloc, home, &.{trust_file_name});
 }
 
-/// One trusted hook. `label` says what it was, for `fx hook list`.
-pub const Entry = struct { digest: [hex_length]u8, label: []u8 };
+/// One trusted hook. `label` says what it was, for `fx hook list`. `identity` names the hook across edits
+/// (see `identityOf`); an entry from a trust file that predates identities has an empty one.
+pub const Entry = struct { digest: [hex_length]u8, label: []u8, identity: []u8 };
 
 /// One hook the person disabled for one workspace. Both strings are owned.
 pub const Disabled = struct { workspace: []u8, id: []u8 };
@@ -44,7 +45,10 @@ pub const Store = struct {
     disabled: std.ArrayList(Disabled) = .empty,
 
     pub fn deinit(self: *Store, alloc: std.mem.Allocator) void {
-        for (self.entries.items) |entry| alloc.free(entry.label);
+        for (self.entries.items) |entry| {
+            alloc.free(entry.label);
+            alloc.free(entry.identity);
+        }
         self.entries.deinit(alloc);
         for (self.disabled.items) |item| {
             alloc.free(item.workspace);
@@ -62,13 +66,29 @@ pub const Store = struct {
         return false;
     }
 
-    /// Adds a digest with a copy of `label`. Does nothing when it is there.
+    /// Adds a digest with a copy of `label`, and no identity. Does nothing when it is there.
     pub fn add(self: *Store, alloc: std.mem.Allocator, value: [Sha256.digest_length]u8, label: []const u8) std.mem.Allocator.Error!void {
+        return self.addWithIdentity(alloc, value, label, "");
+    }
+
+    /// Adds a digest with a copy of `label` and of the hook `identity` (see `identityOf`). Does nothing when the digest is there.
+    pub fn addWithIdentity(self: *Store, alloc: std.mem.Allocator, value: [Sha256.digest_length]u8, label: []const u8, identity: []const u8) std.mem.Allocator.Error!void {
         if (self.contains(value)) return;
         const text = hex(value);
         const copy = try alloc.dupe(u8, label);
         errdefer alloc.free(copy);
-        try self.entries.append(alloc, .{ .digest = text, .label = copy });
+        const identity_copy = try alloc.dupe(u8, identity);
+        errdefer alloc.free(identity_copy);
+        try self.entries.append(alloc, .{ .digest = text, .label = copy, .identity = identity_copy });
+    }
+
+    /// Whether the store holds the hook `identity` under a digest other than `value`: the hook changed since it was trusted.
+    pub fn holdsOtherDigest(self: *const Store, identity: []const u8, value: [Sha256.digest_length]u8) bool {
+        const wanted = hex(value);
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.identity, identity) and !std.mem.eql(u8, &entry.digest, &wanted)) return true;
+        }
+        return false;
     }
 
     /// Whether the person disabled hook `id` for `workspace_root`.
@@ -102,22 +122,32 @@ pub const Store = struct {
     }
 };
 
+/// What names a hook across edits in the trust file: its layer, the file it came from, and either its
+/// explicit id or, for a hook with no id of its own, its place in the file. The digest changes with the
+/// command, and a default id comes from the digest, so neither names a hook once it is edited. The caller owns the result.
+pub fn identityOf(alloc: std.mem.Allocator, hook: *const hooks.config.Hook, file_path: []const u8) std.mem.Allocator.Error![]u8 {
+    if (hooks.config.hasDefaultId(hook)) {
+        return alloc.print("{s}\x1f{s}\x1fat:{s}", .{ @tagName(hook.layer), file_path, hook.where });
+    }
+    return alloc.print("{s}\x1f{s}\x1fid:{s}", .{ @tagName(hook.layer), file_path, hook.id });
+}
+
 pub const LoadError = std.mem.Allocator.Error || error{ TrustFileUnsafe, TrustFileNotRegular, TrustFileInvalid, TrustFileUnreadable };
 
 /// An open regular file, and the stat fx took of it after the open.
 const OpenedRegular = struct { file: std.Io.File, stat: std.Io.File.Stat };
 
 /// Why `openRegular` gave no file: the path is missing, is not a regular file, changed between
-/// its stat and its open, or could not be read. Memory can also run out.
-const OpenRegularError = std.mem.Allocator.Error || error{ FileNotFound, NotRegular, Changed, Unreadable };
+/// its stat and its open, or could not be read.
+const OpenRegularError = error{ FileNotFound, NotRegular, Changed, Unreadable };
 
 /// Opens `file_path` only when it is a regular file, and never waits on a FIFO, device, or
 /// socket: a plain open of a FIFO that no writer has opened waits forever (review 6a, 6c).
-/// fx stats the path and refuses anything that is not a regular file. It opens with O_NONBLOCK,
-/// so a path swapped for a FIFO after the stat opens at once. Then it checks the descriptor's
-/// kind and inode against the stat, so a file swapped in between is refused, not read.
-/// The caller closes the file.
-fn openRegular(alloc: std.mem.Allocator, file_path: []const u8) OpenRegularError!OpenedRegular {
+/// fx stats the path and refuses anything that is not a regular file. The shared open
+/// (`io_mod.openExistingReadOnlyRegularFile`) opens with O_NONBLOCK and checks the descriptor's
+/// kind, so a path swapped for a FIFO after the stat opens at once. This adds the inode check:
+/// a file swapped in between is refused, not read. The caller closes the file.
+fn openRegular(file_path: []const u8) OpenRegularError!OpenedRegular {
     const io = io_mod.getIo();
     const before = std.Io.Dir.cwd().statFile(io, file_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
@@ -125,22 +155,15 @@ fn openRegular(alloc: std.mem.Allocator, file_path: []const u8) OpenRegularError
     };
     if (before.kind != .file) return error.NotRegular;
 
-    const file_path_z = try alloc.dupeSentinel(u8, file_path, 0);
-    defer alloc.free(file_path_z);
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, file_path_z, .{
-        .ACCMODE = .RDONLY,
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    }, 0) catch return error.Unreadable;
-    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
-    const stat = file.stat(io) catch {
-        file.close(io);
-        return error.Unreadable;
+    // A symlink at the path is followed, as this open has always done.
+    const file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), file_path, .follow) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        error.DurablePathUnsafe => return error.NotRegular,
+        else => return error.Unreadable,
     };
-    if (stat.kind != .file or stat.inode != before.inode) {
-        file.close(io);
-        return error.Changed;
-    }
+    errdefer file.close(io);
+    const stat = file.stat(io) catch return error.Unreadable;
+    if (stat.kind != .file or stat.inode != before.inode) return error.Changed;
     return .{ .file = file, .stat = stat };
 }
 
@@ -148,7 +171,6 @@ fn openRegular(alloc: std.mem.Allocator, file_path: []const u8) OpenRegularError
 /// empty store. A file that changed while fx opened it is unreadable, not group-writable.
 fn openRefusal(file_path: []const u8, err: OpenRegularError) ?LoadError {
     switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
         error.FileNotFound => return null,
         error.NotRegular => {
             debug_trace.logf("hooks", "refused to read {s}: it is not a regular file", .{file_path});
@@ -168,7 +190,7 @@ fn openRefusal(file_path: []const u8, err: OpenRegularError) ?LoadError {
 /// A path that is not a regular file, such as a FIFO or a folder, is refused
 /// (TrustFileNotRegular) without a read, so it never blocks fx.
 pub fn load(alloc: std.mem.Allocator, file_path: []const u8) LoadError!Store {
-    const opened = openRegular(alloc, file_path) catch |err| {
+    const opened = openRegular(file_path) catch |err| {
         const refusal = openRefusal(file_path, err) orelse return Store{};
         return refusal;
     };
@@ -209,7 +231,13 @@ pub fn load(alloc: std.mem.Allocator, file_path: []const u8) LoadError!Store {
         if (!parseHex(digest_value.string, &digest_bytes)) return error.TrustFileInvalid;
         const label_value = item.object.get("label") orelse return error.TrustFileInvalid;
         if (label_value != .string) return error.TrustFileInvalid;
-        try store.add(alloc, digest_bytes, label_value.string);
+        // A trust file from before hook identities has none, so its entries match no hook's identity.
+        var identity: []const u8 = "";
+        if (item.object.get("identity")) |identity_value| {
+            if (identity_value != .string) return error.TrustFileInvalid;
+            identity = identity_value.string;
+        }
+        try store.addWithIdentity(alloc, digest_bytes, label_value.string, identity);
     }
     // A file from before disabled hooks has no such list, so it loads with none.
     if (parsed.value.object.get("disabled")) |disabled_value| {
@@ -348,6 +376,8 @@ fn writeStore(json: *std.json.Stringify, store: *const Store) std.Io.Writer.Erro
         try json.write(&entry.digest);
         try json.objectField("label");
         try json.write(entry.label);
+        try json.objectField("identity");
+        try json.write(entry.identity);
         try json.endObject();
     }
     try json.endArray();
@@ -813,9 +843,8 @@ pub fn digest(
 fn hashFile(alloc: std.mem.Allocator, hasher: *Sha256, file_path: []const u8) std.mem.Allocator.Error!void {
     const io = io_mod.getIo();
 
-    const opened = openRegular(alloc, file_path) catch |err| {
+    const opened = openRegular(file_path) catch |err| {
         switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
             error.FileNotFound => hashTag(hasher, "missing", file_path),
             error.NotRegular => hashTag(hasher, "not_regular", file_path),
             error.Changed, error.Unreadable => hashTag(hasher, "other", file_path),
@@ -940,6 +969,39 @@ test "a saved store loads back with its mode and its labels" {
     try std.testing.expect(loaded.contains(second));
     try std.testing.expectEqualStrings("first hook", loaded.entries.items[0].label);
     try std.testing.expectEqualStrings("second hook", loaded.entries.items[1].label);
+}
+
+test "a trust entry keeps the identity of its hook, and an entry from before identities matches none" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const file_path = try std.Io.Dir.path.join(alloc, &.{ root, "hooks-trust.json" });
+    defer alloc.free(file_path);
+
+    const value: [Sha256.digest_length]u8 = @splat(0x33);
+    const identity = "profile\x1f/home/visitor/.fx/hooks.json\x1fid:guard";
+    var store = Store{};
+    defer store.deinit(alloc);
+    try store.addWithIdentity(alloc, value, "PreToolUse hook guard", identity);
+    try save(alloc, file_path, &store);
+
+    var loaded = try load(alloc, file_path);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings(identity, loaded.entries.items[0].identity);
+    try std.testing.expect(loaded.holdsOtherDigest(identity, @splat(0x44)));
+    try std.testing.expect(!loaded.holdsOtherDigest(identity, value));
+
+    const hex_text = std.fmt.bytesToHex(value, .lower);
+    const legacy = try alloc.print("{{\"version\":1,\"trusted\":[{{\"digest\":\"{s}\",\"label\":\"old\"}}]}}", .{hex_text[0..]});
+    defer alloc.free(legacy);
+    try writeFixture(alloc, file_path, legacy);
+    var old = try load(alloc, file_path);
+    defer old.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), old.entries.items.len);
+    try std.testing.expectEqualStrings("", old.entries.items[0].identity);
+    try std.testing.expect(!old.holdsOtherDigest(identity, @splat(0x44)));
 }
 
 test "a trust file others can write is refused" {
