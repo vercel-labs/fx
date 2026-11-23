@@ -2510,6 +2510,11 @@ pub const ConversationIdentity = struct {
         if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
         return null;
     }
+
+    /// A call id of only spaces, tabs, and line ends names no call.
+    pub fn isBlank(value: []const u8) bool {
+        return std.mem.trim(u8, value, " \t\r\n").len == 0;
+    }
 };
 
 pub const AuthoritativeToolAdmission = union(enum) {
@@ -2530,7 +2535,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
+        const final_identity = if (call.final_identity == .valid and ConversationIdentity.isBlank(call.id))
             FinalToolIdentity.empty
         else
             call.final_identity;

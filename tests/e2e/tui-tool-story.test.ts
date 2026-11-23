@@ -1686,3 +1686,70 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+/** Sixty numbered lines; each edit below swaps seven of them for one, `+1/-7`. */
+const G_TSE = Array.from({ length: 60 }, (_, i) => `g line ${i}`).join("\n") + "\n";
+const TOOL_CALLS_FINISH = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+const gEdit = (id: string, start: number) => ({
+  type: "tool-call",
+  toolCallId: id,
+  toolName: "edit_file",
+  input: { path: "g.tse", old_string: Array.from({ length: 7 }, (_, i) => `g line ${start + i}`).join("\n"), new_string: `g joined ${start}` },
+});
+
+/** The tool call and tool result ids in a Gateway request's prompt, in order. */
+function promptCallIds(body: string): { calls: string[]; results: string[] } {
+  const parts = JSON.parse(body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+  const ids = (type: string) => parts.filter((part: { type: string }) => part.type === type).map((part: { toolCallId: string }) => part.toolCallId);
+  return { calls: ids("tool-call"), results: ids("tool-result") };
+}
+
+// Three edits of one file whose replies reuse one call id across replies (F),
+// repeat it in one reply (G), or leave it empty (H), and the ids fx keeps.
+const CALL_ID_CASES: Array<[string, object[][], string[]]> = [
+  ["one id in every reply", [[gEdit("dup", 1)], [gEdit("dup", 10)], [gEdit("dup", 20)]], ["dup", "fx_call_1", "fx_call_2"]],
+  ["one id three times in one reply", [[gEdit("same", 1), gEdit("same", 10), gEdit("same", 20)]], ["same", "fx_call_1", "fx_call_2"]],
+  ["empty ids", [[gEdit("", 1), gEdit("", 10), gEdit("", 20)]], ["fx_call_1", "fx_call_2", "fx_call_3"]],
+];
+
+for (const [label, replies, ids] of CALL_ID_CASES) {
+  test.skipIf(!tmuxAvailable())(
+    `edits whose calls have ${label} each run and count, live and after resume`,
+    async () => {
+      const root = createStoryRoot();
+      roots.push(root);
+      writeFileSync(join(root.workspace, "g.tse"), G_TSE);
+      const finalText = "Joined three blocks of g.tse.";
+      const gateway = startFakeGateway([
+        ...replies.map((calls, index) => fakeGatewaySse([
+          ...(index === 0 ? [{ type: "text-delta", id: "text_edit", delta: "Joining three blocks." }] : []),
+          ...calls,
+          TOOL_CALLS_FINISH,
+        ])),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+      sessions.push(session);
+      await session.waitForComposer();
+      await session.sendText("Join three blocks of g.tse.");
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const live = paneLines(await session.waitForText(/^ {2}1 file changed /m, TIMEOUT));
+
+      expect(readFileSync(join(root.workspace, "g.tse"), "utf8").match(/g joined/g)).toHaveLength(3);
+      expect(live.join("\n")).not.toContain("malformed");
+      expect(live).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(live.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+      // The model gets each call back under the id fx keeps, with its result.
+      expect(promptCallIds(gateway.requests.at(-1)!.body)).toEqual({ calls: ids, results: ids });
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const { lines } = await resumeStory(root, gateway, finalText);
+      expect(lines).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(lines.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+    },
+    TIMEOUT,
+  );
+}

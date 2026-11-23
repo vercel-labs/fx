@@ -7839,7 +7839,7 @@ test("provider context accounting is independent of image encoding size", async 
   }
 }, 60_000);
 
-test("direct provider tool identities obey the session boundary before execution", async () => {
+test("a direct provider tool id past the session limit runs under an fx id", async () => {
   for (const provider of ["codex", "grok"] as const) {
     for (const bytes of [256, 257]) {
       const profile = mkdtempSync(join(tmpdir(), `fx-${provider}-identity-`));
@@ -7864,23 +7864,22 @@ test("direct provider tool identities obey the session boundary before execution
           FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
         };
         const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
-        const accepted = bytes === 256;
-        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(accepted ? 0 : 1);
+        // An id fx can store stays the call's id; a longer one gets an fx id.
+        const kept = bytes === 256 ? options.toolCallId : "fx_call_1";
+        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(0);
         expect(result.signal).toBeNull();
-        expect(existsSync(join(profile, "result.txt"))).toBe(accepted);
-        expect(direct.bodies).toHaveLength(accepted ? 2 : 1);
+        expect(existsSync(join(profile, "result.txt"))).toBe(true);
+        expect(direct.bodies).toHaveLength(2);
+        expect(direct.bodies[1]).toContain(`"call_id":"${kept}"`);
+        if (bytes === 257) expect(direct.bodies[1]).not.toContain(options.toolCallId);
         expect(testGateway.requests).toHaveLength(0);
         const json = JSON.parse(result.stdout);
-        expect(json.tool_calls).toEqual(accepted ? [{ name: "write_file", status: "success" }] : []);
-        if (!accepted) expect(json.error).toBe("MalformedAuthoritativeToolIdentity");
+        expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
         const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
-        // A refused identity fails the turn before anything runs: it is kept
-        // as interrupted (D1), holding only the prompt.
-        else expect(history[0]).toMatchObject({ kind: "interrupted", tool_call: null, completed_tool_names: [] });
+        expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(kept);
       } finally {
         direct.stop(); testGateway.stop();
         rmSync(profile, { recursive: true, force: true });

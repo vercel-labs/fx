@@ -8709,6 +8709,7 @@ fn processQueuedPromptLoop(
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
+                .current_turn_messages = within_turn_suffix.items,
                 .tools = .{
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
@@ -9053,6 +9054,7 @@ fn processQueuedPromptLoop(
                 .retry_count = config.gateway_retry_count,
                 .instructions = request_data.instructions,
                 .messages = request_data.messages,
+                .current_turn_messages = request_data.current_turn_messages,
                 .tools = request_data.tools,
                 .tool_choice = request_data.tool_choice,
                 .vision_mode = request_data.vision_mode,

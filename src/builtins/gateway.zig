@@ -708,6 +708,7 @@ fn streamAgentCompletion(
             .transport => .transport,
             .agent => .agent,
         },
+        .conversation = .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
         .shared_pool = shared_pool,
     };
     const result = (if (request.deadline) |deadline|
