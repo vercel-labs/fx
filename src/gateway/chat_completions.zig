@@ -131,6 +131,28 @@ fn effort_fields(metadata: ?definitions.ModelMetadata, effort: ?types.ReasoningE
     return level.fields;
 }
 
+fn extract_effort_string(
+    alloc: Allocator,
+    key: []const u8,
+    request_fields: request_fragment.Fragment,
+    level_fields: request_fragment.Fragment,
+    out: *streams.RequestEffort,
+) bool {
+    const value_json = level_fields.get(key) orelse request_fields.get(key) orelse return false;
+    // Effort capture is best-effort metadata; never fail a valid request on OOM.
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return false;
+    defer parsed.deinit();
+    const value = if (std.mem.eql(u8, key, "reasoning_effort"))
+        parsed.value
+    else if (parsed.value == .object)
+        parsed.value.object.get("effort") orelse return false
+    else
+        return false;
+    if (value != .string) return false;
+    out.set(value.string);
+    return true;
+}
+
 fn capture_effort(
     alloc: Allocator,
     protocol: definitions.Protocol,
@@ -139,22 +161,18 @@ fn capture_effort(
     out: *streams.RequestEffort,
 ) void {
     out.set(null);
-    const key = switch (protocol) {
-        .@"openai-chat-completions" => if (level_fields.has("reasoning_effort") or request_fields.has("reasoning_effort")) "reasoning_effort" else "reasoning",
-        .@"openai-responses" => "reasoning",
-        .@"anthropic-messages" => "output_config",
-    };
-    const value_json = level_fields.get(key) orelse request_fields.get(key) orelse return;
-    // Effort capture is best-effort metadata; never fail a valid request on OOM.
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return;
-    defer parsed.deinit();
-    const value = if (std.mem.eql(u8, key, "reasoning_effort"))
-        parsed.value
-    else if (parsed.value == .object)
-        parsed.value.object.get("effort") orelse return
-    else
-        return;
-    if (value == .string) out.set(value.string);
+    switch (protocol) {
+        .@"openai-chat-completions" => {
+            var direct: streams.RequestEffort = .{};
+            var nested: streams.RequestEffort = .{};
+            const has_direct = extract_effort_string(alloc, "reasoning_effort", request_fields, level_fields, &direct);
+            const has_nested = extract_effort_string(alloc, "reasoning", request_fields, level_fields, &nested);
+            if (has_direct and has_nested) return;
+            if (has_direct) out.* = direct else if (has_nested) out.* = nested;
+        },
+        .@"openai-responses" => _ = extract_effort_string(alloc, "reasoning", request_fields, level_fields, out),
+        .@"anthropic-messages" => _ = extract_effort_string(alloc, "output_config", request_fields, level_fields, out),
+    }
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -205,7 +223,9 @@ test "configured adapter captures serialized effort from merged request and leve
     var effort_out: streams.RequestEffort = .{};
     for ([_]Case{
         .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning_effort\":\"medium\"}", .label = null, .want = "medium" },
-        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"high\":{\"reasoning_effort\":\"low\"}}", .label = "high", .want = "low" },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"high\":{\"reasoning_effort\":\"low\"}}", .label = "high", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning_effort\":\"low\"},\"reasoning_efforts\":{\"high\":{\"reasoning\":{\"effort\":\"high\"}}}", .label = "high", .want = null },
+        .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"exclude\":true}},\"reasoning_efforts\":{\"high\":{\"reasoning_effort\":\"low\"}}", .label = "high", .want = "low" },
         .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"b\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}}}", .label = "b", .want = "medium" },
         .{ .protocol = "openai-chat-completions", .meta = "\"request\":{\"reasoning\":{\"effort\":\"medium\"}},\"reasoning_efforts\":{\"low\":{\"reasoning\":{}}}", .label = "low", .want = null },
         .{ .protocol = "openai-chat-completions", .meta = "\"reasoning_efforts\":{\"high\":{\"output_config\":{\"effort\":\"max\"}}}", .label = "high", .want = null },
