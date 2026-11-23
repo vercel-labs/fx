@@ -1173,14 +1173,19 @@ pub const Runtime = struct {
         /// they have no index.
         lost: usize = 0,
 
+        const mask_bits = @bitSizeOf(u64);
+        comptime {
+            if (managed_owner.max_unread_feedback > mask_bits) @compileError("the leftover mask cannot hold every unread message the owner allows");
+        }
+
         fn note(self: *LeftoverDrops, index: usize) void {
-            if (index < 64) self.mask |= @as(u64, 1) << @intCast(index) else self.beyond += 1;
+            if (index < mask_bits) self.mask |= @as(u64, 1) << @intCast(index) else self.beyond += 1;
         }
         fn any(self: LeftoverDrops) bool {
             return self.mask != 0 or self.beyond != 0 or self.lost != 0;
         }
         fn has(self: LeftoverDrops, index: usize) bool {
-            return index < 64 and (self.mask >> @intCast(index)) & 1 == 1;
+            return index < mask_bits and (self.mask >> @intCast(index)) & 1 == 1;
         }
     };
 
@@ -1466,16 +1471,11 @@ pub const Runtime = struct {
         return true;
     }
 
-    /// Whether `end`'s child is idle once its report goes. Read before the
-    /// slot starts the next message waiting for the child (`workEnded`), so
-    /// a waiting message counts (`tests/tla/subagent/StopMessage.tla`
-    /// IdleNoteHonest).
-    fn idleAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) bool {
-        return self.idleFactsAfterEnd(a, end).idle();
-    }
-
-    /// The facts `idleAfterEnd` decides on, read in one pass. A report reads
-    /// them before its text, so the text and the idle flag come from one read.
+    /// Whether the child is idle once `end`'s report goes, read in one pass
+    /// before the report's text, so the text and the idle flag come from one
+    /// read. The read comes before the slot starts the next message waiting
+    /// for the child (`workEnded`), so a waiting message counts
+    /// (`tests/tla/subagent/StopMessage.tla` IdleNoteHonest).
     fn idleFactsAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) IdleFacts {
         const facts: IdleFacts = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
@@ -4857,14 +4857,12 @@ test "a close that lands while a subagent's ended work is settled is still writt
     SettleGap.armInSettle();
     defer SettleGap.disarmInSettle();
 
-    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
-    try waitForRuns(&gap.fixture, 1);
-    const child_id = try reviewerId(gap.runtime, gap.arena());
     // A user's turn the child took while its work runs. It waits for that work
     // and ends before the work opens, so the host finishes it at the hold.
-    const turn = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
-    defer std.testing.allocator.free(turn);
-    gap.runtime.endUserWork(child_id, turn, .failed, "");
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
     gap.fixture.release.set(io_mod.getIo());
     SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
     // Two reports are out at the hold: the message's own, and the failed turn's,
@@ -4900,14 +4898,12 @@ test "a close that lands while a subagent's ended work is settled is still writt
     SettleGap.armInSettle();
     defer SettleGap.disarmInSettle();
 
-    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
-    try waitForRuns(&gap.fixture, 1);
-    const child_id = try reviewerId(gap.runtime, gap.arena());
-    const turn = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
-    defer std.testing.allocator.free(turn);
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
     const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2");
     try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
-    gap.runtime.endUserWork(child_id, turn, .failed, "");
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
     gap.fixture.release.set(io_mod.getIo());
     SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
     try std.testing.expectEqual(@as(usize, 2), gap.fixture.reportCount());
@@ -4944,12 +4940,10 @@ test "a user's turn that begins while the host finishes an earlier one is opened
     SettleGap.armInSettle();
     defer SettleGap.disarmInSettle();
 
-    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
-    try waitForRuns(&gap.fixture, 1);
-    const child_id = try reviewerId(gap.runtime, gap.arena());
-    const turn = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
-    defer std.testing.allocator.free(turn);
-    gap.runtime.endUserWork(child_id, turn, .failed, "");
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
     gap.fixture.release.set(io_mod.getIo());
     SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
 
@@ -5658,7 +5652,7 @@ test "a message whose start failed says its subagent is idle only while nothing 
         }
         try std.testing.expect(!runtime.anyWorking());
         // The host's own test for an idle child, as a report applies it.
-        try std.testing.expect(runtime.idleAfterEnd(arena, .{ .child_id = child_id, .work_id = call, .outcome = .failed, .report_owed = false }));
+        try std.testing.expect(runtime.idleFactsAfterEnd(arena, .{ .child_id = child_id, .work_id = call, .outcome = .failed, .report_owed = false }).idle());
     }
 }
 
@@ -5752,6 +5746,8 @@ fn sweepStart(create: bool, seed: bool, fail_at: usize) !bool {
     try waitUntilQuiet(runtime);
     try std.testing.expect(fixture.reportCount() > reports_before);
     try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], if (joined) " completed DONE second" else " completed DONE again");
+    // A message that joined the turn never runs as a work of its own.
+    if (joined) try std.testing.expect(!reportSays(&fixture, " completed DONE again"));
     return failed;
 }
 
@@ -6770,6 +6766,18 @@ const GapFixture = struct {
         const first = self.worker.takeQueuedPrompt(std.testing.allocator).?;
         worker_runtime.freeQueuedPrompt(std.testing.allocator, first);
         return reviewerId(self.runtime, self.arena());
+    }
+
+    const BeganTurn = struct { child_id: []const u8, turn: []u8 };
+
+    /// Sends "first" as "call-1", waits for its run, and begins a user's turn
+    /// on the child while that work runs. The caller frees `turn`.
+    fn beginTurnWhileFirstWorkRuns(self: *GapFixture) !BeganTurn {
+        _ = try self.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
+        try waitForRuns(&self.fixture, 1);
+        const child_id = try reviewerId(self.runtime, self.arena());
+        const turn = self.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
+        return .{ .child_id = child_id, .turn = turn };
     }
 };
 
@@ -8337,7 +8345,7 @@ fn startFailedReport(a: Allocator, cause: []const u8, messages: usize, held: boo
 const start_failed_report_fallback = "The subagent could not start the work you sent it. It never ran. Call status before you send it again.";
 
 /// What decides whether a child is idle once its work's report goes
-/// (`Runtime.idleAfterEnd`).
+/// (`Runtime.idleFactsAfterEnd`).
 const IdleFacts = struct {
     /// The parent's messages the ended turn never took, which become its
     /// next work.
@@ -10098,8 +10106,7 @@ test "a stop after the next work began does not count its message" {
 // (`tests/tla/subagent/StopMessage.tla` NoSilentLoss and CountedNeverRead).
 // An account of `m` is one of: (i) `m`'s turn began; (ii) a count includes `m`,
 // the N of a stop's or close's answer or of a user's note the host delivered;
-// (iii) the report of
-// `m`'s own work says the work failed or was cancelled.
+// (iii) the report of `m`'s own work says the work failed or was cancelled.
 //
 //   R1, never false: if (ii) or (iii) holds for `m`, its turn never begins.
 //   R2, never silent: if `m`'s turn never begins, (ii) or (iii) holds.
