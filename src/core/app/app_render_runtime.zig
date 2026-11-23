@@ -4959,6 +4959,8 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     const status_id = if (retry.cancel) blk: {
         const id: types.ToolLifecycleId = .{ .turn_id = 41, .call_id = "publication-cancel" };
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try app.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running publication check" } });
         break :blk app.shell.toolActivityRecord(id).?.entry_id;
     } else try store.appendPinnedToolStatusAtomic(&app.shell, alloc, "phase one\nphase two\nphase three\n");
     var physical = try vt_emulator.Grid.init(alloc, 80, rows);

@@ -4289,6 +4289,8 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
         .arguments_json = "{\"command\":\"seq 1 1\"}",
         .place_after_current_transcript = true,
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .progress = .{ .id = id, .text = "● Running seq 1 1" } });
     const status_entry_id = h.shell.toolActivityRecord(id).?.entry_id;
     var canonical_source = try h.shell.prepareTranscriptSource(h.alloc, null);
     defer canonical_source.deinit(h.alloc);
@@ -4296,7 +4298,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     try std.testing.expect(std.mem.find(
         u8,
         canonical_source.bytes,
-        "run_command",
+        "Running",
     ) != null);
 
     var projection = try h.shell.buildFullTranscriptProjection(h.alloc, null);
@@ -4313,7 +4315,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     defer h.alloc.free(full_source);
     const notice_index = std.mem.find(u8, full_source, "Auto agent approved") orelse
         return error.TestExpectedEqual;
-    const status_index = std.mem.find(u8, full_source, "run_command") orelse
+    const status_index = std.mem.find(u8, full_source, "Running") orelse
         return error.TestExpectedEqual;
     try std.testing.expect(notice_index < status_index);
 
@@ -4328,7 +4330,7 @@ test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try expectGridNotContains(&h, "Auto agent approved");
-    try expectGridNotContains(&h, "run_command");
+    try expectGridNotContains(&h, "Running seq 1 1");
 }
 
 test "completed replay tool entries fit a constrained terminal" {
@@ -6778,6 +6780,8 @@ test "compact command completion keeps restored history footer stable" {
         .activity_kind = .command,
         .arguments_json = "{\"command\":\"sleep 5\"}",
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running sleep 5" } });
     try std.testing.expect(try approval.syncRequest(alloc, .{
         .label = "shell.run sleep 5",
         .command = "sleep 5",
@@ -6793,7 +6797,7 @@ test "compact command completion keeps restored history footer stable" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const running_row = try findRowContaining(&h, "run_command");
+    const running_row = try findRowContaining(&h, "Running sleep 5");
     const running_thinking_row = try findRowContaining(&h, "Thinking");
     const running_footer_row = try findFirstDividerRowAfter(&h, running_thinking_row);
     try std.testing.expect(h.shell.transcriptCommitDiagnostic().visual_offset > 0);
@@ -9282,8 +9286,10 @@ test "full transcript shows terminal session launch commands in full across widt
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The main view still trails a row that does not fit.
-    try expectGridContains(&h, "Observed python3");
+    // The main view still trails a row that does not fit. The check came
+    // back while the command runs on, so its row still waits for it.
+    try expectGridContains(&h, "Waiting for python3");
+    try expectGridNotContains(&h, "Observed");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
 
     // Ctrl+O shows the whole launch command at every width.
@@ -9304,8 +9310,128 @@ test "full transcript shows terminal session launch commands in full across widt
     // Leaving Ctrl+O restores the trailing main view.
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
     try h.driveResize(100, 30, 4, true);
-    try expectGridContains(&h, "Observed python3");
+    try expectGridContains(&h, "Waiting for python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+}
+
+fn renderToolRows(h: *Harness, input: *InputRuntime, approval: *approval_prompt.ApprovalPrompt) !void {
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try h.flush();
+}
+
+test "a started call that core has not named yet shows no tool name on the grid" {
+    const alloc = std.testing.allocator;
+    const edit_args = "{\"path\":\"src/tool_host.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const first = types.ToolLifecycleId{ .turn_id = 1, .call_id = "edit-1" };
+    const second = types.ToolLifecycleId{ .turn_id = 1, .call_id = "edit-2" };
+    const check = types.ToolLifecycleId{ .turn_id = 1, .call_id = "check-1" };
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        for ([_]types.ToolLifecycleId{ first, second }) |id| {
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "edit_file",
+                .activity_kind = .edit,
+                .arguments_json = edit_args,
+            } });
+        }
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = first, .text = "● Editing src/tool_host.zig" } });
+        // A check of a session has started too. Core has named neither it
+        // nor the second edit, so each still reads as its tool's name.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = check,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
+        } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Editing tool_host.zig");
+        try expectGridNotContains(&h, "edit_file");
+        try expectGridNotContains(&h, "● shell");
+        try expectGridNotContains(&h, "└ shell");
+
+        // Core names both calls.
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = second, .text = "● Editing src/tool_host.zig" } });
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{ .id = check, .text = "● Waiting for sleep 30" } });
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "├ Editing tool_host.zig · 2 edits");
+        try expectGridContains(&h, "└ Waiting for sleep 30");
+        try expectGridNotContains(&h, "edit_file");
+    }
+}
+
+test "a check row keeps one verb on the grid while Ctrl+O keeps each check's own line" {
+    const alloc = std.testing.allocator;
+    const command = "sleep 30; printf done";
+    const run_args = "{\"action\":\"run\",\"command\":\"sleep 30; printf done\"}";
+    const check_args = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}";
+    for ([_]u16{ 40, 100 }) |cols| {
+        var h = try Harness.init(alloc, cols, 30, 4);
+        defer h.deinit();
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        var approval = approval_prompt.ApprovalPrompt{};
+        defer approval.deinit(alloc);
+        try h.shell.initViewport(&h.metrics, 1);
+
+        const calls = [_]struct { id: types.ToolLifecycleId, args: []const u8, label: []const u8, summary: []const u8, ended: bool = false }{
+            .{ .id = .{ .turn_id = 1, .call_id = "run" }, .args = run_args, .label = "Ran", .summary = "● Still running " ++ command },
+            .{ .id = .{ .turn_id = 1, .call_id = "check-1" }, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command },
+            .{ .id = .{ .turn_id = 2, .call_id = "check-2" }, .args = check_args, .label = "Observed", .summary = "● Observed " ++ command, .ended = true },
+        };
+        for (calls, 0..) |call, index| {
+            // The second turn's check follows the first turn's summary.
+            if (index == 2) {
+                try renderToolRows(&h, &input, &approval);
+                // The check came back while the command runs on.
+                try expectGridContains(&h, "● Waiting for sleep, printf · 2 calls");
+                try expectGridNotContains(&h, "Observed");
+                _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{ .turn_duration_ms = 1200 });
+                try renderToolRows(&h, &input, &approval);
+                try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+            }
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+                .id = call.id,
+                .reconciles_provisional_call_id = null,
+                .tool_name = "shell",
+                .activity_kind = .command,
+                .arguments_json = call.args,
+            } });
+            try h.shell.setToolCommandMetadata(alloc, call.id, command, call.label);
+            _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = call.id,
+                .outcome = .{ .kind = .completed, .summary = call.summary },
+                .check_found_command_ended = call.ended,
+            } });
+        }
+        // The next turn's check found the command ended.
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+        try expectGridContains(&h, "● Ran sleep, printf ✓");
+        try expectGridNotContains(&h, "Observed");
+
+        // Ctrl+O keeps each call's own line.
+        try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
+        try renderToolRows(&h, &input, &approval);
+        try expectGridContains(&h, "● Still running " ++ command);
+        try expectGridContains(&h, "● Observed " ++ command);
+        try expectGridNotContains(&h, "Waiting for");
+        try expectGridNotContains(&h, "Waited for");
+        try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
+        try h.driveResize(cols, 30, 4, true);
+        try expectGridContains(&h, "● Waited for sleep, printf · 2 calls");
+        try expectGridContains(&h, "● Ran sleep, printf ✓");
+    }
 }
 
 test "transcript painting keeps the shadow terminal in step with the screen" {

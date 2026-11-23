@@ -2001,6 +2001,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
+        .check_found_command_ended = source.check_found_command_ended,
     };
 }
 
@@ -2016,6 +2017,22 @@ test "a snapshot copy of a tool detail keeps its subagent report mark" {
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(marked, copy.subagent_report);
+    }
+}
+
+test "a snapshot copy of a shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |ended| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
+            .outcome = .completed,
+            .check_found_command_ended = ended,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(ended, copy.check_found_command_ended);
     }
 }
 
@@ -2687,6 +2704,8 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
             .activity_kind = .command,
             .arguments_json = "{\"command\":\"printf committed\"}",
         } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running printf committed" } });
         try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, .{}, id, .stdout, "COMMITTED_RAW\n", true);
     } else {
         _ = try runtime.appendRawTranscriptEntryClassified(alloc, "COMMITTED_RAW", .unknown_raw);

@@ -1500,6 +1500,7 @@ pub fn finishExecutedToolStatus(
             .result = presentation_result,
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
+            .check_found_command_ended = shell_command and try checkFoundCommandEnded(arena, call, result.model_output),
         },
     });
 }
@@ -1634,6 +1635,90 @@ test "a shell run that returns its command running reads Still running" {
     const read = ToolCall{ .id = "r", .name = "read_file", .arguments_json = "{}" };
     try std.testing.expect((try runningCommandDecision(arena, read, running)) == null);
     try std.testing.expect((try runningCommandDecision(arena, run, "not json \"running\"")) == null);
+}
+
+/// Whether a shell check, an `interact` call that sends no input, found its
+/// session's command ended, from the check's result `output`. A check that
+/// found it passed reads `Observed`, as one does while the command runs on,
+/// since the shell gives a check an exit status only when the command failed
+/// (publishSnapshotMetadata in src/tools/shell/shell.zig).
+pub fn checkFoundCommandEnded(arena: Allocator, call: ToolCall, output: []const u8) !bool {
+    if (!std.mem.eql(u8, call.name, "shell")) return false;
+    if (std.mem.find(u8, output, "\"completed\"") == null) return false;
+    const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    const action = tool_args.optionalStringArg(args, "action") orelse return false;
+    if (!std.mem.eql(u8, action, "interact")) return false;
+    if (tool_args.optionalStringArg(args, "chars")) |chars| if (chars.len > 0) return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (parsed != .object) return false;
+    const state = parsed.object.get("state") orelse return false;
+    return state == .string and std.mem.eql(u8, state.string, "completed");
+}
+
+test "a shell check finds its command ended only from a completed result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const check = ToolCall{ .id = "c", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const passed = "{\"state\":\"completed\",\"exit_code\":0,\"duration_ms\":2004,\"output_delta\":\"CAPTURED_DONE\"}";
+    try std.testing.expect(try checkFoundCommandEnded(arena, check, passed));
+    const empty_chars = ToolCall{ .id = "c", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"\"}" };
+    try std.testing.expect(try checkFoundCommandEnded(arena, empty_chars, passed));
+    const failed = "{\"state\":\"completed\",\"exit_code\":1,\"output_delta\":\"\"}";
+    try std.testing.expect(try checkFoundCommandEnded(arena, check, failed));
+
+    const running = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"running_ms\":30008,\"output_delta\":\"completed\"}";
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, running));
+    const stopped = "{\"state\":\"stopped\",\"signal\":15,\"output_delta\":\"completed\"}";
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, stopped));
+    const send = ToolCall{ .id = "s", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, send, passed));
+    const run = ToolCall{ .id = "r", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, run, passed));
+    const read = ToolCall{ .id = "f", .name = "read_file", .arguments_json = "{\"action\":\"interact\"}" };
+    try std.testing.expect(!try checkFoundCommandEnded(arena, read, passed));
+    try std.testing.expect(!try checkFoundCommandEnded(arena, check, "not json \"completed\""));
+}
+
+test "a check tells the transcript it found its command ended and keeps its own status" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const check = ToolCall{ .id = "check", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const cases = [_]struct { output: []const u8, ended: bool }{
+        .{ .output = "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"done\"}", .ended = true },
+        .{ .output = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", .ended = false },
+    };
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        try finishExecutedToolStatus(
+            &hooks,
+            arena,
+            3,
+            check,
+            true,
+            null,
+            .{ .status = .success, .model_output = case.output },
+            case.output,
+            .{ .output_bytes = case.output.len, .stored_output_bytes = case.output.len },
+            null,
+            &.{},
+        );
+        const terminal = capture.events.items[0].terminal;
+        try std.testing.expectEqual(case.ended, terminal.check_found_command_ended);
+        // The status line Ctrl+O, ACP, and `fx ask` show is the same either way.
+        try std.testing.expectEqual(types.ToolOutcomeKind.completed, terminal.outcome.kind);
+        try std.testing.expectEqualStrings("started shell", terminal.outcome.summary);
+    }
 }
 
 fn checkRunningCommandDecisionAllocationFailures(alloc: Allocator) !void {
