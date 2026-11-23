@@ -821,6 +821,40 @@ test "registered candidates expose only authoritative canonical targets" {
     try std.testing.expectEqualStrings("old contents", unchanged);
 }
 
+test "a write to the hooks trust file is a terminal whose owner frees its text" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("HOME", home);
+    io_mod.setEnvironMap(&env);
+    defer io_mod.resetEnvironForTest();
+
+    const tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    var result = try prepareReadyCall(alloc, .{
+        .id = "trust",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\".fx/hooks-trust.json\",\"content\":\"{}\"}",
+    }, .{ .tool_registry = registry, .workspace_root = home, .classifiers = test_classifiers });
+    defer result.deinit(alloc);
+    switch (result) {
+        .terminal => |terminal| {
+            try std.testing.expectEqual(TerminalKind.file_mutation_failure, terminal.kind);
+            try std.testing.expectEqualStrings(
+                "the hooks trust file changes only through fx hook trust",
+                terminal.model_output.?,
+            );
+        },
+        .candidate => return error.TestExpectedTerminal,
+    }
+}
+
 test "ordinary applicable target freshness detects retarget and resolution failure" {
     const builtin_tools = @import("../../builtins/tools.zig");
     const alloc = std.testing.allocator;

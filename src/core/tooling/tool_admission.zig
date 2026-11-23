@@ -401,7 +401,7 @@ fn decodeFileMutationInput(
 /// names the one command that changes it.
 fn targetFailureText(alloc: Allocator, failure: file_mutation_contract.FileTargetResolutionFailure) ![]const u8 {
     return switch (failure) {
-        .hooks_trust_file => "the hooks trust file changes only through fx hook trust",
+        .hooks_trust_file => try alloc.dupe(u8, "the hooks trust file changes only through fx hook trust"),
         else => try alloc.print("file mutation target resolution failed: {s}", .{@tagName(failure)}),
     };
 }

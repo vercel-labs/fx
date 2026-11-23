@@ -5517,6 +5517,7 @@ test {
     _ = @import("core/agent/runtime/assistant_stream.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/tool_admission.zig");
+    _ = @import("core/agent/tool_preparation.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/agent/runtime/runtime_context.zig");
     _ = @import("core/agent/runtime/user_hooks.zig");
