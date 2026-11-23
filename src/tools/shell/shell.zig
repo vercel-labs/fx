@@ -1109,8 +1109,10 @@ const DetachedStopJob = struct {
     }
 };
 
-/// The one trace line for a steered command's stop that fx drops, so log
-/// searches for `dropped=background_command_stop` find every case.
+/// The trace line for a steered command that fx leaves running: its forced
+/// stop gave up, or process exit cut its stop short or came before it ran.
+/// The cancel's own failure in `finalization.zig` is the only other writer
+/// of `dropped=background_command_stop`.
 fn logDroppedStop(session_id: []const u8, turn_id: u64, reason: []const u8) void {
     debug_trace.logf(
         "shell",
@@ -1155,11 +1157,8 @@ fn stopOneSteeringDetached(
             "steering-detached command stop failed session_id={s} turn_id={d} failure={s}",
             .{ session_id, turn_id, cause.text() },
         ),
-        .refused => if (exitBegan(ctx)) logDroppedStop(session_id, turn_id, "runtime_stopping") else debug_trace.logf(
-            "shell",
-            "steering-detached command stop failed session_id={s} turn_id={d} reason={s}",
-            .{ session_id, turn_id, cause.text() },
-        ),
+        // The busy client kept refusing the forced stop, or exit cut it short.
+        .refused => logDroppedStop(session_id, turn_id, cause.text()),
     }
 }
 
@@ -1199,16 +1198,84 @@ fn exitBegan(ctx: tool_dispatch.DispatchContext) bool {
     return runtime.backgroundCancelled();
 }
 
-/// Waits `backoff_ms` before a request the busy terminal client refused
-/// runs again. Returns false, at once, when process exit begins before or
-/// during the wait, so exit never waits out a retry.
-fn waitBusyBackoff(ctx: tool_dispatch.DispatchContext, backoff_ms: u64) bool {
-    const deadline_ms = io_mod.milliTimestamp() + @as(i64, @intCast(backoff_ms));
+/// How often a retry wait checks whether process exit began.
+const busy_wait_exit_check_ms = 10;
+
+/// The wait before run `attempt` + 1 of a request the busy client refused
+/// on run `attempt`, or null when that was the last run.
+fn busyRetryDelayMs(attempt: usize) ?u64 {
+    if (attempt >= max_busy_terminal_attempts) return null;
+    return @as(u64, busy_terminal_first_backoff_ms) << @intCast(attempt - 1);
+}
+
+/// Waits `delay_ms` before a refused request runs again. Returns false, at
+/// once, when process exit begins before or during the wait, so exit never
+/// waits out a retry.
+fn waitBusyBackoff(ctx: tool_dispatch.DispatchContext, delay_ms: u64) bool {
+    const deadline_ms = io_mod.milliTimestamp() + @as(i64, @intCast(delay_ms));
     while (true) {
         if (exitBegan(ctx)) return false;
         const left_ms = deadline_ms - io_mod.milliTimestamp();
         if (left_ms <= 0) return true;
-        io_mod.sleep(@as(u64, @intCast(@min(left_ms, 10))) * std.time.ns_per_ms);
+        io_mod.sleep(@as(u64, @intCast(@min(left_ms, busy_wait_exit_check_ms))) * std.time.ns_per_ms);
+    }
+}
+
+/// Why `retryWhileBusy` stopped running a request.
+const BusyGiveUp = enum { terminal_busy, runtime_stopping };
+
+/// How a request that `retryWhileBusy` runs shows in its trace lines.
+const BusyRequest = struct {
+    /// What the request does, such as "terminal lease release".
+    what: []const u8,
+    session_id: []const u8,
+    /// Shown as `force=` for a stop.
+    force: ?bool = null,
+    /// The `dropped=` tag of the give-up line, when giving up drops the work.
+    dropped: ?[]const u8 = null,
+
+    fn forceText(self: BusyRequest) []const u8 {
+        const force = self.force orelse return "";
+        return if (force) " force=true" else " force=false";
+    }
+
+    fn droppedText(self: BusyRequest, buffer: *[64]u8) []const u8 {
+        const tag = self.dropped orelse return "";
+        return std.mem.print(buffer, " dropped={s}", .{tag}) catch "";
+    }
+};
+
+/// Runs `runner.attempt()` until it returns a result, and again after each
+/// busy refusal (null) with the waits of `busyRetryDelayMs`. Returns the
+/// result, or why it gave up: the client stayed busy for every run, or
+/// process exit began during a wait. Writes the refused and give-up trace
+/// lines; `runner` writes its own.
+fn retryWhileBusy(
+    comptime Result: type,
+    ctx: tool_dispatch.DispatchContext,
+    request: BusyRequest,
+    runner: anytype,
+) !union(enum) { done: Result, gave_up: BusyGiveUp } {
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        if (try runner.attempt()) |result| return .{ .done = result };
+        const give_up: BusyGiveUp = give_up: {
+            const delay_ms = busyRetryDelayMs(attempt) orelse break :give_up .terminal_busy;
+            debug_trace.logf(
+                "shell",
+                "{s} refused session_id={s}{s} attempt={d} reason=terminal_busy retry_in_ms={d}",
+                .{ request.what, request.session_id, request.forceText(), attempt, delay_ms },
+            );
+            if (waitBusyBackoff(ctx, delay_ms)) continue;
+            break :give_up .runtime_stopping;
+        };
+        var dropped_buffer: [64]u8 = undefined;
+        debug_trace.logf(
+            "shell",
+            "{s} gave up session_id={s}{s} attempts={d} reason={s}{s}",
+            .{ request.what, request.session_id, request.forceText(), attempt, @tagName(give_up), request.droppedText(&dropped_buffer) },
+        );
+        return .{ .gave_up = give_up };
     }
 }
 
@@ -1224,77 +1291,64 @@ fn stopDetachedOnce(
     force: bool,
     cause: *DetachedStopCause,
 ) Allocator.Error!DetachedStopOutcome {
-    const force_name = if (force) "true" else "false";
-    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
-    var attempt: usize = 1;
-    while (true) : (attempt += 1) {
-        const result = callStop(ctx, .{
+    var runner: DetachedStopRun = .{ .ctx = ctx, .session_id = session_id, .force = force, .cause = cause };
+    const request: BusyRequest = .{ .what = "steering-detached command stop", .session_id = session_id, .force = force };
+    return switch (try retryWhileBusy(DetachedStopOutcome, ctx, request, &runner)) {
+        .done => |outcome| outcome,
+        .gave_up => |give_up| refused: {
+            cause.set(@tagName(give_up));
+            break :refused .refused;
+        },
+    };
+}
+
+/// One run of a steered command's `stop` for `stopDetachedOnce`.
+const DetachedStopRun = struct {
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+    force: bool,
+    cause: *DetachedStopCause,
+
+    /// What the stop did, or null when the busy client refused it.
+    fn attempt(self: *DetachedStopRun) Allocator.Error!?DetachedStopOutcome {
+        const force_name = if (self.force) "true" else "false";
+        const result = callStop(self.ctx, .{
             .action = .stop,
-            .session_id = session_id,
-            .force = force,
+            .session_id = self.session_id,
+            .force = self.force,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 debug_trace.logf(
                     "shell",
                     "steering-detached command stop errored session_id={s} force={s} err={s}",
-                    .{ session_id, force_name, @errorName(err) },
+                    .{ self.session_id, force_name, @errorName(err) },
                 );
-                cause.set(@errorName(err));
+                self.cause.set(@errorName(err));
                 return .not_ended;
             },
         };
-        defer result.deinit(ctx.allocator);
-        const ended = switch (result) {
-            .success => true,
-            .failure, .rich => false,
-        };
-        var code_buffer: [64]u8 = undefined;
-        const failure = stopFailure(ctx.allocator, result, &code_buffer);
-        if (!ended and failure.busy) {
-            if (attempt == max_busy_terminal_attempts) {
-                debug_trace.logf(
-                    "shell",
-                    "steering-detached command stop gave up session_id={s} force={s} attempts={d} reason=terminal_busy dropped=background_command_stop",
-                    .{ session_id, force_name, attempt },
-                );
-                cause.set("terminal_busy");
-                return .refused;
-            }
-            debug_trace.logf(
-                "shell",
-                "steering-detached command stop refused session_id={s} force={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
-                .{ session_id, force_name, attempt, backoff_ms },
-            );
-            if (!waitBusyBackoff(ctx, backoff_ms)) {
-                debug_trace.logf(
-                    "shell",
-                    "steering-detached command stop retry cut short session_id={s} force={s} attempt={d} reason=runtime_stopping",
-                    .{ session_id, force_name, attempt },
-                );
-                cause.set("runtime_stopping");
-                return .refused;
-            }
-            backoff_ms *= 2;
-            continue;
-        }
-        if (ended) {
+        defer result.deinit(self.ctx.allocator);
+        if (result == .success) {
             debug_trace.logf(
                 "shell",
                 "stopped steering-detached command session_id={s} force={s} ended=true",
-                .{ session_id, force_name },
+                .{ self.session_id, force_name },
             );
             return .ended;
         }
+        var code_buffer: [64]u8 = undefined;
+        const failure = stopFailure(self.ctx.allocator, result, &code_buffer);
+        if (failure.busy) return null;
         debug_trace.logf(
             "shell",
             "stopped steering-detached command session_id={s} force={s} ended=false failure={s}",
-            .{ session_id, force_name, failure.code },
+            .{ self.session_id, force_name, failure.code },
         );
-        cause.set(failure.code);
+        self.cause.set(failure.code);
         return .not_ended;
     }
-}
+};
 
 /// What a failed stop says about itself: its error code, or "none", and
 /// whether the terminal client refused it because it was busy, which is the
@@ -1945,50 +1999,40 @@ pub fn releaseAgentWriteLease(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
 ) !void {
-    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
-    var attempt: usize = 1;
-    while (true) : (attempt += 1) {
-        var released = try executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
-            .session_id = session_id,
+    var runner: LeaseReleaseRun = .{ .ctx = ctx, .session_id = session_id };
+    const request: BusyRequest = .{ .what = "terminal lease release", .session_id = session_id, .dropped = "agent_write_lease_release" };
+    switch (try retryWhileBusy(void, ctx, request, &runner)) {
+        .done => {},
+        .gave_up => return error.TerminalLeaseCleanupFailed,
+    }
+}
+
+/// One run of `releaseAgentWriteLease`.
+const LeaseReleaseRun = struct {
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+
+    /// Done, or null when the busy client refused the release.
+    fn attempt(self: *LeaseReleaseRun) !?void {
+        var released = try executeAuthorizedTerminal(self.ctx, self.session_id, .{ .write = .{
+            .session_id = self.session_id,
             .lease = .release,
             .authority = null,
         } });
-        defer released.deinit(ctx.allocator);
+        defer released.deinit(self.ctx.allocator);
         switch (released.result.view()) {
             .success => |success| switch (success) {
-                .write => return,
+                .write => return {},
                 else => return error.InvalidTerminalLeaseCleanupResult,
             },
             .failure => |failure| switch (failure.code) {
-                .session_not_found, .lease_conflict => return,
+                .session_not_found, .lease_conflict => return {},
                 // Only a busy refusal goes away when the release runs again.
-                else => if (!failure.isBusyRefusal()) return error.TerminalLeaseCleanupFailed,
+                else => return if (failure.isBusyRefusal()) null else error.TerminalLeaseCleanupFailed,
             },
         }
-        if (attempt == max_busy_terminal_attempts) {
-            debug_trace.logf(
-                "shell",
-                "terminal lease release gave up session_id={s} attempts={d} reason=terminal_busy dropped=agent_write_lease_release",
-                .{ session_id, attempt },
-            );
-            return error.TerminalLeaseCleanupFailed;
-        }
-        debug_trace.logf(
-            "shell",
-            "terminal lease release refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
-            .{ session_id, attempt, backoff_ms },
-        );
-        if (!waitBusyBackoff(ctx, backoff_ms)) {
-            debug_trace.logf(
-                "shell",
-                "terminal lease release gave up session_id={s} attempts={d} reason=runtime_stopping dropped=agent_write_lease_release",
-                .{ session_id, attempt },
-            );
-            return error.TerminalLeaseCleanupFailed;
-        }
-        backoff_ms *= 2;
     }
-}
+};
 
 fn finalizeCompletedTty(
     ctx: tool_dispatch.DispatchContext,
@@ -2021,64 +2065,50 @@ fn closeTtyBestEffort(
     // The close ignores `cancel_flag`. A user cancel is when this cleanup
     // matters most, and with the flag set the executor would cancel the
     // close too and leave the command running.
-    // A close the busy terminal client refuses runs again after a short
-    // wait, up to `max_busy_terminal_attempts` times, as a steered stop does.
     var close_ctx = ctx;
     close_ctx.cancel_flag = null;
-    var backoff_ms: u64 = busy_terminal_first_backoff_ms;
-    var attempt: usize = 1;
-    while (true) : (attempt += 1) {
-        var closed = executeAuthorizedTerminal(close_ctx, session_id, .{ .close = .{
-            .session_id = session_id,
+    var runner: UnpublishedCloseRun = .{ .ctx = close_ctx, .session_id = session_id };
+    const request: BusyRequest = .{ .what = "unpublished TTY cleanup", .session_id = session_id, .dropped = "unpublished_tty_close" };
+    // Each run logs its own failure, and the give-up line names the drop.
+    _ = retryWhileBusy(void, ctx, request, &runner) catch |err| switch (err) {};
+}
+
+/// One run of `closeTtyBestEffort`. It never fails: it logs a failed close
+/// itself.
+const UnpublishedCloseRun = struct {
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+
+    /// Done, or null when the busy client refused the close.
+    fn attempt(self: *UnpublishedCloseRun) error{}!?void {
+        var closed = executeAuthorizedTerminal(self.ctx, self.session_id, .{ .close = .{
+            .session_id = self.session_id,
             .policy = .force,
             .authority = null,
         } }) catch |err| {
             debug_trace.logf(
                 "shell",
                 "unpublished TTY cleanup failed session_id={s} err={s} dropped=unpublished_tty_close",
-                .{ session_id, @errorName(err) },
+                .{ self.session_id, @errorName(err) },
             );
-            return;
+            return {};
         };
-        defer closed.deinit(ctx.allocator);
+        defer closed.deinit(self.ctx.allocator);
         const failure = switch (closed.result.view()) {
-            .success => return,
+            .success => return {},
             .failure => |failure| failure,
         };
         // The terminal is already gone, so nothing is left to close.
-        if (failure.code == .session_not_found) return;
-        if (!failure.isBusyRefusal()) {
-            debug_trace.logf(
-                "shell",
-                "unpublished TTY cleanup failed session_id={s} code={s} dropped=unpublished_tty_close",
-                .{ session_id, @tagName(failure.code) },
-            );
-            return;
-        }
-        if (attempt == max_busy_terminal_attempts) {
-            debug_trace.logf(
-                "shell",
-                "unpublished TTY cleanup gave up session_id={s} attempts={d} reason=terminal_busy dropped=unpublished_tty_close",
-                .{ session_id, attempt },
-            );
-            return;
-        }
+        if (failure.code == .session_not_found) return {};
+        if (failure.isBusyRefusal()) return null;
         debug_trace.logf(
             "shell",
-            "unpublished TTY cleanup refused session_id={s} attempt={d} reason=terminal_busy retry_in_ms={d}",
-            .{ session_id, attempt, backoff_ms },
+            "unpublished TTY cleanup failed session_id={s} code={s} dropped=unpublished_tty_close",
+            .{ self.session_id, @tagName(failure.code) },
         );
-        if (!waitBusyBackoff(ctx, backoff_ms)) {
-            debug_trace.logf(
-                "shell",
-                "unpublished TTY cleanup gave up session_id={s} attempts={d} reason=runtime_stopping dropped=unpublished_tty_close",
-                .{ session_id, attempt },
-            );
-            return;
-        }
-        backoff_ms *= 2;
+        return {};
     }
-}
+};
 
 fn finishPreparedWithAccepted(
     ctx: tool_dispatch.DispatchContext,
@@ -4433,6 +4463,16 @@ const TtySteeringCancelTest = struct {
         self.tmp.cleanup();
     }
 
+    /// Starts writing the shell's trace lines to a file in the profile and
+    /// returns its path, which the caller frees. The caller resets the trace.
+    fn startTrace(self: *TtySteeringCancelTest) ![]u8 {
+        const trace_path = try std.Io.Dir.path.join(self.alloc, &.{ self.home, "trace.log" });
+        errdefer self.alloc.free(trace_path);
+        debug_trace.resetForTest();
+        try debug_trace.configureForTestWithScopes(self.alloc, trace_path, "shell");
+        return trace_path;
+    }
+
     /// The context of a call outside any turn, as the cancel uses.
     fn context(self: *TtySteeringCancelTest) tool_dispatch.DispatchContext {
         return .{
@@ -4714,6 +4754,10 @@ test "a turn cancel gives up a steered tty stop the full terminal client keeps r
     try t.init();
     defer t.deinit();
 
+    const trace_path = try t.startTrace();
+    defer t.alloc.free(trace_path);
+    defer debug_trace.resetForTest();
+
     const steered = try t.run("sleep 30", 5);
     defer t.alloc.free(steered);
     var fillers: [64]terminal_contracts.CorrelationId = undefined;
@@ -4731,6 +4775,17 @@ test "a turn cancel gives up a steered tty stop the full terminal client keeps r
     const took_ms = io_mod.milliTimestamp() - started_ms;
     try std.testing.expect(took_ms >= 2 * 1_550);
     try std.testing.expectEqual(managed_execution.SnapshotState.running, t.runtime.stateFor(steered).?);
+
+    // The graceful stop's give-up drops nothing, since the forced stop runs
+    // next. Only the forced stop's give-up leaves the command running.
+    const trace = try readTraceForTest(t.alloc, trace_path);
+    defer t.alloc.free(trace);
+    const graceful = try traceLineWith(trace, "steering-detached command stop gave up session_id=", " force=false attempts=6 reason=terminal_busy");
+    try std.testing.expect(std.mem.find(u8, graceful, "dropped=") == null);
+    const forced = try traceLineWith(trace, "steering-detached command stop gave up session_id=", " force=true attempts=6 reason=terminal_busy");
+    try std.testing.expect(std.mem.find(u8, forced, "dropped=") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "dropped=background_command_stop"));
+    _ = try traceLineWith(trace, "steering-detached command stop failed session_id=", " err=terminal_busy dropped=background_command_stop");
 }
 
 test "a turn-end lease release runs again while the terminal client is full" {
@@ -4810,11 +4865,9 @@ test "process exit during a busy-client retry ends the steered stop at once and 
     var t: TtySteeringCancelTest = undefined;
     try t.init();
     defer t.deinit();
-    const trace_path = try std.Io.Dir.path.join(t.alloc, &.{ t.home, "trace.log" });
+    const trace_path = try t.startTrace();
     defer t.alloc.free(trace_path);
-    debug_trace.resetForTest();
     defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(t.alloc, trace_path, "shell");
 
     const steered = try t.run("sleep 30", 5);
     defer t.alloc.free(steered);
@@ -4832,12 +4885,108 @@ test "process exit during a busy-client retry ends the steered stop at once and 
     const started_ms = io_mod.milliTimestamp();
     t.runtime.terminateForProcessExit();
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    const trace = try readTraceForTest(t.alloc, trace_path);
+    defer t.alloc.free(trace);
+    _ = try traceLineWith(trace, "steering-detached command stop refused session_id=", " reason=terminal_busy");
+    _ = try traceLineWith(trace, "steering-detached command stop gave up session_id=", " reason=runtime_stopping");
+    _ = try traceLineWith(trace, "steering-detached command stop failed session_id=", " err=runtime_stopping dropped=background_command_stop");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "dropped=background_command_stop"));
+}
+
+/// Flushes the trace and returns the file at `trace_path`, which the caller
+/// frees.
+fn readTraceForTest(alloc: Allocator, trace_path: []const u8) ![]u8 {
     debug_trace.shutdown();
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
     defer trace_file.close(io_mod.getIo());
-    const text = try io_mod.readFileToEnd(t.alloc, &trace_file, 1 << 20);
-    defer t.alloc.free(text);
-    try std.testing.expect(std.mem.find(u8, text, "steering-detached command stop refused") != null);
-    try std.testing.expect(std.mem.find(u8, text, "reason=runtime_stopping") != null);
-    try std.testing.expect(std.mem.find(u8, text, "err=runtime_stopping dropped=background_command_stop") != null);
+    return io_mod.readFileToEnd(alloc, &trace_file, 1 << 20);
+}
+
+/// The first line of `trace` that holds `start` and, after it, `rest`.
+fn traceLineWith(trace: []const u8, start: []const u8, rest: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, trace, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.find(u8, line, start) orelse continue;
+        if (std.mem.find(u8, line[at..], rest) != null) return line;
+    }
+    std.debug.print("no trace line with {s}...{s} in:\n{s}\n", .{ start, rest, trace });
+    return error.TestUnexpectedResult;
+}
+
+test "a request the busy client refuses runs at most six times with doubling waits" {
+    const expected = [_]?u64{ 50, 100, 200, 400, 800, null };
+    for (expected, 1..) |delay_ms, attempt| {
+        try std.testing.expectEqual(delay_ms, busyRetryDelayMs(attempt));
+    }
+}
+
+/// Runs `releaseAgentWriteLease` and keeps its result, for a test task.
+fn releaseLeaseForTest(ctx: tool_dispatch.DispatchContext, session_id: []const u8, result: *anyerror!void) void {
+    result.* = releaseAgentWriteLease(ctx, session_id);
+}
+
+test "process exit during a busy-client retry of the lease release ends it at once and logs it dropped" {
+    if (comptime builtin.target.os.tag == .wasi or builtin.single_threaded) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const trace_path = try t.startTrace();
+    defer t.alloc.free(trace_path);
+    defer debug_trace.resetForTest();
+
+    const command = try t.run("sleep 30", 5);
+    defer t.alloc.free(command);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(command, &fillers);
+    defer t.release(fillers[0..filled], 0);
+
+    // The release waits between refused runs while the client stays full;
+    // its first run is refused at once, so it waits by now.
+    const io = io_mod.getIo();
+    var task: std.Io.Group = .init;
+    var result: anyerror!void = {};
+    task.concurrent(io, releaseLeaseForTest, .{ t.context(), command, &result }) catch return error.SkipZigTest;
+    io_mod.sleep(300 * std.time.ns_per_ms);
+
+    const started_ms = io_mod.milliTimestamp();
+    t.runtime.terminateForProcessExit();
+    task.await(io) catch {};
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectError(error.TerminalLeaseCleanupFailed, result);
+    const trace = try readTraceForTest(t.alloc, trace_path);
+    defer t.alloc.free(trace);
+    _ = try traceLineWith(trace, "terminal lease release refused session_id=", " reason=terminal_busy");
+    _ = try traceLineWith(trace, "terminal lease release gave up session_id=", " reason=runtime_stopping dropped=agent_write_lease_release");
+}
+
+test "process exit during a busy-client retry of the unpublished tty close ends it at once and logs it dropped" {
+    if (comptime builtin.target.os.tag == .wasi or builtin.single_threaded) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    const trace_path = try t.startTrace();
+    defer t.alloc.free(trace_path);
+    defer debug_trace.resetForTest();
+
+    const command = try t.run("sleep 30", 5);
+    defer t.alloc.free(command);
+    var fillers: [64]terminal_contracts.CorrelationId = undefined;
+    const filled = try t.fill(command, &fillers);
+    defer t.release(fillers[0..filled], 0);
+
+    // The close waits between refused runs while the client stays full; its
+    // first run is refused at once, so it waits by now.
+    const io = io_mod.getIo();
+    var task: std.Io.Group = .init;
+    task.concurrent(io, closeTtyBestEffort, .{ t.context(), command }) catch return error.SkipZigTest;
+    io_mod.sleep(300 * std.time.ns_per_ms);
+
+    const started_ms = io_mod.milliTimestamp();
+    t.runtime.terminateForProcessExit();
+    task.await(io) catch {};
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    const trace = try readTraceForTest(t.alloc, trace_path);
+    defer t.alloc.free(trace);
+    _ = try traceLineWith(trace, "unpublished TTY cleanup refused session_id=", " reason=terminal_busy");
+    _ = try traceLineWith(trace, "unpublished TTY cleanup gave up session_id=", " reason=runtime_stopping dropped=unpublished_tty_close");
 }
