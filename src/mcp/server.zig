@@ -445,9 +445,10 @@ pub const Server = struct {
         return &r.store.current;
     }
 
-    /// Why fx refused the last list the server answered, in the fixed words of `tools.Refusal`; null when it
-    /// did not. A list that is accepted, and a new process, clear it. An older accepted list is still `toolList`.
-    /// The words stay valid until the next page is refused: copy them.
+    /// Why fx refused the last list the server answered, in the words of `tools.Refusal` (with the HTTP status
+    /// number fx read, for an HTTP refusal); null when it did not. A list that is accepted, and a new process,
+    /// clear it. An older accepted list is still `toolList`. The words stay valid until the next page is refused:
+    /// copy them.
     pub fn listRefusal(r: *const Server) ?[]const u8 {
         return if (r.catalog.refused and r.list_refusal_len > 0) r.list_refusal_buf[0..r.list_refusal_len] else null;
     }

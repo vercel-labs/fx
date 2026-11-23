@@ -104,9 +104,11 @@ pub const Status = struct {
     version: ?[]const u8 = null,
     tools: usize = 0,
     last_error: ?[]const u8 = null,
-    /// Why fx refused the last tool list the server answered, in the fixed words of `mcp.tools.Refusal`: set only
-    /// for a server that is `ready`. It is no failure of the server, so `last_error` stays empty. An older
-    /// accepted list is still served: `tools` counts it. Static words, which no one frees.
+    /// Why fx refused the last tool list the server answered, in the words of `mcp.tools.Refusal`, which may name
+    /// the HTTP status fx read: set only for a server that is `ready`. It is no failure of the server, so
+    /// `last_error` stays empty. An older accepted list is still served: `tools` counts it. The engine only lends
+    /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
+    /// allocator, like the other strings.
     tools_error: ?[]const u8 = null,
     needs_login: bool = false,
     signed_in: bool = false,

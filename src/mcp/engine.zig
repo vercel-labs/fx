@@ -86,8 +86,10 @@ pub const Status = struct {
     version: ?[]const u8,
     tools: usize,
     last_error: ?[]const u8,
-    /// Why fx refused the last list the server answered (`Server.listRefusal`), in fixed words; null
-    /// when it did not. It is no failure of the server: `phase` and `last_error` do not change.
+    /// Why fx refused the last list the server answered (`Server.listRefusal`), in the words of `tools.Refusal`,
+    /// which may name the HTTP status fx read; null when it did not. It is no failure of the server: `phase` and
+    /// `last_error` do not change. The words are lent from the server's buffer until its next refused page, so a
+    /// reader that keeps them copies them.
     list_refusal: ?[]const u8 = null,
     /// How the last process ended, and the last stdout line that answered
     /// nothing since the server was last ready, until it starts again.
