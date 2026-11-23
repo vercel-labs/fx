@@ -1,0 +1,35 @@
+stateDiagram-v2
+  %% Today's code (the "current" design of AcpSessionStaysOpen.tla), as the person sees a session.
+  %% Drawn from TLC's shortest counterexamples for the three rules it breaks, and from the model's actions.
+  [*] --> OpenAlone
+  state "Open, only the opener" as OpenAlone
+  state "Open, the opener and followers" as OpenWithFollowers
+  state "Turn running" as Running
+  state "Turn asks the opener for permission" as Asking
+  state "Closed, followers still listed" as ClosedListed
+  state "Closed, nobody listed" as ClosedEmpty
+
+  OpenAlone --> OpenWithFollowers : a follower joins
+  OpenAlone --> Running : the opener sends a prompt
+  OpenWithFollowers --> Running : a client sends a prompt
+  Running --> OpenWithFollowers : the turn ends with followers
+  Running --> OpenAlone : the turn ends alone
+  Running --> Asking : the turn asks for permission
+  Asking --> Running : the opener answers
+  OpenWithFollowers --> OpenWithFollowers : a follower leaves and another stays
+  OpenWithFollowers --> ClosedListed : the opener sends session/close or its input ends
+  Running --> ClosedListed : the opener leaves during the turn
+  Asking --> ClosedListed : the opener leaves while the question waits
+  ClosedListed --> ClosedListed : a follower leaves and another stays
+  ClosedListed --> ClosedEmpty : the last follower leaves
+  OpenAlone --> ClosedEmpty : the opener sends session/close
+
+  note right of ClosedListed
+    BROKEN: StaysOpenWhileMember and OneMainInJoinOrder (the closing and successor rules of Following a session)
+    BROKEN: DeniedOnlyWhenNoMember, when the question was open (a question is denied only when no member remains)
+    Shortest path to StaysOpen and OneMain: start, a follower joins, the opener sends session/close (3 steps)
+    Shortest path to DeniedOnly: start, a follower joins, the opener sends a prompt, the turn asks, the opener leaves (5 steps)
+  end note
+  note right of ClosedEmpty
+    Nothing is broken here: no member and no session, so the session is closed as the closing rule of Following a session says
+  end note

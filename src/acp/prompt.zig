@@ -8,7 +8,7 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const model_provider = @import("../core/config/model_provider.zig");
-const host = @import("../core/hosts/host.zig");
+const host_module = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const token_pass = @import("../core/gateway/token_pass.zig");
@@ -212,15 +212,15 @@ const ToolCallCard = enum {
 /// reconfigured session cannot issue an ultrafast request unless the current
 /// Gateway catalog still verifies the selected model capability.
 fn ultrafastPromptAllowed(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *const server.ActiveSessionState,
 ) bool {
     if (!session.ultrafast_mode) return true;
-    server.lockCatalog(state);
-    defer server.unlockCatalog(state);
-    const catalog_ready = state.capability_resolver.catalogEntries() != null;
-    const bundle = state.cfg.provider_set.select(session.provider);
-    const capabilities = state.capability_resolver.available(
+    server.lockCatalog(host);
+    defer server.unlockCatalog(host);
+    const catalog_ready = host.capability_resolver.catalogEntries() != null;
+    const bundle = host.cfg.provider_set.select(session.provider);
+    const capabilities = host.capability_resolver.available(
         session.model,
         bundle.fallbackModelCapabilities(session.model),
     );
@@ -308,7 +308,7 @@ const TurnSettings = struct {
 
 const AcpContext = struct {
     alloc: Allocator,
-    state: *server.ServerState,
+    host: *server.Host,
     /// The session whose turn this is. It stays open until the turn's worker
     /// is reaped, and no other session's state is reached through it.
     session: *server.ActiveSessionState,
@@ -547,7 +547,7 @@ const AcpContext = struct {
         const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else .none;
         session.tool_identities_mutex.lockUncancelable(io_mod.getIo());
         defer session.tool_identities_mutex.unlock(io_mod.getIo());
-        session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
+        session.tool_identities.remember(self.host.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -585,7 +585,9 @@ const AcpContext = struct {
         errdefer self.alloc.free(owned_id);
         // Without `follow_supported` no follower takes the other card, so only the owner's is built.
         if (comptime !server.follow_supported) {
-            const meta: ?acp_types.ToolCallMeta = if (self.state.extensions.contains(.tool_call)) presentation.meta else null;
+            const main_record = server.holdMain(self.session);
+            defer main_record.drop();
+            const meta: ?acp_types.ToolCallMeta = if (main_record.extensions.contains(.tool_call)) presentation.meta else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, meta);
@@ -630,7 +632,7 @@ const AcpContext = struct {
         if (card != .awaiting_provider_terminal) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
-        const detail = if (self.state.cfg.minimal_kernel) result else null;
+        const detail = if (self.host.cfg.minimal_kernel) result else null;
         switch (status) {
             .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, detail orelse "Web search completed", null),
             .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
@@ -715,7 +717,9 @@ const AcpContext = struct {
         defer arena_state.deinit();
         // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
         if (comptime !server.follow_supported) {
-            const command_result = if (self.state.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            const second_main_record = server.holdMain(self.session);
+            defer second_main_record.drop();
+            const command_result = if (second_main_record.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCallUpdateWithDiff(&out.writer, tool_call_id, .completed, diff, result_text, command_result);
@@ -752,7 +756,9 @@ const AcpContext = struct {
         defer arena_state.deinit();
         // Without `follow_supported` only the owner's result is built; it takes a command result only when it lists one.
         if (comptime !server.follow_supported) {
-            const command_result = if (self.state.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
+            const third_main_record = server.holdMain(self.session);
+            defer third_main_record.drop();
+            const command_result = if (third_main_record.extensions.contains(.command_result)) parsedCommandResult(arena_state.allocator(), tool_call_id, command_result_json) else null;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
             try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result);
@@ -781,8 +787,12 @@ const AcpContext = struct {
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
+        const fourth_main_record = server.holdMain(self.session);
+        defer fourth_main_record.drop();
+        const fifth_main_record = server.holdMain(self.session);
+        defer fifth_main_record.drop();
         const session = self.session;
-        const provider_capabilities = self.state.cfg.provider_set.select(self.turn.provider).capabilities;
+        const provider_capabilities = self.host.cfg.provider_set.select(self.turn.provider).capabilities;
         // A subagent's turn leaves the session's runtime alone: the runtime would keep a pointer into
         // the subagent's copy past its turn. A prompt's turn points it at its own copy, and points it
         // back at the session's own credential before that copy is freed.
@@ -792,35 +802,35 @@ const AcpContext = struct {
                 .credential_source = self.turn.credential_source,
                 .gateway_team = self.turn.gateway_team,
                 .worker_model = self.turn.model,
-                .gateway_retry_count = self.state.cfg.gateway_retry_count,
-                .gateway_chat_url = self.state.cfg.gateway_chat_url,
+                .gateway_retry_count = self.host.cfg.gateway_retry_count,
+                .gateway_chat_url = self.host.cfg.gateway_chat_url,
             });
         }
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = session.workspace_root,
             .access_scope = session.workspace.access.scope(session.workspace_root),
-            .ignored_list_entries = self.state.cfg.ignored_list_entries,
-            .max_list_entries = self.state.cfg.max_list_entries,
-            .max_read_file_bytes = self.state.cfg.max_read_file_bytes,
-            .max_read_file_lines = self.state.cfg.max_read_file_lines,
-            .max_read_file_line_len = self.state.cfg.max_read_file_line_len,
-            .max_command_output_bytes = self.state.cfg.max_command_output_bytes,
+            .ignored_list_entries = self.host.cfg.ignored_list_entries,
+            .max_list_entries = self.host.cfg.max_list_entries,
+            .max_read_file_bytes = self.host.cfg.max_read_file_bytes,
+            .max_read_file_lines = self.host.cfg.max_read_file_lines,
+            .max_read_file_line_len = self.host.cfg.max_read_file_line_len,
+            .max_command_output_bytes = self.host.cfg.max_command_output_bytes,
             .max_tool_result_bytes = session.max_tool_result_bytes,
-            .auto_compact_percent = self.state.auto_compact_percent,
+            .auto_compact_percent = self.session.auto_compact_percent,
             .api_key = self.turn.api_key,
-            .agent_stream_provider = server.streamProviderFor(self.state, self.turn.provider),
+            .agent_stream_provider = server.streamProviderFor(self.host, self.turn.provider),
             .credential_source = self.turn.credential_source,
             .account_id = self.turn.account_id,
             .provider = self.turn.provider,
             .provider_capabilities = provider_capabilities,
-            .oauth_transport = self.state.cfg.gateway_provider.oauth_transport,
-            .secret_store = self.state.cfg.secret_store,
+            .oauth_transport = self.host.cfg.gateway_provider.oauth_transport,
+            .secret_store = self.host.cfg.secret_store,
             .gateway_team = self.turn.gateway_team,
             .model = self.turn.model,
-            .gateway_retry_count = self.state.cfg.gateway_retry_count,
-            .gateway_chat_url = self.state.cfg.gateway_chat_url,
-            .gateway_models_path = self.state.cfg.gateway_models_path,
+            .gateway_retry_count = self.host.cfg.gateway_retry_count,
+            .gateway_chat_url = self.host.cfg.gateway_chat_url,
+            .gateway_models_path = self.host.cfg.gateway_models_path,
             .agent_step_limit = session.agent_step_limit,
             .fast_mode = self.turn.fast_mode,
             .ultrafast_mode = self.turn.ultrafast_mode,
@@ -831,12 +841,12 @@ const AcpContext = struct {
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
             .host_tool_provider = hostToolProvider(session),
-            .permission_reviewer_provider = self.state.cfg.provider_set.select(self.turn.provider).permission_reviewer,
+            .permission_reviewer_provider = self.host.cfg.provider_set.select(self.turn.provider).permission_reviewer,
             .auto_classifier = self.auto_classifier,
             .subagent_host = session.subagent_host,
             .subagent_caller_id = session.session_id,
             .worker = &session.worker,
-            .permission_prompter = if (self.state.initialized) .{
+            .permission_prompter = if (fifth_main_record.initialized) .{
                 .observer = self.observer,
                 .cancel_flag = &session.cancel_flag,
                 .context = @ptrCast(self),
@@ -847,18 +857,18 @@ const AcpContext = struct {
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = session.workspace.skills.dir,
-            .context_limits = self.state.context_limits,
-            .context_enabled = self.state.context_enabled,
-            .context_registry = self.state.cfg.context_registry,
+            .context_limits = self.session.context_limits,
+            .context_enabled = self.session.context_enabled,
+            .context_registry = self.host.cfg.context_registry,
             .output_chunk_ctx = @ptrCast(self),
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
             .session_child_capability = sessionChildCapability(session),
-            .terminal_client = &self.state.terminal_client,
-            .managed_executions = &self.state.managed_executions,
-            .ephemeral_command_replay = self.state.managed_executions.replayStore(),
-            .web_fetch_runtime = &self.state.web_fetch_runtime,
+            .terminal_client = &fourth_main_record.terminal_client,
+            .managed_executions = &self.host.managed_executions,
+            .ephemeral_command_replay = self.host.managed_executions.replayStore(),
+            .web_fetch_runtime = &self.host.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
             .web_search_runtime_ready = false,
@@ -872,7 +882,7 @@ const AcpContext = struct {
                 .resolve_fn = resolveModelOverride,
             },
             .interactive = false,
-            .lifecycle_view = self.state.lifecycle_view,
+            .lifecycle_view = self.host.lifecycle_view,
             .lifecycle_scope = .{
                 .kind = .acp,
                 .workspace_root = session.workspace_root,
@@ -886,17 +896,19 @@ const AcpContext = struct {
     }
 
     fn modelVisibleProjectContext(self: *const AcpContext) []const u8 {
-        if (!self.state.context_enabled) return "";
+        if (!self.session.context_enabled) return "";
         return self.session.workspace.context_snapshot.modelVisibleBytes();
     }
 
     fn toolRegistry(self: *const AcpContext) tool_dispatch.Registry {
-        return activeToolSet(self.state).registry;
+        return activeToolSet(self.session).registry;
     }
 };
 
-fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    return tool_call_presentation.activeToolSet(state);
+fn activeToolSet(session: *server.ActiveSessionState) tool_set_contract.ToolSet {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    return tool_call_presentation.activeToolSet(main_record);
 }
 
 /// Runs again, through the host, the calls of a resumed turn the host asked
@@ -963,7 +975,9 @@ const ResumeRerun = struct {
 };
 
 fn hostToolProvider(session: *server.ActiveSessionState) ?tool_dispatch.HostToolProvider {
-    if (session.server.host_tools.tools.len == 0) return null;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    if (main_record.host_tools.tools.len == 0) return null;
     return .{
         .context = @ptrCast(session),
         .call_fn = callHostToolWithSchemaTypes,
@@ -984,7 +998,9 @@ fn callHostToolWithSchemaTypes(
     const session: *server.ActiveSessionState = @ptrCast(@alignCast(raw_session));
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const sent = try hostToolArguments(arena_state.allocator(), session.server.host_tools.dynamic_tools, name, arguments_json);
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const sent = try hostToolArguments(arena_state.allocator(), main_record.host_tools.dynamic_tools, name, arguments_json);
     if (comptime host_target.is_wasm) {
         return js_host_tools.provider().call(alloc, name, call_id, sent, max_result_bytes, cancel_flag);
     }
@@ -1057,18 +1073,20 @@ fn callHostTool(
     cancel_flag: ?*std.atomic.Value(bool),
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const session: *server.ActiveSessionState = @ptrCast(@alignCast(raw_session));
-    const state = session.server;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-    const outbound_id = (server.beginOutboundRequest(state, session, .host_tool) catch
+    const outbound_id = (server.beginOutboundRequest(session, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse {
-        if (!server.clientInputEnded(state)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        if (!server.clientInputEnded(session)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
         debug_trace.logf("acp", "event=host_tool_unavailable reason=client_input_ended tool={s}", .{name});
         return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
     };
     var awaiting = true;
     errdefer if (awaiting) {
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .host_tool)) |owned| {
+        server.cancelOutboundRequest(session, outbound_id);
+        if (server.awaitOutboundResponse(session, outbound_id, .host_tool)) |owned| {
             var abandoned = owned;
             abandoned.deinit(state.alloc);
         }
@@ -1085,16 +1103,16 @@ fn callHostTool(
     params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
     params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
     params.writer.writeByte('}') catch return error.OutOfMemory;
-    state.writer.writeRequest(
+    session.client_writer.writeRequest(
         alloc,
-        .{ .integer = @intCast(outbound_id) },
+        .{ .integer = @intCast(outbound_id.id) },
         sh_fx.method.tools_call,
         params.written(),
     ) catch |err| {
         // Returning a value skips the errdefer above, so the pending request is
         // ended here on every failed write.
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .host_tool)) |owned| {
+        server.cancelOutboundRequest(session, outbound_id);
+        if (server.awaitOutboundResponse(session, outbound_id, .host_tool)) |owned| {
             var abandoned = owned;
             abandoned.deinit(state.alloc);
         }
@@ -1103,7 +1121,7 @@ fn callHostTool(
         return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
     };
 
-    var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
+    var response = server.awaitOutboundResponse(session, outbound_id, .host_tool) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
     awaiting = false;
     defer response.deinit(state.alloc);
@@ -1134,11 +1152,11 @@ fn callHostTool(
         if (parsed.value.object.get("contentType")) |kind| {
             if (kind == .string and std.mem.eql(u8, kind.string, "rich")) {
                 const failed = if (parsed.value.object.get("isError")) |value| value == .bool and value.bool else false;
-                return @import("../core/tooling/tool_content.zig").parseRichResult(alloc, content.string, @min(state.max_tool_result_bytes, max_result_bytes), failed);
+                return @import("../core/tooling/tool_content.zig").parseRichResult(alloc, content.string, @min(session.max_tool_result_bytes, max_result_bytes), failed);
             }
         }
     }
-    if (content != .string or content.string.len > @min(state.max_tool_result_bytes, max_result_bytes)) {
+    if (content != .string or content.string.len > @min(session.max_tool_result_bytes, max_result_bytes)) {
         return .{ .failure = try alloc.dupe(u8, "Host tool result exceeded the configured limit") };
     }
     const owned = try alloc.dupe(u8, content.string);
@@ -1166,18 +1184,22 @@ const AcpElicitationResponderContext = struct {
     accepted_legacy_urls: std.ArrayList(AcceptedLegacyUrl) = .empty,
 
     fn deinit(self: *AcpElicitationResponderContext) void {
-        for (self.accepted_url_ids.items) |id| self.acp.state.alloc.free(id);
-        self.accepted_url_ids.deinit(self.acp.state.alloc);
+        for (self.accepted_url_ids.items) |id| self.acp.host.alloc.free(id);
+        self.accepted_url_ids.deinit(self.acp.host.alloc);
         for (self.accepted_legacy_urls.items) |*accepted| {
-            server.removeLegacyUrl(self.acp.state, accepted.acp_id);
-            accepted.deinit(self.acp.state.alloc);
+            const main_record = server.holdMain(self.acp.session);
+            defer main_record.drop();
+            server.removeLegacyUrl(main_record, accepted.acp_id);
+            accepted.deinit(self.acp.host.alloc);
         }
-        self.accepted_legacy_urls.deinit(self.acp.state.alloc);
+        self.accepted_legacy_urls.deinit(self.acp.host.alloc);
         self.* = undefined;
     }
 
     fn responder(self: *AcpElicitationResponderContext) ?tool_mcp_runtime.InputResponder {
-        const capabilities = self.acp.state.client_elicitation;
+        const second_main_record = server.holdMain(self.acp.session);
+        defer second_main_record.drop();
+        const capabilities = second_main_record.client_elicitation;
         if (!capabilities.any()) return null;
         return .{
             .context = @ptrCast(self),
@@ -1269,9 +1291,9 @@ const TurnSignIn = struct {
     /// publishes a credential holds while it replaces and frees the key, the
     /// account and the team (`server.publishRefreshedCredential`), so the
     /// result is one whole credential.
-    fn capture(alloc: Allocator, state: *server.ServerState, session: *const server.ActiveSessionState) !TurnSignIn {
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    fn capture(alloc: Allocator, host: *server.Host, session: *const server.ActiveSessionState) !TurnSignIn {
+        host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer host.subagent_authority_mutex.unlock(io_mod.getIo());
         const api_key = try alloc.dupe(u8, session.api_key);
         errdefer secret.zeroAndFree(alloc, api_key);
         const account_id = if (session.account_id) |value| try alloc.dupe(u8, value) else null;
@@ -1310,7 +1332,7 @@ const TurnSignIn = struct {
 /// connection that sent the prompt; the other clients are told of it as the turn
 /// starts. Null when the turn's input is shown another way (a steer group).
 pub fn handlePrompt(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
@@ -1325,7 +1347,9 @@ pub fn handlePrompt(
     session.settings_mutex.lockUncancelable(io_mod.getIo());
     var settings_locked = true;
     defer if (settings_locked) session.settings_mutex.unlock(io_mod.getIo());
-    if (!try server.selectCredentialForSession(state, session)) {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    if (!try server.selectCredentialForSession(main_record, session)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
@@ -1336,7 +1360,7 @@ pub fn handlePrompt(
                 credentials.missing_credential_message,
         } };
     }
-    if (!ultrafastPromptAllowed(state, session)) {
+    if (!ultrafastPromptAllowed(host, session)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = "Ultrafast mode requires a verified compatible Gateway model",
@@ -1373,7 +1397,7 @@ pub fn handlePrompt(
         alloc,
         params,
         next_image_id,
-        state.cfg.host_attachments,
+        host.cfg.host_attachments,
     ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
@@ -1383,7 +1407,7 @@ pub fn handlePrompt(
             if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
-            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(host.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1419,7 +1443,7 @@ pub fn handlePrompt(
 
     // The prompt's attached files stay out of the instructions: the runtime
     // delivers their folders' rules as a note on the turn's own message.
-    try refreshProjectContext(state, session, alloc);
+    try refreshProjectContext(host, session, alloc);
 
     session.pending_prompt_id = msg.id;
     defer session.pending_prompt_id = null;
@@ -1427,7 +1451,7 @@ pub fn handlePrompt(
 
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = state,
+        .host = host,
         .session = session,
         .turn = &turn_settings,
         .session_id = session.session_id,
@@ -1446,7 +1470,7 @@ pub fn handlePrompt(
     };
     if (observer_hooks) |hook_config| {
         const turn_id = prompt_input.turn_id orelse if (session.journal) |*journal| journal.open_turn_id.slice() else null;
-        hook_bridge.init(alloc, &state.writer, session.session_id, turn_id, hook_config);
+        hook_bridge.init(alloc, &session.client_writer, session.session_id, turn_id, hook_config);
         if (hook_bridge.enabled) ctx.observer = &hook_bridge.observer;
     }
     defer if (ctx.observer) |observer| observer.endTurn(if (session.cancel_flag.load(.seq_cst)) .cancelled else .failed, null);
@@ -1456,7 +1480,7 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        try journal.endUnplaced(alloc, state.alloc, session.session_id);
+        try journal.endUnplaced(alloc, host.alloc, session.session_id);
     }
     if (prompt_input.continue_recovery and session.journal != null) {
         // A journaled libfx session resumes the turn its journal left open.
@@ -1470,7 +1494,7 @@ pub fn handlePrompt(
         // Inputs the crashed turn accepted and never placed go to the model
         // with the resume, and its first progress places them.
         const inputs = journal.takePendingInputs();
-        defer journal_events.freePendingInputs(state.alloc, inputs);
+        defer journal_events.freePendingInputs(host.alloc, inputs);
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs, journal.pending_resume_yielded);
         const answered_step = journal.pending_resume_answered;
         {
@@ -1479,9 +1503,9 @@ pub fn handlePrompt(
             const ids = try alloc.alloc([]const u8, inputs.len);
             defer alloc.free(ids);
             for (inputs, ids) |input, *id| id.* = input.id;
-            try journal.notePlaced(state.alloc, ids);
+            try journal.notePlaced(host.alloc, ids);
         }
-        journal.dropPendingResume(state.alloc);
+        journal.dropPendingResume(host.alloc);
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
         // that they may have partly run.
@@ -1506,7 +1530,7 @@ pub fn handlePrompt(
         if (journal.pending_resume) |pending| {
             // An earlier turn that a new prompt ends: the copy holds this turn's updates, not its, so it stays.
             try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null, false);
-            journal.dropPendingResume(state.alloc);
+            journal.dropPendingResume(host.alloc);
         }
     }
 
@@ -1527,7 +1551,7 @@ pub fn handlePrompt(
                 .text = prompt_input.text,
                 .kind = .follow_up,
             } });
-            try journal.placeFollowUp(state.alloc, input_id);
+            try journal.placeFollowUp(host.alloc, input_id);
         }
     }
 
@@ -1550,11 +1574,11 @@ pub fn handlePrompt(
         }
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try host.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(session), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = session.subagent_host != null,
-        .behind_toolbox = state.toolbox_behind.slice(),
+        .behind_toolbox = session.toolbox_behind.slice(),
     });
     defer tool_projection.deinit(alloc);
 
@@ -1623,7 +1647,7 @@ pub fn handlePrompt(
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialDynamicTools(&ctx, dynamic_tool_arena.allocator());
-    var agent_config = buildAgentConfig(state, session, &turn_settings, .{
+    var agent_config = buildAgentConfig(host, session, &turn_settings, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
         .initial_dynamic_tools = initial_dynamic_tools,
@@ -1632,7 +1656,7 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = sessionChildCapability(session);
-    agent_config.toolbox_behind = state.toolbox_behind.slice();
+    agent_config.toolbox_behind = session.toolbox_behind.slice();
     // The toolbox menu lists the configured MCP servers, by name. The host's
     // own tools stay in the tools fx sends: a durable session reruns them by
     // their name after a crash, which a call through toolbox wouldn't carry.
@@ -1640,10 +1664,10 @@ pub fn handlePrompt(
         const toolbox_arena = dynamic_tool_arena.allocator();
         agent_config.toolbox_mcp_servers = try h.catalog.serverNames(toolbox_arena);
     };
-    maybeStartAcpTitleTask(state, session, &turn_settings, owned_prompt, recovery_checkpoint != null, ctx.observer);
-    defer if (session.title_task != null) completeAcpTitleTask(state, session);
+    maybeStartAcpTitleTask(host, session, &turn_settings, owned_prompt, recovery_checkpoint != null, ctx.observer);
+    defer if (session.title_task != null) completeAcpTitleTask(session);
     const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
-        .view = state.lifecycle_view,
+        .view = host.lifecycle_view,
         .scope = .{
             .kind = .acp,
             .workspace_root = session.workspace_root,
@@ -1669,24 +1693,24 @@ pub fn handlePrompt(
             // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
             // If the commit fails, the turn still ends below.
-            commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
+            commitCancelledJournalTurn(alloc, host.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
         } else {
             // The turn's own failure is the one to report.
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            endJournalTurn(alloc, host.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             return promptExecutionFailure(err);
         }
     };
-    try endJournalTurn(alloc, state.alloc, session);
-    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
+    try endJournalTurn(alloc, host.alloc, session);
+    if (try runReportTurns(host, session, alloc, &ctx, &deps, agent_config, job, usage_total)) |outcome| {
         prompt_input.retainImageSnapshots();
         return outcome;
     }
     prompt_input.retainImageSnapshots();
-    completeAcpTitleTask(state, session);
+    completeAcpTitleTask(session);
     try sessions.sendTurnSessionInfoUpdate(session, alloc, true);
     try sessions.sendTurnSessionUsageUpdate(session, turn_settings.model, turn_settings.provider, alloc);
 
@@ -1704,7 +1728,7 @@ pub fn handlePrompt(
 /// `completeAcpTitleTask` before the session info update goes out. The locally
 /// derived title remains when generation is skipped or unavailable.
 fn maybeStartAcpTitleTask(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     turn: *const TurnSettings,
     prompt_text: []const u8,
@@ -1715,11 +1739,11 @@ fn maybeStartAcpTitleTask(
     // calls from a test process. Wiring is covered by e2e mock servers.
     if (comptime @import("builtin").is_test) return;
     if (comptime host_target.is_wasm) return;
-    if (!state.session_titles or recovery) return;
+    if (!session.session_titles or recovery) return;
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
-    const bundle = state.cfg.provider_set.select(turn.provider);
+    const bundle = host.cfg.provider_set.select(turn.provider);
     const provider_title_model = bundle.title_model orelse return;
     // A Token Pass session of a team with Token Pass titles itself with a
     // Token Pass model.
@@ -1755,8 +1779,7 @@ fn maybeStartAcpTitleTask(
 /// generated title unless the session already carries a user-set title. A
 /// title still pending after the grace is dropped, and the session keeps the
 /// title derived from its first prompt. No-op without a pending task.
-fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
-    _ = state;
+fn completeAcpTitleTask(session: *server.ActiveSessionState) void {
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
@@ -1786,10 +1809,12 @@ pub fn runSubagentChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const active: *server.ActiveSessionState = @ptrCast(@alignCast(raw.?));
-    const state = active.server;
+    const main_record = server.holdMain(active);
+    defer main_record.drop();
+    const state = main_record;
     const subagent_host = active.subagent_host orelse return error.ProviderFailed;
     const alloc = state.alloc;
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     const session_id = active.session_id;
     const captured_mode = active.mode;
     // A reload that keeps this child running sets both under this lock, so
@@ -1799,10 +1824,10 @@ pub fn runSubagentChild(
     // The next prompt gathers the project context again and frees the snapshot this turn would
     // otherwise borrow its bytes from, so the turn holds a copy of its own.
     var project_context = active.workspace.context_snapshot.dupe(alloc) catch |err| {
-        state.subagent_authority_mutex.unlock(io_mod.getIo());
+        state.host.subagent_authority_mutex.unlock(io_mod.getIo());
         return err;
     };
-    state.subagent_authority_mutex.unlock(io_mod.getIo());
+    state.host.subagent_authority_mutex.unlock(io_mod.getIo());
     defer project_context.deinit(alloc);
     // The child's turn copies its session's settings under their lock, so a switch of the
     // provider or the model, which a client may send while it works, changes only later turns.
@@ -1814,7 +1839,7 @@ pub fn runSubagentChild(
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = state,
+        .host = state.host,
         .session = active,
         .turn = &turn_settings,
         .session_id = session_id,
@@ -1825,14 +1850,14 @@ pub fn runSubagentChild(
     defer ctx.deinitPublishedToolCalls();
     var child_bridge: libfx_hooks.Bridge = undefined;
     if (captured_hooks) |hook_config| {
-        child_bridge.init(alloc, &state.writer, turn.child_id orelse session_id, message.id, hook_config);
+        child_bridge.init(alloc, &active.client_writer, turn.child_id orelse session_id, message.id, hook_config);
         child_bridge.root_session_id = session_id;
         child_bridge.parent_session_id = admission.parent_id;
         child_bridge.source_session_id = message.source_id;
         child_bridge.work_id = child_bridge.turn_id;
         if (child_bridge.enabled) ctx.observer = &child_bridge.observer;
     }
-    var child_projection = state.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = state.host.cfg.mode_registry.buildModelToolProjection(
         alloc,
         builtin_tools.advertisement_set,
         captured_mode,
@@ -1840,34 +1865,34 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
-            .behind_toolbox = state.toolbox_behind.slice(),
+            .behind_toolbox = active.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
     var skill_catalog = active.workspace.skills.acquireCatalog();
     defer skill_catalog.deinit();
     return subagent_agent_adapter.run(.{
-        .toolbox_behind = state.toolbox_behind.slice(),
+        .toolbox_behind = active.toolbox_behind.slice(),
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
-        .provider_set = state.cfg.provider_set,
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
-        .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
+        .provider_set = state.host.cfg.provider_set,
+        .system_prompt = state.host.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .model_prompt_overlay = state.host.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
-        .context_registry = state.cfg.context_registry,
-        .context_enabled = state.context_enabled,
+        .context_registry = state.host.cfg.context_registry,
+        .context_enabled = active.context_enabled,
         .project_context = project_context.modelVisibleBytes(),
-        .lifecycle_view = state.lifecycle_view,
+        .lifecycle_view = state.host.lifecycle_view,
         .workspace_capture = childCaptureTarget(active),
     }, turn, message, admission, cancel);
 }
 
 /// Gathers `session`'s project context again from its own workspace.
 fn refreshProjectContext(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
 ) context_contract.ProviderError!void {
@@ -1875,22 +1900,22 @@ fn refreshProjectContext(
     {
         // A subagent's turn copies the snapshot under this lock when it starts, so what this frees
         // is nobody's but the workspace's.
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer host.subagent_authority_mutex.unlock(io_mod.getIo());
         workspace.context_snapshot.deinit(alloc);
     }
-    if (!state.context_enabled) return;
+    if (!session.context_enabled) return;
 
-    const gathered = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
+    const gathered = host.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = workspace.root,
         .access_scope = workspace.access.scope(workspace.root),
-        .context_limits = state.context_limits,
+        .context_limits = session.context_limits,
     }) catch |err| {
         debug_trace.logf("context", "acp gather failed err={s}", .{@errorName(err)});
         return err;
     };
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer host.subagent_authority_mutex.unlock(io_mod.getIo());
     workspace.context_snapshot = gathered;
 }
 
@@ -1901,13 +1926,15 @@ fn initialDynamicTools(
     ctx: *AcpContext,
     arena: Allocator,
 ) ![]const agent_stream_provider.DynamicFunctionTool {
-    const host_tools = ctx.state.host_tools.dynamic_tools;
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
+    const host_tools = main_record.host_tools.dynamic_tools;
     if (comptime host_target.is_wasm) return host_tools;
     const session = ctx.session;
     const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
         arena,
         permissions.mcpRules(ctx.captured_permission_mode orelse session.permission_mode, session.permission_rules),
-        ctx.state.context_limits,
+        ctx.session.context_limits,
         .unrestricted,
         &session.cancel_flag,
     ) else return host_tools;
@@ -1933,26 +1960,28 @@ const AgentConfigSections = struct {
 };
 
 fn buildAgentConfig(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     turn: *const TurnSettings,
     sections: AgentConfigSections,
 ) agent_runtime.Config {
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
     return .{
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .system_prompt = host.cfg.prompt_policy.systemPromptFor(main_record.terminal_ui),
         .host_instructions = sections.host_instructions,
-        .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(turn.model),
+        .model_prompt_overlay = host.cfg.prompt_policy.modelPromptOverlay(turn.model),
         .skill_catalog = sections.skill_catalog,
-        .gateway_retry_count = state.cfg.gateway_retry_count,
-        .gateway_chat_url = state.cfg.gateway_chat_url,
+        .gateway_retry_count = host.cfg.gateway_retry_count,
+        .gateway_chat_url = host.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
-        .initial_dynamic_tools = sections.initial_dynamic_tools orelse state.host_tools.dynamic_tools,
-        .provider_capabilities = state.cfg.provider_set.select(turn.provider).capabilities,
+        .initial_dynamic_tools = sections.initial_dynamic_tools orelse main_record.host_tools.dynamic_tools,
+        .provider_capabilities = host.cfg.provider_set.select(turn.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
-        .auto_compact_percent = state.auto_compact_percent,
+        .auto_compact_percent = session.auto_compact_percent,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = turn.fast_mode,
         .ultrafast_mode = turn.ultrafast_mode,
@@ -1960,8 +1989,8 @@ fn buildAgentConfig(
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = session.workspace_root,
         .access_scope = session.workspace.access.scope(session.workspace_root),
-        .enforce_response_language = !state.cfg.minimal_kernel,
-        .context_limits = state.context_limits,
+        .enforce_response_language = !host.cfg.minimal_kernel,
+        .context_limits = session.context_limits,
     };
 }
 
@@ -2436,30 +2465,32 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
 /// The session's cache warmer, when the profile keeps it on. Unit tests
 /// share the real provider bundles and never ping, and a libfx host owns
 /// its sessions' lifetimes, so its kernel sends no requests of its own.
-fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionState) ?*@import("../core/agent/runtime/cache_warmer.zig").Warmer {
+fn acpCacheWarmer(proc: *server.Host, session: *server.ActiveSessionState) ?*@import("../core/agent/runtime/cache_warmer.zig").Warmer {
     if (comptime @import("builtin").is_test or host_target.is_wasm) return null;
-    if (state.cfg.minimal_kernel or !state.cache_warming) return null;
+    if (proc.cfg.minimal_kernel or !session.cache_warming) return null;
     return session.session_rt.cacheWarmer();
 }
 
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
     const session = ctx.session;
-    session.capture_home = if (!ctx.state.workspace_capture)
+    session.capture_home = if (!ctx.session.workspace_capture)
         null
-    else if (server.sessionsStore(ctx.state)) |store|
+    else if (server.sessionsStore(ctx.host)) |store|
         store.home
     else
         null;
     return .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
-        .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.turn.provider),
+        .agent_stream_provider = server.streamProviderFor(ctx.host, ctx.turn.provider),
         .report_usage = reportUsage,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
-        .context_registry = ctx.state.cfg.context_registry,
-        .context_enabled = ctx.state.context_enabled,
+        .context_registry = ctx.host.cfg.context_registry,
+        .context_enabled = ctx.session.context_enabled,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeSteeringBoundary,
         // The web core's host keeps its steering queue, so the core asks it
@@ -2490,7 +2521,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .record_usage = if (session.v2 != null) recordUsage else null,
-        .cache_warmer = acpCacheWarmer(ctx.state, session),
+        .cache_warmer = acpCacheWarmer(ctx.host, session),
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .start_workspace_capture = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) startWorkspaceCapture else null,
         .reach_workspace = if (comptime !turn_capture.supported) null else if (session.v2 != null and session.capture_home != null) reachWorkspace else null,
@@ -2503,7 +2534,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .propagate_grant = retainAcpGrant,
-        .compaction_activity = if (ctx.state.client_compaction) .{
+        .compaction_activity = if (main_record.client_compaction) .{
             .begin = compactionBegin,
             .running = compactionRunning,
             .settle = compactionSettle,
@@ -2566,7 +2597,7 @@ fn takeSteeringBoundary(
         }
         return if (kind == .cancelled) .interrupt else .none;
     }
-    const kernel = ctx.state.cfg.minimal_kernel;
+    const kernel = ctx.host.cfg.minimal_kernel;
     if (kind == .cancelled) {
         // A user cancel ends the turn, and so does a handoff's interrupt.
         const interrupt = server.takeSteeringInterrupt(ctx.session) orelse return .interrupt;
@@ -2634,7 +2665,7 @@ fn noteJournalPlacement(ctx: *AcpContext, input_ids: []const ?[]u8) !void {
     const journal = if (session.journal) |*value| value else return;
     for (input_ids) |maybe_id| {
         const id = maybe_id orelse continue;
-        try journal.notePlaced(ctx.state.alloc, &.{id});
+        try journal.notePlaced(ctx.host.alloc, &.{id});
     }
 }
 
@@ -2649,7 +2680,7 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     for (taken) |entry| {
         const id = entry.id orelse continue;
         try journal.append(ctx.alloc, session.session_id, .{ .input_accepted = .{ .id = id, .text = entry.text } });
-        try journal.notePlaced(ctx.state.alloc, &.{id});
+        try journal.notePlaced(ctx.host.alloc, &.{id});
     }
 }
 
@@ -2658,7 +2689,9 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
     const message_id = acp_types.generateMessageId(&message_id_storage);
     // Without `follow_supported` no follower takes the other version: the owner's own steer setting picks it.
     if (comptime !server.follow_supported) {
-        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, ctx.state.sendsSteerInput());
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, main_record.sendsSteerInput());
         defer ctx.alloc.free(params);
         var audience = server.lockAudience(ctx.session);
         defer audience.unlock();
@@ -2718,9 +2751,9 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    server.lockCatalog(ctx.state);
-    defer server.unlockCatalog(ctx.state);
-    return ctx.state.capability_resolver.downFailure();
+    server.lockCatalog(ctx.host);
+    defer server.unlockCatalog(ctx.host);
+    return ctx.host.capability_resolver.downFailure();
 }
 
 fn resolveModelCapabilities(
@@ -2730,11 +2763,11 @@ fn resolveModelCapabilities(
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = ctx.session;
-    const bundle = ctx.state.cfg.provider_set.select(ctx.turn.provider);
-    server.lockCatalog(ctx.state);
-    defer server.unlockCatalog(ctx.state);
-    return ctx.state.capability_resolver.resolveWithin(
-        ctx.state.alloc,
+    const bundle = ctx.host.cfg.provider_set.select(ctx.turn.provider);
+    server.lockCatalog(ctx.host);
+    defer server.unlockCatalog(ctx.host);
+    return ctx.host.capability_resolver.resolveWithin(
+        ctx.host.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
@@ -2743,7 +2776,7 @@ fn resolveModelCapabilities(
                 ctx.turn.gateway_team,
                 ctx.turn.account_id,
             ),
-            .endpoint = ctx.state.cfg.gateway_models_path,
+            .endpoint = ctx.host.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
         },
         model,
@@ -2762,12 +2795,12 @@ fn resolveModelOverride(
 ) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = ctx.session;
-    const bundle = ctx.state.cfg.provider_set.select(ctx.turn.provider);
+    const bundle = ctx.host.cfg.provider_set.select(ctx.turn.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    server.lockCatalog(ctx.state);
-    defer server.unlockCatalog(ctx.state);
-    _ = ctx.state.capability_resolver.resolveWithin(
-        ctx.state.alloc,
+    server.lockCatalog(ctx.host);
+    defer server.unlockCatalog(ctx.host);
+    _ = ctx.host.capability_resolver.resolveWithin(
+        ctx.host.alloc,
         catalog_provider,
         .{
             .access = credentials.catalogAccessForCredentialAndAccount(
@@ -2776,14 +2809,14 @@ fn resolveModelOverride(
                 ctx.turn.gateway_team,
                 ctx.turn.account_id,
             ),
-            .endpoint = ctx.state.cfg.gateway_models_path,
+            .endpoint = ctx.host.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
         gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
-    const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
+    const entries = ctx.host.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
     defer {
         for (ids.items) |id| alloc.free(id);
@@ -2797,11 +2830,11 @@ fn availableModelCapabilities(
     model: []const u8,
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    server.lockCatalog(ctx.state);
-    defer server.unlockCatalog(ctx.state);
-    return ctx.state.capability_resolver.available(
+    server.lockCatalog(ctx.host);
+    defer server.unlockCatalog(ctx.host);
+    return ctx.host.capability_resolver.available(
         model,
-        ctx.state.cfg.provider_set.select(ctx.turn.provider).fallbackModelCapabilities(model),
+        ctx.host.cfg.provider_set.select(ctx.turn.provider).fallbackModelCapabilities(model),
     );
 }
 
@@ -2843,7 +2876,7 @@ test "a tool call a finished turn left open reads as the turn's outcome" {
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = ctx.session;
-    try ctx.state.cfg.context_registry.appendDefaultTransient(.{
+    try ctx.host.cfg.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.session.workspace_root,
         .access_scope = ctx.session.workspace.access.scope(ctx.session.workspace_root),
         .interactive = false,
@@ -2856,7 +2889,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    try ctx.state.cfg.context_registry.appendDefaultStatic(.{
+    try ctx.host.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
     // The toolbox menu lists the MCP servers (toolbox_mcp_servers), so there
@@ -2876,7 +2909,7 @@ fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const mode = ctx.captured_mode orelse ctx.session.mode;
-    if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.state), mode, call.name)) |reason| {
+    if (try ctx.host.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.session), mode, call.name)) |reason| {
         return .{ .failure = reason };
     }
     return tool_runtime.validateToolCall(ctx.toolContext(), arena, call);
@@ -2974,14 +3007,14 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state, ctx.session) orelse {
-        if (!server.clientInputEnded(ctx.state)) return error.PermissionRequestAlreadyPending;
+    var request_id = server.beginPermissionRequest(ctx.session) orelse {
+        if (!server.clientInputEnded(ctx.session)) return error.PermissionRequestAlreadyPending;
         debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
         return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
     };
     errdefer {
-        server.cancelPermissionRequest(ctx.state, request_id);
-        _ = server.awaitPermissionDecision(ctx.state, request_id);
+        server.cancelPermissionRequest(ctx.session, request_id);
+        _ = server.awaitPermissionDecision(ctx.session, request_id);
     }
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
@@ -3020,24 +3053,46 @@ fn requestAcpPermission(
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
     try params.writer.writeAll("]}");
 
-    ctx.state.writer.writeRequest(
-        alloc,
-        .{ .integer = @intCast(request_id) },
-        "session/request_permission",
-        params.writer.buffered(),
-    ) catch |err| switch (err) {
-        error.BrokenPipe => {
-            // Returning a value skips the errdefer above, so the pending request
-            // is ended here: the client closed its output and can't answer.
-            server.cancelPermissionRequest(ctx.state, request_id);
-            _ = server.awaitPermissionDecision(ctx.state, request_id);
-            debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
+    // A permission follows the main client through at most this many hand-offs. Each
+    // hand-off asks the new main again, with the same request, under a new id.
+    const max_asks: usize = 8;
+    var asks: usize = 0;
+    while (true) {
+        asks += 1;
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        const main = main_record;
+        const written = server.writeRequestToMain(ctx.session, request_id, alloc, "session/request_permission", params.writer.buffered());
+        if (written) |_| {
+            switch (server.awaitPermissionAnswer(ctx.session, request_id)) {
+                .decided => |decision| return permission_request.OwnedPermissionResponse.init(alloc, decision, null),
+                .moved => {},
+            }
+        } else |err| switch (err) {
+            // The main changed after the request began. The hand-off already answered the
+            // request `moved`, so waiting for it only takes that answer.
+            error.MainChanged => _ = server.awaitPermissionAnswer(ctx.session, request_id),
+            error.BrokenPipe => {
+                // Returning a value skips the errdefer above, so the pending request
+                // is ended here: the client closed its output and can't answer.
+                server.cancelPermissionRequest(ctx.session, request_id);
+                _ = server.awaitPermissionDecision(ctx.session, request_id);
+                if (!server.mainWriteFailed(ctx.session, main)) {
+                    debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
+                    return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+                }
+            },
+            else => return err,
+        }
+        if (asks >= max_asks) {
+            debug_trace.logf("acp", "event=permission_denied reason=too_many_main_changes tool={s}", .{call.name});
             return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        },
-        else => return err,
-    };
-    const decision = server.awaitPermissionDecision(ctx.state, request_id);
-    return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
+        }
+        request_id = server.beginPermissionRequest(ctx.session) orelse {
+            debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
+            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+        };
+    }
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
@@ -3074,12 +3129,14 @@ fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, dis
 
 fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const main_record = server.holdMain(ctx.session);
+    defer main_record.drop();
     return tool_presentation.resolveTerminalDisplayTarget(
         arena,
         ctx.toolRegistry(),
         ctx.session.workspace_root,
-        &ctx.state.terminal_client,
-        &ctx.state.managed_executions,
+        &main_record.terminal_client,
+        &ctx.host.managed_executions,
         call,
     );
 }
@@ -3429,7 +3486,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         ctx.session,
         turn,
         ctx.current_prompt_input,
-        ctx.state.alloc,
+        ctx.host.alloc,
         saves_running_turn,
     );
 }
@@ -3461,11 +3518,13 @@ fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
 
 /// Where a subagent's captures go: the store's home and the active
 /// session's folder, while captures are on.
-fn childCaptureTarget(session: *const server.ActiveSessionState) ?turn_capture.Target {
+fn childCaptureTarget(session: *server.ActiveSessionState) ?turn_capture.Target {
     if (comptime !turn_capture.supported) return null;
-    const state = session.server;
-    if (!state.workspace_capture) return null;
-    const store = server.sessionsStore(state) orelse return null;
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
+    if (!session.workspace_capture) return null;
+    const store = server.sessionsStore(state.host) orelse return null;
     return .{ .home = store.home, .path = session.workspace_root };
 }
 
@@ -3500,6 +3559,7 @@ test "an ACP session's workspace captures watch its turn cancel, not the flag a 
         .v2 = @ptrFromInt(@alignOf(session_adapter.Session)),
         .capture_home = "/tmp/home",
     };
+    session.client_writer = jsonrpc.Writer.initCallback(&session, server.forwardToMain);
     const context = workspaceCaptureContext(&session).?;
     try std.testing.expectEqual(@as(?*const std.atomic.Value(bool), &session.turn_cancel), context.cancel);
 }
@@ -3564,21 +3624,21 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         try journal.appendMarked(ctx.alloc, session.session_id, .{ .tool_intent = progress.running_calls }, waits);
     }
-    if (waits) return flushJournal(ctx.state, session, ctx.alloc);
+    if (waits) return flushJournal(session, ctx.alloc);
 }
 
 /// Waits until the host holds every journal event sent so far.
-fn flushJournal(state: *server.ServerState, session: *const server.ActiveSessionState, alloc: Allocator) !void {
+fn flushJournal(session: *server.ActiveSessionState, alloc: Allocator) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
     const session_id = session.session_id;
-    const outbound_id = (server.beginOutboundRequest(state, session, .journal) catch
+    const outbound_id = (server.beginOutboundRequest(session, .journal) catch
         return error.JournalFlushFailed) orelse return error.JournalFlushFailed;
     var awaiting = true;
     errdefer if (awaiting) {
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .journal)) |owned| {
+        server.cancelOutboundRequest(session, outbound_id);
+        if (server.awaitOutboundResponse(session, outbound_id, .journal)) |owned| {
             var abandoned = owned;
-            abandoned.deinit(state.alloc);
+            abandoned.deinit(alloc);
         }
     };
     var params: std.Io.Writer.Allocating = .init(alloc);
@@ -3586,11 +3646,11 @@ fn flushJournal(state: *server.ServerState, session: *const server.ActiveSession
     try params.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(session_id, &params.writer);
     try params.writer.writeByte('}');
-    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, sh_fx.method.journal_flush, params.written()) catch
+    session.client_writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id.id) }, sh_fx.method.journal_flush, params.written()) catch
         return error.JournalFlushFailed;
-    var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
+    var response = server.awaitOutboundResponse(session, outbound_id, .journal) orelse return error.JournalFlushFailed;
     awaiting = false;
-    defer response.deinit(state.alloc);
+    defer response.deinit(alloc);
     if (response.cancelled) return error.Cancelled;
     if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
 }
@@ -3621,7 +3681,7 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// stays the user's own request. Returns the prompt's outcome when a turn
 /// ends it early. Each turn's usage is added to `usage_total` when it ends.
 fn runReportTurns(
-    state: *server.ServerState,
+    host: *server.Host,
     session: *server.ActiveSessionState,
     alloc: Allocator,
     ctx: *AcpContext,
@@ -3674,7 +3734,7 @@ fn runReportTurns(
         // current one, as a turn the user starts does. A session that changed
         // provider during the turn holds another provider's sign-in, so the
         // turn keeps its own.
-        var sign_in = try TurnSignIn.capture(alloc, state, session);
+        var sign_in = try TurnSignIn.capture(alloc, host, session);
         defer sign_in.deinit(alloc);
         var job = base;
         if (sign_in.provider.eql(job.provider)) sign_in.apply(&job);
@@ -3692,7 +3752,7 @@ fn runReportTurns(
         job.recovery_source_already_presented = false;
         debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
         const report_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
-            .view = state.lifecycle_view,
+            .view = host.lifecycle_view,
             .scope = .{
                 .kind = .acp,
                 .workspace_root = session.workspace_root,
@@ -3702,7 +3762,7 @@ fn runReportTurns(
         }, agent_config, job);
         usage_total.add(session.session_rt.agent.turn_usage);
         report_turn catch |err| {
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            endJournalTurn(alloc, host.alloc, session) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             if (err == error.NonInteractivePermissionRequired) {
@@ -3712,7 +3772,7 @@ fn runReportTurns(
             if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
             return try promptExecutionFailure(err);
         };
-        try endJournalTurn(alloc, state.alloc, session);
+        try endJournalTurn(alloc, host.alloc, session);
     }
 }
 
@@ -3919,7 +3979,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
         // The model this turn runs on, which a session/set_config_option
         // during the turn doesn't change.
-        try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, ctx.turn.model);
+        try journal.appendProgress(ctx.alloc, ctx.host.alloc, session.session_id, checkpoint, ctx.turn.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
         if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
@@ -3932,9 +3992,9 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         journal.barrier_next_progress = false;
         break :barrier barrier;
     };
-    if (barrier) flushJournal(ctx.state, session, ctx.alloc) catch |err| {
+    if (barrier) flushJournal(session, ctx.alloc) catch |err| {
         // The turn commits from this progress as interrupted.
-        if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
+        if (err == error.Cancelled) try keepCancelledProgress(ctx.host.alloc, session, checkpoint);
         return err;
     };
     if (!yields) return;
@@ -3942,7 +4002,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
-        try journal.keepYielded(ctx.state.alloc, checkpoint);
+        try journal.keepYielded(ctx.host.alloc, checkpoint);
     }
     debug_trace.logf("session", "event=libfx_journal_turn_yielded session={s}", .{session.session_id});
     return error.TurnYielded;
@@ -3966,15 +4026,15 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
     // The turn ends here, cancelled or stopped: the steers it never placed
     // are withdrawn while they still belong to it, before the clear ends it.
-    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
+    try handBackUnplacedSteersLocked(ctx.alloc, ctx.host.alloc, session, journal);
     try journal.clearProgress(ctx.alloc, session.session_id);
 }
 
 /// Stores grants on the active ACP session without persisting them.
 fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer ctx.state.subagent_authority_mutex.unlock(io_mod.getIo());
+    ctx.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.host.subagent_authority_mutex.unlock(io_mod.getIo());
     const session = ctx.session;
     try session.retainGrant(ctx.alloc, tool_name, target_path);
 }
@@ -4220,7 +4280,9 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     // Without `follow_supported` no follower can take the other version, so only the owner's is sent:
     // its notice when it lists notices, otherwise its message, as before the audience.
     if (comptime !server.follow_supported) {
-        if (ctx.state.client_notices) {
+        const main_record = server.holdMain(ctx.session);
+        defer main_record.drop();
+        if (main_record.client_notices) {
             const with = ctx.noticeParams(text) catch return;
             defer ctx.alloc.free(with);
             var audience = server.lockAudience(session);
@@ -4241,8 +4303,8 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     // The message fallback takes the operational id, as before, when a member lacks
     // notices. When none does, a fresh id leaves the owner's id state unchanged.
     var fresh: acp_types.MessageIdBuffer = undefined;
-    var some_member_lacks_notices = !ctx.state.client_notices;
-    for (session.followers.items) |member| {
+    var some_member_lacks_notices = !server.mainLocked(ctx.session).?.client_notices;
+    for (session.members.items) |member| {
         if (!member.client_notices) some_member_lacks_notices = true;
     }
     const message_id = if (some_member_lacks_notices) ctx.operationalMessageId() else acp_types.generateMessageId(&fresh);
@@ -4339,7 +4401,9 @@ fn respondToAcpMcpInput(
                 .elicitation_create => |value| value,
                 else => return error.McpInputRequired,
             };
-            if (!responder.acp.state.client_elicitation.supports(input_request.mode)) {
+            const main_record = server.holdMain(responder.acp.session);
+            defer main_record.drop();
+            if (!main_record.client_elicitation.supports(input_request.mode)) {
                 return error.McpInputRequired;
             }
             const direct = try requestAcpElicitation(
@@ -4377,17 +4441,21 @@ fn requestAcpElicitation(
     origin: tool_mcp_runtime.InputOrigin,
     input_request: mcp_elicitation.Request,
 ) ![]u8 {
-    const state = responder.acp.state;
-    const outbound_id = (try server.beginOutboundRequest(state, responder.acp.session, .elicitation)) orelse {
-        if (server.clientInputEnded(state)) {
+    const session = responder.acp.session;
+    // The client's own state (its legacy URLs and its allocator) is read from the session's main.
+    const main_record = server.holdMain(session);
+    defer main_record.drop();
+    const state = main_record;
+    const outbound_id = (try server.beginOutboundRequest(session, .elicitation)) orelse {
+        if (server.clientInputEnded(responder.acp.session)) {
             debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
         }
         return error.McpInputRequired;
     };
     var awaiting = true;
     errdefer if (awaiting) {
-        server.cancelOutboundRequest(state, outbound_id);
-        if (server.awaitOutboundResponse(state, outbound_id, .elicitation)) |owned| {
+        server.cancelOutboundRequest(responder.acp.session, outbound_id);
+        if (server.awaitOutboundResponse(responder.acp.session, outbound_id, .elicitation)) |owned| {
             var response = owned;
             response.deinit(state.alloc);
         }
@@ -4395,7 +4463,7 @@ fn requestAcpElicitation(
 
     var id_buffer: [48]u8 = undefined;
     const url_id = if (input_request.mode == .url)
-        try std.mem.print(&id_buffer, "fx-{d}", .{outbound_id})
+        try std.mem.print(&id_buffer, "fx-{d}", .{outbound_id.id})
     else
         null;
     const legacy_source_id = if (origin.wire.isLegacy() and input_request.mode == .url)
@@ -4433,7 +4501,7 @@ fn requestAcpElicitation(
     const wait = if (responder.acp.observer) |observer| observer.beginWait(.{
         .kind = if (input_request.mode == .url) .mcp_url else .mcp_form,
         .call_id = responder.tool_call_id,
-        .external_id = outbound_id,
+        .external_id = outbound_id.id,
         .prompt = display_message,
         .schema_json = input_request.requested_schema_json,
         .server_name = origin.server_name,
@@ -4442,9 +4510,9 @@ fn requestAcpElicitation(
     var wait_outcome: observation.WaitOutcome = .failed;
     var wait_error: ?[]const u8 = null;
     defer if (!wait_finished) if (wait) |value| value.end(if (responder.operation_cancel_flag != null and responder.operation_cancel_flag.?.load(.seq_cst)) .cancelled else wait_outcome, &.{}, wait_error);
-    state.writer.writeRequest(
+    session.client_writer.writeRequest(
         alloc,
-        .{ .integer = @intCast(outbound_id) },
+        .{ .integer = @intCast(outbound_id.id) },
         "elicitation/create",
         params,
     ) catch |err| {
@@ -4456,7 +4524,7 @@ fn requestAcpElicitation(
     };
 
     const maybe_response = awaitAcpElicitationResponse(
-        state,
+        responder.acp.session,
         outbound_id,
         origin,
         responder.operation_cancel_flag,
@@ -4634,31 +4702,33 @@ const AcpElicitationCondition = struct {
 const AcpElicitationWatch = select_watch.Watch(AcpElicitationCondition);
 
 fn awaitAcpElicitationResponse(
-    state: *server.ServerState,
-    id: u64,
+    session: *server.ActiveSessionState,
+    request: server.OutboundRequest,
     origin: tool_mcp_runtime.InputOrigin,
     operation_cancel_flag: ?*const std.atomic.Value(bool),
 ) !?server.OutboundResponse {
     var watch: AcpElicitationWatch = .{};
     var select_buffer: [2]AcpElicitationWait = undefined;
     var select: std.Io.Select(AcpElicitationWait) = .init(io_mod.getIo(), &select_buffer);
-    try select.concurrent(.response, server.awaitOutboundResponse, .{ state, id, server.OutboundKind.elicitation });
+    try select.concurrent(.response, server.awaitOutboundResponse, .{ session, request, server.OutboundKind.elicitation });
     select.concurrent(.watch, AcpElicitationWatch.run, .{ &watch, select.io, AcpElicitationCondition{
         .deadline_ms = origin.deadline_ms,
         .lifecycle_cancel_flag = origin.lifecycle_cancel_flag,
         .operation_cancel_flag = operation_cancel_flag,
     } }) catch |err| {
-        server.cancelOutboundRequest(state, id);
-        server.takeCancelledResponse(state, &select);
+        server.cancelOutboundRequest(session, request);
+        server.takeCancelledResponse(session, &select);
         return err;
     };
     const event = select.await() catch |err| {
         watch.stop(select.io);
-        server.cancelOutboundRequest(state, id);
+        server.cancelOutboundRequest(session, request);
         while (select.cancel()) |item| switch (item) {
             .response => |maybe_response| if (maybe_response) |owned| {
                 var response = owned;
-                response.deinit(state.alloc);
+                const main_record = server.holdMain(session);
+                defer main_record.drop();
+                response.deinit(main_record.alloc);
             },
             .watch => {},
         };
@@ -4670,8 +4740,8 @@ fn awaitAcpElicitationResponse(
             break :result response;
         },
         .watch => result: {
-            server.cancelOutboundRequest(state, id);
-            server.takeCancelledResponse(state, &select);
+            server.cancelOutboundRequest(session, request);
+            server.takeCancelledResponse(session, &select);
             break :result null;
         },
     };
@@ -4701,20 +4771,22 @@ fn finishAcpUrlElicitations(
             std.json.Stringify.value(id, .{}, &params.writer) catch continue;
             params.writer.writeByte('}') catch continue;
             // It completes a request only the owner's client was sent, so only the owner gets it.
-            responder.acp.state.writer.writeNotification(
+            responder.acp.session.client_writer.writeNotification(
                 alloc,
                 "elicitation/complete",
                 params.writer.buffered(),
             ) catch {};
         }
-        responder.acp.state.alloc.free(id);
+        responder.acp.host.alloc.free(id);
     }
     responder.accepted_url_ids.clearRetainingCapacity();
     for (responder.accepted_legacy_urls.items) |*accepted| {
         if (outcome != .completed) {
-            server.removeLegacyUrl(responder.acp.state, accepted.acp_id);
+            const main_record = server.holdMain(responder.acp.session);
+            defer main_record.drop();
+            server.removeLegacyUrl(main_record, accepted.acp_id);
         }
-        accepted.deinit(responder.acp.state.alloc);
+        accepted.deinit(responder.acp.host.alloc);
     }
     responder.accepted_legacy_urls.clearRetainingCapacity();
 }
@@ -5232,21 +5304,23 @@ test "ACP permission to a client whose input ended is denied without a request" 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-permission.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
-    state.input_ended = true;
+    server.endClientInput(&state);
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -5361,14 +5435,16 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
 
 test "ACP message IDs rotate when the logical message kind resumes" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -5390,6 +5466,8 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     const source_spans = [_][]const u8{
         "# Heading\n\n- **bold** item\n",
         "| A | B |\n| - | - |\n| 1 | 2 |\n",
@@ -5422,14 +5500,14 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     defer capture.close(io_mod.getIo());
     {
         var state: server.ServerState = undefined;
-        try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+        try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
         defer state.deinit();
         state.writer = .{ .stdout = capture };
         var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
         defer turn_settings.deinit(alloc);
         var ctx = AcpContext{
             .alloc = alloc,
-            .state = &state,
+            .host = state.host,
             .session = server.firstSession(&state).?,
             .turn = &turn_settings,
             .session_id = "session_1",
@@ -5480,14 +5558,14 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
     var failed_output = try tmp.dir.createFile(io_mod.getIo(), "acp-stream-failure.jsonl", .{});
     failed_output.close(io_mod.getIo());
     var failed_state: server.ServerState = undefined;
-    try initTestAcpState(&failed_state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &failed_state, alloc, "/tmp/workspace", .ask);
     defer failed_state.deinit();
     failed_state.writer = .{ .stdout = failed_output };
     var failed_turn_settings = try TurnSettings.capture(alloc, server.firstSession(&failed_state).?);
     defer failed_turn_settings.deinit(alloc);
     var failed_ctx = AcpContext{
         .alloc = alloc,
-        .state = &failed_state,
+        .host = failed_state.host,
         .session = server.firstSession(&failed_state).?,
         .turn = &failed_turn_settings,
         .session_id = "session_1",
@@ -5505,13 +5583,15 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
 
 test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-auth-failure.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     server.firstSession(&state).?.credential_source = .vercel_oidc_token;
@@ -5519,7 +5599,7 @@ test "ACP auth failure emits a valid detail-free JSON-RPC notification" {
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -5575,15 +5655,17 @@ test "ACP tool updates preserve typed permission failures without truncation" {
 
 test "ACP plan mode validates registered tools against mode policy" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/fx-acp-plan-mode", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/fx-acp-plan-mode", .ask);
     defer state.deinit();
     server.firstSession(&state).?.mode = "plan";
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = server.firstSession(&state).?.session_id,
@@ -5684,7 +5766,7 @@ fn testServerConfig() server.Config {
         .gateway_models_path = "/models",
         .gateway_provider = test_builtin_gateway.provider,
         .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
-        .secret_store = host.unavailable_secret_store,
+        .secret_store = host_module.unavailable_secret_store,
         .prompt_policy = .{
             .system_prompt = "test",
             .model_prompt_overlay_fn = testModelPromptOverlay,
@@ -5704,15 +5786,16 @@ fn testServerConfig() server.Config {
 
 /// Fills `state` in place with one open session, so the session's pointer to
 /// it stays valid.
-fn initTestAcpState(state: *server.ServerState, alloc: Allocator, workspace_root: []const u8, mode: PermissionMode) !void {
+fn initTestAcpState(proc: *server.Host, state: *server.ServerState, alloc: Allocator, workspace_root: []const u8, mode: PermissionMode) !void {
     const owned_workspace = try alloc.dupe(u8, workspace_root);
     const api_key = alloc.dupe(u8, "test-api-key") catch |err| {
         alloc.free(owned_workspace);
         return err;
     };
+    proc.cfg = testServerConfig();
     state.* = .{
         .alloc = alloc,
-        .cfg = testServerConfig(),
+        .host = proc,
         .writer = jsonrpc.Writer.init(),
         .launch = .{ .root = owned_workspace },
         .api_key = api_key,
@@ -5773,20 +5856,22 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-tool-call.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -5843,20 +5928,22 @@ test "ACP provider search lifecycle publishes only public terminal updates" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-provider-search.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -5988,20 +6075,22 @@ test "ACP rejection of a finished provider search sends no second card or update
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-rejected-search.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -6048,20 +6137,22 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -6110,14 +6201,16 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
 
 test "ACP propagateGrant stores deduped runtime session grants" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -6140,8 +6233,10 @@ test "ACP propagateGrant stores deduped runtime session grants" {
 
 test "a subagent's model route is its own copy, which a switch of the session leaves as it was" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     const session = server.firstSession(&state).?;
     const saved_key = session.api_key;
@@ -6178,7 +6273,7 @@ test "a subagent's model route is its own copy, which a switch of the session le
     session.account_id = null;
     session.fast_mode = false;
 
-    var child = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &copy, .session_id = "session_1", .captured_mcp_host = .{ .host = null } };
+    var child = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &copy, .session_id = "session_1", .captured_mcp_host = .{ .host = null } };
     try std.testing.expect(child.isSubagentTurn());
     const kept = child.turn;
     try std.testing.expectEqual(model_provider.ProviderId.codex, kept.provider);
@@ -6201,34 +6296,36 @@ test "a subagent's model route is its own copy, which a switch of the session le
 
 test "ACP refreshes typed registry context and propagates enabled gathering errors" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     AcpContextRegistryFixture.reset();
 
     var state: server.ServerState = undefined;
 
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
 
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
     var contribution = server.firstSession(&state).?.workspace.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.acp_context", contribution.provider_id);
     try std.testing.expectEqualStrings("ACP registry context 1", contribution.content);
 
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     contribution = server.firstSession(&state).?.workspace.context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("ACP registry context 2", contribution.content);
 
-    state.context_enabled = false;
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    server.firstSession(&state).?.context_enabled = false;
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
     try std.testing.expectEqual(@as(usize, 2), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(server.firstSession(&state).?.workspace.context_snapshot.contribution == null);
 
-    state.context_enabled = true;
+    server.firstSession(&state).?.context_enabled = true;
     AcpContextRegistryFixture.gather_error = error.WriteFailed;
     try std.testing.expectError(
         error.WriteFailed,
-        refreshProjectContext(&state, server.firstSession(&state).?, alloc),
+        refreshProjectContext(state.host, server.firstSession(&state).?, alloc),
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(server.firstSession(&state).?.workspace.context_snapshot.contribution == null);
@@ -6236,12 +6333,14 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
 
 test "a copy of the project context keeps its bytes when the next prompt gathers it again" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     AcpContextRegistryFixture.reset();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     const session = server.firstSession(&state).?;
-    try refreshProjectContext(&state, session, alloc);
+    try refreshProjectContext(state.host, session, alloc);
 
     // What a subagent's turn takes when it starts.
     var copy = try session.workspace.context_snapshot.dupe(alloc);
@@ -6249,15 +6348,17 @@ test "a copy of the project context keeps its bytes when the next prompt gathers
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 
     // The next prompt gathers the context again and frees the snapshot the copy was made from.
-    try refreshProjectContext(&state, session, alloc);
+    try refreshProjectContext(state.host, session, alloc);
     try std.testing.expectEqualStrings("ACP registry context 2", session.workspace.context_snapshot.modelVisibleBytes());
     try std.testing.expectEqualStrings("ACP registry context 1", copy.modelVisibleBytes());
 }
 
 test "ACP prompt propagates context provider errors before pending prompt state" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var msg = jsonrpc.Message{
         .id = .{ .integer = 7 },
@@ -6276,7 +6377,7 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
+            handlePrompt(state.host, server.firstSession(&state).?, alloc, &msg, null, "code", .ask, &usage),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(server.firstSession(&state).?.pending_prompt_id == null);
@@ -6286,19 +6387,21 @@ test "ACP prompt propagates context provider errors before pending prompt state"
 
 test "ACP registry callbacks preserve snapshot bytes before transient context" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     AcpContextRegistryFixture.reset();
 
     var state: server.ServerState = undefined;
 
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
-    try refreshProjectContext(&state, server.firstSession(&state).?, alloc);
+    try refreshProjectContext(state.host, server.firstSession(&state).?, alloc);
 
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = server.firstSession(&state).?.session_id,
@@ -6338,7 +6441,7 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try std.testing.expectEqual(PermissionMode.auto, tool_context.permission_mode);
     try std.testing.expectEqualStrings("test.acp_context", tool_context.context_registry.defaultProvider().id);
 
-    state.context_enabled = false;
+    ctx.session.context_enabled = false;
     try std.testing.expectEqualStrings("", ctx.modelVisibleProjectContext());
     try std.testing.expect(!ctx.toolContext().context_enabled);
     try std.testing.expect(!agentRuntimeDeps(&ctx).context_enabled);
@@ -6374,15 +6477,17 @@ fn createSymlinkOrSkip(dir: std.Io.Dir, target_path: []const u8, link_path: []co
 
 test "ACP deps validate malformed registered calls" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const deps = agentRuntimeDeps(&ctx);
     try deps.finalize_turn(deps.ctx, 8, .completed, null);
@@ -6408,12 +6513,14 @@ test "ACP finalization maps failed turns and provider length" {
 
     for (cases) |case| {
         const alloc = std.testing.allocator;
+        var test_host = server.testHost(alloc);
+        defer test_host.deinit();
         var state: server.ServerState = undefined;
-        try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+        try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
         defer state.deinit();
         var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
         defer turn_settings.deinit(alloc);
-        var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+        var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
         const deps = agentRuntimeDeps(&ctx);
 
         try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
@@ -6424,15 +6531,17 @@ test "ACP finalization maps failed turns and provider length" {
 
 test "ACP deps reject malformed native web_search calls" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const deps = agentRuntimeDeps(&ctx);
     const validate = deps.validate_tool_call orelse return error.TestExpectedEqual;
@@ -6446,6 +6555,8 @@ test "ACP deps reject malformed native web_search calls" {
 
 test "ACP prompt projection configures web search then blocks native execution" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     const web_search_contract = @import("../core/tooling/web_search_contract.zig");
     const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
     const ProviderState = struct {
@@ -6473,12 +6584,12 @@ test "ACP prompt projection configures web search then blocks native execution" 
     var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-web-runtime-timing.jsonl", .{});
     defer capture.close(io_mod.getIo());
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     var turn_settings = try TurnSettings.capture(arena, server.firstSession(&state).?);
     defer turn_settings.deinit(arena);
-    var ctx = AcpContext{ .alloc = arena, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = arena, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
     var provider_state = ProviderState{};
     var provider = server.firstSession(&state).?.web_search_runtime.provider orelse return error.TestExpectedEqual;
     provider.context = @ptrCast(&provider_state);
@@ -6513,8 +6624,8 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqualStrings("web_search field \"query\" must contain at least two characters", validation.failure);
     try std.testing.expectEqualStrings(session.api_key, server.firstSession(&state).?.web_search_runtime.api_key);
     try std.testing.expectEqualStrings(session.model, server.firstSession(&state).?.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
+    try std.testing.expectEqual(state.host.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(state.host.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
 
     const execute = deps.execute_tool_call;
     const execution = try execute(deps.ctx, .{
@@ -6532,16 +6643,18 @@ test "ACP prompt projection configures web search then blocks native execution" 
     });
     try std.testing.expectEqualStrings(session.api_key, server.firstSession(&state).?.web_search_runtime.api_key);
     try std.testing.expectEqualStrings(session.model, server.firstSession(&state).?.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
+    try std.testing.expectEqual(state.host.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(state.host.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
 
 test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .auto);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .auto);
     defer state.deinit();
     server.firstSession(&state).?.credential_source = .chatgpt_subscription;
     server.firstSession(&state).?.provider = .codex;
@@ -6549,7 +6662,7 @@ test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
     server.firstSession(&state).?.api_key = try alloc.dupe(u8, "chatgpt-secret");
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(tool_ctx.web_search_backend == null);
@@ -6559,15 +6672,17 @@ test "ACP ChatGPT route removes Gateway-backed auxiliary capabilities" {
 
 test "ACP default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "direct",
@@ -6631,18 +6746,21 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
     };
 
     const alloc = std.testing.allocator;
+
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var fake = FakeClassifier{ .decision = .clear };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -6727,6 +6845,9 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
     };
 
     const alloc = std.testing.allocator;
+
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
@@ -6740,14 +6861,14 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, workspace, .auto);
+    try initTestAcpState(&test_host, &state, alloc, workspace, .auto);
     defer state.deinit();
     var fake = FakeClassifier{ .decision = .clear };
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{
         .alloc = alloc,
-        .state = &state,
+        .host = state.host,
         .session = server.firstSession(&state).?,
         .turn = &turn_settings,
         .session_id = "session_1",
@@ -6809,15 +6930,17 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
 
 test "ACP admits default-safe web fetch without a rule" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .auto);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .auto);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const call: ToolCall = .{
         .id = "fetch",
@@ -6842,15 +6965,17 @@ test "ACP admits default-safe web fetch without a rule" {
 
 test "ACP admits default-safe web_search before execution" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .auto);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .auto);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "search",
@@ -6863,15 +6988,17 @@ test "ACP admits default-safe web_search before execution" {
 
 test "ACP admits default-safe web_fetch before execution" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .auto);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .auto);
     defer state.deinit();
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
 
     const decision = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "fetch",
@@ -6896,6 +7023,8 @@ test "ACP full advertisement includes direct provider search with explicit permi
 
 test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
@@ -6903,12 +7032,12 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     defer alloc.free(workspace);
 
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, workspace, .auto);
+    try initTestAcpState(&test_host, &state, alloc, workspace, .auto);
     defer state.deinit();
     const session = server.firstSession(&state).?;
     session.gateway_team = try alloc.dupe(u8, "team_before");
 
-    var first = try TurnSignIn.capture(alloc, &state, session);
+    var first = try TurnSignIn.capture(alloc, state.host, session);
     defer first.deinit(alloc);
     var job: worker_runtime.QueuedPrompt = .{
         .prompt = &.{},
@@ -6928,8 +7057,8 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
         .team_id = try alloc.dupe(u8, "team_after"),
     };
     {
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
         server.adoptSessionCredential(alloc, session, &refreshed);
     }
     refreshed.deinit(alloc);
@@ -6937,7 +7066,7 @@ test "ACP turn sign-in outlives a refreshed credential the server publishes" {
     try std.testing.expectEqualStrings("team_before", job.gateway_team.?);
 
     // The report turn after it sends the published one.
-    var next = try TurnSignIn.capture(alloc, &state, session);
+    var next = try TurnSignIn.capture(alloc, state.host, session);
     defer next.deinit(alloc);
     var report_job = job;
     next.apply(&report_job);
@@ -6967,8 +7096,8 @@ const SignInRace = struct {
         defer credential.deinit(alloc);
         credential.account_id = try alloc.print("account-{d}", .{number});
         credential.team_id = try alloc.print("team-{d}", .{number});
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+        state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
         server.adoptSessionCredential(alloc, server.firstSession(state).?, &credential);
     }
 
@@ -6981,7 +7110,7 @@ const SignInRace = struct {
     fn runCapturer(self: *SignInRace) void {
         const alloc = std.testing.allocator;
         while (!self.publisher_done.load(.acquire)) {
-            var sign_in = TurnSignIn.capture(alloc, self.state, server.firstSession(self.state).?) catch {
+            var sign_in = TurnSignIn.capture(alloc, self.state.host, server.firstSession(self.state).?) catch {
                 _ = self.torn.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -7005,6 +7134,8 @@ const SignInRace = struct {
 
 test "ACP turn sign-in is one whole credential while a refresh publishes beside it" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
@@ -7012,7 +7143,7 @@ test "ACP turn sign-in is one whole credential while a refresh publishes beside 
     defer alloc.free(workspace);
 
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, workspace, .auto);
+    try initTestAcpState(&test_host, &state, alloc, workspace, .auto);
     defer state.deinit();
     try SignInRace.publish(&state, 0);
 
@@ -7028,6 +7159,8 @@ test "ACP turn sign-in is one whole credential while a refresh publishes beside 
 
 test "ACP prompt agent config carries request options from active session" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
@@ -7036,10 +7169,10 @@ test "ACP prompt agent config carries request options from active session" {
 
     var state: server.ServerState = undefined;
 
-    try initTestAcpState(&state, alloc, workspace, .auto);
+    try initTestAcpState(&test_host, &state, alloc, workspace, .auto);
     defer state.deinit();
     server.firstSession(&state).?.gateway_team = try alloc.dupe(u8, "team_123");
-    state.context_limits.project_instruction_file_bytes = .{
+    server.firstSession(&state).?.context_limits.project_instruction_file_bytes = .{
         .value = .{ .bytes = 17 },
         .source = .command_line,
     };
@@ -7050,7 +7183,7 @@ test "ACP prompt agent config carries request options from active session" {
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    const config = buildAgentConfig(&state, session, &turn_settings, .{
+    const config = buildAgentConfig(state.host, session, &turn_settings, .{
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
@@ -7064,18 +7197,18 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expect(tool_projection_mod.containsName(config.advertised_tool_names, "read_file"));
     try std.testing.expectEqualStrings("acp custom tool guidance", config.custom_tool_guidance);
     try std.testing.expectEqualStrings("ACP test model overlay", config.model_prompt_overlay.?);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = server.firstSession(&state).?, .turn = &turn_settings, .session_id = "session_1" };
     const tool_ctx = ctx.toolContext();
     try std.testing.expect(!tool_ctx.web_search_runtime_ready);
     try std.testing.expect(tool_ctx.web_search_backend != null);
-    try std.testing.expect(server.firstSession(&state).?.web_search_runtime.provider.?.execute_fn == state.cfg.provider_set.gateway.fx_search.?.execute_fn);
-    try std.testing.expect(server.firstSession(&state).?.web_search_runtime.provider.?.preferred_backends_fn == state.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
-    try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.web_fetch_runtime);
+    try std.testing.expect(server.firstSession(&state).?.web_search_runtime.provider.?.execute_fn == state.host.cfg.provider_set.gateway.fx_search.?.execute_fn);
+    try std.testing.expect(server.firstSession(&state).?.web_search_runtime.provider.?.preferred_backends_fn == state.host.cfg.provider_set.gateway.fx_search.?.preferred_backends_fn);
+    try std.testing.expect(tool_ctx.web_fetch_runtime.? == &state.host.web_fetch_runtime);
     try std.testing.expectEqualStrings("team_123", tool_ctx.gateway_team.?);
     try std.testing.expectEqualStrings("team_123", server.firstSession(&state).?.web_search_runtime.gateway_team.?);
     try std.testing.expectEqualStrings(session.model, server.firstSession(&state).?.web_search_runtime.worker_model);
-    try std.testing.expectEqual(state.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
-    try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
+    try std.testing.expectEqual(state.host.cfg.gateway_retry_count, server.firstSession(&state).?.web_search_runtime.gateway_retry_count);
+    try std.testing.expectEqualStrings(state.host.cfg.gateway_chat_url, server.firstSession(&state).?.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
     try std.testing.expect(tool_ctx.ultrafast_mode);
 }
@@ -7102,27 +7235,34 @@ fn refuseWrite(_: ?*anyopaque, _: []const u8) anyerror!void {
 
 test "an audience member gets each update in the owner's bytes, and turn progress only where it lists it" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    state.connection_id = 1;
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
     state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
     state.extensions = sh_fx.Set.initMany(&.{.turn_progress});
     const session = server.firstSession(&state).?;
+    // The main client's record copies its extensions when the session opens, before this test sets them.
+    session.members.items[0].extensions = state.extensions;
 
     var follower_wire = WireCapture{ .alloc = alloc };
     defer follower_wire.deinit();
     var follower = server.ServerState{
         .alloc = alloc,
-        .cfg = undefined,
+        .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
+        .connection_id = 2,
     };
-    try session.followers.append(alloc, &follower);
+    defer follower.deinit();
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     // An update goes to both members, byte for byte the same.
@@ -7141,35 +7281,39 @@ test "an audience member gets each update in the owner's bytes, and turn progres
 
 test "an audience member whose write fails is dropped, and the owner still gets the update" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
     state.writer = jsonrpc.Writer.initCallback(&owner_wire, WireCapture.write);
     const session = server.firstSession(&state).?;
-
     var follower = server.ServerState{
         .alloc = alloc,
-        .cfg = undefined,
+        .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(null, refuseWrite),
     };
-    try session.followers.append(alloc, &follower);
+    defer follower.deinit();
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"owner\"}}");
     try std.testing.expect(owner_wire.bytes.items.len > 0);
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
 }
 
 test "an audience member whose writer has stopped is dropped after the next update, and the owner still gets it" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
@@ -7180,28 +7324,31 @@ test "an audience member whose writer has stopped is dropped after the next upda
     defer follower_wire.deinit();
     var follower = server.ServerState{
         .alloc = alloc,
-        .cfg = undefined,
+        .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
     };
+    defer follower.deinit();
     // Its client closed: the writer drops later notifications without an error.
     follower.writer.dropping = true;
-    try session.followers.append(alloc, &follower);
+    try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"after\"}}");
-    try std.testing.expectEqual(@as(usize, 0), session.followers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.followerCountForTest(session));
     try std.testing.expectEqual(@as(usize, 0), follower_wire.bytes.items.len);
     try std.testing.expect(owner_wire.bytes.items.len > 0);
 }
 
 test "a running turn's copy keeps each update in order, with the params each kind of client takes" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
@@ -7209,7 +7356,7 @@ test "a running turn's copy keeps each update in order, with the params each kin
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -7246,8 +7393,10 @@ test "a running turn's copy keeps each update in order, with the params each kin
 
 test "a running turn's copy keeps only its latest turn progress" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
     var owner_wire = WireCapture{ .alloc = alloc };
@@ -7256,7 +7405,7 @@ test "a running turn's copy keeps only its latest turn progress" {
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     ctx.progress.provider = try alloc.dupe(u8, "first");
@@ -7274,8 +7423,10 @@ test "a running turn's copy keeps only its latest turn progress" {
 
 test "releasing a running turn's copy frees its entries and its progress" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
     var owner_wire = WireCapture{ .alloc = alloc };
@@ -7284,7 +7435,7 @@ test "releasing a running turn's copy frees its entries and its progress" {
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"one\"}}");
@@ -7305,8 +7456,10 @@ test "releasing a running turn's copy frees its entries and its progress" {
 
 test "a running turn's copy stops at its limit, and later updates are counted as dropped" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     var owner_wire = WireCapture{ .alloc = alloc };
     defer owner_wire.deinit();
@@ -7314,7 +7467,7 @@ test "a running turn's copy stops at its limit, and later updates are counted as
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     // Eighteen 1 MiB chunks are more than the copy's 16 MiB limit.
@@ -7335,8 +7488,10 @@ test "a running turn's copy stops at its limit, and later updates are counted as
 
 test "a turn's save empties its running copy, a later update waits for the turn's end, and a compaction summary keeps the copy" {
     const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
     var state: server.ServerState = undefined;
-    try initTestAcpState(&state, alloc, "/tmp/workspace", .ask);
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     // The owner's frames go to a capture, not to stdout: the test runner reads stdout as its protocol.
     var owner_wire = WireCapture{ .alloc = alloc };
@@ -7345,7 +7500,7 @@ test "a turn's save empties its running copy, a later update waits for the turn'
     const session = server.firstSession(&state).?;
     var turn_settings = try TurnSettings.capture(alloc, session);
     defer turn_settings.deinit(alloc);
-    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session = session, .turn = &turn_settings, .session_id = "session_1" };
+    var ctx = AcpContext{ .alloc = alloc, .host = state.host, .session = session, .turn = &turn_settings, .session_id = "session_1" };
     defer ctx.deinitPublishedToolCalls();
 
     try ctx.sendUpdate("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"before the save\"}}");

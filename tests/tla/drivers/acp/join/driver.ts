@@ -130,6 +130,9 @@ const PLANS: Plan[] = [
 // ------------------------------------------------------------ observations --
 
 const WAIT_MS = 60_000;
+// How long fx may stay up after its input ends while a follower is joined. fx exits as soon as
+// nothing is left to serve, so a process that exits inside this window fails the plan.
+const KEPT_WINDOW_MS = 2_000;
 const REFUSAL = "This session is open on another connection; only that connection can change it.";
 
 /// One plan's run against the real binary. The owner's frames become steps as
@@ -145,6 +148,7 @@ class Run {
   private sessionId = "";
   private readonly turnOfPrompt = new Map<number, number>();
   private readonly followers = new Map<Joiner, { client: SocketClient; requestId: number }>();
+  private readonly left = new Set<Joiner>();
   private holdReleased = false;
 
   constructor(
@@ -306,6 +310,7 @@ class Run {
     const { answer } = await follower.client.request("session/close", { sessionId: this.sessionId });
     const closed = !answer.error && JSON.stringify(answer.result) === "{}";
     this.observations.push(closed ? { op: "close", who } : { op: "close_failed", who });
+    this.left.add(who);
   }
 
   /// Sends the follower the two changes that stay refused while it follows the
@@ -334,11 +339,19 @@ class Run {
     this.drain();
     if (this.owner) {
       const acp = this.owner;
-      const outcome = await acp.close();
-      await acp.readerDone;
+      acp.disconnect();
+      const kept = await acp.waitForExit(KEPT_WINDOW_MS);
+      const joined = [...this.followers.keys()].some((who) => !this.left.has(who));
+      if (kept.exited && joined) throw new Error("fx acp exited while a follower was still joined");
+      for (const who of this.followers.keys()) {
+        if (!this.left.has(who)) await this.closeFollower(who);
+        this.followers.get(who)?.client.close();
+      }
+      const outcome = await acp.waitForExit(WAIT_MS);
       this.owner = null;
-      this.processes.push({ how: "exit", pid: acp.proc.pid, exit: outcome.exit, stderr: outcome.stderr.slice(-2000) });
-      if (outcome.exit !== 0) throw new Error(`fx acp exited ${outcome.exit}: ${outcome.stderr.slice(-400)}`);
+      this.processes.push({ how: "exit", pid: acp.proc.pid, exit: outcome.code ?? -1, stderr: acp.stderr.slice(-2000) });
+      if (!outcome.exited) throw new Error(`fx acp did not exit after its last client left: ${acp.stderr.slice(-400)}`);
+      if (outcome.code !== 0) throw new Error(`fx acp exited ${outcome.code}: ${acp.stderr.slice(-400)}`);
     }
     this.drain();
     this.evidence.push({ op: "gateway", requests: this.gateway.requests.length });

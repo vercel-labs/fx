@@ -27,6 +27,10 @@ import { SharedFixture, SocketClient, isAnswer, settle, userChunkText, FrameStre
 import { type Kind, type Obs, type Req, type Sys, type Verdict, type Who, validate } from "./trace";
 import { outDir, sha256File, tlcToolchain, writeJson } from "./tlc";
 
+// How long fx may stay up after its input ends while a follower is joined. fx exits as soon as
+// nothing is left to serve, so a process that exits inside this window fails the plan.
+const KEPT_WINDOW_MS = 2_000;
+
 // ------------------------------------------------------------------ requests --
 
 const OWNER1: Req = { who: "owner", n: 1 };
@@ -70,6 +74,7 @@ class Run {
   private owner: Acp | null = null;
   private readonly ownerFrames = new FrameStream();
   private follower: SocketClient | null = null;
+  private followerGone = false;
   private sessionId = "";
   /// Each prompt's request id on its sender's wire, and its kind.
   private readonly ids = new Map<string, number>();
@@ -278,6 +283,7 @@ class Run {
   /// (server.zig, withdrawFollowerInput, after the prompt leaves the line).
   async leave(r: Req) {
     this.follower!.close();
+    this.followerGone = true;
     this.observations.push({ op: "leave", who: "follower" });
     const needle = `${WITHDRAWN} session=${this.sessionId} request=${this.ids.get(key(r))} reason=follower_left`;
     const traced = await settle(() => this.fixture.traceHas(needle), 30_000);
@@ -289,11 +295,18 @@ class Run {
   async finalDrain() {
     if (this.owner) {
       const acp = this.owner;
-      const outcome = await acp.close();
-      await acp.readerDone;
+      acp.disconnect();
+      const kept = await acp.waitForExit(KEPT_WINDOW_MS);
+      if (kept.exited && this.follower && !this.followerGone) this.processFailed = true;
+      if (this.follower && !this.followerGone) {
+        this.follower.close();
+        this.followerGone = true;
+        this.observations.push({ op: "leave", who: "follower" });
+      }
+      const outcome = await acp.waitForExit(WAIT_MS);
       this.owner = null;
-      this.evidence.push({ op: "owner_exit", exit: outcome.exit, stderr: outcome.stderr.slice(-2000) });
-      if (outcome.exit !== 0) this.processFailed = true;
+      this.evidence.push({ op: "owner_exit", exit: outcome.code ?? -1, stderr: acp.stderr.slice(-2000) });
+      if (!outcome.exited || outcome.code !== 0) this.processFailed = true;
     }
     if (this.follower) await settle(() => this.follower!.stream.closed, 5_000);
     for (const who of ["owner", "follower"] as Who[]) {

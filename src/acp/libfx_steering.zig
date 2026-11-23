@@ -71,11 +71,35 @@ pub const Steer = struct {
 pub const Sender = struct {
     id: RequestId,
     from: connection.ConnectionId,
+    /// Set once the sender's client has been answered at its close, so the turn's end does not answer it again.
+    answered: bool = false,
 };
 
 /// Frees the ids of `senders`. The caller frees the slice.
 pub fn freeSenders(alloc: Allocator, senders: []const Sender) void {
     for (senders) |sender| freeRequestId(alloc, sender.id);
+}
+
+/// Marks each sender of `from` that no close has answered yet, and appends its id to `out`. The ids
+/// stay owned by `senders`. The caller holds the session's `audience_mutex`, which the turn's end also
+/// takes before it answers a sender. `out` gets room for every match before anything is marked, so a
+/// failure marks nothing.
+pub fn markAnsweredFrom(
+    alloc: Allocator,
+    senders: []Sender,
+    from: connection.ConnectionId,
+    out: *std.ArrayList(RequestId),
+) Allocator.Error!void {
+    var count: usize = 0;
+    for (senders) |sender| {
+        if (connection.sameConnection(sender.from, from) and !sender.answered) count += 1;
+    }
+    try out.ensureUnusedCapacity(alloc, count);
+    for (senders) |*sender| {
+        if (!connection.sameConnection(sender.from, from) or sender.answered) continue;
+        sender.answered = true;
+        out.appendAssumeCapacity(sender.id);
+    }
 }
 
 pub fn freeSteers(alloc: Allocator, steers: []const Steer) void {
@@ -574,6 +598,32 @@ pub const Runtime = struct {
         }
     }
 
+    /// Moves the steers that connection `from` sent and the turn has taken into `out`, so the caller
+    /// answers them now. The turn's end then finds none of them and does not answer them again.
+    /// `out` gets room for every match before anything moves, so a failure takes nothing.
+    pub fn takeAbsorbedFrom(
+        self: *Runtime,
+        alloc: Allocator,
+        from: connection.ConnectionId,
+        out: *std.ArrayList(Sender),
+    ) Allocator.Error!void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.absorbed.items) |sender| {
+            if (connection.sameConnection(sender.from, from)) count += 1;
+        }
+        try out.ensureUnusedCapacity(alloc, count);
+        var index: usize = 0;
+        while (index < self.absorbed.items.len) {
+            if (!connection.sameConnection(self.absorbed.items[index].from, from)) {
+                index += 1;
+                continue;
+            }
+            out.appendAssumeCapacity(self.absorbed.orderedRemove(index));
+        }
+    }
+
     pub fn close(self: *Runtime, alloc: Allocator, reason: []const u8) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -953,4 +1003,50 @@ test "a withdrawal from one connection leaves a queued steer with the same reque
     try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
     try std.testing.expectEqualStrings("from b", finished.untaken[0].text);
     try std.testing.expectEqual(@as(connection.ConnectionId, 2), finished.untaken[0].from);
+}
+
+test "takeAbsorbedFrom moves one client's taken steers out of the turn's list, once" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+    try runtime.enqueueRequest(alloc, "from one", .{ .integer = 1 }, 1);
+    try runtime.enqueueRequest(alloc, "from two", .{ .integer = 2 }, 2);
+    const drained = try runtime.takeAll(alloc, alloc, false);
+    defer freeDrained(alloc, drained);
+
+    var taken: std.ArrayList(Sender) = .empty;
+    defer {
+        freeSenders(alloc, taken.items);
+        taken.deinit(alloc);
+    }
+    try runtime.takeAbsorbedFrom(alloc, 1, &taken);
+    try std.testing.expectEqual(@as(usize, 1), taken.items.len);
+    try std.testing.expectEqual(@as(i64, 1), taken.items[0].id.integer);
+    try std.testing.expectEqual(@as(usize, 1), runtime.absorbed.items.len);
+    try std.testing.expectEqual(@as(i64, 2), runtime.absorbed.items[0].id.integer);
+
+    try runtime.takeAbsorbedFrom(alloc, 1, &taken);
+    try std.testing.expectEqual(@as(usize, 1), taken.items.len);
+}
+
+test "markAnsweredFrom marks one client's steers that started a turn, once" {
+    const alloc = std.testing.allocator;
+    var senders = [_]Sender{
+        .{ .id = .{ .integer = 7 }, .from = 2 },
+        .{ .id = .{ .integer = 8 }, .from = 3 },
+        .{ .id = .{ .integer = 9 }, .from = 2 },
+    };
+    var marked: std.ArrayList(RequestId) = .empty;
+    defer marked.deinit(alloc);
+    try markAnsweredFrom(alloc, &senders, 2, &marked);
+    try std.testing.expectEqual(@as(usize, 2), marked.items.len);
+    try std.testing.expectEqual(@as(i64, 7), marked.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 9), marked.items[1].integer);
+    try std.testing.expect(senders[0].answered);
+    try std.testing.expect(!senders[1].answered);
+    try std.testing.expect(senders[2].answered);
+
+    try markAnsweredFrom(alloc, &senders, 2, &marked);
+    try std.testing.expectEqual(@as(usize, 2), marked.items.len);
 }
