@@ -537,6 +537,10 @@ const ActivePrompt = struct {
     /// The connection that sent the prompt this turn runs; its answer goes there. A turn
     /// of steers has no prompt of its own: each steer's answer goes to that steer's sender.
     from: ConnectionId = no_connection,
+    /// Set once the prompt's own answer is written: by the turn's end, or by a close while
+    /// others remain (`answerClosingTurn`). Cleared when the worker starts the next turn in
+    /// this record. Read and set under `audience_mutex`.
+    answered: bool = false,
     /// Mode and permission policy captured when the prompt was dispatched.
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
@@ -2109,6 +2113,7 @@ fn detachFollowerAt(state: *ServerState, index: usize, leave: FollowerLeave) voi
             .left => "connection_end",
         },
     });
+    if (leave == .closed) answerClosingTurn(state, membership.session);
     {
         var audience = lockAudience(membership.session);
         defer audience.unlock();
@@ -4895,6 +4900,13 @@ fn promptWorkerMain(active: *ActivePrompt) void {
             dropped.input.deinit(host.alloc);
         }
         if (next) |taken| {
+            // The turn that ended was answered above. The next prompt that this record runs is
+            // not answered yet, so its close, or its own answer, may write one.
+            {
+                var audience = lockAudience(session);
+                defer audience.unlock();
+                active.answered = false;
+            }
             var waiting = taken;
             defer waiting.deinit(host.alloc);
             if (waiting == .steers) publishStartingSteers(session, active.alloc, waiting.steers.items);
@@ -5063,6 +5075,63 @@ pub fn noteSteeringTool(active: *ActiveSessionState, call_id: []const u8, starte
     }
 }
 
+/// Writes the turn's own answer to its prompt, once. A close that leaves others
+/// (`answerClosingTurn`) writes that answer first and sets `answered`, so the turn's answer
+/// is dropped with a trace, and the sender never gets two answers to one request.
+fn answerTurnPrompt(
+    active: *ActivePrompt,
+    from: ConnectionId,
+    id: ?jsonrpc.RequestId,
+    need: RunningCopy.Need,
+    with: Answer,
+    without: Answer,
+) !void {
+    // Without `follow_supported` no client can close the session while the turn runs.
+    if (comptime !follow_supported) return answerSender(active.session, active.alloc, from, id, need, with, without);
+    var audience = lockAudience(active.session);
+    defer audience.unlock();
+    if (active.answered) {
+        traceDroppedAnswer(active.session, id, "answered_at_close", null);
+        return;
+    }
+    active.answered = true;
+    return answerSenderLocked(active.session, &audience, active.alloc, from, id, need, with, without);
+}
+
+/// A `session/close` while another member remains: the closing client's own running prompt
+/// gets `cancelled` now, before the close's own answer, because the closing client is still a
+/// member here. The turn goes on for the others. The last member's close does not come here:
+/// `cancelAndReapPrompt` cancels its turn. A turn that steers started has no prompt of its own
+/// to answer, so it is left alone.
+fn answerClosingTurn(state: *ServerState, session: *ActiveSessionState) void {
+    if (comptime !follow_supported) return;
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    if (session.members.items.len <= 1) return;
+    // The turn is read under the line lock, as the cancel path reads it. The write below runs
+    // after that lock is released, as the other line-lock paths do. The turn cannot finish
+    // while this holds `audience_mutex`, because its own answer needs that lock, so the
+    // request id it names stays valid.
+    const id = owed: {
+        session.waiting_prompts.lock();
+        defer session.waiting_prompts.unlock();
+        const active = session.prompt orelse return;
+        if (active.answered or active.from != state.connection_id or active.group_ids.len != 0) return;
+        const request_id = active.msg.id orelse return;
+        active.answered = true;
+        break :owed request_id;
+    };
+    var body: std.Io.Writer.Allocating = .init(state.alloc);
+    defer body.deinit();
+    acp_types.writePromptResponse(&body.writer, .cancelled) catch |err| {
+        debug_trace.logf("acp", "failed to answer a closing prompt err={s}", .{@errorName(err)});
+        return;
+    };
+    const answer: Answer = .{ .response = body.written() };
+    answerSenderLocked(session, &audience, state.alloc, state.connection_id, id, .none, answer, answer) catch |err|
+        debug_trace.logf("acp", "failed to answer a closing prompt err={s}", .{@errorName(err)});
+}
+
 /// Answers a turn that ended: the prompt that started it, or each steer that
 /// started it together (`next_turn`), and each steer it took (`absorbed`). Each
 /// answer goes to the connection that sent its request, in the shape that
@@ -5093,15 +5162,15 @@ fn publishPromptOutcome(active: *ActivePrompt, from: ConnectionId, id: ?jsonrpc.
             if (comptime !follow_supported) {
                 const body = try stopResponse(active, stop_reason, active.usage_shown);
                 defer active.alloc.free(body);
-                return answerSender(active.session, active.alloc, from, id, .none, .{ .response = body }, .{ .response = body });
+                return answerTurnPrompt(active, from, id, .none, .{ .response = body }, .{ .response = body });
             }
             const with = try stopResponse(active, stop_reason, true);
             defer active.alloc.free(with);
             const without = try stopResponse(active, stop_reason, false);
             defer active.alloc.free(without);
-            try answerSender(active.session, active.alloc, from, id, .{ .extension = .usage }, .{ .response = with }, .{ .response = without });
+            try answerTurnPrompt(active, from, id, .{ .extension = .usage }, .{ .response = with }, .{ .response = without });
         },
-        .rpc_error => |rpc_error| try answerSender(active.session, active.alloc, from, id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
+        .rpc_error => |rpc_error| try answerTurnPrompt(active, from, id, .none, .{ .rpc_error = rpc_error }, .{ .rpc_error = rpc_error }),
     }
 }
 
@@ -6240,6 +6309,20 @@ fn answerSender(
     }
     var audience = lockAudience(session);
     defer audience.unlock();
+    return answerSenderLocked(session, &audience, alloc, from, id, need, with, without);
+}
+
+/// `answerSender` for a caller that already holds `audience_mutex`, through `audience`.
+fn answerSenderLocked(
+    session: *ActiveSessionState,
+    audience: *Audience,
+    alloc: Allocator,
+    from: ConnectionId,
+    id: ?jsonrpc.RequestId,
+    need: RunningCopy.Need,
+    with: Answer,
+    without: Answer,
+) !void {
     if (sameConnection(mainLocked(session).?.connection_id, from)) {
         return writeAnswer(mainLocked(session).?.writer, alloc, id, if (memberTakes(mainLocked(session).?, need)) with else without);
     }
@@ -6344,6 +6427,7 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     const session = findSession(state, session_id) orelse return state.writer.writeResponse(alloc, msg.id, "{}");
     // The main client closes a session a follower still has open. The follower becomes its
     // main, and the session, its turn and the follower's input stay open (the leave rule).
+    answerClosingTurn(state, session);
     if (leaveMember(state, session, .closed)) {
         removeMembershipForSession(state, session);
         return state.writer.writeResponse(alloc, msg.id, "{}");

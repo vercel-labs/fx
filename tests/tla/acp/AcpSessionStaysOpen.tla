@@ -30,9 +30,10 @@ Designs, selected by the constant Design:
 Rules the model checks, in plain words:
 - Leaving while another member remains ("Stopping and withdrawing"): the
   leaver's queued prompts and untaken steers are withdrawn. A close answers
-  them as cancelled, and an input end traces them. A running turn that the
-  leaver's prompt started goes on, and its permission requests go to the next
-  main. The model keeps steers in the queue with prompts, so the queue stands
+  them as cancelled, and an input end traces them. A close also answers the
+  leaver's running prompt as cancelled. The turn that the leaver's prompt
+  started goes on, and its permission requests go to the next main. The model
+  keeps steers in the queue with prompts, so the queue stands
   for both.
 - The last member's leave ("Keeping turns after a disconnect"): a close
   cancels the closer's own running turn and answers its own queued prompts as
@@ -289,8 +290,9 @@ OneMainInJoinOrder == s.members # <<>> => Main(s) = s.members[1]
 PermissionToMain == s.askOpen => (s.members # <<>> /\ s.askTo = Main(s))
 
 \* The session, its turn and its open question never name a client that has left. A running
-\* turn may outlive its sender while members remain (see Left work in the header): its answer
-\* is then dropped with a trace, as answerSender does with sender_left in src/acp/server.zig.
+\* turn may outlive its sender while members remain (see Left work in the header). A close
+\* answers the sender's own running prompt at once, so a later answer for it is dropped with a
+\* trace, as answerTurnPrompt does with answered_at_close in src/acp/server.zig.
 NoDanglingClient ==
   /\ (s.askOpen => (s.askTo \in Mem(s)))
   /\ (Design = "A" => IF s.members = <<>> THEN s.owner = "none" ELSE s.owner \in Mem(s))

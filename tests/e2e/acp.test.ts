@@ -15989,6 +15989,119 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a session/close answers the opener's running prompt with cancelled before its own answer, and the follower's turn goes on",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-close-running-");
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), held.response, finalText("FOLLOWER_AFTER_CLOSE")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const opener = started.owner;
+        owner = opener;
+        const joined = await followSession(started.socket, started.sessionId, root);
+        follower = joined;
+        const committed = () => logLines(root.home, started.sessionId).filter((line) => line.kind === "turn_committed").length;
+        const committedBefore = committed();
+
+        sendPrompt(opener, 10, "RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        held.send("PART_ONE ");
+        await waitForCondition("the follower sees the first part", () => joined.received.some((message) => JSON.stringify(message).includes("PART_ONE")), TIMEOUT);
+
+        const closed = (await opener.request("session/close", { sessionId: started.sessionId }, 14)) as any;
+        expect(closed.error).toBeUndefined();
+        expect(closed.result).toEqual({});
+        const lines = opener.rawLines.map((line) => JSON.parse(line));
+        const promptAt = lines.findIndex((message) => message.id === 10);
+        const closeAt = lines.findIndex((message) => message.id === 14);
+        expect(promptAt).toBeGreaterThanOrEqual(0);
+        expect(promptAt).toBeLessThan(closeAt);
+        expect(lines[promptAt].result?.stopReason).toBe("cancelled");
+
+        held.send("PART_TWO ");
+        held.release("TURN_END");
+        const after = await joined.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_AFTER_CLOSE" }],
+          _meta: { "sh.fx/delivery": "queue" },
+        });
+        expect(after.answer.error).toBeUndefined();
+        expect(after.answer.result.stopReason).toBe("end_turn");
+        expect(joined.received.some((message) => JSON.stringify(message).includes("PART_TWO"))).toBe(true);
+        const afterClose = opener.rawLines.map((line) => JSON.parse(line)).slice(closeAt + 1);
+        expect(afterClose.filter((message) => message.method === "session/update" || message.id === 10)).toEqual([]);
+        expect(committed()).toBe(committedBefore + 2);
+        expect(savedText(root.home, started.sessionId)).toContain("PART_TWO");
+        expect(opener.stderr).toBe("");
+      } finally {
+        held.dispose();
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    "a follower's session/close answers its own running prompt with cancelled before its own answer, and the opener's turn goes on",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-follower-close-running-");
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), held.response, finalText("OPENER_AFTER_CLOSE")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const opener = started.owner;
+        owner = opener;
+        const joined = await followSession(started.socket, started.sessionId, root);
+        follower = joined;
+        const committed = () => logLines(root.home, started.sessionId).filter((line) => line.kind === "turn_committed").length;
+        const committedBefore = committed();
+
+        const runningId = joined.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_RUNNING" }],
+        });
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        held.send("PART_ONE ");
+        await waitForCondition("the opener sees the first part", () => opener.rawLines.some((line) => line.includes("PART_ONE")), TIMEOUT);
+
+        const closed = await joined.request("session/close", { sessionId: started.sessionId });
+        expect(closed.answer.error).toBeUndefined();
+        expect(closed.answer.result).toEqual({});
+        expect(closed.before.find((message) => message.id === runningId)?.result?.stopReason).toBe("cancelled");
+        const closeAt = joined.received.indexOf(closed.answer);
+
+        held.send("PART_TWO ");
+        await waitForCondition("the opener sees the second part", () => opener.rawLines.some((line) => line.includes("PART_TWO")), TIMEOUT);
+        held.release("TURN_END");
+        const queued = (await opener.request("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "OPENER_AFTER_CLOSE" }],
+          _meta: { "sh.fx/delivery": "queue" },
+        }, 15)) as any;
+        expect(queued.error).toBeUndefined();
+        expect(queued.result.stopReason).toBe("end_turn");
+        const afterClose = joined.received.slice(closeAt + 1);
+        expect(afterClose.filter((message) => message.method === "session/update" || message.id === runningId)).toEqual([]);
+        expect(committed()).toBe(committedBefore + 2);
+        expect(savedText(root.home, started.sessionId)).toContain("PART_TWO");
+        expect(opener.stderr).toBe("");
+      } finally {
+        held.dispose();
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
     "a prompt the opener queued behind its turn never runs once the opener leaves while a follower remains",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-stays-open-queue-");
