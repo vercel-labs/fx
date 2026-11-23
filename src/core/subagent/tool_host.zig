@@ -1471,11 +1471,11 @@ pub const Runtime = struct {
         return true;
     }
 
-    /// Whether the child is idle once `end`'s report goes, read in one pass
-    /// before the report's text, so the text and the idle flag come from one
-    /// read. The read comes before the slot starts the next message waiting
-    /// for the child (`workEnded`), so a waiting message counts
-    /// (`tests/tla/subagent/StopMessage.tla` IdleNoteHonest).
+    /// The facts that decide whether the child is idle once `end`'s report
+    /// goes, read in one pass before the report's text, so the text and the
+    /// idle flag come from one read. The read comes before the slot starts the
+    /// next message waiting for the child (`workEnded`), so a waiting message
+    /// counts (`tests/tla/subagent/StopMessage.tla` IdleNoteHonest).
     fn idleFactsAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) IdleFacts {
         const facts: IdleFacts = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
