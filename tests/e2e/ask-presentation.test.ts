@@ -1393,9 +1393,10 @@ describe("fx ask presentation", () => {
       expect(scrollback).toMatch(/^MCP server fixture requests Release note \(required\)\s*$/m);
       expect(scrollback).toMatch(/^Reason: Choose the next step\s*$/m);
       expect(scrollback).toMatch(/^Enter a value: \^C\s*$/m);
-      // fx ends by re-raising SIGINT: tmux reports signal 2, and a shell reports the same exit as 130.
+      // fx ends by re-raising SIGINT, which a shell reports as exit 130. tmux 3.6 names the
+      // signal "2" in its dead-pane line and tmux 3.6a names it "int".
       expect(session.paneStatus()).toEqual({ dead: true, status: null });
-      expect(scrollback).toContain("Pane is dead (signal 2");
+      expect(scrollback).toMatch(/Pane is dead \(signal (2|int),/);
 
       // The restore sequence comes after the last autowrap change, and it turns autowrap on.
       const output = await readOutputUntil(outputPath, "\x1b[?25h\x1b[?7h");
