@@ -34,7 +34,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, waitForRootTurnCommitted, withoutConversionNotice } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, holdChildAnswer, logLines, logLinesAfterCompaction, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -3475,6 +3475,9 @@ describe("gateway stream lifecycle", () => {
       const scrollback = await tui.captureFullScrollback();
       expect(scrollback).toContain(`Opened ${skillName}`);
       expect(scrollback).toContain("Read skill resource references/rules.md");
+      // The group's header counts what the calls opened as skills.
+      expect(scrollback).toContain("● Opened skills");
+      expect(scrollback).not.toContain("pened tools");
       expect(scrollback).not.toContain("Loaded skill skill");
       expect(scrollback).not.toContain("Loaded skill different-directory");
       for (const name of additionalSkills) expect(scrollback).toContain(`Opened ${name}`);
@@ -8918,8 +8921,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
-          // The read names the command whose saved output it searches.
-          expect(pane).toContain("cat source.txt output for \"RETRIEVAL_MATCH\"");
+          // The read names the command whose saved output it searches, by the
+          // short form the command's own row shows.
+          expect(pane).toContain("├ Ran printf, cat\n");
+          expect(pane).toContain("Searched printf, cat output for \"RETRIEVAL_MATCH\"");
           if (trigger === "manual") {
             await compactAndWait(tui, root, 20000);
           }
@@ -10547,11 +10552,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
     let phase = 0;
+    // The worker answers only once the parent has saved the turn that sent its
+    // message, so its report starts the next turn instead of joining that one.
+    const hold = holdChildAnswer(root.home);
     const gateway = startDynamicFakeGateway(async (body) => {
       if (!body.includes('"name":"subagent"')) {
-        // A report that arrives while the parent's first turn runs joins that
-        // turn, so the worker answers only once that turn is saved.
-        await waitForRootTurnCommitted(root.home);
+        const refused = await hold.wait();
+        if (refused) return refused;
         return fakeGatewayFinalText("CHILD_SEED_DONE");
       }
       if (phase === 0) {
@@ -10569,6 +10576,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const seeded = await runFx(["ask", "--json", "--auto", "Start a saved conversation with a worker."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
+      hold.check();
       expect(seeded.code).toBe(0);
       const id = parseAskJson(seeded.stdout).session_id;
       expect(id).not.toBe("");
@@ -11081,7 +11089,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let childRequests = 0;
     // Each child answers only once its run's parent has saved its turn, so the
     // report starts the next turn and the receipt gets a request of its own.
-    const hold = holdChildAnswer(root.home);
+    // The hold gives up before `runFx` does, so a failed hold ends fx with the
+    // kept error instead of a killed run's exit code.
+    const RUN_MS = 10_000;
+    const hold = holdChildAnswer(root.home, RUN_MS / 2);
     const gateway = startDynamicFakeGateway(async (body) => {
       if (latestUserIsReport(body)) {
         reports[delegation].push(latestUserText(body));
@@ -11120,11 +11131,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       for (const outcome of ["ok", "failed"] as const) {
         delegation = outcome;
         hold.mark();
-        const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: RUN_MS });
         hold.check();
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
-        const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: RUN_MS });
         expect(repeat.code).toBe(0);
         expect(seen[outcome]).toHaveLength(2);
         expect(seen[outcome][0]?.ok).toBe(true);
@@ -11789,26 +11800,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const firstMessage = "Reply exactly PERSISTED_FIRST.";
     const secondMessage = "Reply exactly PERSISTED_SECOND.";
     // The child answers only once its run's parent has saved the turn that
-    // sent the message. A report that arrives while that turn still runs
-    // joins it (`postMail` in `src/core/agent/worker_runtime.zig`), and the
-    // receipt would get no request of its own.
-    let committedBefore = 0;
-    // A wait that fails is kept and answered with an error response, so fx
-    // sees a failed request and `runFx` ends it normally; the test throws the
-    // kept error after the run. Thrown out of the gateway's handler, it would
-    // fail the test at once and leave fx running.
-    let holdError: unknown;
-    const holdChild = async (): Promise<Response | undefined> => {
-      if (holdError === undefined) {
-        try {
-          await waitForRootTurnCommitted(root.home, committedBefore);
-          return undefined;
-        } catch (error) {
-          holdError = error;
-        }
-      }
-      return new Response("the parent's turn was not saved", { status: 500 });
-    };
+    // sent the message, so each run's report starts the parent's next turn
+    // instead of joining that one.
+    const hold = holdChildAnswer(root.home);
     const gateway = startDynamicFakeGateway(async (body) => {
       // Each run's report starts the parent's next turn.
       if (latestUserIsReport(body)) {
@@ -11830,7 +11824,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(body).toContain("PERSISTED_FIRST");
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
-        const refused = await holdChild();
+        const refused = await hold.wait();
         if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_SECOND");
       }
@@ -11852,7 +11846,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       if (promptText(body).includes(firstMessage)) {
         expect(body).toContain(persistentInstructions);
         expect(body).not.toContain('"name":"subagent"');
-        const refused = await holdChild();
+        const refused = await hold.wait();
         if (refused) return refused;
         return fakeGatewayFinalText("PERSISTED_FIRST");
       }
@@ -11880,7 +11874,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           timeoutMs: 15_000,
         },
       );
-      if (holdError) throw holdError;
+      hold.check();
       expect(first.code).toBe(0);
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("PARENT_FIRST_COMPLETE");
@@ -11890,7 +11884,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const internalChildId = [...children][0]!;
       // The resumed run's child waits for a turn past the ones the first run
       // committed.
-      committedBefore = committedRootTurns(root.home);
+      hold.mark();
 
       const second = await runFx(
         [
@@ -11907,7 +11901,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           timeoutMs: 15_000,
         },
       );
-      if (holdError) throw holdError;
+      hold.check();
       if (second.code !== 0) throw new Error(`Resumed child failed: ${second.stderr}\n${second.stdout}`);
       const secondOutput = parseAskJson(second.stdout).output;
       if (!secondOutput.includes("PARENT_SECOND_COMPLETE")) {

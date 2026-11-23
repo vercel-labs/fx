@@ -2806,6 +2806,34 @@ test "provisional lifecycle owns semantic detail before authoritative reconcilia
     try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
 }
 
+test "a provisional row keeps its call's arguments once they are whole, while the call waits" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "saved-search" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+    } });
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(entry_id).?.arguments_json == null);
+
+    const arguments_json = "{\"handle\":\"result-1111.txt\",\"query\":\"npx\"}";
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+        .arguments_json = arguments_json,
+    } });
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings(arguments_json, detail.arguments_json.?);
+    try std.testing.expect(detail.arguments_json.?.ptr != arguments_json.ptr);
+    try std.testing.expect(detail.streaming);
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+}
+
 test "nonzero command remains Ran in the current compact projection" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
@@ -5616,6 +5644,7 @@ pub const TranscriptRuntime = struct {
                 provisional.presentation_group_id,
                 provisional.tool_name,
                 provisional.activity_kind,
+                provisional.arguments_json,
             ),
             .authoritative_started => |started| self.applyAuthoritativeLifecycle(
                 alloc,
@@ -6078,6 +6107,7 @@ pub const TranscriptRuntime = struct {
         presentation_group_id: ?types.ToolPresentationGroupId,
         tool_name: ?[]const u8,
         activity_kind: types.ToolActivityKind,
+        arguments_json: ?[]const u8,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
         if (self.notebook.lifecycle_state.recordPtr(id)) |record| {
@@ -6092,7 +6122,7 @@ pub const TranscriptRuntime = struct {
                 id,
                 name,
                 activity_kind,
-                null,
+                arguments_json,
             );
             defer detail_start.deinit(alloc);
             detail_start.streaming = true;
@@ -6123,7 +6153,7 @@ pub const TranscriptRuntime = struct {
             id,
             tool_name orelse "tool",
             activity_kind,
-            null,
+            arguments_json,
         );
         defer detail_start.deinit(alloc);
         detail_start.streaming = true;

@@ -9591,6 +9591,42 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 3,
 );
 
+test.skipIf(!tmuxAvailable())(
+  "a question still open when fx was killed reads as one fx couldn't ask after a resume",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-question-");
+    const question = "STOPPED_QUESTION_6120: ship the release now?";
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("QUESTION_RESUMED_6120");
+      if (body.includes("Ask before shipping.")) {
+        return fakeGatewayToolCall("stopped_question", "ask_user_question", {
+          questions: [{ question, options: [{ label: "Ship" }, { label: "Wait" }] }],
+        });
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Ask before shipping.");
+      await active.waitForText(question, TIMEOUT);
+      await endFx(active, "SIGKILL");
+
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      const pane = await active.waitForText("QUESTION_RESUMED_6120", TIMEOUT);
+      expect(pane).toContain("● Couldn't ask you · fx stopped");
+      expect(pane.split("\n").map((line) => line.trim())).not.toContain("● Failed");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
 /// The model-facing messages of a gateway request, as text.
 function requestMessages(body: string): string[] {
   const prompt = (JSON.parse(body).prompt ?? []) as Array<{ role: string; content: unknown }>;

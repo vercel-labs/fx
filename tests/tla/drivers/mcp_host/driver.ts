@@ -42,7 +42,11 @@ export function fxEnv(f: Fixture, extra: Record<string, string> = {}): Record<st
 
 /** A stdio server entry for mcp.json running the fixture. */
 export function stdioServer(f: Fixture, name: string, extra: Record<string, string> = {}) {
-  return { command: BUN, args: [FIXTURE], env: { FIXTURE_NAME: name, FIXTURE_LOG: f.serverLog, FIXTURE_CONTROL: f.control, ...extra } };
+  // These traces model the session's own engine (HostLifecycle.tla and its
+  // neighbors): its starts, reloads, and stops. A server shared between
+  // sessions runs in the owner instead, which SharedServers.tla and the
+  // owner's tests cover, so these servers stay in the session.
+  return { command: BUN, args: [FIXTURE], shared: false, env: { FIXTURE_NAME: name, FIXTURE_LOG: f.serverLog, FIXTURE_CONTROL: f.control, ...extra } };
 }
 
 export function writeProfile(f: Fixture, servers: Record<string, unknown>) {

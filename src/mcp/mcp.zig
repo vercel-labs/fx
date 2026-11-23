@@ -32,6 +32,10 @@ pub const http_headers = @import("protocol/http_headers.zig");
 /// Runs one stdio server process.
 pub const stdio = @import("io/process.zig");
 
+/// Bounds the engine and the host agree on, such as the largest message
+/// either reads.
+pub const limits = @import("io/limits.zig");
+
 /// Streamable HTTP (2026) POSTs over std.http.Client.
 pub const http = @import("io/http.zig");
 
