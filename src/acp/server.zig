@@ -7604,9 +7604,9 @@ test "ACP a waiter blocked on the client wakes for each kind of answer, cancel, 
         var session: ActiveSessionState = undefined;
         session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
         try attachOpenerForTest(&session, &state);
+        defer releaseTestSession(&state, &session);
         session.outbound = .{};
         defer session.outbound.pending.deinit(alloc);
-        try attachOpenerForTest(&session, &state);
 
         var waiting = prompt_test_controls.Gate{};
         prompt_test_controls.outbound_waiting = &waiting;
