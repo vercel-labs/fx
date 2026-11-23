@@ -8623,6 +8623,7 @@ test "a queued prompt's answer is written on the connection that sent it, not on
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
     const owner_before = owner_wire.bytes.items.len;
 
@@ -8826,6 +8827,7 @@ test "a next turn that fails to start answers each waiting prompt and steer with
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
 
     // A follower's steer, waiting when the next turn failed to start.
@@ -8970,6 +8972,7 @@ test "a prompt that arrives after the close has begun is refused, and starts no 
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
 
     beginClose(session);
@@ -9139,6 +9142,7 @@ test "a reap that finds a join under way waits for it, and joins nothing once th
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     const session = try openAnswerSession(alloc, &state, &follower);
     const line = &session.waiting_prompts;
 
@@ -9382,6 +9386,7 @@ test "a follower's prompt on an idle session starts a turn on that session, and 
         .writer = jsonrpc.Writer.initCallback(&follower_wire, AnswerWire.write),
         .connection_id = 2,
     };
+    defer follower.deinit();
     follower.host.cfg.minimal_kernel = false;
     const session = try openAnswerSession(alloc, &state, &follower);
     const owner_before = owner_wire.bytes.items.len;
