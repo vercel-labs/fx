@@ -1862,6 +1862,15 @@ pub fn attachOpenerForTest(session: *ActiveSessionState, state: *ServerState) !v
     addMembershipLocked(state, session, opener);
 }
 
+/// Drops the membership a test made for `session`, and its reference, so the test state stays usable.
+pub fn dropMembershipForTest(state: *ServerState, session: *ActiveSessionState) void {
+    for (state.memberships.items, 0..) |membership, index| {
+        if (membership.session != session) continue;
+        removeMembershipAt(state, index);
+        return;
+    }
+}
+
 /// Drops a test state's memberships and their references, without closing the sessions a test
 /// built by hand. The test frees the session's member list with `freeMembers` first.
 pub fn releaseMembershipsForTest(state: *ServerState) void {

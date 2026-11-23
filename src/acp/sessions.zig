@@ -3283,23 +3283,30 @@ test "execution replay plan interleaves assistant text and orphan results" {
 }
 
 /// A session to replay history for in tests that open none.
-fn testReplaySession(state: *server.ServerState, session_id: []const u8) server.ActiveSessionState {
-    var session: server.ActiveSessionState = undefined;
-    session.client_writer = jsonrpc.Writer.initCallback(&session, server.forwardToMain);
-    server.attachOpenerForTest(&session, state) catch unreachable;
+fn testReplaySession(state: *server.ServerState, session: *server.ActiveSessionState, session_id: []const u8) void {
+    session.* = undefined;
+    session.client_writer = jsonrpc.Writer.initCallback(session, server.forwardToMain);
+    session.waiting_prompts = .{};
+    server.attachOpenerForTest(session, state) catch unreachable;
     session.session_id = @constCast(session_id);
     session.workspace = &state.launch;
     session.workspace_root = state.launch.root;
     session.tool_identities = .{};
     session.tool_identities_mutex = .init;
     session.mcp_host = null;
-    return session;
+}
+
+fn releaseTestReplaySession(state: *server.ServerState, session: *server.ActiveSessionState) void {
+    server.freeMembers(session, state.host.alloc);
+    server.dropMembershipForTest(state, session);
 }
 
 fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(alloc);
-    var session = testReplaySession(state, session_id);
+    var session: server.ActiveSessionState = undefined;
+    testReplaySession(state, &session, session_id);
+    defer releaseTestReplaySession(state, &session);
     return sendHistoryTurnAsUpdates(try server.pendingMember(state), &session, alloc, &sources, turn, null);
 }
 
@@ -3390,7 +3397,9 @@ test "ACP load titles a read with the call from an earlier turn" {
     };
     var read_steps = [_]types.ToolExecutionStep{.{ .tool_calls = read_calls[0..] }};
 
-    var replay_session = testReplaySession(&state, "session-1");
+    var replay_session: server.ActiveSessionState = undefined;
+    testReplaySession(&state, &replay_session, "session-1");
+    defer releaseTestReplaySession(&state, &replay_session);
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
     defer sources.deinit(arena);
     try sendHistoryTurnAsUpdates(try server.pendingMember(&state), &replay_session, arena, &sources, .{ .assistant = .{
