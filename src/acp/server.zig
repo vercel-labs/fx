@@ -1871,6 +1871,22 @@ pub fn dropMembershipForTest(state: *ServerState, session: *ActiveSessionState) 
     }
 }
 
+/// Frees a test session's member list and each membership a test made for it, and the list
+/// itself once no membership is left. A test defers it right after it attaches the session.
+pub fn releaseTestSession(state: *ServerState, session: *ActiveSessionState) void {
+    freeMembers(session, state.host.alloc);
+    var index = state.memberships.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (state.memberships.items[index].session != session) continue;
+        removeMembershipAt(state, index);
+    }
+    if (state.memberships.items.len == 0) {
+        state.memberships.deinit(state.alloc);
+        state.memberships = .empty;
+    }
+}
+
 /// Drops a test state's memberships and their references, without closing the sessions a test
 /// built by hand. The test frees the session's member list with `freeMembers` first.
 pub fn releaseMembershipsForTest(state: *ServerState) void {
@@ -7370,6 +7386,7 @@ test "an ACP steer that cuts the reply short is no turn cancel, and the client's
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
     defer session.outbound.pending.deinit(alloc);
     try attachOpenerForTest(&session, &state);
+    defer releaseTestSession(&state, &session);
     session.steering.open(alloc);
     defer session.steering.deinit(alloc);
     _ = session.steering.notePhase(1, .reply, &session.cancel_flag);
