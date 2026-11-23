@@ -471,9 +471,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, fork, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).toContain("session resume [last|<id>]");
+        expect(r.stdout).toContain("session fork <last|id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
         // Sessions convert on open; there is nothing to migrate by hand.
         expect(r.stdout).not.toContain("migrate");
@@ -5058,6 +5059,194 @@ describe("cli: session", () => {
         expect(child.stdout).not.toContain(childId);
       } finally {
         rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+  // The environment a run gets from `gateway`, with no key but the test's.
+  function forkEnv(home: string, gateway: ReturnType<typeof startFakeGateway>): Record<string, string | undefined> {
+    return {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "session-fork-test-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+  }
+
+  // Starts fx without waiting, so a test can work while it runs. The caller
+  // owns `proc` and must end it.
+  function startFx(args: string[], env: Record<string, string | undefined>, cwd: string) {
+    const proc = Bun.spawn([FX_BIN, ...args], {
+      cwd,
+      env: Object.fromEntries(
+        Object.entries({ ...env, NO_COLOR: "1", FX_SOUND: "0", PATH: process.env.PATH })
+          .filter((entry): entry is [string, string] => entry[1] !== undefined),
+      ),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const finished = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+      .then(([stdout, stderr, code]) => ({ stdout, stderr, code }));
+    return { proc, finished };
+  }
+
+  test(
+    "session fork copies a saved session by id and last, marks its title, leaves source untouched, and resumes cleanly",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const workspaceRoot = realpathSync(workspace);
+      const gateway = startFakeGateway([fakeGatewayFinalText("turn one ok"), fakeGatewayFinalText("follow up ok")]);
+      const env = forkEnv(home, gateway);
+      try {
+        const first = await runFx(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+        const sourceBefore = savedText(home, sourceId);
+
+        const fork = await runFx(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked).toMatchObject({
+          kind: "session_fork",
+          source_id: sourceId,
+          workspace_root: workspaceRoot,
+          history_turns: 1,
+          copied_agents: 0,
+        });
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(savedText(home, sourceId)).toBe(sourceBefore);
+
+        const follow = await runFx(["ask", "--resume", forked.fork_id, "--json", "follow up"], { cwd: workspace, env });
+        expect(follow.code, follow.stderr).toBe(0);
+        expect(follow.stdout).toContain("follow up ok");
+        const forkDetail = await runFx(["session", forked.fork_id, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(forkDetail.code, forkDetail.stderr).toBe(0);
+        expect(JSON.parse(forkDetail.stdout).history_len).toBe(2);
+        const sourceDetail = await runFx(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(sourceDetail.stdout).history_len).toBe(1);
+
+        const last = await runFx(["session", "fork", "last"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code, last.stderr).toBe(0);
+        expect(last.stderr).toBe("");
+        expect(last.stdout).toContain("[session fork] copied");
+        expect(last.stdout).toContain("history_turns:");
+        expect(last.stdout).toContain("resume: fx --resume");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session fork copies a live mid-turn session without blocking the running agent",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      let signalTurn2Started!: () => void;
+      const turn2Started = new Promise<void>((resolve) => (signalTurn2Started = resolve));
+      let releaseTurn2!: () => void;
+      const turn2Released = new Promise<void>((resolve) => (releaseTurn2 = resolve));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("turn one ok"),
+        async () => {
+          signalTurn2Started();
+          await turn2Released;
+          return fakeGatewayFinalText("turn two ok");
+        },
+        fakeGatewayFinalText("side answer"),
+      ]);
+      const env = forkEnv(home, gateway);
+      let turn2: ReturnType<typeof startFx> | undefined;
+      try {
+        const first = await runFx(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+
+        turn2 = startFx(["ask", "--resume", sourceId, "--json", "Say the second answer."], env, workspace);
+        await Promise.race([
+          turn2Started,
+          turn2.finished.then((done) => {
+            throw new Error(`turn two ended before the gateway saw it: ${done.stderr}`);
+          }),
+        ]);
+
+        const live = await runFx(["sessions", "--live", "--all", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(live.code, live.stderr).toBe(0);
+        expect(JSON.parse(live.stdout).sessions).toContainEqual(expect.objectContaining({ id: sourceId, state: "working" }));
+
+        const fork = await runFx(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(forked).toMatchObject({ kind: "session_fork", source_id: sourceId, history_turns: 1 });
+
+        const side = await runFx(["ask", "--resume", forked.fork_id, "--json", "side question"], { cwd: workspace, env });
+        expect(side.code, side.stderr).toBe(0);
+        expect(side.stdout).toContain("side answer");
+
+        releaseTurn2();
+        const done = await turn2.finished;
+        expect(done.code, done.stderr).toBe(0);
+        expect(done.stdout).toContain("turn two ok");
+        const detail = await runFx(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(detail.stdout).history_len).toBe(2);
+      } finally {
+        releaseTurn2();
+        if (turn2 && turn2.proc.exitCode === null) turn2.proc.kill();
+        if (turn2) await turn2.finished;
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "session fork reports usage and lookup errors with stable exit codes",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      try {
+        const usage = await runFx(["session", "fork"], { cwd: workspace, env: { HOME: home } });
+        expect(usage.code).toBe(2);
+        expect(usage.stderr).toContain("session fork <last|id>|--id <id> [--json]");
+
+        const tail = await runFx(["session", "fork", "id", "--tail", "5", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(tail.code).toBe(2);
+        expect(tail.stderr).toBe("");
+        expect(JSON.parse(tail.stdout)).toEqual({ kind: "session", error: "invalid arguments", code: "InvalidSessionForkArgs" });
+
+        const missing = await runFx(["session", "fork", "missing-session", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(missing.code).toBe(1);
+        expect(missing.stderr).toBe("");
+        expect(JSON.parse(missing.stdout)).toEqual({ kind: "session", error: "record not found", code: "SessionNotFound" });
+
+        const last = await runFx(["session", "fork", "last", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code).toBe(1);
+        expect(last.stderr).toBe("");
+        expect(JSON.parse(last.stdout)).toMatchObject({ kind: "session", code: "NoSavedSessions" });
+      } finally {
+        cleanupIsolatedTestHome(root);
       }
     },
     TIMEOUT,

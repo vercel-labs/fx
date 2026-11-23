@@ -402,6 +402,16 @@ const SessionRecoveryOptions = struct {
     }
 };
 
+const SessionForkOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    target: SessionDetailTarget,
+
+    fn deinit(self: *SessionForkOptions, alloc: Allocator) void {
+        self.target.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 const AcpOptions = struct {
     agent: agent_run_flags.Overrides = .{},
     log_file: ?[]const u8 = null,
@@ -2057,6 +2067,14 @@ fn runNonInteractiveWithDeps(
             return runDoctor(alloc, cfg, deps, opts);
         },
         .session => |rest| {
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "fork")) {
+                var fork = parseSessionForkArgs(alloc, rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest[1..]);
+                    return usage_failure;
+                };
+                defer fork.deinit(alloc);
+                return runSessionFork(alloc, deps, fork);
+            }
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
                 var recovery = parseSessionRecoveryArgs(
                     alloc,
@@ -3423,6 +3441,18 @@ fn writeSessionRecovery(
     return if (result.status == .recovered) .handled_success else .handled_failure;
 }
 
+fn writeSessionFork(
+    alloc: Allocator,
+    deps: RunDeps,
+    result: session_store.SessionForkResult,
+    format: output_contracts.OutputFormat,
+) !RunResult {
+    const text = try (output_contracts.SessionForkSnapshot{ .result = result }).render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+    return .handled_success;
+}
+
 /// `fx sessions` on v2: the page v1 shows, from the v2 catalog.
 fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
@@ -3738,6 +3768,60 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     return writeSessionRecovery(alloc, deps, result, recovery.format);
 }
 
+/// `fx session fork <last|id>` (D5): copies a saved or live root session up
+/// to its last finished turn. The result borrows the source id and the fork,
+/// which this function frees.
+fn runSessionFork(alloc: Allocator, deps: RunDeps, fork: SessionForkOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), fork.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    const source_id = (try resolveForkSource(alloc, deps, &store, fork.target, fork.format)) orelse return .handled_failure;
+    defer alloc.free(source_id);
+    var forked = session_adapter.forkSession(&store, alloc, source_id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, source_id, session_adapter.commandError(err), store.problem.text(), fork.format);
+        return .handled_failure;
+    };
+    defer forked.deinit(alloc);
+    return writeSessionFork(alloc, deps, .{
+        .source_session_id = source_id,
+        .fork_session_id = forked.id,
+        .workspace_root = forked.workspace_root,
+        .history_len = forked.history_len,
+        .copied_agents = forked.copied_agents,
+    }, fork.format);
+}
+
+/// The saved session `fork` copies: the id given, or the newest one in this
+/// workspace for `last`. Null after a lookup failure has been written. Caller
+/// owns the id.
+fn resolveForkSource(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    target: SessionDetailTarget,
+    format: output_contracts.OutputFormat,
+) !?[]u8 {
+    switch (target) {
+        .id => |id| return try alloc.dupe(u8, id),
+        .last => {
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            var page = session_adapter.listPage(store, alloc, workspace_root, null, 1) catch |err| {
+                try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), format);
+                return null;
+            };
+            defer page.deinit(alloc);
+            if (page.summaries.items.len == 0) {
+                try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(store, alloc), format);
+                return null;
+            }
+            return try alloc.dupe(u8, page.summaries.items[0].id);
+        },
+    }
+}
+
 fn writeLookupFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -3868,6 +3952,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionDetailArgs,
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
+        error.InvalidSessionForkArgs,
         error.InvalidResumeArgs,
         error.InvalidUpgradeArgs,
         error.InvalidConfigArgs,
@@ -5054,6 +5139,23 @@ fn parseSessionRecoveryArgs(
     };
 }
 
+fn parseSessionForkArgs(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+) !SessionForkOptions {
+    const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionForkArgs;
+    // A fork copies up to a turn boundary; it shows no turns to tail.
+    if (parsed.tail != null) return error.InvalidSessionForkArgs;
+    const target = parsed.target orelse return error.InvalidSessionForkArgs;
+    return .{
+        .format = parsed.format,
+        .target = if (!parsed.exact_id and std.mem.eql(u8, target, "last"))
+            .last
+        else
+            .{ .id = try alloc.dupe(u8, target) },
+    };
+}
+
 fn parseResumeArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -5967,6 +6069,38 @@ test "parse session recovery args accepts exact ids and rejects ambiguity" {
             },
         ),
     );
+}
+
+test "parse session fork args takes an id, last, or the exact id flag and rejects bad input" {
+    const alloc = std.testing.allocator;
+
+    var by_id = try parseSessionForkArgs(alloc, &.{ "release.2026.06", "--json" });
+    defer by_id.deinit(alloc);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, by_id.format);
+    switch (by_id.target) {
+        .last => return error.TestExpectedExactId,
+        .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
+    }
+
+    var newest = try parseSessionForkArgs(alloc, &.{ "last", "--json" });
+    defer newest.deinit(alloc);
+    switch (newest.target) {
+        .last => {},
+        .id => return error.TestExpectedLast,
+    }
+
+    var exact = try parseSessionForkArgs(alloc, &.{ "--id", "last" });
+    defer exact.deinit(alloc);
+    switch (exact.target) {
+        .last => return error.TestExpectedExactId,
+        .id => |id| try std.testing.expectEqualStrings("last", id),
+    }
+
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{"--json"}));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "id", "--tail", "5" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "id", "--jsno" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "a", "--id", "b" }));
+    try std.testing.expectError(error.InvalidSessionForkArgs, parseSessionForkArgs(alloc, &.{ "a", "b" }));
 }
 
 test "parse resume args defaults to last owns ids and rejects invalid input" {
