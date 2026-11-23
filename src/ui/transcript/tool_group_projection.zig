@@ -1953,6 +1953,9 @@ const StoryRow = struct {
     /// The messages its subagent sent main while main waited, which join a
     /// wait's row (`joinWaitChain`).
     received_messages: usize = 0,
+    /// How many calls later rows that said the same stood for, which
+    /// joinRepeatedRows folded into this one.
+    joined_calls: usize = 0,
 };
 
 /// The name a call adds to a `.read`, `.search`, `.more_output`, or
@@ -2202,18 +2205,27 @@ fn pendingCallRow(scratch: std.mem.Allocator, rows: []StoryRow, entry: Transcrip
 /// that order. The newest few show and the older ones are counted before
 /// them, so the last step is the newest call's, which may still run.
 fn combinedCommandSteps(scratch: std.mem.Allocator, records: []const *const ToolDetailRecord) !ShortCommand {
-    var all: std.ArrayList([]const u8) = .empty;
+    var ran: std.ArrayList([]const u8) = .empty;
     for (records) |record| {
         const source = storyArgString(scratch, record, "command") orelse record.command_display orelse continue;
-        var steps: std.ArrayList([]const u8) = .empty;
+        const before = ran.items.len;
         var raw_steps: usize = 0;
-        if (try collectShortSteps(scratch, source, &steps, &raw_steps, 0) and steps.items.len > 0) {
-            for (steps.items) |step| try StoryTally.addLatest(&all, scratch, step);
-        } else {
-            const first = std.mem.trim(u8, source, " \t\r\n");
-            if (first.len > 0) try StoryTally.addLatest(&all, scratch, first[0 .. std.mem.findAny(u8, first, " \t\r\n") orelse first.len]);
+        if (!try collectShortSteps(scratch, source, &ran, &raw_steps, 0) or ran.items.len == before) {
+            ran.shrinkRetainingCapacity(before);
+            try ran.append(scratch, unnamedCommandName((try shortText(scratch, source)).text));
         }
     }
+    // Each step once, where it last ran: a walk back keeps the first of each
+    // it meets.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var all: std.ArrayList([]const u8) = .empty;
+    var index = ran.items.len;
+    while (index > 0) {
+        index -= 1;
+        if ((try seen.getOrPut(scratch, ran.items[index])).found_existing) continue;
+        try all.append(scratch, ran.items[index]);
+    }
+    std.mem.reverse([]const u8, all.items);
     const kept = @min(all.items.len, short_command_max_steps);
     return .{ .steps = all.items[all.items.len - kept ..], .more = 0, .earlier = all.items.len - kept };
 }
@@ -2917,13 +2929,11 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     // Core writes the path terminal-safe, so a control byte in it shows
     // escaped.
     const shown = try terminalSafeText(scratch, path);
-    if (phrase.len <= shown.len or !std.mem.endsWith(u8, phrase, shown)) return null;
-    const label = phrase[0 .. phrase.len - shown.len];
-    if (label[label.len - 1] != ' ') return null;
-    if (std.Io.Dir.path.basename(path).len == 0) return null;
+    const named = phrasePath(phrase, path, shown) orelse return null;
+    if (std.Io.Dir.path.basename(named.path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
-    try out.writer.writeAll(label);
-    try writeFileName(&out.writer, path);
+    try out.writer.writeAll(named.label);
+    try writeFileName(&out.writer, named.path);
     if (!merged) {
         // "L15-200" for a start and a count, "L15+" for a start alone, and
         // "L1-200" for a count alone.
@@ -2953,21 +2963,39 @@ fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     const shown = try terminalSafeText(scratch, path);
     const named = if (diffStatsSuffixStart(phrase)) |at| phrase[0..at] else phrase;
     const merged = row.identity.kind == .edit and row.count > 1;
-    const label = if (named.len > shown.len and std.mem.endsWith(u8, named, shown) and named[named.len - shown.len - 1] == ' ')
-        named[0 .. named.len - shown.len]
+    const target: PhrasePath = if (phrasePath(named, path, shown)) |found|
+        found
     else if (merged)
         // The row's calls are completed or running changes, whose verb is
         // one word, such as "Edited".
-        if (findByte(named, ' ')) |space| named[0 .. space + 1] else return null
+        if (findByte(named, ' ')) |space| .{ .label = named[0 .. space + 1], .path = path } else return null
     else
         return null;
     const totals = if (merged) row.diff else diffTotalsOfPhrase(phrase);
     var out: std.Io.Writer.Allocating = .init(scratch);
-    try out.writer.writeAll(label);
-    try writeFileName(&out.writer, path);
+    try out.writer.writeAll(target.label);
+    try writeFileName(&out.writer, target.path);
     if (totals.added > 0) try out.writer.print(" +{d}", .{totals.added});
     if (totals.removed > 0) try out.writer.print("{s}-{d}", .{ if (totals.added > 0) "/" else " ", totals.removed });
     return out.written();
+}
+
+/// A phrase's label, such as "Wrote ", and the path after it that its row
+/// names the file by.
+const PhrasePath = struct { label: []const u8, path: []const u8 };
+
+/// The label and path of a phrase that ends with the file a call named:
+/// `path`, which core wrote as `shown`, or the absolute path core named the
+/// file by instead. Core names a file outside the project by its resolved
+/// path, so a link cannot make it look like one inside, such as
+/// "/private/tmp/notes.md" for a call that named "/tmp/notes.md"; the row
+/// then names it that way too. Null when the phrase ends with neither.
+fn phrasePath(phrase: []const u8, path: []const u8, shown: []const u8) ?PhrasePath {
+    if (shown.len > 0 and phrase.len > shown.len and std.mem.endsWith(u8, phrase, shown) and phrase[phrase.len - shown.len - 1] == ' ')
+        return .{ .label = phrase[0 .. phrase.len - shown.len], .path = path };
+    const start = (std.mem.find(u8, phrase, " /") orelse return null) + 1;
+    if (std.Io.Dir.path.basename(phrase[start..]).len == 0) return null;
+    return .{ .label = phrase[0..start], .path = phrase[start..] };
 }
 
 /// A running read, edit, or write row by the file's name before the call's
@@ -3739,6 +3767,76 @@ fn collectStoryRows(
     return rows;
 }
 
+/// A finished row that says the same as an earlier row of its group joins
+/// that row, which then counts the calls of both, so a repeat shows once and
+/// the other rows keep their order. A row still running or that failed keeps
+/// its own, and so does a row for a file, a saved output, or a pattern, whose
+/// calls already share a row: two files with the same name stay two rows. A
+/// subagent's report keeps its own line, and so does a subagent wait or
+/// status, whose row tells what main did while its subagents worked.
+fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) !void {
+    // Where the first row with each key went among the kept rows.
+    var firsts: std.StringHashMapUnmanaged(usize) = .empty;
+    var kept: usize = 0;
+    for (rows.items) |row| {
+        if (try repeatKey(scratch, &row)) |key| {
+            const first = try firsts.getOrPut(scratch, key);
+            if (first.found_existing) {
+                rows.items[first.value_ptr.*].joined_calls += rowCalls(&row);
+                continue;
+            }
+            first.value_ptr.* = kept;
+        }
+        rows.items[kept] = row;
+        kept += 1;
+    }
+    rows.shrinkRetainingCapacity(kept);
+}
+
+/// The widest row joinRepeatedRows compares, so no row's text is clipped.
+const repeat_key_cols = std.math.maxInt(u16);
+
+/// What a row says once its calls finished, which a later row must say too
+/// to join it. Null for a row that keeps its own.
+fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    if (record.activity_kind == .subagent and !isSubagentMessage(scratch, record)) return null;
+    switch (row.identity.kind) {
+        .read, .more_output, .search, .edit, .subagent_wait => return null,
+        // A command, read, search, or change whose arguments do not name
+        // what it ran or touched may not be the same call, so it keeps its
+        // own row, and so does any call with no usable arguments.
+        .single => if (record.activity_kind == .command or joinsByArgument(record) or !storyHasArgs(record)) return null,
+        else => {},
+    }
+    if (record.outcome != .completed or record.streaming or row.failures > 0 or row.tries > 1 or storyCallFailed(row.detail)) return null;
+    const body = (try storyRowText(scratch, row, .{}, repeat_key_cols)).body;
+    // A row whose command has not ended, such as a check's "Waiting for",
+    // has not finished either.
+    return if (phraseShowsProgress(body)) null else body;
+}
+
+/// How many calls a row stands for.
+fn rowCalls(row: *const StoryRow) usize {
+    return if (row.identity.kind == .commands) row.combined.items.len else row.count;
+}
+
+/// How many calls a row that later repeats joined stands for, such as
+/// " · 4 calls", or " · 2 messages" for messages to or from a subagent. ""
+/// when no row joined it.
+fn joinedNote(scratch: std.mem.Allocator, row: *const StoryRow) ![]const u8 {
+    if (row.joined_calls == 0) return "";
+    const messages = isSubagentMessage(scratch, row.detail.?);
+    return countNote(scratch, " · ", rowCalls(row) + row.joined_calls, if (messages) " messages" else " calls");
+}
+
+/// Whether a call is main's message to a subagent, not a report, wait, or
+/// status.
+fn isSubagentMessage(scratch: std.mem.Allocator, record: *const ToolDetailRecord) bool {
+    if (record.activity_kind != .subagent or record.subagent_report) return false;
+    return std.mem.eql(u8, storyArgString(scratch, record, "action") orelse "", "message");
+}
+
 /// The command the run that started a session sent, for a later call to that
 /// session. Such a call has no `command` argument, and its display folds the
 /// command onto one line, where a here-document's body no longer lexes as
@@ -3794,11 +3892,12 @@ test "a session's row shortens the command its run sent, not the display folded 
     errdefer std.debug.print("check:\n{s}\n", .{text});
     try std.testing.expectEqualStrings("● Waiting for python3", std.mem.trim(u8, text, "\n"));
 
-    // With no run in the transcript, the row keeps its display.
+    // With no run in the transcript, the row reads the folded display, whose
+    // document's body drops out up to its delimiter word.
     const alone = try groupTextForTest(alloc, &entries, &.{check});
     defer alloc.free(alone);
     errdefer std.debug.print("alone:\n{s}\n", .{alone});
-    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, alone, "\n"), "● Waiting for python3 - <<"));
+    try std.testing.expectEqualStrings("● Waiting for python3", std.mem.trim(u8, alone, "\n"));
 }
 
 /// The latest row with a run that returned while its command went on, for a
@@ -3859,15 +3958,16 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         const label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
+        const note = try joinedNote(scratch, row);
         // A narrow row leaves out its oldest steps first, so the newest stays
         // in view. The budget leaves room for the connector and the mark.
         const budget: usize = if (cols > 4) cols - 4 else 1;
-        while (steps.steps.len > 1 and display_width.visibleWidthIgnoringAnsi(display) > budget) {
+        while (steps.steps.len > 1 and display_width.visibleWidthIgnoringAnsi(display) + display_width.visibleWidthIgnoringAnsi(note) > budget) {
             steps.steps = steps.steps[1..];
             steps.earlier += 1;
             display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
         }
-        return .{ .display = display, .body = display, .suffix = "" };
+        return .{ .display = try std.mem.concat(scratch, u8, &.{ display, note }), .body = display, .suffix = note };
     }
     const merged_read = row.identity.kind == .read and row.count > 1;
     const status_phrase = if (merged_read)
@@ -3940,7 +4040,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const passed_after_failing = row.failures > 0 and row.detail != null and
         row.detail.?.outcome != null and !storyCallFailed(row.detail);
     // A call that completed after the model repeated it says which try it was.
-    const suffix: []const u8 = if (row.count < 2) (if (row.tries > 1) try countNote(scratch, " · ", row.tries, ordinalEnding(row.tries, " try")) else "") else switch (row.identity.kind) {
+    const suffix: []const u8 = if (row.joined_calls > 0) try joinedNote(scratch, row) else if (row.count < 2) (if (row.tries > 1) try countNote(scratch, " · ", row.tries, ordinalEnding(row.tries, " try")) else "") else switch (row.identity.kind) {
         .command => if (passed_after_failing)
             // " ×3 · passed on the 3rd run".
             try countNote(scratch, try countNote(scratch, " ×", row.count, " · passed on the "), row.count, ordinalEnding(row.count, " run"))
@@ -4416,7 +4516,8 @@ fn writeGroupBlock(
 ) ![]const u8 {
     const retries = try collectStoryRetries(scratch, entries, status_indices, details, detail_indices);
     var unshown: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    const rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, output_sources, focused_entry_id, &retries, &unshown);
+    var rows = try collectStoryRows(scratch, entries, status_indices, details, detail_indices, output_sources, focused_entry_id, &retries, &unshown);
+    try joinRepeatedRows(scratch, &rows);
     // A group whose only calls name nothing yet shows nothing until they do.
     if (rows.items.len == 0 and unshown.count() > 0) return "";
     var tally: StoryTally = .{};
@@ -4793,6 +4894,11 @@ const shell_programs = [_][]const u8{
 /// How deep the short form looks into `sh -c` scripts inside `sh -c` scripts.
 const short_command_max_depth = 2;
 
+/// How many `$( )`, `<( )`, and array lists inside one another shortText
+/// reads part by part. Deeper ones it only counts its way through, so a
+/// command nested without end cannot run the stack out.
+const short_text_max_depth = 16;
+
 /// Programs that run a script named by their first argument.
 const interpreter_programs = [_][]const u8{
     "sh",      "bash", "zsh", "dash", "fish", "python",
@@ -4822,7 +4928,10 @@ const ShortStep = struct {
     /// A wrapper such as `timeout` came first, so its flags and its number
     /// are skipped until the program it runs.
     after_wrapper: bool = false,
-    /// git's `-C <dir>` and `-c <key=value>` take the next token.
+    /// The wrapper that came first, such as `env`.
+    wrapper: []const u8 = "",
+    /// git's `-C <dir>` and `-c <key=value>`, and env's `-u <name>`, take
+    /// the next token.
     skip_next: bool = false,
     after_pipe: bool = false,
     /// A loop header or a block's end, which the short form leaves out.
@@ -4831,6 +4940,8 @@ const ShortStep = struct {
     script_flag: bool = false,
     /// The script a `sh -c` step runs, whose own steps the short form shows.
     inline_script: ?[]const u8 = null,
+    /// Where the step's first token starts in the lexed text, once it has one.
+    start: ?usize = null,
 };
 
 fn isWordToken(token: command_lex.ArgvToken) bool {
@@ -4863,12 +4974,20 @@ fn shortProgramName(value: []const u8) []const u8 {
 fn addShortToken(step: *ShortStep, token: command_lex.ArgvToken, roles: WordRoles) void {
     const value = token.value;
     if (step.program.len == 0) {
+        if (step.skip_next) {
+            step.skip_next = false;
+            return;
+        }
         if (command_lex.is_safe_env_assignment(value) or isEnvAssignment(value)) return;
         // The `$` of a leading `$( ... )`, whose program comes after it.
         if (!token.quoted and std.mem.eql(u8, value, "$")) return;
-        if (step.after_wrapper and looksLikeWrapperArgument(value)) return;
+        if (step.after_wrapper and looksLikeWrapperArgument(value)) {
+            step.skip_next = std.mem.eql(u8, step.wrapper, "env") and isEnvValueOption(value);
+            return;
+        }
         if (roles.wrapper) {
             step.after_wrapper = true;
+            step.wrapper = value;
             return;
         }
         if (!token.quoted and roles.leading_keyword) return;
@@ -4919,14 +5038,35 @@ fn addShortToken(step: *ShortStep, token: command_lex.ArgvToken, roles: WordRole
     step.closed = true;
 }
 
+/// Whether `value` sets a variable, as `name=value` or `name+=value`. A name
+/// that starts with a digit, as in `69c=$(…)`, is no valid name, so the
+/// shell looks for a command by that word and finds none; it names no
+/// program either way.
 fn isEnvAssignment(value: []const u8) bool {
     const eq = findByte(value, '=') orelse return false;
-    if (eq == 0) return false;
-    for (value[0..eq], 0..) |byte, index| {
-        const ok = byte == '_' or std.ascii.isAlphabetic(byte) or (index > 0 and std.ascii.isDigit(byte));
-        if (!ok) return false;
-    }
+    const name = if (eq > 0 and value[eq - 1] == '+') value[0 .. eq - 1] else value[0..eq];
+    if (name.len == 0) return false;
+    for (name) |byte| if (!(byte == '_' or std.ascii.isAlphanumeric(byte))) return false;
     return true;
+}
+
+/// env's options whose value is the next word, such as `-u NAME`, so that
+/// word is not the program env runs.
+fn isEnvValueOption(value: []const u8) bool {
+    const options = [_][]const u8{ "-u", "--unset", "-C", "--chdir" };
+    for (options) |option| if (std.mem.eql(u8, value, option)) return true;
+    return false;
+}
+
+/// The program a step runs through a variable the command set, as
+/// `R=~/bin/review; $R status` runs `review`: the variable's value, whose
+/// base name the step shows. Null when `word` is no variable, or the command
+/// did not set it to a program path.
+fn variableProgram(scope: *const ShortScope, word: []const u8) ?[]const u8 {
+    if (word.len < 2 or word[0] != '$') return null;
+    const value = scope.variable(word[1..]) orelse return null;
+    const program = shortProgramName(value);
+    return if (program.len > 0 and program[0] != '$') value else null;
 }
 
 /// The errors of the short-form step walk, which recurses into `sh -c`
@@ -4939,18 +5079,31 @@ fn finishShortStep(
     raw_steps: *usize,
     step: ShortStep,
     depth: usize,
-    defined: []const []const u8,
+    scope: *const ShortScope,
+    /// The command's `$( )` scripts that no earlier step had, and where the
+    /// step's last token ends.
+    substitutions: *ShortSubstitutions,
+    end: usize,
 ) ShortStepError!void {
-    if (step.program.len == 0 and !step.after_wrapper) return;
+    // A step that only sets variables, as `mb=$(git merge-base …)`, and a
+    // loop's word list run the commands in their `$( )`, which show. A
+    // `$( )` in a program's own arguments stays part of them.
+    const sets_only = step.program.len == 0 and !step.after_wrapper;
+    const loop_list = std.mem.eql(u8, step.program, "for") or std.mem.eql(u8, step.program, "select");
+    const own = substitutions.take(step.start, end);
+    if ((sets_only or loop_list) and depth < short_command_max_depth) {
+        for (own) |substitution| _ = try collectScopedSteps(scratch, substitution.script, steps, raw_steps, depth + 1, scope);
+    }
+    if (sets_only) return;
     // A `sh -c` step shows the steps of its script, when they lex.
     if (step.inline_script) |script| if (depth < short_command_max_depth) {
         const before = steps.items.len;
-        if (try collectShortSteps(scratch, script, steps, raw_steps, depth + 1) and steps.items.len > before) return;
+        if (try collectScopedSteps(scratch, script, steps, raw_steps, depth + 1, scope) and steps.items.len > before) return;
     };
     raw_steps.* += 1;
     if (step.dropped or step.program.len == 0 or step.program_roles.shell_setup) return;
     // A call to a function the command defined runs its body, which shows.
-    for (defined) |name| if (std.mem.eql(u8, step.program, name)) return;
+    if (scope.defines(step.program)) return;
     if (step.after_pipe and step.program_roles.output_filter) return;
     // Words past `word_count` are empty, so they add nothing.
     try steps.append(scratch, try std.mem.concat(scratch, u8, &.{
@@ -5046,24 +5199,49 @@ fn formatShortCommand(scratch: std.mem.Allocator, short: ShortCommand, base_styl
 /// "cd desktop && npm ci --no-audit && npm run build -- --mode production"
 /// is "npm ci, npm run build". A one-step command whose `shown` text, the
 /// command as its row shows it, is at most short_command_max_len bytes keeps
-/// that text. Null when the command keeps its text or does not lex. The steps
-/// live in `scratch`.
+/// that text. A command whose steps it cannot name shows one name instead,
+/// from unnamedCommandName, so a row never shows a long command whole. Null
+/// when the command keeps its text. The steps live in `scratch`.
 fn shortCommandSteps(scratch: std.mem.Allocator, command: []const u8, shown_text: []const u8) !?ShortCommand {
     var steps: std.ArrayList([]const u8) = .empty;
     var raw_steps: usize = 0;
-    if (!try collectShortSteps(scratch, command, &steps, &raw_steps, 0)) return null;
+    const lexed = try collectShortSteps(scratch, command, &steps, &raw_steps, 0);
+    const lexable = try shortText(scratch, command);
     // The same step twice in a row shows once.
     var shown: std.ArrayList([]const u8) = .empty;
     for (steps.items) |text| {
         if (shown.items.len > 0 and std.mem.eql(u8, shown.items[shown.items.len - 1], text)) continue;
         try shown.append(scratch, text);
     }
-    if (shown.items.len == 0) return null;
-    if (raw_steps <= 1 and shown_text.len <= short_command_max_len) return null;
+    // A here-document's body never shows, however short.
+    if (lexed and raw_steps == 1 and shown_text.len <= short_command_max_len and !lexable.here_document) return null;
+    if (!lexed or shown.items.len == 0) {
+        const name = try scratch.alloc([]const u8, 1);
+        name[0] = unnamedCommandName(lexable.text);
+        return .{ .steps = name, .more = 0 };
+    }
     // A command that is already its own short form keeps its text.
     if (shown.items.len == 1 and (std.mem.eql(u8, shown.items[0], command) or std.mem.eql(u8, shown.items[0], shown_text))) return null;
     const kept = @min(shown.items.len, short_command_max_steps);
     return .{ .steps = shown.items[0..kept], .more = shown.items.len - kept };
+}
+
+/// What a row names a command by when it shows none of its steps, as the
+/// shell tool's own label does when a call has no command.
+const unnamed_command = "command";
+
+/// The name of a command whose steps the short form cannot name, as one that
+/// does not lex or only sets variables: the first program its lexed `text`
+/// names, such as "python3", or unnamed_command when it names none.
+fn unnamedCommandName(text: []const u8) []const u8 {
+    var words = std.mem.tokenizeAny(u8, text, " \t\r\n;&|(){}<>");
+    while (words.next()) |word| {
+        const roles = wordRoles(word);
+        if (isEnvAssignment(word) or roles.leading_keyword or roles.wrapper) continue;
+        if (word[0] == '\'' or word[0] == '"' or word[0] == '$' or word[0] == '-') continue;
+        return shortProgramName(word);
+    }
+    return unnamed_command;
 }
 
 /// Appends the steps `command` runs to `steps`, and counts every step it has,
@@ -5075,10 +5253,68 @@ fn collectShortSteps(
     raw_steps: *usize,
     depth: usize,
 ) ShortStepError!bool {
-    // A here-document's body is text for the program, not shell words, so
-    // an apostrophe in it does not stop the command from lexing.
-    const here_docs = try withoutHereDocBodies(scratch, command);
-    const source = here_docs.text;
+    return collectScopedSteps(scratch, command, steps, raw_steps, depth, null);
+}
+
+/// The functions and variables a script sets, which its later steps and the
+/// scripts it runs in a `$( )` or with `sh -c` can use. A script looks in
+/// the scope of the command around it after its own, so no scope copies
+/// another's.
+const ShortScope = struct {
+    /// Functions the script defines, such as `p() { sed -n "$1"p f; }`.
+    defined: std.StringHashMapUnmanaged(void) = .empty,
+    /// The value the script last gave each variable, such as `R=~/bin/review`.
+    variables: std.StringHashMapUnmanaged([]const u8) = .empty,
+    outer: ?*const ShortScope = null,
+
+    fn defines(self: *const ShortScope, name: []const u8) bool {
+        var scope: ?*const ShortScope = self;
+        while (scope) |current| {
+            if (current.defined.contains(name)) return true;
+            scope = current.outer;
+        }
+        return false;
+    }
+
+    fn variable(self: *const ShortScope, name: []const u8) ?[]const u8 {
+        var scope: ?*const ShortScope = self;
+        while (scope) |current| {
+            if (current.variables.get(name)) |value| return value;
+            scope = current.outer;
+        }
+        return null;
+    }
+};
+
+/// A command's `$( )` scripts, which its steps take in order, each the ones
+/// inside its own words.
+const ShortSubstitutions = struct {
+    all: []const ShortSubstitution,
+    next: usize = 0,
+
+    /// The scripts whose `$()` is between `start` and `end`, after it skips
+    /// the ones before `start`. A later step's range starts past `end`, so
+    /// each script is looked at once.
+    fn take(self: *ShortSubstitutions, start: ?usize, end: usize) []const ShortSubstitution {
+        const from = start orelse end;
+        while (self.next < self.all.len and self.all[self.next].at < from) self.next += 1;
+        const first = self.next;
+        while (self.next < self.all.len and self.all[self.next].at < end) self.next += 1;
+        return self.all[first..self.next];
+    }
+};
+
+/// collectShortSteps for a script that runs inside a command with `outer`.
+fn collectScopedSteps(
+    scratch: std.mem.Allocator,
+    command: []const u8,
+    steps: *std.ArrayList([]const u8),
+    raw_steps: *usize,
+    depth: usize,
+    outer: ?*const ShortScope,
+) ShortStepError!bool {
+    const lexable = try shortText(scratch, command);
+    const source = lexable.text;
     const argv = command_lex.tokenize_argv(scratch, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
@@ -5086,20 +5322,30 @@ fn collectShortSteps(
     const tokens = argv.tokens;
 
     var step: ShortStep = .{};
-    // Functions the command defines, such as `p() { sed -n "$1"p f; }`.
-    var defined: std.ArrayList([]const u8) = .empty;
+    var scope: ShortScope = .{ .outer = outer };
+    var substitutions: ShortSubstitutions = .{ .all = lexable.substitutions };
+    // The `case` blocks still open, and whether the words up to the next
+    // `)` are a branch's pattern, which runs nothing.
+    var open_cases: usize = 0;
+    var in_pattern = false;
     var index: usize = 0;
     while (index <= tokens.len) : (index += 1) {
         const at_end = index == tokens.len;
         const token: ?command_lex.ArgvToken = if (at_end) null else tokens[index];
-        // A comment runs to the end of its line.
-        if (!at_end and !tokens[index].quoted and std.mem.startsWith(u8, tokens[index].raw, "#")) {
-            while (index + 1 < tokens.len and !gapHasNewline(source, tokens[index].end, tokens[index + 1].start)) index += 1;
-            continue;
-        }
+        // The `)` that ends a pattern ends the step before it too, and an
+        // `esac` after the last branch closes the block.
+        if (in_pattern) if (token) |t| {
+            const ends = !t.quoted and (std.mem.eql(u8, t.value, ")") or std.mem.eql(u8, t.value, "esac"));
+            if (!ends) continue;
+            in_pattern = false;
+        };
         // A command substitution, `$( ... )`, and an expansion such as
-        // `{1..80}` or `${name}` belong to the word around them.
+        // `{1..80}` or `${name}` belong to the word around them, and so
+        // does the rest of a word that started before them, as the `-b` of
+        // `out=a-$(date)-b`.
         if (!at_end) if (expansionClose(source, tokens, index)) |close| {
+            const inside_word = index > 0 and tokens[index - 1].end == tokens[index].start and
+                !(!tokens[index - 1].quoted and std.mem.eql(u8, tokens[index - 1].value, "$"));
             var nesting: usize = 0;
             while (index < tokens.len) : (index += 1) {
                 const inner = tokens[index];
@@ -5110,12 +5356,21 @@ fn collectShortSteps(
                     if (nesting == 0) break;
                 }
             }
+            if (inside_word) while (index + 1 < tokens.len) {
+                const next = tokens[index + 1];
+                if (next.start != tokens[index].end) break;
+                const next_roles = wordRoles(next.value);
+                if (!next.quoted and (next_roles.command_operator or next_roles.redirection)) break;
+                index += 1;
+            };
+            // An expansion core cut off still lets the last step finish.
+            if (index == tokens.len) index -= 1;
             continue;
         };
         // `name() { ...; }` defines a function: its body shows, and calls to
         // it are not steps of their own.
         if (!at_end and step.program.len > 0 and step.word_count == 0 and !step.dropped and isFunctionParens(tokens, index)) {
-            try defined.append(scratch, step.program);
+            try scope.defined.put(scratch, step.program, {});
             step.dropped = true;
             index += 1;
             continue;
@@ -5124,34 +5379,20 @@ fn collectShortSteps(
         const operator = if (token) |t| !t.quoted and roles.command_operator else false;
         const new_line = if (token) |t| index > 0 and gapHasNewline(source, tokens[index - 1].end, t.start) else false;
         if (at_end or operator or new_line) {
-            try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
+            const end = if (index > 0) tokens[index - 1].end else 0;
+            try finishShortStep(scratch, steps, raw_steps, step, depth, &scope, &substitutions, end);
+            // `;;` ends a `case` branch, so the words up to the next `)`
+            // are the next branch's pattern.
+            if (operator and open_cases > 0 and std.mem.eql(u8, token.?.value, ";") and index > 0 and
+                !tokens[index - 1].quoted and std.mem.eql(u8, tokens[index - 1].value, ";")) in_pattern = true;
             step = .{ .after_pipe = operator and std.mem.eql(u8, token.?.value, "|") };
             if (operator or at_end) continue;
         }
         const t = token.?;
+        if (step.start == null) step.start = t.start;
         if (isRedirectionFd(tokens, index)) continue;
-        // A here-document's operator and delimiter, whose body and closing
-        // line `source` no longer has, are like a redirection: neither is a
-        // word of the step. A command whose lines core folded into one still
-        // has its body and closing delimiter on this line, and the step ends
-        // at that delimiter.
-        if (!t.quoted and std.mem.startsWith(u8, t.value, "<<") and !std.mem.eql(u8, t.value, "<<<")) {
-            const joined = t.value.len > 2;
-            if (!joined and index + 1 < tokens.len) index += 1;
-            const delimiter = std.mem.trimStart(u8, if (joined) t.value[2..] else tokens[index].value, "-");
-            var end = index + 1;
-            const closing: ?usize = if (!here_docs.open) null else while (end < tokens.len and !gapHasNewline(source, tokens[end - 1].end, tokens[end].start)) : (end += 1) {
-                if (delimiter.len > 0 and std.mem.eql(u8, tokens[end].value, delimiter)) break end;
-            } else null;
-            if (closing) |at| {
-                index = at;
-                try finishShortStep(scratch, steps, raw_steps, step, depth, defined.items);
-                step = .{};
-            }
-            continue;
-        }
         if (step.program.len == 0 and !t.quoted and std.mem.eql(u8, t.value, "function") and index + 1 < tokens.len) {
-            try defined.append(scratch, tokens[index + 1].value);
+            try scope.defined.put(scratch, tokens[index + 1].value, {});
             step.program = "function";
             step.dropped = true;
             step.closed = true;
@@ -5159,135 +5400,381 @@ fn collectShortSteps(
             continue;
         }
         if (!t.quoted and roles.redirection) {
-            // A redirection's target is not a word of the step.
+            // A redirection's target, such as a here-document's delimiter,
+            // is not a word of the step.
             index += 1;
             continue;
+        }
+        // `case WORD in` opens a block whose branches each start with a
+        // pattern.
+        if (!t.quoted and std.mem.eql(u8, step.program, "case") and std.mem.eql(u8, t.value, "in")) {
+            open_cases += 1;
+            in_pattern = true;
+            continue;
+        }
+        if (step.program.len == 0) {
+            if (!t.quoted and std.mem.eql(u8, t.value, "esac")) open_cases -|= 1;
+            if (isEnvAssignment(t.value)) {
+                const eq = findByte(t.value, '=').?;
+                const name = std.mem.trimEnd(u8, t.value[0..eq], "+");
+                try scope.variables.put(scratch, name, t.value[eq + 1 ..]);
+            }
+            if (variableProgram(&scope, t.value)) |program| {
+                var through_variable = t;
+                // A token value the lexer made in `scratch`; nothing writes it.
+                through_variable.value = @constCast(program);
+                through_variable.quoted = false;
+                addShortToken(&step, through_variable, wordRoles(program));
+                continue;
+            }
         }
         addShortToken(&step, t, roles);
     }
     return true;
 }
 
-/// A command's text without its here-document bodies.
-const HereDocText = struct {
+/// A command's text as the short form lexes it, and the scripts of its
+/// command substitutions.
+const ShortText = struct {
+    /// The command without its here-document bodies, its comments, and the
+    /// insides of its `$( )`, `<( )`, `>( )`, and array lists, which the
+    /// plain lexer cannot read: quotes nest inside `$( )`, and a comment or
+    /// a body can hold a lone apostrophe. Each `$( )` stays as an empty
+    /// `$()`, and a process substitution as `''`, a file name. A line that
+    /// a backslash continues joins the next, and a quote left open at the
+    /// end, as in a command core cut short, is closed.
     text: []const u8,
-    /// Whether a here-document's body is still in `text`, as in a command
-    /// whose lines core folded into one.
-    open: bool = false,
+    /// The scripts of the `$()` in `text`, in order.
+    substitutions: []const ShortSubstitution,
+    /// Whether the command opens a here-document, whose body `text` leaves
+    /// out.
+    here_document: bool,
 };
 
-/// `command` without the bodies of its here-documents and their closing
-/// lines, such as the lines after `cat > notes.md <<'EOF'` up to and with
-/// `EOF`, so the line that opened them ends their step. A command with no
-/// `<<` is returned as is; `<<<` and a shift inside `$(( ))` open no
-/// here-document. The text lives in `scratch`.
-fn withoutHereDocBodies(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error!HereDocText {
-    if (std.mem.find(u8, command, "<<") == null) return .{ .text = command };
+/// A command substitution's script, and where its `$()` is in the lexed
+/// text.
+const ShortSubstitution = struct { at: usize, script: []const u8 };
+
+/// `command` as the short form lexes it. The text lives in `scratch`.
+fn shortText(scratch: std.mem.Allocator, command: []const u8) std.mem.Allocator.Error!ShortText {
+    var scan: ShortTextScan = .{ .scratch = scratch, .command = command, .folded = findByte(command, '\n') == null };
+    try scan.run(true, false);
+    return .{ .text = scan.out.items, .substitutions = scan.substitutions.items, .here_document = scan.here_document };
+}
+
+/// The walk behind shortText. `keep` says whether what it reads goes into
+/// the text, which a part it skips, such as a `$( )`, does not.
+const ShortTextScan = struct {
+    scratch: std.mem.Allocator,
+    command: []const u8,
+    /// Whether core folded the command's lines into one, so a
+    /// here-document's body follows the words of its opening line.
+    folded: bool,
+    index: usize = 0,
+    /// How many parts the scan is inside, up to short_text_max_depth.
+    depth: usize = 0,
+    out: std.ArrayList(u8) = .empty,
+    substitutions: std.ArrayList(ShortSubstitution) = .empty,
+    /// Here-documents whose bodies start on the next line.
+    here_docs: std.ArrayList(HereDoc) = .empty,
+    here_document: bool = false,
+
     const HereDoc = struct { delimiter: []const u8, strip_tabs: bool };
-    var out: std.ArrayList(u8) = .empty;
-    var pending: std.ArrayList(HereDoc) = .empty;
-    var quote: u8 = 0;
-    var arithmetic: usize = 0;
-    var index: usize = 0;
-    while (index < command.len) {
-        const byte = command[index];
-        if (quote == '\'') {
-            if (byte == '\'') quote = 0;
-            try out.append(scratch, byte);
-            index += 1;
-            continue;
-        }
-        if (byte == '\\' and index + 1 < command.len) {
-            try out.appendSlice(scratch, command[index .. index + 2]);
-            index += 2;
-            continue;
-        }
-        if (quote == '"') {
-            if (byte == '"') quote = 0;
-            try out.append(scratch, byte);
-            index += 1;
-            continue;
-        }
-        if (byte == '\'' or byte == '"') {
-            quote = byte;
-            try out.append(scratch, byte);
-            index += 1;
-            continue;
-        }
-        // A comment runs to the end of its line.
-        if (byte == '#' and (index == 0 or std.mem.findScalar(u8, " \t\n;&|(", command[index - 1]) != null)) {
-            const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
-            try out.appendSlice(scratch, command[index..line_end]);
-            index = line_end;
-            continue;
-        }
-        if (std.mem.startsWith(u8, command[index..], "$((")) {
-            arithmetic += 1;
-            try out.appendSlice(scratch, "$((");
-            index += 3;
-            continue;
-        }
-        if (arithmetic > 0 and std.mem.startsWith(u8, command[index..], "))")) {
-            arithmetic -= 1;
-            try out.appendSlice(scratch, "))");
-            index += 2;
-            continue;
-        }
-        // A here-string's `<<<` opens no here-document, at any of its bytes.
-        if (std.mem.startsWith(u8, command[index..], "<<<")) {
-            try out.appendSlice(scratch, "<<<");
-            index += 3;
-            continue;
-        }
-        if (arithmetic == 0 and std.mem.startsWith(u8, command[index..], "<<")) {
-            var scan = index + 2;
-            const strip_tabs = scan < command.len and command[scan] == '-';
-            if (strip_tabs) scan += 1;
-            while (scan < command.len and (command[scan] == ' ' or command[scan] == '\t')) scan += 1;
-            // The delimiter is one word, with its quotes and escapes taken out.
-            var delimiter: std.ArrayList(u8) = .empty;
-            var delimiter_quote: u8 = 0;
-            while (scan < command.len) : (scan += 1) {
-                const c = command[scan];
-                if (delimiter_quote != 0) {
-                    if (c == delimiter_quote) delimiter_quote = 0 else try delimiter.append(scratch, c);
-                    continue;
-                }
-                if (c == '\'' or c == '"') {
-                    delimiter_quote = c;
-                    continue;
-                }
-                if (c == '\\') continue;
-                if (std.ascii.isWhitespace(c) or std.mem.findScalar(u8, ";&|<>()", c) != null) break;
-                try delimiter.append(scratch, c);
-            }
-            if (delimiter.items.len > 0) try pending.append(scratch, .{ .delimiter = delimiter.items, .strip_tabs = strip_tabs });
-            try out.appendSlice(scratch, command[index..scan]);
-            index = scan;
-            continue;
-        }
-        try out.append(scratch, byte);
-        index += 1;
-        if (byte != '\n' or pending.items.len == 0) continue;
-        // The lines after the one that opened here-documents are their
-        // bodies, one after another, each up to its delimiter line.
-        for (pending.items, 0..) |here_doc, position| {
-            // The next body starts after the line that closed the last one.
-            if (position > 0 and index < command.len) index += 1;
-            while (index < command.len) {
-                const line_end = std.mem.findScalarPos(u8, command, index, '\n') orelse command.len;
-                var line = std.mem.trimEnd(u8, command[index..line_end], "\r");
-                if (here_doc.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
-                index = line_end;
-                if (std.mem.eql(u8, line, here_doc.delimiter)) break;
-                if (index < command.len) index += 1;
-            }
-        }
-        pending.clearRetainingCapacity();
-        // The newline after the last closing line follows the opening line.
-        if (index < command.len) index += 1;
+    const Error = std.mem.Allocator.Error;
+
+    fn emit(self: *ShortTextScan, keep: bool, bytes: []const u8) Error!void {
+        if (keep) try self.out.appendSlice(self.scratch, bytes);
     }
-    return .{ .text = out.items, .open = pending.items.len > 0 };
+
+    /// Reads to the end, or with `closes`, to the `)` that closes the part
+    /// the scan is in.
+    fn run(self: *ShortTextScan, keep: bool, closes: bool) Error!void {
+        const command = self.command;
+        var parens: usize = 0;
+        while (self.index < command.len) {
+            const rest = command[self.index..];
+            const byte = rest[0];
+            switch (byte) {
+                '\'' => {
+                    try self.singleQuoted(keep);
+                    continue;
+                },
+                '"' => {
+                    try self.doubleQuoted(keep);
+                    continue;
+                },
+                '\\' => {
+                    try self.escape(keep);
+                    continue;
+                },
+                '$' => if (std.mem.startsWith(u8, rest, "$((")) {
+                    try self.arithmetic(keep);
+                    continue;
+                } else if (std.mem.startsWith(u8, rest, "$(")) {
+                    try self.substitution(keep);
+                    continue;
+                },
+                '#' => if (self.atWordStart()) {
+                    // A comment runs to the end of its line.
+                    self.index = std.mem.findScalarPos(u8, command, self.index, '\n') orelse command.len;
+                    continue;
+                },
+                '<', '>' => if (rest.len > 1 and rest[1] == '(') {
+                    self.index += 2;
+                    _ = try self.skipToClose();
+                    try self.emit(keep, "''");
+                    continue;
+                } else if (std.mem.startsWith(u8, rest, "<<<")) {
+                    // A here-string opens no here-document.
+                    try self.emit(keep, "<<<");
+                    self.index += 3;
+                    continue;
+                } else if (std.mem.startsWith(u8, rest, "<<")) {
+                    try self.hereDoc(keep);
+                    continue;
+                },
+                '(' => if (self.opensArray() or self.qualifiesWord()) {
+                    // An array's words are values, not commands, and a glob
+                    // qualifier or pattern, as in `test(N.om)`, belongs to
+                    // its word.
+                    self.index += 1;
+                    _ = try self.skipToClose();
+                    continue;
+                } else if (closes) {
+                    parens += 1;
+                },
+                ')' => if (closes) {
+                    if (parens == 0) return;
+                    parens -= 1;
+                },
+                else => {},
+            }
+            try self.emit(keep, rest[0..1]);
+            self.index += 1;
+            if (byte == '\n' and self.here_docs.items.len > 0) self.skipHereDocBodies();
+        }
+    }
+
+    /// Skips past the `)` that closes the part the scan is in. True when
+    /// the part closes before the end.
+    fn skipToClose(self: *ShortTextScan) Error!bool {
+        if (self.depth >= short_text_max_depth) return self.countToClose();
+        self.depth += 1;
+        defer self.depth -= 1;
+        try self.run(false, true);
+        if (self.index == self.command.len) return false;
+        self.index += 1;
+        return true;
+    }
+
+    /// skipToClose for a part too deep to read: it counts the parentheses
+    /// and quotes up to the part's `)`, with no recursion. True when the
+    /// part closes before the end.
+    fn countToClose(self: *ShortTextScan) Error!bool {
+        const command = self.command;
+        // The `)` or `"` that closes each part the count is inside.
+        var closers: std.ArrayList(u8) = .empty;
+        try closers.append(self.scratch, ')');
+        while (self.index < command.len) {
+            const byte = command[self.index];
+            self.index += 1;
+            if (byte == '\\') {
+                self.index = @min(self.index + 1, command.len);
+                continue;
+            }
+            if (closers.last().? == '"') {
+                if (byte == '"') _ = closers.pop();
+                if (byte == '$' and self.index < command.len and command[self.index] == '(') {
+                    try closers.append(self.scratch, ')');
+                    self.index += 1;
+                }
+                continue;
+            }
+            switch (byte) {
+                '\'' => self.index = if (std.mem.findScalarPos(u8, command, self.index, '\'')) |at| at + 1 else command.len,
+                '"' => try closers.append(self.scratch, '"'),
+                '(' => try closers.append(self.scratch, ')'),
+                ')' => {
+                    _ = closers.pop();
+                    if (closers.items.len == 0) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// A `$( )`, which stays as `$()`. The scan keeps the script of one in
+    /// the text it keeps, for the step the script belongs to.
+    fn substitution(self: *ShortTextScan, keep: bool) Error!void {
+        self.index += "$(".len;
+        const start = self.index;
+        const closed = try self.skipToClose();
+        const script_end = if (closed) self.index - 1 else self.index;
+        if (keep) try self.substitutions.append(self.scratch, .{ .at = self.out.items.len, .script = self.command[start..script_end] });
+        try self.emit(keep, "$()");
+    }
+
+    fn singleQuoted(self: *ShortTextScan, keep: bool) Error!void {
+        const close = std.mem.findScalarPos(u8, self.command, self.index + 1, '\'');
+        const end = if (close) |at| at + 1 else self.command.len;
+        try self.emit(keep, self.command[self.index..end]);
+        if (close == null) try self.emit(keep, "'");
+        self.index = end;
+    }
+
+    /// A double-quoted string, whose `$( )` holds quotes of its own.
+    fn doubleQuoted(self: *ShortTextScan, keep: bool) Error!void {
+        try self.emit(keep, "\"");
+        self.index += 1;
+        while (self.index < self.command.len) {
+            const rest = self.command[self.index..];
+            switch (rest[0]) {
+                '"' => {
+                    try self.emit(keep, "\"");
+                    self.index += 1;
+                    return;
+                },
+                '\\' => {
+                    try self.escape(keep);
+                    continue;
+                },
+                '$' => if (std.mem.startsWith(u8, rest, "$((")) {
+                    try self.arithmetic(keep);
+                    continue;
+                } else if (std.mem.startsWith(u8, rest, "$(")) {
+                    try self.substitution(keep);
+                    continue;
+                },
+                else => {},
+            }
+            try self.emit(keep, rest[0..1]);
+            self.index += 1;
+        }
+        try self.emit(keep, "\"");
+    }
+
+    /// A backslash and the byte it quotes. One before a newline joins the
+    /// two lines, and one at the very end, as in a command core cut short,
+    /// quotes nothing, so both drop out.
+    fn escape(self: *ShortTextScan, keep: bool) Error!void {
+        const next = self.index + 1;
+        if (next < self.command.len and self.command[next] != '\n') try self.emit(keep, self.command[self.index .. next + 1]);
+        self.index = @min(next + 1, self.command.len);
+    }
+
+    /// `$(( ... ))`, whose `<<` is a shift, not a here-document.
+    fn arithmetic(self: *ShortTextScan, keep: bool) Error!void {
+        const start = self.index;
+        var depth: usize = 0;
+        while (self.index < self.command.len) {
+            const byte = self.command[self.index];
+            self.index += 1;
+            if (byte == '(') depth += 1;
+            if (byte == ')') {
+                depth -|= 1;
+                if (depth == 0) break;
+            }
+        }
+        try self.emit(keep, self.command[start..self.index]);
+    }
+
+    /// A here-document's `<<` and delimiter, which stay as `<< ''`. Its body
+    /// is on the lines after the one that opens it, and drops out there. In
+    /// a command core folded into one line, the body runs on from here to
+    /// the delimiter as a word of its own, or to the end, and drops out, and
+    /// what comes after it starts a new line.
+    fn hereDoc(self: *ShortTextScan, keep: bool) Error!void {
+        const command = self.command;
+        var scan = self.index + "<<".len;
+        const strip_tabs = scan < command.len and command[scan] == '-';
+        if (strip_tabs) scan += 1;
+        while (scan < command.len and (command[scan] == ' ' or command[scan] == '\t')) scan += 1;
+        // The delimiter is one word, with its quotes and escapes taken out.
+        var delimiter: std.ArrayList(u8) = .empty;
+        var delimiter_quote: u8 = 0;
+        while (scan < command.len and command[scan] != '\n') : (scan += 1) {
+            const c = command[scan];
+            if (delimiter_quote != 0) {
+                if (c == delimiter_quote) delimiter_quote = 0 else try delimiter.append(self.scratch, c);
+                continue;
+            }
+            if (c == '\'' or c == '"') {
+                delimiter_quote = c;
+                continue;
+            }
+            if (c == '\\') continue;
+            if (std.ascii.isWhitespace(c) or std.mem.findScalar(u8, ";&|<>()", c) != null) break;
+            try delimiter.append(self.scratch, c);
+        }
+        self.index = scan;
+        try self.emit(keep, "<< ''");
+        if (delimiter.items.len == 0) return;
+        self.here_document = true;
+        if (!self.folded) return self.here_docs.append(self.scratch, .{ .delimiter = delimiter.items, .strip_tabs = strip_tabs });
+        self.index = foldedBodyEnd(command, scan, delimiter.items);
+        try self.emit(keep, "\n");
+    }
+
+    /// Skips the bodies of the here-documents the line before opened, one
+    /// after another, each up to and with its delimiter line.
+    fn skipHereDocBodies(self: *ShortTextScan) void {
+        const command = self.command;
+        for (self.here_docs.items, 0..) |here_doc, position| {
+            // The next body starts after the line that closed the last one.
+            if (position > 0 and self.index < command.len) self.index += 1;
+            while (self.index < command.len) {
+                const line_end = std.mem.findScalarPos(u8, command, self.index, '\n') orelse command.len;
+                var line = std.mem.trimEnd(u8, command[self.index..line_end], "\r");
+                if (here_doc.strip_tabs) line = std.mem.trimStart(u8, line, "\t");
+                self.index = line_end;
+                if (std.mem.eql(u8, line, here_doc.delimiter)) break;
+                if (self.index < command.len) self.index += 1;
+            }
+        }
+        self.here_docs.clearRetainingCapacity();
+        // The newline after the last closing line follows the opening line,
+        // which already ended with one.
+        if (self.index < command.len) self.index += 1;
+    }
+
+    /// Whether a word starts at the scan's byte, so a `#` there opens a
+    /// comment.
+    fn atWordStart(self: *const ShortTextScan) bool {
+        return self.index == 0 or std.mem.findScalar(u8, " \t\n;&|()<>", self.command[self.index - 1]) != null;
+    }
+
+    /// Whether the `(` at the scan follows a word with no space, as a zsh
+    /// glob qualifier or a ksh pattern does, and is no function's empty `()`.
+    fn qualifiesWord(self: *const ShortTextScan) bool {
+        const next = self.index + 1;
+        if (self.index == 0 or next >= self.command.len or self.command[next] == ')') return false;
+        return std.mem.findScalar(u8, " \t\n;&|()<>", self.command[self.index - 1]) == null;
+    }
+
+    /// Whether the `(` at the scan opens an array's words, as in
+    /// `files=(a b)`.
+    fn opensArray(self: *const ShortTextScan) bool {
+        const before = self.command[0..self.index];
+        if (!std.mem.endsWith(u8, before, "=")) return false;
+        var start = before.len - 1;
+        if (start > 0 and before[start - 1] == '+') start -= 1;
+        const name_end = start;
+        while (start > 0 and (std.ascii.isAlphanumeric(before[start - 1]) or before[start - 1] == '_')) start -= 1;
+        return start < name_end and (start == 0 or std.mem.findScalar(u8, " \t\n;&|(", before[start - 1]) != null);
+    }
+};
+
+/// Where a here-document's body ends in a command core folded into one
+/// line: after its delimiter as a word of its own, past `from`, or at the
+/// end when core cut the command short first.
+fn foldedBodyEnd(command: []const u8, from: usize, delimiter: []const u8) usize {
+    var at = from;
+    while (std.mem.findPos(u8, command, at, delimiter)) |found| : (at = found + 1) {
+        const end = found + delimiter.len;
+        if (found > from and command[found - 1] == ' ' and (end == command.len or command[end] == ' ')) return end;
+    }
+    return command.len;
 }
 
 /// Replaces the command a command row ends with by its short form, so a long
@@ -7009,6 +7496,64 @@ test "an edit row adds up its counts when core names the file another way" {
         defer alloc.free(text);
         try std.testing.expectEqualStrings("● Edited main.zig +5/-3 · 2 edits", std.mem.trim(u8, text, "\n"));
     }
+}
+
+test "a file outside the project shows by its name when core names its real path" {
+    const alloc = std.testing.allocator;
+    // Core names a file under /tmp by its real path, as macOS links /tmp to
+    // /private/tmp, while the call says /tmp.
+    const write_args = "{\"path\":\"/tmp/steer-ab2.ts\",\"content\":\"x\"}";
+    const read_args = "{\"path\":\"/tmp/followup-checks.sh\"}";
+    const body_args = "{\"path\":\"/tmp/pr-body-steer.md\",\"content\":\"x\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote /private/tmp/steer-ab2.ts +80\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read /private/tmp/followup-checks.sh\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote /private/tmp/pr-body-steer.md +7 / -3\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args), .outcome = .completed },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    var rows = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+    _ = rows.next();
+    try std.testing.expectEqualStrings("├ Wrote steer-ab2.ts +80", rows.next().?);
+    try std.testing.expectEqualStrings("├ Read followup-checks.sh", rows.next().?);
+    try std.testing.expectEqualStrings("└ Wrote pr-body-steer.md +7/-3", rows.next().?);
+    // The name links to the path core named, where the file really is.
+    var compact = try build(alloc, &entries, &details, 120);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.entry_actions.items[0].override.bytes, "file:///private/tmp/steer-ab2.ts") != null);
+
+    // A linked folder anywhere in the path shows the same way.
+    const linked = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote /Users/example/real/notes.ts +3\n", .class = .tool_status } }};
+    const linked_details = [_]ToolDetailRecord{.{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast("{\"path\":\"/Users/example/link/notes.ts\",\"content\":\"x\"}"), .outcome = .completed }};
+    const linked_text = try groupTextForTest(alloc, &linked, &linked_details);
+    defer alloc.free(linked_text);
+    try std.testing.expectEqualStrings("● Wrote notes.ts +3", std.mem.trim(u8, linked_text, "\n"));
+
+    // A write still running names its file the same way.
+    const running = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Writing /private/tmp/pr-body-steer.md\n", .class = .tool_status } }};
+    const running_details = [_]ToolDetailRecord{.{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args) }};
+    const running_text = try groupTextForTest(alloc, &running, &running_details);
+    defer alloc.free(running_text);
+    try std.testing.expectEqualStrings("● Writing pr-body-steer.md", std.mem.trim(u8, running_text, "\n"));
+
+    // Ctrl+O keeps the whole path.
+    var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, null);
+    defer expanded.deinit(alloc);
+    var full: std.ArrayList(u8) = .empty;
+    defer full.deinit(alloc);
+    for (expanded.entry_actions.items, entries) |action, entry| switch (action) {
+        .override => |override| try full.appendSlice(alloc, override.bytes),
+        .keep => try full.appendSlice(alloc, entry.raw_bytes.bytes),
+        else => {},
+    };
+    try std.testing.expect(std.mem.find(u8, full.items, "/private/tmp/steer-ab2.ts") != null);
+    try std.testing.expect(std.mem.find(u8, full.items, "/private/tmp/pr-body-steer.md") != null);
 }
 
 test "a denied or cancelled change keeps its own row beside the file's edits" {
@@ -9607,7 +10152,7 @@ test "a long shell command shows its steps in short form" {
         .{ .command = "cd tests/e2e && FX_SOUND=0 bun test tui-tool-story.test.ts", .short = "bun test" },
         .{ .command = "cd /tmp && sh ./scripts/run-everything.sh --verbose", .short = "sh run-everything.sh" },
         .{ .command = "make; echo \"exit: $?\"", .short = "make, echo" },
-        .{ .command = "for i in $(seq 1 96); do printf 'marker %03d\\n' \"$i\"; sleep 0.03; done", .short = "printf, sleep" },
+        .{ .command = "for i in $(seq 1 96); do printf 'marker %03d\\n' \"$i\"; sleep 0.03; done", .short = "seq, printf, sleep" },
         .{ .command = "echo \"$(date)\" started && npm test -- --run --reporter=dot --bail", .short = "echo, npm test" },
         .{ .command = "cat AGENTS.md && printf 'executed\\n' >> executions.log", .short = "cat, printf" },
         // A command's own functions show their bodies, not their calls.
@@ -9631,11 +10176,10 @@ test "a long shell command shows its steps in short form" {
         .{ .command = "while true; do curl -s localhost:3000 && break; sleep 1; done", .short = "curl, sleep" },
         .{ .command = "if [ -f package.json ]; then npm test; fi", .short = "npm test" },
         .{ .command = "for f in src/*.zig; do zig fmt --check \"$f\"; done", .short = "zig fmt" },
-        // Short one-step commands, and commands that do not lex, stay whole.
+        // Short one-step commands stay whole.
         .{ .command = "git status --short --branch", .short = null },
         .{ .command = "pwd", .short = null },
         .{ .command = "sh test.sh", .short = null },
-        .{ .command = "echo 'unclosed && ls -la /a/very/long/path/that/goes/on/and/on/for/a/while", .short = null },
         .{ .command = "cd desktop", .short = null },
     };
     for (cases) |case| {
@@ -9645,6 +10189,141 @@ test "a long shell command shows its steps in short form" {
         } else {
             try std.testing.expect(short == null);
         }
+    }
+}
+
+test "the short form of a command nested without end still names its program" {
+    // A command can nest `$( )` deeper than the stack holds; past a few
+    // levels the short form counts its way to the end of a part.
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const levels = 50_000;
+    const repeated = struct {
+        fn of(scratch: std.mem.Allocator, text: []const u8, count: usize) ![]const u8 {
+            const out = try scratch.alloc(u8, text.len * count);
+            for (0..count) |index| @memcpy(out[index * text.len ..][0..text.len], text);
+            return out;
+        }
+    }.of;
+    const closes = try repeated(arena, ")", levels);
+    const cases = [_]struct { command: []const u8, short: []const u8 }{
+        // Never closed, as in a command core cut short or a hostile one.
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "$(", levels), "x" }), .short = "echo" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "\"$(", levels), "x" }), .short = "echo" },
+        // Closed, so the steps after the part still show.
+        .{ .command = try std.mem.concat(arena, u8, &.{ "echo ", try repeated(arena, "$(", levels), "x", closes, "; ls -la" }), .short = "echo, ls" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "diff ", try repeated(arena, "<(", levels), "x", closes, " b; ls -la" }), .short = "diff, ls" },
+        .{ .command = try std.mem.concat(arena, u8, &.{ "files=(", try repeated(arena, "$(", levels), "x", closes, ")", "; ls -la" }), .short = "ls" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.short, (try shortCommand(arena, case.command)) orelse return error.TestExpectedShortForm);
+    }
+}
+
+/// How many steps the short-form budget tests give a command.
+const budget_test_steps = 20_000;
+
+/// A command for the short-form budget tests: `head`, then `step`
+/// budget_test_steps times, with its number when `numbered`, then `tail`.
+fn budgetTestCommand(scratch: std.mem.Allocator, head: []const u8, comptime step: []const u8, comptime numbered: bool, tail: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try out.writer.writeAll(head);
+    for (0..budget_test_steps) |index| {
+        if (numbered) try out.writer.print(step, .{index}) else try out.writer.writeAll(step);
+    }
+    try out.writer.writeAll(tail);
+    return out.written();
+}
+
+/// Checks that `command`'s short form is `short`, made within 64 MiB of
+/// memory, every allocation counted, and one second.
+fn expectShortWithinBudget(command: []const u8, short: []const u8) !void {
+    const budget = try std.testing.allocator.alloc(u8, 64 << 20);
+    defer std.testing.allocator.free(budget);
+    var fixed = std.heap.FixedBufferAllocator.init(budget);
+    const started = std.Io.Timestamp.now(std.testing.io, .awake);
+    const got = try shortCommand(fixed.allocator(), command) orelse return error.TestExpectedShortForm;
+    const took_ms = @divFloor(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds - started.nanoseconds, std.time.ns_per_ms);
+    try std.testing.expectEqualStrings(short, got);
+    errdefer std.debug.print("took {d} ms\n", .{took_ms});
+    try std.testing.expect(took_ms < 1000);
+}
+
+test "the short form of many steps that set variables from a $( ) stays within a fixed time and memory" {
+    // Each step reads only its own `$( )` scripts, and a script looks up
+    // what the command set without a copy of it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try expectShortWithinBudget(try budgetTestCommand(arena_state.allocator(), "", "a=$(b); ", false, "echo done"), "b, echo");
+}
+
+test "the short form of many runs of a program through a variable stays within a fixed time and memory" {
+    // `$R` finds the value the command last gave `R` without a walk back
+    // over every variable set before it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const assignments = try budgetTestCommand(arena, "R=/opt/tools/bin/review; ", "v{d}=1; ", true, "");
+    try expectShortWithinBudget(try budgetTestCommand(arena, assignments, "$R status; ", false, ""), "review status");
+}
+
+test "the short form of many function definitions stays within a fixed time and memory" {
+    // A call finds the function it runs without a walk over every function
+    // defined before it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try expectShortWithinBudget(try budgetTestCommand(arena_state.allocator(), "", "f{d}() {{ make; }}; ", true, "f1; f2; ls -la"), "make, ls");
+}
+
+test "the short form names only the commands a shell command runs" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const loop_and_lists =
+        \\w=/Users/example/worktrees/cell-suffix; mb=$(git -C $w merge-base origin/main HEAD); for f in $(git -C $w diff --name-only $mb HEAD -- src); do echo "$f $(git -C $w diff $mb HEAD -- $f | grep -c -E '^\\+test "')"; done; 69c=$(python3 -c "import json;print(len(json.load(open('$w/scripts/pgso/corpus.json')).get('scenarios',[])))" 2>/dev/null); echo "corpus=${69c:-n/a}"
+    ;
+    const cases = [_]struct { command: []const u8, short: []const u8 }{
+        // A variable is not a command, and a statement that only sets
+        // variables names none.
+        .{ .command = "AI_GATEWAY_API_KEY=x echo hi; rm f", .short = "echo, rm" },
+        .{ .command = "N=~/notes/2080; M=1; cat $N/a.txt | wc -l && make lint", .short = "cat, make lint" },
+        .{ .command = "N=1; M=2", .short = "command" },
+        // env's `-u NAME` names a variable, not the program env runs.
+        .{ .command = "env -u AI_GATEWAY_API_KEY -u AI_GATEWAY_TEST_API_KEY HOME=$T bun test tui-resume.test.ts", .short = "bun test" },
+        // A program a variable holds shows by its name.
+        .{ .command = "R=~/bin/review; $R status 2>&1 | tail -8; $R start 1634", .short = "review status, review start" },
+        // A here-document's body never shows, in a short command too, and in
+        // one core folded into one line or cut short.
+        .{ .command = "python3 - <<'EOF'\ns = open(\"/tmp/followup-unit.sh\").read()\nprint(s)\nEOF", .short = "python3" },
+        .{ .command = "python3 - <<'EOF' s = open(\"/tmp/followup-unit.sh\").read() print(s) EOF", .short = "python3" },
+        .{ .command = "cat > f <<'EOF'\nit's\nEOF", .short = "cat" },
+        .{ .command = "N=~/notes/2080; cat > $N/a.sh <<'EOF' set -u # Builds this side's fx the way", .short = "cat" },
+        // A loop's word list and a statement that only sets variables run
+        // the commands in their `$( )`; one in a program's arguments is part
+        // of them.
+        .{ .command = loop_and_lists, .short = "git merge-base, git diff, echo +2 more" },
+        .{ .command = "echo \"started $(date)\" && npm test", .short = "echo, npm test" },
+        // Quotes inside a `$( )` inside quotes, a comment with an apostrophe,
+        // and lines a backslash continues.
+        .{ .command = "for m in Debug ReleaseSafe; do echo \"== $m: $(zig build test -Doptimize=$m 2>&1 | grep -E \"passed|' failed\" | head -6)\"; done", .short = "echo" },
+        .{ .command = "# don't print anything yet\nmake lint\nmake test", .short = "make lint, make test" },
+        .{ .command = "gh pr create --draft --base main \\\n  --title \"Fix rows\" \\\n  --body \"$(cat <<'EOF'\n## Summary\n\nIt's done.\nEOF\n)\"", .short = "gh pr create" },
+        // A case pattern, an array, a process substitution, a glob
+        // qualifier, and the rest of a word after a `$( )` run nothing.
+        .{ .command = "for f in $(ls); do case $f in *.sh) bash run.sh;; *.py) python3 run.py;; esac; done", .short = "ls, bash run.sh, python3 run.py" },
+        .{ .command = "files=(LICENSE quickjs.c quickjs.h); cp ${files[@]} dst/ && ls dst", .short = "cp, ls" },
+        .{ .command = "diff <(git show HEAD:AGENTS.md) AGENTS.md > /dev/null && echo same", .short = "diff, echo" },
+        .{ .command = "for f in .zig-cache/o/*/test(N.om[1,4]); do nm \"$f\" | grep -c ubsan; done", .short = "nm" },
+        .{ .command = "out=/tmp/gate-$(cat slug.txt)-$ts-$(cut -c1-12 sha.txt).md; echo \"$out\" > /tmp/report.txt", .short = "cat, cut, echo" },
+        // A command core cut short inside a quote still names its program.
+        .{ .command = "echo 'unclosed && ls -la /a/very/long/path/that/goes/on/and/on/for/a/while", .short = "echo" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("command: {s}\n", .{case.command});
+        try std.testing.expectEqualStrings(case.short, (try shortCommand(arena, case.command)) orelse return error.TestExpectedShortForm);
     }
 }
 
@@ -9700,7 +10379,7 @@ test "a long command keeps its merge note when its row is clipped" {
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(merged) <= cols);
 }
 
-test "a command between two runs of another keeps all three rows" {
+test "a command run again after another joins its first row" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sh build.sh\n", .class = .tool_status } },
@@ -9716,11 +10395,92 @@ test "a command between two runs of another keeps all three rows" {
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● Ran commands ✓\n" ++
-            "├ Ran \x1b[38;5;252msh\x1b[39m build.sh\n" ++
-            "├ Ran \x1b[38;5;252msh\x1b[39m lint.sh\n" ++
-            "└ Ran \x1b[38;5;252msh\x1b[39m build.sh",
+            "├ Ran \x1b[38;5;252msh\x1b[39m build.sh · 2 calls\n" ++
+            "└ Ran \x1b[38;5;252msh\x1b[39m lint.sh",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "a row said again in its group joins the first and counts its calls" {
+    const alloc = std.testing.allocator;
+    // Three calls share the first "Ran sed, grep" row. After a read, one call
+    // whose steps read the same joins it; a failure that reads the same keeps
+    // its own row.
+    const commands = [_][]const u8{ "grep -n x a.log", "sed -n 1,9p a.log", "grep -n y b.ts", "sed -n 2p c.ts; grep -c z c.ts", "sed -n 3p d.ts; grep -c z d.ts" };
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran grep -n x a.log\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran sed -n 1,9p a.log\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Ran grep -n y b.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read b.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "● Ran sed -n 2p c.ts; grep -c z c.ts\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 6, .bytes = "● Exited 1 sed -n 3p d.ts; grep -c z d.ts\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, "{\"command\":\"grep -n x a.log\"}", 0, null),
+        storyCommandDetail(2, "{\"command\":\"sed -n 1,9p a.log\"}", 0, null),
+        storyCommandDetail(3, "{\"command\":\"grep -n y b.ts\"}", 0, null),
+        storyReadDetailForTest(4, "b.ts"),
+        storyCommandDetail(5, "{\"command\":\"sed -n 2p c.ts; grep -c z c.ts\"}", 0, null),
+        storyCommandDetail(6, "{\"command\":\"sed -n 3p d.ts; grep -c z d.ts\"}", 1, null),
+    };
+    for ([_]usize{ 0, 1, 2, 4, 5 }, commands) |index, command| details[index].command_display = @constCast(command);
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    var rows = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+    _ = rows.next();
+    try std.testing.expectEqualStrings("├ Ran sed, grep · 4 calls", rows.next().?);
+    try std.testing.expectEqualStrings("├ Read b.ts", rows.next().?);
+    try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "└ Exited 1 sed, grep"));
+    try std.testing.expect(rows.next() == null);
+
+    // Each report from a subagent keeps its own line, and so does a wait,
+    // which tells what main did while its subagents worked.
+    const report: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{}"), .outcome = .completed, .subagent_report = true };
+    const report_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● lander completed · Opened the PR.\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● lander completed · Opened the PR.\n", .class = .tool_status } },
+    };
+    var reports = [_]ToolDetailRecord{ report, report };
+    reports[1].entry_id = 2;
+    const report_text = try groupTextForTest(alloc, &report_entries, &reports);
+    defer alloc.free(report_text);
+    try std.testing.expect(std.mem.find(u8, report_text, "messages") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, report_text, "lander finished"));
+    const wait_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● waited for lander\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● waited for lander\n", .class = .tool_status } },
+    };
+    const waits = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"wait\"}"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"wait\",\"agent\":\"lander\"}"), .outcome = .completed },
+    };
+    const wait_text = try groupTextForTest(alloc, &wait_entries, &waits);
+    defer alloc.free(wait_text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wait_text, "Waited for lander"));
+    try std.testing.expect(std.mem.find(u8, wait_text, "calls") == null);
+
+    // Main's messages to one subagent count as messages.
+    const message: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}"), .outcome = .completed };
+    var message_row: StoryRow = .{ .entry = report_entries[0], .entry_id = 1, .detail = &message, .identity = .{ .kind = .subagent, .key = "scout" }, .joined_calls = 1 };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings(" · 2 messages", try joinedNote(arena_state.allocator(), &message_row));
+    message_row.detail = &report;
+    try std.testing.expect(try repeatKey(arena_state.allocator(), &message_row) == null);
+
+    // Two calls of another tool whose rows read the same are one row too.
+    const skill: ToolDetailRecord = .{ .entry_id = 1, .tool_name = @constCast("skill"), .activity_kind = .read, .arguments_json = @constCast("{\"name\":\"land\"}"), .outcome = .completed };
+    const skill_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Completed skill\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Completed skill\n", .class = .tool_status } },
+    };
+    var skills = [_]ToolDetailRecord{ skill, skill };
+    skills[1].entry_id = 2;
+    skills[1].arguments_json = @constCast("{\"name\":\"ship\"}");
+    const skill_text = try groupTextForTest(alloc, &skill_entries, &skills);
+    defer alloc.free(skill_text);
+    try std.testing.expectEqualStrings("● Completed skill · 2 calls", std.mem.trim(u8, skill_text, "\n"));
 }
 
 test "one file read in parts shares a row" {
@@ -11261,7 +12021,8 @@ test "a command with a here-document shows its steps, whatever the document says
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // The call that opened a PR: its body's apostrophes are not shell quotes.
+    // The call that opened a PR: its body's apostrophes are not shell quotes,
+    // and the `$( )` a variable is set to runs `gh pr create`.
     const opened_pr =
         \\cd "$(cat /tmp/work/dir)"; b=fix-notes; cat > /tmp/work/body.md <<'EOF'
         \\## Summary
@@ -11270,7 +12031,7 @@ test "a command with a here-document shows its steps, whatever the document says
         \\EOF
         \\url=$(gh pr create --draft --head "$b" --title "Say why" --body-file /tmp/work/body.md 2>&1 | tail -1); echo "$url"; n=$(echo "$url" | grep -o '[0-9]*$'); echo $n > /tmp/work/pr; gh pr view $n --json isDraft -q '"draft=\(.isDraft)"'; gh pr view $n --json body -q .body | grep -c Summary || true
     ;
-    try std.testing.expectEqualStrings("cat, echo, gh pr view", (try shortCommand(a, opened_pr)).?);
+    try std.testing.expectEqualStrings("cat, gh pr create, echo +1 more", (try shortCommand(a, opened_pr)).?);
     try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat > notes.md <<'EOF'\nThe model's notes\nEOF\nwc -l notes.md")).?);
     // Two documents on one line, one with its tabs taken out.
     try std.testing.expectEqualStrings("cat, wc", (try shortCommand(a, "cat <<A <<-\"B\" > x\na's\nA\n\tb's\n\tB\nwc -l x")).?);

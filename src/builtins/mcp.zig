@@ -146,6 +146,14 @@ pub fn loadHost(
         for (notes) |note| alloc.free(note);
         alloc.free(notes);
     }
+    // Servers shared with other fx sessions live under the profile's folder;
+    // when it can't be named, each server stays in this process.
+    const fx_home: ?[]u8 = profile_paths.rootDir(alloc, home) catch |err| blk: {
+        debug_trace.logf("mcp", "MCP servers run in this session reason=no fx home err={s}", .{@errorName(err)});
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        break :blk null;
+    };
+    defer if (fx_home) |path| alloc.free(path);
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .{ .detect = home },
@@ -153,6 +161,8 @@ pub fn loadHost(
         .questions = extras.questions,
         .notify = extras.notify,
         .slash_commands = extras.slash_commands,
+        .idle_ms = mcp_host.idleMs(),
+        .share = if (fx_home) |path| .{ .fx_home = path } else null,
     }, builtins);
     h.notes = notes;
     return h;
@@ -759,6 +769,20 @@ test "profile required policy defaults to optional" {
     try std.testing.expect(required_config.required);
     try std.testing.expectEqual(mcp_contract.ConfigSource.profile, optional_config.source);
     try std.testing.expectEqual(mcp_contract.ConfigScope.profile, optional_config.scope);
+}
+
+test "an edit keeps a server's \"shared\": false, and leaves the default unwritten" {
+    const alloc = std.testing.allocator;
+    const before =
+        \\{"mcp":{"own":{"command":["node"],"shared":false}}}
+    ;
+    const after = try config_file.add(alloc, .profile, before, "added", .{ .stdio = .{ .command = "node" } });
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "\"shared\": false"));
+    var configs = try loadConfigFromJson(alloc, after);
+    defer freeConfigs(alloc, &configs);
+    try std.testing.expect(!findConfig(configs.items, "own").?.shared);
+    try std.testing.expect(findConfig(configs.items, "added").?.shared);
 }
 
 test "profile config reports invalid required policy" {

@@ -9,7 +9,6 @@ const io_mod = @import("../shared/io.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 const subscription_logout = @import("subscription_logout.zig");
 
@@ -434,26 +433,10 @@ const StdinManualCodeReader = struct {
 };
 
 const sign_out = subscription_logout.Provider(grok_session, .grok, revokeToken, "Grok");
-pub const LogoutResult = subscription_logout.LogoutResult;
-pub const LocalLogout = subscription_logout.LocalLogout;
 /// Deletes the saved Grok login, then revokes its refresh token at xAI.
 pub const logout = sign_out.logout;
 pub const logoutLocally = sign_out.logoutLocally;
-
-/// Revokes the Grok sign-outs that earlier logouts kept because the provider
-/// did not confirm them (`pending_revocation.retry`).
-pub fn retryKeptSignOuts(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    before_revocation: ?oauth.BeforeRevocation,
-) pending_revocation.RetryOutcome {
-    return pending_revocation.retry(alloc, .grok, .{ .context = &transport, .run = revokeKept }, before_revocation);
-}
-
-fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
-    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
-    return revokeToken(alloc, transport.*, tokens.refresh_token);
-}
+pub const retryKeptSignOuts = sign_out.retryKeptSignOuts;
 
 pub fn sourceExists(alloc: Allocator) !bool {
     var session = (try grok_session.load(alloc)) orelse return false;

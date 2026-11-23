@@ -847,7 +847,7 @@ describe("/mcp in the shell", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
     await tui.waitForComposer(15_000);
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -949,7 +949,7 @@ describe("/mcp in the shell", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp show slow");
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -961,7 +961,10 @@ describe("/mcp in the shell", () => {
       while (tui.isAlive() && Date.now() - start < 5_000) await Bun.sleep(20);
       // A graceful stop would wait 1.5 s on the closed stdin before SIGTERM.
       expect(Date.now() - start).toBeLessThan(1_000);
-      for (let i = 0; i < 50 && isRunning(pid); i++) await Bun.sleep(20);
+      // The owner stops the server, which ignores its closed stdin, with
+      // SIGTERM within its grace; the session itself does not wait for it.
+      // Polls that process's exit, bounded at 5 s.
+      for (let i = 0; i < 250 && isRunning(pid); i++) await Bun.sleep(20);
       expect(isRunning(pid)).toBe(false);
     } finally {
       if (isRunning(pid)) process.kill(pid, "SIGKILL");

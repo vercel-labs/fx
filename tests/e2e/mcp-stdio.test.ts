@@ -991,6 +991,41 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("an idle stdio server stops and the next call starts it again", async () => {
+    const root = createRoot("idle-restart", MODERN_FIXTURE);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+      // The model waits longer than the idle limit before its second call, so
+      // the server stops in the gap. A fixed window is the point: the gap must
+      // outlast the idle limit, and no event marks the stop.
+      async () => {
+        await Bun.sleep(2_000);
+        return fakeGatewayToolCall("call_mcp2", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
+      },
+      fakeGatewayFinalText("IDLE_RESTART_DONE"),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool twice."],
+      {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway), FX_TEST_MCP_IDLE_MS: "300" },
+        timeoutMs: 30_000,
+      },
+    );
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("IDLE_RESTART_DONE");
+    const wire = readWire(root.wireLogPath);
+    const calls = wire.filter((entry) => entry.message.method === "tools/call");
+    expect(calls).toHaveLength(2);
+    const [first, second] = calls.map((entry) => entry.pid);
+    expect(second).not.toBe(first);
+    // The idle stop ended the first process, and the second call started a
+    // new one.
+    await expectProcessesExited([first]);
+    await expectFixtureProcessesExited(wire);
+  }, 40_000);
+
   for (const matchingPath of [false, true]) {
     test.skipIf(process.platform === "win32" || !tmuxAvailable())(
       `MCP slash add preserves scoped arguments with ${matchingPath ? "a matching" : "no matching"} local path`,
@@ -2243,7 +2278,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         for (const entry of wire) {
           const meta = entry.message.params?._meta as Record<string, unknown>;
           expect(meta["io.modelcontextprotocol/protocolVersion"]).toBe("2026-07-28");
-          expect(meta["io.modelcontextprotocol/clientCapabilities"]).toEqual({});
+          // A shared server runs in one owner for every session that wants
+          // it, so it hears the union of their question UIs. fx ask shows
+          // none itself, and a question it cannot show is declined. A server
+          // this session runs itself, as on a home whose owner socket path is
+          // too long, hears no capability at all.
+          const capabilities = meta["io.modelcontextprotocol/clientCapabilities"] as Record<string, unknown> | undefined;
+          expect([[], ["elicitation"]]).toContainEqual(Object.keys(capabilities ?? {}));
         }
       } else {
         expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
@@ -2995,7 +3036,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
   // A 2025 server, as Datadog's is: a 2026 server's -32602 on a call makes fx negotiate the protocol again.
   // Returns the model's text for the failed call, the trace log (every scope) and standard error fx wrote meanwhile,
   // and what the TUI showed. With `report`, it also runs /trace and returns the report fx wrote, as text and records.
-  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false) {
+  async function refusedCall(label: string, options: RootOptions, finalText: string, report = false, rowText?: string) {
     const root = createRoot(label, LEGACY_FIXTURE, { mode: "invalid_params", legacyVersion: "2025-06-18", ...options });
     const activeGateway = startToolGateway(finalText);
     gateway = activeGateway;
@@ -3013,9 +3054,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture with a typed argument.");
     await tui.waitForText(finalText, 25_000);
-    // The failed call's row gets its reason once the turn ends on it, which
-    // is after the final text arrives.
+    // A failed call's row takes its cause once the turn ends on it, one frame
+    // after the reply text, and the capture below must not land between the
+    // two.
     await tui.waitForText(`Couldn't use ${TOOL_ROW} · `, 10_000);
+    if (rowText) await tui.waitForText(rowText, 10_000);
     const body = activeGateway.requests.at(-1)?.body;
     const screen = await tui.captureFullScrollback();
     let traced: { records: Array<Record<string, unknown>>; calls: Array<Record<string, unknown>> } | null = null;
@@ -3134,11 +3177,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         ["other-code", "Internal error", null],
       ] as const;
       for (const [kind, message, cause] of cases) {
+        const rowText = `Couldn't run ${TOOL_NAME} · ${cause ?? `MCP protocol error -32603: ${message}`}`;
         const logged = await refusedCall(
           `tui-invalid-params-log-${kind}`,
           { protocolErrorMessage: message, protocolErrorData: data, ...(cause === null ? { protocolErrorCode: -32603 } : {}) },
           `Log ${kind} complete.`,
           true,
+          rowText,
         );
         const text = logged.text();
         expect(text.length).toBeGreaterThan(8 * 1024);

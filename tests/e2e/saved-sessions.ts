@@ -150,8 +150,11 @@ export async function waitForRootTurnCommitted(home: string, after = 0, timeoutM
 /// its message. A report that arrives while that turn still runs joins it
 /// (`postMail` in `src/core/agent/worker_runtime.zig`), and the receipt would
 /// get no request of its own, so a test's request counts and its reading of
-/// the report would depend on which side is faster.
-export function holdChildAnswer(home: string) {
+/// the report would depend on which side is faster. A wait gives up after
+/// `waitMs` (`waitForRootTurnCommitted`'s bound when unset): keep it below the
+/// `runFx` bound of the run it holds, or `runFx` ends fx first and the kept
+/// error never gets thrown.
+export function holdChildAnswer(home: string, waitMs?: number) {
   let committedBefore = 0;
   // A wait that fails is kept and answered with an error response, so fx sees
   // a failed request and `runFx` ends it normally; the test throws the kept
@@ -168,7 +171,7 @@ export function holdChildAnswer(home: string) {
     async wait(): Promise<Response | undefined> {
       if (failed === undefined) {
         try {
-          await waitForRootTurnCommitted(home, committedBefore);
+          await waitForRootTurnCommitted(home, committedBefore, waitMs);
           return undefined;
         } catch (error) {
           failed = error;
