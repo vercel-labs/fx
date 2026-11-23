@@ -23,9 +23,6 @@ const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const max_hold_ms = 60_000;
-
 /// How long a message waits for a starting work's turn to begin before it
 /// goes to the child's next turn. A start takes milliseconds; the limit only
 /// keeps the parent's call from waiting on a start that never comes.
@@ -117,9 +114,9 @@ pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) vo
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "start child={s}", .{child_id}) catch return;
-    writeMarker(marker, contents) catch return;
-    const deadline = io_mod.milliTimestamp() + max_hold_ms;
-    while (!cancel.load(.seq_cst) and !pathExists(files.release) and !pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
+    end_test_controls.writeMarker(marker, contents) catch return;
+    const deadline = io_mod.milliTimestamp() + end_test_controls.max_hold_ms;
+    while (!cancel.load(.seq_cst) and !end_test_controls.pathExists(files.release) and !end_test_controls.pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);
     }
 }
@@ -130,21 +127,6 @@ pub fn waitLimitMs() u64 {
     if (builtin.is_test) return test_wait_limit_ms orelse default_wait_limit_ms;
     const raw = io_mod.getenv("FX_TEST_SUBAGENT_START_WAIT_MS") orelse return default_wait_limit_ms;
     return std.fmt.parseInt(u64, raw, 10) catch default_wait_limit_ms;
-}
-
-fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
-}
-
-fn pathExists(path: []const u8) bool {
-    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    return true;
 }
 
 test "a test build holds a work's start and sets the wait limit only through its hooks" {
