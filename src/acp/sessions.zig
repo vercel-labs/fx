@@ -4412,12 +4412,14 @@ test "a joiner's answer comes before an owner update sent right after the join" 
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
     try commitJoinTestTurn(alloc, session, "question one", "answer one");
 
     var send = SendOnAnswer{ .alloc = alloc, .frames = &joiner_frames, .session = session };
     var joiner = try joinTestStateOn(alloc, &test_host, jsonrpc.Writer.initCallback(&send, SendOnAnswer.write), "/tmp/elsewhere");
+    joiner.connection_id = 2;
     defer joiner.deinit();
     // Declared after the joiner, so the thread finishes before the joiner is freed.
     defer if (send.thread) |thread| thread.join();
