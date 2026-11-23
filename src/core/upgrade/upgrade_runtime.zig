@@ -250,7 +250,7 @@ fn upgradeWorkerInner(
         return;
     };
 
-    helpers.replaceBinary(extracted_bin, self_exe) catch {
+    helpers.replaceBinary(alloc, extracted_bin, self_exe) catch {
         result.err = .replace_failed;
         return;
     };
