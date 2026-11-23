@@ -271,6 +271,15 @@ fn configureWithOptions(
 
 fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
     const zio = io_mod.getIo();
+    if (!exclusive) {
+        // The append open never waits on a FIFO and refuses anything that is not a
+        // regular file. The tape then starts empty, as a truncating create would.
+        var file = try io_mod.openRegularFileForAppendAbsolute(path, .follow);
+        errdefer file.close(zio);
+        try file.setLength(zio, 0);
+        return file;
+    }
+    // Exclusive: O_CREAT|O_EXCL refuses an existing path, a FIFO included, without opening it.
     if (std.Io.Dir.path.isAbsolute(path)) {
         if (private) {
             return std.Io.Dir.createFileAbsolute(zio, path, .{
@@ -1034,4 +1043,30 @@ test "an unusable recording path stops a debug recording, and a plain one runs o
 
     io_mod.setEnvironMap(&debug);
     try testing.expect(std.meta.isError(configureFromEnv(alloc, 80, 24, "vtest")));
+}
+
+test "explicit recording refuses a FIFO with no reader instead of blocking" {
+    const alloc = testing.allocator;
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const path = try std.Io.Dir.path.join(alloc, &.{ dir, "tape.fxtape" });
+    defer alloc.free(path);
+    const path_z = try alloc.allocSentinel(u8, path.len, 0);
+    defer alloc.free(path_z);
+    @memcpy(path_z, path);
+    try testing.expectEqual(@as(c_int, 0), fifo_c.mkfifo(path_z, 0o600));
+
+    shutdown();
+    defer shutdown();
+    // The explicit FX_RECORD path is non-exclusive and not private. Opening a
+    // FIFO with no reader used to block here forever; it must be refused at once.
+    try testing.expectError(error.DurablePathUnsafe, configure(alloc, path, 80, 24, "vtest"));
+    try testing.expect(!state.enabled);
 }

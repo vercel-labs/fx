@@ -333,27 +333,33 @@ pub fn configureForTestWithScopes(alloc: Allocator, path: []const u8, scope_filt
 
 pub fn configure(options: Options) !void {
     const zio = io_mod.getIo();
-    state_mutex.lockUncancelable(zio);
-    defer state_mutex.unlock(zio);
+    var refused: ?anyerror = null;
+    {
+        state_mutex.lockUncancelable(zio);
+        defer state_mutex.unlock(zio);
 
-    if (state.configured) return;
-    state.configured = true;
-    state.stderr_enabled = options.stderr_enabled;
+        if (state.configured) return;
+        state.configured = true;
+        state.stderr_enabled = options.stderr_enabled;
 
-    if (options.file_path) |path| {
-        if (prepareTraceFile(zio, path)) |_| {
-            state.file_path = std.heap.c_allocator.dupe(u8, path) catch null;
-        } else |_| {
-            // Refused without a word: the file sink stays off, and the stderr
-            // sink below still starts.
+        if (options.file_path) |path| {
+            if (prepareTraceFile(zio, path)) |_| {
+                state.file_path = std.heap.c_allocator.dupe(u8, path) catch null;
+            } else |err| {
+                // The file sink stays off, and the stderr sink below still starts.
+                refused = err;
+            }
         }
-    }
-    if (options.scope_filter) |filter| {
-        const trimmed = std.mem.trim(u8, filter, " \t\r\n");
-        if (trimmed.len > 0) state.scope_filter = try std.heap.c_allocator.dupe(u8, trimmed);
-    }
+        if (options.scope_filter) |filter| {
+            const trimmed = std.mem.trim(u8, filter, " \t\r\n");
+            if (trimmed.len > 0) state.scope_filter = try std.heap.c_allocator.dupe(u8, trimmed);
+        }
 
-    state.enabled = state.stderr_enabled or state.file_path != null;
+        state.enabled = state.stderr_enabled or state.file_path != null;
+    }
+    // logf takes state_mutex itself, so it runs after the lock is released. It
+    // writes only when tracing is on, so a refusal with tracing off stays silent.
+    if (refused) |err| logf("core", "trace log file refused err={s}", .{@errorName(err)});
 }
 
 /// Opens the trace file for appending and creates it when missing. It is refused
