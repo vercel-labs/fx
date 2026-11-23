@@ -180,13 +180,23 @@ function elicitationCapabilities() {
 
 function hasModernMetadata(message) {
   const meta = message.params?._meta;
-  const capabilities = JSON.stringify(meta?.["io.modelcontextprotocol/clientCapabilities"]);
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const declared = JSON.stringify(elicitationCapabilities());
-  const capabilitiesMatch = advertiseElicitation
-    ? capabilities === declared
-    : capabilities === "{}" || capabilities === declared;
+  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
+  const capabilityNames = capabilities && typeof capabilities === "object"
+    ? Object.keys(capabilities)
+    : [];
+  const elicitation = capabilityNames.includes("elicitation") ? capabilities.elicitation : null;
+  const declaredModes = elicitation && typeof elicitation === "object"
+    ? Object.keys(elicitation)
+    : [];
+  const neededModes = Object.keys(elicitationCapabilities().elicitation ?? {});
+  // A session that shares its server runs it in one owner for every session
+  // that wants it, so the server hears the union of their question UIs: a
+  // session can ask for less than what reached the wire, never more. The
+  // fixture still refuses a client that leaves out a mode it needs, and one
+  // that declares anything besides form and url.
+  const capabilitiesMatch = capabilityNames.every((name) => name === "elicitation") &&
+    neededModes.every((mode) => declaredModes.includes(mode)) &&
+    declaredModes.every((mode) => mode === "form" || mode === "url");
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
