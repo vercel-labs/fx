@@ -10863,24 +10863,36 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }
 
-  // The child's next tool result needs a new blob, which a read-only blobs
-  // folder refuses, so the write fails while the child streams the step and
-  // the cause is the refused write.
+  // The child's next tool result is small, so it is packed, and the pack is
+  // created by the failing commit (the child has none yet). A read-only session
+  // folder refuses that create, so the write fails while the child streams the
+  // step and the cause is the refused write. The blobs folder is read-only too,
+  // for a result over the pack's limit.
   const readOnlyBlobs: BlobsFault = {
     cause: "AccessDenied",
-    inject: (blobs) => chmodSync(blobs, 0o500),
-    restore: (blobs) => chmodSync(blobs, 0o700),
+    inject: (blobs) => {
+      chmodSync(blobs, 0o500);
+      chmodSync(join(blobs, ".."), 0o500);
+    },
+    restore: (blobs) => {
+      chmodSync(join(blobs, ".."), 0o700);
+      chmodSync(blobs, 0o700);
+    },
   };
 
-  // A file where the blobs folder must be fails the child's commit for every
-  // user. The step still streams, and the cause is the failed commit.
+  // A file where the blobs folder must be, and a folder where the session's
+  // pack must be: the failing commit creates the pack, and that create fails
+  // on the folder for every user. The step still streams, and the cause is
+  // the failed commit.
   const fileInPlaceOfBlobs: BlobsFault = {
     cause: "SessionCommitFailed",
     inject: (blobs) => {
       renameSync(blobs, `${blobs}.aside`);
       writeFileSync(blobs, "");
+      mkdirSync(join(blobs, "..", "blobs.pack"));
     },
     restore: (blobs) => {
+      rmSync(join(blobs, "..", "blobs.pack"), { recursive: true, force: true });
       rmSync(blobs);
       renameSync(`${blobs}.aside`, blobs);
     },
@@ -10946,7 +10958,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           fault.inject(childBlobs);
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
-        return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
+        // Over the pack's 4 KiB limit, so this result is a blob file and the
+        // child has no pack yet: the first packed write is the failing commit.
+        return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt && head -c 5000 /dev/zero | tr '\\0' x");
       }
       return fakeGatewayFinalText("UNEXPECTED_CHILD_REQUEST");
     }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
