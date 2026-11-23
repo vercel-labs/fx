@@ -448,7 +448,8 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
 }
 
 function stripAnsi(text: string): string {
-  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  // Style codes, and the links file names carry.
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
 }
 
 type SessionPickerEntry = {
@@ -9593,6 +9594,42 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed!.body).toContain("fx stopped while this tool was running");
       // With a tool in flight the note keeps its caveat.
       expect(resumed!.body).toContain("A tool that was running may have partly run.");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a question still open when fx was killed reads as one fx couldn't ask after a resume",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-question-");
+    const question = "STOPPED_QUESTION_6120: ship the release now?";
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("QUESTION_RESUMED_6120");
+      if (body.includes("Ask before shipping.")) {
+        return fakeGatewayToolCall("stopped_question", "ask_user_question", {
+          questions: [{ question, options: [{ label: "Ship" }, { label: "Wait" }] }],
+        });
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Ask before shipping.");
+      await active.waitForText(question, TIMEOUT);
+      await endFx(active, "SIGKILL");
+
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      const pane = await active.waitForText("QUESTION_RESUMED_6120", TIMEOUT);
+      expect(pane).toContain("● Couldn't ask you · fx stopped");
+      expect(pane.split("\n").map((line) => line.trim())).not.toContain("● Failed");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();

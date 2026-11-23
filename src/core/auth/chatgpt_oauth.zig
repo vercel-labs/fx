@@ -10,7 +10,6 @@ const io_mod = @import("../shared/io.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
 const subscription_logout = @import("subscription_logout.zig");
 const types = @import("../shared/types.zig");
@@ -360,26 +359,10 @@ pub fn runLogin(
 }
 
 const sign_out = subscription_logout.Provider(chatgpt_session, .codex, revokeToken, "Codex");
-pub const LogoutResult = subscription_logout.LogoutResult;
-pub const LocalLogout = subscription_logout.LocalLogout;
 /// Deletes the saved Codex login, then revokes its refresh token at OpenAI.
 pub const logout = sign_out.logout;
 pub const logoutLocally = sign_out.logoutLocally;
-
-/// Revokes the Codex sign-outs that earlier logouts kept because the provider
-/// did not confirm them (`pending_revocation.retry`).
-pub fn retryKeptSignOuts(
-    alloc: Allocator,
-    transport: oauth_transport.Provider,
-    before_revocation: ?oauth.BeforeRevocation,
-) pending_revocation.RetryOutcome {
-    return pending_revocation.retry(alloc, .codex, .{ .context = &transport, .run = revokeKept }, before_revocation);
-}
-
-fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
-    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
-    return revokeToken(alloc, transport.*, tokens.refresh_token);
-}
+pub const retryKeptSignOuts = sign_out.retryKeptSignOuts;
 
 /// Revokes a Codex refresh token at OpenAI, which ends its login there.
 pub fn revokeToken(alloc: Allocator, transport: oauth_transport.Provider, token: []const u8) !void {

@@ -1170,6 +1170,68 @@ test "a check killed at the deadline takes with it what it started in a group of
     try std.testing.expect(gone);
 }
 
+/// How long a test waits for a stop path that may block before its watchdog
+/// kills what the test started. A stop that works returns in about a second.
+const stop_bound_ms: i64 = 10_000;
+
+/// Kills `pids` and their groups if `disarm` has not been called `stop_bound_ms`
+/// after `arm`. A check that nothing kills stays stopped by `stopTrees`, and
+/// the waiter that `wait` cancels can only end when the check does, so a
+/// missing kill would hang the test. It kills with `std.posix.kill` itself, so
+/// a bug planted in the stop path cannot disable it.
+const StopWatchdog = struct {
+    pids: []const std.posix.pid_t,
+    over: std.Io.Event = .unset,
+    /// Written by the watchdog's thread, read after `disarm` joins it.
+    fired: bool = false,
+    thread: ?std.Thread = null,
+
+    fn arm(self: *StopWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Ends the watchdog and returns whether it had to kill. Calling it again
+    /// returns the same answer.
+    fn disarm(self: *StopWatchdog) bool {
+        self.over.set(io_mod.getIo());
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        return self.fired;
+    }
+
+    fn run(self: *StopWatchdog) void {
+        const limit = io_mod.milliTimestamp() + stop_bound_ms;
+        while (!self.over.isSet()) {
+            const left = limit - io_mod.milliTimestamp();
+            if (left <= 0) {
+                self.fired = true;
+                killStarted(self.pids);
+                return;
+            }
+            // A timeout or a wake-up with no signal sends the loop back to the clock and the flag.
+            self.over.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(left) } }) catch {};
+        }
+    }
+};
+
+/// What a test prints, with the call that was blocked and `stop_bound_ms`,
+/// when its watchdog had to kill. The test prints it itself: the direct-write
+/// audit lists the `std.debug.print` sites outside test blocks one by one
+/// (`tests/e2e/render-lab/audit-direct-writes.ts`).
+const stop_path_hung_fmt = "{s} had not returned after {d} ms, so the watchdog killed the processes it waited on: the stop path did not end them\n";
+
+/// Kills each of `pids` and its group. A pid of 0 or 1 would signal the test's
+/// own group or every process, so it is skipped.
+fn killStarted(pids: []const std.posix.pid_t) void {
+    for (pids) |pid| {
+        if (pid <= 1) continue;
+        // A group that has already ended is what the kill is for.
+        std.posix.kill(-pid, .KILL) catch {};
+        // So is a process that has.
+        std.posix.kill(pid, .KILL) catch {};
+    }
+}
+
 test "an ending signal during the fan-out stops what started, starts nothing more, and is returned" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.heap.c_allocator;
@@ -1178,6 +1240,8 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     var processes: std.ArrayList(*ProcessProbe) = .empty;
     const first = try ProcessProbe.create(alloc, "first", &.{ "/bin/sh", "-c", "sleep 30" }, null);
     first.spawn(&waiters, null);
+    // A test that fails before `wait` ends it leaves no `sleep` behind.
+    defer if (!first.done.load(.acquire)) killStarted(&.{first.pid});
     try processes.append(alloc, first);
     // The handler's whole work, as if the signal reached it now.
     recordStopSignal(.TERM);
@@ -1186,7 +1250,15 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     try std.testing.expectEqual(@as(usize, 0), servers.next);
     try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
     const started = io_mod.milliTimestamp();
+    const first_pids = [_]std.posix.pid_t{first.pid};
+    var watchdog: StopWatchdog = .{ .pids = &first_pids };
+    try watchdog.arm();
+    defer _ = watchdog.disarm();
     try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters, &servers).?);
+    if (watchdog.disarm()) {
+        std.debug.print(stop_path_hung_fmt, .{ "wait", stop_bound_ms });
+        return error.StopPathHung;
+    }
     // It stopped at the signal, not at the deadline, and never started the
     // check that waited in the queue.
     try std.testing.expect(io_mod.milliTimestamp() - started < reap_grace_ms);
@@ -1419,6 +1491,33 @@ fn entryCount(dir: std.Io.Dir) !usize {
     return count;
 }
 
+/// The most processes one forker starts, after which it only waits for them.
+/// A stop that works ends it after a few dozen; the cap bounds what a stop
+/// path that never ends it, and a runner that starts the test again, can start.
+const forker_start_cap: usize = 200;
+const forker_start_cap_arg = std.fmt.comptimePrint("{d}", .{forker_start_cap});
+const forker_rounds: usize = 5;
+/// How long, all together, the processes the forkers started have to be
+/// gone after the last stop. The test once gave each one this long, one
+/// after the other, so no process may take longer than before.
+const forker_reap_ms: i64 = 1_000;
+
+/// Ends the forkers still running and every process still alive that one of
+/// them recorded in `dir`, so a test that fails leaves none of them sleeping
+/// on. A forker whose waiter has reaped it is left alone: its pid may be reused.
+fn killForkerLeftovers(dir: std.Io.Dir, forkers: []const ?*ProcessProbe) void {
+    for (forkers) |forker| {
+        const probe = forker orelse continue;
+        if (!probe.done.load(.acquire)) killStarted(&.{probe.pid});
+    }
+    var it = dir.iterate();
+    while (it.next(io_mod.getIo()) catch null) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        // A check that cannot be read is killed too: it may be alive.
+        if (process_tree.processIsAlive(std.heap.c_allocator, pid) catch true) killStarted(&.{pid});
+    }
+}
+
 test "stopping a check that keeps starting processes in groups of their own leaves none of them" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.heap.c_allocator;
@@ -1426,6 +1525,8 @@ test "stopping a check that keeps starting processes in groups of their own leav
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
+    var forkers: [forker_rounds]?*ProcessProbe = @splat(null);
+    defer killForkerLeftovers(tmp.dir, &forkers);
     // Each process it starts moves to a group of its own and writes its pid,
     // like a stdio server an `fx mcp show` child starts. It starts one about
     // every millisecond. The pause bounds the storm: started as fast as the
@@ -1436,13 +1537,17 @@ test "stopping a check that keeps starting processes in groups of their own leav
     // stops the forker. Each ignores SIGHUP before it moves: the kernel hangs
     // up a stopped process in a group that its parent's death orphans, which
     // would end them without fx's own kill of what a check started outside its
-    // group, and this test must prove that kill.
-    const script = "while :; do /usr/bin/perl -e '$SIG{HUP} = \"IGNORE\"; setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.001; done";
-    for (0..5) |round| {
+    // group, and this test must prove that kill. It starts no more than
+    // `forker_start_cap` (its `$1`) and then waits for them, so a stop path
+    // that never ends it cannot start thousands, and a stop that lands late
+    // still finds a check to stop.
+    const script = "n=0; while [ $n -lt \"$1\" ]; do /usr/bin/perl -e '$SIG{HUP} = \"IGNORE\"; setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & n=$((n + 1)); sleep 0.001; done; wait";
+    for (&forkers, 0..) |*forker, round| {
         var waiters: std.Io.Group = .init;
         const before = try entryCount(tmp.dir);
-        const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
+        const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir, forker_start_cap_arg }, null);
         probe.spawn(&waiters, null);
+        forker.* = probe;
         // Once it has started one, so the stop meets it while it starts more.
         // On a loaded machine that takes longer than any fixed wait.
         const started_one = for (0..1_000) |_| {
@@ -1454,7 +1559,15 @@ test "stopping a check that keeps starting processes in groups of their own leav
         // Under load the stop can take longer than `stop_land_ms` to land,
         // which `stopTrees` allows; what it started must be gone either way.
         stopTrees(&.{probe});
+        const forker_pids = [_]std.posix.pid_t{probe.pid};
+        var watchdog: StopWatchdog = .{ .pids = &forker_pids };
+        try watchdog.arm();
+        defer _ = watchdog.disarm();
         waiters.cancel(io_mod.getIo());
+        if (watchdog.disarm()) {
+            std.debug.print(stop_path_hung_fmt, .{ "cancelling the forker's waiter", stop_bound_ms });
+            return error.StopPathHung;
+        }
         // Only after the stop, so a test that fails here does not leave the
         // forker starting processes.
         try std.testing.expect(started_one);
@@ -1462,17 +1575,23 @@ test "stopping a check that keeps starting processes in groups of their own leav
     }
     // Every process any round started is gone, once the system reaps it.
     var started: usize = 0;
+    var alive: usize = 0;
+    const reap_limit = io_mod.milliTimestamp() + forker_reap_ms;
     var it = tmp.dir.iterate();
     while (try it.next(io_mod.getIo())) |entry| {
         const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
         started += 1;
-        const gone = for (0..200) |_| {
-            if (!try process_tree.processIsAlive(alloc, pid)) break true;
+        while (try process_tree.processIsAlive(alloc, pid)) {
+            if (io_mod.milliTimestamp() >= reap_limit) {
+                alive += 1;
+                break;
+            }
             io_mod.sleep(5 * std.time.ns_per_ms);
-        } else false;
-        if (!gone) std.posix.kill(pid, .KILL) catch {};
-        try std.testing.expect(gone);
+        }
     }
+    const gone = alive == 0;
+    if (!gone) std.debug.print("{d} of the {d} processes the forkers started were still alive {d} ms after the stops\n", .{ alive, started, forker_reap_ms });
+    try std.testing.expect(gone);
     try std.testing.expect(started > 0);
 }
 

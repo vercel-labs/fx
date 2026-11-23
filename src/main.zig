@@ -130,6 +130,7 @@ const shell_process_provider = @import("tools/shell/process_provider.zig");
 const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
+const mcp_owner = mcp_host.owner;
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -3930,6 +3931,19 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.
     try useFxHomeFromEnv(raw_env);
+
+    if (mcp_owner.isModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        // The servers run here now, so a session's trace asks this process
+        // for them; it starts in the session's directory.
+        debug_trace.configureFromEnv(processAllocator(), ".");
+        try mcp_owner.run(processAllocator(), std.mem.sliceTo(raw_args[2], 0), build_options.app_version);
+        return;
+    }
 
     if (comptime terminal_native_session.isSupported()) {
         if (terminal_native_session.isControlModeRaw(raw_args)) {

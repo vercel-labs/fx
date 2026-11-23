@@ -3,7 +3,9 @@
 \* `fx mcp add`, `remove` and `list --json` runs, each in its own HOME and
 \* workspace (tests/tla/drivers/mcp_host/config-edit.test.ts).
 \*   init {profile, project}   the two files before the first command, each
-\*                             {st, typo, both, big, ent}; ent has every name;
+\*                             {st, typo, both, big, ent}; st is "absent", "ok",
+\*                             "deep" (readable, nested past the edit's limit) or
+\*                             "broken"; ent has every name;
 \*                             typo is what the profile's misspelled servers key holds:
 \*                             "no-typo", "other" (a server that is not one of the
 \*                             names) or the name of the server it holds
@@ -21,7 +23,7 @@
 \*                             the harness edits a file itself, as an editor would:
 \*                             typo_appears (name: the server the key holds, or
 \*                             another name for "other"), typo_fixed, grows, both_appear,
-\*                             both_merged, hand, breaks, repairs, deletes
+\*                             both_merged, hand, deepens, flattens, breaks, repairs, deletes
 EXTENDS ConfigEdit, TraceObs, Sequences
 
 VARIABLES i, bad
@@ -30,6 +32,7 @@ Viol ==
     (IF AddedIsLoaded THEN {} ELSE {"AddedIsLoaded"}) \cup
     (IF RefusedLeavesFile THEN {} ELSE {"RefusedLeavesFile"}) \cup
     (IF NoRewriteOfMisspelled THEN {} ELSE {"NoRewriteOfMisspelled"}) \cup
+    (IF NoWriteOfDeep THEN {} ELSE {"NoWriteOfDeep"}) \cup
     (IF HintMatchesHeldName THEN {} ELSE {"HintMatchesHeldName"}) \cup
     (IF OthersKept THEN {} ELSE {"OthersKept"})
 
@@ -60,6 +63,8 @@ Step(rec) ==
             \/ rec.data.kind = "both_appear" /\ BothAppear
             \/ rec.data.kind = "both_merged" /\ BothMerged
             \/ rec.data.kind = "hand" /\ HandEntry(rec.data.file, rec.data.name, rec.data.class)
+            \/ rec.data.kind = "deepens" /\ Deepens(rec.data.file)
+            \/ rec.data.kind = "flattens" /\ Flattens(rec.data.file)
             \/ rec.data.kind = "breaks" /\ Breaks(rec.data.file)
             \/ rec.data.kind = "repairs" /\ Repairs(rec.data.file)
             \/ rec.data.kind = "deletes" /\ Deletes(rec.data.file)

@@ -245,6 +245,10 @@ pub const ToolLifecycleEvent = union(enum) {
         presentation_group_id: ?ToolPresentationGroupId = null,
         tool_name: ?[]const u8,
         activity_kind: ToolActivityKind,
+        /// The call's arguments once the provider has sent all of them, while
+        /// the call waits to start; null while they still stream in.
+        /// Borrowed for this push only.
+        arguments_json: ?[]const u8 = null,
     },
     authoritative_started: struct {
         id: ToolLifecycleId,
@@ -275,6 +279,15 @@ pub const ToolLifecycleEvent = union(enum) {
         /// src/core/agent/runtime/tool_presentation.zig). Only the
         /// transcript's compact rows read it.
         check_found_command_ended: bool = false,
+        /// The file a read, edit, or write read or changed, as core resolved
+        /// it with symlinks followed, the same for every way the call named
+        /// the file: an edit's or write's absolute path
+        /// (`finishCommittedFileStatus`), or the path a read's result names,
+        /// relative to the workspace for a file in it
+        /// (`finishExecutedToolStatus`, both in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        resolved_path: ?[]const u8 = null,
     },
     turn_finished: TurnFinished,
 };
@@ -1242,6 +1255,9 @@ pub const PersistedToolResult = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// A `subagent` message that made a new subagent, which a v2 session
+    /// saves as an item of its own beside the result (D101).
+    subagent_started: bool = false,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -1406,6 +1422,9 @@ pub const ToolResultMemory = struct {
     /// the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
+    /// A `subagent` message that made a new subagent, so its row reads
+    /// "Started" rather than "Messaged". The model never sees it.
+    subagent_started: bool = false,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1761,6 +1780,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
@@ -3667,6 +3687,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .subagent_started = result.subagent_started,
     };
 }
 

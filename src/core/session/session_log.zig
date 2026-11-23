@@ -1421,6 +1421,16 @@ pub const ConversationTurnBuilder = struct {
         return true;
     }
 
+    /// Marks the result of `call_id`, already appended in this turn, as a
+    /// message that made a new subagent (D101). False when the turn has no
+    /// such result of a `subagent` call.
+    pub fn markSubagentStarted(self: *ConversationTurnBuilder, call_id: []const u8) bool {
+        const result = self.findResult(call_id) orelse return false;
+        if (!std.mem.eql(u8, result.tool_name, "subagent")) return false;
+        result.subagent_started = true;
+        return true;
+    }
+
     /// The result of `call_id` in the open step or in a step this turn
     /// already finished.
     fn findResult(self: *ConversationTurnBuilder, call_id: []const u8) ?*types.PersistedToolResult {
@@ -1762,6 +1772,27 @@ test "review rows attach once, only to a turn's edit with no full-diff source" {
     try std.testing.expect(results[1].committed_file_presentation.?.review_lines == null);
 }
 
+test "a subagent start marks only the turn's subagent result it names (D101)" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    try builder.begin(.{ .text = "ask the scout" });
+    try builder.appendToolCall(.{ .call_id = "message-1", .tool_name = "subagent", .arguments_json = "{}" });
+    try builder.appendToolCall(.{ .call_id = "read-1", .tool_name = "read_file", .arguments_json = "{}" });
+    for ([_][]const u8{ "message-1", "read-1" }, [_][]const u8{ "subagent", "read_file" }) |call_id, tool_name| {
+        try builder.appendToolResult(.{ .call_id = call_id, .tool_name = tool_name, .status = .success, .artifact_ref = "result.txt", .stored_bytes = 0, .completeness = .complete });
+    }
+    try std.testing.expect(!builder.markSubagentStarted("missing"));
+    try std.testing.expect(!builder.markSubagentStarted("read-1"));
+    try std.testing.expect(builder.markSubagentStarted("message-1"));
+    try builder.appendAssistant(.{ .text = "done" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    const results = turn.assistant.execution.tool_steps[0].tool_results;
+    try std.testing.expect(results[0].subagent_started);
+    try std.testing.expect(!results[1].subagent_started);
+}
+
 test "reasoning-only checkpoint coverage and replay count the same completed unit" {
     const alloc = std.testing.allocator;
     const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
@@ -1904,6 +1935,7 @@ fn dupeConversationToolResult(
         .command_output_replay = command_output_replay,
         .command_process_presentation = value.command_process_presentation,
         .terminal_action_presentation = value.terminal_action_presentation,
+        .subagent_started = value.subagent_started,
     };
 }
 

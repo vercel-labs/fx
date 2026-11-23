@@ -5,6 +5,8 @@ const transcript_window_shell = @import("transcript_window_shell.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const agent_tool_presentation = @import("../../core/agent/runtime/tool_presentation.zig");
+const file_mutation_execution = @import("../../core/tooling/file_mutation_execution.zig");
+const tool_result_display = @import("../../core/tooling/tool_result_display.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -2804,6 +2806,34 @@ test "provisional lifecycle owns semantic detail before authoritative reconcilia
     try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
 }
 
+test "a provisional row keeps its call's arguments once they are whole, while the call waits" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "saved-search" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+    } });
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(entry_id).?.arguments_json == null);
+
+    const arguments_json = "{\"handle\":\"result-1111.txt\",\"query\":\"npx\"}";
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+        .arguments_json = arguments_json,
+    } });
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings(arguments_json, detail.arguments_json.?);
+    try std.testing.expect(detail.arguments_json.?.ptr != arguments_json.ptr);
+    try std.testing.expect(detail.streaming);
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+}
+
 test "nonzero command remains Ran in the current compact projection" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
@@ -3202,6 +3232,153 @@ test "a resumed shell check keeps whether it found its command ended" {
         });
         try std.testing.expectEqual(case.ended, runtime.toolDetailForEntry(entry_id).?.check_found_command_ended);
     }
+}
+
+test "a subagent message's start mark reaches its detail live and on resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}";
+    const call: types.ToolCall = .{ .id = "resumed-start", .name = "subagent", .arguments_json = arguments };
+    for ([_]bool{ true, false }) |started| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "sent to scout · map it", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .subagent, .{
+            .tool_call_id = @constCast("resumed-start"),
+            .tool_name = @constCast("subagent"),
+            .status = .success,
+            .output = @constCast("{\"ok\":true}"),
+            .output_bytes = 11,
+            .stored_output_bytes = 11,
+            .subagent_started = started,
+        });
+        try std.testing.expectEqual(started, runtime.toolDetailForEntry(entry_id).?.subagent_started);
+    }
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-start" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "subagent",
+        .activity_kind = .subagent,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(!runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "sent to scout · map it" },
+        .result = "{\"ok\":true}",
+        .result_memory = .{ .subagent_started = true },
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+}
+
+/// The file a saved call read or changed, as its result names it with
+/// symlinks followed: a committed change's (`changedPathOfResult`), or a
+/// completed read_file's (`readPathOfResult`). Null for any other call. A
+/// read's path is taken only from its whole saved text, as live.
+fn savedResolvedPath(call: types.ToolCall, result: types.PersistedToolResult) ?[]const u8 {
+    if (result.status != .success) return null;
+    if (result.committed_file_presentation != null) {
+        return file_mutation_execution.changedPathOfResult(if (result.output.len > 0) result.output else result.preview orelse "");
+    }
+    if (std.mem.eql(u8, call.name, "read_file")) return tool_result_display.readPathOfResult(result.output);
+    return null;
+}
+
+/// An owned copy of `path`, made absolute in `root` when it is relative and
+/// the root is known; else as it is.
+fn resolvedPathIn(alloc: Allocator, path: []const u8, root: ?[]const u8) ![]u8 {
+    const folder = root orelse return alloc.dupe(u8, path);
+    if (std.Io.Dir.path.isAbsolute(path) or !std.Io.Dir.path.isAbsolute(folder)) return alloc.dupe(u8, path);
+    return std.mem.concat(alloc, u8, &.{ std.mem.trimEnd(u8, folder, "/"), "/", path });
+}
+
+test "a call's resolved file reaches its detail live and on resume, absolute only where its folder is known" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .file_link_root = "/w" };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"path\":\"/w/tsec/x.tse\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const call: types.ToolCall = .{ .id = "resumed-edit", .name = "edit_file", .arguments_json = arguments };
+    const saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("resumed-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited tsec/x.tse (2 bytes)"),
+        .output_bytes = 27,
+        .stored_output_bytes = 27,
+        .committed_file_presentation = .{ .path = "/w/tsec/x.tse", .kind = .edited, .lines = &.{}, .additions = 1, .deletions = 1, .truncated = false },
+    };
+    // With no folder known for the replay, the path stays as saved: the
+    // session may have run in another workspace.
+    const elsewhere_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, elsewhere_id, call, .edit, saved);
+    try std.testing.expectEqualStrings("tsec/x.tse", runtime.toolDetailForEntry(elsewhere_id).?.resolved_path.?);
+
+    runtime.saved_calls_root = "/w";
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .edit, saved);
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", runtime.toolDetailForEntry(entry_id).?.resolved_path.?);
+    // A saved result with no file change kept has none.
+    var bare = saved;
+    bare.committed_file_presentation = null;
+    const bare_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, bare_id, call, .edit, bare);
+    try std.testing.expect(runtime.toolDetailForEntry(bare_id).?.resolved_path == null);
+    // A read names the file core read: the target of the symlink it named.
+    const read_call: types.ToolCall = .{ .id = "resumed-read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const read_saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("resumed-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("<path>real/real.md</path>\n<content>\n1\tok\n</content>"),
+        .output_bytes = 48,
+        .stored_output_bytes = 48,
+    };
+    const read_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Read notes.md", true);
+    try runtime.attachHistoricalToolDetail(alloc, read_id, read_call, .read, read_saved);
+    try std.testing.expectEqualStrings("/w/real/real.md", runtime.toolDetailForEntry(read_id).?.resolved_path.?);
+    // A failed read resolved no file.
+    var failed = read_saved;
+    failed.status = .failure;
+    const failed_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .failed, "Couldn't read notes.md", true);
+    try runtime.attachHistoricalToolDetail(alloc, failed_id, read_call, .read, failed);
+    try std.testing.expect(runtime.toolDetailForEntry(failed_id).?.resolved_path == null);
+    runtime.saved_calls_root = null;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-edit" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "edit_file",
+        .activity_kind = .edit,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.resolved_path == null);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Edited /w/tsec/x.tse +1 / -1" },
+        .resolved_path = "/w/tsec/x.tse",
+    } });
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.resolved_path.?);
+    // A live read's path is in the folder its tools ran in.
+    const read = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = read,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"notes.md\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = read,
+        .outcome = .{ .kind = .completed, .summary = "Read notes.md" },
+        .resolved_path = "real/real.md",
+    } });
+    try std.testing.expectEqualStrings("/w/real/real.md", runtime.toolDetailForEntry(runtime.toolActivityRecord(read).?.entry_id).?.resolved_path.?);
 }
 
 test "historical context-withheld tool detail keeps the call without result evidence" {
@@ -4593,6 +4770,7 @@ const PendingToolDetailTerminal = struct {
     command_process_presentation: ?types.CommandProcessPresentation = null,
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
+    subagent_started: bool = false,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
@@ -4881,6 +5059,8 @@ const transcript_screen_fields = [_][:0]const u8{
     "transcript_archive_boundary",
     "transcript_archive_land_index",
     "collapse_tool_calls",
+    "file_link_root",
+    "saved_calls_root",
     "painting",
     "footer_viewport",
     "extra_input_rows",
@@ -5062,6 +5242,17 @@ pub const TranscriptRuntime = struct {
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
+    /// The folder the session's tools resolve a relative path in, which a
+    /// live call's relative resolved path (`ToolDetailRecord.resolved_path`)
+    /// is in. The app owns it and keeps it while the transcript lives; null
+    /// when it has none.
+    file_link_root: ?[]const u8 = null,
+    /// The folder a saved call's relative resolved path is in while a resumed
+    /// session replays: the workspace, when every turn ran in it. Null when
+    /// the turns may have run in another workspace, whose paths would name
+    /// other files here, so the record keeps the path relative and its row
+    /// has no link. The app owns it and sets it only for the replay.
+    saved_calls_root: ?[]const u8 = null,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -5318,6 +5509,8 @@ pub const TranscriptRuntime = struct {
         self.replaceable_row = source.replaceable_row;
         self.command_output_render = source.command_output_render;
         self.collapse_tool_calls = source.collapse_tool_calls;
+        self.file_link_root = source.file_link_root;
+        self.saved_calls_root = source.saved_calls_root;
         self.full_transcript = source.full_transcript;
         self.transcript_band_dirty = source.transcript_band_dirty;
     }
@@ -5451,6 +5644,7 @@ pub const TranscriptRuntime = struct {
                 provisional.presentation_group_id,
                 provisional.tool_name,
                 provisional.activity_kind,
+                provisional.arguments_json,
             ),
             .authoritative_started => |started| self.applyAuthoritativeLifecycle(
                 alloc,
@@ -5475,6 +5669,7 @@ pub const TranscriptRuntime = struct {
                 terminal.result_memory,
                 terminal.command_artifact_handle,
                 terminal.check_found_command_ended,
+                terminal.resolved_path,
             ),
             .turn_finished => |finished| self.applyTurnFinishedLifecycle(
                 alloc,
@@ -5912,6 +6107,7 @@ pub const TranscriptRuntime = struct {
         presentation_group_id: ?types.ToolPresentationGroupId,
         tool_name: ?[]const u8,
         activity_kind: types.ToolActivityKind,
+        arguments_json: ?[]const u8,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
         if (self.notebook.lifecycle_state.recordPtr(id)) |record| {
@@ -5926,7 +6122,7 @@ pub const TranscriptRuntime = struct {
                 id,
                 name,
                 activity_kind,
-                null,
+                arguments_json,
             );
             defer detail_start.deinit(alloc);
             detail_start.streaming = true;
@@ -5957,7 +6153,7 @@ pub const TranscriptRuntime = struct {
             id,
             tool_name orelse "tool",
             activity_kind,
-            null,
+            arguments_json,
         );
         defer detail_start.deinit(alloc);
         detail_start.streaming = true;
@@ -6159,6 +6355,7 @@ pub const TranscriptRuntime = struct {
         result_memory: ?types.ToolResultMemory,
         command_artifact_handle: ?[]const u8,
         check_found_command_ended: bool,
+        resolved_path: ?[]const u8,
     ) !?types.ToolActivityKind {
         const record = self.notebook.lifecycle_state.recordPtr(id) orelse {
             if (self.notebook.lifecycle_state.isFenced(id.turn_id)) {
@@ -6204,6 +6401,8 @@ pub const TranscriptRuntime = struct {
             @as(u32, @intFromBool(append_turn_cancellation)),
         );
         defer detail_update.deinit(alloc);
+        var owned_resolved_path = if (resolved_path) |path| try resolvedPathIn(alloc, path, self.file_link_root) else null;
+        defer if (owned_resolved_path) |path| alloc.free(path);
         if (!try transcript_store.replacePinnedToolStatusForTerminalAtomic(
             self,
             alloc,
@@ -6238,7 +6437,14 @@ pub const TranscriptRuntime = struct {
             outcome.kind,
             &detail_update,
         );
-        if (self.toolDetailPtr(record.entry_id)) |detail| detail.check_found_command_ended = check_found_command_ended;
+        if (self.toolDetailPtr(record.entry_id)) |detail| {
+            detail.check_found_command_ended = check_found_command_ended;
+            if (owned_resolved_path) |path| {
+                if (detail.resolved_path) |old| alloc.free(old);
+                detail.resolved_path = path;
+                owned_resolved_path = null;
+            }
+        }
         return null;
     }
 
@@ -6638,6 +6844,7 @@ pub const TranscriptRuntime = struct {
                 .command_output_replay = result.command_output_replay,
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
+                .subagent_started = result.subagent_started,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,
@@ -6646,6 +6853,12 @@ pub const TranscriptRuntime = struct {
             detail.created_at_ms = result.created_at_ms;
             detail.origin = .recorded;
             detail.check_found_command_ended = check_found_command_ended;
+            // The saved call keeps the path as the call named it; its result
+            // names the file core resolved, as live.
+            if (savedResolvedPath(call, result)) |path| {
+                if (detail.resolved_path) |old| alloc.free(old);
+                detail.resolved_path = try resolvedPathIn(alloc, path, self.saved_calls_root);
+            }
         }
     }
 
@@ -6930,6 +7143,7 @@ pub const TranscriptRuntime = struct {
             memory.command_process_presentation
         else
             null;
+        pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -6987,6 +7201,7 @@ pub const TranscriptRuntime = struct {
             pending.command_output_replay = null;
         }
         detail.command_process_presentation = pending.command_process_presentation;
+        detail.subagent_started = pending.subagent_started;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }

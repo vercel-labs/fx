@@ -5211,11 +5211,14 @@ pub fn dupeToolLifecycleEvent(
             const call_id = try alloc.dupe(u8, started.id.call_id);
             errdefer alloc.free(call_id);
             const tool_name = if (started.tool_name) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (tool_name) |name| alloc.free(name);
+            const arguments_json = if (started.arguments_json) |value| try alloc.dupe(u8, value) else null;
             break :blk .{ .provisional = .{
                 .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
                 .presentation_group_id = started.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = started.activity_kind,
+                .arguments_json = arguments_json,
             } };
         },
         .authoritative_started => |started| blk: {
@@ -5269,6 +5272,8 @@ pub fn dupeToolLifecycleEvent(
             else
                 null;
             errdefer if (command_artifact_handle) |handle| alloc.free(handle);
+            const resolved_path = if (terminal.resolved_path) |path| try alloc.dupe(u8, path) else null;
+            errdefer if (resolved_path) |path| alloc.free(path);
             break :blk .{ .terminal = .{
                 .id = .{ .turn_id = terminal.id.turn_id, .call_id = call_id },
                 .outcome = .{
@@ -5279,6 +5284,7 @@ pub fn dupeToolLifecycleEvent(
                 .result_memory = result_memory,
                 .command_artifact_handle = command_artifact_handle,
                 .check_found_command_ended = terminal.check_found_command_ended,
+                .resolved_path = resolved_path,
             } };
         },
         .turn_finished => |finished| .{ .turn_finished = finished },
@@ -5293,6 +5299,7 @@ pub fn freeToolLifecycleEvent(
         .provisional => |started| {
             alloc.free(@constCast(started.id.call_id));
             if (started.tool_name) |name| alloc.free(@constCast(name));
+            if (started.arguments_json) |arguments_json| alloc.free(@constCast(arguments_json));
         },
         .authoritative_started => |started| {
             alloc.free(@constCast(started.id.call_id));
@@ -5314,6 +5321,7 @@ pub fn freeToolLifecycleEvent(
             if (terminal.result) |result| alloc.free(@constCast(result));
             freeToolResultMemory(alloc, terminal.result_memory);
             if (terminal.command_artifact_handle) |handle| alloc.free(@constCast(handle));
+            if (terminal.resolved_path) |path| alloc.free(@constCast(path));
         },
         .turn_finished => {},
     }
@@ -5354,6 +5362,7 @@ fn dupeToolResultMemory(
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
@@ -8237,6 +8246,17 @@ test "typed lifecycle worker events duplicate and free every payload variant" {
         const owned = try dupeToolLifecycleEvent(alloc, event);
         freeToolLifecycleEvent(alloc, owned);
     }
+}
+
+test "a copied terminal event keeps the file an edit changed" {
+    const alloc = std.testing.allocator;
+    const owned = try dupeToolLifecycleEvent(alloc, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "edit" },
+        .outcome = .{ .kind = .completed, .summary = "Edited x.tse" },
+        .resolved_path = "tsec/x.tse",
+    } });
+    defer freeToolLifecycleEvent(alloc, owned);
+    try std.testing.expectEqualStrings("tsec/x.tse", owned.terminal.resolved_path.?);
 }
 
 fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {

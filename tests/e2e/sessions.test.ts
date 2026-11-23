@@ -40,7 +40,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -3754,11 +3754,13 @@ test("waiting for a committed root turn skips what fx has not written yet and re
 
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
+  // The child answers only once the parent has saved the turn that sent its
+  // message, so its report starts the next turn instead of joining that one.
+  const hold = holdChildAnswer(fixture.home);
   const gateway = startDynamicFakeGateway(async (body) => {
     if (isChildRequest(body)) {
-      // A report that arrives while the parent's first turn runs joins that
-      // turn, so the child answers only once that turn is saved.
-      await waitForRootTurnCommitted(fixture.home);
+      const refused = await hold.wait();
+      if (refused) return refused;
       return fakeGatewayFinalText("CHILD_ANSWER_5521");
     }
     if (isReportTurn(body)) {
@@ -3771,6 +3773,7 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
   try {
     // A subagent run prints its progress on stderr.
     const result = await ask(fixture, gateway, ["Delegate the marker report."]);
+    hold.check();
     expect(result.code).toBe(0);
     expect(result.stderr).not.toContain("panic");
     const output = JSON.parse(result.stdout);
