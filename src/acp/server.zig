@@ -7531,9 +7531,9 @@ test "ACP client requests of every kind get their own answer, a cancel, or the c
         var session: ActiveSessionState = undefined;
         session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
         try attachOpenerForTest(&session, &state);
+        defer releaseTestSession(&state, &session);
         session.outbound = .{};
         defer session.outbound.pending.deinit(alloc);
-        try attachOpenerForTest(&session, &state);
 
         const answered = (try beginOutboundRequest(&session, kind)).?;
         handleClientResponse(&state, alloc, &.{
