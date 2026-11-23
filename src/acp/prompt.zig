@@ -5315,7 +5315,7 @@ test "ACP permission to a client whose input ended is denied without a request" 
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     state.writer = .{ .stdout = capture };
-    state.input_ended = true;
+    server.endClientInput(&state);
     var turn_settings = try TurnSettings.capture(alloc, server.firstSession(&state).?);
     defer turn_settings.deinit(alloc);
     var ctx = AcpContext{

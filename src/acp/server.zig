@@ -335,6 +335,8 @@ pub const Member = struct {
         if (self.refs.fetchSub(1, .acq_rel) == 1) self.destroy();
     }
 
+    /// Whether steering updates carry `sh.fx/steerInput`: `fx acp`'s clients
+    /// list `sh.fx/promptDelivery`, and a libfx host lists `sh.fx/hostSteering`.
     pub fn sendsSteerInput(self: *const Member) bool {
         return self.extensions.contains(.prompt_delivery) or self.extensions.contains(.host_steering);
     }
@@ -654,22 +656,9 @@ pub const ServerState = struct {
     /// The extensions that both fx and the client list at `initialize`. fx
     /// sends an extension's notifications and `_meta` keys only for these.
     extensions: sh_fx.Set = .empty,
-    /// Guards the connection's request ids and `input_ended`. The requests
-    /// themselves are in the sessions they belong to (`ActiveSessionState.outbound`).
-    outbound_mutex: std.Io.Mutex = .init,
-    next_outbound_request_id: u64 = 1,
-    /// Set when the client's input ends. Guarded by `outbound_mutex`; once it
-    /// is set, `beginOutboundRequest` refuses new requests to the client.
-    input_ended: bool = false,
     /// What a socket connection answers `initialize` with beyond the stdio answer:
     /// this process's pid and the sessions it leads. Null on stdio, whose answer is unchanged.
     leader_info: ?LeaderInfo = null,
-
-    /// Whether steering updates carry `sh.fx/steerInput`: `fx acp`'s clients
-    /// list `sh.fx/promptDelivery`, and a libfx host lists `sh.fx/hostSteering`.
-    pub fn sendsSteerInput(self: *const ServerState) bool {
-        return self.extensions.contains(.prompt_delivery) or self.extensions.contains(.host_steering);
-    }
 
     pub fn deinit(self: *ServerState) void {
         if (self.pending_member) |member| {
@@ -1465,6 +1454,15 @@ pub fn steerChunkParams(
     try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id, steer_input);
     try update.writer.writeByte('}');
     return try update.toOwnedSlice();
+}
+
+/// The member record this connection holds in `session`. A session the connection has open always
+/// has its membership, and only the connection's reader thread changes the membership list, so no lock is needed.
+fn ownMember(state: *ServerState, session: *ActiveSessionState) *Member {
+    for (state.memberships.items) |membership| {
+        if (membership.session == session) return membership.member;
+    }
+    unreachable;
 }
 
 /// The open session `session_id` names, when this connection leads it, or null.
@@ -2602,12 +2600,14 @@ fn runServer(
     // so end what fx still waits on and refuse new requests.
     // A session that a follower still has open goes on with that follower as its main, so
     // its turn is not cancelled here (the leave rule). Other sessions stop as before.
-    const keep_turns = state.extensions.contains(.keep_turn_on_disconnect);
     // Once this connection's record leaves a session, it no longer leads it, so the next led
     // session is always at index 0. A turn that stops because its last client leaves is
     // cancelled and ends before that client's record leaves, so the client still hears the turn's end.
     while (sessionAt(&state, 0)) |session| {
-        if (!keep_turns and !runningTurnKeeps(session) and isOnlyMember(session, state.connection_id)) {
+        const own_member = ownMember(&state, session);
+        if (!own_member.extensions.contains(.keep_turn_on_disconnect) and !runningTurnKeeps(session) and
+            isOnlyMember(session, own_member.connection_id))
+        {
             handleCancel(session, false);
             // The client can't answer any more, so what the turn waits on ends before the turn is awaited.
             endClientInput(&state);
@@ -2694,9 +2694,9 @@ fn handleClientResponse(state: *ServerState, alloc: Allocator, msg: *const jsonr
     } else null;
 
     const io = io_mod.getIo();
-    const request: OutboundRequest = .{ .connection = state.connection_id, .id = numeric_id };
     var index: usize = 0;
     while (sessionAt(state, index)) |session| : (index += 1) {
+        const request: OutboundRequest = .{ .connection = ownMember(state, session).connection_id, .id = numeric_id };
         session.outbound.mutex.lockUncancelable(io);
         const pending = session.outbound.pending.getPtr(request) orelse {
             session.outbound.mutex.unlock(io);
@@ -2898,15 +2898,16 @@ fn cancelSessionPending(session: *ActiveSessionState, notify_client: bool) void 
 /// Ends the client's input: every request fx waits on gets the `no_client`
 /// result, and later requests are refused, so no turn waits for an answer
 /// that can't arrive. The sessions this connection leads hold its requests.
-fn endClientInput(state: *ServerState) void {
+pub fn endClientInput(state: *ServerState) void {
     const io = io_mod.getIo();
     markMembersInputEnded(state);
     var index: usize = 0;
     while (sessionAt(state, index)) |session| : (index += 1) {
         session.outbound.mutex.lockUncancelable(io);
+        const own_connection = ownMember(state, session).connection_id;
         var pending = session.outbound.pending.iterator();
         while (pending.next()) |entry| {
-            if (entry.key_ptr.connection != state.connection_id) continue;
+            if (entry.key_ptr.connection != own_connection) continue;
             if (entry.value_ptr.response != null) continue;
             entry.value_ptr.response = .{ .no_client = true };
         }
@@ -2918,7 +2919,7 @@ fn endClientInput(state: *ServerState) void {
 /// Records that this connection's input ended on each member record it holds, so a turn never
 /// asks it a question once it is the main client. Covers the sessions it leads and follows.
 fn markMembersInputEnded(state: *ServerState) void {
-    for (state.memberships.items) |membership| markMemberInputEnded(membership.session, state.connection_id);
+    for (state.memberships.items) |membership| markMemberInputEnded(membership.session, membership.member.connection_id);
 }
 
 fn markMemberInputEnded(session: *ActiveSessionState, connection_id: ConnectionId) void {
@@ -3422,6 +3423,7 @@ fn withdrawSessionRequest(
     session: *ActiveSessionState,
     requested: jsonrpc.RequestId,
 ) bool {
+    const own_member = ownMember(state, session);
     const outcome: enum { stop_turn, withdrawn, none } = outcome: {
         // AcpSessionReaders WithdrawLocked: the slot and the turn it holds are read
         // under the line lock, so a reap cannot free the turn while this reads it.
@@ -3430,12 +3432,12 @@ fn withdrawSessionRequest(
         const active = session.prompt orelse break :outcome .none;
         if (active.group_ids.len == 0) {
             if (active.msg.id) |active_id| {
-                const same_connection = sameConnection(active.from, state.connection_id);
+                const same_connection = sameConnection(active.from, own_member.connection_id);
                 if (same_connection and requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
             }
         }
-        if (session.steering.withdrawRequest(state.alloc, state.connection_id, requested) or
-            session.waiting_prompts.withdrawLocked(state.alloc, state.connection_id, requested)) break :outcome .withdrawn;
+        if (session.steering.withdrawRequest(state.alloc, own_member.connection_id, requested) or
+            session.waiting_prompts.withdrawLocked(state.alloc, own_member.connection_id, requested)) break :outcome .withdrawn;
         break :outcome .none;
     };
     switch (outcome) {
@@ -3448,7 +3450,7 @@ fn withdrawSessionRequest(
                 .code = ErrorCode.request_cancelled,
                 .message = "Request cancelled",
             } };
-            answerSender(session, alloc, state.connection_id, requested, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
+            answerSender(session, alloc, own_member.connection_id, requested, .none, answer, answer) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
         },
         .none => return false,
     }
@@ -3752,6 +3754,7 @@ fn deliveredDecision(outcome: DeliveryOutcome) ?PromptDecision {
 /// slot with no turn. The thread starts later, outside the lock
 /// (`startClaimedTurn`).
 fn claimTurnLocked(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message, session: *ActiveSessionState) !*ActivePrompt {
+    const own_member = ownMember(state, session);
     const active = try alloc.create(ActivePrompt);
     errdefer alloc.destroy(active);
     active.* = .{
@@ -3759,12 +3762,12 @@ fn claimTurnLocked(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Me
         .session = session,
         .alloc = alloc,
         .msg = try cloneMessage(alloc, msg),
-        .from = state.connection_id,
+        .from = own_member.connection_id,
         .mode = session.mode,
         .permission_mode = session.permission_mode,
-        .usage_shown = state.extensions.contains(.usage),
-        .delivery_shown = state.extensions.contains(.prompt_delivery),
-        .keep_turn = state.extensions.contains(.keep_turn_on_disconnect),
+        .usage_shown = own_member.extensions.contains(.usage),
+        .delivery_shown = own_member.extensions.contains(.prompt_delivery),
+        .keep_turn = own_member.extensions.contains(.keep_turn_on_disconnect),
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
     session.turn_cancel.store(false, .seq_cst);
@@ -3848,11 +3851,12 @@ fn answerDelivery(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Mes
 /// taking input. The caller holds the line lock.
 fn deliverSteerLocked(state: *ServerState, session: *ActiveSessionState, id: ?jsonrpc.RequestId, text: []const u8) !DeliveryOutcome {
     const line = &session.waiting_prompts;
+    const own_member = ownMember(state, session);
     // AcpSessionReaders Deliver: the steer touches the session, not a turn it holds.
-    session.steering.enqueueRequest(state.alloc, text, id, state.connection_id) catch |err| switch (err) {
+    session.steering.enqueueRequest(state.alloc, text, id, own_member.connection_id) catch |err| switch (err) {
         error.SteeringNotActive => {
             // The running turn stopped taking input: the steer runs next.
-            line.addLateLocked(state.alloc, text, id.?, state.connection_id) catch |late_err| switch (late_err) {
+            line.addLateLocked(state.alloc, text, id.?, own_member.connection_id) catch |late_err| switch (late_err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.SteeringQueueFull => return .{ .failed = .{
                     .code = ErrorCode.invalid_request,
@@ -3886,7 +3890,8 @@ fn deliverSteerLocked(state: *ServerState, session: *ActiveSessionState, id: ?js
 /// line takes the copy, and `queued` is cleared once it does.
 fn deliverQueueLocked(state: *ServerState, session: *ActiveSessionState, queued: *?jsonrpc.Message) !DeliveryOutcome {
     // AcpSessionReaders Deliver: the queued prompt touches the session, not a turn it holds.
-    session.waiting_prompts.addQueuedLocked(state.alloc, queued.*.?, state.connection_id) catch |err| switch (err) {
+    const own_member = ownMember(state, session);
+    session.waiting_prompts.addQueuedLocked(state.alloc, queued.*.?, own_member.connection_id) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.PromptQueueFull => return .{ .failed = .{
             .code = ErrorCode.invalid_request,
@@ -6309,6 +6314,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     const root = parsed.value;
     if (root != .object) return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Params must be object" });
     const target_session = (try requireParsedSessionTarget(state, alloc, msg.id, root)) orelse return;
+    const own_member = ownMember(state, target_session);
     // Held for every branch and the response, so a turn that publishes a
     // renewed credential sees the settings either before or after this change.
     target_session.settings_mutex.lockUncancelable(io_mod.getIo());
@@ -6439,7 +6445,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     state.host.cfg.gateway_provider.oauth_transport,
                     state.host.cfg.secret_store,
                     target,
-                    if (target == .gateway) state.gateway_source_preference else null,
+                    if (target == .gateway) own_member.gateway_source_preference else null,
                 )) orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
@@ -6623,7 +6629,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         state.host.capability_resolver.catalogEntries(),
     );
     try out.writer.writeAll(",");
-    try sessions.writeModeConfigOption(&out.writer, state.host.cfg.mode_registry, target_session.mode, state.extensions.contains(.permission_mode));
+    try sessions.writeModeConfigOption(&out.writer, state.host.cfg.mode_registry, target_session.mode, own_member.extensions.contains(.permission_mode));
     if (sessions.effortConfigState(state, target_session)) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
