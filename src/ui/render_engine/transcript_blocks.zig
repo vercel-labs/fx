@@ -84,6 +84,15 @@ pub const ToolDetailRecord = struct {
     /// which its status (`Observed`) does not say when the command passed
     /// (`checkFoundCommandEnded` in src/core/agent/runtime/tool_presentation.zig).
     check_found_command_ended: bool = false,
+    /// The file a read, edit, or write read or changed, as core resolved it
+    /// with symlinks followed, the same for every way the call named the
+    /// file: live, from the terminal event; on resume, the path its saved
+    /// result names. It is absolute when the transcript knows the folder a
+    /// relative one is in, and relative when the call may have run in another
+    /// workspace (`TranscriptRuntime.saved_calls_root`). Only the compact rows
+    /// read it: to join a file's changes, and to link to the file, which
+    /// they do only from an absolute path.
+    resolved_path: ?[]u8 = null,
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
@@ -105,6 +114,7 @@ pub const ToolDetailRecord = struct {
         if (self.command_output_replay) |replay| {
             types.freeCommandOutputReplay(alloc, replay);
         }
+        if (self.resolved_path) |value| alloc.free(value);
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
         self.* = undefined;
     }

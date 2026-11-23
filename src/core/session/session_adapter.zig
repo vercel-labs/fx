@@ -2803,6 +2803,11 @@ pub const Session = struct {
     /// turn: the record of its newest `recovery` piece, null when its
     /// response had arrived or none was saved, and when it was saved. Null
     /// when the newest turn ended otherwise, has no prompt, or completed.
+    /// Whether every turn ran in `workspace` (`sm.Session.ranOnlyIn`).
+    pub fn ranOnlyIn(self: *Session, workspace: []const u8) !bool {
+        return self.handle.ranOnlyIn(self.alloc, workspace);
+    }
+
     pub fn interruptedRequest(self: *Session) !?InterruptedRequest {
         var state = try self.handle.state(self.alloc);
         defer state.deinit(self.alloc);

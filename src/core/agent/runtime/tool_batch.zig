@@ -459,6 +459,7 @@ pub fn processCommittedFileResult(
         status_started,
         display_target,
         handoff.preview,
+        handoff.tracker.raw_path,
         advertised_dynamic_tool_names,
     ) catch |err| {
         reporting_degraded = true;
