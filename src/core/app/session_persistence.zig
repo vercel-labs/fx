@@ -881,15 +881,16 @@ pub const SessionPickerResume = struct {
                     self.request.workspace_root,
                     .app,
                     if (self.request.title.len > 0) self.request.title else null,
+                    &self.cancel_requested,
                 ) catch |err| {
-                    self.outcome = .{ .failed = err };
+                    self.outcome = if (err == error.Cancelled) .cancelled else .{ .failed = err };
                     return;
                 },
             };
             var v2_owned = true;
             defer if (v2_owned) {
                 var id_buf: [64]u8 = undefined;
-                const delete_fork = self.request.action == .forking and self.cancel_requested.load(.acquire);
+                const delete_fork = self.request.action == .forking;
                 const raw_id = v2.id();
                 const copy_len = @min(raw_id.len, id_buf.len);
                 if (delete_fork) @memcpy(id_buf[0..copy_len], raw_id[0..copy_len]);
@@ -899,7 +900,7 @@ pub const SessionPickerResume = struct {
                     self.store.manager.delete(fork_id) catch |err| {
                         debug_trace.logf(
                             "session",
-                            "picker cancelled fork cleanup failed id={s} err={s}",
+                            "picker abandoned fork cleanup failed id={s} err={s}",
                             .{ fork_id, @errorName(err) },
                         );
                     };

@@ -1759,6 +1759,9 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: schema.Host,
+    /// Optional cooperative cancellation flag polled during fork copy so
+    /// abandoning or exiting stops before staging a new session directory.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 /// A child of a fork's source that the fork takes a copy of (D97): its log
@@ -1780,7 +1783,7 @@ pub const Forked = struct {
     copies: []*Session,
 };
 
-pub const ForkError = OpenError || error{InvalidForkPoint};
+pub const ForkError = OpenError || error{ InvalidForkPoint, Cancelled };
 
 /// A new root session whose lines 2..S are the source's, unchanged, where
 /// S ends a turn (D5). The source is read without its lock and never
@@ -1874,10 +1877,15 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const created = env.nowMs();
     session.frameMarked(1, created, .{ .session_created = session.identity.created() }) catch |err| return forkError(err);
     session.created_ms = created;
+    if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
     const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, point.seq) catch |err| return forkError(err);
+    copyFolded(session, copied, point.seq, options.cancel) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => |append_err| forkError(append_err),
+    };
+    if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
     // Then one finished work item per copy, after S, so the fork owns them.
     var seq = point.seq;
     for (children, copies) |child, copy| {
@@ -1964,7 +1972,10 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, cut.seq) catch |err| return forkError(err);
+    copyFolded(session, copied, cut.seq, null) catch |err| return switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => |append_err| forkError(append_err),
+    };
     var seq = cut.seq;
     if (session.state.open_turn) |turn| {
         // At the last copied line's time, which is at or before the cut.
@@ -2210,7 +2221,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
 /// crc holds, except snapshots: a snapshot records byte offsets, and the
 /// fork's line 1 has a different length, so each snapshot is encoded again
 /// from the fork's own fold at that point, with the same seq and time.
-fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!void {
+fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64, cancel: ?*const std.atomic.Value(bool)) (AppendError || error{Cancelled})!void {
     const gpa = session.env.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2218,6 +2229,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
     defer encoded.deinit(gpa);
     var at: usize = 0;
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
+        if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
         _ = arena.reset(.retain_capacity);
         const source_line = copied[at .. nl + 1];
         const source_header = log_mod.checkLine(source_line) catch |io_err| return storage.ioFault(io_err);
@@ -3246,6 +3258,14 @@ const session_tests = struct {
         try closeAndDestroy(zero);
         try expectKinds(&t, zero_id, &.{ .session_created, .closed });
         try testing.expectError(error.NotFound, session_mod.openFork(&t.env, .{ .source = "missing", .at = .last_good, .workspace = "/w", .host = .app }));
+        var cancelled = std.atomic.Value(bool).init(true);
+        try testing.expectError(error.Cancelled, session_mod.openFork(&t.env, .{
+            .source = source.id,
+            .at = .last_good,
+            .workspace = "/w",
+            .host = .app,
+            .cancel = &cancelled,
+        }));
     }
 
     test "recover: a damaged source forks up to its last good turn, untouched" {

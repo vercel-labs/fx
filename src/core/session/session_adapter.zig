@@ -423,6 +423,21 @@ pub const Store = struct {
         return store.manager.lockHolderPid(id) catch null;
     }
 
+    fn parseTurnEndCompletedAt(arena: Allocator, data: []const u8) i64 {
+        const TurnEnd = struct {
+            turn_summary: ?struct { completed_at_ms: i64 = 0 } = null,
+        };
+        const parsed = json_decode.parseFromSliceLeaky(TurnEnd, arena, data, .{ .ignore_unknown_fields = true }) catch return 0;
+        const completed = if (parsed.turn_summary) |summary| summary.completed_at_ms else 0;
+        return if (completed > 0) completed else 0;
+    }
+
+    fn assistantPieceHasText(arena: Allocator, data: []const u8) bool {
+        const Assistant = struct { text: []const u8 = "" };
+        const parsed = json_decode.parseFromSliceLeaky(Assistant, arena, data, .{ .ignore_unknown_fields = true }) catch return false;
+        return parsed.text.len > 0;
+    }
+
     /// Completion timestamp of the child's newest completed assistant reply,
     /// read backward from the end of its log without replaying earlier turns.
     /// Returns 0 when no completed reply has a saved timestamp.
@@ -455,18 +470,11 @@ pub const Store = struct {
                         if (piece.turn != turn) continue;
                         if (std.mem.eql(u8, piece.type, "turn_end")) {
                             _ = scratch.reset(.retain_capacity);
-                            const TurnEnd = struct {
-                                turn_summary: ?struct { completed_at_ms: i64 = 0 } = null,
-                            };
                             const data = src.pieceData(scratch.allocator(), piece) catch {
                                 candidate_turn = null;
                                 continue;
                             };
-                            const parsed = json_decode.parseFromSliceLeaky(TurnEnd, scratch.allocator(), data, .{ .ignore_unknown_fields = true }) catch {
-                                candidate_turn = null;
-                                continue;
-                            };
-                            const completed = if (parsed.turn_summary) |summary| summary.completed_at_ms else 0;
+                            const completed = parseTurnEndCompletedAt(scratch.allocator(), data);
                             if (completed > 0) {
                                 candidate_completed_at_ms = completed;
                                 saw_turn_end = true;
@@ -475,16 +483,11 @@ pub const Store = struct {
                             }
                         } else if (saw_turn_end and std.mem.eql(u8, piece.type, "assistant")) {
                             _ = scratch.reset(.retain_capacity);
-                            const Assistant = struct { text: []const u8 = "" };
                             const data = src.pieceData(scratch.allocator(), piece) catch {
                                 candidate_turn = null;
                                 continue;
                             };
-                            const parsed = json_decode.parseFromSliceLeaky(Assistant, scratch.allocator(), data, .{ .ignore_unknown_fields = true }) catch {
-                                candidate_turn = null;
-                                continue;
-                            };
-                            if (parsed.text.len > 0) return candidate_completed_at_ms;
+                            if (assistantPieceHasText(scratch.allocator(), data)) return candidate_completed_at_ms;
                             candidate_turn = null;
                         } else if (saw_turn_end and (std.mem.eql(u8, piece.type, "tool_call") or std.mem.eql(u8, piece.type, "tool_result"))) {
                             // A tool call/result after the last assistant text means this turn had no final reply.
@@ -3764,6 +3767,7 @@ pub const Session = struct {
         workspace: []const u8,
         host: Host,
         title: ?[]const u8,
+        cancel: ?*const std.atomic.Value(bool),
     ) !*Session {
         io_mod.e2eFailIfDurableMutationAttempted();
         const handle = try store.manager.openFork(.{
@@ -3771,6 +3775,7 @@ pub const Session = struct {
             .at = .last_good,
             .workspace = workspace,
             .host = host,
+            .cancel = cancel,
         });
         errdefer handle.release();
         const copy = try init(alloc, store, handle, false);
@@ -6662,6 +6667,8 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
             // A subagent start (D101).
             "{\"call_id\":\"call-start\"}",
+            // A turn_end summary for childLatestReplyAt.
+            "{\"turn_summary\":{\"completed_at_ms\":1762300000123,\"turn_duration_ms\":12}}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -6679,6 +6686,9 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     // when every string is one Ctrl+O may show.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+    // Backward reply-time scans inspect turn_end and assistant piece JSON.
+    try std.testing.expect(Store.parseTurnEndCompletedAt(arena_state.allocator(), buffer[0..len]) >= 0);
+    _ = Store.assistantPieceHasText(arena_state.allocator(), buffer[0..len]);
     // A subagent start (D101) names one call, within the identity limit.
     if (try decodeSubagentStarted(arena_state.allocator(), buffer[0..len])) |call_id| {
         try std.testing.expect(call_id.len > 0 and call_id.len <= session_event.max_conversation_identity_bytes);
@@ -14309,7 +14319,7 @@ test "forkLatest forks an actively open session without locking it and rejects u
     const expected_pid: u32 = @intCast(std.c.getpid());
     try testing.expectEqual(@as(?u32, expected_pid), t.store.lockHolderPid(live.id()));
 
-    const forked = try Session.forkLatest(alloc, &t.store, live.id(), "/w", .app, "Live task");
+    const forked = try Session.forkLatest(alloc, &t.store, live.id(), "/w", .app, "Live task", null);
     defer forked.close();
     try testing.expect(!std.mem.eql(u8, live.id(), forked.id()));
 

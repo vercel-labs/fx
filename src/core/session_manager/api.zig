@@ -66,6 +66,7 @@ const max_text_bytes = 4096;
 /// An I/O failure with its OS cause when known, `Io` otherwise (D29).
 pub const IoFault = storage.IoFault;
 pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, OutOfMemory } || storage.IoFault;
+pub const ForkError = OpenError || error{Cancelled};
 pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
 pub const CloseError = error{OutOfMemory} || storage.IoFault;
 pub const ReadError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
@@ -134,6 +135,7 @@ pub const ForkOptions = struct {
     host: Host,
     /// The source's children the fork takes a copy of (D97).
     children: []const ChildCopy = &.{},
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const ChildCopy = session_mod.ChildCopy;
@@ -336,7 +338,7 @@ pub const Manager = struct {
     /// A new root session that starts as a copy of `source` up to a turn
     /// boundary (D5). The source is never changed, and may be damaged
     /// (`.last_good`, D15).
-    pub fn openFork(m: *Manager, options: ForkOptions) OpenError!Session {
+    pub fn openFork(m: *Manager, options: ForkOptions) ForkError!Session {
         try checkId(options.source);
         try checkText(options.workspace);
         for (options.children) |child| {
@@ -349,8 +351,9 @@ pub const Manager = struct {
             .at = options.at,
             .workspace = options.workspace,
             .host = options.host,
+            .cancel = options.cancel,
         }, options.children) catch |err| return switch (err) {
-            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.Cancelled, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
         defer m.gpa.free(forked.copies);

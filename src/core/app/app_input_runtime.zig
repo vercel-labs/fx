@@ -1810,11 +1810,17 @@ pub fn Runtime(comptime App: type) type {
                 '2' => {
                     if (!has_error) {
                         _ = app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
+                    } else {
+                        debug_trace.logf("input", "session busy prompt ignored byte=0x{x} reason=error_shown", .{byte});
                     }
                     return true;
                 },
                 'y', 'Y' => {
-                    if (!has_error) try startSessionPickerBusyFork(app, agent);
+                    if (!has_error) {
+                        try startSessionPickerBusyFork(app, agent);
+                    } else {
+                        debug_trace.logf("input", "session busy prompt ignored byte=0x{x} reason=error_shown", .{byte});
+                    }
                     return true;
                 },
                 'n', 'N' => {
@@ -1826,10 +1832,17 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
                 '\t' => {
-                    if (!has_error) _ = app_session_runtime.Runtime(App).toggleSessionPickerBusyPrompt(app, agent);
+                    if (!has_error) {
+                        _ = app_session_runtime.Runtime(App).toggleSessionPickerBusyPrompt(app, agent);
+                    } else {
+                        debug_trace.logf("input", "session busy prompt ignored byte=0x{x} reason=error_shown", .{byte});
+                    }
                     return true;
                 },
-                8, 127 => return true,
+                8, 127 => {
+                    debug_trace.logf("input", "session busy prompt ignored byte=0x{x} reason=not_editable", .{byte});
+                    return true;
+                },
                 else => {
                     if (byte < 0x20) return false;
                     if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "session_busy_prompt");

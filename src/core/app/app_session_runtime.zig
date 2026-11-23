@@ -2282,7 +2282,7 @@ pub fn Runtime(comptime App: type) type {
                 if (picker.busy_prompt) |*prompt| {
                     const msg = switch (err) {
                         error.InvalidForkPoint => "Cannot fork yet · turn 1 still running.",
-                        error.NotFound => "Cannot fork this session format while open in another fx.",
+                        error.NotFound => "This saved session was not found. Press esc and reopen the picker.",
                         else => "Unable to fork this session. Press esc and try again.",
                     };
                     try prompt.setError(app.alloc, msg);
