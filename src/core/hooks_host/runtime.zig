@@ -96,6 +96,8 @@ pub const Runtime = struct {
     dirty: bool = true,
     /// Sessions that started here and have not ended. Changes only under `mutex`.
     sessions: std.ArrayList(SessionEntry) = .empty,
+    /// The waiting count last told to a turn with no session (`--no-save`). Changes only under `mutex`.
+    process_trust_notice_count: usize = 0,
     /// Notes queued for a session's next turn, in the order they were queued. Changes only under `mutex`.
     pending_notes: std.ArrayList(PendingNote) = .empty,
     /// The answers InstructionsLoaded hooks gave, one per session and path. Changes only under `mutex`.
@@ -567,18 +569,21 @@ pub const Runtime = struct {
         return shared.snapshot.pending();
     }
 
-    /// Records `count` as the waiting count this session was last told about, and returns it when it rose
-    /// past the count told before. Null when the session did not start here or the count did not rise.
-    /// Changes only under `mutex`, and runs no hook.
+    /// Records `count` as the waiting count the person was last told about, and returns it when it rose past
+    /// the count told before. The empty id is the key of a turn with no session (`--no-save`): no session has it,
+    /// since `session_layout.validateSessionId` refuses an empty id, so that turn is told once per process.
+    /// Null when the session did not start here or the count did not rise. Changes only under `mutex`, and runs no hook.
     pub fn trustNoticeDue(self: *Runtime, session_id: []const u8, count: usize) ?usize {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const index = self.sessionIndexLocked(session_id) orelse return null;
-        const entry = &self.sessions.items[index];
-        const told = entry.trust_notice_count;
-        entry.trust_notice_count = count;
-        return if (count > told) count else null;
+        const told: *usize = if (session_id.len == 0) &self.process_trust_notice_count else blk: {
+            const index = self.sessionIndexLocked(session_id) orelse return null;
+            break :blk &self.sessions.items[index].trust_notice_count;
+        };
+        const was = told.*;
+        told.* = count;
+        return if (count > was) count else null;
     }
 
     pub fn summary(self: *Runtime) Summary {

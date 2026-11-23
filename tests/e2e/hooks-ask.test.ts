@@ -239,10 +239,12 @@ async function runAsk(
   gateway: ReturnType<typeof startFakeGateway>,
   flags: string[],
   trust = true,
+  json = true,
 ) {
   try {
     if (trust) await trustProjectHooks(root);
-    const result = await runFx(["ask", "--json", ...flags, prompt], {
+    const args = json ? ["ask", "--json", ...flags, prompt] : ["ask", ...flags, prompt];
+    const result = await runFx(args, {
       cwd: root.workspace,
       env: {
         HOME: root.home,
@@ -414,6 +416,92 @@ describe("fx ask with hooks", () => {
     expect(existsSync(keep)).toBe(false);
     expect(askJson(third.result.stdout).tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "success" }));
   }, TIMEOUT * 3);
+
+  test("fx ask tells the person in its JSON notices that hooks wait for trust, and runs none of them", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, denyShellHooks(root.hookRan));
+
+    const { result } = await runAsk(
+      root,
+      "Say hello.",
+      startFakeGateway([fakeGatewayFinalText("hello")]),
+      ["--yolo"],
+      false,
+    );
+
+    expect(result.code).toBe(0);
+    expect(existsSync(root.hookRan)).toBe(false);
+    expect(askJson(result.stdout).notices).toContainEqual({
+      topic: "hooks",
+      tone: "neutral",
+      text: "1 hook waits for trust and does not run. Run fx hook list to review it.",
+    });
+  }, TIMEOUT);
+
+  test("fx ask prints the waiting-for-trust notice on stderr in text mode", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, denyShellHooks(root.hookRan));
+
+    const { result } = await runAsk(
+      root,
+      "Say hello.",
+      startFakeGateway([fakeGatewayFinalText("hello")]),
+      ["--yolo"],
+      false,
+      false,
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain("[notice] 1 hook waits for trust and does not run. Run fx hook list to review it.");
+  }, TIMEOUT);
+
+  test("once the person trusts the hooks, fx ask stops telling them that hooks wait", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    writeProjectHooks(root, denyShellHooks(root.hookRan));
+
+    const { result } = await runAsk(root, "Say hello.", startFakeGateway([fakeGatewayFinalText("hello")]), ["--yolo"]);
+
+    expect(result.code).toBe(0);
+    const waiting = askJson(result.stdout).notices.filter((notice: { text: string }) =>
+      notice.text.includes("waits for trust"),
+    );
+    expect(waiting).toEqual([]);
+    expect(result.stderr).not.toContain("waits for trust");
+  }, TIMEOUT);
+
+  test("fx ask --no-save tells the person that hooks wait for trust, and SessionStart still does not run", async () => {
+    const root = createRoot({ experimental: { hooks: true } });
+    const countFile = join(root.workspace, "start-count");
+    writeProjectHooks(root, {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", id: "start", command: `echo start >> '${countFile}'` }] }],
+        PreToolUse: denyShellHooks(root.hookRan).hooks.PreToolUse,
+      },
+    });
+    // Only the SessionStart hook is trusted, so the guard is the one hook still waiting.
+    const trusted = await runFx(["hook", "trust", "start"], {
+      cwd: root.workspace,
+      env: { HOME: root.home, AI_AGENT: undefined, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(trusted.code).toBe(0);
+
+    const { result } = await runAsk(
+      root,
+      "Say hello.",
+      startFakeGateway([fakeGatewayFinalText("hello")]),
+      ["--yolo", "--no-save"],
+      false,
+    );
+
+    expect(result.code).toBe(0);
+    expect(askJson(result.stdout).notices).toContainEqual({
+      topic: "hooks",
+      tone: "neutral",
+      text: "1 hook waits for trust and does not run. Run fx hook list to review it.",
+    });
+    expect(existsSync(countFile)).toBe(false);
+  }, TIMEOUT);
 
   test("a deny reason with an ESC sequence reaches stderr as visible text, and the model still gets the raw bytes", async () => {
     const root = createRoot({ experimental: { hooks: true } });

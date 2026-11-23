@@ -392,11 +392,16 @@ pub const TurnHooks = struct {
     }
 
     /// Runs the user's SessionStart hooks (SubagentStart in a subagent turn) the first time this
-    /// session has a turn in this process, and keeps their context for the session.
+    /// session has a turn in this process, and keeps their context for the session. A turn with no session
+    /// (`--no-save`) runs none of them, but still tells the person about hooks that wait for trust.
     pub fn sessionStart(self: *TurnHooks, arena: std.mem.Allocator, resumed: bool) void {
         if (comptime host_target.is_wasm) return;
         if (!self.active()) return;
-        const session_id = self.session_id orelse return;
+        const session_id = self.session_id orelse {
+            // The empty id is this turn's key for the trust notice (see `trustNoticeDue`).
+            self.noticeWaitingHooks(arena, "");
+            return;
+        };
         const first = self.runtime.?.beginSession(.{
             .session_id = session_id,
             .surface = self.surface,
@@ -431,15 +436,17 @@ pub const TurnHooks = struct {
         self.keepStartContext(arena, session_id, "SessionStart", outcome);
     }
 
-    /// Tells the person, at the start of each interactive turn where the count of hooks waiting for trust
-    /// rose, that they wait and do not run. Only the interactive shell asks for trust, so only its turns are told.
+    /// Tells the person, at the start of each turn where the count of hooks waiting for trust rose, that they
+    /// wait and do not run. The interactive shell, fx ask, and an ACP session are told, each with the command that
+    /// lists the hooks on that surface. A subagent's turns are not told, since the person does not read them.
     fn noticeWaitingHooks(self: *const TurnHooks, arena: std.mem.Allocator, session_id: []const u8) void {
         if (comptime host_target.is_wasm) return;
-        if (!self.trust_required or self.surface != .interactive) return;
+        if (!self.trust_required) return;
+        const review = reviewCommand(self.surface) orelse return;
         const runtime = self.runtime orelse return;
         const count = runtime.waitingHooks();
         const due = runtime.trustNoticeDue(session_id, count) orelse return;
-        const text = waitingTrustText(arena, due) catch |err| {
+        const text = waitingTrustText(arena, due, review) catch |err| {
             debug_trace.logf("hooks", "dropped the trust notice: {s}", .{@errorName(err)});
             return;
         };
@@ -1419,10 +1426,20 @@ fn hookNoticeTone(kind: hooks_engine.answer.NoticeKind) deps_mod.HookNoticeTone 
     };
 }
 
-/// The trust notice's text: the singular for one hook, the plural for more. Allocated with `arena`.
-fn waitingTrustText(arena: std.mem.Allocator, count: usize) std.mem.Allocator.Error![]u8 {
-    if (count == 1) return arena.dupe(u8, "1 hook waits for trust and does not run. Run /hook list to review it.");
-    return arena.print("{d} hooks wait for trust and do not run. Run /hook list to review them.", .{count});
+/// The command that lists the hooks on `surface`, as the trust notice names it. Null when the surface is not told.
+fn reviewCommand(surface: hooks_engine.Surface) ?[]const u8 {
+    return switch (surface) {
+        .interactive => "/hook list",
+        .ask, .acp => "fx hook list",
+        .libfx, .subagent => null,
+    };
+}
+
+/// The trust notice's text: the singular for one hook, the plural for more, and the command that lists them.
+/// Allocated with `arena`.
+fn waitingTrustText(arena: std.mem.Allocator, count: usize, review: []const u8) std.mem.Allocator.Error![]u8 {
+    if (count == 1) return arena.print("1 hook waits for trust and does not run. Run {s} to review it.", .{review});
+    return arena.print("{d} hooks wait for trust and do not run. Run {s} to review them.", .{ count, review });
 }
 
 fn testLifecycle(kind: @import("../../hooks/definitions.zig").ScopeKind) runtime_lifecycle.LifecycleContext {
@@ -1607,7 +1624,74 @@ test "the trust notice counts several hooks in the plural" {
     );
 }
 
-test "the trust notice stays silent without trust, off the interactive shell, or with no hook waiting" {
+test "fx ask and an ACP session tell the person to run fx hook list, and the interactive shell keeps /hook list" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ask = NoticeCapture{};
+    try sessionStartsWithHooks(alloc, arena, &ask, guard_hooks_text, true, .ask, 1);
+    try std.testing.expectEqual(@as(usize, 1), ask.hook_count);
+    try std.testing.expectEqualStrings(
+        "1 hook waits for trust and does not run. Run fx hook list to review it.",
+        ask.hook_texts[0],
+    );
+
+    var acp = NoticeCapture{};
+    try sessionStartsWithHooks(alloc, arena, &acp, two_hooks_text, true, .acp, 1);
+    try std.testing.expectEqual(@as(usize, 1), acp.hook_count);
+    try std.testing.expectEqualStrings(
+        "2 hooks wait for trust and do not run. Run fx hook list to review them.",
+        acp.hook_texts[0],
+    );
+}
+
+test "a turn with no session still tells the person once that hooks wait for trust" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.fx");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const hooks_path = try std.Io.Dir.path.join(alloc, &.{ workspace, ".fx", "hooks.json" });
+    defer alloc.free(hooks_path);
+    try io_mod.writeFileAtomic(alloc, hooks_path, guard_hooks_text);
+
+    var runtime = try runtime_lifecycle.UserHooksRuntime.init(alloc, .{ .enabled = true, .home = home, .workspace_root = workspace });
+    defer runtime.deinit();
+    runtime.refresh();
+
+    var lifecycle = testLifecycle(.ask);
+    lifecycle.user_hooks = &runtime;
+    lifecycle.trust_required = true;
+    lifecycle.scope.session_id = null;
+    lifecycle.scope.workspace_root = workspace;
+
+    var capture = NoticeCapture{};
+    var deps: AgentRuntimeDeps = undefined;
+    deps.ctx = &capture;
+    deps.push_system_notice = NoticeCapture.pushSystem;
+    deps.push_hook_notice = NoticeCapture.pushHook;
+    var turn = TurnHooks.init(lifecycle, &deps, 1, null);
+
+    turn.sessionStart(arena, false);
+    turn.sessionStart(arena, false);
+    try std.testing.expectEqual(@as(usize, 1), capture.hook_count);
+    try std.testing.expectEqualStrings(
+        "1 hook waits for trust and does not run. Run fx hook list to review it.",
+        capture.hook_texts[0],
+    );
+    try std.testing.expectEqual(@as(usize, 0), capture.system_count);
+}
+
+test "the trust notice stays silent without trust, in a subagent, or with no hook waiting" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

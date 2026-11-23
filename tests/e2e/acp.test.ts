@@ -3898,6 +3898,53 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "an ACP session tells the client once that hooks wait for trust, as a notice",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-hook-waiting-");
+      writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ experimental: { hooks: true } }));
+      mkdirSync(join(root.workspace, ".fx"), { recursive: true });
+      writeFileSync(
+        join(root.workspace, ".fx", "hooks.json"),
+        JSON.stringify({
+          hooks: { PreToolUse: [{ matcher: "shell", hooks: [{ type: "command", command: "exit 2", id: "guard" }] }] },
+        }),
+      );
+      const gateway = startFakeGateway([finalText("first answer"), finalText("second answer")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway) },
+          args: ["acp"],
+        });
+        await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: {} } } }, 1);
+        const created = (await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2)) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        const noticeTitles = (prompt: any) =>
+          prompt.messages
+            .map((message: any) => message.params?.update)
+            .filter((update: any) => update?.sessionUpdate === "notice")
+            .map((update: any) => update.title);
+
+        const first = await runPrompt(client, "Say hello.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(noticeTitles(first)).toEqual([
+          "1 hook waits for trust and does not run. Run fx hook list to review it.",
+        ]);
+
+        const second = await runPrompt(client, "Say hello again.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(noticeTitles(second)).toEqual([]);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "a PreToolUse hook denies a shell call in an ACP session",
     async () => {
       const root = createIsolatedRoot("fx-acp-hook-deny-");
