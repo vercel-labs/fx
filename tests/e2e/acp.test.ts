@@ -32,7 +32,7 @@ import {
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { childLines, childWork, copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
-import { bearer, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
+import { bearer, fxLoginPath, rotateFxLogin, startFakeIssuer, storedFxLoginToken, unauthorized, writeFxLogin } from "./fx-login-fakes";
 import { ignoresFileModes } from "./file-modes";
 import {
   canonicalSubagentIdForStore,
@@ -1113,6 +1113,35 @@ test.each(["local", "remote"])("configured provider ACP loading %s stages creden
     client.endStdin();
     expect(await client.waitForExit()).toBe(0);
   } finally { await client?.close(); fixture.close(); target.close(); }
+}, 45000);
+
+test("ACP loads a closed session with the login the connection started with after the login is removed", async () => {
+  const root = createIsolatedRoot("fx-acp-started-login-");
+  const gateway = startFakeGateway([finalText("kept answer")]);
+  writeFxLogin(root.home, gateway.baseUrl, "started-login-token");
+  const client = await AcpClient.create({
+    cwd: root.workspace,
+    env: { ...fakeGatewayEnv(root, gateway), AI_GATEWAY_API_KEY: undefined },
+  });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    expect(created.error).toBeUndefined();
+    const sessionId = created.result.sessionId;
+    const prompted = await runPrompt(client, "remember this", TIMEOUT);
+    expect(prompted.promptResult.result.stopReason).toBe("end_turn");
+    const closed = await client.request("session/close", { sessionId }, 3) as any;
+    expect(closed.error).toBeUndefined();
+    rmSync(fxLoginPath(root.home));
+    const loaded = await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 4) as any;
+    expect(loaded.error).toBeUndefined();
+    expect(loaded.result).toBeDefined();
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+  } finally {
+    await client.close();
+    gateway.stop();
+  }
 }, 45000);
 
 test("configured provider ACP prompts and switching preserve connection credentials", async () => {

@@ -1016,7 +1016,7 @@ fn handleRestoreSession(
         state.selected_model
     else
         durable.preferences.model;
-    var staged_credential = server.prepareCredentialForProvider(try server.pendingMember(state), null, effective_provider) catch |err| {
+    var staged_credential = server.prepareStagingCredential(state, effective_provider) catch |err| {
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,

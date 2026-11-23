@@ -909,6 +909,23 @@ pub fn prepareCredentialForProvider(
     };
 }
 
+/// Stages the credential for a load or resume that no session holds yet. The
+/// connection's own credential stays in use while it matches the provider and
+/// is ready, so a stored login removed later does not refuse the load.
+pub fn prepareStagingCredential(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+) !?credentials.Credential {
+    if (state.host.cfg.auth_mode != .host_managed and !hostManagesRoute(state.host.cfg, provider)) {
+        const now_ms = io_mod.milliTimestamp();
+        state.host.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+        defer state.host.subagent_authority_mutex.unlock(io_mod.getIo());
+        if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
+            credentialReadyAt(state.credential_source, state.api_key, state.credential_refresh_after_ms, now_ms)) return null;
+    }
+    return prepareCredentialForProvider(try pendingMember(state), null, provider);
+}
+
 test "ACP credential preparation preserves the existing borrowed credential" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
