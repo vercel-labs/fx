@@ -14,6 +14,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const json_depth = @import("../../core/shared/json_depth.zig");
 const command_lex = @import("../../core/shell_command/command_lex.zig");
 const tooling_presentation = @import("../../core/tooling/tool_presentation.zig");
+const toolbox = @import("../../core/tooling/toolbox.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const read_tool_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
@@ -587,10 +588,208 @@ const StatToken = struct {
 
 /// Diff counts exist only on write_file/edit_file status lines; every other
 /// phrase can end in a coincidental " +N" / "-N" (for example `head -80`).
-noinline fn entryShowsDiffStats(detail: ?*const ToolDetailRecord) bool {
-    const record = detail orelse return false;
-    return std.mem.eql(u8, record.tool_name, "write_file") or
-        std.mem.eql(u8, record.tool_name, "edit_file");
+noinline fn entryShowsDiffStats(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !bool {
+    return try fileChangeOf(scratch, detail) != null;
+}
+
+/// The edit or write a record stands for: the tool and the arguments it ran
+/// with.
+const FileChange = struct { tool: []const u8, arguments: ?[]const u8 };
+
+fn isFileChangeTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file");
+}
+
+/// The edit or write a record stands for: its own call of `edit_file` or
+/// `write_file`, or the one a toolbox run of it carries, whose record can keep
+/// toolbox's name and the run's wrapped arguments. Null for any other call.
+fn fileChangeOf(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !?FileChange {
+    const record = detail orelse return null;
+    if (isFileChangeTool(record.tool_name)) return .{ .tool = record.tool_name, .arguments = record.arguments_json };
+    const run = (try toolbox.carriedCall(scratch, record.tool_name, record.arguments_json orelse return null)) orelse return null;
+    if (!isFileChangeTool(run.name)) return null;
+    return .{ .tool = run.name, .arguments = run.arguments_json };
+}
+
+/// The path an edit or write's status names after its one-word verb, such
+/// as "tsec/main.zig" in "Edited tsec/main.zig +1 / -7", for a record that
+/// kept no path of its own: a completed call's, or a running call's whose
+/// arguments have not arrived. Null for a call that failed, was denied, or
+/// was cancelled, whose status does not name the file it changed.
+fn statusFilePath(record: *const ToolDetailRecord, phrase: []const u8) ?[]const u8 {
+    if (record.outcome) |outcome| {
+        if (outcome != .completed) return null;
+    } else if (storyHasArgs(record)) return null;
+    const named = std.mem.trimEnd(u8, if (diffStatsSuffixStart(phrase)) |at| phrase[0..at] else phrase, " ");
+    const space = findByte(named, ' ') orelse return null;
+    const path = named[space + 1 ..];
+    if (std.Io.Dir.path.basename(path).len == 0) return null;
+    return path;
+}
+
+/// A path without its "." parts and repeated or trailing slashes, so
+/// "./src//main.zig" and "src/main.zig" are one file. ".." parts stay, since a
+/// symlinked folder can make them name another file. The result is allocated
+/// in `scratch` when the path changes.
+fn normalizedPath(scratch: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (std.mem.startsWith(u8, path, "/")) try out.append(scratch, '/');
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '/') try out.append(scratch, '/');
+        try out.appendSlice(scratch, part);
+    }
+    if (std.mem.eql(u8, out.items, path)) return path;
+    return out.items;
+}
+
+/// The row identity of a completed edit or write, or one still running,
+/// that named the file `named`. Its key is the file core says the call
+/// changed (`ToolDetailRecord.resolved_path`), the same for every way of
+/// naming one file, or, before the call ends, the path it named. `alias` is
+/// the path it named, so a call still running joins the row of calls that
+/// named the file the same way.
+fn fileChangeIdentity(scratch: std.mem.Allocator, record: *const ToolDetailRecord, named: []const u8) !StoryIdentity {
+    const alias = try normalizedPath(scratch, named);
+    return .{ .kind = .edit, .key = record.resolved_path orelse alias, .alias = alias };
+}
+
+test "an edit row's file key is the same for each way a call names the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "src/main.zig", "./src/main.zig", "src//main.zig", "src/./main.zig", "src/main.zig/" }) |path| {
+        try std.testing.expectEqualStrings("src/main.zig", try normalizedPath(arena, path));
+    }
+    try std.testing.expectEqualStrings("/w/src/main.zig", try normalizedPath(arena, "/w/./src//main.zig"));
+    try std.testing.expectEqualStrings("../src/main.zig", try normalizedPath(arena, "./../src/main.zig"));
+
+    const completed = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .outcome = .completed };
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Edited tsec/main.tse +1 / -7").?);
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Edited tsec/main.tse -7").?);
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&completed, "Wrote tsec/main.tse").?);
+    try std.testing.expect(statusFilePath(&completed, "Edited") == null);
+    var running = completed;
+    running.outcome = null;
+    try std.testing.expectEqualStrings("tsec/main.tse", statusFilePath(&running, "Editing tsec/main.tse").?);
+    try std.testing.expect(statusFilePath(&running, "Editing") == null);
+    // A running call with its arguments names its file by them.
+    running.arguments_json = @constCast("{\"path\":\"tsec/main.tse\"}");
+    try std.testing.expect(statusFilePath(&running, "Editing tsec/main.tse") == null);
+    var failed = completed;
+    failed.outcome = .failed;
+    try std.testing.expect(statusFilePath(&failed, "Failed tsec/main.tse: old_string not found") == null);
+}
+
+test "edits read by their file whether their records keep toolbox's run or no arguments" {
+    const alloc = std.testing.allocator;
+    const Edit = struct { path: []const u8, stats: []const u8 };
+    const edits = [_]Edit{
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+48 / -100" },
+        .{ .path = "tsec/selfhost/checker-types.tse", .stats = "+38 / -78" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/selfhost/checker-world.tse", .stats = "+5 / -11" },
+        .{ .path = "tsec/selfhost/checker.tse", .stats = "-7" },
+        .{ .path = "tsec/selfhost/checker-resolve.tse", .stats = "+1 / -7" },
+        .{ .path = "tsec/test/query-codegen.ts", .stats = "+1 / -7" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries: [edits.len + 1]TranscriptEntry = undefined;
+    var direct: [edits.len]ToolDetailRecord = undefined;
+    for (edits, 0..) |edit, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = try std.mem.concat(arena, u8, &.{ "● Edited ", edit.path, " ", edit.stats, "\n" }), .class = .tool_status } };
+        const arguments = try std.mem.concat(arena, u8, &.{ "{\"path\":\"", edit.path, "\",\"old_string\":\"a\",\"new_string\":\"b\"}" });
+        direct[index] = .{ .entry_id = id, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = arguments, .outcome = .completed };
+    }
+    entries[edits.len] = .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    var through_toolbox = direct;
+    var without_arguments = direct;
+    for (&through_toolbox, &without_arguments) |*run, *bare| {
+        run.tool_name = @constCast("toolbox");
+        run.arguments_json = try std.mem.concat(arena, u8, &.{ "{\"run\":\"edit_file\",\"arguments\":", run.arguments_json.?, "}" });
+        bare.arguments_json = null;
+    }
+    const want =
+        "\n● Edited files\n" ++
+        "├ Edited checker-types.tse +87/-185 · 3 edits\n" ++
+        "├ Edited checker-world.tse +7/-25 · 3 edits\n" ++
+        "├ Edited checker.tse -7\n" ++
+        "├ Edited checker-resolve.tse +1/-7\n" ++
+        "└ Edited query-codegen.ts +1/-7\n" ++
+        "  5 files changed +96 -231 · 2s";
+    for ([_][]const ToolDetailRecord{ &direct, &through_toolbox, &without_arguments }) |details| {
+        const text = try groupTextForTest(alloc, &entries, details);
+        defer alloc.free(text);
+        errdefer std.debug.print("group of {s} records:\n{s}\n", .{ details[0].tool_name, text });
+        try std.testing.expectEqualStrings(want, text);
+    }
+}
+
+test "an edit row joins every way its calls named one file, and same-named files in other folders stay apart" {
+    const alloc = std.testing.allocator;
+    const Edit = struct { named: []const u8, changed: []const u8, outcome: ?types.ToolOutcomeKind = .completed };
+    const edits = [_]Edit{
+        .{ .named = "tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "./tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "/w/tsec/selfhost/a.tse", .changed = "tsec/selfhost/a.tse" },
+        .{ .named = "tsec/test/a.tse", .changed = "tsec/test/a.tse" },
+        // A symlinked folder and its target are one file too.
+        .{ .named = "/tmp/notes.md", .changed = "/private/tmp/notes.md" },
+        .{ .named = "/private/tmp/notes.md", .changed = "/private/tmp/notes.md" },
+        // A call still running joins the row of calls that named the file
+        // its way, before its result says which file it changed.
+        .{ .named = "/w/tsec/selfhost/a.tse", .changed = "", .outcome = null },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entries: [edits.len + 1]TranscriptEntry = undefined;
+    var details: [edits.len]ToolDetailRecord = undefined;
+    for (edits, 0..) |edit, index| {
+        const id: u32 = @intCast(index + 1);
+        const status = if (edit.outcome == null) try std.mem.concat(arena, u8, &.{ "● Editing ", edit.named, "\n" }) else try std.mem.concat(arena, u8, &.{ "● Edited ", edit.named, " +1 / -7\n" });
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = status, .class = .tool_status } };
+        details[index] = .{
+            .entry_id = id,
+            .tool_name = @constCast("edit_file"),
+            .activity_kind = .edit,
+            .arguments_json = try std.mem.concat(arena, u8, &.{ "{\"path\":\"", edit.named, "\",\"old_string\":\"a\",\"new_string\":\"b\"}" }),
+            .resolved_path = if (edit.outcome == null) null else @constCast(edit.changed),
+            .outcome = edit.outcome,
+        };
+    }
+    entries[edits.len] = .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    const text = try groupTextForTest(alloc, entries[0..edits.len], &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("group:\n{s}\n", .{text});
+    try std.testing.expectEqualStrings(
+        "\n● Editing files\n" ++
+            "├ Editing a.tse +3/-21 · 4 edits\n" ++
+            "├ Edited a.tse +1/-7\n" ++
+            "└ Edited notes.md +2/-14 · 2 edits",
+        text,
+    );
+    // Once the last call ends, the recap counts each file once.
+    details[edits.len - 1].outcome = .completed;
+    details[edits.len - 1].resolved_path = @constCast("tsec/selfhost/a.tse");
+    entries[edits.len - 1].raw_bytes.bytes = "● Edited /w/tsec/selfhost/a.tse +1 / -7\n";
+    const ended = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(ended);
+    errdefer std.debug.print("ended group:\n{s}\n", .{ended});
+    try std.testing.expectEqualStrings(
+        "\n● Edited files\n" ++
+            "├ Edited a.tse +4/-28 · 4 edits\n" ++
+            "├ Edited a.tse +1/-7\n" ++
+            "└ Edited notes.md +2/-14 · 2 edits\n" ++
+            "  3 files changed +7 -49 · 2s",
+        ended,
+    );
 }
 
 /// Matches a trailing " +N" or " -N" diff count in a plain status phrase, or
@@ -993,7 +1192,12 @@ fn skipJsonValue(json: []const u8, start: usize) ?usize {
 }
 
 noinline fn storyArgString(scratch: std.mem.Allocator, record: *const ToolDetailRecord, key: []const u8) ?[]const u8 {
-    const json = record.arguments_json orelse return null;
+    return jsonArgString(scratch, record.arguments_json, key);
+}
+
+/// A non-empty string field of a call's arguments.
+fn jsonArgString(scratch: std.mem.Allocator, arguments_json: ?[]const u8, key: []const u8) ?[]const u8 {
+    const json = arguments_json orelse return null;
     return switch (jsonField(scratch, json, key) orelse return null) {
         .string => |text| if (text.len > 0) text else null,
         else => null,
@@ -1140,8 +1344,13 @@ const StoryTally = struct {
                 self.change_calls += 1;
                 if (record.outcome == null) self.changes_running += 1;
                 if (kind == .write) self.write_calls += 1;
-                if (storyArgString(scratch, record, "path")) |path| try addDistinct(&self.changed_paths, scratch, path);
                 const phrase = try entryStatus(scratch, entry) orelse "";
+                // One file counts once, however its calls named it.
+                if (try fileChangeOf(scratch, record)) |change| {
+                    if (jsonArgString(scratch, change.arguments, "path") orelse statusFilePath(record, phrase)) |path| {
+                        try addDistinct(&self.changed_paths, scratch, (try fileChangeIdentity(scratch, record, path)).key);
+                    }
+                }
                 const totals = diffTotalsOfPhrase(phrase);
                 self.diff.added += totals.added;
                 self.diff.removed += totals.removed;
@@ -1913,6 +2122,8 @@ const StoryIdentity = struct {
     /// none, so its key is empty, except for a cancelled read of saved
     /// output, whose key is what it read (`savedOutputIdentity`).
     key: []const u8 = "",
+    /// For an `.edit` row, the path its call named (`fileChangeIdentity`).
+    alias: []const u8 = "",
 };
 
 const StoryRow = struct {
@@ -1935,6 +2146,15 @@ const StoryRow = struct {
     diff: DiffTotals = .{},
     /// How many of an `.edit` row's calls were writes.
     writes: usize = 0,
+    /// The paths an `.edit` row's calls named the file by, each once.
+    named_paths: std.ArrayList([]const u8) = .empty,
+    /// The file an `.edit` row's latest completed call changed, as core
+    /// resolved it, which the row's name links to.
+    resolved_path: ?[]const u8 = null,
+    /// The file each name of a `.read` row was read from, as core resolved
+    /// it for the latest completed call that named it, which the name links
+    /// to.
+    read_links: std.ArrayList(NameLink) = .empty,
     /// Which try the row's latest call was, when the model repeated a call
     /// that failed and this one completed; 0 otherwise.
     tries: usize = 0,
@@ -1979,6 +2199,33 @@ fn storyRowName(identity: StoryIdentity) ?[]const u8 {
         .output_search => outputSearchQuery(identity.key),
         else => null,
     };
+}
+
+/// A name a `.read` row lists, and the file core resolved it to.
+const NameLink = struct { name: []const u8, path: []const u8 };
+
+/// The file core resolved a completed call's path to
+/// (`ToolDetailRecord.resolved_path`). Null for a call that has not
+/// completed, whose path core has not resolved to a file.
+fn completedResolvedPath(detail: ?*const ToolDetailRecord) ?[]const u8 {
+    const record = detail orelse return null;
+    if (record.outcome != .completed) return null;
+    return record.resolved_path;
+}
+
+/// Sets the file `name` was read from, as the newest call that read it says.
+fn setReadLink(links: *std.ArrayList(NameLink), scratch: std.mem.Allocator, name: []const u8, path: []const u8) !void {
+    for (links.items) |*link| if (std.mem.eql(u8, link.name, name)) {
+        link.path = path;
+        return;
+    };
+    try links.append(scratch, .{ .name = name, .path = path });
+}
+
+/// The file core read for `name` in a `.read` row, or null.
+fn readLink(row: *const StoryRow, name: []const u8) ?[]const u8 {
+    for (row.read_links.items) |link| if (std.mem.eql(u8, link.name, name)) return link.path;
+    return null;
 }
 
 /// The search tool of a `.search` row's key, which rows for the same tool
@@ -2930,8 +3177,8 @@ test "a cancelled look into saved output names what it read as its running row d
 }
 
 /// A read row by the file's name and the lines it read, such as
-/// "Read orchestrator.zig L15-200", in place of the whole path. An absolute
-/// path makes the name a file link, so Cmd+click opens the file. Null when
+/// "Read orchestrator.zig L15-200", in place of the whole path. The name
+/// links to the file (`writeFileName`), so Cmd+click opens it. Null when
 /// the phrase does not end with the path the call read.
 fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow, merged: bool) !?[]const u8 {
     const record = row.detail orelse return null;
@@ -2944,7 +3191,7 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     if (std.Io.Dir.path.basename(named.path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(named.label);
-    try writeFileName(&out.writer, named.path);
+    try writeFileName(&out.writer, named.path, .{ .resolved = readLink(row, row.identity.key) });
     if (!merged) {
         // "L15-200" for a start and a count, "L15+" for a start alone, and
         // "L1-200" for a count alone.
@@ -2967,8 +3214,11 @@ fn readRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
 /// path cut short. Null for a row of one call whose phrase does not end with
 /// the path it changed and its counts.
 fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
-    if (!entryShowsDiffStats(row.detail)) return null;
-    const path = storyArgString(scratch, row.detail.?, "path") orelse return try pendingPathPhrase(scratch, phrase, row.detail.?);
+    const change = try fileChangeOf(scratch, row.detail) orelse return null;
+    const record = row.detail.?;
+    const path = jsonArgString(scratch, change.arguments, "path") orelse
+        statusFilePath(record, phrase) orelse
+        return try pendingPathPhrase(scratch, phrase, record);
     // Core writes the path terminal-safe, so a control byte in it shows
     // escaped.
     const shown = try terminalSafeText(scratch, path);
@@ -2985,7 +3235,9 @@ fn editRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Sto
     const totals = if (merged) row.diff else diffTotalsOfPhrase(phrase);
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(target.label);
-    try writeFileName(&out.writer, target.path);
+    // The link goes to the file the change wrote, which a symlink or "./"
+    // in the path the call named does not hide.
+    try writeFileName(&out.writer, target.path, .{ .resolved = row.resolved_path });
     if (totals.added > 0) try out.writer.print(" +{d}", .{totals.added});
     if (totals.removed > 0) try out.writer.print("{s}-{d}", .{ if (totals.added > 0) "/" else " ", totals.removed });
     return out.written();
@@ -3014,7 +3266,8 @@ fn phrasePath(phrase: []const u8, path: []const u8, shown: []const u8) ?PhrasePa
 /// already names the path after its one-word verb, such as "Reading
 /// /src/main.zig". Null once the call has arguments, which name the path
 /// instead, or an outcome, whose phrase can end in counts, and when the
-/// phrase names no folder to leave out.
+/// phrase names no folder to leave out. Core has not resolved the path yet,
+/// so the name has no link.
 fn pendingPathPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *const ToolDetailRecord) !?[]const u8 {
     if (record.outcome != null or storyHasArgs(record)) return null;
     const space = findByte(phrase, ' ') orelse return null;
@@ -3022,7 +3275,7 @@ fn pendingPathPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
     if (findByte(path, '/') == null or std.Io.Dir.path.basename(path).len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(scratch);
     try out.writer.writeAll(phrase[0 .. space + 1]);
-    try writeFileName(&out.writer, path);
+    try writeFileName(&out.writer, path, .{});
     return out.written();
 }
 
@@ -3045,20 +3298,177 @@ fn linkOpensSafely(name: []const u8) bool {
     return true;
 }
 
-/// A file by its name, in place of its whole path. An absolute path to a
-/// file that opens safely makes the name a file link, so Cmd+click opens
-/// the file. A path with no name shows whole. The text is terminal-safe.
-fn writeFileName(writer: *std.Io.Writer, path: []const u8) !void {
+/// Where a file name's link points.
+const FileLink = struct {
+    /// The file core resolved the call's path to, with symlinks followed
+    /// (`ToolDetailRecord.resolved_path`). The link never takes the path the
+    /// model named: a symlink there can point to a program.
+    resolved: ?[]const u8 = null,
+};
+
+/// The absolute path a file name links to: the path core resolved. Null
+/// when core resolved none, or when the path is relative, cut short with
+/// "…", or holds a backslash, as core escapes a path it writes as text, so
+/// it may name another file.
+fn fileLinkTarget(link: FileLink) ?[]const u8 {
+    const target = link.resolved orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(target)) return null;
+    if (std.mem.find(u8, target, "…") != null or findByte(target, '\\') != null) return null;
+    return target;
+}
+
+/// A file by its name, in place of its whole path. The name links to the
+/// file core resolved (`fileLinkTarget`), so Cmd+click opens it, when both
+/// the name and that file open safely. A path with no name shows whole. The
+/// text is terminal-safe, and the link's path is percent-encoded.
+fn writeFileName(writer: *std.Io.Writer, path: []const u8, link: FileLink) !void {
     const base = std.Io.Dir.path.basename(path);
     const name = if (base.len == 0) path else base;
-    const link = base.len > 0 and std.Io.Dir.path.isAbsolute(path) and linkOpensSafely(base);
-    if (link) {
+    const target = if (base.len > 0 and linkOpensSafely(base)) fileLinkTarget(link) else null;
+    // The file the link opens can have another name than the row shows,
+    // such as a symlink's target, which must open safely too.
+    const opens = if (target) |absolute| linkOpensSafely(std.Io.Dir.path.basename(absolute)) else false;
+    if (opens) {
         try writer.writeAll("\x1b]8;;file://");
-        try writeFileUrlPath(writer, path);
+        try writeFileUrlPath(writer, target.?);
         try writer.writeAll("\x1b\\");
     }
     try writeTerminalSafe(writer, name);
-    if (link) try writer.writeAll(link_close);
+    if (opens) try writer.writeAll(link_close);
+}
+
+test "a file name links only to the file core resolved, when that file opens safely" {
+    var out_buf: [512]u8 = undefined;
+    const Case = struct { path: []const u8, link: FileLink = .{}, want: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "tsec/selfhost/checker.tse", .link = .{ .resolved = "/Users/example/my ws/tsec/selfhost/checker.tse" }, .want = "\x1b]8;;file:///Users/example/my%20ws/tsec/selfhost/checker.tse\x1b\\checker.tse" ++ link_close },
+        // The path the model named is never the link: it can be a symlink to
+        // a program.
+        .{ .path = "docs/plan.md", .want = "plan.md" },
+        .{ .path = "/opt/notes/plan.md", .want = "plan.md" },
+        // A symlink's name links to the file it points to, and to nothing
+        // when that file could run on a click or has no extension.
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/real/real.md" }, .want = "\x1b]8;;file:///Users/example/ws/real/real.md\x1b\\notes.md" ++ link_close },
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/run.command" }, .want = "notes.md" },
+        .{ .path = "notes.md", .link = .{ .resolved = "/Users/example/ws/bin/tool" }, .want = "notes.md" },
+        // A name that could run gets no link, wherever it points.
+        .{ .path = "tools/install.command", .link = .{ .resolved = "/Users/example/ws/tools/real.md" }, .want = "install.command" },
+        .{ .path = "bin/fx", .link = .{ .resolved = "/Users/example/ws/bin/fx" }, .want = "fx" },
+        // A path out of the folder links where core resolved it.
+        .{ .path = "../notes/plan.md", .link = .{ .resolved = "/Users/example/notes/plan.md" }, .want = "\x1b]8;;file:///Users/example/notes/plan.md\x1b\\plan.md" ++ link_close },
+        .{ .path = "/tmp/plan.md", .link = .{ .resolved = "/private/tmp/plan.md" }, .want = "\x1b]8;;file:///private/tmp/plan.md\x1b\\plan.md" ++ link_close },
+        // A relative path, from a session that may have run in another
+        // workspace, can name another file here; a path core cut short or
+        // escaped names no file.
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "docs/plan.md" }, .want = "plan.md" },
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "/Users/example/ws/very…/plan.md" }, .want = "plan.md" },
+        .{ .path = "docs/plan.md", .link = .{ .resolved = "/Users/example/ws/docs/pl\\x1ban.md" }, .want = "plan.md" },
+        // Escape bytes in a name stay escaped, and the link encodes them.
+        .{ .path = "docs/a\x1b]8;;evil\x07.md", .link = .{ .resolved = "/Users/example/my ws/docs/a\x1b]8;;evil\x07.md" }, .want = "\x1b]8;;file:///Users/example/my%20ws/docs/a%1B%5D8%3B%3Bevil%07.md\x1b\\a\\x1b]8;;evil\\x07.md" ++ link_close },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer = .fixed(&out_buf);
+        try writeFileName(&out, case.path, case.link);
+        errdefer std.debug.print("path {s}: {s}\n", .{ case.path, out.buffered() });
+        try std.testing.expectEqualStrings(case.want, out.buffered());
+    }
+}
+
+/// A group's painted rows, joined by "\n".
+fn paintedGroupForTest(gpa: std.mem.Allocator, entries: []const TranscriptEntry, details: []const ToolDetailRecord, cols: u16) ![]u8 {
+    var group = try buildStyled(gpa, entries, details, cols, .{}, .{});
+    defer group.deinit(gpa);
+    var painted: std.ArrayList(u8) = .empty;
+    errdefer painted.deinit(gpa);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| {
+            try painted.appendSlice(gpa, override.bytes);
+            try painted.append(gpa, '\n');
+        },
+        else => {},
+    };
+    return painted.toOwnedSlice(gpa);
+}
+
+test "compact rows link read, edit, and write names to the files core resolved, without changing what they show" {
+    const alloc = std.testing.allocator;
+    const root = "/Users/example/ws";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Edited docs/spec.md +10 / -9\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Wrote docs/ledger.md +1\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Read src/a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● Read src/b.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast("{\"path\":\"docs/spec.md\",\"old_string\":\"a\",\"new_string\":\"b\"}"), .resolved_path = @constCast(root ++ "/docs/spec.md"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast("{\"path\":\"docs/ledger.md\",\"content\":\"x\"}"), .resolved_path = @constCast(root ++ "/docs/ledger.md"), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"src/a.zig\"}"), .resolved_path = @constCast(root ++ "/src/a.zig"), .outcome = .completed },
+        .{ .entry_id = 4, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"src/b.zig\"}"), .resolved_path = @constCast(root ++ "/src/b.zig"), .outcome = .completed },
+    };
+    var unresolved = details;
+    for (&unresolved) |*detail| detail.resolved_path = null;
+    for ([_]u16{ 120, 28 }) |cols| {
+        const linked = try paintedGroupForTest(alloc, &entries, &details, cols);
+        defer alloc.free(linked);
+        const plain = try paintedGroupForTest(alloc, &entries, &unresolved, cols);
+        defer alloc.free(plain);
+        errdefer std.debug.print("cols {d}:\n{s}\n", .{ cols, linked });
+        // The links add no cells: the rows read and clip as they did.
+        const linked_text = try visibleLinesForTest(alloc, linked, cols);
+        defer alloc.free(linked_text);
+        const plain_text = try visibleLinesForTest(alloc, plain, cols);
+        defer alloc.free(plain_text);
+        try std.testing.expectEqualStrings(plain_text, linked_text);
+        // With no path core resolved, no name links.
+        try std.testing.expect(std.mem.find(u8, plain, "\x1b]8;") == null);
+        // A cut row closes every link it opens.
+        var lines = std.mem.splitScalar(u8, linked, '\n');
+        while (lines.next()) |line| try std.testing.expect(!endsInsideLink(line));
+        if (cols < 120) continue;
+        try std.testing.expect(std.mem.find(u8, linked_text, "├ Edited spec.md +10/-9\n") != null);
+        try std.testing.expect(std.mem.find(u8, linked_text, "├ Wrote ledger.md +1\n") != null);
+        try std.testing.expect(std.mem.find(u8, linked_text, "└ Read a.zig, b.zig") != null);
+        for ([_][]const u8{ "docs/spec.md\x1b\\spec.md", "docs/ledger.md\x1b\\ledger.md", "src/a.zig\x1b\\a.zig", "src/b.zig\x1b\\b.zig" }) |target| {
+            const want = try std.mem.concat(alloc, u8, &.{ "\x1b]8;;file://" ++ root ++ "/", target, link_close });
+            defer alloc.free(want);
+            try std.testing.expect(std.mem.find(u8, linked, want) != null);
+        }
+    }
+}
+
+test "a read row links to the file core read, never to the symlink the model named" {
+    const alloc = std.testing.allocator;
+    // In the workspace, notes.md -> run.command (a script), link.md ->
+    // real/real.md, and gone.md -> a file that does not exist.
+    const notes = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"notes.md\"}"), .resolved_path = @constCast("/ws/run.command"), .outcome = .completed };
+    const link = ToolDetailRecord{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"link.md\"}"), .resolved_path = @constCast("/ws/real/real.md"), .outcome = .completed };
+    const gone = ToolDetailRecord{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"gone.md\"}"), .outcome = .failed };
+    const notes_entry = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Read notes.md\n", .class = .tool_status } };
+    const link_entry = TranscriptEntry{ .raw_bytes = .{ .id = 2, .bytes = "● Read link.md\n", .class = .tool_status } };
+    const gone_entry = TranscriptEntry{ .raw_bytes = .{ .id = 3, .bytes = "● Couldn't read gone.md · Path not found: gone.md\n", .class = .tool_status } };
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, links: []const []const u8 };
+    const cases = [_]Case{
+        .{ .entries = &.{notes_entry}, .details = &.{notes}, .links = &.{} },
+        .{ .entries = &.{link_entry}, .details = &.{link}, .links = &.{"\x1b]8;;file:///ws/real/real.md\x1b\\link.md" ++ link_close} },
+        .{ .entries = &.{gone_entry}, .details = &.{gone}, .links = &.{} },
+        // In one row's list of names, each name keeps its own file.
+        .{ .entries = &.{ notes_entry, link_entry, gone_entry }, .details = &.{ notes, link, gone }, .links = &.{"\x1b]8;;file:///ws/real/real.md\x1b\\link.md" ++ link_close} },
+    };
+    for (cases) |case| {
+        const painted = try paintedGroupForTest(alloc, case.entries, case.details, 120);
+        defer alloc.free(painted);
+        errdefer std.debug.print("rows:\n{s}\n", .{painted});
+        try std.testing.expectEqual(case.links.len, std.mem.count(u8, painted, "\x1b]8;;file://"));
+        for (case.links) |want| try std.testing.expect(std.mem.find(u8, painted, want) != null);
+        try std.testing.expect(std.mem.find(u8, painted, "notes.md\x1b]8;;") == null);
+    }
+    // A running read has no resolved path yet, so no link.
+    var running = link;
+    running.outcome = null;
+    const painted = try paintedGroupForTest(alloc, &.{.{ .raw_bytes = .{ .id = 2, .bytes = "● Reading link.md\n", .class = .tool_status } }}, &.{running}, 120);
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "\x1b]8;") == null);
 }
 
 /// The text of a row that names several files, patterns, sources, or
@@ -3086,7 +3496,7 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
     for (names, pieces) |name, *piece| {
         var text: std.Io.Writer.Allocating = .init(scratch);
         switch (kind) {
-            .read => try writeFileName(&text.writer, name),
+            .read => try writeFileName(&text.writer, name, .{ .resolved = readLink(row, name) }),
             .more_output => try writeTerminalSafe(&text.writer, moreOutputShortName(name)),
             // Core quotes a search terminal-safe.
             .output_search => try text.writer.writeAll(name),
@@ -3215,6 +3625,26 @@ fn shellRetryKey(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?
     if (std.mem.trim(u8, command, " \t\r\n").len == 0) return null;
     const short = try shortCommand(scratch, command) orelse command;
     return try std.mem.concat(scratch, u8, &.{ "shell\x00", short });
+}
+
+/// Whether one of an edit row's calls named its file as `path`.
+fn namedFileBefore(row: *const StoryRow, path: []const u8) bool {
+    for (row.named_paths.items) |named| if (std.mem.eql(u8, named, path)) return true;
+    return false;
+}
+
+/// The identity of a completed edit or write whose record kept no path, by
+/// the file its status names, so it joins that file's row as a call with
+/// its path would. Any other call keeps `identity`.
+fn statusFileIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    if (identity.kind != .single) return identity;
+    const record = detail orelse return identity;
+    // A running call waits in its file's row instead (`pendingCallRow`).
+    if (record.outcome != .completed) return identity;
+    const change = try fileChangeOf(scratch, detail) orelse return identity;
+    if (jsonArgString(scratch, change.arguments, "path") != null) return identity;
+    const path = statusFilePath(record, try entryStatus(scratch, entry) orelse return identity) orelse return identity;
+    return try fileChangeIdentity(scratch, record, path);
 }
 
 /// A running toolbox call's identity by the MCP tool its status names, such
@@ -3554,9 +3984,11 @@ fn storyIdentity(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) !
             // own row, so what happened to it shows. One still running joins
             // the file's row, where it stays when it completes.
             if (record.outcome) |outcome| if (outcome != .completed) return .{};
-            if (!entryShowsDiffStats(detail)) return .{};
-            const path = storyArgString(scratch, record, "path") orelse return .{};
-            return .{ .kind = .edit, .key = path };
+            const change = try fileChangeOf(scratch, detail) orelse return .{};
+            // A completed change with no path of its own takes the file its
+            // status names (`statusFileIdentity`).
+            const path = jsonArgString(scratch, change.arguments, "path") orelse return .{};
+            return try fileChangeIdentity(scratch, record, path);
         },
         .mcp => {
             // A call that failed, was denied, or was cancelled keeps its own
@@ -3689,7 +4121,7 @@ fn collectStoryRows(
             try unshown.put(scratch, entry_id, {});
             continue :calls;
         };
-        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))));
+        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -3712,6 +4144,9 @@ fn collectStoryRows(
         };
         const target = for (candidates) |*row| {
             if (sharesStoryRow(row.identity, identity)) break row;
+            // A change still running has only the path it named, so it
+            // joins the row of a call that named the file the same way.
+            if (identity.kind == .edit and row.identity.kind == .edit and namedFileBefore(row, identity.alias)) break row;
             if (identity.kind == .session and std.mem.eql(u8, row.session, identity.key)) break row;
         } else new: {
             // A run's record keeps its output but not the session it started,
@@ -3762,11 +4197,19 @@ fn collectStoryRows(
         };
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
+        if (completedResolvedPath(detail)) |path| switch (identity.kind) {
+            .read => if (std.mem.eql(u8, detail.?.tool_name, "read_file")) try setReadLink(&target.read_links, scratch, identity.key, path),
+            .edit => target.resolved_path = path,
+            else => {},
+        };
         if (identity.kind == .edit) {
             const totals = diffTotalsOfPhrase(try entryStatus(scratch, entry) orelse "");
             target.diff.added +|= totals.added;
             target.diff.removed +|= totals.removed;
-            if (std.mem.eql(u8, detail.?.tool_name, "write_file")) target.writes += 1;
+            if (try fileChangeOf(scratch, detail)) |change| if (std.mem.eql(u8, change.tool, "write_file")) {
+                target.writes += 1;
+            };
+            try StoryTally.addDistinct(&target.named_paths, scratch, identity.alias);
         }
     }
     for (rows.items) |*row| {
@@ -4687,7 +5130,7 @@ const story_reason_min_cols = 8;
 /// `mark` after them, as clipStoryRow writes a row with no reason.
 fn clipStoryPhrase(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryRow, text: *const StoryRowText, mark: []const u8, cols: u16, style: SummaryStyle) ![]const u8 {
     const tail = try std.mem.concat(scratch, u8, &.{ text.suffix, mark });
-    if (!entryShowsDiffStats(row.detail))
+    if (!try entryShowsDiffStats(scratch, row.detail))
         return clipKeepingTail(scratch, try std.mem.concat(scratch, u8, &.{ lead, text.body }), tail, cols, style.text_style);
     const tail_width = display_width.visibleWidthIgnoringAnsi(tail);
     const phrase_cols: u16 = if (cols > tail_width * 2) @intCast(cols - tail_width) else cols;
@@ -5982,7 +6425,7 @@ fn formatExpandedChild(
     else
         "";
     const child = try std.mem.concat(scratch, u8, &.{ marker, marker_reset, " ", display_phrase });
-    const accented = if (entryShowsDiffStats(detail))
+    const accented = if (try entryShowsDiffStats(scratch, detail))
         try accentTrailingDiffStats(scratch, child, "")
     else
         child;
@@ -7002,7 +7445,7 @@ test "a group's rows keep their diff count accents, and a collapsed group's head
         "● Edited files, read a file\n" ++
             "├ Read runtime.zig\n" ++
             "├ Wrote note.txt [G]+143\x1b[0m\n" ++
-            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+            "└ Edited main.zig [G]+12\x1b[0m/[R]-3\x1b[0m",
         projection.entry_actions.items[0].override.bytes,
     );
 
@@ -7026,7 +7469,7 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     ui_render.diff_removed_marker_style = "[R]";
 
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Wrote\x1b[0m \x1b[38;5;245mdocs/release-notes/very-long-release-note-file-name.md\x1b[0m \x1b[38;2;48;164;108m+143\x1b[0m\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 2, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;229;72;77m-27\x1b[0m\n", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Edited\x1b[0m \x1b[38;5;245msrc/ui/transcript/tool_group_projection.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n", .class = .tool_status } },
     };
@@ -7041,13 +7484,13 @@ test "collapsed tool group keeps diff counts when the path is clipped" {
     defer projection.deinit(alloc);
     const bytes = projection.entry_actions.items[0].override.bytes;
 
-    // The phrase ends in the ellipsis and the counts follow it, so each row
-    // fills the width exactly instead of losing its counts to the clip.
+    // Each file shows by its name. A name too long for the row ends in the
+    // ellipsis and the counts follow it, so each row fills the width
+    // exactly instead of losing its counts to the clip.
     try std.testing.expectEqualStrings(
         "● Edited files\n" ++
-            "├ Wrote docs/release-notes/very-lo… [G]+143\x1b[0m\n" ++
-            "├ Edited src/ui/transcript/tool_gro… [R]-27\x1b[0m\n" ++
-            "└ Edited src/ui/transcript/too… [G]+12\x1b[0m / [R]-3\x1b[0m",
+            "├ Wrote very-long-release-note-fil… [G]+143\x1b[0m\n" ++
+            "└ Edited tool_group_p… [G]+12\x1b[0m/[R]-30\x1b[0m · 2 edits",
         bytes,
     );
     var rows = std.mem.splitScalar(u8, bytes, '\n');
@@ -7198,12 +7641,14 @@ test "clipped diff counts fall back to a plain clip below half the row" {
     const both = "● Edited\x1b[0m \x1b[38;5;245mmain.zig\x1b[0m \x1b[38;2;48;164;108m+12\x1b[0m \x1b[38;5;245m/\x1b[0m \x1b[38;2;229;72;77m-3\x1b[0m\n";
     const wide = "● Edited\x1b[0m \x1b[38;5;245m文档文档文档文档文档文档.md\x1b[0m \x1b[38;2;229;72;77m-7\x1b[0m\n";
     const cases = [_]struct { bytes: []const u8, cols: u16, row: []const u8 }{
-        // A one-call group is its own header line. " +12 / -3" takes 9 of 18
-        // cells: the counts still fit in half the row.
-        .{ .bytes = both, .cols = 18, .row = "● Edited… [G]+12\x1b[0m / [R]-3\x1b[0m" },
+        // A one-call group is its own header line, which names the file and
+        // its counts. " +12/-3" takes 7 of 14 cells: the counts still fit in
+        // half the row.
+        .{ .bytes = both, .cols = 18, .row = "● Edited m… [G]+12\x1b[0m/[R]-3\x1b[0m" },
+        .{ .bytes = both, .cols = 14, .row = "● Edit… [G]+12\x1b[0m/[R]-3\x1b[0m" },
         // One cell narrower, the counts would take more than half the row,
         // so the row clips from the right like any other row.
-        .{ .bytes = both, .cols = 17, .row = "● Edited main.zi…" },
+        .{ .bytes = both, .cols = 13, .row = "● Edited mai…" },
         .{ .bytes = both, .cols = 12, .row = "● Edited ma…" },
         // A two-cell glyph that would cross the cut is dropped whole.
         .{ .bytes = wide, .cols = 20, .row = "● Edited 文档文… [R]-7\x1b[0m" },
@@ -7218,6 +7663,7 @@ test "clipped diff counts fall back to a plain clip below half the row" {
         var projection = try build(alloc, &entries, &details, case.cols);
         defer projection.deinit(alloc);
         const row = projection.entry_actions.items[0].override.bytes;
+        errdefer std.debug.print("cols {d}: {s}\n", .{ case.cols, row });
         try std.testing.expect(std.mem.findScalar(u8, row, '\n') == null);
         try std.testing.expectEqualStrings(case.row, row);
         try std.testing.expect(try widthWithoutTestMarkersForTest(alloc, row) <= case.cols);
@@ -7459,9 +7905,9 @@ test "edit rows name the file, and changes to one file share a row" {
         .{ .raw_bytes = .{ .id = 4, .bytes = "● Failed " ++ app_path ++ ": old_string not found\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .resolved_path = @constCast(main_path), .outcome = .completed },
         .{ .entry_id = 2, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
-        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(edit_args), .resolved_path = @constCast(main_path), .outcome = .completed },
         .{ .entry_id = 4, .tool_name = @constCast("edit_file"), .activity_kind = .edit, .arguments_json = @constCast(failed_args), .outcome = .failed },
     };
 
@@ -7565,9 +8011,9 @@ test "a file outside the project shows by its name when core names its real path
         .{ .raw_bytes = .{ .id = 3, .bytes = "● Wrote /private/tmp/pr-body-steer.md +7 / -3\n", .class = .tool_status } },
     };
     const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .outcome = .completed },
-        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .outcome = .completed },
-        .{ .entry_id = 3, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(write_args), .resolved_path = @constCast("/private/tmp/steer-ab2.ts"), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast(read_args), .resolved_path = @constCast("/private/tmp/followup-checks.sh"), .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("write_file"), .activity_kind = .write, .arguments_json = @constCast(body_args), .resolved_path = @constCast("/private/tmp/pr-body-steer.md"), .outcome = .completed },
     };
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
@@ -7577,7 +8023,7 @@ test "a file outside the project shows by its name when core names its real path
     try std.testing.expectEqualStrings("├ Wrote steer-ab2.ts +80", rows.next().?);
     try std.testing.expectEqualStrings("├ Read followup-checks.sh", rows.next().?);
     try std.testing.expectEqualStrings("└ Wrote pr-body-steer.md +7/-3", rows.next().?);
-    // The name links to the path core named, where the file really is.
+    // The name links to the file core resolved, where the file really is.
     var compact = try build(alloc, &entries, &details, 120);
     defer compact.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, compact.entry_actions.items[0].override.bytes, "file:///private/tmp/steer-ab2.ts") != null);
@@ -9754,7 +10200,7 @@ test "commands one after the other share a row, and reads show the file by name"
         .{ .raw_bytes = .{ .id = 6, .bytes = "● Ran nl -ba src/b.zig\n", .class = .tool_status } },
     };
     var details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\",\"start_line\":15,\"line_count\":186}"), .outcome = .completed },
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\",\"start_line\":15,\"line_count\":186}"), .resolved_path = @constCast(path), .outcome = .completed },
         storyCommandDetail(2, "{\"command\":\"rg -n retry src\"}", 0, null),
         storyCommandDetail(3, "{\"command\":\"sed -n 1,40p src/a.zig\"}", 0, null),
         storyCommandDetail(4, "{\"command\":\"rg -n backoff src\"}", 0, null),
@@ -10568,6 +11014,8 @@ fn storyReadDetailForTest(entry_id: u32, comptime path: []const u8) ToolDetailRe
         .tool_name = @constCast("read_file"),
         .activity_kind = .read,
         .arguments_json = @constCast("{\"path\":\"" ++ path ++ "\"}"),
+        // A finished read names the file core read.
+        .resolved_path = @constCast(path),
         .outcome = .completed,
     };
 }
@@ -11462,10 +11910,11 @@ test "a list row says what its calls did, and links only files that open safely"
     details[2].outcome = null;
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
-    // A runnable file and a file with no extension get no link; the row
-    // reads "Read" while the last read still runs.
+    // A runnable file and a file with no extension get no link, nor does a
+    // read that still runs, whose path core has not resolved yet; the row
+    // reads "Read" while it runs.
     try std.testing.expectEqualStrings(
-        "● Read run.command, fx, \x1b]8;;file:///Users/example/a.zig\x1b\\a.zig" ++ link_close,
+        "● Read run.command, fx, a.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
