@@ -7295,6 +7295,7 @@ test "an audience member whose write fails is dropped, and the owner still gets 
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(null, refuseWrite),
     };
+    defer follower.deinit();
     try server.joinMemberForTest(session, &follower);
 
     var turn_settings = try TurnSettings.capture(alloc, session);
@@ -7326,6 +7327,7 @@ test "an audience member whose writer has stopped is dropped after the next upda
         .host = &test_host,
         .writer = jsonrpc.Writer.initCallback(&follower_wire, WireCapture.write),
     };
+    defer follower.deinit();
     // Its client closed: the writer drops later notifications without an error.
     follower.writer.dropping = true;
     try server.joinMemberForTest(session, &follower);
