@@ -136,6 +136,7 @@ pub fn handleNewLibfxSession(
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
+    server.cancelAndReapActivePrompt(state);
     server.stopSubagentsForSwitch(state);
     try server.releaseActiveSession(state);
     requested_owned = false;
@@ -3560,6 +3561,83 @@ test "a reload under another cwd and a libfx/new drop what the host they replace
     try std.testing.expectEqual(@as(usize, 0), state.worker.queuedPromptCount());
     try std.testing.expectEqual(@as(usize, 0), state.report_calls.items.len);
     try std.testing.expect(state.subagent_host == null);
+}
+
+/// A stand-in for a prompt that is still running. The real prompt worker runs a
+/// model turn, which a unit test cannot hold, so this thread holds its place: it
+/// waits until the session's cancel flag is set, or until the test stops it.
+/// `cancel_seen` records that the wait ended on the cancel.
+const HeldPrompt = struct {
+    cancel: *std.atomic.Value(bool),
+    stop: std.atomic.Value(bool) = .init(false),
+    cancel_seen: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *HeldPrompt) void {
+        while (!self.cancel.load(.seq_cst) and !self.stop.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        if (self.cancel.load(.seq_cst)) self.cancel_seen.store(true, .seq_cst);
+    }
+};
+
+test "libfx/new cancels and joins a running prompt before it releases the session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.minimal_kernel = true;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/new", .params_raw = "{\"mcpServers\":[]}" };
+    try handleNewSession(&state, arena, &new_msg);
+    const session = &state.active_session.?;
+
+    // Held as `startPrompt` holds one: the steering queue open, the prompt on the
+    // state, and its own thread. `ActivePrompt` is private to server.zig, so its
+    // type comes from the field.
+    session.steering.open(arena);
+    const Prompt = std.meta.Child(std.meta.Child(@FieldType(server.ServerState, "active_prompt")));
+    const prompt = try arena.create(Prompt);
+    var held: HeldPrompt = .{ .cancel = &session.cancel_flag };
+    prompt.* = .{
+        .state = &state,
+        .alloc = arena,
+        .msg = .{ .id = .{ .integer = 2 }, .method = try arena.dupe(u8, "session/prompt") },
+        .mode = session.mode,
+        .permission_mode = session.permission_mode,
+    };
+    prompt.thread = try std.Thread.spawn(.{}, HeldPrompt.run, .{&held});
+    state.active_prompt = prompt;
+    // Runs before `state.deinit`, which reaps an active prompt too. Only a run that
+    // failed before the call reaped the prompt gets here with the thread still waiting.
+    defer if (state.active_prompt) |leftover| {
+        held.stop.store(true, .seq_cst);
+        leftover.thread.join();
+        state.active_prompt = null;
+    };
+
+    var libfx_msg = jsonrpc.Message{ .id = .{ .integer = 3 }, .method = "libfx/new", .params_raw = "{}" };
+    try handleNewLibfxSession(&state, arena, &libfx_msg);
+    // The call reaps the prompt, which cancels it and joins its thread, before it
+    // releases the session. Without that reap the prompt is still held after the call.
+    try std.testing.expect(state.active_prompt == null);
+    try std.testing.expect(held.cancel_seen.load(.seq_cst));
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {

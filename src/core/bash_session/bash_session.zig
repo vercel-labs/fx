@@ -228,18 +228,23 @@ pub const Session = struct {
     /// state) or when the folder is gone. The record is emptied, not deleted, so
     /// the file keeps the owner-only mode `prepare` gave it, and the next
     /// program's `pending` write needs no umask change. A record that cannot be
-    /// read counts as `.failed`, so fx reports the drop rather than trust it.
+    /// read, or is not a regular file, counts as `.failed`, so fx reports the drop
+    /// rather than trust it. The program can put a FIFO or a link there, so the
+    /// record is opened without waiting and without following a link, and it is
+    /// emptied through that same open file.
     pub fn takeSaveStatus(self: *Session, io: std.Io) ?SaveStatus {
         const dir_path = self.dir orelse return null;
         var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
         defer dir.close(io);
-        const text = dir.readFileAlloc(io, save_status_file, self.alloc, .limited(max_status_bytes)) catch |err| switch (err) {
+        var file = openRegularFile(io, dir, save_status_file, true) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return .failed,
         };
+        defer file.close(io);
+        const text = readOpenedFile(self.alloc, file, max_status_bytes) catch return .failed;
         defer self.alloc.free(text);
         // Best effort: a record that stays is read again by the next take, so its notice repeats.
-        dir.writeFile(io, .{ .sub_path = save_status_file, .data = "" }) catch {};
+        file.setLength(io, 0) catch {};
         return parseSaveStatus(text);
     }
 
@@ -263,8 +268,10 @@ pub const Session = struct {
     }
 
     /// Reads the folder the last saved program ended in and keeps it when it is
-    /// an absolute path, with no NUL byte, that opens as a directory. Anything
-    /// else sets null, which means the workspace root.
+    /// an absolute path, with no NUL byte, that opens as a directory. The folder
+    /// file must be a regular file: a FIFO, a link, or any other kind is a bad
+    /// record, and the read never waits on it. Anything else sets null, which
+    /// means the workspace root.
     pub fn refreshStartFolder(self: *Session, io: std.Io) void {
         // A missing or bad folder file is not an error: the workspace root is
         // the folder a session starts in until a program saves one.
@@ -277,7 +284,9 @@ pub const Session = struct {
         const dir_path = self.dir orelse return null;
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
         defer dir.close(io);
-        const folder = try dir.readFileAlloc(io, folder_file, self.alloc, .limited(std.Io.Dir.max_path_bytes));
+        var file = try openRegularFile(io, dir, folder_file, false);
+        defer file.close(io);
+        const folder = try readOpenedFile(self.alloc, file, std.Io.Dir.max_path_bytes);
         errdefer self.alloc.free(folder);
         if (!std.Io.Dir.path.isAbsolute(folder) or std.mem.findScalar(u8, folder, 0) != null) return error.BadStartFolder;
         var target = try std.Io.Dir.cwd().openDir(io, folder, .{});
@@ -392,6 +401,45 @@ fn removeTree(io: std.Io, dir: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
 
+/// Opens `name` in `dir` as a regular file, for the reads and the one truncate
+/// that the session makes of files the program can also write. The open does not
+/// follow a link and does not wait: a program can put a FIFO or a device at
+/// either name, and a plain open of a FIFO waits for a writer. The file is
+/// checked once it is open, so anything but a regular file is an error. The
+/// caller closes the returned file.
+fn openRegularFile(io: std.Io, dir: std.Io.Dir, name: []const u8, writable: bool) !std.Io.File {
+    const flags: std.posix.O = .{
+        .ACCMODE = if (writable) .RDWR else .RDONLY,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    };
+    const fd = try std.posix.openat(dir.handle, name, flags, 0);
+    var file = std.Io.File{
+        .handle = fd,
+        .flags = .{ .nonblocking = true },
+    };
+    errdefer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.NotRegularFile;
+    return file;
+}
+
+/// Reads at most `limit` bytes of an open regular file, from its start. A file
+/// that holds more is an error. The caller frees the result. O_NONBLOCK does not
+/// make a regular file's read return early, so the read cannot wait.
+fn readOpenedFile(alloc: std.mem.Allocator, file: std.Io.File, limit: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const n = try std.posix.read(file.handle, &chunk);
+        if (n == 0) break;
+        if (n > limit - out.items.len) return error.FileTooLong;
+        try out.appendSlice(alloc, chunk[0..n]);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// The state script, in two parts. `envScript` writes the names fx adds to
 /// every program between them. The test "the bash script keeps the reviewed
 /// bytes" pins the whole script by hash, so a change to either part must update
@@ -407,7 +455,10 @@ fn removeTree(io: std.Io, dir: []const u8) void {
 /// The first line turns off alias expansion while the script runs, so an alias
 /// the user's startup files define cannot rewrite the script's own words (a `for`
 /// alias would break its loop). The startup definitions are recorded before the
-/// state loads, and expansion is turned back on after it.
+/// state loads, and expansion is turned back on after it. The save never writes
+/// the state's `expand_aliases` line, so the state loads with expansion off
+/// whatever aliases it holds: a saved alias named `shopt` or `set` would
+/// otherwise rewrite the option lines after it.
 ///
 /// The save and the `trap` wrapper are defined before the state loads and before
 /// aliases expand. Every command word in them is `builtin`, `command`, or `[[`,
@@ -494,7 +545,7 @@ const body_after_skip =
     \\    block = block $0 "\n"
     \\}
     \\END { if (block != "" && !(block in known)) printf "%s", block }' "$__fx_defs_fn" "$__fx_defs_al" || builtin exit 1
-    \\      builtin shopt -p
+    \\      builtin shopt -p | while builtin read -r __fx_decl; do case $__fx_decl in *' expand_aliases') builtin continue ;; esac; builtin printf '%s\n' "$__fx_decl"; done
     \\      if [[ "$__fx_nocase" -eq 1 ]]; then builtin printf 'shopt -s nocasematch\n'; fi
     \\      builtin set +o | while builtin read -r __fx_decl; do case $__fx_decl in *' errexit'|*' posix'|*' xtrace') ;; *) builtin printf '%s\n' "$__fx_decl" ;; esac; done
     \\    } 2>/dev/null >|"$__fx_tmp"
@@ -578,7 +629,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("55071cfb512399d6714c5641cebecb641c3e33c81f81fe8d5ba40551158e51e1", &hex);
+    try std.testing.expectEqualStrings("52b93423f5c602a8661e55c3046f1063901fd4df7ecb98fb31eb56c7a57be3b1", &hex);
 }
 
 test "prepare refuses a relative temp root and leaves no session" {
@@ -653,6 +704,14 @@ fn runProgramAfterStartup(alloc: std.mem.Allocator, io: std.Io, session: *const 
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
     });
+}
+
+/// Makes a FIFO at `path` with the `mkfifo` tool, since std has no call for it.
+/// The tests that use it run where `/bin/bash` exists, so POSIX.
+fn makeFifo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const result = try std.process.run(alloc, io, .{ .argv = &.{ "/usr/bin/mkfifo", path } });
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
 }
 
 fn freeRun(alloc: std.mem.Allocator, result: std.process.RunResult) void {
@@ -1873,6 +1932,134 @@ test "a program that sets nocasematch keeps the variables of the next program" {
     defer freeRun(alloc, second);
     try expectExit(second, 0);
     try std.testing.expectEqualStrings("x=1 h=kept\non\n", second.stdout);
+}
+
+test "a saved alias named shopt, set, declare, or alias leaves the next program's options alone" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    // The aliases come after the settings, as in the review's probe r9, so the
+    // settings are made before any of the four words is aliased.
+    const first = try runProgram(alloc, io, &session, dir, "alias1", "shopt -s nocasematch extglob\nset -u\nx=1\nf() { echo F; }\nalias ll='echo LL'\nalias shopt=:\nalias set=:\nalias declare=:\nalias alias=:");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    try std.testing.expect(session.takeSaveStatus(io) == null);
+
+    // The second program uses `builtin` and `[[`, never the four aliased words.
+    const second = try runProgram(alloc, io, &session, dir, "alias2", "builtin shopt -q nocasematch && echo nc=on || echo nc=off\nbuiltin shopt -q extglob && echo eg=on || echo eg=off\n[[ $- == *u* ]] && echo u=on || echo u=off\necho \"x=$x\"\nf\nll");
+    defer freeRun(alloc, second);
+    try expectExit(second, 0);
+    try std.testing.expectEqualStrings("nc=on\neg=on\nu=on\nx=1\nF\nLL\n", second.stdout);
+}
+
+test "a folder file that is a FIFO is a bad record: the start folder is the workspace root, and the call returns" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const folder_path = try alloc.print("{s}/{s}", .{ session.dir.?, folder_file });
+    defer alloc.free(folder_path);
+    try makeFifo(alloc, io, folder_path);
+
+    // A plain open would wait here for a writer that never comes, so this call is the check.
+    session.refreshStartFolder(io);
+    try std.testing.expect(session.startFolder() == null);
+}
+
+test "a folder file that is a symlink is a bad record, even when the link leads to a valid folder path" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    // The target holds a folder path that would be accepted, so only the no-follow open refuses the link.
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = root });
+    const target_path = try alloc.print("{s}/target", .{root});
+    defer alloc.free(target_path);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    try folder.symLink(io, target_path, folder_file, .{});
+
+    session.refreshStartFolder(io);
+    try std.testing.expect(session.startFolder() == null);
+}
+
+test "a save-status that is a FIFO is a failed record, and the call returns" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, save_status_file);
+    const status_path = try alloc.print("{s}/{s}", .{ session.dir.?, save_status_file });
+    defer alloc.free(status_path);
+    try makeFifo(alloc, io, status_path);
+
+    // A plain open would wait here for a writer that never comes, so this call is the check.
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+}
+
+test "a save-status that is a symlink is a failed record, and the file it names is not truncated" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "cap 42\n" });
+    const target_path = try alloc.print("{s}/target", .{root});
+    defer alloc.free(target_path);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, save_status_file);
+    try folder.symLink(io, target_path, save_status_file, .{});
+
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+    const kept = try tmp.dir.readFileAlloc(io, "target", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("cap 42\n", kept);
 }
 
 test "a program that hides awk and mv from PATH still saves its state" {
