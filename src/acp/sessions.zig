@@ -4489,10 +4489,12 @@ test "a follower's set_mode and set_config_option get -32600, and the owner's se
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
     var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
