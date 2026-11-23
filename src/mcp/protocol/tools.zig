@@ -162,7 +162,7 @@ pub const Refusal = enum {
     /// They fit `text_max` bytes.
     pub fn text(refusal: Refusal, status: u16, buf: *[text_max]u8) []const u8 {
         if (refusal != .http_status or status == 0) return refusal.words();
-        return std.fmt.bufPrint(buf, "the server answered the list with HTTP {d}", .{status}) catch refusal.words();
+        return std.mem.print(buf, "the server answered the list with HTTP {d}", .{status}) catch refusal.words();
     }
 };
 

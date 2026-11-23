@@ -378,6 +378,33 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-restart-count-is-per-listing",
+    description: "A listing restarts once on an invalid cursor, as the model says, and so does the next listing: each starts with its own count, so the second listing's first invalid cursor restarts it, publishes its new list and refuses nothing",
+    servers: {
+      f: {
+        rules: [
+          initialize,
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c1" } },
+          { method: "tools/list", cursor: "c1", times: 1, error: { code: -32602, message: "no such cursor" } },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")] } },
+          { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] },
+          { method: "tools/list", cursor: null, times: 1, result: { tools: [tool("add")], nextCursor: "c2" } },
+          { method: "tools/list", cursor: "c2", times: 1, error: { code: -32602, message: "no such cursor" } },
+          list25("add", "sub"),
+        ],
+      },
+    },
+    script: ["tools f", "expect f.tools.ok", "status", "call f add", "expect f.called.1.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "status"],
+    machines: { f: [...BASE, "catalog"] },
+    check(lines) {
+      // The lab prints one more status when it ends, which repeats the last: the two the script asked for.
+      const states = lines.filter((l) => l.status).map((l) => l.status![0]).slice(0, 2);
+      return first(
+        same(states.map((s) => [s.phase, s.tools, s.list_refusal]), [["ready", 1, null], ["ready", 2, null]], "the status [phase, tools, list_refusal] after each list: the second list is published, and nothing is refused"),
+      );
+    },
+  }),
+  engineScenario({
     name: "u12-lazy",
     description: "A server nothing needs never starts: listing one server's tools leaves the other idle, with no process (LazyConnect)",
     servers: { a: { rules: modern() }, b: { rules: modern() } },

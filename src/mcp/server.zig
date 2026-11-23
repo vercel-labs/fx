@@ -2519,6 +2519,42 @@ test "the words of a refusal are those of the last answer that refused the list,
     try std.testing.expectEqualStrings("the server answered the list with an error", (r.listRefusal() orelse return error.TestExpectedRefusal));
 }
 
+test "a later listing's first invalid cursor only restarts it, and leaves the words of an older refusal" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    var out: catalog.Output = .{};
+    const c = &r.catalog;
+    const more: @FieldType(wire.Response, "body") = .{ .result = .{ .raw = "{\"tools\":[],\"nextCursor\":\"c\"}", .kind = .complete } };
+    const last: @FieldType(wire.Response, "body") = .{ .result = .{ .raw = "{\"tools\":[]}", .kind = .complete } };
+    try c.step(.{ .process_started = .modern }, &out);
+
+    // Listing 1 restarts once, on its first invalid cursor, and ends.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(more), &out);
+    try c.step(try r.pageEvent(failurePage(wire.code.invalid_params)), &out);
+    try std.testing.expectEqual(@as(u1, 1), c.restarts);
+    try c.step(try r.pageEvent(last), &out);
+    try std.testing.expect(!c.refused);
+
+    // Listing 2 is refused, with its words.
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(.{ .result = .{ .raw = "{\"tools\":7}", .kind = .complete } }), &out);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", r.listRefusal() orelse return error.TestExpectedRefusal);
+
+    // Listing 3 has its own count: its first invalid cursor restarts it, and the words are still listing 2's.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(more), &out);
+    const first = try r.pageEvent(failurePage(wire.code.invalid_params));
+    try std.testing.expectEqual(catalog.Event.invalid_cursor, first);
+    try c.step(first, &out);
+    try std.testing.expectEqual(@as(u1, 1), c.restarts);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
 test "an HTTP ending refuses a tool list, unless another flow reads it" {
     // A status that nothing else reads, with no message in the body, is an answer that refuses the list. The number is the status.
     for ([_]u16{ 400, 403, 404, 405, 408, 410, 429, 500, 502, 503, 504, 301 }) |status| {

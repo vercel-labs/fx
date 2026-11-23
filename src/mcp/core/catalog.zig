@@ -141,6 +141,7 @@ pub const Catalog = struct {
     listing: bool = false,
     start_generation: Generation = 0,
     page: u32 = 0,
+    /// Restarts of the running listing after an invalid cursor: 0 when it starts from a need, 1 after its restart.
     restarts: u1 = 0,
     /// The shortest TTL of the running listing's pages so far.
     ttl_min: u32 = std.math.maxInt(u32),
@@ -183,6 +184,8 @@ pub const Catalog = struct {
                 } else {
                     c.listing = true;
                     c.waiting = true;
+                    // Each listing may restart once: the count is the listing's own, as `StartListing` has it.
+                    c.restarts = 0;
                     c.startListing(out);
                 }
             },
@@ -462,6 +465,8 @@ fn apply(c: *Catalog, w: *World, move: Move) !bool {
                     // OneListing: a listing starts only when none runs.
                     try testing.expect(!w.listing);
                     w.restarts = 0;
+                    // The catalog's own count starts at 0 too, whatever the listings before it did.
+                    try testing.expectEqual(@as(u1, 0), c.restarts);
                 } else {
                     // A restart after an invalid cursor, once.
                     try testing.expect(event == .invalid_cursor);
@@ -653,6 +658,35 @@ test "pages stop at the limit; an invalid cursor restarts once" {
     try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
     try testing.expectEqual(Effect{ .publish = true }, out.effects()[0]);
     try testing.expectError(error.NotReady, c.step(.invalid_cursor, &out));
+}
+
+test "a later listing restarts after its own first invalid cursor, as the model's StartListing resets the count" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    const more: Event = .{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } };
+    const last: Event = .{ .page_received = .{ .more = false, .ttl_ms = 9, .now_ms = 0 } };
+    try c.step(.{ .process_started = .modern }, &out);
+    // Listing 1: its first invalid cursor restarts it, and it ends.
+    try c.step(.need, &out);
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{ .discard_pages, .{ .send_page = .first } }, out.effects());
+    try testing.expectEqual(@as(u1, 1), c.restarts);
+    try c.step(last, &out);
+    try testing.expect(out.effects()[0] == .publish);
+    // The list changes and listing 2 starts: its count is its own, so its first invalid cursor restarts it and refuses nothing.
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try testing.expectEqual(@as(u1, 0), c.restarts);
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{ .discard_pages, .{ .send_page = .first } }, out.effects());
+    try testing.expect(!c.refused);
+    // Its second one refuses it, and the older list is served.
+    try c.step(more, &out);
+    try c.step(.invalid_cursor, &out);
+    try testing.expectEqualSlices(Effect, &.{.serve_last}, out.effects());
+    try testing.expect(c.refused);
 }
 
 test "later needs join a running listing; nothing lists before a server is ready" {
