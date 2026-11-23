@@ -28,6 +28,7 @@ pub const Sink = struct {
 pub fn ofResult(
     provider: []const u8,
     model: []const u8,
+    effort: ?[]const u8,
     purpose: types.ModelCallPurpose,
     started_ms: i64,
     settled_ms: i64,
@@ -40,6 +41,7 @@ pub fn ofResult(
         .purpose = purpose,
         .provider = provider,
         .model = model,
+        .effort = checked(effort),
     };
     switch (result.*) {
         .completed => |*completed| {
@@ -65,6 +67,7 @@ pub fn ofResult(
 pub fn ofError(
     provider: []const u8,
     model: []const u8,
+    effort: ?[]const u8,
     purpose: types.ModelCallPurpose,
     started_ms: i64,
     settled_ms: i64,
@@ -78,6 +81,7 @@ pub fn ofError(
         .outcome = if (cancelled) .cancelled else .failed,
         .provider = provider,
         .model = model,
+        .effort = checked(effort),
         .failure = if (cancelled) null else @errorName(err),
     };
 }
@@ -99,7 +103,7 @@ test "a settled request's record keeps its outcome, cost and checked provider id
         .resolved_provider = "bedrock",
         .usage = .{ .input_tokens = 1240, .output_tokens = 56, .cache_read_tokens = 900 },
     } } };
-    const record = ofResult("gateway", "anthropic/claude-opus-4.8", .turn, 1_000, 3_140, &completed, false);
+    const record = ofResult("gateway", "anthropic/claude-opus-4.8", "high", .turn, 1_000, 3_140, &completed, false);
     try std.testing.expectEqual(@as(i64, 3_140), record.at_ms);
     try std.testing.expectEqual(@as(u64, 2_140), record.elapsed_ms);
     try std.testing.expectEqual(types.ModelCallOutcome.completed, record.outcome);
@@ -108,19 +112,21 @@ test "a settled request's record keeps its outcome, cost and checked provider id
     try std.testing.expectEqualStrings("stop", record.finish.?);
     try std.testing.expectEqual(@as(?u64, 1240), record.input_tokens);
     try std.testing.expectEqual(@as(?u64, 56), record.output_tokens);
+    try std.testing.expectEqualStrings("high", record.effort.?);
 
     var failed: agent_stream_provider.Result = .{ .failed = .{ .kind = .rate_limited, .retry_after_seconds = 4 } };
-    const refused = ofResult("codex", "gpt-5.2", .compaction, 5_000, 4_000, &failed, false);
+    const refused = ofResult("codex", "gpt-5.2", "low", .compaction, 5_000, 4_000, &failed, false);
     try std.testing.expectEqual(types.ModelCallOutcome.failed, refused.outcome);
     try std.testing.expectEqualStrings("rate_limited", refused.failure.?);
     try std.testing.expectEqual(@as(?u32, 4), refused.retry_after_s);
     try std.testing.expectEqual(@as(u64, 0), refused.elapsed_ms);
     try std.testing.expectEqual(types.ModelCallPurpose.compaction, refused.purpose);
+    try std.testing.expectEqualStrings("low", refused.effort.?);
 
     // A result that comes back after a stop was asked for is a cancelled
     // call; a failure stays a failure.
-    try std.testing.expectEqual(types.ModelCallOutcome.cancelled, ofResult("gateway", "m", .turn, 0, 0, &completed, true).outcome);
-    try std.testing.expectEqual(types.ModelCallOutcome.failed, ofResult("gateway", "m", .turn, 0, 0, &failed, true).outcome);
+    try std.testing.expectEqual(types.ModelCallOutcome.cancelled, ofResult("gateway", "m", null, .turn, 0, 0, &completed, true).outcome);
+    try std.testing.expectEqual(types.ModelCallOutcome.failed, ofResult("gateway", "m", null, .turn, 0, 0, &failed, true).outcome);
 }
 
 test "a settled request's record leaves out provider text that could forge a line" {
@@ -128,19 +134,32 @@ test "a settled request's record leaves out provider text that could forge a lin
         .generation_id = "gen_\x1b[2Jcleared",
         .resolved_provider = "line\nbreak",
     } } };
-    const record = ofResult("gateway", "m", .turn, 0, 0, &completed, false);
+    const record = ofResult("gateway", "m", "line\nbreak", .turn, 0, 0, &completed, false);
     try std.testing.expect(record.generation_id == null);
     try std.testing.expect(record.served_by == null);
     try std.testing.expect(record.finish == null);
+    try std.testing.expect(record.effort == null);
 }
 
 test "a request that ends in an error is recorded as cancelled or failed" {
-    const stopped = ofError("gateway", "m", .turn, 10, 25, true, error.Canceled);
+    const stopped = ofError("gateway", "m", "medium", .turn, 10, 25, true, error.Canceled);
+    try std.testing.expectEqualStrings("medium", stopped.effort.?);
     try std.testing.expectEqual(types.ModelCallOutcome.cancelled, stopped.outcome);
     try std.testing.expect(stopped.failure == null);
     try std.testing.expectEqual(@as(u64, 15), stopped.elapsed_ms);
-    const broken = ofError("gateway", "m", .compaction, 10, 25, false, error.ConnectionResetByPeer);
+    const broken = ofError("gateway", "m", null, .compaction, 10, 25, false, error.ConnectionResetByPeer);
     try std.testing.expectEqual(types.ModelCallOutcome.failed, broken.outcome);
     try std.testing.expectEqualStrings("ConnectionResetByPeer", broken.failure.?);
     try std.testing.expectEqual(types.ModelCallPurpose.compaction, broken.purpose);
+    try std.testing.expect(broken.effort == null);
+}
+
+test "a saved copy of a call record owns its effort text" {
+    var source = "high".*;
+    var failed: agent_stream_provider.Result = .{ .failed = .{ .kind = .rate_limited } };
+    const record = ofResult("gateway", "m", source[0..], .turn, 0, 0, &failed, false);
+    const copy = try types.dupeModelCallRecord(std.testing.allocator, record);
+    defer types.freeModelCallRecordStrings(std.testing.allocator, copy);
+    @memset(&source, 'x');
+    try std.testing.expectEqualStrings("high", copy.effort.?);
 }

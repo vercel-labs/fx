@@ -12288,7 +12288,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   // The provider's own default limit ran out before any text: reasoning only.
-  const emptyLengthLimitedReply = () => fakeGatewaySse([
+  const emptyLengthLimitedReply = (generationId?: string) => fakeGatewaySse([
     { type: "reasoning-start", id: "spent_reasoning" },
     { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the provider stops" },
     { type: "reasoning-end", id: "spent_reasoning" },
@@ -12296,6 +12296,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       type: "finish",
       finishReason: { unified: "length", raw: "length" },
       usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+      ...(generationId ? { providerMetadata: { gateway: { generationId: generationId } } } : {}),
     },
   ]);
 
@@ -12319,11 +12320,27 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
   ]);
 
+  /** Each saved model call's record, keyed by its gateway generation id. */
+  function savedCallsByGeneration(home: string, sessionId: string) {
+    const calls = new Map<string, { effort?: string | null }>();
+    const lines = logLines(home, sessionId) as Array<{
+      kind: string;
+      type?: string;
+      data?: { generation_id?: string; effort?: string | null };
+    }>;
+    for (const line of lines) {
+      if (line.kind !== "item" || line.type !== "model_call" || !line.data?.generation_id) continue;
+      calls.set(line.data.generation_id, line.data);
+    }
+    return calls;
+  }
+
   async function askWithReplies(
     label: string,
     replies: Array<() => Response>,
     model: Record<string, unknown> = {},
     env: Record<string, string> = {},
+    options: { saved?: boolean; args?: string[] } = {},
   ) {
     const root = createFixtureRoot(label);
     const tracePath = join(root.root, "trace.log");
@@ -12334,17 +12351,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
     try {
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
+        ["ask", "--json", "--auto", ...(options.saved ? [] : ["--no-save"]), ...(options.args ?? []), "Answer briefly."],
         { cwd: root.workspace, env: { ...fixtureEnv(root, gateway, tracePath), ...env }, timeoutMs: 30_000 },
       );
+      const json = parseAskJson(result.stdout);
       return {
         result,
-        json: parseAskJson(result.stdout),
+        json,
         bodies: gateway.requests.map((request) =>
           JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string; prompt: PromptMessage[] }
         ),
         trace: readFileSync(tracePath, "utf8"),
         cutCallRan: existsSync(join(root.workspace, CUT_CALL_SENTINEL)),
+        calls: options.saved
+          ? savedCallsByGeneration(root.home, json.session_id)
+          : new Map<string, { effort?: string | null }>(),
       };
     } finally {
       gateway.stop();
@@ -12432,6 +12453,37 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[1]!.reasoning).toBe("low");
     expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
     expect(trace).toContain("event=length_limited_resend");
+  }, 40_000);
+
+  const EFFORT_GEN_A = "gen_01JC7P5XQ2M8VZ000000000101";
+  const EFFORT_GEN_B = "gen_01JC7P5XQ2M8VZ000000000102";
+
+  test("a resent call logs the effort its request body sent, matched by generation id", async () => {
+    // Explicit high is cut short, and the resend goes to low. Both calls keep
+    // their own effort in the saved log, found by generation id.
+    const { result, json, bodies, calls } = await askWithReplies("effort-logged-resend", [
+      () => emptyLengthLimitedReply(EFFORT_GEN_A),
+      () =>
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "answered at low effort" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+            providerMetadata: { gateway: { generationId: EFFORT_GEN_B } },
+          },
+        ]),
+    ], {
+      context_window: 200_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    }, {}, { saved: true, args: ["--effort", "high"] });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("answered at low effort");
+    expect(bodies.map((body) => body.reasoning)).toEqual(["high", "low"]);
+    expect(calls.get(EFFORT_GEN_A)?.effort).toBe(bodies[0]!.reasoning);
+    expect(calls.get(EFFORT_GEN_B)?.effort).toBe(bodies[1]!.reasoning);
   }, 40_000);
 
   test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {

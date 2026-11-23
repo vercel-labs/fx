@@ -199,6 +199,9 @@ pub fn buildAgentRequest(
     var provider_options = request.provider_options;
     provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
     provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
+    if (request.effort_out) |effort_out| {
+        effort_out.set(vercel_protocol.serializedReasoning(&provider_options));
+    }
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse

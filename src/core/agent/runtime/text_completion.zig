@@ -134,6 +134,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         if (request.model_calls) |sink| sink.record(model_call_record.ofError(
             sink.provider,
             request.model,
+            attempt_evidence.sentEffort(),
             callPurpose(request.purpose),
             started_ms,
             io_mod.milliTimestamp(),
@@ -150,6 +151,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     if (request.model_calls) |sink| sink.record(model_call_record.ofResult(
         sink.provider,
         request.model,
+        attempt_evidence.sentEffort(),
         callPurpose(request.purpose),
         started_ms,
         io_mod.milliTimestamp(),

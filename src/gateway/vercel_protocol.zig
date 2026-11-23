@@ -412,15 +412,22 @@ fn buildGatewayRequestBodyValidated(
         try out.writer.print(",\"maxOutputTokens\":{d}", .{value});
     }
 
-    if (options.reasoning) |*reasoning| {
+    if (serializedReasoning(&options)) |reasoning| {
         try out.writer.writeAll(",\"reasoning\":");
-        try std.json.Stringify.value(reasoning.label(), .{}, &out.writer);
+        try std.json.Stringify.value(reasoning, .{}, &out.writer);
     }
     try writeProviderOptions(&out.writer, options);
 
     try out.writer.writeByte('}');
     if (budget) |active| try active.check();
     return try out.toOwnedSlice();
+}
+
+/// Returns the reasoning effort label serialized into the Gateway body, or null
+/// when none is set. Borrowed from `options`.
+pub fn serializedReasoning(options: *const model_capabilities.ResolvedProviderOptions) ?[]const u8 {
+    if (options.reasoning) |*reasoning| return reasoning.label();
+    return null;
 }
 
 /// Returns a new request body with the provider-visible user agent added.

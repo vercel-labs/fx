@@ -4785,11 +4785,12 @@ fn publishHeldModelCall(deps: *const AgentRuntimeDeps, owned: types.ModelCallRec
 fn settledCallRecord(
     provider: []const u8,
     model: []const u8,
+    effort: ?[]const u8,
     started_ms: i64,
     result: *const runtime_gateway_step.StreamResult,
     cancel_flag: *const std.atomic.Value(bool),
 ) types.ModelCallRecord {
-    return model_call_record.ofResult(provider, model, .turn, started_ms, io_mod.milliTimestamp(), result, cancel_flag.load(.seq_cst));
+    return model_call_record.ofResult(provider, model, effort, .turn, started_ms, io_mod.milliTimestamp(), result, cancel_flag.load(.seq_cst));
 }
 
 /// The turn's model call sink for requests made outside the step loop, such
@@ -5259,8 +5260,10 @@ fn holdImagesToBlocks(
     const projection = try request_image_budget.withhold(arena, request.messages, rounded_cut - cut, tool_text_limit);
     var rounded = request.*;
     rounded.messages = projection.messages;
+    const saved_effort = if (request.effort_out) |out| out.* else null;
     const rebuilt = (try provider.buildRequest(arena, rounded)) orelse return body;
     if (rebuilt.len > limits.max_request_bytes) {
+        if (request.effort_out) |out| out.* = saved_effort.?;
         debug_trace.eventf("images", "request_images_block_skipped", trace_ctx, "cut={d} block_cut={d} request_bytes={d} limit_bytes={d}", .{
             cut,
             rounded_cut,
@@ -8738,6 +8741,8 @@ fn processQueuedPromptLoop(
                 request_data.messages = past_limit.messages;
             }
             var prepared_request_body: ?[]const u8 = null;
+            var prepared_effort: agent_stream_provider.RequestEffort = .{};
+            request_data.effort_out = &prepared_effort;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
             if (try deps.agent_stream_provider.buildRequest(
@@ -8788,6 +8793,7 @@ fn processQueuedPromptLoop(
                 // way: the part compaction cannot shrink.
                 var fixed_request = request_data;
                 fixed_request.messages = &.{};
+                fixed_request.effort_out = null;
                 agent.request_fixed_tokens = if (try deps.agent_stream_provider.buildRequest(overlay_arena, fixed_request)) |fixed_body| fixed: {
                     const measured = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, fixed_body, fixed_request);
                     const fixed = if (applicable_calibration) |calibration| runtime_prompt_context.calibrateProviderRequest(measured, calibration) else measured;
@@ -9028,7 +9034,7 @@ fn processQueuedPromptLoop(
             // entry for its lifetime from then.
             var request_started_ms = gateway_wait_started_ms;
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
-            var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
+            var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{ .effort = prepared_effort };
             var provider_events = ProviderEventContext{
                 .stream = &stream_ctx,
                 .recovery = &request_recovery,
@@ -9080,7 +9086,7 @@ fn processQueuedPromptLoop(
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
                 // A stopped call is noted once its text is out (below).
                 const thrown_at_ms = io_mod.milliTimestamp();
-                if (!cancel_requested) noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, false, err));
+                if (!cancel_requested) noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, model_call_record.ofError(job.provider.label(), gateway_model, gateway_attempt_evidence.sentEffort(), .turn, gateway_wait_started_ms, thrown_at_ms, false, err));
                 const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
@@ -9190,7 +9196,7 @@ fn processQueuedPromptLoop(
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                     // The stopped call's line goes after what text it wrote.
-                    if (cancel_requested) noteModelCall(deps, finalization, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, true, err));
+                    if (cancel_requested) noteModelCall(deps, finalization, model_call_record.ofError(job.provider.label(), gateway_model, gateway_attempt_evidence.sentEffort(), .turn, gateway_wait_started_ms, thrown_at_ms, true, err));
                     if (try append_immediate_steering_after_cancel(
                         deps,
                         arena,
@@ -9282,7 +9288,7 @@ fn processQueuedPromptLoop(
                 return err;
             };
             stream_result_set = true;
-            noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, gateway_wait_started_ms, &stream_result, config.cancel_flag));
+            noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, gateway_attempt_evidence.sentEffort(), gateway_wait_started_ms, &stream_result, config.cancel_flag));
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
@@ -9304,7 +9310,7 @@ fn processQueuedPromptLoop(
                 )) {
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
-                    var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
+                    var replay_evidence: runtime_gateway_step.AttemptEvidence = .{ .effort = prepared_effort };
                     model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.credential.direct.tenant_context = job.gateway_team;
                     model_request.delivery = &replay_delivery;
@@ -9312,7 +9318,7 @@ fn processQueuedPromptLoop(
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
-                    noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, replay_wait_started_ms, &stream_result, config.cancel_flag));
+                    noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, replay_evidence.sentEffort(), replay_wait_started_ms, &stream_result, config.cancel_flag));
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",

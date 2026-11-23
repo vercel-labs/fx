@@ -99,9 +99,10 @@ pub fn buildRequest(
     }
     try writer.writeByte('}');
 
-    if (request.provider_options.reasoning) |effort| {
+    const serialized_effort: ?[]const u8 = if (request.provider_options.reasoning) |*effort| effort.label() else null;
+    if (serialized_effort) |label| {
         try writer.writeAll(",\"reasoning\":{\"effort\":");
-        try std.json.Stringify.value(effort.label(), .{}, writer);
+        try std.json.Stringify.value(label, .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
     // xAI exposes Fast mode as its priority service tier; the subscription
@@ -109,7 +110,9 @@ pub fn buildRequest(
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
-    return out.toOwnedSlice();
+    const body = try out.toOwnedSlice();
+    if (request.effort_out) |effort_out| effort_out.set(serialized_effort);
+    return body;
 }
 
 fn buildRequestForProvider(

@@ -111,8 +111,11 @@ pub fn buildRequest(
     }
     try writer.writeByte('}');
 
-    if (request.provider_options.reasoning) |effort| {
-        const label = if (std.mem.eql(u8, effort.label(), "minimal")) "low" else effort.label();
+    const serialized_effort: ?[]const u8 = if (request.provider_options.reasoning) |*effort|
+        if (std.mem.eql(u8, effort.label(), "minimal")) "low" else effort.label()
+    else
+        null;
+    if (serialized_effort) |label| {
         try writer.writeAll(",\"reasoning\":{\"effort\":");
         try std.json.Stringify.value(label, .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
@@ -120,7 +123,9 @@ pub fn buildRequest(
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
     try writer.writeByte('}');
-    return out.toOwnedSlice();
+    const body = try out.toOwnedSlice();
+    if (request.effort_out) |effort_out| effort_out.set(serialized_effort);
+    return body;
 }
 
 fn buildRequestForProvider(
@@ -466,6 +471,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
+    var effort_out: stream_provider.RequestEffort = .{};
     const body = try buildRequest(std.testing.allocator, .{
         .model = "gpt-5.4",
         .instructions = &instructions,
@@ -473,6 +479,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
         .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
+        .effort_out = &effort_out,
     });
     defer std.testing.allocator.free(body);
 
@@ -484,6 +491,18 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+    try std.testing.expectEqualStrings("high", effort_out.slice().?);
+
+    const mapped = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.4",
+        .messages = messages[0..1],
+        .tool_choice = .none,
+        .provider_options = .{ .reasoning = types.ReasoningEffort.literal("minimal") },
+        .effort_out = &effort_out,
+    });
+    defer std.testing.allocator.free(mapped);
+    try std.testing.expect(std.mem.find(u8, mapped, "\"reasoning\":{\"effort\":\"low\"") != null);
+    try std.testing.expectEqualStrings("low", effort_out.slice().?);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
