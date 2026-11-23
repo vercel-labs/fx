@@ -5211,11 +5211,14 @@ pub fn dupeToolLifecycleEvent(
             const call_id = try alloc.dupe(u8, started.id.call_id);
             errdefer alloc.free(call_id);
             const tool_name = if (started.tool_name) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (tool_name) |name| alloc.free(name);
+            const arguments_json = if (started.arguments_json) |value| try alloc.dupe(u8, value) else null;
             break :blk .{ .provisional = .{
                 .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
                 .presentation_group_id = started.presentation_group_id,
                 .tool_name = tool_name,
                 .activity_kind = started.activity_kind,
+                .arguments_json = arguments_json,
             } };
         },
         .authoritative_started => |started| blk: {
@@ -5293,6 +5296,7 @@ pub fn freeToolLifecycleEvent(
         .provisional => |started| {
             alloc.free(@constCast(started.id.call_id));
             if (started.tool_name) |name| alloc.free(@constCast(name));
+            if (started.arguments_json) |arguments_json| alloc.free(@constCast(arguments_json));
         },
         .authoritative_started => |started| {
             alloc.free(@constCast(started.id.call_id));

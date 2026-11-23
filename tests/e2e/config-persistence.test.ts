@@ -1330,7 +1330,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "Bearer fake-capability-key",
         );
         expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
-          reasoning: "xhigh",
+          reasoning: "max",
           providerOptions: { gateway: { speed: "fast" } },
         });
         expect(JSON.parse(gateway.requests[1]!.body)).not.toHaveProperty("fast");

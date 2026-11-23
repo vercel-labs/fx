@@ -163,7 +163,7 @@ const controls: { name: string; module: string; constants: Record<string, never>
   },
   {
     name: "config edit", module: "ConfigEdit",
-    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
+    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true },
     good: [
       { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none" } } } },
       { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
