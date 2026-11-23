@@ -7454,9 +7454,9 @@ test "ACP client input end gives a pending request no client and refuses new one
     var session: ActiveSessionState = undefined;
     session.client_writer = jsonrpc.Writer.initCallback(&session, forwardToMain);
     try attachOpenerForTest(&session, &state);
+    defer releaseTestSession(&state, &session);
     session.outbound = .{};
     defer session.outbound.pending.deinit(alloc);
-    try attachOpenerForTest(&session, &state);
 
     const request = (try beginOutboundRequest(&session, .elicitation)).?;
     endClientInput(&state);
