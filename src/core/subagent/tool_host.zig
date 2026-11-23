@@ -10051,9 +10051,12 @@ const Plan = struct {
     }
 };
 
-/// The pairs that end in a user's stop are not run: the app calls
-/// `Runtime.userStopped` only while a turn runs, and no turn runs after a stop
-/// or close.
+/// The pairs that end in a user's stop: the two that follow a parent's stop or
+/// close of the same turn are run, since a cancelled turn is still in flight
+/// until it is saved and the user's stop can reach it. The fixture's user stop
+/// calls the worker's drop directly, as the app does once its Esc check has
+/// passed. The two that follow a user's stop or close are not run: the app's Esc
+/// and approval paths skip a turn whose cancel is already requested.
 const table_plans = [_]Plan{
     .{ .first = .parent_stop },
     .{ .first = .parent_close },
@@ -10071,6 +10074,8 @@ const table_plans = [_]Plan{
     .{ .first = .parent_close, .second = .parent_close },
     .{ .first = .user_close, .second = .user_close },
     .{ .first = .user_stop, .second = .user_close },
+    .{ .first = .parent_stop, .second = .user_stop },
+    .{ .first = .parent_close, .second = .user_stop },
 };
 
 const Scenario = enum {
