@@ -1,0 +1,28 @@
+flowchart TD
+  adapter["session_adapter.zig<br/>BlobHost, pieces, usage, cursors"]
+  childStore["session_child_store.zig<br/>child capability, blob handles"]
+  replay["command_replay_store.zig<br/>command output replay"]
+  web["web_fetch_artifacts.zig<br/>downloads"]
+  images["images/image_attachments.zig<br/>image paths"]
+  api["session_manager/api.zig<br/>Manager, Session, blobPath"]
+  sess["session_manager/session.zig<br/>storeBlob, loadFolded, fork, trash"]
+  logm["session_manager/log.zig<br/>frame, CRC32C, scanners, torn cut"]
+  schema["session_manager/schema.zig<br/>header v=1, kinds, bodies"]
+  fold["session_manager/fold.zig<br/>State, set newest-wins, snapshots"]
+  catalog["session_manager/catalog.zig<br/>index.jsonl"]
+  storage["session_manager/storage.zig<br/>files, flock, fsync, rename"]
+
+  adapter --> childStore
+  adapter --> api
+  replay --> childStore
+  web --> childStore
+  images --> api
+  childStore --> api
+  api --> sess
+  api --> catalog
+  sess --> logm
+  sess --> fold
+  sess --> storage
+  logm --> schema
+  fold --> schema
+  catalog --> storage

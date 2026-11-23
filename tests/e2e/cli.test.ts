@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   lstatSync,
@@ -6913,4 +6914,400 @@ describe("cli: completion", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);
+});
+
+describe("cli: session prune, restore, and discard", () => {
+  const PRUNE_ANSWERS = 24;
+
+  type PruneContext = {
+    root: string;
+    workspace: string;
+    fxHome: string;
+    env: Record<string, string | undefined>;
+    gateway: ReturnType<typeof startFakeGateway>;
+  };
+
+  function pruneContext(): PruneContext {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-prune-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const fxHome = join(root, "profile");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const gateway = startFakeGateway(
+      Array.from({ length: PRUNE_ANSWERS }, () => fakeGatewayFinalText("PRUNE_TEST_ANSWER")),
+    );
+    return {
+      root,
+      workspace,
+      fxHome,
+      gateway,
+      env: {
+        HOME: home,
+        FX_HOME: fxHome,
+        AI_GATEWAY_API_KEY: "fx-session-prune-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_SOUND: "0",
+      },
+    };
+  }
+
+  function cleanupPruneContext(ctx: PruneContext): void {
+    ctx.gateway.stop();
+    rmSync(ctx.root, { recursive: true, force: true });
+  }
+
+  function sessionFolder(ctx: PruneContext, id: string): string {
+    return join(ctx.fxHome, "sessions", "v2", id);
+  }
+
+  function logPath(ctx: PruneContext, id: string): string {
+    return join(sessionFolder(ctx, id), "log.jsonl");
+  }
+
+  function keptLogPath(ctx: PruneContext, id: string): string {
+    return join(sessionFolder(ctx, id), "pruned", "log.jsonl");
+  }
+
+  // CRC-32C (Castagnoli), the checksum fx frames each log line with.
+  const CRC32C_TABLE = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0x82f63b78 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+
+  function crc32c(text: string): number {
+    let crc = 0xffffffff;
+    for (const byte of Buffer.from(text, "utf8")) crc = CRC32C_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  test("the checksum matches the CRC-32C check value", () => {
+    expect(crc32c("123456789")).toBe(0xe3069283);
+  });
+
+  // Appends one framed line, as fx frames it: the header, the fields, and the
+  // checksum of every byte before it.
+  function appendLogLine(path: string, kind: string, fields: string): void {
+    const text = readFileSync(path, "utf8");
+    const lastLine = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).at(-1)!;
+    const seq = (JSON.parse(lastLine).seq as number) + 1;
+    const payload = `{"v":1,"seq":${seq},"ts":${Date.now()},"kind":"${kind}"${fields}`;
+    const checksum = crc32c(payload).toString(16).padStart(8, "0");
+    appendFileSync(path, `${payload},"crc":"${checksum}"}\n`);
+  }
+
+  // `set usage` lines in the shape fx wrote before per-reply totals (D92).
+  function appendLegacyUsage(ctx: PruneContext, id: string, count: number): void {
+    for (let i = 0; i < count; i++) {
+      appendLogLine(logPath(ctx, id), "set", ',"key":"usage","value":{"at_ms":1,"snapshot":{}}');
+    }
+  }
+
+  async function askInSession(ctx: PruneContext, resume?: string): Promise<string> {
+    const args = resume === undefined
+      ? ["ask", "--json", "Say something."]
+      : ["ask", "--json", "--resume", resume, "Say more."];
+    const asked = await runFx(args, { cwd: ctx.workspace, env: ctx.env });
+    expect(asked.code).toBe(0);
+    return JSON.parse(asked.stdout).session_id as string;
+  }
+
+  function runSession(ctx: PruneContext, args: string[]) {
+    return runFx(["session", ...args], { cwd: ctx.workspace, env: ctx.env });
+  }
+
+  async function historyOf(ctx: PruneContext, id: string): Promise<unknown[]> {
+    const shown = await runSession(ctx, ["--id", id, "--json"]);
+    expect(shown.code).toBe(0);
+    return JSON.parse(shown.stdout).history;
+  }
+
+  // Holds the session's writer lock, as another fx process with the session
+  // open does, until the returned function runs.
+  async function holdSessionLock(ctx: PruneContext, id: string): Promise<() => Promise<void>> {
+    const holder = Bun.spawn(["flock", "-x", join(sessionFolder(ctx, id), "lock"), "-c", "echo READY; read _"], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const reader = holder.stdout.getReader();
+    const decoder = new TextDecoder();
+    let seen = "";
+    while (!seen.includes("READY")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value);
+    }
+    reader.releaseLock();
+    expect(seen).toContain("READY");
+    return async () => {
+      holder.stdin.end();
+      await holder.exited;
+    };
+  }
+
+  test("a dry run prints the size change and changes nothing", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+      const before = readFileSync(logPath(ctx, id));
+
+      const json = await runSession(ctx, ["prune", id, "--dry-run", "--json"]);
+      expect(json.code).toBe(0);
+      expect(json.stderr).toBe("");
+      const row = JSON.parse(json.stdout);
+      expect(row).toMatchObject({
+        kind: "session_prune",
+        action: "prune",
+        session_id: id,
+        status: "would_prune",
+        file: "log.jsonl",
+        usage_superseded: 1,
+        original_kept: false,
+      });
+      expect(row.bytes_before).toBe(before.length);
+      expect(row.bytes_after).toBeLessThan(row.bytes_before);
+
+      const text = await runSession(ctx, ["prune", id, "--dry-run"]);
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain(`${id}: would prune log.jsonl`);
+      expect(text.stdout).toContain("dry run; nothing changed");
+
+      expect(readFileSync(logPath(ctx, id))).toEqual(before);
+      expect(existsSync(join(sessionFolder(ctx, id), "pruned"))).toBe(false);
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 3);
+
+  test("prune writes the cleaned log, keeps the original, and the session reads the same turns", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+      const original = readFileSync(logPath(ctx, id));
+      const turns = await historyOf(ctx, id);
+
+      const pruned = await runSession(ctx, ["prune", id]);
+      expect(pruned.code).toBe(0);
+      expect(pruned.stdout).toContain(`${id}: pruned log.jsonl`);
+      expect(pruned.stdout).toContain(`original kept at $FX_HOME/sessions/v2/${id}/pruned/log.jsonl`);
+      expect(pruned.stdout).toContain(`fx session prune ${id} --discard-original`);
+      expect(readFileSync(keptLogPath(ctx, id))).toEqual(original);
+      expect(readFileSync(logPath(ctx, id)).length).toBeLessThan(original.length);
+      expect(await historyOf(ctx, id)).toEqual(turns);
+
+      const again = await runSession(ctx, ["prune", id, "--json"]);
+      expect(again.code).toBe(0);
+      expect(JSON.parse(again.stdout)).toMatchObject({ kind: "session_prune", session_id: id, status: "nothing_to_do" });
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 4);
+
+  test("a repeat prune keeps the first original", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+      const first = readFileSync(logPath(ctx, id));
+      expect((await runSession(ctx, ["prune", id])).code).toBe(0);
+
+      appendLegacyUsage(ctx, id, 1);
+      const repeat = await runSession(ctx, ["prune", id, "--json"]);
+      expect(repeat.code).toBe(0);
+      expect(JSON.parse(repeat.stdout)).toMatchObject({ status: "pruned", original_kept: true });
+      expect(readFileSync(keptLogPath(ctx, id))).toEqual(first);
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 4);
+
+  test("restore puts the original back with every turn written since the cleanup", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+      const first = readFileSync(logPath(ctx, id));
+      expect((await runSession(ctx, ["prune", id])).code).toBe(0);
+
+      await askInSession(ctx, id);
+      appendLegacyUsage(ctx, id, 1);
+      expect((await runSession(ctx, ["prune", id])).code).toBe(0);
+      const turns = await historyOf(ctx, id);
+
+      const restored = await runSession(ctx, ["restore", id, "--json"]);
+      expect(restored.code).toBe(0);
+      expect(JSON.parse(restored.stdout)).toMatchObject({
+        kind: "session_restore",
+        action: "restore",
+        session_id: id,
+        status: "restored",
+        file: "log.jsonl",
+      });
+      expect(await historyOf(ctx, id)).toEqual(turns);
+      expect(readFileSync(logPath(ctx, id)).subarray(0, first.length)).toEqual(first);
+      expect(existsSync(join(sessionFolder(ctx, id), "pruned"))).toBe(false);
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 5);
+
+  test("discard deletes the kept original only after a finished cleanup", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+
+      const unpruned = await runSession(ctx, ["prune", id, "--discard-original", "--json"]);
+      expect(unpruned.code).toBe(1);
+      expect(JSON.parse(unpruned.stdout)).toMatchObject({ kind: "session_prune", code: "SessionNotPruned" });
+
+      const pruned = await runSession(ctx, ["prune", id, "--json"]);
+      expect(pruned.code).toBe(0);
+      expect(JSON.parse(pruned.stdout)).toMatchObject({ status: "pruned", original_kept: true });
+      const turns = await historyOf(ctx, id);
+      const dry = await runSession(ctx, ["prune", id, "--discard-original", "--dry-run", "--json"]);
+      expect(dry.code).toBe(0);
+      const planned = JSON.parse(dry.stdout);
+      expect(planned).toMatchObject({ status: "would_discard", session_id: id });
+      expect(planned.freed_bytes).toBeGreaterThan(0);
+      expect(existsSync(keptLogPath(ctx, id))).toBe(true);
+
+      const discarded = await runSession(ctx, ["prune", id, "--discard-original", "--json"]);
+      expect(discarded.code).toBe(0);
+      expect(JSON.parse(discarded.stdout)).toMatchObject({
+        kind: "session_prune",
+        action: "discard_original",
+        status: "discarded",
+        session_id: id,
+        freed_bytes: planned.freed_bytes,
+      });
+      expect(existsSync(join(sessionFolder(ctx, id), "pruned"))).toBe(false);
+      expect(await historyOf(ctx, id)).toEqual(turns);
+
+      const afterDiscard = await runSession(ctx, ["restore", id, "--json"]);
+      expect(afterDiscard.code).toBe(1);
+      expect(JSON.parse(afterDiscard.stdout)).toMatchObject({ kind: "session_restore", code: "SessionNotPruned" });
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 4);
+
+  test("a held session lock refuses prune, restore, and discard, and changes nothing", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+      appendLegacyUsage(ctx, id, 2);
+      expect((await runSession(ctx, ["prune", id])).code).toBe(0);
+      appendLegacyUsage(ctx, id, 1);
+      const before = readFileSync(logPath(ctx, id));
+
+      const release = await holdSessionLock(ctx, id);
+      try {
+        const refusals: [string[], string][] = [
+          [["prune", id, "--json"], "session_prune"],
+          [["restore", id, "--json"], "session_restore"],
+          [["prune", id, "--discard-original", "--json"], "session_prune"],
+        ];
+        for (const [args, kind] of refusals) {
+          const busy = await runSession(ctx, args);
+          expect(busy.code).toBe(1);
+          expect(JSON.parse(busy.stdout)).toMatchObject({ kind, code: "SessionBusy" });
+        }
+        expect(readFileSync(logPath(ctx, id))).toEqual(before);
+        expect(existsSync(keptLogPath(ctx, id))).toBe(true);
+      } finally {
+        await release();
+      }
+
+      expect((await runSession(ctx, ["prune", id])).code).toBe(0);
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 4);
+
+  test("a bad command line exits 2, and a JSON error keeps its shape", async () => {
+    const ctx = pruneContext();
+    try {
+      const id = await askInSession(ctx);
+
+      const none = await runSession(ctx, ["prune"]);
+      expect(none.code).toBe(2);
+      expect(none.stderr).toContain("session prune");
+
+      const both = await runSession(ctx, ["prune", id, "--all"]);
+      expect(both.code).toBe(2);
+
+      const bogus = await runSession(ctx, ["prune", id, "--bogus", "--json"]);
+      expect(bogus.code).toBe(2);
+      expect(bogus.stderr).toBe("");
+      expect(JSON.parse(bogus.stdout)).toMatchObject({ kind: "session_prune", code: "InvalidSessionPruneArgs" });
+      expect(JSON.parse(bogus.stdout).error).toContain("--bogus");
+
+      const restoreNoId = await runSession(ctx, ["restore", "--json"]);
+      expect(restoreNoId.code).toBe(2);
+      expect(JSON.parse(restoreNoId.stdout)).toMatchObject({ kind: "session_restore", code: "InvalidSessionRestoreArgs" });
+
+      const missing = await runSession(ctx, ["prune", "no-such-session", "--json"]);
+      expect(missing.code).toBe(1);
+      expect(JSON.parse(missing.stdout)).toMatchObject({ kind: "session_prune", code: "SessionNotFound" });
+
+      const help = await runSession(ctx, ["--help"]);
+      expect(help.code).toBe(0);
+      expect(help.stdout).toContain("prune <id>");
+      expect(help.stdout).toContain("restore <id>");
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 3);
+
+  test("--all reports every session and exits 1 when one is busy or failed", async () => {
+    const ctx = pruneContext();
+    try {
+      const prunable = await askInSession(ctx);
+      appendLegacyUsage(ctx, prunable, 2);
+      const done = await askInSession(ctx);
+      appendLegacyUsage(ctx, done, 2);
+      expect((await runSession(ctx, ["prune", done])).code).toBe(0);
+      const busy = await askInSession(ctx);
+      appendLegacyUsage(ctx, busy, 2);
+      const damaged = await askInSession(ctx);
+      appendLegacyUsage(ctx, damaged, 2);
+      const damagedLog = readFileSync(logPath(ctx, damaged), "utf8");
+      writeFileSync(logPath(ctx, damaged), damagedLog.replace('"kind":"turn_started"', '"kind":"turn_startXd"'));
+
+      const release = await holdSessionLock(ctx, busy);
+      try {
+        const all = await runSession(ctx, ["prune", "--all", "--json"]);
+        expect(all.code).toBe(1);
+        const report = JSON.parse(all.stdout);
+        expect(report).toMatchObject({ kind: "session_prune", all: true });
+        const byId = Object.fromEntries(report.sessions.map((row: { session_id: string }) => [row.session_id, row]));
+        expect(Object.keys(byId).sort()).toEqual([prunable, done, busy, damaged].sort());
+        expect(byId[prunable].status).toBe("pruned");
+        expect(byId[done].status).toBe("nothing_to_do");
+        expect(byId[busy]).toMatchObject({ status: "busy", code: "SessionBusy" });
+        expect(byId[damaged]).toMatchObject({ status: "failed", code: "InvalidSessionFormat" });
+
+        const text = await runSession(ctx, ["prune", "--all"]);
+        expect(text.code).toBe(1);
+        const lines = text.stdout.trim().split("\n");
+        expect(lines).toHaveLength(4);
+        expect(lines.some((line) => line.startsWith(`${busy}: busy`))).toBe(true);
+        expect(lines.some((line) => line.startsWith(`${damaged}: failed`))).toBe(true);
+      } finally {
+        await release();
+      }
+    } finally {
+      cleanupPruneContext(ctx);
+    }
+  }, TIMEOUT * 6);
 });

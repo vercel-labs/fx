@@ -16,6 +16,8 @@ const session_display_metadata = @import("../session/session_display_metadata.zi
 const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
+const session_layout = @import("../session/session_layout.zig");
+const session_prune = @import("../session/session_prune.zig");
 const session_list_text = @import("session_list_text.zig");
 const usage = @import("../../usage/usage.zig");
 const local_time = @import("../shared/local_time.zig");
@@ -1908,6 +1910,171 @@ pub const SessionRecoverySnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
+
+/// What `fx session prune`, `fx session prune --discard-original`, and
+/// `fx session restore` did: one row for a session, or one per session with
+/// `--all`. A single row is the whole JSON object; `--all` lists the rows and
+/// counts them by status.
+pub const SessionActionSnapshot = struct {
+    rows: []const session_prune.Row,
+    all: bool = false,
+
+    pub fn render(self: SessionActionSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: SessionActionSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        for (self.rows) |row| {
+            try writeActionText(&out.writer, row);
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: SessionActionSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (!self.all) {
+            std.debug.assert(self.rows.len == 1);
+            try writeActionJson(&out.writer, self.rows[0], true);
+            return try out.toOwnedSlice();
+        }
+        try out.writer.writeAll("{\"kind\":\"session_prune\",\"all\":true,\"sessions\":[");
+        for (self.rows, 0..) |row, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try writeActionJson(&out.writer, row, false);
+        }
+        try out.writer.writeAll("],\"counts\":{");
+        var first = true;
+        inline for (@typeInfo(session_prune.Status).@"enum".field_names) |name| {
+            const count = countStatus(self.rows, @field(session_prune.Status, name));
+            if (count > 0) {
+                if (!first) try out.writer.writeByte(',');
+                first = false;
+                try out.writer.print("\"{s}\":{d}", .{ name, count });
+            }
+        }
+        try out.writer.writeAll("}}");
+        return try out.toOwnedSlice();
+    }
+};
+
+fn countStatus(rows: []const session_prune.Row, status: session_prune.Status) usize {
+    var count: usize = 0;
+    for (rows) |row| {
+        if (row.status == status) count += 1;
+    }
+    return count;
+}
+
+fn actionKind(action: session_prune.Action) []const u8 {
+    return switch (action) {
+        .prune, .discard_original => "session_prune",
+        .restore => "session_restore",
+    };
+}
+
+fn writeActionJson(w: *std.Io.Writer, row: session_prune.Row, with_kind: bool) !void {
+    try w.writeByte('{');
+    if (with_kind) {
+        try w.writeAll("\"kind\":");
+        try std.json.Stringify.value(actionKind(row.action), .{}, w);
+        try w.writeByte(',');
+    }
+    try w.writeAll("\"action\":");
+    try std.json.Stringify.value(@tagName(row.action), .{}, w);
+    try w.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(row.session_id, .{}, w);
+    try w.writeAll(",\"status\":");
+    try std.json.Stringify.value(@tagName(row.status), .{}, w);
+    if (row.action != .discard_original) try w.writeAll(",\"file\":\"log.jsonl\"");
+    if (row.bytes_before) |bytes| try w.print(",\"bytes_before\":{d}", .{bytes});
+    if (row.bytes_after) |bytes| try w.print(",\"bytes_after\":{d}", .{bytes});
+    if (row.action == .prune) {
+        try w.print(",\"usage_superseded\":{d},\"snapshots_superseded\":{d}", .{ row.usage_superseded, row.snapshots_superseded });
+    }
+    if (row.freed_bytes) |bytes| try w.print(",\"freed_bytes\":{d}", .{bytes});
+    if (row.action != .restore) try w.print(",\"original_kept\":{}", .{row.original_kept});
+    if (row.original_path) |path| {
+        try w.writeAll(",\"original_path\":");
+        try std.json.Stringify.value(path, .{}, w);
+    }
+    if (row.failure) |failure| {
+        try w.writeAll(",\"error\":");
+        try std.json.Stringify.value(row.message orelse @errorName(failure), .{}, w);
+        try w.writeAll(",\"code\":");
+        try std.json.Stringify.value(@errorName(failure), .{}, w);
+    }
+    try w.writeByte('}');
+}
+
+fn writeActionText(w: *std.Io.Writer, row: session_prune.Row) !void {
+    try w.print("{s}: ", .{row.session_id});
+    switch (row.status) {
+        .pruned => {
+            try w.writeAll("pruned log.jsonl ");
+            try writeSizeChange(w, row);
+            try w.writeAll("; original kept at ");
+            try writeDisplayKeptPath(w, row.session_id);
+            try w.print(" (fx session prune {s} --discard-original deletes it)", .{row.session_id});
+        },
+        .nothing_to_do => try w.writeAll("nothing to prune"),
+        .would_prune => {
+            try w.writeAll("would prune log.jsonl ");
+            try writeSizeChange(w, row);
+            try w.writeAll(" (dry run; nothing changed)");
+        },
+        .discarded => {
+            try w.writeAll("discarded the kept original, freeing ");
+            try writeSize(w, row.freed_bytes orelse 0);
+        },
+        .would_discard => {
+            try w.writeAll("would discard the kept original, freeing ");
+            try writeSize(w, row.freed_bytes orelse 0);
+            try w.writeAll(" (dry run; nothing changed)");
+        },
+        .nothing_to_discard => try w.writeAll("no kept original to discard"),
+        .restored => {
+            try w.writeAll("restored log.jsonl ");
+            try writeSizeChange(w, row);
+            try w.writeAll("; the original is back, with every turn written since the cleanup");
+        },
+        .busy => try w.print("busy: {s}", .{row.message orelse ""}),
+        .failed => try w.print("failed: {s}", .{row.message orelse ""}),
+    }
+}
+
+fn writeSizeChange(w: *std.Io.Writer, row: session_prune.Row) !void {
+    try writeSize(w, row.bytes_before orelse 0);
+    try w.writeAll(" -> ");
+    try writeSize(w, row.bytes_after orelse 0);
+}
+
+/// A byte count for a person: bytes, KiB, or MiB with one decimal.
+fn writeSize(w: *std.Io.Writer, bytes: u64) !void {
+    if (bytes < 1024) return w.print("{d} B", .{bytes});
+    const kib = @as(f64, @floatFromInt(bytes)) / 1024.0;
+    if (bytes < 1024 * 1024) return w.print("{d:.1} KiB", .{kib});
+    return w.print("{d:.1} MiB", .{kib / 1024.0});
+}
+
+/// The kept original's path as fx names it in a message: `$FX_HOME` or `~/.fx`,
+/// then the session folder.
+fn writeDisplayKeptPath(w: *std.Io.Writer, id: []const u8) !void {
+    try w.print("{s}/{s}/{s}/{s}/{s}/{s}", .{
+        profile_paths.displayRoot(),
+        profile_paths.sessions_dir_name,
+        session_layout.sessions_v2_dir,
+        id,
+        session_prune.kept_dir_name,
+        session_prune.log_name,
+    });
+}
 
 /// What `fx sessions convert` did (D61): counts, then one line per session
 /// it skipped.
@@ -4672,4 +4839,93 @@ test "slack text reads the access expiry in the local zone" {
     const unknown_text = try snapshot.render(alloc, .text);
     defer alloc.free(unknown_text);
     try std.testing.expect(std.mem.find(u8, unknown_text, "Access expiration time is unavailable.\n") != null);
+}
+
+test "a session prune row renders as one text line that names the file, the sizes, and the kept original" {
+    const alloc = std.testing.allocator;
+    var row: session_prune.Row = .{
+        .action = .prune,
+        .session_id = try alloc.dupe(u8, "abc123"),
+        .status = .pruned,
+        .bytes_before = 1048576,
+        .bytes_after = 524288,
+        .usage_superseded = 2,
+        .original_kept = true,
+        .original_path = try alloc.dupe(u8, "/p/abc123/pruned/log.jsonl"),
+    };
+    defer row.deinit(alloc);
+    const rows = [_]session_prune.Row{row};
+    const text = try (SessionActionSnapshot{ .rows = &rows }).renderText(alloc);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "abc123: pruned log.jsonl 1.0 MiB -> 512.0 KiB; original kept at "));
+    try std.testing.expect(std.mem.find(u8, text, "pruned/log.jsonl (fx session prune abc123 --discard-original") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "a session action row renders as JSON with its kind, and --all lists rows with counts" {
+    const alloc = std.testing.allocator;
+    var pruned: session_prune.Row = .{
+        .action = .prune,
+        .session_id = try alloc.dupe(u8, "abc123"),
+        .status = .pruned,
+        .bytes_before = 1048576,
+        .bytes_after = 524288,
+        .usage_superseded = 2,
+        .original_kept = true,
+        .original_path = try alloc.dupe(u8, "/p/abc123/pruned/log.jsonl"),
+    };
+    defer pruned.deinit(alloc);
+    var busy: session_prune.Row = .{
+        .action = .prune,
+        .session_id = try alloc.dupe(u8, "def456"),
+        .status = .busy,
+        .failure = error.SessionBusy,
+        .message = "session is busy or the filesystem cannot provide the required lock",
+    };
+    defer busy.deinit(alloc);
+
+    const single = [_]session_prune.Row{pruned};
+    const one = try (SessionActionSnapshot{ .rows = &single }).renderJson(alloc);
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_prune\",\"action\":\"prune\",\"session_id\":\"abc123\",\"status\":\"pruned\"," ++
+            "\"file\":\"log.jsonl\",\"bytes_before\":1048576,\"bytes_after\":524288,\"usage_superseded\":2," ++
+            "\"snapshots_superseded\":0,\"original_kept\":true,\"original_path\":\"/p/abc123/pruned/log.jsonl\"}",
+        one,
+    );
+
+    const many = [_]session_prune.Row{ pruned, busy };
+    const list = try (SessionActionSnapshot{ .rows = &many, .all = true }).renderJson(alloc);
+    defer alloc.free(list);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_prune\",\"all\":true,\"sessions\":[" ++
+            "{\"action\":\"prune\",\"session_id\":\"abc123\",\"status\":\"pruned\",\"file\":\"log.jsonl\"," ++
+            "\"bytes_before\":1048576,\"bytes_after\":524288,\"usage_superseded\":2,\"snapshots_superseded\":0," ++
+            "\"original_kept\":true,\"original_path\":\"/p/abc123/pruned/log.jsonl\"}," ++
+            "{\"action\":\"prune\",\"session_id\":\"def456\",\"status\":\"busy\",\"file\":\"log.jsonl\"," ++
+            "\"usage_superseded\":0,\"snapshots_superseded\":0,\"original_kept\":false," ++
+            "\"error\":\"session is busy or the filesystem cannot provide the required lock\",\"code\":\"SessionBusy\"}" ++
+            "],\"counts\":{\"pruned\":1,\"busy\":1}}",
+        list,
+    );
+}
+
+test "a restore row renders as JSON with the session_restore kind" {
+    const alloc = std.testing.allocator;
+    var row: session_prune.Row = .{
+        .action = .restore,
+        .session_id = try alloc.dupe(u8, "abc123"),
+        .status = .restored,
+        .bytes_before = 524288,
+        .bytes_after = 1048576,
+    };
+    defer row.deinit(alloc);
+    const rows = [_]session_prune.Row{row};
+    const json = try (SessionActionSnapshot{ .rows = &rows }).renderJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_restore\",\"action\":\"restore\",\"session_id\":\"abc123\",\"status\":\"restored\"," ++
+            "\"file\":\"log.jsonl\",\"bytes_before\":524288,\"bytes_after\":1048576}",
+        json,
+    );
 }

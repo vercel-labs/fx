@@ -51,6 +51,7 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const session_prune = @import("../session/session_prune.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -2076,6 +2077,22 @@ fn runNonInteractiveWithDeps(
                 defer recovery.deinit(alloc);
                 return runSessionRecovery(alloc, deps, recovery);
             }
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "prune")) {
+                var prune = parseSessionPruneArgs(alloc, rest[1..]) catch |err| {
+                    try writeSessionSubcommandUsageError(alloc, cfg.command_catalog, deps, "prune", "session_prune", &builtin_commands.session_prune_options, err, rest[1..]);
+                    return usage_failure;
+                };
+                defer prune.deinit(alloc);
+                return runSessionPrune(alloc, deps, prune);
+            }
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "restore")) {
+                var restore = parseSessionRestoreArgs(alloc, rest[1..]) catch |err| {
+                    try writeSessionSubcommandUsageError(alloc, cfg.command_catalog, deps, "restore", "session_restore", &builtin_commands.session_restore_options, err, rest[1..]);
+                    return usage_failure;
+                };
+                defer restore.deinit(alloc);
+                return runSessionRestore(alloc, deps, restore);
+            }
 
             var opts = parseSessionDetailArgs(alloc, rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest);
@@ -3063,6 +3080,11 @@ fn writeFlagFailure(alloc: Allocator, deps: RunDeps, kind: TopLevelKind, args: a
 /// Null when the flags are fine. The caller frees the result.
 fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
     const docs = parsedOptions(kind) orelse return null;
+    return flagProblemIn(alloc, kind, docs, args);
+}
+
+/// `flagProblem` for the options `docs` lists, for a subcommand that takes its own.
+fn flagProblemIn(alloc: Allocator, kind: TopLevelKind, docs: []const command_specs.OptionDoc, args: anytype) !?[]u8 {
     // `fx session` and `fx config` read operands that may start with a dash,
     // such as an ID or `-5`; report what their parsers hit.
     const parser: cli_flags.Parser = switch (kind) {
@@ -3738,6 +3760,132 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
     return writeSessionRecovery(alloc, deps, result, recovery.format);
 }
 
+/// `fx session prune`, `fx session prune --discard-original`, and their dry
+/// runs: one session, or every root session with `--all`.
+fn runSessionPrune(alloc: Allocator, deps: RunDeps, opts: SessionPruneOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "session_prune", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    if (opts.all) return runPruneEvery(alloc, deps, &store, opts);
+
+    var row = try sessionPruneRow(alloc, &store, opts.target.?, opts.dry_run, opts.discard_original, false);
+    defer row.deinit(alloc);
+    if (row.failure) |failure| return writeSessionActionFailure(alloc, deps, "session_prune", failure, opts.format);
+    const single = [_]session_prune.Row{row};
+    const text = try (output_contracts.SessionActionSnapshot{ .rows = &single }).render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return .handled_success;
+}
+
+fn sessionPruneRow(
+    alloc: Allocator,
+    store: *session_adapter.Store,
+    id: []const u8,
+    dry_run: bool,
+    discard_original: bool,
+    many: bool,
+) !session_prune.Row {
+    if (discard_original) return session_prune.discardOriginal(store, alloc, id, dry_run, many);
+    return session_prune.prune(store, alloc, id, dry_run);
+}
+
+/// One row per root session, newest first. Exit 1 when any session was busy
+/// or failed; the rows still show every session.
+fn runPruneEvery(alloc: Allocator, deps: RunDeps, store: *session_adapter.Store, opts: SessionPruneOptions) !RunResult {
+    const ids = try session_prune.rootIds(store, alloc);
+    defer session_prune.freeIds(alloc, ids);
+    var rows: std.ArrayList(session_prune.Row) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit(alloc);
+    }
+    var clean = true;
+    for (ids) |id| {
+        var row = try sessionPruneRow(alloc, store, id, opts.dry_run, opts.discard_original, true);
+        errdefer row.deinit(alloc);
+        if (row.failure) |failure| row.message = commandFailureMessage(failure);
+        if (row.status == .busy or row.status == .failed) clean = false;
+        try rows.append(alloc, row);
+    }
+    const text = try (output_contracts.SessionActionSnapshot{ .rows = rows.items, .all = true }).render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return if (clean) .handled_success else .handled_failure;
+}
+
+/// `fx session restore <id>`: the kept original back as the log, with every
+/// turn written since the cleanup.
+fn runSessionRestore(alloc: Allocator, deps: RunDeps, opts: SessionRestoreOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "session_restore", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    var row = try session_prune.restore(&store, alloc, opts.session_id);
+    defer row.deinit(alloc);
+    if (row.failure) |failure| return writeSessionActionFailure(alloc, deps, "session_restore", failure, opts.format);
+    const single = [_]session_prune.Row{row};
+    const text = try (output_contracts.SessionActionSnapshot{ .rows = &single }).render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return .handled_success;
+}
+
+/// A single session's failure: JSON in the shared shape, or one stderr line.
+fn writeSessionActionFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    kind: []const u8,
+    failure: session_adapter.CommandError,
+    format: output_contracts.OutputFormat,
+) !RunResult {
+    const message = commandFailureMessage(failure) orelse @errorName(failure);
+    if (format == .json) {
+        try writeJsonCommandFailure(alloc, deps, kind, failure, message);
+    } else {
+        const line = try alloc.print("fx session: {s}\n", .{message});
+        defer alloc.free(line);
+        try writeStderr(deps, line);
+    }
+    return .handled_failure;
+}
+
+/// A usage error in a `fx session` subcommand. The subcommand's own flags
+/// decide what is wrong, not the group's.
+fn writeSessionSubcommandUsageError(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    subcommand: []const u8,
+    output_kind: []const u8,
+    docs: []const command_specs.OptionDoc,
+    err: anyerror,
+    args: anytype,
+) !void {
+    if (argsContainJson(args)) {
+        if (try flagProblemIn(alloc, .session, docs, args)) |problem| {
+            defer alloc.free(problem);
+            return writeJsonCommandFailure(alloc, deps, output_kind, err, problem);
+        }
+        try writeCommandFailure(alloc, deps, output_kind, err, .json);
+        return;
+    }
+    if (try flagProblemIn(alloc, .session, docs, args)) |problem| {
+        defer alloc.free(problem);
+        const line = try alloc.print("fx session {s}: {s}\n", .{ subcommand, problem });
+        defer alloc.free(line);
+        try writeStderr(deps, line);
+    } else if (commandFailureMessage(err)) |message| {
+        const line = try alloc.print("fx session {s}: {s}\n", .{ subcommand, message });
+        defer alloc.free(line);
+        try writeStderr(deps, line);
+    }
+    try writeTopLevelUsage(command_catalog, deps, .session);
+}
+
 fn writeLookupFailure(
     alloc: Allocator,
     deps: RunDeps,
@@ -3873,6 +4021,8 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidConfigArgs,
         error.InvalidSlackArguments,
         => "invalid arguments",
+        error.InvalidSessionPruneArgs => "give a session id or --all, and only one of them",
+        error.InvalidSessionRestoreArgs => "give one session id",
         error.UnknownConfigSetting => "unknown setting",
         error.WorkspaceConfigWrite => workspace_write_message,
         else => null,
@@ -3890,6 +4040,8 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
         error.SessionBusy => "session is busy or the filesystem cannot provide the required lock",
+        error.SessionNotPruned => "no finished cleanup is kept for this session; run fx session prune <id> first",
+        error.SessionReplayMismatch => "the cleaned log did not match the original, so nothing was changed",
         error.SessionPathUnsafe,
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
@@ -5038,6 +5190,83 @@ fn parseSessionDetailArgs(
     else
         .{ .id = try alloc.dupe(u8, target) };
     return options;
+}
+
+const SessionPruneFlag = enum { all, dry_run, discard_original, json };
+const session_prune_flag_ids = cli_flags.idTable(SessionPruneFlag, &builtin_commands.session_prune_options);
+const SessionRestoreFlag = enum { json };
+const session_restore_flag_ids = cli_flags.idTable(SessionRestoreFlag, &builtin_commands.session_restore_options);
+
+const SessionPruneOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    /// The session to act on; null with `--all`.
+    target: ?[]u8 = null,
+    all: bool = false,
+    dry_run: bool = false,
+    discard_original: bool = false,
+
+    fn deinit(self: *SessionPruneOptions, alloc: Allocator) void {
+        if (self.target) |target| alloc.free(target);
+        self.* = undefined;
+    }
+};
+
+const SessionRestoreOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    session_id: []u8,
+
+    fn deinit(self: *SessionRestoreOptions, alloc: Allocator) void {
+        alloc.free(self.session_id);
+        self.* = undefined;
+    }
+};
+
+/// `fx session prune <id>` or `fx session prune --all`, with its flags.
+fn parseSessionPruneArgs(alloc: Allocator, args: []const [:0]const u8) !SessionPruneOptions {
+    var parsed: SessionPruneOptions = .{};
+    errdefer parsed.deinit(alloc);
+    var positional: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .initDashOperands(&builtin_commands.session_prune_options, args);
+    while (parser.next() catch return error.InvalidSessionPruneArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (positional != null) return error.InvalidSessionPruneArgs;
+            positional = arg;
+        },
+        .option => |match| switch (session_prune_flag_ids[match.index].?) {
+            .all => parsed.all = true,
+            .dry_run => parsed.dry_run = true,
+            .discard_original => parsed.discard_original = true,
+            .json => parsed.format = .json,
+        },
+    };
+    if (parsed.all and positional != null) return error.InvalidSessionPruneArgs;
+    if (!parsed.all and positional == null) return error.InvalidSessionPruneArgs;
+    if (positional) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidSessionPruneArgs;
+        parsed.target = try alloc.dupe(u8, trimmed);
+    }
+    return parsed;
+}
+
+/// `fx session restore <id>`, with `--json`.
+fn parseSessionRestoreArgs(alloc: Allocator, args: []const [:0]const u8) !SessionRestoreOptions {
+    var format: output_contracts.OutputFormat = .text;
+    var positional: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .initDashOperands(&builtin_commands.session_restore_options, args);
+    while (parser.next() catch return error.InvalidSessionRestoreArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (positional != null) return error.InvalidSessionRestoreArgs;
+            positional = arg;
+        },
+        .option => |match| switch (session_restore_flag_ids[match.index].?) {
+            .json => format = .json,
+        },
+    };
+    const raw = positional orelse return error.InvalidSessionRestoreArgs;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidSessionRestoreArgs;
+    return .{ .format = format, .session_id = try alloc.dupe(u8, trimmed) };
 }
 
 fn parseSessionRecoveryArgs(
@@ -7747,4 +7976,56 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "session prune takes one session id or --all, with its own flags, and refuses both or neither" {
+    const alloc = std.testing.allocator;
+    {
+        const args = [_][:0]const u8{ "abc123", "--dry-run", "--json" };
+        var parsed = try parseSessionPruneArgs(alloc, &args);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqualStrings("abc123", parsed.target.?);
+        try std.testing.expect(parsed.dry_run);
+        try std.testing.expect(!parsed.all);
+        try std.testing.expectEqual(output_contracts.OutputFormat.json, parsed.format);
+    }
+    {
+        const args = [_][:0]const u8{ "--all", "--discard-original" };
+        var parsed = try parseSessionPruneArgs(alloc, &args);
+        defer parsed.deinit(alloc);
+        try std.testing.expect(parsed.all);
+        try std.testing.expect(parsed.discard_original);
+        try std.testing.expect(parsed.target == null);
+    }
+    {
+        const args = [_][:0]const u8{ "abc123", "--all" };
+        try std.testing.expectError(error.InvalidSessionPruneArgs, parseSessionPruneArgs(alloc, &args));
+    }
+    {
+        const args = [_][:0]const u8{};
+        try std.testing.expectError(error.InvalidSessionPruneArgs, parseSessionPruneArgs(alloc, &args));
+    }
+    {
+        const args = [_][:0]const u8{ "abc123", "--bogus" };
+        try std.testing.expectError(error.InvalidSessionPruneArgs, parseSessionPruneArgs(alloc, &args));
+    }
+}
+
+test "session restore takes one session id and --json" {
+    const alloc = std.testing.allocator;
+    {
+        const args = [_][:0]const u8{ "abc123", "--json" };
+        var parsed = try parseSessionRestoreArgs(alloc, &args);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqualStrings("abc123", parsed.session_id);
+        try std.testing.expectEqual(output_contracts.OutputFormat.json, parsed.format);
+    }
+    {
+        const args = [_][:0]const u8{"--json"};
+        try std.testing.expectError(error.InvalidSessionRestoreArgs, parseSessionRestoreArgs(alloc, &args));
+    }
+    {
+        const args = [_][:0]const u8{ "abc123", "--dry-run" };
+        try std.testing.expectError(error.InvalidSessionRestoreArgs, parseSessionRestoreArgs(alloc, &args));
+    }
 }

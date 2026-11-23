@@ -105,6 +105,16 @@ const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
     .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
+    .{
+        .usage = "prune <id>|--all",
+        .description = "Remove superseded lines from a saved session's log; the original is kept",
+        .options = &session_prune_options,
+    },
+    .{
+        .usage = "restore <id>",
+        .description = "Put the kept original back as the log, with every turn written since the cleanup",
+        .options = &session_restore_options,
+    },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
@@ -112,6 +122,17 @@ pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
     json_option,
 };
+
+/// `fx session prune`: one session or every one, and its dry run or the
+/// deletion of the kept original.
+pub const session_prune_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--all", .description = "Prune every saved session, across workspaces" },
+    .{ .flag = "--dry-run", .description = "Count what would change and change nothing" },
+    .{ .flag = "--discard-original", .description = "Delete a finished cleanup's kept original; prunes nothing" },
+    json_option,
+};
+
+pub const session_restore_options = [_]command_specs.OptionDoc{json_option};
 
 pub const acp_options = agentRunOptions("sessions this server starts", .without_provider_order) ++ [_]command_specs.OptionDoc{
     .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
@@ -373,7 +394,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json] | session prune <id>|--all [--dry-run] [--discard-original] [--json] | session restore <id> [--json]",
         .summary = "Inspect, resume, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
@@ -505,6 +526,8 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
+        .{ .usage = "session prune <id>|--all", .summary = "Remove superseded lines from a saved session's log" },
+        .{ .usage = "session restore <id>", .summary = "Put a pruned session's original back" },
     } },
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok] [--api-key]", .summary = "Sign in to a model provider" },
