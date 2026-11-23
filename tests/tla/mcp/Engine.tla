@@ -17,9 +17,11 @@
 \* never reaches a server (PermissionBeforeCall). A call to a ready server
 \* goes out at once; one to any other server waits, goes out the moment its
 \* server is ready, and fails with the first start that fails while it waits
-\* (WaitsForOneStart). A call in flight ends
-\* with its server's answer, or as lost when its process dies. The host may
-\* reconnect or disconnect a server at most MaxHost times in all. The ghosts
+\* (WaitsForOneStart). A call in flight ends with its server's answer, as
+\* lost when its process dies, or as lost while the link stays up. After
+\* LostLimit lost calls in a row with none in flight, the engine drops the
+\* link, so the next call starts a new one. The host may reconnect or
+\* disconnect a server at most MaxHost times in all. The ghosts
 \* record what the invariants need: whether the host allowed a call, whether
 \* something needed the server (or its own failure) when it started, whether
 \* it stayed up since it last started, whether the host dropped it since it
@@ -28,23 +30,25 @@
 \* server gave up, or a disconnect, which refuses it too.
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost
+CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost, LostLimit
 
-ASSUME MaxAttempts \in Nat \ {0} /\ MaxHost \in Nat /\ \A c \in Calls: Owner(c) \in Servers
+ASSUME MaxAttempts \in Nat \ {0} /\ MaxHost \in Nat /\ LostLimit \in Nat \ {0} /\ \A c \in Calls: Owner(c) \in Servers
 
 Phases == {"idle", "connecting", "ready", "backoff", "failed"}
 CallStates == {"none", "waiting", "sent", "done"}
 \* How a call ended: refused by the host, its server gave up, the host
-\* cancelled it or dropped its server, the server answered, or its process died.
+\* cancelled it or dropped its server, the server answered, or its link
+\* lost it.
 Ends == {"none", "denied", "failed", "cancelled", "answered", "lost"}
 
 VARIABLES phase, attempts, need, call, ended, allowed, cause, host,
     retry,   \* [Servers -> BOOLEAN]: down by a failure, it starts again by itself
     stayed,  \* ghost: [Servers -> BOOLEAN], it stayed up since it last started
     dropped, \* ghost: [Servers -> BOOLEAN], the host dropped it since it last went down
-    asked    \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
+    asked,   \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
+    lost     \* [Servers -> 0..LostLimit]: calls lost in a row while its link stayed up
 
-vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
+vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, lost>>
 
 Waiting(s) == {c \in Calls: Owner(c) = s /\ call[c] = "waiting"}
 Sent(s) == {c \in Calls: Owner(c) = s /\ call[c] = "sent"}
@@ -63,6 +67,7 @@ TypeOK ==
     /\ stayed \in [Servers -> BOOLEAN]
     /\ dropped \in [Servers -> BOOLEAN]
     /\ asked \in [Servers -> BOOLEAN]
+    /\ lost \in [Servers -> 0..LostLimit]
 
 Init ==
     /\ phase = [s \in Servers |-> "idle"]
@@ -77,6 +82,7 @@ Init ==
     /\ stayed = [s \in Servers |-> FALSE]
     /\ dropped = [s \in Servers |-> FALSE]
     /\ asked = [s \in Servers |-> FALSE]
+    /\ lost = [s \in Servers |-> 0]
 
 \* ---- The host ----
 
@@ -92,7 +98,7 @@ Ask(c, ok) ==
               ELSE IF phase[s] = "ready" THEN "sent" ELSE "waiting"]
        /\ ended' = [ended EXCEPT ![c] =
               IF ~ok THEN "denied" ELSE IF phase[s] = "failed" THEN "failed" ELSE "none"]
-    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked, lost>>
 
 \* The host needs the tool list. A ready server lists at once (the catalog
 \* answers every need, U05); a failed one says so at once.
@@ -101,7 +107,7 @@ Need(s) ==
     /\ phase[s] \notin {"ready", "failed"}
     /\ need' = [need EXCEPT ![s] = TRUE]
     /\ asked' = [asked EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped, lost>>
 
 \* A waiting call is cancelled before it went out. One in flight is the
 \* server's to end (U02).
@@ -109,7 +115,7 @@ Cancel(c) ==
     /\ call[c] = "waiting"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "cancelled"]
-    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, lost>>
 
 \* The host drops a server's link and its tries in a row. Reconnect keeps what
 \* waits for it, which starts it again; disconnect ends that too. Either way
@@ -127,6 +133,7 @@ Drop(s, keep) ==
     /\ dropped' = [dropped EXCEPT ![s] = TRUE]
     \* Disconnect refuses a waiting tool list need.
     /\ asked' = [asked EXCEPT ![s] = asked[s] /\ keep]
+    /\ lost' = [lost EXCEPT ![s] = 0]
     /\ UNCHANGED <<allowed, cause, stayed>>
 
 \* ---- The link ----
@@ -141,12 +148,13 @@ Connect(s) ==
     /\ attempts' = [attempts EXCEPT ![s] = @ + 1]
     /\ cause' = [cause EXCEPT ![s] = Demand(s) \/ retry[s]]
     /\ stayed' = [stayed EXCEPT ![s] = FALSE]
-    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked>>
+    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked, lost>>
 
 \* Ready: the tool list need goes to the server, and every waiting call goes
 \* out. Its tries in a row start over only once it stays up (Stable).
 Up(s) ==
     /\ phase[s] = "connecting"
+    /\ lost' = [lost EXCEPT ![s] = 0]
     /\ phase' = [phase EXCEPT ![s] = "ready"]
     /\ need' = [need EXCEPT ![s] = FALSE]
     /\ call' = [c \in Calls |-> IF c \in Waiting(s) THEN "sent" ELSE call[c]]
@@ -159,7 +167,7 @@ Stable(s) ==
     /\ phase[s] = "ready" /\ attempts[s] > 0
     /\ attempts' = [attempts EXCEPT ![s] = 0]
     /\ stayed' = [stayed EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked>>
+    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked, lost>>
 
 \* The start or the link failed. The calls in flight are lost, and the calls
 \* waiting for that start fail with it: a call waits for one start, and later
@@ -176,34 +184,63 @@ Down(s) ==
        /\ retry' = [retry EXCEPT ![s] = ~gaveUp]
        /\ asked' = [asked EXCEPT ![s] = asked[s] /\ ~gaveUp]
     /\ dropped' = [dropped EXCEPT ![s] = FALSE]
+    /\ lost' = [lost EXCEPT ![s] = 0]
     /\ UNCHANGED <<attempts, allowed, cause, host, stayed>>
 
 BackoffOver(s) ==
     /\ phase[s] = "backoff"
     /\ phase' = [phase EXCEPT ![s] = "idle"]
-    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
+    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, lost>>
 
 \* The server answers a call in flight.
 Answer(c) ==
     /\ call[c] = "sent"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "answered"]
+    /\ lost' = [lost EXCEPT ![Owner(c)] = 0]
     /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
+
+\* A stream that breaks mid-call loses the call; it is never resent, since the
+\* server may have run it.
+Lose(c) ==
+    /\ call[c] = "sent"
+    /\ call' = [call EXCEPT ![c] = "done"]
+    /\ ended' = [ended EXCEPT ![c] = "lost"]
+    /\ lost' = [lost EXCEPT ![Owner(c)] = IF @ < LostLimit THEN @ + 1 ELSE @]
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
+
+\* Drops a link after LostLimit lost calls in a row, with no call in flight, and
+\* starts its tries over so it can connect again.
+Restart(s) ==
+    /\ phase[s] = "ready"
+    /\ lost[s] = LostLimit
+    /\ Sent(s) = {}
+    /\ phase' = [phase EXCEPT ![s] = "idle"]
+    /\ attempts' = [attempts EXCEPT ![s] = 0]
+    /\ lost' = [lost EXCEPT ![s] = 0]
+    /\ UNCHANGED <<need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
 
 Next ==
     \/ \E c \in Calls, ok \in BOOLEAN: Ask(c, ok)
     \/ \E c \in Calls: Cancel(c) \/ Answer(c)
-    \/ \E s \in Servers: Need(s) \/ Connect(s) \/ Up(s) \/ Down(s) \/ BackoffOver(s) \/ Stable(s)
+    \/ \E c \in Calls: Lose(c)
+    \/ \E s \in Servers: Need(s) \/ Connect(s) \/ Up(s) \/ Down(s) \/ BackoffOver(s) \/ Stable(s) \/ Restart(s)
     \/ \E s \in Servers, keep \in BOOLEAN: Drop(s, keep)
 
+\* A start must end, up or down; a ready link may stay up, so only Restart
+\* drops one that loses calls.
 Fairness ==
-    /\ \A s \in Servers: WF_vars(Connect(s)) /\ WF_vars(Up(s) \/ Down(s)) /\ WF_vars(BackoffOver(s))
+    /\ \A s \in Servers: WF_vars(Connect(s)) /\ WF_vars(Up(s) \/ (Down(s) /\ phase[s] = "connecting")) /\ WF_vars(BackoffOver(s))
+    /\ \A s \in Servers: WF_vars(Restart(s))
     /\ \A c \in Calls: WF_vars(Answer(c))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
 \* Owners for the configs: calls 1 and 2 to server 1, call 3 (and 4) to server 2.
 SmokeOwner(c) == IF c <= 2 THEN 1 ELSE 2
+
+\* Owner for Engine.lost.cfg: every call to server 1.
+OnlyServer(c) == 1
 
 \* ---- Invariants ----
 
@@ -264,4 +301,17 @@ NeedServed == \A s \in Servers: need[s] ~> ~need[s]
 \* A server down by a failure comes back or gives up, with nothing
 \* needing it.
 RetriesEnd == \A s \in Servers: retry[s] ~> ~retry[s]
+
+\* Only Restart takes a ready link to idle by itself: after LostLimit losses in
+\* a row, with no call in flight.
+RestartOnlyAfterLosses ==
+    [][\A s \in Servers:
+        (phase[s] = "ready" /\ phase'[s] = "idle" /\ host' = host) =>
+            lost[s] = LostLimit /\ Sent(s) = {}]_vars
+
+\* A link that has lost LostLimit calls in a row, with none in flight, does not
+\* stay up.
+LossesRestart ==
+    \A s \in Servers: (phase[s] = "ready" /\ lost[s] = LostLimit /\ Sent(s) = {})
+        ~> (phase[s] # "ready" \/ lost[s] < LostLimit)
 ====

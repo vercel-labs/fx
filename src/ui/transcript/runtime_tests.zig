@@ -13785,6 +13785,8 @@ test "coalesced approval lifecycle reposition preserves an authoritative committ
         .arguments_json = "{\"command\":\"seq 1 1\"}",
         .place_after_current_transcript = true,
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running seq 1 1" } });
 
     try std.testing.expectEqualDeep(
         committed_diagnostic,
@@ -13796,7 +13798,7 @@ test "coalesced approval lifecycle reposition preserves an authoritative committ
     try std.testing.expect(std.mem.find(
         u8,
         repositioned_source.bytes,
-        "run_command",
+        "Running",
     ) != null);
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
     defer projection.deinit(alloc);
@@ -13812,7 +13814,7 @@ test "coalesced approval lifecycle reposition preserves an authoritative committ
     defer alloc.free(full);
     const notice_index = std.mem.find(u8, full, "Auto agent approved") orelse
         return error.TestExpectedEqual;
-    const full_status_index = std.mem.find(u8, full, "run_command") orelse
+    const full_status_index = std.mem.find(u8, full, "Running") orelse
         return error.TestExpectedEqual;
     try std.testing.expect(notice_index < full_status_index);
 
@@ -16332,6 +16334,8 @@ test "recorded tool finality stays independent of a live turn with the same numb
         .tool_name = "write_file",
         .activity_kind = .write,
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = live_id, .text = "● Writing live file" } });
     for ([_]bool{ false, true }) |terminal| {
         if (terminal) _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
             .id = live_id,

@@ -1475,6 +1475,14 @@ pub const Runtime = struct {
                     const s = r.resolved.servers[i];
                     debug_trace.logf("mcp", "MCP call ended server={s} transport={s} code=malformed reason={s} bytes={d}", .{ s.name, @tagName(s.transport), if (c.refused_body) "unreadable_body" else "unreadable_line", c.refused_bytes });
                 }
+                // A lost call logs its reason and whether the link restarted; an oversized one logged above.
+                if (c.outcome == .lost and !c.oversized) {
+                    const s = r.resolved.servers[i];
+                    var line_buf: [lost_call_line_max_bytes]u8 = undefined;
+                    // Every lost call carries its reason; `unknown` would mean a path forgot to set it.
+                    const why = if (c.lost_why) |w| @tagName(w) else "unknown";
+                    debug_trace.logf("mcp", "{s}", .{lostCallLine(&line_buf, s.name, @tagName(s.transport), why, c.protocol, c.status, c.restarted)});
+                }
                 if (r.holdForUrls(i, req, result)) return;
                 r.finish(req, .{ .call = result });
             },
@@ -2880,6 +2888,17 @@ fn cutErrorData(alloc: Allocator, text: []const u8, total: usize) Allocator.Erro
     return try out.toOwnedSlice();
 }
 
+/// Room for one `MCP call lost` line; a longer one is cut.
+const lost_call_line_max_bytes: usize = 512;
+
+/// The `MCP call lost` line: names, enum tags, numbers, and a flag, never content.
+fn lostCallLine(buf: []u8, server: []const u8, transport: []const u8, why: []const u8, protocol: ?[]const u8, status: u16, restarted: bool) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    // A name too long for `buf` cuts the line; what fits is still written.
+    out.print("MCP call lost server={s} transport={s} why={s} protocol={s} status={d} restarted={}", .{ server, transport, why, protocol orelse "none", status, restarted }) catch {};
+    return out.buffered();
+}
+
 fn copyCall(scratch: Allocator, alloc: Allocator, c: anytype) Allocator.Error!CallResult {
     const answer = c.answer orelse return .{ .ended = .{ .outcome = c.outcome, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out } };
     return switch (answer) {
@@ -3798,6 +3817,22 @@ test "copyCall keeps a successful result and an ended call as they were" {
         .timed_out = false,
     });
     try testing.expectEqual(engine.Outcome.lost, lost.ended.outcome);
+}
+
+test "a lost call's trace line names the server, transport, reason, protocol, status, and restart, and nothing else" {
+    var buf: [lost_call_line_max_bytes]u8 = undefined;
+    try testing.expectEqualStrings(
+        "MCP call lost server=web transport=http why=stream_broken protocol=2026-07-28 status=0 restarted=false",
+        lostCallLine(&buf, "web", "http", "stream_broken", "2026-07-28", 0, false),
+    );
+    try testing.expectEqualStrings(
+        "MCP call lost server=web transport=http why=resume_refused protocol=2025-11-25 status=503 restarted=false",
+        lostCallLine(&buf, "web", "http", "resume_refused", "2025-11-25", 503, false),
+    );
+    try testing.expectEqualStrings(
+        "MCP call lost server=local transport=stdio why=link_down protocol=none status=0 restarted=true",
+        lostCallLine(&buf, "local", "stdio", "link_down", null, 0, true),
+    );
 }
 
 test "many failing calls with a huge error data each stay bounded" {

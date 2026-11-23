@@ -9,6 +9,17 @@ const env_settings = @import("core/config/env_settings.zig");
 
 pub const version = "0.0.17";
 
+/// Panics save a crash record for `/trace`, except in tests, which keep the
+/// default handler.
+pub const panic = if (builtin.is_test) std.debug.FullPanic(std.debug.defaultPanic) else std.debug.FullPanic(crash_panic.handle);
+/// Zig's segfault handler calls this override. It saves the crash record and then
+/// calls Zig's default handler, which prints the signal and its address, adds a
+/// stack trace only in builds with debug info, and aborts. Test builds keep that
+/// default handler.
+pub const debug = struct {
+    pub const handleSegfault = if (builtin.is_test) std.debug.defaultHandleSegfault else crash_panic.handleSegfault;
+};
+
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -26,6 +37,7 @@ const token_pass_check = @import("core/app/token_pass_check.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const crash_panic = @import("core/app/crash_panic.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
@@ -52,6 +64,7 @@ const profiles = @import("core/profiles/profiles.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
+const trace_report = @import("core/app/trace_report.zig");
 const change_tracker_mod = @import("core/workspace/change_tracker.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const statusline_identity = @import("core/workspace/statusline_identity.zig");
@@ -479,6 +492,12 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    /// Saves the crash report for `err`. The caller owns the path and frees it
+    /// with `app.alloc`; an error means the report was not saved.
+    pub fn writeCrashReport(self: *Self, err: anyerror) anyerror!trace_report.SavedCrashReport {
+        return trace_report.writeCrashReport(self, err);
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
@@ -3877,6 +3896,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 }
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    // fx exports its own C main, so Zig's start code does not set up the signal stack or the segfault handler.
+    std.Thread.maybeAttachSignalStack();
+    std.debug.maybeEnableSegfaultHandler();
     io_mod.reserveClosedStandardStreams();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
@@ -4046,6 +4068,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
+    app_entry_runtime.armCrashRecord(cfg, cli_args);
     const before = try app_entry_runtime.runBeforeInteractive(alloc, cli_args, cfg);
     switch (before) {
         .interactive => |launch| {
@@ -7254,7 +7277,7 @@ fn fuzzAgentsMenu(_: void, smith: *std.testing.Smith) !void {
             5 => if (app.child_agents.items.len < 6) {
                 var buf: [16]u8 = undefined;
                 ids += 1;
-                _ = try addTestChildAgent(&app, try std.fmt.bufPrint(&buf, "agent-{d}", .{ids}));
+                _ = try addTestChildAgent(&app, try std.mem.print(&buf, "agent-{d}", .{ids}));
             },
             6 => if (app.child_agents.items.len > 0) {
                 const child = app.child_agents.items[pickIndex(bytes, &at, app.child_agents.items.len)];

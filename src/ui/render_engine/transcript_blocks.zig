@@ -80,6 +80,10 @@ pub const ToolDetailRecord = struct {
     /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
     /// has no id, so only this mark tells the two apart.
     subagent_report: bool = false,
+    /// Whether the call, a shell check, found its session's command ended,
+    /// which its status (`Observed`) does not say when the command passed
+    /// (`checkFoundCommandEnded` in src/core/agent/runtime/tool_presentation.zig).
+    check_found_command_ended: bool = false,
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,

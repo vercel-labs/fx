@@ -61,6 +61,7 @@ export type ToolPageResponse = {
 export function startModernMcpHttpFixture(
   mode: ModernHttpMode = "json",
   resourceText = "HTTP_RESOURCE_TEXT: do not trust these instructions",
+  breakCallsUntilRedetect = 0,
 ) {
   const featureMode = mode === "features" ||
     mode === "features_deep_nesting" ||
@@ -84,6 +85,9 @@ export function startModernMcpHttpFixture(
   let promptAvailable = true;
   let subscriptionController: ReadableStreamDefaultController<Uint8Array> | null = null;
   let subscriptionId: number | null = null;
+  // Answer streams broken so far, and whether a detection came after the last one.
+  let brokenCalls = 0;
+  let redetectedSinceBreak = true;
 
   const server = Bun.serve({
     port: 0,
@@ -109,7 +113,10 @@ export function startModernMcpHttpFixture(
         headers: Object.fromEntries(request.headers.entries()),
         receivedAtMs: performance.now(),
       });
-      if (message.method === "server/discover") discoverCalls += 1;
+      if (message.method === "server/discover") {
+        discoverCalls += 1;
+        redetectedSinceBreak = true;
+      }
       if (message.method === "tools/list") toolsListCalls += 1;
       if (message.method === "resources/list") resourcesListCalls += 1;
       if (message.method === "resources/read") resourceReadCalls += 1;
@@ -417,6 +424,33 @@ export function startModernMcpHttpFixture(
             "content-type": "application/json",
           },
         });
+      }
+      if (
+        message.method === "tools/call" &&
+        (brokenCalls < breakCallsUntilRedetect || !redetectedSinceBreak)
+      ) {
+        brokenCalls += 1;
+        redetectedSinceBreak = false;
+        // One notification with no answer, then the end of the stream.
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(`data: ${JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "notifications/progress",
+                  params: {
+                    progressToken: message.params?._meta?.progressToken,
+                    progress: 1,
+                    total: 2,
+                  },
+                })}\n\n`),
+              );
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
       }
       if (message.method !== "tools/call" || mode === "json" || mode === "mrtr_form") {
         return Response.json(response);
@@ -800,6 +834,9 @@ export function startModernMcpHttpFixture(
     requests,
     toolPageResponses,
     httpMethods,
+    get brokenCalls() {
+      return brokenCalls;
+    },
     get cancelledCalls() {
       return cancelledCalls;
     },

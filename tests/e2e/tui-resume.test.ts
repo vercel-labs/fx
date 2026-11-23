@@ -9248,15 +9248,17 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     // The replayed row abbreviates against the live workspace and reclips to
     // the live width instead of keeping the frozen compact-bound marker.
     // The launch and its observe share one session row, which is the group's
-    // header and shows the launch command's steps in short form.
-    const row = scrollback.split("\n").find((line) => line.includes("Observed printf"));
+    // header and shows the launch command's steps in short form. The observe
+    // found the command ended, so the row says it ran.
+    const row = scrollback.split("\n").find((line) => line.includes("Ran printf"));
     expect(row).toBeDefined();
     expect(row!).toContain(" · 2 calls");
     expect(row!).not.toContain("...");
     // Session-action rows resolve the launch command through the live root
     // instead of falling back to the raw session id.
-    expect(scrollback).toContain("Observed printf");
-    expect(scrollback).not.toContain("Observed shell-1");
+    expect(scrollback).toContain("Ran printf");
+    expect(scrollback).not.toContain("Observed printf");
+    expect(scrollback).not.toContain("Ran shell-1");
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
     active = null;
