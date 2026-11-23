@@ -26,6 +26,10 @@ pub const Bundle = struct {
         /// Whether a request carries fx's output limit. ChatGPT's Codex
         /// endpoint chooses its own and rejects the parameter.
         sends_output_limit: bool = true,
+        /// Whether the provider's model catalog lists every model it accepts.
+        /// Only then is a subagent model override checked against the catalog
+        /// before the child starts; otherwise the override passes through.
+        authoritative_model_catalog: bool = false,
     };
 
     capabilities: Capabilities = .{},

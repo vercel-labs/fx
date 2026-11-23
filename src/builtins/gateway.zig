@@ -153,7 +153,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 };
 
 pub const provider_bundle = provider_set.Bundle{
-    .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true },
+    .capabilities = .{ .gateway_prompt_caching = true, .fx_search = true, .vision_fallback = true, .authoritative_model_catalog = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
     .title_model = title_model,

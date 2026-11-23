@@ -289,6 +289,15 @@ fn append_entry(alloc: Allocator, entries: *std.ArrayList(catalog.ModelCatalogEn
     try entries.append(alloc, entry);
 }
 
+test "configured connections never claim an authoritative model catalog" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"fetch_models":true}}
+    );
+    defer registry.deinit(alloc);
+    try std.testing.expect(!bundle(registry.get("local").?).capabilities.authoritative_model_catalog);
+}
+
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
