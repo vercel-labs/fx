@@ -206,9 +206,9 @@ A joined client's `session/close` or input end is that client leaving, as "Leavi
 
 A client leaves a session when it sends `session/close` for it, or when its input ends. The session stays open while any client has it, and its running turn goes on while another client remains.
 
-When a client leaves and another client remains, the leaving client's waiting prompts and steers are withdrawn with it. A `session/close` answers each of that client's waiting steers and queued prompts with `-32800`, "Request cancelled". A `session/close` also answers that client's own running prompt with `stopReason` `cancelled`, before the close's own answer; the turn goes on for the other clients, and the closed client gets nothing more for that session. When a client's input ends, fx drops them without an answer and traces each drop.
+When a client leaves and another client remains, the leaving client's waiting prompts and steers are withdrawn with it. A `session/close` answers every request of that client in the session that has no answer yet, before the close's own answer. A waiting steer or queued prompt gets `-32800`, "Request cancelled". The running prompt, and each steer that its running turn has taken, get `stopReason` `cancelled`. The turn goes on for the other clients, and the closed client gets nothing more for that session. When a client's input ends, fx drops them without an answer and traces each drop.
 
-The last client to leave ends the session. Its `session/close` cancels the running turn and answers its queued prompts and steers with `-32800`. Its input end follows "Keeping turns after a disconnect".
+The last client to leave ends the session. Its `session/close` cancels the running turn, whoever started it, and answers its queued prompts and steers with `-32800`. Its input end follows "Keeping turns after a disconnect".
 
 fx acp exits when no client remains and no turn runs.
 

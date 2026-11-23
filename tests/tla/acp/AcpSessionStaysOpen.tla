@@ -31,13 +31,13 @@ Rules the model checks, in plain words:
 - Leaving while another member remains ("Stopping and withdrawing"): the
   leaver's queued prompts and untaken steers are withdrawn. A close answers
   them as cancelled, and an input end traces them. A close also answers the
-  leaver's running prompt as cancelled. The turn that the leaver's prompt
+  leaver's running prompt, and each steer its turn has taken, as cancelled. The turn that the leaver's prompt
   started goes on, and its permission requests go to the next main. The model
   keeps steers in the queue with prompts, so the queue stands
   for both.
 - The last member's leave ("Keeping turns after a disconnect"): a close
-  cancels the closer's own running turn and answers its own queued prompts as
-  cancelled. An input end with keep lets its turn finish and its queued prompts
+  cancels the running turn, whoever started it, and answers its own queued
+  prompts as cancelled. An input end with keep lets its turn finish and its queued prompts
   run. An input end without keep stops its turn, saved as interrupted, and its
   queued prompts still run.
 - Left work: no close or leave cancels or answers another client's left work.
@@ -291,8 +291,9 @@ PermissionToMain == s.askOpen => (s.members # <<>> /\ s.askTo = Main(s))
 
 \* The session, its turn and its open question never name a client that has left. A running
 \* turn may outlive its sender while members remain (see Left work in the header). A close
-\* answers the sender's own running prompt at once, so a later answer for it is dropped with a
-\* trace, as answerTurnPrompt does with answered_at_close in src/acp/server.zig.
+\* answers the sender's own running prompt and its taken steers at once. A later answer for the
+\* prompt is dropped with a trace, as answerTurnPrompt does with answered_at_close in
+\* src/acp/server.zig; a taken steer is no longer in the turn's list, so no later answer comes for it.
 NoDanglingClient ==
   /\ (s.askOpen => (s.askTo \in Mem(s)))
   /\ (Design = "A" => IF s.members = <<>> THEN s.owner = "none" ELSE s.owner \in Mem(s))
