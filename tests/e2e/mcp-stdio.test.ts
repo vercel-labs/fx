@@ -3003,11 +3003,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         const resumedStderrPath = join(root.root, "resumed-stderr.log");
         tui = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume last`, isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath: resumedStderrPath, env });
         await tui.waitForComposer(15_000);
-        // A resume shows no row yet for a call cancelled while it ran: core's
-        // replay writes no line for any such call, as Ctrl+O shows too, and
-        // only the turn's notice comes back.
-        await tui.waitForText("▪ Cancelled · What can fx do differently?", 15_000);
-        expect(compactRows(await tui.captureFullScrollback())).toEqual([`● Opened ${alias}`, "▪ Cancelled · What can fx do differently?"]);
+        // A resume shows the call's row as live did, with the server and tool
+        // the session recorded.
+        await tui.waitForText(`▪ Cancelled using ${serverName} to echo · What can fx do differently?`, 15_000);
+        expect(compactRows(await tui.captureFullScrollback())).toEqual(live);
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
         await tui.kill();
         tui = null;
@@ -4650,6 +4649,78 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await expectFixtureProcessesExited(wire);
     },
     35_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a stalled MCP call the user cancelled keeps its row after resume, as live",
+    async () => {
+      const root = createRoot("tui-cancel-resume", MODERN_FIXTURE, {
+        mode: "stall_operation",
+        operationTimeoutMs: 30_000,
+        expectedElicitation: "both",
+      });
+      const activeGateway = startToolGateway("Not reached.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const env = { ...fixtureEnv(root, activeGateway), FX_TRACE_SCOPES: "mcp,interrupt" };
+      const toolRows = (screen: string) =>
+        screen
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+          .split("\n")
+          .map((line) => line.trimEnd())
+          .filter((line) => /^\s*[●├└▪] /.test(line));
+      const expectFullTranscriptShows = async (session: TmuxSession) => {
+        await session.sendKeys("C-o");
+        await session.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForStableComposer(10_000);
+      };
+      tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 100, height: 30, stderrPath, env });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the stalled MCP fixture.");
+      await tui.waitForPane(
+        () => existsSync(root.wireLogPath) && readWire(root.wireLogPath).some((entry) => entry.message.method === "tools/call"),
+        15_000,
+      );
+      await tui.sendInterruptEscapePair(10_000);
+      await tui.waitForText("What can fx do differently?", 10_000);
+      await tui.waitForPane(
+        () => existsSync(root.traceLogPath) && readFileSync(root.traceLogPath, "utf8").includes("event=interrupt_persisted"),
+        10_000,
+      );
+      await tui.waitForStableComposer(5_000);
+      const live = toolRows(await tui.captureFullScrollback());
+      expect(live.some((line) => line.includes(`Cancelled using ${TOOL_ROW}`))).toBe(true);
+      await expectFullTranscriptShows(tui);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd()).toBe(true);
+      await tui.kill();
+      tui = null;
+      const wire = readWire(root.wireLogPath);
+
+      tui = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        isolated: true,
+        cwd: root.workspace,
+        width: 100,
+        height: 30,
+        stderrPath,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("What can fx do differently?", 10_000);
+      // The row, and the notice under it, read as they did live.
+      expect(toolRows(await tui.captureFullScrollback())).toEqual(live);
+      // Ctrl+O gains the call's line, as it has live.
+      await expectFullTranscriptShows(tui);
+      expect(activeGateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    60_000,
   );
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(

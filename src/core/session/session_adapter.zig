@@ -2950,6 +2950,9 @@ pub const Session = struct {
             if (try encodeCancelledCommand(a, event)) |data| {
                 try batch.append(a, .{ .item = try self.itemAs(a, cancelled_command_type, data) });
             }
+            if (try encodeCancelledWait(a, event)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, cancelled_wait_type, data) });
+            }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (try encodeSubagentStarted(a, event)) |data| {
@@ -5639,6 +5642,10 @@ noinline fn replay(
                         try noteCancelledCommand(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, cancelled_wait_type)) {
+                        try noteCancelledWait(src, pa, &builder, piece);
+                        continue;
+                    }
                     if (std.mem.eql(u8, piece.type, subagent_started_type)) {
                         try noteSubagentStarted(src, pa, &builder, piece);
                         continue;
@@ -6222,6 +6229,79 @@ fn decodeCancelledCommand(a: Allocator, data: []const u8) ?[]const u8 {
     return value.call_id;
 }
 
+/// The item right before an `interruption` piece when the turn cancelled a
+/// `subagent` wait while it waited, `{"call_id":…,"subagents":"lander"}`:
+/// the wait has no result, so only this keeps its row on resume and names
+/// the subagents its row named (D102). `subagents` is absent when the host
+/// named none. Older fx versions skip the unknown item and read the turn as
+/// before.
+const cancelled_wait_type = "cancelled_wait";
+
+const CancelledWaitData = struct { call_id: []const u8, subagents: ?[]const u8 = null };
+
+/// The most bytes of names a `cancelled_wait` item keeps.
+const max_cancelled_wait_names_bytes = 1024;
+
+/// Whether `names` may be saved and shown on a wait's row: short, valid
+/// UTF-8, and free of control characters.
+fn validCancelledWaitNames(names: []const u8) bool {
+    if (names.len == 0 or names.len > max_cancelled_wait_names_bytes) return false;
+    if (!std.unicode.utf8ValidateSlice(names)) return false;
+    for (names) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+/// The `cancelled_wait` item data for `event`, or null when it needs none.
+/// Names that can't be shown are left out, and the row names no one. The
+/// data is owned by `a`.
+fn encodeCancelledWait(a: Allocator, event: Event) !?[]u8 {
+    const interruption = switch (event) {
+        .interrupted => |value| value,
+        else => return null,
+    };
+    const call_id = interruption.cancelled_wait_call_id orelse return null;
+    if (call_id.len == 0 or call_id.len > session_event.max_conversation_identity_bytes) return error.InvalidConversationFrame;
+    var names = interruption.cancelled_wait_subagents;
+    if (names) |text| if (!validCancelledWaitNames(text)) {
+        debug_trace.logf("session", "event=sessions_v2_cancelled_wait_names_invalid bytes={d} dropped=cancelled_wait_names", .{text.len});
+        names = null;
+    };
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    try std.json.Stringify.value(CancelledWaitData{ .call_id = call_id, .subagents = names }, .{ .emit_null_optional_fields = false }, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+/// Gives the turn the cancelled wait a `cancelled_wait` item names. One that
+/// can't be read is logged and left out, and the turn reads as it did before
+/// the item existed.
+fn noteCancelledWait(src: Source, a: Allocator, builder: *session_log.ConversationTurnBuilder, piece: sm.Body.Piece) !void {
+    const data = src.pieceData(a, piece) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_cancelled_wait_unreadable session={s} err={s} dropped=cancelled_wait_row", .{ src.id, @errorName(err) });
+            return;
+        },
+    };
+    const wait = try decodeCancelledWait(a, data) orelse {
+        debug_trace.logf("session", "event=sessions_v2_cancelled_wait_invalid session={s} dropped=cancelled_wait_row", .{src.id});
+        return;
+    };
+    try builder.noteCancelledWait(wait.call_id, wait.subagents);
+}
+
+/// What a `cancelled_wait` item's data names, or null when the data isn't
+/// one. Fields a newer fx adds are ignored. The strings are in `a`.
+fn decodeCancelledWait(a: Allocator, data: []const u8) error{OutOfMemory}!?CancelledWaitData {
+    const value = json_decode.parseFromSliceLeaky(CancelledWaitData, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (value.call_id.len == 0 or value.call_id.len > session_event.max_conversation_identity_bytes) return null;
+    if (value.subagents) |names| if (!validCancelledWaitNames(names)) return null;
+    return value;
+}
+
 /// The item right after the `tool_result` of a `subagent` message that made a
 /// new subagent, `{"call_id":…}`, so a resume reads its row as "Started" and
 /// not "Messaged" (D101). The result piece keeps its bytes: older fx versions
@@ -6524,6 +6604,9 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
             // A subagent start (D101).
             "{\"call_id\":\"call-start\"}",
+            // A cancelled wait (D102), with names and with names to refuse.
+            "{\"call_id\":\"call-wait\",\"subagents\":\"lander, scout\"}",
+            "{\"call_id\":\"call-wait\",\"subagents\":\"lander\\u001b[2J\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -6544,6 +6627,11 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
     // A subagent start (D101) names one call, within the identity limit.
     if (try decodeSubagentStarted(arena_state.allocator(), buffer[0..len])) |call_id| {
         try std.testing.expect(call_id.len > 0 and call_id.len <= session_event.max_conversation_identity_bytes);
+    }
+    // A cancelled wait (D102) names one call and names a row may show.
+    if (try decodeCancelledWait(arena_state.allocator(), buffer[0..len])) |wait| {
+        try std.testing.expect(wait.call_id.len > 0 and wait.call_id.len <= session_event.max_conversation_identity_bytes);
+        if (wait.subagents) |names| try std.testing.expect(validCancelledWaitNames(names));
     }
     if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
         try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
@@ -10356,6 +10444,109 @@ test "replay reads a cancelled command item a newer fx wrote and leaves out one 
     @memset(long_id, 'c');
     try testing.expect(decodeCancelledCommand(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
     try testing.expect(decodeCancelledCommand(a, "not json") == null);
+}
+
+test "a wait cancelled while it waited keeps its row and names on resume and in a fork (D102)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const wait: types.ToolCall = .{ .id = "call-wait", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" };
+    const lang = types.ConversationLanguage.default();
+    // A wait for lander, one whose host named no one, a turn cancelled with
+    // no wait, and a later turn that a fork leaves out.
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("named") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "lander" }, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("unnamed") }, .tool_call = wait, .cancelled_wait = .{}, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("no wait") }, .tool_call = wait, .terminal_reason = .cancelled } }, lang);
+    try s.commitTurn(.{ .interrupted = .{ .user = .{ .text = @constCast("later") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "scout" }, .terminal_reason = .cancelled } }, lang);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Only the cancelled waits get the item, on its own line right before
+    // the interruption that ends its turn.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\"" ++ cancelled_wait_type ++ "\""));
+    const item_at = std.mem.find(u8, bytes, "\"type\":\"" ++ cancelled_wait_type ++ "\",\"data\":{\"call_id\":\"call-wait\",\"subagents\":\"lander\"},") orelse return error.TestExpectedItem;
+    const interruption_at = std.mem.find(u8, bytes, "\"type\":\"interruption\"") orelse return error.TestExpectedInterruption;
+    try testing.expect(item_at < interruption_at);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes[item_at..interruption_at], "\n"));
+    try testing.expect(std.mem.find(u8, bytes, "\"type\":\"" ++ cancelled_wait_type ++ "\",\"data\":{\"call_id\":\"call-wait\"},") != null);
+    // The piece itself is the same bytes as before the item existed.
+    try testing.expect(std.mem.find(u8, bytes, "\"interruption\",\"data\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}") != null);
+    try testing.expect(std.mem.find(u8, bytes, "cancelled_wait_call_id") == null);
+    try testing.expect(std.mem.find(u8, bytes, "cancelled_wait_subagents") == null);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    {
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 4), restored.history.len);
+        try testing.expectEqualStrings("lander", restored.history[0].interrupted.cancelled_wait.?.waited_for.?);
+        try testing.expectEqualStrings("call-wait", restored.history[0].interrupted.tool_call.?.id);
+        try testing.expect(restored.history[1].interrupted.cancelled_wait.?.waited_for == null);
+        try testing.expect(restored.history[2].interrupted.cancelled_wait == null);
+        try testing.expectEqualStrings("scout", restored.history[3].interrupted.cancelled_wait.?.waited_for.?);
+    }
+
+    // A fork copies the turns before its point with their items.
+    const points = try r.forkPoints(testing.allocator);
+    defer Session.freeForkPoints(testing.allocator, points);
+    const copy = try r.fork(testing.allocator, .{ .before_turn = points[3].turn, .workspace = "/w", .host = .app });
+    defer copy.close();
+    var forked = try copy.restore(testing.allocator);
+    defer forked.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), forked.history.len);
+    try testing.expectEqualStrings("lander", forked.history[0].interrupted.cancelled_wait.?.waited_for.?);
+    try testing.expect(forked.history[1].interrupted.cancelled_wait.?.waited_for == null);
+    try testing.expect(forked.history[2].interrupted.cancelled_wait == null);
+}
+
+test "a cancelled wait saves only names a row may show (D102)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const encode = struct {
+        fn run(alloc: Allocator, names: ?[]const u8) ![]u8 {
+            return (try encodeCancelledWait(alloc, .{ .interrupted = .{ .reason = .cancelled, .cancelled_wait_call_id = "w", .cancelled_wait_subagents = names } })).?;
+        }
+    }.run;
+    try testing.expectEqualStrings("{\"call_id\":\"w\",\"subagents\":\"lander, scout\"}", try encode(a, "lander, scout"));
+    try testing.expectEqualStrings("{\"call_id\":\"w\"}", try encode(a, null));
+    // Names that would move the cursor or run too long are left out.
+    try testing.expectEqualStrings("{\"call_id\":\"w\"}", try encode(a, "lander\x1b[2J"));
+    const long_names = try a.alloc(u8, max_cancelled_wait_names_bytes + 1);
+    @memset(long_names, 'n');
+    try testing.expectEqualStrings("{\"call_id\":\"w\"}", try encode(a, long_names));
+    // A turn with no cancelled wait gets no item.
+    try testing.expect(try encodeCancelledWait(a, .{ .interrupted = .{ .reason = .cancelled } }) == null);
+}
+
+test "replay reads a cancelled wait item a newer fx wrote and leaves out one it can't read (D102)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const read = (try decodeCancelledWait(a, "{\"call_id\":\"w\",\"subagents\":\"lander\",\"agents\":[\"lander\"]}")).?;
+    try testing.expectEqualStrings("w", read.call_id);
+    try testing.expectEqualStrings("lander", read.subagents.?);
+    try testing.expect((try decodeCancelledWait(a, "{\"call_id\":\"w\"}")).?.subagents == null);
+    // An empty or missing call id, one too long, names a row can't show, and
+    // bytes that aren't JSON.
+    try testing.expect(try decodeCancelledWait(a, "{\"call_id\":\"\"}") == null);
+    try testing.expect(try decodeCancelledWait(a, "{\"subagents\":\"lander\"}") == null);
+    const long_id = try a.alloc(u8, session_event.max_conversation_identity_bytes + 1);
+    @memset(long_id, 'c');
+    try testing.expect(try decodeCancelledWait(a, try a.print("{{\"call_id\":\"{s}\"}}", .{long_id})) == null);
+    try testing.expect(try decodeCancelledWait(a, "{\"call_id\":\"w\",\"subagents\":\"\"}") == null);
+    try testing.expect(try decodeCancelledWait(a, "{\"call_id\":\"w\",\"subagents\":\"a\\u001b[2J\"}") == null);
+    try testing.expect(try decodeCancelledWait(a, "{\"call_id\":\"w\",\"subagents\":7}") == null);
+    try testing.expect(try decodeCancelledWait(a, "not json") == null);
 }
 
 test "a message that made its subagent keeps its start on resume, in an item older fx skips (D101)" {

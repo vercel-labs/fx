@@ -34,6 +34,7 @@ const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
+const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -12925,6 +12926,13 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                // A wait has no result to name whom it waited for, so the turn
+                // keeps the names its row showed (D102).
+                const cancelled_wait: ?types.CancelledWaitPresentation = if (!execution_is_command and
+                    try tooling_presentation.subagentRoster(arena, identity_call) == .working)
+                    .{ .waited_for = tool_display_target }
+                else
+                    null;
                 const persist_error = if (execution_is_command)
                     runtime_interruption.persistInterruptedCommandTurnOnce(
                         deps,
@@ -12939,6 +12947,21 @@ fn processQueuedPromptLoop(
                         stop_state.retained_candidate,
                         &stop_state.terminal_materializing,
                         cancelled_command,
+                    )
+                else if (cancelled_wait) |wait|
+                    runtime_interruption.persistInterruptedWaitTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        identity_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                        wait,
                     )
                 else
                     runtime_interruption.persistInterruptedTurnOnce(

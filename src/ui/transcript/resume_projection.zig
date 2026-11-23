@@ -346,6 +346,15 @@ pub const ResumeProjection = struct {
         );
     }
 
+    pub fn attachHistoricalCancelledCallDetail(
+        self: *ResumeProjection,
+        entry_id: u32,
+        call: types.ToolCall,
+        activity_kind: types.ToolActivityKind,
+    ) !void {
+        try self.runtime.attachHistoricalCancelledCallDetail(self.alloc, entry_id, call, activity_kind);
+    }
+
     pub fn appendDiff(self: *ResumeProjection, payload: diff.DiffEntryPayload) !void {
         const c_alloc = std.heap.c_allocator;
         var owns_payload = true;
