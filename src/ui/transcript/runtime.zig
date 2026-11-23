@@ -3209,6 +3209,64 @@ test "only a subagent report's detail carries the report mark" {
     try std.testing.expect(!runtime.toolDetailForEntry(call_id).?.subagent_report);
 }
 
+test "an MCP call's detail keeps the server and tool core named, live and after a resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    // Live: the names come with the call's start, while its arguments wait
+    // and once it runs.
+    const waiting = types.ToolLifecycleId{ .turn_id = 1, .call_id = "waiting" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = waiting,
+        .tool_name = "toolbox",
+        .activity_kind = .mcp,
+        .arguments_json = "{\"run\":\"mcp_Team_notes_echo\"}",
+        .mcp_tool = .{ .server = "Team notes", .tool = "echo" },
+    } });
+    const running = types.ToolLifecycleId{ .turn_id = 1, .call_id = "running" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = running,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "toolbox",
+        .activity_kind = .mcp,
+        .arguments_json = "{\"run\":\"mcp_my_srv_echo\"}",
+        .mcp_tool = .{ .server = "my_srv", .tool = "echo" },
+    } });
+    const read = types.ToolLifecycleId{ .turn_id = 1, .call_id = "read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = read,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"a\"}",
+    } });
+    const named = runtime.toolDetailForEntry(runtime.toolActivityRecord(running).?.entry_id).?;
+    try std.testing.expectEqualStrings("my_srv", named.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", named.mcp_tool.?);
+    const streaming = runtime.toolDetailForEntry(runtime.toolActivityRecord(waiting).?.entry_id).?;
+    try std.testing.expectEqualStrings("Team notes", streaming.mcp_server.?);
+    const plain = runtime.toolDetailForEntry(runtime.toolActivityRecord(read).?.entry_id).?;
+    try std.testing.expect(plain.mcp_server == null and plain.mcp_tool == null);
+
+    // After a resume: the names the session recorded for the saved call.
+    var metrics: Metrics = .{};
+    const held = "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"review_caution\"}}";
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .denied, "Safety caution mcp___n___echo", true);
+    try runtime.attachHistoricalToolDetail(alloc, entry_id, .{ .id = "held", .name = "toolbox", .arguments_json = "{\"run\":\"mcp___n___echo\"}" }, .mcp, .{
+        .tool_call_id = @constCast("held"),
+        .tool_name = @constCast("toolbox"),
+        .status = .failure,
+        .output = @constCast(held),
+        .output_bytes = held.len,
+        .stored_output_bytes = held.len,
+    });
+    try runtime.attachHistoricalMcpToolName(alloc, entry_id, .{ .server = "ünï", .tool = "echo" });
+    const resumed = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings("ünï", resumed.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", resumed.mcp_tool.?);
+}
+
 test "a resumed shell check keeps whether it found its command ended" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -5684,6 +5742,11 @@ pub const TranscriptRuntime = struct {
             );
             return err;
         };
+        switch (event) {
+            .provisional => |provisional| try self.nameMcpTool(alloc, provisional.id, provisional.mcp_tool),
+            .authoritative_started => |started| try self.nameMcpTool(alloc, started.id, started.mcp_tool),
+            else => {},
+        }
         debug_trace.eventf(
             "ui_activity",
             "lifecycle_reduced",
@@ -6860,6 +6923,31 @@ pub const TranscriptRuntime = struct {
                 detail.resolved_path = try resolvedPathIn(alloc, path, self.saved_calls_root);
             }
         }
+    }
+
+    /// Gives a starting call's detail the MCP tool core named for it.
+    fn nameMcpTool(self: *TranscriptRuntime, alloc: Allocator, id: types.ToolLifecycleId, name: ?types.McpToolName) !void {
+        const value = name orelse return;
+        const record = self.notebook.lifecycle_state.recordPtr(id) orelse return;
+        const detail = self.toolDetailPtr(record.entry_id) orelse return;
+        try setMcpToolName(alloc, detail, value);
+    }
+
+    /// Gives a resumed MCP call's detail the server and tool its session
+    /// recorded for it, or the live catalog knows.
+    pub fn attachHistoricalMcpToolName(self: *TranscriptRuntime, alloc: Allocator, entry_id: u32, name: types.McpToolName) !void {
+        const detail = self.toolDetailPtr(entry_id) orelse return;
+        try setMcpToolName(alloc, detail, name);
+    }
+
+    fn setMcpToolName(alloc: Allocator, detail: *ToolDetailRecord, name: types.McpToolName) Allocator.Error!void {
+        const server = try alloc.dupe(u8, name.server);
+        errdefer alloc.free(server);
+        const tool = try alloc.dupe(u8, name.tool);
+        if (detail.mcp_server) |old| alloc.free(old);
+        if (detail.mcp_tool) |old| alloc.free(old);
+        detail.mcp_server = server;
+        detail.mcp_tool = tool;
     }
 
     /// Gives a resumed row of a call made through `fx mcp call` the detail

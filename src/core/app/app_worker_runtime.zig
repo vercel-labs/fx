@@ -759,7 +759,28 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             event: types.ToolLifecycleEvent,
         ) !void {
-            try pushEvent(app, agent, .{ .tool_lifecycle = event });
+            var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer scratch.deinit();
+            try pushEvent(app, agent, .{ .tool_lifecycle = try withMcpToolName(app, agent, scratch.allocator(), event) });
+        }
+
+        /// `event`, with the MCP tool a starting call runs
+        /// (`app_session_runtime.Runtime.liveMcpToolName`); any other event
+        /// as it is. The name lives in `arena`.
+        fn withMcpToolName(app: *App, agent: *AppAgent, arena: std.mem.Allocator, event: types.ToolLifecycleEvent) !types.ToolLifecycleEvent {
+            if (comptime !@hasField(App, "main_agent")) return event;
+            const Session = app_session_runtime.Runtime(App);
+            var named = event;
+            switch (named) {
+                .provisional => |*started| if (started.mcp_tool == null) if (started.tool_name) |name| {
+                    started.mcp_tool = try Session.liveMcpToolName(app, agent, arena, name, started.arguments_json);
+                },
+                .authoritative_started => |*started| if (started.mcp_tool == null) {
+                    started.mcp_tool = try Session.liveMcpToolName(app, agent, arena, started.tool_name, started.arguments_json);
+                },
+                else => {},
+            }
+            return named;
         }
 
         pub fn pushWebSearchProgress(app: *App, agent: *AppAgent, call_id: []const u8, progress: types.WebSearchProgress) !void {

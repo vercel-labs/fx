@@ -16,6 +16,7 @@ const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_adapter = @import("../session/session_adapter.zig");
+const tool_call_identities = @import("../mcp/tool_call_identities.zig");
 const turn_capture = @import("../workspace/turn_capture.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
@@ -1085,12 +1086,16 @@ pub const Persistence = struct {
     /// copying the app after it opens the store (`adoptStore`).
     v2_store: ?*session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
+    /// The MCP tools `v2` called, by alias, so a resume names each call's
+    /// server and tool before the servers connect (D46). The worker thread
+    /// records them, so it allocates with `std.heap.c_allocator`.
+    tool_identities: tool_call_identities.SessionRecord = .{},
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 36) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 37) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1131,6 +1136,7 @@ pub const Persistence = struct {
         storage.shutdown_failure = null;
         storage.v2_store = null;
         storage.v2 = null;
+        storage.tool_identities = .{};
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -1186,6 +1192,7 @@ pub const Persistence = struct {
         }
         // Before the session closes: a start capture still running uses it.
         self.turn_capture.deinit();
+        self.tool_identities.deinit(std.heap.c_allocator);
         if (self.v2) |v2| v2.close();
         for (self.fork_copies.items) |copy| copy.finish();
         self.fork_copies.deinit(alloc);

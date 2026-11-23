@@ -3287,8 +3287,8 @@ pub const Session = struct {
         try self.putSetting(scratch.allocator(), .client_prompt, try jsonString(scratch.allocator(), text));
     }
 
-    /// The MCP tool identities this ACP session recorded for replay, as
-    /// their JSON object, or null. Caller owns it.
+    /// The MCP tool identities this session recorded for replay, as their
+    /// JSON object, or null. Caller owns it.
     pub fn toolIdentities(self: *Session, alloc: Allocator) !?[]u8 {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();

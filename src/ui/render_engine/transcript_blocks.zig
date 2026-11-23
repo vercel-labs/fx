@@ -96,6 +96,12 @@ pub const ToolDetailRecord = struct {
     /// A `subagent` message that made a new subagent, as its host said
     /// live and its session saved (D101).
     subagent_started: bool = false,
+    /// The MCP server a call's tool is on and the tool's own name, as core
+    /// knew them when the call started or the session recorded them
+    /// (`types.McpToolName`); null for any other call, or one core could not
+    /// name. Only the compact rows read them.
+    mcp_server: ?[]u8 = null,
+    mcp_tool: ?[]u8 = null,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit
@@ -116,6 +122,8 @@ pub const ToolDetailRecord = struct {
         }
         if (self.resolved_path) |value| alloc.free(value);
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+        if (self.mcp_server) |value| alloc.free(value);
+        if (self.mcp_tool) |value| alloc.free(value);
         self.* = undefined;
     }
 };

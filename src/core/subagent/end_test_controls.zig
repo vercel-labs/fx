@@ -38,7 +38,10 @@ const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const max_hold_ms = 60_000;
+
+/// The longest any hold waits for its release file. Every seam in this folder
+/// reads it from here.
+pub const max_hold_ms = 60_000;
 
 var holds = std.atomic.Value(u32).init(0);
 
@@ -202,7 +205,9 @@ fn holdOnFiles(counter: *std.atomic.Value(u32), files: HoldFiles, comptime fmt: 
     }
 }
 
-fn writeMarker(path: []const u8, contents: []const u8) !void {
+/// Writes a hold's marker file with owner-only permissions and syncs it. Every
+/// seam in this folder writes its marker here.
+pub fn writeMarker(path: []const u8, contents: []const u8) !void {
     var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
         .truncate = true,
         .permissions = private_file_permissions,
@@ -212,7 +217,9 @@ fn writeMarker(path: []const u8, contents: []const u8) !void {
     try file.sync(io_mod.getIo());
 }
 
-fn pathExists(path: []const u8) bool {
+/// Whether a hold's release file exists. Every seam in this folder checks it
+/// here.
+pub fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
