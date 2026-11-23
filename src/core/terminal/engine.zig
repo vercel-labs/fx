@@ -2550,6 +2550,7 @@ pub const Grid = struct {
             }
 
             var col: u16 = first;
+            var after_regional_indicator = false;
             while (col <= last) {
                 const cell = next.cells[next_base + col - 1];
                 if (cell.width == 0) {
@@ -2565,6 +2566,11 @@ pub const Grid = struct {
                     cur_hyperlink = cell.style.hyperlink_id;
                 }
                 if (cell.codepoint == '│') try out.print("\x1b[{d}G", .{col});
+                // Regional indicators written back to back join into one flag,
+                // so the second one moves the cursor onto its own cell first.
+                if (after_regional_indicator and isRegionalIndicator(cell.codepoint)) {
+                    try out.print("\x1b[{d}G", .{col});
+                }
                 const suffix = next.combiningSuffix(cell.combining_suffix_id);
                 const guard_margin_suffix = !prev.autowrap and
                     cell.width == 2 and
@@ -2578,6 +2584,7 @@ pub const Grid = struct {
                 // its second cell, so clear both first.
                 if (disputed_width and cell.width == 2) try out.writeAll("\x1b[2X");
                 try emitCodepoint(out, cell.codepoint);
+                after_regional_indicator = isRegionalIndicator(cell.codepoint);
                 if (suffix) |bytes| {
                     try out.writeAll(bytes);
                 }
@@ -3364,6 +3371,10 @@ fn cellsEqual(a_grid: Grid, a: Cell, b_grid: Grid, b: Cell) bool {
     const a_params = a_grid.hyperlinkParams(a.style.hyperlink_id) orelse return false;
     const b_params = b_grid.hyperlinkParams(b.style.hyperlink_id) orelse return false;
     return std.mem.eql(u8, a_url, b_url) and std.mem.eql(u8, a_params, b_params);
+}
+
+fn isRegionalIndicator(codepoint: u21) bool {
+    return codepoint >= 0x1F1E6 and codepoint <= 0x1F1FF;
 }
 
 /// Whether a cell's combining suffix holds VS15 or VS16, which terminals
@@ -4711,6 +4722,25 @@ test "diffTo emits \\x1b[0m at end when last style was non-default" {
     try Grid.diffTo(prev, next, &writer.writer);
     buf = writer.toArrayList();
     try testing.expect(std.mem.find(u8, buf.items, "\x1b[0m") != null);
+}
+
+test "diffBand keeps adjacent regional indicators in their own cells" {
+    // The flag at column 4 outlives the flag written over column 2, so both
+    // cells are set. Emitted back to back, the two would join into one flag.
+    var prev = try Grid.init(testing.allocator, 8, 1);
+    defer prev.deinit();
+    try prev.feed("\x1b[1;4H🇸\x1b[1;2H🇺");
+
+    var screen = try Grid.init(testing.allocator, 8, 1);
+    defer screen.deinit();
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffBand(screen, prev, 1, 1, &diff.writer);
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[4G🇸") != null);
+
+    try screen.feed(diff.written());
+    try testing.expectEqual(@as(u21, 0x1F1F8), screen.cellAt(1, 4).?.codepoint);
+    try testing.expect(screen.combiningSuffix(screen.cellAt(1, 2).?.combining_suffix_id) == null);
 }
 
 test "OSC 8 hyperlink round-trips through diffBand" {
