@@ -7854,6 +7854,103 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a search of a long command's saved output names the command by the short form its own row shows",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-search-row-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const fakeBin = join(root, "bin");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // A local stand-in for gh, so the command runs as written and no
+      // request leaves the machine. Its output is short, so Ctrl+O shows
+      // the search's row above what the search found.
+      const fakeGh = join(fakeBin, "gh");
+      writeFileSync(fakeGh, "#!/bin/sh\nprintf 'blob\\tsrc/a.zig\\nblob\\tsrc/b.zig\\ntree\\tsrc\\n'\n");
+      chmodSync(fakeGh, 0o755);
+      const command = String.raw`gh api repos/vercel-labs/fx-factory/git/trees/HEAD?recursive=1 --jq '.tree[] | "\(.type)\t\(.path)"'`;
+      const finalText = "COMMAND_SEARCH_ROW_FINISHED";
+
+      const commandGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        ) as Array<Record<string, unknown>>;
+        const output = (callId: string): string | null => {
+          const part = parts.find((candidate) => candidate.type === "tool-result" && candidate.toolCallId === callId);
+          return part ? contentText(part.output) : null;
+        };
+        if (output("search_tree") !== null) return fakeGatewayFinalText(finalText);
+        const listed = output("list_tree");
+        if (listed === null) {
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "list_tree", toolName: "shell", input: { request: { action: "run", command, profile: "clean", yield_time_ms: 30_000 } } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        const handle = listed.match(/fx-command-replay-[A-Za-z0-9_.-]+?\.bin/)?.[0];
+        if (!handle) return new Response("missing command output handle", { status: 500 });
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "search_tree", toolName: "read_tool_result", input: { handle, query: "blob" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = commandGateway;
+      const env = {
+        HOME: home,
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        AI_GATEWAY_API_KEY: "fake-command-search-row-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: commandGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: commandGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: commandGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, width: 140, height: 35, stderrPath, env });
+      const toolRows = (pane: string) =>
+        pane.split("\n").map((line) => line.trim()).filter((line) => /^[●├└] /.test(line));
+      const search = '└ Searched gh api output for "blob"';
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("List the tree, then search it.");
+      await session.waitForText(finalText, TIMEOUT);
+      // The search names the command by the short form its own row shows,
+      // not by core's full command.
+      const live = toolRows(await session.captureFullScrollback());
+      expect(live).toContain("├ Ran gh api");
+      expect(live).toContain(search);
+      expect(live.filter((row) => row.includes("fx-factory"))).toEqual([]);
+
+      // Ctrl+O keeps core's row, with the whole command.
+      await session.sendKeys("C-o");
+      const full = await session.waitForPane((pane) => pane.includes('output for "blob"'), TIMEOUT);
+      expect(full).toContain("Searched gh api repos/vercel-labs/fx-factory/git/trees/HEAD?recursive=1");
+      await session.sendKeys("C-o");
+      await session.waitForComposer(TIMEOUT);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // A resume shows the rows the live session ended with.
+      const resumedStderr = join(root, "resumed-stderr.log");
+      session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, width: 140, height: 35, stderrPath: resumedStderr, env });
+      await session.waitForComposer(TIMEOUT);
+      await session.waitForText(finalText, TIMEOUT);
+      expect(toolRows(await session.captureFullScrollback())).toEqual(live);
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "searches of a saved file cancelled while they stream in name the file and each search, not the handle",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-saved-search-cancel-")));

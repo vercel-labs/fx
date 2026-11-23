@@ -2783,6 +2783,36 @@ test "searches of one saved output share one row that names the source by its sh
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide_row) <= 54);
 }
 
+test "a search of a long command's saved output names the command by the short form its own row shows" {
+    const alloc = std.testing.allocator;
+    const command = "gh api repos/vercel-labs/fx-factory/git/trees/HEAD?recursive=1 --jq '.tree[] | \"\\(.type)\\t\\(.path)\"'";
+    const replay = "fx-command-replay-5e1d-0b7a.bin";
+    const arguments = try std.json.Stringify.valueAlloc(alloc, .{ .command = command }, .{});
+    defer alloc.free(arguments);
+    const search_arguments = "{\"handle\":\"" ++ replay ++ "\",\"query\":\"blob\"}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched " ++ command ++ " output for \"blob\"\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{
+        storyCommandDetail(1, arguments, 0, null),
+        .{ .entry_id = 2, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast(search_arguments), .outcome = .completed },
+    };
+    details[0].command_display = @constCast(command);
+    details[0].command_artifact_handle = @constCast(replay);
+    // The search finds the command by the output it saved, and again by
+    // core's row alone, as when the command is not in view.
+    for ([_]?[]u8{ details[0].command_artifact_handle, null }) |handle| {
+        details[0].command_artifact_handle = handle;
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("search of a command's output:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.find(u8, text, "├ Ran gh api\n") != null);
+        try std.testing.expect(std.mem.find(u8, text, "└ Searched gh api output for \"blob\"") != null);
+        try std.testing.expect(std.mem.find(u8, text, "fx-factory") == null);
+    }
+}
+
 test "a look into saved output has its finished row's words and name from the moment its arguments arrive" {
     const alloc = std.testing.allocator;
     // While the model streams the three calls in, core's rows name the
