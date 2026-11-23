@@ -3208,6 +3208,12 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                fn attachHistoricalCancelledCallDetail(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalCancelledCallDetail")) {
+                        try self.app.attachHistoricalCancelledCallDetail(entry_id, call);
+                    }
+                }
+
                 fn appendQuestionResolution(
                     self: *Self,
                     answers: []const types.QuestionAnswer,
@@ -3513,6 +3519,10 @@ pub fn Runtime(comptime App: type) type {
                     // The live row's command metadata, so the compact view
                     // shows the command's short form, as it did live.
                     try self.attachCommandDisplay(entry_id, call);
+                }
+
+                fn attachHistoricalCancelledCallDetail(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    try self.projection.attachHistoricalCancelledCallDetail(entry_id, call, self.activityKind(call));
                 }
 
                 fn appendQuestionResolution(
@@ -4101,14 +4111,19 @@ pub fn Runtime(comptime App: type) type {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
                         try writeModelCallNotices(sink, final_calls.after);
+                        const cancelled_call = cancelledCallOf(app, agent, entry);
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
+                        } else if (cancelled_call) |call| {
+                            try writeCancelledCallPresentation(app, agent, sink, call, entry.cancelled_wait, labels);
                         }
                         if (entry.tool_call) |call| {
                             try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
                         }
                         switch (entry.terminal_reason) {
-                            .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) {
+                            // The cancelled call's row says the turn stopped, as
+                            // it did live.
+                            .cancelled => if (entry.cancelled_command == null and cancelled_call == null and entry.cancellation_origin == .turn) {
                                 try sink.appendTurnCancellation();
                             },
                             .failed => try sink.appendNotice(
@@ -4190,6 +4205,48 @@ pub fn Runtime(comptime App: type) type {
                 presentation.command_artifact_handle,
                 replayed_output,
             );
+        }
+
+        /// The open call of a turn the user cancelled, when it is no command,
+        /// whose row a resume shows as live did: "Cancelled" and its call. A
+        /// command's row comes from its `cancelled_command` presentation
+        /// (D100), or not at all. Null when the turn has no such call.
+        fn cancelledCallOf(app: *App, agent: *AppAgent, entry: types.InterruptedHistoryTurn) ?types.ToolCall {
+            if (entry.cancelled_command != null) return null;
+            if (entry.terminal_reason != .cancelled or entry.cancellation_origin != .turn) return null;
+            const call = entry.tool_call orelse return null;
+            if (app.historicalToolActivityKind(agent, call) == .command) return null;
+            return call;
+        }
+
+        /// Writes the row of `model_call`, which the turn cancelled while it
+        /// ran, as live wrote it. A `subagent` wait names the subagents its
+        /// row named live (D102); a wait saved before that names none.
+        fn writeCancelledCallPresentation(
+            app: *App,
+            agent: *AppAgent,
+            sink: anytype,
+            model_call: types.ToolCall,
+            cancelled_wait: ?types.CancelledWaitPresentation,
+            labels: *HistoricalSessionLabels,
+        ) !void {
+            var action_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer mem_utils.deinit_arena(action_arena);
+            const arena = action_arena.allocator();
+            const call = try shownHistoricalCall(app, agent, arena, model_call);
+            const target = if (cancelled_wait) |wait|
+                wait.waited_for
+            else
+                historicalSessionTarget(arena, labels, call) orelse
+                    try tool_presentation.readToolResultDisplayTarget(
+                        arena,
+                        app.toolAdvertisementSet(agent).registry,
+                        call,
+                        &labels.saved_output_sources,
+                    );
+            const action = try app.describeToolActionDeniedWithAdvertised(agent, arena, call, target, "Cancelled", &.{});
+            const entry_id = try writeCompletedToolStatus(sink, .cancelled, action);
+            try sink.attachHistoricalCancelledCallDetail(entry_id, call);
         }
 
         fn writeExecutionHistory(app: *App, agent: *AppAgent, execution: types.ExecutionMemory) !void {
@@ -5928,6 +5985,8 @@ const TestApp = struct {
     cancelled_command_detail_count: usize = 0,
     cancelled_command_artifact_handle: ?[]u8 = null,
     cancelled_command_replayed_output: bool = false,
+    cancelled_call_detail_count: usize = 0,
+    denied_action_targets: std.ArrayList([]u8) = .empty,
     command_stdout: std.ArrayList(u8) = .empty,
     command_stderr: std.ArrayList(u8) = .empty,
     command_output_writes: std.ArrayList(CapturedCommandOutput) = .empty,
@@ -6042,6 +6101,8 @@ const TestApp = struct {
         self.historical_question_entry_ids.deinit(self.alloc);
         self.historical_tool_detail_entry_ids.deinit(self.alloc);
         if (self.cancelled_command_artifact_handle) |handle| self.alloc.free(handle);
+        for (self.denied_action_targets.items) |target| self.alloc.free(target);
+        self.denied_action_targets.deinit(self.alloc);
         self.command_stdout.deinit(self.alloc);
         self.command_stderr.deinit(self.alloc);
         for (self.command_output_writes.items) |write| self.alloc.free(write.text);
@@ -6183,6 +6244,11 @@ const TestApp = struct {
         }
     }
 
+    pub fn attachHistoricalCancelledCallDetail(self: *TestApp, entry_id: u32, _: types.ToolCall) !void {
+        try self.historical_tool_detail_entry_ids.append(self.alloc, entry_id);
+        self.cancelled_call_detail_count += 1;
+    }
+
     fn allocateTranscriptEntryId(self: *TestApp) u32 {
         const entry_id = self.next_transcript_entry_id;
         self.next_transcript_entry_id +%= 1;
@@ -6223,9 +6289,14 @@ const TestApp = struct {
         return arena.print("● Completed {s}", .{call.name});
     }
 
-    fn describeToolActionDeniedWithAdvertised(self: *TestApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionDeniedWithAdvertised(self: *TestApp, _: anytype, arena: Allocator, call: types.ToolCall, target: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
+        }
+        if (target) |text| {
+            const owned = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(owned);
+            try self.denied_action_targets.append(self.alloc, owned);
         }
         return arena.print("● {s} {s}", .{ label, call.name });
     }
@@ -9934,6 +10005,55 @@ test "zero-output cancelled command restores detail without an output block" {
     try std.testing.expectEqual(@as(usize, 1), app.cancelled_command_detail_count);
     try std.testing.expect(!app.cancelled_command_replayed_output);
     try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+}
+
+test "a cancelled call that is no command keeps its row on replay, in place of the turn's notice" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        turn: types.InterruptedHistoryTurn,
+        row: bool,
+        /// Whether the turn's own "Cancelled" notice follows.
+        notice: bool = false,
+        target: ?[]const u8 = null,
+    };
+    const read: types.ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const wait: types.ToolCall = .{ .id = "wait", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" };
+    const command: types.ToolCall = .{ .id = "cmd", .name = "shell", .arguments_json = "{\"command\":\"sleep 20\"}" };
+    const cases = [_]Case{
+        .{ .name = "read", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = true },
+        .{ .name = "wait with names (D102)", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "lander" } }, .row = true, .target = "lander" },
+        .{ .name = "wait saved before D102", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait }, .row = true },
+        // Unchanged: a command with no presentation, a failed turn, a turn
+        // that compaction cancelled, and a turn with no open call.
+        .{ .name = "command", .turn = .{ .user = .{ .text = @constCast("run") }, .tool_call = command }, .row = false, .notice = true },
+        .{ .name = "failed", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .terminal_reason = .failed }, .row = false },
+        .{ .name = "compaction", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .cancellation_origin = .compaction }, .row = false },
+        .{ .name = "no call", .turn = .{ .user = .{ .text = @constCast("stop") } }, .row = false, .notice = true },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var app = try TestApp.init(alloc, "/workspace");
+        defer app.deinit();
+        const history = [_]types.HistoryTurn{.{ .interrupted = case.turn }};
+        try Runtime(TestApp).replayHistory(&app, (&app).agent(), &history);
+        const rows: usize = if (case.row) 1 else 0;
+        try std.testing.expectEqual(rows, app.completed_tool_statuses.items.len);
+        try std.testing.expectEqual(rows, app.cancelled_call_detail_count);
+        if (case.row) {
+            try std.testing.expect(std.mem.startsWith(u8, app.completed_tool_statuses.items[0], "● Cancelled "));
+            try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, app.completed_tool_outcomes.items[0]);
+        }
+        // A cancelled call's row says the turn stopped, so no notice of the
+        // turn's own follows it.
+        try std.testing.expectEqual(case.notice, std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+        if (case.target) |target| {
+            try std.testing.expectEqual(@as(usize, 1), app.denied_action_targets.items.len);
+            try std.testing.expectEqualStrings(target, app.denied_action_targets.items[0]);
+        } else if (case.row) {
+            try std.testing.expectEqual(@as(usize, 0), app.denied_action_targets.items.len);
+        }
+    }
 }
 
 test "a command cancelled before it printed anything keeps its row across a persisted session restart (D100)" {

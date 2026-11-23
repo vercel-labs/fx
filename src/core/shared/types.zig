@@ -1262,6 +1262,14 @@ pub const CancelledCommandPresentation = struct {
     command_artifact_handle: ?[]const u8 = null,
 };
 
+/// A `subagent` wait the turn cancelled while it waited, so a resume shows
+/// its row again (D102).
+pub const CancelledWaitPresentation = struct {
+    /// The subagents its row named, such as "lander, scout", or null when
+    /// its host named none.
+    waited_for: ?[]const u8 = null,
+};
+
 pub const CommandProcessPresentation = union(enum) {
     exit_code: i64,
     signal: u32,
@@ -2783,6 +2791,8 @@ pub const InterruptedHistoryTurn = struct {
     completed_tool_names: [][]u8 = &.{},
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
+    /// Set only when `tool_call` is that wait.
+    cancelled_wait: ?CancelledWaitPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
     cancellation_origin: CancellationOrigin = .turn,
     /// fx stopped before the turn ended, by a crash or a closed window,
@@ -3130,6 +3140,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
+            if (entry.cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
         },
     }
 }
@@ -3209,6 +3220,12 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 freeCancelledCommandPresentation(alloc, presentation);
             };
 
+            const cancelled_wait = if (entry.cancelled_wait) |presentation|
+                try dupeCancelledWaitPresentation(alloc, presentation)
+            else
+                null;
+            errdefer if (cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
+
             const execution = try dupeExecutionMemory(alloc, entry.execution);
 
             break :blk .{ .interrupted = .{
@@ -3218,6 +3235,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .completed_tool_names = completed_tool_names,
                 .execution = execution,
                 .cancelled_command = cancelled_command,
+                .cancelled_wait = cancelled_wait,
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
@@ -3250,6 +3268,20 @@ pub fn freeCancelledCommandPresentation(
 ) void {
     if (presentation.output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     if (presentation.command_artifact_handle) |handle| alloc.free(@constCast(handle));
+}
+
+pub fn dupeCancelledWaitPresentation(
+    alloc: std.mem.Allocator,
+    presentation: CancelledWaitPresentation,
+) !CancelledWaitPresentation {
+    return .{ .waited_for = if (presentation.waited_for) |names| try alloc.dupe(u8, names) else null };
+}
+
+pub fn freeCancelledWaitPresentation(
+    alloc: std.mem.Allocator,
+    presentation: CancelledWaitPresentation,
+) void {
+    if (presentation.waited_for) |names| alloc.free(@constCast(names));
 }
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
@@ -4323,6 +4355,17 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     );
     freeHistoryTurn(alloc, interrupted_copy);
     freeHistoryTurn(alloc, interrupted_original);
+
+    const wait_original: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = try alloc.dupe(u8, "wait") },
+        .cancelled_wait = .{ .waited_for = try alloc.dupe(u8, "lander, scout") },
+    } };
+    const wait_copy = try dupeHistoryTurn(alloc, wait_original);
+    const copied_names = wait_copy.interrupted.cancelled_wait.?.waited_for.?;
+    try std.testing.expectEqualStrings("lander, scout", copied_names);
+    try std.testing.expect(copied_names.ptr != wait_original.interrupted.cancelled_wait.?.waited_for.?.ptr);
+    freeHistoryTurn(alloc, wait_copy);
+    freeHistoryTurn(alloc, wait_original);
 
     const finished_original = FinishedPrompt{
         .turn = .{ .interrupted = .{

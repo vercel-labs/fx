@@ -73,6 +73,7 @@ pub fn contextHistoryRange(
                     entry.tool_call = null;
                     entry.completed_tool_names = &.{};
                     entry.cancelled_command = null;
+                    entry.cancelled_wait = null;
                 },
                 .compacted_summary => unreachable,
             }

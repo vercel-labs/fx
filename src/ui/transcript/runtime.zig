@@ -6754,6 +6754,20 @@ pub const TranscriptRuntime = struct {
         if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
     }
 
+    /// The detail of a saved call, no command, that its turn cancelled
+    /// while it ran, as live left it: the call and a cancelled outcome.
+    pub fn attachHistoricalCancelledCallDetail(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        call: types.ToolCall,
+        activity_kind: types.ToolActivityKind,
+    ) !void {
+        try self.upsertToolDetailStart(alloc, entry_id, null, call.name, activity_kind, call.arguments_json);
+        try self.updateToolDetailTerminal(alloc, entry_id, null, call.name, activity_kind, .cancelled, null, null, null, null);
+        if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
+    }
+
     fn upsertToolDetailStart(
         self: *TranscriptRuntime,
         alloc: Allocator,
