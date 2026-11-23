@@ -1323,6 +1323,61 @@ fn checkRowPhrase(scratch: std.mem.Allocator, row: *const StoryRow, phrase: []co
     return try std.mem.concat(scratch, u8, &.{ label, " ", phrase[own_label.len..] });
 }
 
+/// Whether `check` is a shell check still running after `latest`, the row's
+/// latest call, found the command ended. While it runs its status reads
+/// `Waiting for`, a verb the command is past, so the row keeps showing how
+/// `latest` found the command ended until the check comes back.
+fn rechecksEndedCommand(scratch: std.mem.Allocator, latest: ?*const ToolDetailRecord, check: ?*const ToolDetailRecord) bool {
+    const ended = latest orelse return false;
+    const record = check orelse return false;
+    return ended.check_found_command_ended and record.outcome == null and isSessionCheck(scratch, record);
+}
+
+test "a check of a command an earlier check found ended keeps the row on that end while it runs" {
+    const alloc = std.testing.allocator;
+    const command = "fx-cloud run zig build test";
+    var run = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"fx-cloud run zig build test\"}", 0, null);
+    run.command_process_presentation = null;
+    run.command_display = @constCast(command);
+    var ended = storyCommandDetail(2, "{\"action\":\"interact\",\"session_id\":\"shell-4\"}", 0, null);
+    ended.command_process_presentation = null;
+    ended.command_display = @constCast(command);
+    ended.check_found_command_ended = true;
+    var recheck = ended;
+    recheck.entry_id = 3;
+    recheck.outcome = null;
+    recheck.check_found_command_ended = false;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Still running " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Observed " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "● Waiting for " ++ command ++ "\n", .class = .tool_status } },
+    };
+    const Case = struct {
+        name: []const u8,
+        ended_status: []const u8,
+        ended_outcome: types.ToolOutcomeKind = .completed,
+        ended_exit_code: ?i64 = null,
+        found_ended: bool = true,
+        want: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .name = "passed", .ended_status = "● Observed " ++ command ++ "\n", .want = "● Ran " ++ command ++ " · 3 calls ✓" },
+        .{ .name = "failed", .ended_status = "● Exited 1 " ++ command ++ "\n", .ended_outcome = .failed, .ended_exit_code = 1, .want = "● Exited 1 " ++ command ++ " · 3 calls" },
+        // A check after one that found the command still running waits too.
+        .{ .name = "still running", .ended_status = "● Observed " ++ command ++ "\n", .found_ended = false, .want = "● Waiting for " ++ command ++ " · 3 calls" },
+    };
+    for (cases) |case| {
+        entries[1].raw_bytes.bytes = case.ended_status;
+        ended.outcome = case.ended_outcome;
+        ended.command_process_presentation = if (case.ended_exit_code) |code| .{ .exit_code = code } else null;
+        ended.check_found_command_ended = case.found_ended;
+        const text = try groupTextForTest(alloc, &entries, &.{ run, ended, recheck });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ case.name, text });
+        try std.testing.expectEqualStrings(case.want, firstLineForTest(text));
+    }
+}
+
 test "a command check row keeps one verb while its command runs" {
     const alloc = std.testing.allocator;
     var run = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"fx-cloud run zig build test\"}", 0, null);
@@ -2914,6 +2969,7 @@ fn collectStoryRows(
         };
         target.count += 1;
         if (storyRowCallFailed(scratch, detail)) target.failures += 1;
+        if (rechecksEndedCommand(scratch, target.detail, detail)) continue :calls;
         target.entry = entry;
         target.entry_id = entry_id;
         target.detail = detail;
