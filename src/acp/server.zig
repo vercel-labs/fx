@@ -1984,15 +1984,16 @@ fn isOnlyMember(session: *ActiveSessionState, connection_id: ConnectionId) bool 
     return session.members.items.len == 1 and session.members.items[0].connection_id == connection_id;
 }
 
-/// A client leaves `session`: its input ended, or it closed the session. Its record leaves the
-/// audience under `audience_mutex`. Returns whether a member remains. The caller removes the
-/// session from its own lists, on its own thread.
-pub fn leaveMember(state: *ServerState, session: *ActiveSessionState) bool {
+/// A client leaves `session`: its input ended (`leave` is `.left`), or it closed the session (`.closed`).
+/// Its record leaves the audience under `audience_mutex`. Returns whether a member remains. The caller
+/// removes the session from its own lists, on its own thread.
+pub fn leaveMember(state: *ServerState, session: *ActiveSessionState, leave: FollowerLeave) bool {
     var audience = lockAudience(session);
     defer audience.unlock();
-    // The leaver's waiting input is withdrawn only when another member remains to take the turn.
+    // The leaver's waiting input is withdrawn only when another member remains to take the turn. A close
+    // answers it, because the client is still there to read the answer; an ended input has no reader.
     if (session.members.items.len > 1) {
-        if (findMemberLocked(session, state.connection_id)) |member| withdrawFollowerInput(member, session, .left);
+        if (findMemberLocked(session, state.connection_id)) |member| withdrawFollowerInput(member, session, leave);
     }
     return removeMemberLocked(session, state.connection_id);
 }
@@ -2669,7 +2670,7 @@ fn runServer(
             endClientInput(&state);
             reapSessionPrompt(session, true);
         }
-        if (leaveMember(&state, session)) removeMembershipForSession(&state, session);
+        if (leaveMember(&state, session, .left)) removeMembershipForSession(&state, session);
     }
     endClientInput(&state);
 }
@@ -6343,7 +6344,7 @@ pub fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     const session = findSession(state, session_id) orelse return state.writer.writeResponse(alloc, msg.id, "{}");
     // The main client closes a session a follower still has open. The follower becomes its
     // main, and the session, its turn and the follower's input stay open (the leave rule).
-    if (leaveMember(state, session)) {
+    if (leaveMember(state, session, .closed)) {
         removeMembershipForSession(state, session);
         return state.writer.writeResponse(alloc, msg.id, "{}");
     }
@@ -7705,7 +7706,7 @@ fn openHandOffTestSession(state: *ServerState, session_id: []const u8) !*ActiveS
 
 const HandOffRun = struct {
     fn run(state: *ServerState, session: *ActiveSessionState, moved: *bool) void {
-        moved.* = leaveMember(state, session);
+        moved.* = leaveMember(state, session, .left);
     }
 };
 
@@ -7759,7 +7760,7 @@ test "a permission write parked while the opener leaves reaches no client, and t
     const writing = try std.Thread.spawn(.{}, PermissionWriteRun.run, .{ session, request, alloc, &write_error });
     gate.awaitReached();
 
-    const moved = leaveMember(&state, session);
+    const moved = leaveMember(&state, session, .left);
     gate.release();
     writing.join();
 
@@ -7783,7 +7784,7 @@ test "a permission write parked while the opener leaves reaches no client, and t
 
 const LeaveRun = struct {
     fn run(state: *ServerState, session: *ActiveSessionState, moved: *bool) void {
-        moved.* = leaveMember(state, session);
+        moved.* = leaveMember(state, session, .left);
     }
 };
 
@@ -7955,7 +7956,7 @@ test "a session request that reads its target before a leave and its follow afte
     const targeting = try std.Thread.spawn(.{}, TargetRun.run, .{ &follower, alloc, parsed.value, &found });
     gate.awaitReached();
 
-    const moved = leaveMember(&state, session);
+    const moved = leaveMember(&state, session, .left);
     gate.release();
     targeting.join();
 
@@ -7982,7 +7983,7 @@ test "a turn that holds the main record reads its client field after the member 
     const reading = try std.Thread.spawn(.{}, HoldReadRun.run, .{ session, &gate, &read });
     gate.awaitReached();
 
-    _ = leaveMember(&state, session);
+    _ = leaveMember(&state, session, .left);
     state.deinit();
     @memset(std.mem.asBytes(&state), 0xaa);
     gate.release();

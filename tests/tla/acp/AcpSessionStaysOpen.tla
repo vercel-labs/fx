@@ -30,9 +30,7 @@ Designs, selected by the constant Design:
 Rules the model checks, in plain words:
 - Leaving while another member remains ("Stopping and withdrawing"): the
   leaver's queued prompts and untaken steers are withdrawn. A close answers
-  them as cancelled, and an input end traces them. The built code also traces
-  them without an answer when the main client closes while another member
-  remains; the spec's "Leaving a session" section says so. A running turn that the
+  them as cancelled, and an input end traces them. A running turn that the
   leaver's prompt started goes on, and its permission requests go to the next
   main. The model keeps steers in the queue with prompts, so the queue stands
   for both.

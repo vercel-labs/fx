@@ -160,7 +160,7 @@ The response to a steer arrives when the turn that took it ends. It carries that
 
 - `session/cancel` stops only the running turn. The steers that the turn didn't take and the queued prompts still run after it.
 - A client withdraws its own steer or queued prompt that hasn't run yet with `$/cancel_request` and the prompt's request id. fx answers the prompt with `-32800`, "Request cancelled". A steer that a turn has taken can't be withdrawn.
-- A `session/close` answers each steer and queued prompt of that client that hasn't run with `-32800`, except when the closing client is the main client and another client remains: then fx drops them without an answer. See "Leaving a session".
+- A `session/close` answers each of that client's waiting steers and queued prompts with `-32800`. See "Leaving a session".
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
@@ -206,7 +206,7 @@ A joined client's `session/close` or input end is that client leaving, as "Leavi
 
 A client leaves a session when it sends `session/close` for it, or when its input ends. The session stays open while any client has it, and its running turn goes on while another client remains.
 
-When a client leaves and another client remains, the leaving client's waiting prompts and steers are withdrawn with it. A `session/close` from a client that is not the main client answers each of them with `-32800`, "Request cancelled". When the main client closes the session while another client remains, or a client's input ends, fx drops them without an answer and traces each drop.
+When a client leaves and another client remains, the leaving client's waiting prompts and steers are withdrawn with it. A `session/close` answers each of that client's waiting steers and queued prompts with `-32800`, "Request cancelled". When a client's input ends, fx drops them without an answer and traces each drop.
 
 The last client to leave ends the session. Its `session/close` cancels the running turn and answers its queued prompts and steers with `-32800`. Its input end follows "Keeping turns after a disconnect".
 
