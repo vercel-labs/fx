@@ -4188,21 +4188,31 @@ fn isContentFilterBlock(root: std.json.Value) bool {
     const message_value = source.object.get("message") orelse return false;
     const message = jsonValueString(message_value) orelse return false;
     if (std.mem.find(u8, message, content_filter_block_phrase) == null) return false;
-    return statusesAllowContentFilterBlock(root);
+    return statusesAllowContentFilterBlock(root, source.object);
 }
 
-/// Whether every `statusCode` that `providerErrorEventStatus` reads is
+/// Whether every `statusCode` on the event, its `error`/`providerError`
+/// wrappers (and their `param`), and the nested object carrying `code` is
 /// absent or exactly 400. A malformed or different one rules the block out.
-fn statusesAllowContentFilterBlock(root: std.json.Value) bool {
+fn statusesAllowContentFilterBlock(root: std.json.Value, source: std.json.ObjectMap) bool {
     const bad_request_status = 400;
     if (root != .object) return false;
     if (!statusCodeFieldIsAbsentOr(root.object, bad_request_status)) return false;
-    const err = root.object.get("error") orelse return true;
-    if (err != .object) return true;
-    if (!statusCodeFieldIsAbsentOr(err.object, bad_request_status)) return false;
-    const param = err.object.get("param") orelse return true;
-    if (param != .object) return true;
-    return statusCodeFieldIsAbsentOr(param.object, bad_request_status);
+    if (!statusCodeFieldIsAbsentOr(source, bad_request_status)) return false;
+    if (source.get("param")) |param| {
+        if (param == .object and !statusCodeFieldIsAbsentOr(param.object, bad_request_status)) return false;
+    }
+    inline for (.{ "error", "providerError" }) |key| {
+        if (root.object.get(key)) |err| {
+            if (err == .object) {
+                if (!statusCodeFieldIsAbsentOr(err.object, bad_request_status)) return false;
+                if (err.object.get("param")) |param| {
+                    if (param == .object and !statusCodeFieldIsAbsentOr(param.object, bad_request_status)) return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 fn statusCodeFieldIsAbsentOr(object: std.json.ObjectMap, status: i64) bool {
@@ -6065,6 +6075,7 @@ test "consumeSseStream reads a streamed output filter error as a content filter 
             "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}}\n\n",
         "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}\n\n",
         "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ ".\"}}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ ".\",\"statusCode\":400}}}\n\n",
         "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"param\":{\"statusCode\":400}}}\n\n",
         test_filter_type_event ++ error_finish,
         "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n" ++ test_filter_type_event,
@@ -6095,6 +6106,8 @@ test "consumeSseStream keeps every other invalid request error and an explicit f
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"output blocked by content filtering policy\"}}\n\n" },
         // A status other than 400, a malformed one, or two that disagree.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"providerError\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}\n\n" },
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":\"400\"}}\n\n" },
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":200}}\n\n" },
         .{ .payload = "data: {\"type\":\"error\",\"statusCode\":500,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}}\n\n" },
