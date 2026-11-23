@@ -4244,10 +4244,12 @@ test "a follower's session/close detaches it, the session stays open for its own
     var joiner_frames = JoinFrames{ .alloc = alloc };
     defer joiner_frames.deinit();
     var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
     defer owner.deinit();
     const session = try openJoinSession(&owner);
 
     var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
     defer joiner.deinit();
     var load_msg = jsonrpc.Message{
         .id = .{ .integer = 2 },
