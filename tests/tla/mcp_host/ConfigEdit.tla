@@ -24,7 +24,9 @@
 \*     reads every key, and writes nothing.
 \*
 \* File states. "ok" is JSON the reader loads, "deep" is the same nested past
-\* the limit an edit writes back, and "broken" is not JSON, or repeats a key.
+\* the limit an edit writes back, and "broken" is not JSON, or repeats a key. `NoWriteOfDeep` is a
+\* property of one file, whatever the number of names, so the stress config sets Deep = FALSE:
+\* the fourth file state alone would more than double its states.
 \*
 \* Entry classes. "ok" loads from either file. "bad" is skipped from either: a
 \* URL that isn't https or loopback http with a port, a user name in the URL, a
@@ -47,7 +49,8 @@ CONSTANTS
     Checked,      \* BOOLEAN: add runs the reader on the new entry
     KeyScan,      \* "none", "bounded" or "complete": what the profile's keys are checked with
     GuardRemove,  \* BOOLEAN: remove checks the key too
-    Atomic        \* BOOLEAN: the reader check and the write are one step under the lock
+    Atomic,       \* BOOLEAN: the reader check and the write are one step under the lock
+    Deep          \* BOOLEAN: a file can be nested past the edit's limit (the "deep" state, Deepens and Flattens)
 
 Files == {"profile", "project"}
 \* What the profile's misspelled servers key holds: no such key, a server that is not one of Names, or the
@@ -57,7 +60,7 @@ OtherTypo == "other"
 HeldValues == Names \cup {NoTypo, OtherTypo}
 NoEntry == "none"
 Entries == Classes \cup {NoEntry}
-FileStates == {"absent", "ok", "deep", "broken"}
+FileStates == IF Deep THEN {"absent", "ok", "deep", "broken"} ELSE {"absent", "ok", "broken"}
 NoPend == [none |-> TRUE]
 
 VARIABLES
@@ -258,6 +261,7 @@ HandEntry(f, n, c) ==
 
 \* A person's editor nests a readable file past the limit an edit writes back, or flattens it again.
 Deepens(f) ==
+    /\ Deep
     /\ st[f] = "ok"
     /\ st' = [st EXCEPT ![f] = "deep"]
     /\ Edited(f)

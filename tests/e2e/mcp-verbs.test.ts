@@ -1576,7 +1576,7 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
   }, 90_000);
 
   // A file nested past the limit (src/core/shared/json_depth.zig) is not rewritten: the writer aborts the whole
-  // process at 256 levels. The reader still loads such a file.
+  // process from 257 levels. The reader still loads such a file.
   const nested = (levels: number, server = "old") => `{"mcpServers":{"${server}":{"command":"true"}},"notes":${"[".repeat(levels)}${"]".repeat(levels)}}`;
   const TOO_DEEP = "the file is nested more than 64 levels deep; flatten it by hand first";
 

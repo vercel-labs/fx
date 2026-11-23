@@ -37,8 +37,8 @@ pub const Error = Allocator.Error || error{
     TooDeep,
 };
 
-/// An edit writes the whole file back with `std.json.Stringify`, which aborts at 256 levels in a
-/// safe build, so a file past the shared limit is refused before it is parsed
+/// An edit writes the whole file back with `std.json.Stringify`, which aborts from 257 levels in a
+/// safe build (a `{}` or `[]` is one level, as in `json_depth`), so a file past the shared limit is refused before it is parsed
 /// (`tests/tla/mcp_host/ConfigEdit.tla` `NoWriteOfDeep`). Reading such a file is not limited.
 fn requireShallow(text: []const u8) error{TooDeep}!void {
     if (json_depth.exceeds(text)) return error.TooDeep;
@@ -390,7 +390,7 @@ test "add and remove edit a file at the nesting limit and refuse one past it, wh
     const a = arena.allocator();
     const entry: Entry = .{ .stdio = .{ .command = "y" } };
     const at_limit = try nestedFile(a, json_depth.max_depth - 1);
-    // `std.json.Stringify` aborts at 256 levels; 100,000 is far past anything it could hold.
+    // `std.json.Stringify` aborts from 257 levels; 100,000 is far past anything it could hold.
     const past_limit = [_]usize{ json_depth.max_depth, 256, 300, 100_000 };
     for ([_]File{ .profile, .project }) |file| {
         const added = try add(a, file, at_limit, "web", entry);

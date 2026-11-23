@@ -17,7 +17,7 @@ import { checkTrace, type TraceRecord, type Value } from "./trace";
 type Cls = "ok" | "bad" | "auth";
 type File = "profile" | "project";
 const NAMES = ["a", "b", "c"];
-const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true };
+const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true };
 
 const OK_URL = "https://ok.example/mcp";
 const BAD_URL = "http://example.com/mcp";
