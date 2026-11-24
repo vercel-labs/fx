@@ -755,6 +755,10 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
             .{pin_count},
         );
     }
+    if (self.assistant_tail.items.len > 0) {
+        debug_trace.logf("transcript", "assistant tail dropped at transcript clear entries={d}", .{self.assistant_tail.items.len});
+    }
+    freeAssistantTail(self, alloc);
     self.notebook.transcript.clearRetainingCapacity();
     self.notebook.transcript_cache_origin_untrimmed = false;
     if (comptime @hasDecl(@TypeOf(self.*), "clearFullTranscriptDetails")) {

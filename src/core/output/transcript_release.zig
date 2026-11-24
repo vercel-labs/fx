@@ -57,18 +57,44 @@ pub const State = struct {
         finalized_tool_turn_watermark: u64,
         replaceable_start: ?usize,
     ) ?usize {
+        return self.finality_floor_at_or_after(
+            candidates,
+            finalized_tool_turn_watermark,
+            replaceable_start,
+            0,
+        );
+    }
+
+    /// Like `finality_floor`, ignoring non-tail floors strictly before
+    /// `min_non_tail_byte` that native terminal history has already crossed;
+    /// `tail_start` always applies because provisional tail rows never enter
+    /// native history.
+    pub fn finality_floor_at_or_after(
+        self: State,
+        candidates: Candidates,
+        finalized_tool_turn_watermark: u64,
+        replaceable_start: ?usize,
+        min_non_tail_byte: usize,
+    ) ?usize {
         // Append-only output is final except for the provisional tail, which is never final.
         if (self.policy == .append_only) return candidates.tail_start;
 
-        var floor = candidates.mutation_pin_start;
+        var floor: ?usize = null;
+        if (candidates.mutation_pin_start) |start| {
+            if (start >= min_non_tail_byte) floor = earlier(floor, start);
+        }
         for (candidates.tool_turn_floors) |turn_floor| {
             if (turn_floor.turn_id <= finalized_tool_turn_watermark) continue;
-            floor = earlier(floor, turn_floor.start_byte);
+            if (turn_floor.start_byte >= min_non_tail_byte) {
+                floor = earlier(floor, turn_floor.start_byte);
+            }
         }
-        if (replaceable_start) |start| floor = earlier(floor, start);
+        if (replaceable_start) |start| {
+            if (start >= min_non_tail_byte) floor = earlier(floor, start);
+        }
         if (self.assistant_tail_writable) {
             if (candidates.assistant_tail_start) |start| {
-                floor = earlier(floor, start);
+                if (start >= min_non_tail_byte) floor = earlier(floor, start);
             }
         }
         if (candidates.tail_start) |start| floor = earlier(floor, start);
@@ -135,6 +161,28 @@ test "transcript release holds a provisional tail even when the assistant tail i
         (State{ .assistant_tail_writable = false }).finality_floor(candidates, 0, null),
     );
     try std.testing.expectEqual(@as(?usize, null), (State{}).finality_floor(.{}, 0, null));
+}
+
+test "finality_floor_at_or_after skips breached non-tail floors while preserving tail_start" {
+    const tool_turns = [_]ToolTurnFloor{
+        .{ .turn_id = 4, .start_byte = 12 },
+        .{ .turn_id = 5, .start_byte = 48 },
+    };
+    const candidates = Candidates{
+        .mutation_pin_start = 8,
+        .assistant_tail_start = 24,
+        .tail_start = 60,
+        .tool_turn_floors = &tool_turns,
+    };
+
+    try std.testing.expectEqual(
+        @as(?usize, 48),
+        (State{}).finality_floor_at_or_after(candidates, 3, 20, 30),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 60),
+        (State{}).finality_floor_at_or_after(candidates, 3, 20, 64),
+    );
 }
 
 test "assistant tail writability returns a new state" {

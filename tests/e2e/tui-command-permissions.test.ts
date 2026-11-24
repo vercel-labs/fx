@@ -1479,7 +1479,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossless direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && !pane.includes("Generating ("),
         TIMEOUT,
       );
 
@@ -1509,7 +1509,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossy direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSY_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSY_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSY_DONE") && !pane.includes("Generating ("),
         TIMEOUT,
       );
       const lossyCompact = await activeSession.captureFullScrollback();
@@ -3167,7 +3167,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForPane(
         (pane) =>
           pane.includes("classifier approved complete") &&
-          !pane.includes("Streaming ("),
+          !pane.includes("Generating ("),
         TIMEOUT,
       );
 

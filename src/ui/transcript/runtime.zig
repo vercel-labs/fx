@@ -5509,6 +5509,11 @@ pub const TranscriptRuntime = struct {
         self.transcript_commit_state.deinit(alloc);
         self.footer_viewport.deinit(alloc);
         self.ui_observer.deinit(alloc);
+        const shown_entries = self.assistant_tail.items.len;
+        const staged_events = if (self.staged_assistant_tail) |staged| staged.events.len else 0;
+        if (shown_entries > 0 or staged_events > 0) {
+            debug_trace.logf("transcript", "assistant tail dropped at deinit shown_entries={d} staged_events={d}", .{ shown_entries, staged_events });
+        }
         self.discardStagedAssistantTail();
         transcript_store.freeAssistantTail(self, alloc);
     }
@@ -5520,14 +5525,6 @@ pub const TranscriptRuntime = struct {
         self.staged_assistant_tail_id += 1;
         self.staged_assistant_tail = .{ .id = self.staged_assistant_tail_id, .events = events, .alloc = alloc };
         return self.staged_assistant_tail_id;
-    }
-
-    /// Gives up the staged tail only when `id` is its id. The caller owns the events.
-    pub fn takeStagedAssistantTail(self: *TranscriptRuntime, id: u64) ?[]assistant_presentation.Event {
-        const staged = self.staged_assistant_tail orelse return null;
-        if (staged.id != id) return null;
-        self.staged_assistant_tail = null;
-        return staged.events;
     }
 
     /// The pacer reports a due tail: its events become the transcript's tail.
@@ -9341,20 +9338,45 @@ pub const TranscriptRuntime = struct {
         return self.planTranscriptScrollForFrame(prepared, false, false);
     }
 
-    /// Selects the finality floor in flow bytes from the prepared paint's
+    /// Selects the finality floor in flow bytes at or after
+    /// `committed_history_visual_offset` from the prepared paint's
     /// activity-independent candidates plus the frame-fresh producer facts
     /// (lifecycle watermark, assistant-tail writability, replaceable tail).
     /// Null means the whole flow is final. Pure over its inputs, so repeated
     /// calls within one frame agree.
-    fn finalityFloorBytes(
+    fn finalityFloorBytesForHistory(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        committed_history_visual_offset: u32,
     ) ?usize {
-        return self.notebook.transcript_release.finality_floor(
+        const min_non_tail_byte = flowOffsetForVisualRowsFloor(
+            prepared,
+            committed_history_visual_offset,
+        );
+        return self.notebook.transcript_release.finality_floor_at_or_after(
             prepared.finality_candidates,
             self.finalizedToolTurnWatermark(),
             if (prepared.replaceable_last_line) prepared.replaceable_start else null,
+            min_non_tail_byte,
         );
+    }
+
+    fn flowOffsetForVisualRowsFloor(
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        visual_offset: u32,
+    ) usize {
+        if (visual_offset == 0) return 0;
+        const lines = prepared.sourceVisibleLines();
+        const visual_rows = prepared.sourceVisualRows();
+        var rows: u32 = 0;
+        for (lines, 0..) |line, index| {
+            if (rows >= visual_offset) switch (line) {
+                .transcript => |t| return t.ref.ref.start,
+                .folded_line => {},
+            };
+            if (index < visual_rows.len) rows += visual_rows[index];
+        }
+        return prepared.bytes.len;
     }
 
     /// Visual rows contributed by the flow prefix [0..flow_offset). The
@@ -9385,9 +9407,13 @@ pub const TranscriptRuntime = struct {
     fn finalityReleasableOffset(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        committed_history_visual_offset: u32,
         target_offset: u32,
     ) u32 {
-        const floor_bytes = self.finalityFloorBytes(prepared) orelse return target_offset;
+        const floor_bytes = self.finalityFloorBytesForHistory(
+            prepared,
+            committed_history_visual_offset,
+        ) orelse return target_offset;
         const floor_rows = preparedVisualRowsForFlowOffset(prepared, floor_bytes);
         return @min(target_offset, floor_rows);
     }
@@ -9505,9 +9531,13 @@ pub const TranscriptRuntime = struct {
                 }
                 const semantic_rows, const semantic_progress_rows = if (rebase_owes_nothing)
                     .{ @as(u32, 0), @as(u32, 0) }
-                else if (self.finalityFloorBytes(prepared) != null) bounded: {
+                else if (self.finalityFloorBytesForHistory(
+                    prepared,
+                    receipt.accepted_history_visual_offset,
+                ) != null) bounded: {
                     const releasable_offset = self.finalityReleasableOffset(
                         prepared,
+                        receipt.accepted_history_visual_offset,
                         target_offset,
                     );
                     const bounded_growth_rows = @min(
@@ -9644,7 +9674,11 @@ pub const TranscriptRuntime = struct {
         // cannot). Either fact missing forces zero release; the frame
         // re-anchors on the new flow and the derived history debt settles
         // on the next compatible frame through the existing replay.
-        const releasable_offset = self.finalityReleasableOffset(prepared, target_offset);
+        const releasable_offset = self.finalityReleasableOffset(
+            prepared,
+            anchor.history_visual_offset,
+            target_offset,
+        );
         const releasable_advance = releasable_offset -| anchor.history_visual_offset;
         const committed_projection_offset = committedProjectionVisualOffset(anchor);
         // Rows between history and the viewport are on no screen, so only a
@@ -11484,6 +11518,7 @@ pub const TranscriptRuntime = struct {
                 !self.fullTranscriptActive() and
                 self.finalityReleasableOffset(
                     prepared,
+                    target.history_visual_offset,
                     scroll_facts.target_visual_offset,
                 ) > target.history_visual_offset,
             .resize_reflow_rows = scroll_facts.resize_reflow_rows,
@@ -16285,7 +16320,7 @@ fn tailEventsWithText(alloc: Allocator, text: []const u8) ![]assistant_presentat
     return events;
 }
 
-test "staged assistant tail gives up only the id it was staged under" {
+test "staged assistant tail applies only the id it was staged under" {
     const alloc = std.testing.allocator;
     var runtime: TranscriptRuntime = .{};
     defer runtime.deinit(alloc);
@@ -16293,13 +16328,17 @@ test "staged assistant tail gives up only the id it was staged under" {
     const first = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "one"));
     const second = runtime.stageAssistantTail(alloc, try tailEventsWithText(alloc, "two"));
     try std.testing.expect(first != second);
-    try std.testing.expect(runtime.takeStagedAssistantTail(first) == null);
+    runtime.applyStagedAssistantTail(alloc, first);
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+    try std.testing.expect(runtime.staged_assistant_tail != null);
 
-    const events = runtime.takeStagedAssistantTail(second) orelse return error.TestExpectedStagedTail;
-    defer assistant_presentation.freeEventSlice(alloc, events);
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqualStrings("two", events[0].text);
-    try std.testing.expect(runtime.takeStagedAssistantTail(second) == null);
+    runtime.applyStagedAssistantTail(alloc, second);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+    try std.testing.expectEqualStrings("two", runtime.assistant_tail.items[0].assistant_turn.segments.text.items);
+    try std.testing.expect(runtime.staged_assistant_tail == null);
+
+    runtime.applyStagedAssistantTail(alloc, second);
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
 }
 
 test "staged assistant tail is freed when a newer tail replaces it and when the runtime deinits" {
@@ -16324,6 +16363,19 @@ test "a non-assistant append and a finished turn each clear the assistant tail" 
     transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
     // The tail is cleared before the turn's own checks, so their failure does not matter here.
     _ = runtime.applyTurnFinishedLifecycle(alloc, .{ .turn_id = 7, .outcome = .interrupted }, false) catch {};
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
+test "clearing the transcript drops a shown assistant tail" {
+    const alloc = std.testing.allocator;
+    var runtime: TranscriptRuntime = .{};
+    defer runtime.deinit(alloc);
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("streaming") }};
+
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    runtime.clearTranscript(alloc);
     try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
 }
 

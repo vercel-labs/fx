@@ -10508,3 +10508,135 @@ test "attaching a transcript slot and resetting the terminal shows only that tra
     try expectGridNotContains(&h, "child");
     try std.testing.expect(std.mem.find(u8, hidden.notebook.transcript.items, "child second") != null);
 }
+
+fn expectAllToolItemsVisible(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    item_count: usize,
+) !void {
+    const screen = try captureTrimmedGrid(h, alloc);
+    defer alloc.free(screen);
+    for (1..item_count + 1) |i| {
+        var marker_buf: [24]u8 = undefined;
+        const marker = try std.mem.print(&marker_buf, "item-{d:0>2}.txt", .{i});
+        if (std.mem.find(u8, probe.history.items, marker) == null and
+            std.mem.find(u8, screen, marker) == null)
+        {
+            std.debug.print(
+                "missing {s}: history_offset={d} visual_offset={d}\n",
+                .{
+                    marker,
+                    h.shell.transcriptCommitDiagnostic().history_visual_offset,
+                    h.shell.transcriptCommitDiagnostic().visual_offset,
+                },
+            );
+            return error.MissingTranscriptRow;
+        }
+    }
+}
+
+fn setupPickerClosePastToolFloor(
+    alloc: Allocator,
+    h: *Harness,
+    probe: *PhysicalHistoryProbe,
+    input: *InputRuntime,
+    approval: *approval_prompt.ApprovalPrompt,
+    item_count: usize,
+) !void {
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "intro 01\nintro 02\nintro 03\nintro 04\n",
+        true,
+    );
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+
+    _ = input.deletionState(null).delete(alloc, .character_left, .clear);
+    const group = types.ToolPresentationGroupId{ .turn_id = 99, .anchor_step_id = 1 };
+    for (1..item_count + 1) |i| {
+        var call_buf: [24]u8 = undefined;
+        var tool_buf: [24]u8 = undefined;
+        var summary_buf: [32]u8 = undefined;
+        const call_id = try std.mem.print(&call_buf, "read-hold-{d:0>2}", .{i});
+        const tool_name = try std.mem.print(&tool_buf, "tool_{d:0>2}", .{i});
+        const summary = try std.mem.print(&summary_buf, "Checked item-{d:0>2}.txt", .{i});
+        const id = types.ToolLifecycleId{ .turn_id = 99, .call_id = call_id };
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .presentation_group_id = if (i == 1) null else group,
+            .reconciles_provisional_call_id = null,
+            .tool_name = tool_name,
+            .activity_kind = .mcp,
+        } });
+        _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = summary },
+        } });
+    }
+    h.frame_redraw = true;
+    try renderTestFooter(h, input, approval, &h.frame_redraw);
+    try capturePhysicalFrame(h, probe);
+    try expectAllToolItemsVisible(alloc, h, probe, item_count);
+}
+
+test "a picker close past a tool finality floor keeps all rows visible during committed growth" {
+    const alloc = std.testing.allocator;
+    const item_count: usize = 30;
+    var h = try Harness.init(alloc, 100, 32, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try setupPickerClosePastToolFloor(alloc, &h, &probe, &input, &approval, item_count);
+
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "COMMITTED_REPLY_01\nCOMMITTED_REPLY_02\nCOMMITTED_REPLY_03\n",
+    );
+    h.shell.notebook.transcript_release = h.shell.notebook.transcript_release.with_assistant_tail_writable(false);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}
+
+test "a picker close past a tool finality floor keeps all rows visible during provisional tail growth" {
+    const alloc = std.testing.allocator;
+    const item_count: usize = 30;
+    var h = try Harness.init(alloc, 100, 32, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try setupPickerClosePastToolFloor(alloc, &h, &probe, &input, &approval, item_count);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, "PROVISIONAL_TAIL_LINE", &committed);
+    try applyProvisionalTail(&h, &processor);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}

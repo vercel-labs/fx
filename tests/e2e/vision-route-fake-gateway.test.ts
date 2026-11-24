@@ -3717,7 +3717,10 @@ describe("Vision route fake Gateway", () => {
         expect(secondApproval).toContain("Inspecting images");
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux outage continued", TIMEOUT);
+        await session.waitForPane(
+          (pane) => pane.includes("tmux outage continued") && !pane.includes("Generating ("),
+          TIMEOUT,
+        );
 
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).toContain("Inspected images");

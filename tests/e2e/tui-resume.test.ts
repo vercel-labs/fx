@@ -1266,7 +1266,7 @@ printf '${trailingMarker}   '
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("Streaming ("),
+        (pane) => pane.includes(doneMarker) && !pane.includes("Generating ("),
         TIMEOUT,
       );
       const compactGrid = await active.capturePaneGrid();
@@ -1882,7 +1882,7 @@ test.skipIf(!tmuxAvailable())(
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
       await active.waitForPane(
-        (pane) => pane.includes("FULL_CTRL_O_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("FULL_CTRL_O_DONE") && !pane.includes("Generating ("),
         TIMEOUT,
       );
       const compactGrid = await active.capturePaneGrid();
@@ -4320,7 +4320,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane(
         (pane) =>
           pane.includes("CTRL_O_HANDOFF_SCROLLBACK_DONE") &&
-          !pane.includes("Streaming ("),
+          !pane.includes("Generating ("),
         actionTimeout,
       );
       const scrollback = await active.captureFullScrollback();
@@ -7146,6 +7146,10 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(`Question 1 of ${batchSize}`, TIMEOUT);
       await active.sendLiteralText(
         Array.from({ length: batchSize }, (_, index) => (index % 2 === 0 ? "1" : "2")).join(""),
+      );
+      await active.waitForPane(
+        (pane) => pane.includes(completion) && !pane.includes("Generating ("),
+        TIMEOUT,
       );
       expectEveryAnswer(await waitForScrollback(active, completion));
       await active.sendText("/quit");
