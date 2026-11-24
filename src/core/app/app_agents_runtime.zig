@@ -3443,7 +3443,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Keeps a child's terminal provider error for the parent.
         pub fn noteChildFailure(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
-            if (status.kind != .terminal_provider_error) return;
+            if (status.kind != .terminal_provider_error and status.kind != .cyber_policy) return;
             const run = runInFlight(app, agent) orelse return;
             run.failure = status.diagnostic orelse return;
         }

@@ -632,6 +632,19 @@ function streamedErrorAfterPartialToolResponse(error: Record<string, unknown>): 
 
 const outputFilterMessage = "Output blocked by content filtering policy";
 
+const cyberPolicyMessage =
+  "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. " +
+  "If you\u2019re doing authorized security work that requires more cyber permissive safeguards, apply for access via " +
+  "https://example.com/cyber-access-application-form-with-a-long-path";
+
+function cyberPolicyHttpResponse(): Response {
+  return new Response(
+    JSON.stringify({ error: { type: "cyber_policy", code: "cyber_policy", message: cyberPolicyMessage } }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  );
+}
+
+
 function streamedFilterErrorResponse(form: "type" | "code"): Response {
   return streamedErrorAfterPartialToolResponse(
     form === "type"
@@ -14322,6 +14335,76 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("blocked.py");
       }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("cyber policy block in a stream ends the turn after one request and reports its cause", async () => {
+    const root = createFixtureRoot("streamed-cyber-policy");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      streamedErrorAfterPartialToolResponse({ type: "cyber_policy", message: cyberPolicyMessage })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the binary."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(json.recovery?.message).toStartWith(
+        "\u26a0 Blocked by the provider's cyber policy \u00b7 cyber_policy: This content was flagged",
+      );
+      expect(gateway.requestCount()).toBe(1);
+      // The whole provider message, with its guidance and link, reaches the person once.
+      expect(result.stderr).toContain(
+        `[notice] Blocked by the provider's cyber policy \u00b7 cyber_policy: ${cyberPolicyMessage}\n`,
+      );
+      expect(result.stderr.split("cyber permissive safeguards").length - 1).toBe(1);
+      expect(trace).not.toContain("event=content_filter_resend");
+      expect(trace).not.toContain("event=before_tool_execution");
+      expect(existsSync(join(root.workspace, "blocked.py"))).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("cyber policy block in an HTTP error ends the turn after one request and reports its cause", async () => {
+    const root = createFixtureRoot("http-cyber-policy");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => cyberPolicyHttpResponse());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the binary."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(json.recovery?.message).toStartWith(
+        "\u26a0 Blocked by the provider's cyber policy \u00b7 HTTP 400 \u00b7 cyber_policy: This content was flagged",
+      );
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain(cyberPolicyMessage);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

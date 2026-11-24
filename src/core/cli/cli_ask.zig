@@ -3593,6 +3593,9 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         .unsafe_tool_start,
         .content_filter,
         => ctx.output_mode != .json and ctx.output_mode != .quiet,
+        // The block's own notice or HTTP error already showed the provider's
+        // whole message, which this status's label would cut short.
+        .cyber_policy => false,
     };
     if (!notice) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;

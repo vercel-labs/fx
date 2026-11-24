@@ -3458,6 +3458,68 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a streamed cyber policy block shows the provider's message and is not resent",
+    async () => {
+      const guidance = "PROVIDER_GUIDANCE_TAIL";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-cyber-policy-",
+        [
+          fakeGatewaySse([
+            {
+              type: "error",
+              error: {
+                type: "cyber_policy",
+                message: `This content was flagged for possible cybersecurity risk. ${guidance}`,
+              },
+            },
+          ]),
+        ],
+      );
+
+      await session!.sendText("Inspect the binary.");
+      // The transcript notice and the status row both name the block.
+      await session!.waitForPane(
+        (pane) => pane.includes("system: Blocked by the provider's cyber policy") &&
+          pane.includes("\u26a0 Blocked by the provider's cyber policy"),
+        TIMEOUT,
+      );
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(1);
+      expect(scrollback).toContain(guidance);
+      expect(scrollback).not.toContain("press Esc");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a cyber policy HTTP error ends the turn without waiting to send it again",
+    async () => {
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-cyber-policy-http-",
+        [
+          () => new Response(
+            JSON.stringify({ error: { type: "cyber_policy", message: "This content was flagged for possible cybersecurity risk." } }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          ),
+        ],
+      );
+
+      await session!.sendText("Inspect the binary.");
+      await session!.waitForText("Blocked by the provider's cyber policy", TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(1);
+      expect(scrollback).not.toContain("The provider rejected this request");
+      expect(scrollback).not.toContain("press Esc");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a rejected request waits for the user and Enter sends it again",
     async () => {
       const finalText = "REJECTED_THEN_ANSWERED";

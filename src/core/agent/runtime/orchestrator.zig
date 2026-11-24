@@ -4997,7 +4997,7 @@ fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
 
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     return switch (kind) {
-        .invalid_request => .bad_request,
+        .invalid_request, .cyber_policy => .bad_request,
         .unauthorized => .unauthorized,
         .forbidden => .forbidden,
         .request_too_large => .payload_too_large,
@@ -5019,6 +5019,8 @@ fn needsUserFailureKind(
     failure: agent_stream_provider.Failure,
     credential_source: ?types.CredentialSource,
 ) ?runtime_request_recovery.Failure.Kind {
+    // A cyber policy block is reported, never sent again.
+    if (failure.kind == .cyber_policy) return null;
     if (failure.kind == .quota_exhausted or
         gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
     {
@@ -5034,6 +5036,7 @@ fn needsUserFailureKind(
         .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
         // 429 and 5xx retry.
         .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+        .cyber_policy => null,
     };
 }
 
@@ -5885,6 +5888,38 @@ fn pushTerminalProviderFailureStatus(
     });
 }
 
+/// Reports a cyber policy block as the request's terminal status, which
+/// `fx ask --json` and ACP report with the cause `cyber_policy`.
+fn pushCyberPolicyStatus(
+    request: *runtime_request_recovery.RequestRecovery,
+    diagnostic: types.ModelFailureDiagnostic,
+) !void {
+    try request.replaceStatus(.{
+        .kind = .cyber_policy,
+        .attempt = request.attempt(),
+        .diagnostic = diagnostic,
+    });
+}
+
+/// The most a cyber policy notice keeps of the provider's message, which is
+/// longer than a diagnostic holds and ends in the provider's guidance.
+const cyber_policy_notice_max_bytes = 1024;
+
+/// The notice for a cyber policy block: fx's name for it, then the
+/// provider's whole message, masked and made terminal-safe. Falls back to
+/// `diagnostic` when the provider sent no message. `arena` owns the result.
+fn cyberPolicyNotice(
+    arena: Allocator,
+    detail: []const u8,
+    diagnostic: types.ModelFailureDiagnostic,
+) ![]const u8 {
+    const masked = try text_utils.maskSecrets(arena, std.mem.trim(u8, detail, " \t\r\n"));
+    var encoded = try text_utils.encodeTerminalSafe(arena, masked, cyber_policy_notice_max_bytes);
+    defer encoded.deinit(arena);
+    const message = if (encoded.bytes.len > 0) encoded.bytes else diagnostic.view();
+    return arena.print("{s} · {s}", .{ types.RouteRecoveryStatus.cyber_policy_block_name, message });
+}
+
 /// A resend that had to reconcile uncertain tool evidence returned another
 /// tool call. fx cannot prove the earlier call didn't run, so the turn stops
 /// with its checkpoint kept for the user to inspect, as before; only the
@@ -6014,6 +6049,16 @@ fn prepareExternalFailureDiagnostic(
         null;
     defer if (owned_source) |source| alloc.free(source);
     const source = owned_source orelse if (trimmed.len > 0) trimmed else fallback;
+    return safeFailureDiagnostic(alloc, source, fallback);
+}
+
+/// `source` masked, made terminal-safe, and bounded as a diagnostic, or
+/// `fallback` when nothing is left of it.
+fn safeFailureDiagnostic(
+    alloc: Allocator,
+    source: []const u8,
+    fallback: []const u8,
+) !types.ModelFailureDiagnostic {
     const masked = try text_utils.maskSecrets(alloc, source);
     defer if (masked.ptr != source.ptr) alloc.free(masked);
 
@@ -9881,7 +9926,7 @@ fn processQueuedPromptLoop(
                 // elsewhere the turn ends as other non-retryable endings do.
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered)
                     .content_filter
-                else if (failure_cause == .non_retryable)
+                else if (failure_cause == .non_retryable or failure_cause == .cyber_policy)
                     null
                 else
                     runtime_request_recovery.failureKind(cause);
@@ -10081,8 +10126,18 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (attempt_completion.provider_failure_cause == .non_retryable) {
-                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                const failure_cause = attempt_completion.provider_failure_cause;
+                if (failure_cause == .non_retryable or failure_cause == .cyber_policy) {
+                    if (failure_cause == .cyber_policy) {
+                        try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(
+                            arena,
+                            attempt_completion.provider_failure_detail orelse "",
+                            diagnostic,
+                        ));
+                        try pushCyberPolicyStatus(&request_recovery, diagnostic);
+                    } else {
+                        try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    }
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
@@ -10215,6 +10270,14 @@ fn processQueuedPromptLoop(
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
                 try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
+            }
+            if (failure.kind == .cyber_policy) {
+                const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
+                const message = try gateway_error_format.formatHttpRecoveryDiagnostic(arena, failureStatus(failure), http_detail);
+                try pushCyberPolicyStatus(
+                    &request_recovery,
+                    try safeFailureDiagnostic(arena, message, types.cyber_policy_code),
+                );
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;

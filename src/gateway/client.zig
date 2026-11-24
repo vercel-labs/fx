@@ -4404,6 +4404,9 @@ const ErrorEventClass = enum {
     /// The provider's output content filter blocked the answer, sent as an
     /// error event rather than as a content filter finish.
     content_filter,
+    /// The provider's cybersecurity safeguard blocked the request. Like a
+    /// code a resend cannot fix, it ends the turn, under its own cause.
+    cyber_policy,
 
     /// Whether `next` replaces `current` as the stream's class: only when it
     /// says more. A code or a usable HTTP status beats an event with neither,
@@ -4419,7 +4422,7 @@ const ErrorEventClass = enum {
             .uncoded => 0,
             .transient => 1,
             .stream_timeout => 2,
-            .rate_limited, .non_retryable, .content_filter => 3,
+            .rate_limited, .non_retryable, .content_filter, .cyber_policy => 3,
         };
     }
 };
@@ -4482,6 +4485,7 @@ fn statusCodeFieldIsAbsentOr(object: std.json.ObjectMap, status: i64) bool {
 
 fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
     if (std.mem.eql(u8, code, "gateway_stream_timeout")) return .stream_timeout;
+    if (std.mem.eql(u8, code, types.cyber_policy_code)) return .cyber_policy;
     for (transient_provider_error_codes) |transient| {
         if (std.mem.eql(u8, code, transient)) return .transient;
     }
@@ -4495,27 +4499,33 @@ fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
 }
 
 /// The failure kind of an HTTP error response: `kind`, the provider's reading
-/// of its status, except that a 429 whose body names a used-up quota or spend
-/// cap is `quota_exhausted`, so the turn ends instead of waiting for a quota
-/// that does not come back. Every provider's HTTP failure path calls this.
+/// of its status, except that a body that names a cyber policy block is
+/// `cyber_policy`, and a 429 whose body names a used-up quota or spend cap is
+/// `quota_exhausted`. Both end the turn instead of waiting for something that
+/// does not change. Every provider's HTTP failure path calls this.
 pub fn httpFailureKind(
     alloc: std.mem.Allocator,
     kind: agent_stream_provider.FailureKind,
     body: ?[]const u8,
 ) agent_stream_provider.FailureKind {
-    if (kind != .rate_limited) return kind;
     const text = body orelse return kind;
+    if (errorBodyCodeIsOneOf(alloc, text, &.{types.cyber_policy_code})) return .cyber_policy;
+    if (kind != .rate_limited) return kind;
     return if (errorBodyNamesQuota(alloc, text)) .quota_exhausted else kind;
 }
 
-/// Whether an HTTP error body names a used-up quota or spend cap, read as
-/// `providerErrorEventCode` reads an error event.
 fn errorBodyNamesQuota(alloc: std.mem.Allocator, body: []const u8) bool {
+    return errorBodyCodeIsOneOf(alloc, body, &quota_error_codes);
+}
+
+/// Whether an HTTP error body's code is one of `codes`, read as
+/// `providerErrorEventCode` reads an error event.
+fn errorBodyCodeIsOneOf(alloc: std.mem.Allocator, body: []const u8, codes: []const []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
     defer parsed.deinit();
     const code = providerErrorEventCode(parsed.value) orelse return false;
-    for (quota_error_codes) |quota| {
-        if (std.mem.eql(u8, code, quota)) return true;
+    for (codes) |candidate| {
+        if (std.mem.eql(u8, code, candidate)) return true;
     }
     return false;
 }
@@ -4562,6 +4572,7 @@ fn streamFailureCause(
         .content_filter => null,
         // A classified code beats a timeout the finish names.
         .non_retryable => .non_retryable,
+        .cyber_policy => .cyber_policy,
         .rate_limited => .rate_limited,
         .stream_timeout => .gateway_stream_timeout,
         .transient => if (finish_timeout) .gateway_stream_timeout else null,
@@ -4589,7 +4600,7 @@ fn finishFromErrorEvents(
     if (class == .content_filter and error_or_missing) return .content_filter;
     if (finish != null) return finish;
     return switch (class) {
-        .transient, .rate_limited, .non_retryable => .provider_error,
+        .transient, .rate_limited, .non_retryable, .cyber_policy => .provider_error,
         .uncoded, .stream_timeout, .content_filter => null,
     };
 }
@@ -6398,6 +6409,88 @@ test "consumeSseStream keeps every other invalid request error and an explicit f
         try std.testing.expectEqual(case.finish, completion.finish_reason);
         try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
         try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
+    }
+}
+
+const test_cyber_message = "This content was flagged for possible cybersecurity risk.";
+const test_cyber_type_event = "data: {\"type\":\"error\",\"error\":{\"type\":\"cyber_policy\",\"message\":\"" ++ test_cyber_message ++ "\"}}\n\n";
+
+test "consumeSseStream reads a cyber policy error event as its own cause that is never resent" {
+    for ([_][]const u8{
+        test_cyber_type_event,
+        test_partial_tool_input ++ test_cyber_type_event,
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"cyber_policy\",\"message\":\"" ++ test_cyber_message ++ "\",\"statusCode\":400}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"cyber_policy\",\"message\":\"" ++ test_cyber_message ++ "\"}}}\n\n",
+        test_cyber_type_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n" ++ test_cyber_type_event,
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("cyber_policy", @tagName(completion.provider_failure_cause.?));
+        try std.testing.expectEqualStrings("cyber_policy: " ++ test_cyber_message, completion.provider_failure_detail.?);
+        try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
+    }
+}
+
+test "consumeSseStream keeps other codes, the code in text, and a normal finish as they were" {
+    const Case = struct {
+        payload: []const u8,
+        finish: ?types.ProviderFinishReason = .provider_error,
+        cause: ?types.ProviderFailureCause = .non_retryable,
+    };
+    const cases = [_]Case{
+        .{ .payload = test_bad_request_event },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"cyber_policy_v2\",\"message\":\"" ++ test_cyber_message ++ "\"}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"CYBER_POLICY\",\"message\":\"" ++ test_cyber_message ++ "\"}}\n\n" },
+        // The code only in the text or the message is not the code.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"cyber_policy\"}\n\n" ++ test_bad_request_event },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"cyber_policy: " ++ test_cyber_message ++ "\"}}\n\n" },
+        // The first classified event decides.
+        .{ .payload = test_bad_request_event ++ test_cyber_type_event },
+        // A normal finish decides on its own.
+        .{
+            .payload = test_cyber_type_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+            .finish = .stop,
+            .cause = null,
+        },
+        // A server error is still resent.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n", .cause = null },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.finish, completion.finish_reason);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+    // An output content filter block is still a content filter finish.
+    var filtered = try testStreamOutcome(test_filter_type_event);
+    defer deinitGatewayCompletion(std.testing.allocator, &filtered);
+    try std.testing.expectEqual(@as(?types.ProviderFinishReason, .content_filter), filtered.finish_reason);
+}
+
+test "httpFailureKind names a cyber policy block in any HTTP error body" {
+    const alloc = std.testing.allocator;
+    const Kind = agent_stream_provider.FailureKind;
+    for ([_][]const u8{
+        "{\"error\":{\"type\":\"cyber_policy\",\"message\":\"" ++ test_cyber_message ++ "\"}}",
+        "{\"error\":{\"code\":\"cyber_policy\",\"message\":\"" ++ test_cyber_message ++ "\"}}",
+        "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"cyber_policy\",\"message\":\"m\"}}}",
+    }) |body| {
+        for ([_]Kind{ .invalid_request, .forbidden, .provider_error }) |kind| {
+            errdefer std.debug.print("body: {s} kind: {s}\n", .{ body, @tagName(kind) });
+            try std.testing.expectEqualStrings("cyber_policy", @tagName(httpFailureKind(alloc, kind, body)));
+        }
+    }
+    for ([_]?[]const u8{
+        null,
+        "cyber_policy",
+        "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"cyber_policy: blocked\"}}",
+        "{\"error\":{\"code\":\"cyber_policy_v2\",\"message\":\"m\"}}",
+    }) |body| {
+        try std.testing.expectEqual(Kind.invalid_request, httpFailureKind(alloc, .invalid_request, body));
     }
 }
 

@@ -505,6 +505,9 @@ pub const FailureKind = enum {
     unavailable,
     gateway_timeout,
     provider_error,
+    /// An error whose body names the provider's cybersecurity safeguard:
+    /// fx reports it and does not resend.
+    cyber_policy,
 
     /// Classifies a provider's HTTP error status.
     pub fn fromHttpStatus(status: std.http.Status) FailureKind {

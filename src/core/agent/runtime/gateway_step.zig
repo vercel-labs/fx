@@ -321,7 +321,7 @@ test "the trace's error message masks the key before clipping and after decoding
 
 fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
     return switch (kind) {
-        .invalid_request => 400,
+        .invalid_request, .cyber_policy => 400,
         .unauthorized => 401,
         .forbidden => 403,
         .request_too_large => 413,
