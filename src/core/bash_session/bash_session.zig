@@ -730,9 +730,8 @@ fn removeAbandoned(io: std.Io, path: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const kind = (try entryKind(io, cwd, path)) orelse return;
     if (kind != .directory) return removeEntry(io, cwd, path, kind);
-    const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true };
-    const fd = try std.posix.openat(cwd.handle, path, flags, 0);
-    var folder = std.Io.Dir{ .handle = fd };
+    // Opened without following a link, so a link that took the path is refused, never followed.
+    var folder = try cwd.openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
     defer folder.close(io);
     try folder.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
     try cwd.deleteTree(io, path);
