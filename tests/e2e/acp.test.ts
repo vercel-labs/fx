@@ -12185,6 +12185,11 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  // ACP asks the same gateway for a session title after the first prompt
+  // (`src/acp/prompt.zig`, `session_titles`), so the fake's request log holds
+  // side calls too: a turn is a request that is not a title call.
+  const isTitleCall = (body: string) => body.includes(TITLE_GENERATION_MARKER);
+
   // In ACP a subagent's approval request goes to main, so main gets a note
   // turn and the fake answers it; its question still never goes to the client,
   // and a cancel does not end the wait. A reload stops such a subagent, as it
@@ -12221,9 +12226,13 @@ describe("acp: model-independent", () => {
           });
           const sessionId = await startAutoSession(acp, true);
           sendPrompt(acp, 7501, "Start the writing subagent.");
-          await waitForCondition("the parent's finished turn, the writer's request, and main's note turn", () => gateway.requests.length === 3, TIMEOUT);
+          const turns = () => gateway.requests.filter((request) => !isTitleCall(request.body));
+          // Each of the three turns it needs, by content, so a title call that
+          // arrives first cannot make an exact count unreachable.
+          await waitForCondition("the parent's finished turn", () => turns().some((request) => request.body.includes("reload_approval_call")), TIMEOUT);
+          await waitForCondition("the writer's request", () => turns().some((request) => !request.body.includes('"name":"subagent"')), TIMEOUT);
+          await waitForCondition("main's note turn", () => turns().filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
           await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
-          await waitForCondition("main's note turn", () => gateway.requests.filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
 
           acp.send(via === "session/cancel"
             ? { jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} }
@@ -12234,21 +12243,21 @@ describe("acp: model-independent", () => {
           expect(stopped.messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
           const outcomesBefore = reloadChildOutcomes(root.home, sessionId);
 
-          const base = gateway.requests.length;
+          const base = turns().length;
           sendPrompt(acp, 7503, "Report the writer's state.");
-          await waitForCondition("the next prompt's first request", () => gateway.requests.length > base, TIMEOUT);
+          await waitForCondition("the next prompt's first request", () => turns().length > base, TIMEOUT);
           // Wherever the request puts the turn's list of subagents, it holds the writer's line.
-          const note = JSON.stringify(acpGatewayRequest(gateway.requests[base]!.body)).match(/- writer: [^\\"]*/)?.[0] ?? "";
+          const note = JSON.stringify(acpGatewayRequest(turns()[base]!.body)).match(/- writer: [^\\"]*/)?.[0] ?? "";
           if (via === "session/cancel") {
             // The wait goes on, so the prompt does too, until the user cancels it.
             acp.send({ jsonrpc: "2.0", id: 7504, method: "session/cancel", params: {} });
           }
           const ended = await readUntilResponses(acp, via === "session/cancel" ? [7503, 7504] : [7503], TIMEOUT);
           expect(existsSync(target)).toBe(false);
-          seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason, requests: gateway.requests.length - base };
+          seen[via] = { outcomesBefore, note, stopReason: ended.responses.get(7503).result.stopReason, requests: turns().length - base };
           if (via === "session/load") {
             // The prompt ended by itself: its own turn, then the writer's report, which says it was stopped.
-            const reportTurn = gateway.requests[base + 1]!.body;
+            const reportTurn = turns()[base + 1]!.body;
             expect(acpLatestUserIsReport(reportTurn)).toBe(true);
             expect(reportTurn).toContain("fx stopped before it finished");
             const trace = readFileSync(tracePath, "utf8");
@@ -12313,10 +12322,12 @@ describe("acp: model-independent", () => {
         });
         const sessionId = await startAutoSession(acp, true);
         sendPrompt(acp, 7601, "Start both subagents.");
-        // The parent's two calls and its turn after each, the writer's request, and main's note turn.
-        await waitForCondition("both subagents' requests and main's note turn", () => gateway.requests.length === 5, TIMEOUT);
+        const turns = () => gateway.requests.filter((request) => !isTitleCall(request.body));
+        // The parent's two calls and its turn after each, the writer's request,
+        // and main's note turn, each by content.
+        await waitForCondition("both subagents' requests", () => turns().filter((request) => !request.body.includes('"name":"subagent"')).length === 2, TIMEOUT);
+        await waitForCondition("the parent's calls and main's note turn", () => turns().some((request) => request.body.includes("reload_hold_call")) && turns().filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
         await waitForCondition("the writer's wait for an approval", () => approvalWaitRegistered(tracePath), TIMEOUT);
-        await waitForCondition("main's note turn", () => gateway.requests.filter((request) => acpLatestPromptText(request.body).includes("I wait for your approval to run")).length === 1, TIMEOUT);
 
         acp.send({ jsonrpc: "2.0", id: 7602, method: "session/load", params: { sessionId, mcpServers: [] } });
         const reloaded = await readUntilResponses(acp, [7601, 7602], TIMEOUT);
@@ -12325,19 +12336,19 @@ describe("acp: model-independent", () => {
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
 
         // The prompt runs the writer's report, then waits for the holder.
-        const base = gateway.requests.length;
+        const base = turns().length;
         sendPrompt(acp, 7603, "Confirm the reloaded session is usable.");
-        await waitForCondition("the prompt's turn and the writer's report", () => gateway.requests.length === base + 2, TIMEOUT);
-        expect(acpLatestUserIsReport(gateway.requests[base + 1]!.body)).toBe(true);
-        expect(gateway.requests[base + 1]!.body).toContain("fx stopped before it finished");
+        await waitForCondition("the prompt's turn and the writer's report", () => turns().length === base + 2, TIMEOUT);
+        expect(acpLatestUserIsReport(turns()[base + 1]!.body)).toBe(true);
+        expect(turns()[base + 1]!.body).toContain("fx stopped before it finished");
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted"]);
 
         holder.resolve(finalText("HOLDER_DONE"));
         const ended = await readUntilResponses(acp, [7603], TIMEOUT);
         expect(ended.responses.get(7603).result.stopReason).toBe("end_turn");
         expect(reloadChildOutcomes(root.home, sessionId)).toEqual(["interrupted", "ok"]);
-        expect(gateway.requests.length).toBe(base + 3);
-        expect(gateway.requests[base + 2]!.body).toContain("HOLDER_DONE");
+        expect(turns().length).toBe(base + 3);
+        expect(turns()[base + 2]!.body).toContain("HOLDER_DONE");
         expect(existsSync(target)).toBe(false);
         expect(acp.stderr).toBe("");
       } finally {
