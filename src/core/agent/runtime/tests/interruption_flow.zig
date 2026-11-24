@@ -633,6 +633,47 @@ test "processQueuedPrompt persists interrupted turn with aborted tool output for
     try expectGatewayPromptRoleContentKinds(&follow_gateway, 0);
 }
 
+test "processQueuedPrompt keeps the names a cancelled wait's row showed in interrupted history (D102)" {
+    const alloc = std.testing.allocator;
+    const Case = struct { call: ToolCall, target: ?[]const u8, wait: bool };
+    const cases = [_]Case{
+        .{ .call = toolCall("call_wait", "subagent", "{\"action\":\"wait\"}"), .target = "lander", .wait = true },
+        .{ .call = toolCall("call_named", "subagent", "{\"action\":\"wait\",\"agent\":\"lander\"}"), .target = "lander, scout", .wait = true },
+        .{ .call = toolCall("call_unnamed", "subagent", "{\"action\":\"wait\"}"), .target = null, .wait = true },
+        // A message or a read the user cancelled is no wait.
+        .{ .call = toolCall("call_message", "subagent", "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"go\"}"), .target = "lander", .wait = false },
+        .{ .call = toolCall("call_read", "read_file", "{\"path\":\"notes.md\"}"), .target = null, .wait = false },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.call.id});
+        const calls = [_]ToolCall{case.call};
+        const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        hooks.exec_plans = &.{.{ .err = error.Cancelled }};
+        hooks.cancel_on_execute = &fixture.cancel_flag;
+        hooks.tool_display_target = case.target;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+        const interrupted = hooks.history_turns.items[0].interrupted;
+        try std.testing.expectEqualStrings(case.call.id, interrupted.tool_call.?.id);
+        try std.testing.expect(interrupted.cancelled_command == null);
+        if (!case.wait) {
+            try std.testing.expect(interrupted.cancelled_wait == null);
+            continue;
+        }
+        const wait = interrupted.cancelled_wait orelse return error.TestExpectedCancelledWait;
+        if (case.target) |target| {
+            try std.testing.expectEqualStrings(target, wait.waited_for.?);
+        } else try std.testing.expect(wait.waited_for == null);
+    }
+}
+
 test "processQueuedPrompt retains cancelled command replay in interrupted history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

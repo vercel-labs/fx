@@ -44,6 +44,7 @@ pub fn persistInterruptedTurnOnce(
         retained_candidate,
         terminal_materializing,
         null,
+        null,
         .turn,
     );
 }
@@ -71,6 +72,7 @@ pub fn persistCompactionInterruptedTurnOnce(
         current_turn_messages,
         retained_candidate,
         terminal_materializing,
+        null,
         null,
         .compaction,
     );
@@ -103,6 +105,42 @@ pub fn persistInterruptedCommandTurnOnce(
         retained_candidate,
         terminal_materializing,
         cancelled_command,
+        null,
+        .turn,
+    );
+}
+
+/// Persists a turn cancelled while its `subagent` wait `active_tool_call`
+/// waited, with the subagents its row named, so a resume shows the row
+/// (D102).
+pub fn persistInterruptedWaitTurnOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: ?[]const u8,
+    active_tool_call: ToolCall,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+    cancelled_wait: types.CancelledWaitPresentation,
+) !void {
+    return persistInterruptedTurnWithPresentation(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        active_tool_call,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+        null,
+        cancelled_wait,
         .turn,
     );
 }
@@ -120,6 +158,7 @@ fn persistInterruptedTurnWithPresentation(
     retained_candidate: ?[]const u8,
     terminal_materializing: *bool,
     cancelled_command: ?types.CancelledCommandPresentation,
+    cancelled_wait: ?types.CancelledWaitPresentation,
     cancellation_origin: types.CancellationOrigin,
 ) !void {
     if (persisted.*) return;
@@ -159,6 +198,7 @@ fn persistInterruptedTurnWithPresentation(
             .completed_tool_names = completed_tool_names,
             .execution = execution,
             .cancelled_command = cancelled_command,
+            .cancelled_wait = cancelled_wait,
             .cancellation_origin = cancellation_origin,
         } };
         const finished = try types.dupeFinishedPrompt(
@@ -202,6 +242,7 @@ fn persistInterruptedTurnWithPresentation(
         .completed_tool_names = completed_tool_names,
         .execution = execution,
         .cancelled_command = cancelled_command,
+        .cancelled_wait = cancelled_wait,
         .cancellation_origin = cancellation_origin,
     } };
 

@@ -6,7 +6,7 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { rootSessionIds } from "./saved-sessions";
+import { logLines, rootSessionIds, savedSessionIds } from "./saved-sessions";
 import {
   CHILD_MARKER,
   createStoryRoot,
@@ -1519,6 +1519,147 @@ test.skipIf(!tmuxAvailable())(
     expect(resumed).toEqual(live);
     // Ctrl+O still shows each message.
     for (const note of LANDER_NOTES) expect(fullTranscript).toContain(note);
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a wait the user stopped reads as stopping the wait, never as cancelling the subagent, live and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    let session: TmuxSession | undefined;
+    let releaseReport = () => {};
+    const reportHeld = new Promise<void>((release) => (releaseReport = release));
+    let stopped = false;
+    const calls = [startLander, bareWait("wait_1"), bareWait("wait_2")];
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const request = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        // One message during the first wait, and the report once the user
+        // stopped the second.
+        if (toolResultsAfter(request, CHILD_MARKER) === 0) {
+          await session!.waitForPane(() => waitsBegun() >= 1, TIMEOUT);
+          return fakeGatewayToolCall("lander_note_0", "subagent", { request: { action: "message", agent: "parent", message: LANDER_NOTES[0] } });
+        }
+        await reportHeld;
+        return fakeGatewayFinalText("Landed block B.");
+      }
+      if (stopped) return fakeGatewayFinalText("LANDED");
+      return calls[toolResultsAfter(request, "STOPPED_WAIT")]?.() ?? fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox,interrupt" };
+    const toolLines = (pane: string) => paneLines(pane).filter((line) => /^(●|├|└|▪) /.test(line));
+    const fullTranscriptOf = async (active: TmuxSession) => {
+      await active.sendKeys("C-o");
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+      let text = await active.capturePane();
+      for (let page = 0; page < 12 && !text.includes("Cancelled lander"); page += 1) {
+        await active.sendKeys("PPage");
+        text += await active.capturePane();
+      }
+      await active.sendKeys("C-o");
+      return text;
+    };
+    session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("STOPPED_WAIT");
+    await session.waitForPane(() => waitsBegun() >= 2, TIMEOUT);
+    await session.waitForText("Waiting for lander", TIMEOUT);
+    stopped = true;
+    await session.sendInterruptEscapePair(TIMEOUT);
+    await session.waitForPane(() => readFileSync(trace, "utf8").includes("event=interrupt_persisted"), TIMEOUT);
+    releaseReport();
+    await session.waitForText("LANDED", TIMEOUT);
+    const live = toolLines(await session.waitForComposer(TIMEOUT));
+    const liveTranscript = await fullTranscriptOf(session);
+
+    // The row says main stopped waiting, and counts the message the wait
+    // took; the notice under it names no subagent.
+    expect(live).toEqual([
+      "● Started a subagent · 1 cancelled",
+      "├ Started lander",
+      "└ Stopped waiting for lander · 1 message",
+      "▪ Cancelled · What can fx do differently?",
+      "● lander finished",
+    ]);
+    // Ctrl+O keeps core's words.
+    expect(liveTranscript).toContain("Cancelled lander");
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    // The turn saved whom the wait waited for, in an item of its own (D102).
+    const items = savedSessionIds(root.home)
+      .flatMap((id) => logLines(root.home, id))
+      .filter((line: any) => line.kind === "item" && line.type === "cancelled_wait");
+    expect(items.map((line: any) => line.data)).toEqual([{ call_id: "wait_2", subagents: "lander" }]);
+
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(toolLines(await resumed.waitForComposer(TIMEOUT))).toEqual(live);
+    expect(await fullTranscriptOf(resumed)).toContain("Cancelled lander");
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a message counts only on the wait row that waits for its sender, live and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    const trace = join(root.root, "trace.log");
+    const waitsBegun = () => (existsSync(trace) ? readFileSync(trace, "utf8").split("event=wait_begin").length - 1 : 0);
+    let session: TmuxSession | undefined;
+    // Lander sends a message during the first wait and reports during the
+    // third; scout sends one during the second and reports during the fourth.
+    const childSteps: Record<string, Array<{ afterWaits: number; message?: string; report?: string }>> = {
+      LANDER_JOB: [{ afterWaits: 1, message: "Lander one." }, { afterWaits: 3, report: "Landed." }],
+      SCOUT_JOB: [{ afterWaits: 2, message: "Scout one." }, { afterWaits: 4, report: "Mapped." }],
+    };
+    const calls = [
+      () => fakeGatewayToolCall("start_lander", "subagent", { action: "message", agent: "lander", message: "LANDER_JOB Land block B." }),
+      () => fakeGatewayToolCall("start_scout", "subagent", { action: "message", agent: "scout", message: "SCOUT_JOB Map the tray." }),
+      bareWait("wait_2"),
+      bareWait("wait_3"),
+      bareWait("wait_4"),
+      bareWait("wait_5"),
+    ];
+    const gateway = startDynamicFakeGateway(async (body) => {
+      const request = storyPrompt(body);
+      if (body.includes("You are the subagent")) {
+        const marker = Object.keys(childSteps).find((key) => body.includes(key))!;
+        const step = childSteps[marker][toolResultsAfter(request, marker)];
+        await session!.waitForPane(() => waitsBegun() >= step.afterWaits, TIMEOUT);
+        if (step.message) {
+          return fakeGatewayToolCall(`${marker}_note`, "subagent", { request: { action: "message", agent: "parent", message: step.message } });
+        }
+        return fakeGatewayFinalText(step.report!);
+      }
+      return calls[toolResultsAfter(request, "TWO_AGENTS")]?.() ?? fakeGatewayFinalText("LANDED");
+    });
+    gateways.push(gateway);
+    const env = { ...storyEnv(root, gateway), FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mailbox" };
+    session = await TmuxSession.create({ cwd: root.workspace, env, width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("TWO_AGENTS");
+    await session.waitForText("LANDED", TIMEOUT);
+    const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
+    // The last wait's row waits for scout only, so it counts scout's
+    // message, and lander's keeps its own line.
+    expect(live).toContain("└ Waited for scout · 1 message");
+    expect(live).toContain("● Message from lander");
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumed = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(resumed);
+    await resumed.waitForText("LANDED", TIMEOUT);
+    expect(paneLines(await resumed.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line))).toEqual(live);
   },
   TIMEOUT * 3,
 );

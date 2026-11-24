@@ -1551,6 +1551,10 @@ describe("effect-aware command permissions", () => {
       expect(lossyModelResult).toContain("  DIRECT_PADDED  ");
       expect(lossyModelResult).toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
+      // Both results hold their exact output, so neither repeats the replay
+      // handle that Ctrl-O reads.
+      expect(JSON.parse(losslessModelResult)).not.toHaveProperty("full_output_handle");
+      expect(JSON.parse(lossyModelResult)).not.toHaveProperty("full_output_handle");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -1567,8 +1571,8 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).toContain("full_output_handle");
-      expect(publicSession.stdout).toContain("fx-command-replay-");
+      expect(publicSession.stdout).not.toContain("full_output_handle");
+      expect(publicSession.stdout).not.toContain("fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3452,7 +3456,10 @@ describe("effect-aware command permissions", () => {
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
-        expect(commandSnapshot.full_output_handle).toMatch(/^fx-command-replay-.+\.bin$/);
+        // The output is exact text, so the result needs no replay handle.
+        expect(commandSnapshot).not.toHaveProperty("output_terminal_safe");
+        expect(commandSnapshot).not.toHaveProperty("output_truncated");
+        expect(commandSnapshot).not.toHaveProperty("full_output_handle");
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
         expect(gateway.requests[1]!.body).not.toContain("\\u0000");

@@ -217,9 +217,9 @@ pub const Notify = struct {
 pub const Options = struct {
     client_version: []const u8,
     /// Where sign-in credentials are kept. `.detect` names the home whose
-    /// store the owner thread picks with `credentials.Store.detect`, so
-    /// `start` never waits for the Keychain; the owner replaces it with
-    /// that store before it handles any request.
+    /// store the owner thread picks lazily with `credentials.Store.detect`
+    /// when an HTTP server needs it, so `start` never waits for the Keychain
+    /// and stdio-only configs never touch it.
     credentials: union(enum) { detect: []const u8, store: credentials.Store },
     /// The workspace whose `.mcp.json` servers keep their own logins.
     workspace_root: []const u8 = "",
@@ -588,6 +588,14 @@ pub const Runtime = struct {
         errdefer r.arena.deinit();
         errdefer r.snapshot_arena.deinit();
         const arena = r.arena.allocator();
+        r.options.workspace_root = try arena.dupe(u8, options.workspace_root);
+        r.options.credentials = switch (options.credentials) {
+            .detect => |home| .{ .detect = try arena.dupe(u8, home) },
+            .store => |store| .{ .store = .{
+                .home = try arena.dupe(u8, store.home),
+                .backend = store.backend,
+            } },
+        };
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
         const resolved = try config.resolve(scratch.allocator(), configs, inherited, r.options.workspace_root, io_mod.homeDir());
@@ -1233,7 +1241,7 @@ pub const Runtime = struct {
                 // may have saved it after this one took its own: it's revoked
                 // too, or it would stay valid at the server
                 // (`tests/tla/mcp_host/SharedLogins.tla` LogoutRevokesSaved).
-                const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
+                const saved = r.ensureCredentialStore().lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
                     else => blk: {
@@ -1252,11 +1260,11 @@ pub const Runtime = struct {
                 defer if (saved_token) |t| secret.zeroAndFree(r.gpa, t);
                 // The saved login goes first: a store that can't be read leaves
                 // the session signed in rather than half signed out.
-                if (r.options.credentials.store.remove(r.gpa, s.credentialKey())) |_| {} else |err| switch (err) {
+                if (r.ensureCredentialStore().remove(r.gpa, s.credentialKey())) |_| {} else |err| switch (err) {
                     error.CredentialStoreUnreadable => {
                         // Nothing is revoked, so nothing stays kept.
-                        if (held_token) |t| kept_sign_outs.forget(r.gpa, r.options.credentials.store, t);
-                        if (saved_token) |t| kept_sign_outs.forget(r.gpa, r.options.credentials.store, t);
+                        if (held_token) |t| kept_sign_outs.forget(r.gpa, r.ensureCredentialStore(), t);
+                        if (saved_token) |t| kept_sign_outs.forget(r.gpa, r.ensureCredentialStore(), t);
                         return r.finish(req, .{ .failed = error.CredentialStoreUnreadable });
                     },
                     else => {
@@ -1320,7 +1328,7 @@ pub const Runtime = struct {
             return r.finish(req, .ok);
         }
         // A sign-in that couldn't be saved would last only this session.
-        r.options.credentials.store.check(r.gpa) catch |err| switch (err) {
+        r.ensureCredentialStore().check(r.gpa) catch |err| switch (err) {
             error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
             else => debug_trace.logf("mcp", "MCP credential store not checked server={s} err={s}", .{ s.name, @errorName(err) }),
         };
@@ -1532,7 +1540,7 @@ pub const Runtime = struct {
     fn endLogout(r: *Runtime, l: PendingLogout, confirmed: bool) void {
         if (confirmed) l.request.logout_revocation = .confirmed;
         if (l.kept_token) |token| {
-            if (confirmed) kept_sign_outs.forget(r.gpa, r.options.credentials.store, token);
+            if (confirmed) kept_sign_outs.forget(r.gpa, r.ensureCredentialStore(), token);
             l.request.logout_retry_later = !confirmed;
             secret.zeroAndFree(r.gpa, token);
         }
@@ -2038,7 +2046,7 @@ pub const Runtime = struct {
         if (try r.engine.saveCredential(s.name, &out.writer)) {
             // A refresh's save is its last step under the refresh lock.
             for (r.refreshes.items) |*f| if (f.server == i) if (f.lock) |*l| l.restamp();
-            if (r.options.credentials.store.put(r.gpa, s.credentialKey(), out.written())) {
+            if (r.ensureCredentialStore().put(r.gpa, s.credentialKey(), out.written())) {
                 // Only a saved login is this process's own; one that wasn't
                 // leaves the store's as it was, for a refusal to remove.
                 r.flags[i].tried = credentials.digest(out.written());
@@ -2048,7 +2056,7 @@ pub const Runtime = struct {
                 if (r.flags[i].not_saved) return;
                 r.flags[i].not_saved = true;
                 var buf: [320]u8 = undefined;
-                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.options.credentials.store.writeFailure(&buf, err) } });
+                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.ensureCredentialStore().writeFailure(&buf, err) } });
             }
         } else {
             // The tokens are gone, so this process is signed out whatever
@@ -2057,7 +2065,7 @@ pub const Runtime = struct {
             const own = r.flags[i].tried orelse return debug_trace.logf("mcp", "MCP login dropped server={s} saved=none", .{s.name});
             // Only this process's own login goes: one another fx saved since
             // stays, for the next request to take.
-            const removed = r.options.credentials.store.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
+            const removed = r.ensureCredentialStore().removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
                 return debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
             };
             debug_trace.logf("mcp", "MCP login dropped server={s} saved={s}", .{ s.name, if (removed) "removed" else "kept, another fx saved a newer one" });
@@ -2311,7 +2319,7 @@ pub const Runtime = struct {
     fn adoptSaved(r: *Runtime, i: usize) void {
         const s = r.resolved.servers[i];
         if (s.url == null) return;
-        const found = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| {
+        const found = r.ensureCredentialStore().lookup(r.gpa, s.credentialKey()) catch |err| {
             if (err != error.OutOfMemory) r.store_unread = err;
             return debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
         };
@@ -2784,15 +2792,16 @@ pub const Runtime = struct {
     /// refreshes anyway.
     fn tryRefresh(r: *Runtime, f: *Refresh) !void {
         const s = r.resolved.servers[f.server];
-        if (r.options.credentials.store.tryRefreshLock(s.credentialKey())) |maybe| {
+        const store = r.ensureCredentialStore();
+        if (store.tryRefreshLock(s.credentialKey())) |maybe| {
             if (maybe) |lock| {
                 f.lock = lock;
-            } else if (!r.options.credentials.store.refreshHolderStopped(s.credentialKey(), f.started_ms, refresh_answer_ms)) {
+            } else if (!store.refreshHolderStopped(s.credentialKey(), f.started_ms, refresh_answer_ms)) {
                 return;
             } else debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=another fx stopped refreshing started={d} at={d}", .{ s.name, f.started_ms, r.nowMs() });
         } else |err| debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=no refresh lock err={s}", .{ s.name, @errorName(err) });
         f.sent = true;
-        const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
+        const saved = store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // Whether it's still saved can't be told, so it's refreshed as before.
             else => {
@@ -2854,7 +2863,7 @@ pub const Runtime = struct {
             debug_trace.logf("mcp", "MCP sign-out not kept reason=its login has no revocation endpoint fx may use", .{});
             return null;
         };
-        if (!kept_sign_outs.keep(r.gpa, r.options.credentials.store, tokens)) return null;
+        if (!kept_sign_outs.keep(r.gpa, r.ensureCredentialStore(), tokens)) return null;
         return r.gpa.dupe(u8, tokens.refresh_token) catch {
             // It stays kept, and a later retry revokes it.
             debug_trace.logf("mcp", "MCP kept sign-out not tracked reason=out of memory", .{});
@@ -2888,7 +2897,7 @@ pub const Runtime = struct {
     /// can't use it.
     fn takeSaved(r: *Runtime, i: usize) !bool {
         const s = r.resolved.servers[i];
-        const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
+        const saved = r.ensureCredentialStore().lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
@@ -2915,17 +2924,34 @@ pub const Runtime = struct {
         return true;
     }
 
+    fn hasHttpServer(r: *const Runtime) bool {
+        for (r.resolved.engine_server) |i| {
+            if (r.resolved.servers[i].url != null) return true;
+        }
+        return false;
+    }
+
+    fn ensureCredentialStore(r: *Runtime) credentials.Store {
+        switch (r.options.credentials) {
+            .store => |s| return s,
+            .detect => |home| {
+                const store = credentials.Store.detect(r.gpa, home);
+                r.options.credentials = .{ .store = store };
+                return store;
+            },
+        }
+    }
+
     /// Before any request: picks the store when `start` left that to the
     /// owner, reads it once, and gives each HTTP server the login saved
-    /// under its key, so no server starts without it. A store that can't be
+    /// under its key, so no server starts without it. Stdio-only configs
+    /// skip detection and snapshotting completely until an HTTP server is
+    /// added via reload (`ensureCredentialStore`). A store that can't be
     /// read leaves every server signed out, and `store_unread` says why.
     fn restoreCredentials(r: *Runtime) void {
         defer r.credentials_restored.set(r.io);
-        const store: credentials.Store = switch (r.options.credentials) {
-            .store => |s| s,
-            .detect => |home| .detect(r.gpa, home),
-        };
-        r.options.credentials = .{ .store = store };
+        if (!r.hasHttpServer()) return;
+        const store = r.ensureCredentialStore();
         var saved = store.snapshot(r.gpa) catch |err| {
             debug_trace.logf("mcp", "MCP credentials not loaded err={s}", .{@errorName(err)});
             r.store_unread = err;
@@ -3942,6 +3968,74 @@ test "saved credentials load on the owner thread, and statuses wait for them" {
     try testing.expect(!got[4].signed_in);
     try testing.expect(got[5].signed_in);
     try testing.expectEqual(State.idle, got[0].state);
+}
+
+test "stdio-only MCP startup skips credential store detection and snapshot" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    var options = f.options();
+    options.credentials = .{ .detect = f.home };
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const got = try r.statuses(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(State.idle, got[0].state);
+    try testing.expect(r.options.credentials == .detect);
+
+    const fx_dir = try std.Io.Dir.path.join(arena.allocator(), &.{ f.home, ".fx" });
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, fx_dir, .{}));
+}
+
+test "stdio-only MCP startup resolves credential store lazily on HTTP reload without dangling home" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    const home_arg = try testing.allocator.dupe(u8, f.home);
+    var home_freed = false;
+    defer if (!home_freed) testing.allocator.free(home_arg);
+    const ws_arg = try testing.allocator.dupe(u8, f.home);
+    var ws_freed = false;
+    defer if (!ws_freed) testing.allocator.free(ws_arg);
+
+    const before = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    var options = f.options();
+    options.credentials = .{ .detect = home_arg };
+    options.workspace_root = ws_arg;
+    try r.start(testing.allocator, testing.io, &before, &f.inherited, options);
+    defer r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const initial = try r.statuses(a);
+    try testing.expectEqual(@as(usize, 1), initial.len);
+    try testing.expect(r.options.credentials == .detect);
+
+    testing.allocator.free(home_arg);
+    home_freed = true;
+    testing.allocator.free(ws_arg);
+    ws_freed = true;
+
+    const after = [_]mcp_contract.McpServerConfig{
+        .{ .name = "fake", .command = f.server },
+        .{ .name = "web", .transport = .http, .url = "https://web.example.invalid/mcp" },
+    };
+    _ = try r.reload(&after, &f.inherited);
+    const reloaded = try r.statuses(a);
+    try testing.expectEqual(@as(usize, 2), reloaded.len);
+    try testing.expect(r.options.credentials == .store);
+    try testing.expectEqualStrings(f.home, r.options.credentials.store.home);
+    try testing.expectEqualStrings("web", reloaded[1].name);
+    try testing.expectEqual(State.idle, reloaded[1].state);
 }
 
 test "held servers say why, and unknown names and stdio logins are refused" {

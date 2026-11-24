@@ -1567,8 +1567,25 @@ fn subagentRowDeed(scratch: std.mem.Allocator, row: *const StoryRow) !?SubagentD
     return .other;
 }
 
-/// The verbs core puts before the subagents a wait concerns.
-const wait_leads = [_][]const u8{ "waited for ", "waiting for " };
+/// The verbs core puts before the subagents a wait concerns, and the word
+/// it puts before those of a wait the user stopped.
+const wait_leads = [_][]const u8{ "waited for ", "waiting for ", stopped_wait_lead };
+
+/// What core's status of a wait the user stopped leads with:
+/// "Cancelled lander" (`subagentAction` in
+/// src/core/tooling/tool_presentation.zig). Ctrl+O keeps core's words.
+const stopped_wait_lead = "Cancelled ";
+
+/// The subagents a wait the user stopped waited for, from `lead`, its
+/// status's lead, such as "lander" from "Cancelled lander". The row reads
+/// "Stopped waiting for lander", never "Cancelled lander", which would say
+/// the subagent was cancelled. Null for any other call.
+fn stoppedWaitNames(scratch: std.mem.Allocator, record: *const ToolDetailRecord, lead: []const u8) ?[]const u8 {
+    if (record.outcome != .cancelled or !isWaitAction(scratch, record)) return null;
+    if (!std.mem.startsWith(u8, lead, stopped_wait_lead)) return null;
+    const names = lead[stopped_wait_lead.len..];
+    return if (names.len == 0) null else names;
+}
 
 /// What core puts after a wait's verb when it lists no subagents
 /// (`action_words` in src/core/tooling/tool_presentation.zig).
@@ -2172,6 +2189,10 @@ const StoryRow = struct {
     /// The server of an MCP row's tool, from the first of its calls' results
     /// that names it; "" while none does.
     mcp_server: []const u8 = "",
+    /// An MCP row's server and tool as core named them for the first of its
+    /// calls it could (`ToolDetailRecord.mcp_server`); null while it named
+    /// none. It wins over `mcp_server` and the alias, which can only guess.
+    mcp_tool: ?types.McpToolName = null,
     /// The command the run that started the row's session sent, when the
     /// row's latest call is a later call to that session (sessionLaunchCommand).
     launch_command: ?[]const u8 = null,
@@ -2181,8 +2202,8 @@ const StoryRow = struct {
     /// Whether the row's latest call is a message that makes its subagent
     /// (`messageStarts`).
     starts: bool = false,
-    /// The messages the group's waits took, which the last row that reads
-    /// as a wait counts (`waitMessagesRow`).
+    /// The messages the group's waits took that this row counts
+    /// (`countWaitMessages`).
     received_messages: usize = 0,
     /// How many calls later rows that said the same stood for, which
     /// joinRepeatedRows folded into this one.
@@ -2601,6 +2622,7 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
     }
     // A report or a message a subagent sent to main.
     if (action == null) return try rewordSubagentLead(scratch, lead, &report_rewordings) orelse lead;
+    if (stoppedWaitNames(scratch, record, lead)) |names| return try std.mem.concat(scratch, u8, &.{ "Stopped waiting for ", names });
     // A wait, status, stop, or close leads with its verb, which takes a
     // capital like "Ran" and "Read".
     const verbs = [_][]const u8{ "waited ", "waiting ", "checked ", "checking ", "stopped ", "stopping ", "closed ", "closing ", "couldn't " };
@@ -3759,6 +3781,44 @@ fn mcpToolWords(scratch: std.mem.Allocator, alias: []const u8, server: []const u
     return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, name), " to ", words });
 }
 
+/// An MCP tool in words from the names core gave it (`StoryRow.mcp_tool`),
+/// as `mcpToolWords` writes them, but sure of the server and whole: no
+/// alias cut short or `_2` it took for a name another tool had. Null when
+/// the tool's name leaves no words.
+fn namedMcpToolWords(scratch: std.mem.Allocator, name: types.McpToolName) !?[]const u8 {
+    if (name.server.len == 0) return null;
+    const tool = withoutServerName(name.tool, name.server);
+    const words = try toolNameWords(scratch, tool);
+    if (words.len == 0) return null;
+    const server = try scratch.dupe(u8, name.server);
+    server[0] = std.ascii.toUpper(server[0]);
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, server), " to ", try terminalSafeText(scratch, words) });
+}
+
+/// `tool` without its repeat of `server`'s name, as slack's slack_read_thread
+/// reads as read_thread: the bytes the alias would spell alike, with case
+/// ignored, then "_" and more.
+fn withoutServerName(tool: []const u8, server: []const u8) []const u8 {
+    if (tool.len <= server.len + 1 or tool[server.len] != '_') return tool;
+    for (server, tool[0..server.len]) |a, b| {
+        if (aliasByte(a) != aliasByte(b)) return tool;
+    }
+    return tool[server.len + 1 ..];
+}
+
+fn aliasByte(byte: u8) u8 {
+    return if (mcp_tool_names.isIdentifierByte(byte)) std.ascii.toLower(byte) else '_';
+}
+
+/// The words for an MCP row's tool: from core's names when it gave them,
+/// else from its alias (`mcpToolWords`).
+fn mcpRowWords(scratch: std.mem.Allocator, alias: []const u8, row: *const StoryRow) !?[]const u8 {
+    if (row.mcp_tool) |name| if (types.isMcpToolName(alias)) {
+        if (try namedMcpToolWords(scratch, name)) |words| return words;
+    };
+    return mcpToolWords(scratch, alias, row.mcp_server);
+}
+
 /// A tool's name as lower-case words: "read thread" for read_thread, and
 /// "get issue" for getIssue. An alias holds only letters, digits, "_", and
 /// "-" (`isIdentifierByte` in src/core/mcp/tool_names.zig).
@@ -3792,7 +3852,7 @@ fn mcpRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const Stor
     const record = row.detail orelse return null;
     if (record.activity_kind != .mcp) return null;
     for (mcp_row_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
-        const shown = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const shown = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
         return try std.mem.concat(scratch, u8, &.{ label.shown, shown });
     };
     return null;
@@ -3818,7 +3878,7 @@ fn unrunMcpRowText(scratch: std.mem.Allocator, phrase: []const u8, row: *const S
     const record = row.detail orelse return null;
     if (record.outcome != .denied or record.activity_kind != .mcp) return null;
     for (mcp_unrun_labels) |label| if (std.mem.startsWith(u8, phrase, label.core)) {
-        const words = try mcpToolWords(scratch, phrase[label.core.len..], row.mcp_server) orelse return null;
+        const words = try mcpRowWords(scratch, phrase[label.core.len..], row) orelse return null;
         const body = try std.mem.concat(scratch, u8, &.{ "Didn't use ", words });
         return .{ .display = try std.mem.concat(scratch, u8, &.{ body, label.note }), .body = body, .suffix = label.note };
     };
@@ -3929,6 +3989,79 @@ test "MCP rows say in words which server's tool a call used" {
     try std.testing.expect(std.mem.find(u8, text, "get_account") == null);
     try std.testing.expect(std.mem.find(u8, text, "Ran MCP") == null);
     try std.testing.expect(std.mem.find(u8, text, "Running MCP") == null);
+}
+
+test "MCP rows name the server and tool core named for the call, in every state" {
+    const alloc = std.testing.allocator;
+    const Case = struct { phrase: []const u8, server: []const u8, tool: []const u8, outcome: ?types.ToolOutcomeKind, row: []const u8 };
+    const E = "\x1b";
+    const cases = [_]Case{
+        // A server whose name has a "_" or a space, in every state, with no
+        // result to name it.
+        .{ .phrase = "● Running MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = null, .row = "● Using My_srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .completed, .row = "● Used My_srv to echo" },
+        .{ .phrase = "● Failed mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .failed, .row = "● Couldn't use My_srv to echo" },
+        .{ .phrase = "● Safety caution mcp_my_srv_echo\n", .server = "my_srv", .tool = "echo", .outcome = .denied, .row = "● Didn't use My_srv to echo · safety caution" },
+        .{ .phrase = "● Denied mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · denied" },
+        .{ .phrase = "● Review unavailable mcp_Team_notes_echo\n", .server = "Team notes", .tool = "echo", .outcome = .denied, .row = "● Didn't use Team notes to echo · review unavailable" },
+        // A unicode server's alias is all "_" where the alias spells it.
+        .{ .phrase = "● Safety caution mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .denied, .row = "● Didn't use ünï to echo · safety caution" },
+        .{ .phrase = "● Ran MCP mcp___n___echo\n", .server = "ünï", .tool = "echo", .outcome = .completed, .row = "● Used ünï to echo" },
+        // The tool's own name, not the alias's spelling of it.
+        .{ .phrase = "● Ran MCP mcp_fixture_caf___list\n", .server = "fixture", .tool = "café_list", .outcome = .completed, .row = "● Used Fixture to café list" },
+        // An alias cut at 64 bytes, and one with the "_2" of a name another
+        // tool had first.
+        .{ .phrase = "● Ran MCP mcp_fixture_a_very_long_tool_name_that_goes_well_beyond_the_sixt\n", .server = "fixture", .tool = "a_very_long_tool_name_that_goes_well_beyond_the_sixty_four_byte_alias_limit", .outcome = .completed, .row = "● Used Fixture to a very long tool name that goes well beyond the sixty four byte alias limit" },
+        .{ .phrase = "● Ran MCP mcp_a_b_c_2\n", .server = "a", .tool = "b_c", .outcome = .completed, .row = "● Used A to b c" },
+        // A name the terminal would act on shows escaped.
+        .{ .phrase = "● Ran MCP mcp_bad__0_PWN_srv_echo\n", .server = "bad" ++ E ++ "]0;PWN\x07srv", .tool = "echo", .outcome = .completed, .row = "● Used Bad\\x1b]0;PWN\\x07srv to echo" },
+        .{ .phrase = "● Ran MCP mcp_fixture_echo\n", .server = "fixture", .tool = "ec\x07ho", .outcome = .completed, .row = "● Used Fixture to ec\\x07ho" },
+        // The tool repeats its server's name, as the alias spells it.
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture_list_items\n", .server = "fixture", .tool = "fixture_list_items", .outcome = .completed, .row = "● Used Fixture to list items" },
+        .{ .phrase = "● Ran MCP mcp_Team_notes_team_notes_search\n", .server = "Team notes", .tool = "team_notes_search", .outcome = .completed, .row = "● Used Team notes to search" },
+        .{ .phrase = "● Ran MCP mcp_fixture_fixture\n", .server = "fixture", .tool = "fixture", .outcome = .completed, .row = "● Used Fixture to fixture" },
+        .{ .phrase = "● Ran MCP mcp_1password_item2Get_v3\n", .server = "1password", .tool = "item2Get_v3", .outcome = .completed, .row = "● Used 1password to item2 get v3" },
+        .{ .phrase = "● Ran MCP mcp_fixture_getHTTPStatus\n", .server = "fixture", .tool = "getHTTPStatus", .outcome = .completed, .row = "● Used Fixture to get http status" },
+    };
+    for (cases) |case| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = case.phrase, .class = .tool_status } }};
+        const alias = std.mem.trimEnd(u8, case.phrase[std.mem.findScalar(u8, case.phrase, 'm').?..], "\n");
+        var arguments: [160]u8 = undefined;
+        const details = [_]ToolDetailRecord{.{
+            .entry_id = 1,
+            .tool_name = @constCast("toolbox"),
+            .activity_kind = .mcp,
+            .arguments_json = try std.mem.print(&arguments, "{{\"run\":\"{s}\",\"arguments\":{{}}}}", .{alias}),
+            .outcome = case.outcome,
+            .mcp_server = @constCast(case.server),
+            .mcp_tool = @constCast(case.tool),
+        }};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}=> {s}\n", .{ case.phrase, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A row learns the names from whichever of its calls core named, and a
+    // cancelled call's notice names the call as its row does.
+    const run = "{\"run\":\"mcp_my_srv_echo\",\"arguments\":{}}";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running MCP mcp_my_srv_echo\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "▪ Cancelled mcp_Team_notes_echo" ++ cancellation_follow_up, .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast(run), .mcp_server = @constCast("my_srv"), .mcp_tool = @constCast("echo") },
+        .{ .entry_id = 3, .tool_name = @constCast("toolbox"), .activity_kind = .mcp, .arguments_json = @constCast("{\"run\":\"mcp_Team_notes_echo\",\"arguments\":{}}"), .outcome = .cancelled, .mcp_server = @constCast("Team notes"), .mcp_tool = @constCast("echo") },
+    };
+    const text = try groupTextForTest(alloc, &entries, &details);
+    defer alloc.free(text);
+    errdefer std.debug.print("rows:\n{s}\n", .{text});
+    try std.testing.expect(std.mem.find(u8, text, "├ Using My_srv to echo ×2\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "└ Cancelled using Team notes to echo\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "▪ Cancelled using Team notes to echo" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, text, "an MCP tool") == null);
 }
 
 /// A running subagent call's identity by the agent its status names, such
@@ -4194,6 +4327,9 @@ fn collectStoryRows(
         target.tries = retries.tries.get(entry_id) orelse 0;
         if (target.mcp_server.len == 0) if (detail) |record| if (try mcpResultServer(scratch, record)) |server| {
             target.mcp_server = server;
+        };
+        if (target.mcp_tool == null) if (detail) |record| if (record.mcp_server) |server| if (record.mcp_tool) |tool| {
+            target.mcp_tool = .{ .server = server, .tool = tool };
         };
         try addSearchPath(scratch, target, detail);
         if (storyRowName(identity)) |name| try StoryTally.addLatest(&target.names, scratch, name);
@@ -4918,9 +5054,6 @@ fn recapTurnSummary(
 const GroupBlock = struct {
     bytes: []u8,
     lines: []const transcript_blocks.LineProvenance,
-    /// Whether a row counts the messages the group's waits took, so the
-    /// caller hides their own lines (`waitMessagesRow`).
-    counts_wait_messages: bool = false,
 };
 
 fn formatGroupBlock(
@@ -4931,7 +5064,8 @@ fn formatGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
+    wait_messages: []const usize,
+    counted_messages: []bool,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -4944,19 +5078,19 @@ fn formatGroupBlock(
     errdefer lines.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    var counts_wait_messages = false;
     // writeGroupBlock has no cleanup of its own, so its many failure points
     // share this one; each `try` here would repeat the cleanup in the binary.
-    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, wait_messages, &counts_wait_messages, focused_entry_id, collapse_tool_calls, cols, style, styles);
+    const header = try writeGroupBlock(alloc, scratch_state.allocator(), &out.writer, &lines, entries, status_indices, details, detail_indices, output_sources, summary, wait_messages, counted_messages, focused_entry_id, collapse_tool_calls, cols, style, styles);
     const bytes = if (collapse_tool_calls) try alloc.dupe(u8, header) else try out.toOwnedSlice();
     errdefer alloc.free(bytes);
-    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc), .counts_wait_messages = counts_wait_messages };
+    return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
 }
 
 /// Writes a group's header and, unless `collapse_tool_calls`, its rows to
 /// `out`, and their provenance to `lines`. `wait_messages` are the messages
-/// the group's waits took (`joinWaitChain`); `counts_wait_messages` says
-/// whether a row counts them. Returns the header, which lives in `scratch`.
+/// the group's waits took (`joinWaitChain`); `counted_messages` says which of
+/// them a row counts (`countWaitMessages`). Returns the header, which lives
+/// in `scratch`.
 fn writeGroupBlock(
     alloc: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -4968,8 +5102,8 @@ fn writeGroupBlock(
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     output_sources: *const OutputSources,
     summary: Summary,
-    wait_messages: usize,
-    counts_wait_messages: *bool,
+    wait_messages: []const usize,
+    counted_messages: []bool,
     focused_entry_id: ?u32,
     collapse_tool_calls: bool,
     cols: u16,
@@ -4996,10 +5130,7 @@ fn writeGroupBlock(
         try tally.observe(scratch, entry, detail);
     }
     try tally.subagent_rows.note(scratch, rows.items);
-    if (wait_messages > 0) if (waitMessagesRow(scratch, rows.items)) |row| {
-        row.received_messages = wait_messages;
-        counts_wait_messages.* = true;
-    };
+    try countWaitMessages(scratch, entries, rows.items, wait_messages, counted_messages);
     for (rows.items) |*row| {
         if (!storyCallFailed(row.detail)) continue;
         row.ends_turn = callEndsTurn(entries, row.status_index);
@@ -5069,11 +5200,12 @@ fn writeGroupBlock(
         const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
         if (detail.outcome != .cancelled) continue;
 
-        // A cancelled command's notice names no command; its row does. A
-        // call whose row names it in the compact row's words, such as a read
-        // of saved output or an MCP call, has a notice that names it so too.
+        // A cancelled command's notice names no command, and a stopped
+        // wait's names no subagent; its row does. A call whose row names it
+        // in the compact row's words, such as a read of saved output or an
+        // MCP call, has a notice that names it so too.
         var shown = entry;
-        const name = if (isShellCommandCall(scratch, detail)) "" else try cancelledCallName(scratch, rows.items, entry_id);
+        const name = if (isShellCommandCall(scratch, detail) or isWaitAction(scratch, detail)) "" else try cancelledCallName(scratch, rows.items, entry_id);
         if (name) |shown_name| if (try cancelledNotice(scratch, entry.raw_bytes.bytes, shown_name)) |notice| {
             shown.raw_bytes.bytes = notice;
         };
@@ -6771,17 +6903,48 @@ fn buildWithStyleAndStats(
     return projection;
 }
 
-/// The row that counts the messages a group's waits took: the last row that
-/// reads as a wait. Null when later calls to the subagents took over every
-/// wait's row, so the messages keep their own lines: on a row that reads
-/// "Messaged lander", a count would read as main's own messages.
-fn waitMessagesRow(scratch: std.mem.Allocator, rows: []StoryRow) ?*StoryRow {
-    var latest_wait_row: ?*StoryRow = null;
-    for (rows) |*row| {
-        if (!isWaitCall(scratch, row.detail)) continue;
-        if (latest_wait_row == null or row.status_index > latest_wait_row.?.status_index) latest_wait_row = row;
+/// Counts each of `messages`, the messages a group's waits took, on the row
+/// that waits for its sender (`waitRowFor`), and marks it in `counted`, so
+/// its own line goes. A message no row waits for keeps its own line.
+fn countWaitMessages(scratch: std.mem.Allocator, entries: []const TranscriptEntry, rows: []StoryRow, messages: []const usize, counted: []bool) !void {
+    for (messages, counted) |index, *is_counted| {
+        const sender = try messageSender(scratch, entries[index]) orelse continue;
+        const row = try waitRowFor(scratch, rows, sender) orelse continue;
+        row.received_messages += 1;
+        is_counted.* = true;
     }
-    return latest_wait_row;
+}
+
+/// The row that counts a message from `sender` that a group's waits took:
+/// the last row that reads as a wait for `sender` (`rowWaitsFor`). Null when
+/// none does: on a row that reads "Messaged lander" or "Waited for scout", a
+/// count would read as main's own messages or as scout's.
+fn waitRowFor(scratch: std.mem.Allocator, rows: []StoryRow, sender: []const u8) !?*StoryRow {
+    var found: ?*StoryRow = null;
+    for (rows) |*row| {
+        if (!try rowWaitsFor(scratch, row, sender)) continue;
+        if (found == null or row.status_index > found.?.status_index) found = row;
+    }
+    return found;
+}
+
+/// Whether `row` reads as a wait for `sender`: its latest call is a wait,
+/// done or stopped, that names `sender`, or a bare wait whose row lists
+/// `sender` or lists no subagent.
+fn rowWaitsFor(scratch: std.mem.Allocator, row: *const StoryRow, sender: []const u8) !bool {
+    const record = row.detail orelse return false;
+    if (!isWaitCall(scratch, record) and !(record.outcome == .cancelled and isWaitAction(scratch, record))) return false;
+    if (row.identity.kind == .subagent) return std.mem.eql(u8, row.identity.key, sender);
+    const roster = waitRoster(try entryStatus(scratch, row.entry) orelse "") orelse return true;
+    return listsName(roster, sender);
+}
+
+/// Whether a call is main's `subagent` wait, however it ended.
+fn isWaitAction(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool {
+    const record = detail orelse return false;
+    if (!std.mem.eql(u8, record.tool_name, "subagent") or record.subagent_report) return false;
+    const action = storyArgString(scratch, record, "action") orelse return false;
+    return std.mem.eql(u8, action, "wait");
 }
 
 /// Whether a call is main's `subagent` wait that has not failed.
@@ -6797,14 +6960,25 @@ fn isWaitCall(scratch: std.mem.Allocator, detail: ?*const ToolDetailRecord) bool
 /// Whether a report's row is a message from a subagent `roster` lists, or
 /// from any subagent when the wait listed none.
 fn isMessageFrom(scratch: std.mem.Allocator, entry: TranscriptEntry, roster: ?[]const u8) !bool {
-    const phrase = try entryStatus(scratch, entry) orelse return false;
+    const sender = try messageSender(scratch, entry) orelse return false;
+    const names = roster orelse return true;
+    return listsName(names, sender);
+}
+
+/// The subagent a message's row is from, such as "lander", or null when
+/// the row is no message from a subagent.
+fn messageSender(scratch: std.mem.Allocator, entry: TranscriptEntry) !?[]const u8 {
+    const phrase = try entryStatus(scratch, entry) orelse return null;
     const lead = if (std.mem.find(u8, phrase, " · ")) |at| phrase[0..at] else phrase;
     const message_lead = report_rewordings[0].match;
-    if (!std.mem.startsWith(u8, lead, message_lead)) return false;
-    const sender = lead[message_lead.len..];
-    const names = roster orelse return true;
-    var listed = std.mem.splitSequence(u8, names, ", ");
-    while (listed.next()) |name| if (std.mem.eql(u8, name, sender)) return true;
+    if (!std.mem.startsWith(u8, lead, message_lead)) return null;
+    return lead[message_lead.len..];
+}
+
+/// Whether `roster`, such as "lander, scout", lists `name`.
+fn listsName(roster: []const u8, name: []const u8) bool {
+    var listed = std.mem.splitSequence(u8, roster, ", ");
+    while (listed.next()) |listed_name| if (std.mem.eql(u8, listed_name, name)) return true;
     return false;
 }
 
@@ -6843,7 +7017,7 @@ fn callIsAloneInGroup(
 /// "Waited for lander" show as one row, "Waited for lander · 1 message".
 /// After the group's first wait, it takes each message from a subagent the
 /// wait before it lists, whatever row that wait shares, into `messages`,
-/// which the last row that reads as a wait counts (`waitMessagesRow`).
+/// which the row that waits for its sender counts (`countWaitMessages`).
 /// When the group ends on a wait, it goes on after the group: it takes such
 /// messages and each wait that would be alone in its group and share that
 /// row, and stops at anything else, such as a report like "lander
@@ -6912,11 +7086,12 @@ fn joinWaitChain(
     }
 }
 
-/// Hides the lines of the messages a group's waits took once a row of
-/// `block` counts them. Ctrl+O still shows each one.
-fn hideCountedMessages(projection: *Projection, block: GroupBlock, messages: []const usize) void {
-    if (!block.counts_wait_messages) return;
-    for (messages) |index| projection.entry_actions.items[index] = .hide;
+/// Hides the lines of the messages a group's waits took that a row counts.
+/// Ctrl+O still shows each one.
+fn hideCountedMessages(projection: *Projection, messages: []const usize, counted: []const bool) void {
+    for (messages, counted) |index, is_counted| if (is_counted) {
+        projection.entry_actions.items[index] = .hide;
+    };
 }
 
 /// The detail of the call whose status entry is at `index`.
@@ -7102,6 +7277,9 @@ fn fillProjection(
             var wait_messages: std.ArrayList(usize) = .empty;
             defer wait_messages.deinit(alloc);
             try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &group_indices, &group_summary, &wait_messages);
+            const counted_messages = try alloc.alloc(bool, wait_messages.items.len);
+            defer alloc.free(counted_messages);
+            @memset(counted_messages, false);
 
             const bytes = try formatGroupBlock(
                 alloc,
@@ -7111,14 +7289,15 @@ fn fillProjection(
                 detail_indices,
                 &output_sources,
                 group_summary,
-                wait_messages.items.len,
+                wait_messages.items,
+                counted_messages,
                 focused_entry_id,
                 collapse_tool_calls,
                 cols,
                 style,
                 styles,
             );
-            hideCountedMessages(projection, bytes, wait_messages.items);
+            hideCountedMessages(projection, wait_messages.items, counted_messages);
             if (bytes.bytes.len == 0) {
                 // Its calls name nothing yet, so the group shows nothing.
                 alloc.free(bytes.bytes);
@@ -7173,6 +7352,9 @@ fn fillProjection(
         var wait_messages: std.ArrayList(usize) = .empty;
         defer wait_messages.deinit(alloc);
         try joinWaitChain(alloc, projection, entries, details, detail_indices, presentation_group_indices, presentation_groups.items, &status_indices, &summary, &wait_messages);
+        const counted_messages = try alloc.alloc(bool, wait_messages.items.len);
+        defer alloc.free(counted_messages);
+        @memset(counted_messages, false);
 
         const bytes = try formatGroupBlock(
             alloc,
@@ -7182,14 +7364,15 @@ fn fillProjection(
             detail_indices,
             &output_sources,
             summary,
-            wait_messages.items.len,
+            wait_messages.items,
+            counted_messages,
             focused_entry_id,
             collapse_tool_calls,
             cols,
             style,
             styles,
         );
-        hideCountedMessages(projection, bytes, wait_messages.items);
+        hideCountedMessages(projection, wait_messages.items, counted_messages);
         if (bytes.bytes.len == 0) {
             alloc.free(bytes.bytes);
             alloc.free(bytes.lines);
@@ -11510,6 +11693,167 @@ test "a message from a subagent the waits did not name keeps its own line after 
             "└ Waited for lander · 1 message\n" ++
             "● Message from scout",
     );
+}
+
+test "a wait the user stopped reads as stopping the wait, never as cancelling the subagent" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    // A wait, a message it took, and a wait the user stopped: the stopped
+    // wait's row counts the message, and its notice names no subagent.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "waited for lander"),
+            waitChainEntryForTest(3, "from lander · On the checks."),
+            .{ .raw_bytes = .{ .id = 4, .bytes = "▪ Cancelled lander · What can fx do differently?\n", .class = .tool_status } },
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, wait, .completed),
+            reportDetailForTest(3),
+            subagentDetailForTest(4, wait, .cancelled),
+        };
+        details[0].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent · 1 cancelled\n" ++
+                "├ Started lander\n" ++
+                "└ Stopped waiting for lander · 1 message\n\n" ++
+                "▪ Cancelled · What can fx do differently?",
+        );
+    }
+    // One alone, whose host named no subagents.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled subagents · What can fx do differently?\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{subagentDetailForTest(1, wait, .cancelled)};
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Stopped waiting for subagents\n\n" ++
+                "▪ Cancelled · What can fx do differently?",
+        );
+    }
+    // A message the user stopped keeps core's words: its subagent got no
+    // message.
+    {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled lander · What can fx do differently?\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{subagentDetailForTest(1, to_lander, .cancelled)};
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.find(u8, text, "Stopped waiting") == null);
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, text, "\n"), "● Cancelled lander"));
+    }
+}
+
+test "a message counts only on a wait row that waits for its sender" {
+    const alloc = std.testing.allocator;
+    const wait = "{\"action\":\"wait\"}";
+    const wait_for_scout = "{\"action\":\"wait\",\"agent\":\"scout\"}";
+    const to_lander = "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"Land block B\"}";
+    const to_scout = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"Map the tray\"}";
+    // Two subagents: the bare row ends waiting for scout, so it counts
+    // scout's message, and lander's keeps its own line.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "from lander · On the checks."),
+            waitChainEntryForTest(5, "waited for lander, scout"),
+            waitChainEntryForTest(6, "from scout · Tray mapped."),
+            waitChainEntryForTest(7, "waited for lander, scout"),
+            waitChainEntryForTest(8, "lander completed · Landed."),
+            waitChainEntryForTest(9, "waited for scout"),
+            waitChainEntryForTest(10, "scout completed · Mapped."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait, .completed),
+            reportDetailForTest(4),
+            subagentDetailForTest(5, wait, .completed),
+            reportDetailForTest(6),
+            subagentDetailForTest(7, wait, .completed),
+            reportDetailForTest(8),
+            subagentDetailForTest(9, wait, .completed),
+            reportDetailForTest(10),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started subagents\n" ++
+                "├ Started lander\n" ++
+                "├ Started scout\n" ++
+                "└ Waited for scout · 1 message\n" ++
+                "● Message from lander\n" ++
+                "● lander finished\n" ++
+                "● scout finished",
+        );
+    }
+    // A wait that names scout holds no message from lander, even when its
+    // phrase lists every subagent at work.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "sent to lander · Land block B"),
+            waitChainEntryForTest(2, "sent to scout · Map the tray"),
+            waitChainEntryForTest(3, "waited for lander, scout"),
+            waitChainEntryForTest(4, "from lander · On the checks."),
+        };
+        var details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, to_lander, .completed),
+            subagentDetailForTest(2, to_scout, .completed),
+            subagentDetailForTest(3, wait_for_scout, .completed),
+            reportDetailForTest(4),
+        };
+        details[0].subagent_started = true;
+        details[1].subagent_started = true;
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &entries,
+            &details,
+            "● Started a subagent\n" ++
+                "├ Started lander\n" ++
+                "└ Waited for lander, scout\n" ++
+                "● Message from lander",
+        );
+        // A later bare wait that lists lander counts it.
+        const more = entries ++ [_]TranscriptEntry{waitChainEntryForTest(5, "waited for lander, scout")};
+        const more_details = details ++ [_]ToolDetailRecord{subagentDetailForTest(5, wait, .completed)};
+        try expectLiveAndResumedRowsForTest(
+            alloc,
+            &more,
+            &more_details,
+            "● Started a subagent\n" ++
+                "├ Started lander\n" ++
+                "├ Waited for lander, scout\n" ++
+                "└ Waited for lander, scout · 1 message",
+        );
+    }
+    // A wait whose host named no subagents holds a message from any.
+    {
+        const entries = [_]TranscriptEntry{
+            waitChainEntryForTest(1, "waited for subagents"),
+            waitChainEntryForTest(2, "from lander · On the checks."),
+            waitChainEntryForTest(3, "waited for subagents"),
+        };
+        const details = [_]ToolDetailRecord{
+            subagentDetailForTest(1, wait, .completed),
+            reportDetailForTest(2),
+            subagentDetailForTest(3, wait, .completed),
+        };
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, "● Waited for subagents · 1 message");
+    }
 }
 
 /// Checks that `entries` show as `want` both live, where main's calls share
