@@ -593,6 +593,7 @@ pub const Reducer = struct {
     alloc: Allocator,
     limits: Limits,
     choice: types.ToolChoice,
+    call_ids: tool_call_ids.ReplyIds,
     tools: std.ArrayList(Tool) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
@@ -617,10 +618,11 @@ pub const Reducer = struct {
         // The reply answers a request `build_request` already let through, so
         // an effort it carries was declared.
         try validate_request(request, true);
-        return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
+        return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice, .call_ids = try tool_call_ids.ReplyIds.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages }) };
     }
 
     pub fn deinit(self: *Reducer) void {
+        self.call_ids.deinit();
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.content.deinit(self.alloc);
@@ -797,6 +799,28 @@ pub const Reducer = struct {
         } else destination.* = try self.alloc.dupe(u8, text);
     }
 
+    /// A call's id may come in any delta, but stays the same. An empty or
+    /// oversized one is no id: the call gets an fx id when the reply ends.
+    fn accept_tool_id(self: *Reducer, tool: *Tool, value: ?std.json.Value) Error!void {
+        const text = try string(value orelse return);
+        if (text.len == 0 or text.len > self.limits.identity_bytes) return;
+        if (tool.id) |prior| {
+            if (!std.mem.eql(u8, prior, text)) return error.ConflictingIdentity;
+        } else tool.id = try self.alloc.dupe(u8, text);
+    }
+
+    /// Gives every call the id it keeps in fx (`tool_call_ids.ReplyIds`).
+    fn assign_tool_ids(self: *Reducer) Error!void {
+        for (self.tools.items) |*tool| {
+            if (try self.call_ids.sameCallAgain(tool.id, tool.name.items, tool.arguments.items)) continue;
+            const id = try self.call_ids.assign(tool.id);
+            if (tool.id) |source| if (std.mem.eql(u8, source, id)) continue;
+            const owned = try self.alloc.dupe(u8, id);
+            if (tool.id) |source| self.alloc.free(source);
+            tool.id = owned;
+        }
+    }
+
     fn accept_tools(self: *Reducer, value: std.json.Value) Error!void {
         if (value != .array) return error.InvalidChunk;
         if (value.array.items.len > self.limits.tool_calls) return error.TooManyTools;
@@ -811,10 +835,7 @@ pub const Reducer = struct {
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
-            try self.accept_identity(&tool.id, non_null(delta, "id"), self.limits.identity_bytes);
-            if (tool.id) |id| for (self.tools.items, 0..) |other, other_index| {
-                if (other_index != index and other.id != null and std.mem.eql(u8, id, other.id.?)) return error.ConflictingIdentity;
-            };
+            try self.accept_tool_id(tool, non_null(delta, "id"));
             if (non_null(delta, "function")) |function_value| {
                 const function = try object(function_value);
                 if (non_null(function, "name")) |name_value| {
@@ -898,10 +919,10 @@ pub const Reducer = struct {
         // loop decides whether such a call runs and answers the rest, and the
         // permission reviewer retries a malformed decision.
         for (self.tools.items) |tool| {
-            if (tool.id == null) return error.InvalidToolCallId;
             try function_tools.validate_name(tool.name.items);
             try check_json_depth(tool.arguments.items);
         }
+        try self.assign_tool_ids();
         const provider_state = self.reasoning_state() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
             else => |failure| return failure,
@@ -2305,7 +2326,6 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .first = test_text, .chunk = "{\"id\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_text, .chunk = "{\"model\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"other\"}]}}]}", .failure = error.ConflictingIdentity },
-        .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"web_search\"}]}}]}", .failure = error.InvalidChunk },
@@ -2587,11 +2607,10 @@ test "chat completions model bounds and serializer ignore external cancellation 
 test "chat completions missing tool fields sparse indexes and invalid identities fail closed" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { delta: []const u8, failure: Error, at_finish: bool = false }{
-        .{ .delta = "{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
-        .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
-        .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidChunk },
+        // The skipped index 0 is a call with no name.
+        .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"arguments\":{}}}", .failure = error.InvalidChunk },
@@ -2606,6 +2625,102 @@ test "chat completions missing tool fields sparse indexes and invalid identities
             try test_accept(&reducer, chunk);
             try std.testing.expectError(case.failure, test_finish(&reducer, test_tools_finish));
         } else try std.testing.expectError(case.failure, reducer.accept(chunk, false));
+    }
+}
+
+fn test_tool_delta(comptime index: []const u8, comptime id_field: []const u8) []const u8 {
+    return "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":" ++ index ++ id_field ++ ",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}";
+}
+
+fn test_call_ids(alloc: Allocator, calls: []const types.ToolCall) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (calls) |call| try out.print(alloc, "{s};", .{call.id});
+    return out.toOwnedSlice(alloc);
+}
+
+test "chat completions gives a call the id an earlier step used an fx id" {
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{\"path\":\"old\"}" }};
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var reducer = try Reducer.init(alloc, request, .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, comptime test_tool_delta("0", ",\"id\":\"dup\""));
+    try test_accept(&reducer, comptime test_tool_delta("1", ",\"id\":\"call-2\""));
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion.tool_calls);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("fx_call_1;call-2;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
+}
+
+test "chat completions keeps the id of a call sent again with an earlier call's id, tool, and arguments" {
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{\"path\":\"x\",\"n\":1}" }};
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var reducer = try Reducer.init(alloc, request, .{});
+    defer reducer.deinit();
+    // The same arguments with other whitespace and key order, twice.
+    const again = ",\"id\":\"dup\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{ \\\"n\\\": 1, \\\"path\\\": \\\"x\\\" }\"}}]}}]}";
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0" ++ again);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1" ++ again);
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion.tool_calls);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("dup;fx_call_1;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
+}
+
+test "chat completions gives repeated, missing, empty, and oversized call ids fx ids, and sends them back" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_reasoning);
+    try test_accept(&reducer, comptime test_tool_delta("0", ",\"id\":\"same\""));
+    try test_accept(&reducer, comptime test_tool_delta("1", ",\"id\":\"same\""));
+    try test_accept(&reducer, comptime test_tool_delta("2", ""));
+    try test_accept(&reducer, comptime test_tool_delta("3", ",\"id\":\"\""));
+    try test_accept(&reducer, comptime test_tool_delta("4", ",\"id\":\"" ++ text_utils.repeat("i", 257) ++ "\""));
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const ids = try test_call_ids(alloc, completion.tool_calls);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("same;fx_call_1;fx_call_2;fx_call_3;fx_call_4;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+    try std.testing.expect(std.mem.endsWith(u8, completion.provider_state_json.?, "\"_tool_call_ids\":[\"same\",\"fx_call_1\",\"fx_call_2\",\"fx_call_3\",\"fx_call_4\"]}"));
+
+    var results: [5]types.ChatMessage = undefined;
+    for (completion.tool_calls, &results) |call, *message| message.* = .{ .role = .tool, .tool_call_id = call.id, .tool_name = call.name, .content = "result" };
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try messages.append(alloc, .{ .role = .user, .content = "hi" });
+    try messages.append(alloc, .{ .role = .assistant, .tool_calls = completion.tool_calls, .provider_replay = .{ .source = .{ .provider = provider, .model = test_request().model }, .parts_json = completion.provider_state_json.? } });
+    try messages.appendSlice(alloc, &results);
+    var request = test_tool_request();
+    request.messages = messages.items;
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const wire = parsed.value.object.get("messages").?.array.items;
+    const sent_calls = wire[3].object.get("tool_calls").?.array.items;
+    for (completion.tool_calls, sent_calls, wire[4..9]) |call, sent, answer| {
+        try std.testing.expectEqualStrings(call.id, sent.object.get("id").?.string);
+        try std.testing.expectEqualStrings(call.id, answer.object.get("tool_call_id").?.string);
     }
 }
 

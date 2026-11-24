@@ -9,6 +9,7 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -380,6 +381,7 @@ pub fn completeFromStream(
         request.content_capture_limit,
         .{},
         progress,
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -406,8 +408,9 @@ fn consumeSse(
     content_capture_limit: ?usize,
     limits: CodexLimits,
     progress: ?sse_stream.Progress,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
     var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
@@ -722,6 +725,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         null,
         .{},
         null,
+        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -759,6 +763,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         null,
         limits,
         null,
+        .{},
     );
 }
 
@@ -809,12 +814,15 @@ test "OpenAI Codex rejects cumulative event and byte limits" {
     );
 }
 
-test "OpenAI Codex rejects oversized streamed tool identities" {
-    try expectOpenAICodexSseError(
-        error.OpenAICodexToolCallLimitExceeded,
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n",
+test "OpenAI Codex gives an oversized call id an fx id and rejects an oversized tool name" {
+    const completion = try consumeOpenAICodexTestSse(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\",\"arguments\":\"{}\"}}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
         .{ .tool_identity_bytes = 3 },
     );
+    defer freeOpenAICodexTestCompletion(completion);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].id);
     try expectOpenAICodexSseError(
         error.OpenAICodexToolCallLimitExceeded,
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"ok\",\"name\":\"read\"}}\n\n",
@@ -944,7 +952,7 @@ fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null);
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null, .{});
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));

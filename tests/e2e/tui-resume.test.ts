@@ -448,7 +448,8 @@ async function waitForSessionPickerClosed(session: TmuxSession): Promise<string>
 }
 
 function stripAnsi(text: string): string {
-  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  // Style codes, and the links file names carry.
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
 }
 
 type SessionPickerEntry = {
@@ -6199,6 +6200,52 @@ test("update runs the manual upgrade", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
+  "TTY upgrade prints bold fx version header before output",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const installedFx = join(root, "fx");
+    const home = join(root, "home");
+    mkdirSync(home);
+    const release = startUpgradeServer(root, argvLogPath);
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let session: TmuxSession | null = null;
+    try {
+      const sq = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
+      const cmd = `${sq(installedFx)} upgrade --channel stable; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+      session = await TmuxSession.create({
+        isolated: true,
+        cmd: `/bin/sh -c ${sq(cmd)}`,
+        cwd: root,
+        env: {
+          ...envWithoutFxHome(),
+          HOME: home,
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          NO_COLOR: undefined,
+        },
+        width: 96,
+        height: 24,
+        remainOnExit: true,
+      });
+      await session.waitForText("__FX_EXIT_0__", UPGRADE_TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain("upgraded to v9.9.9");
+      expect(scrollback).not.toContain("Run /help for commands");
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(escaped).toMatch(/\x1b\[1m𝒇x\x1b\[0m v/);
+    } finally {
+      if (session) await session.kill();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));
@@ -8714,6 +8761,206 @@ for (const scenario of cancelledRowCases) {
     120_000,
   );
 }
+
+/// Calls that are no command, cancelled while they wait at their prompt.
+const cancelledCallCases = [
+  {
+    name: "a read",
+    permission: { read: { "notes.md": "ask" } },
+    call: () => fakeGatewayToolCall("cancelled-call-read", "read_file", { path: "notes.md" }),
+    row: "● Cancelled notes.md",
+    full: "notes.md",
+  },
+  {
+    name: "a web fetch",
+    permission: { web_fetch: { "domain:example.com": "ask" } },
+    call: () => fakeGatewayToolCall("cancelled-call-fetch", "web_fetch", { url: "https://example.com/docs" }),
+    row: "● Cancelled https://example.com/docs",
+    full: "https://example.com/docs",
+  },
+];
+
+for (const scenario of cancelledCallCases) {
+  test.skipIf(!tmuxAvailable())(
+    `${scenario.name} the user cancelled keeps its row after resume, as live`,
+    async () => {
+      const timeout = 60_000;
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-call-resume-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(workspace, "notes.md"), "notes\n");
+      writeFileSync(stderrPath, "");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission: scenario.permission }),
+      );
+      const initialGateway = startFakeGateway([scenario.call()]);
+      const resumedGateway = startFakeGateway([]);
+      let active: TmuxSession | null = null;
+      let passed = false;
+      try {
+        active = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+          stderrPath,
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("Make the call.");
+        await active.waitForText("esc cancel", timeout);
+        await active.sendKeys("Escape");
+        const live = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        await waitForCondition(
+          () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+          "the interrupted turn on disk",
+          timeout,
+        );
+        await expectFullTranscriptShows(active, scenario.full, timeout);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+        expect(live).toContain(scenario.row);
+
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume last`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumedGateway),
+          stderrPath,
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        // The row, and the notice under it, read as they did live, with no
+        // second notice of the turn's own.
+        const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        expect(resumed).toEqual(live);
+        expect(resumed.filter((line) => line.startsWith("▪"))).toHaveLength(1);
+        // Ctrl+O gains the call's line, as it has live.
+        await expectFullTranscriptShows(active, scenario.full, timeout);
+        expect(resumedGateway.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        // The session saves the turn as before: no item of its own.
+        const items = savedItems(home, onlySessionId(home));
+        expect(items.filter((item) => item.cancelled_command || item.cancelled_wait)).toEqual([]);
+        passed = true;
+      } finally {
+        if (active) {
+          if (!passed) {
+            try {
+              writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+            } catch {}
+          }
+          await active.kill();
+        }
+        initialGateway.stop();
+        resumedGateway.stop();
+        if (passed) {
+          rmSync(root, { recursive: true, force: true });
+        } else {
+          console.error(`retained cancelled call resume artifacts at ${root}`);
+        }
+      }
+    },
+    120_000,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a question the user cancelled at its prompt keeps only the turn's notice after resume",
+  async () => {
+    const timeout = 60_000;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-question-resume-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const tracePath = join(root, "trace.log");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+    const initialGateway = startFakeGateway([
+      fakeGatewayToolCall("cancelled-question", "ask_user_question", {
+        questions: [{ question: "Which one?", options: [{ label: "A" }, { label: "B" }] }],
+      }),
+    ]);
+    const resumedGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    let passed = false;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Ask me.");
+      await active.waitForText("Which one?", timeout);
+      await active.sendKeys("Escape");
+      await waitForCondition(
+        () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+        "the interrupted turn on disk",
+        timeout,
+      );
+      // Live, the question shows its prompt and never a row.
+      const live = compactToolRows(await waitForScrollback(active, "▪ Cancelled", timeout));
+      expect(live.filter((line) => !line.startsWith("▪"))).toEqual([]);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      // A resume shows no row for it either, only the turn's notice.
+      const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+      expect(resumed).toEqual(["▪ Cancelled · What can fx do differently?"]);
+      // Ctrl+O shows no line of the call's own, and no raw arguments.
+      await active.sendKeys("C-o");
+      const full = stripAnsi(await active.waitForText("esc close · pgup/pgdn scroll", timeout));
+      expect(full).not.toContain("questions:");
+      expect(full).not.toContain("Cancelled  ·");
+      await active.sendKeys("Escape");
+      await active.waitForComposer(timeout);
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (active) {
+        if (!passed) {
+          try {
+            writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+          } catch {}
+        }
+        await active.kill();
+      }
+      initialGateway.stop();
+      resumedGateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained cancelled question resume artifacts at ${root}`);
+      }
+    }
+  },
+  120_000,
+);
 
 test.skipIf(!tmuxAvailable())(
   "latest and picker resume preserve conversations beside incomplete session creation",

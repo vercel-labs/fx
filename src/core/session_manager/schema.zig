@@ -101,8 +101,9 @@ pub const Reason = enum { cancel, failed, closed, crash };
 pub const Outcome = enum { ok, failed, cancelled, interrupted, lost };
 /// `language` is the conversation language fx keeps per session, a JSON
 /// string such as `"es"` or `"und-Latn"` (D18); the index lists it.
-/// `client_prompt` (a JSON string) and `tool_identities` are an ACP
-/// client's settings (D46). `moved_files` records a session moved off fx's
+/// `client_prompt` (a JSON string) is an ACP client's setting, and
+/// `tool_identities` the MCP tools a session called, which ACP and the
+/// terminal both write (D46). `moved_files` records a session moved off fx's
 /// side folder: its value names the blob that maps old handles to blobs,
 /// and its line lists every moved blob (D47). `compaction_records` names
 /// the blob that maps fx's compactor record names to blobs, and its line

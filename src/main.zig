@@ -525,6 +525,10 @@ const App = struct {
         return self.providerSet().select(provider).model_catalog;
     }
 
+    pub fn providerCredits(self: *const Self, provider: model_provider.ProviderId) ?gateway_provider.CreditsProvider {
+        return self.providerSet().select(provider).credits;
+    }
+
     pub fn cooperativeTransportPulse(self: *Self, agent: *agents.Agent) !void {
         if (comptime !host_target.is_wasm) return;
         if (try event_loop.pump_ready_input(
@@ -2799,6 +2803,10 @@ const App = struct {
         outcome: types.ToolOutcomeKind,
     ) !void {
         try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
+    }
+
+    pub fn attachHistoricalMcpToolName(self: *App, entry_id: u32, name: types.McpToolName) !void {
+        try self.shell.attachHistoricalMcpToolName(self.alloc, entry_id, name);
     }
 
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {

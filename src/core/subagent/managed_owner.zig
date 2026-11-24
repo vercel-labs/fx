@@ -152,7 +152,8 @@ pub const WorkEnd = struct {
     /// The work's reply, for a work the host can't find by its id: a turn
     /// the user started carries none in the child's log. Borrowed.
     reply: ?[]const u8 = null,
-    /// Who started the work and why it was cancelled, for its report.
+    /// Who started the work and why it was cancelled, or that the user
+    /// closed a completed work, for its report.
     end: child_state.EndFacts = .{},
     /// The parent's messages the turn never took, for the host to queue as
     /// the child's next work.
@@ -165,8 +166,8 @@ pub const WorkEnd = struct {
     dropped_by_user: usize = 0,
     /// The user closed the child from the agent list while this work was
     /// running or had just returned. The host words the notice of
-    /// `dropped_by_user` with it, since a work that ended completed has no
-    /// cause.
+    /// `dropped_by_user` with it, since a notice names no work and carries no
+    /// end facts.
     closed_by_user: bool = false,
     /// Why the work never began, for one that failed because its slot could
     /// not start: its report says the message never ran. A static string.
@@ -1391,7 +1392,7 @@ fn slotMain(slot: *Slot) void {
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());
-        const end: child_state.EndFacts = .{ .cause = if (slot.closed_by_user and outcome.outcome == .cancelled)
+        const end: child_state.EndFacts = .{ .cause = if (slot.closed_by_user and (outcome.outcome == .cancelled or outcome.outcome == .completed))
             .user_close
         else
             owner.cancelCause(outcome.outcome, slot.stopped_by_user) };

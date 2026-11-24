@@ -40,7 +40,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -826,14 +826,16 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
     // The first turn saves the runtime context it captured right after its
-    // user message (D94), then the model call that answered it, at the
-    // start of its only step (D96).
+    // user message (D94), checkpoints recovery before the model call and
+    // clears it after the call completes, alongside the model call (D96).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
       "item:runtime_context",
+      "item:recovery",
       "item:model_call",
+      "item:recovery",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
@@ -3883,6 +3885,52 @@ function askIn(fixture: Fixture, gateway: any, cwd: string, args: string[]) {
 /// The tools a request offered the model, by name.
 const offeredTools = (body: string): string[] => (JSON.parse(body).tools ?? []).map((tool: { name: string }) => tool.name);
 
+/// Writes session `id`'s log again with `edit` applied to each line's text
+/// before its CRC, each line sealed with its CRC32C again.
+function rewriteLogLines(fixture: Fixture, id: string, edit: (head: string) => string) {
+  const path = join(storeRoot(fixture.home), id, "log.jsonl");
+  const marker = ',"crc":"';
+  const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  const sealed = lines.map((text) => {
+    const head = edit(text.slice(0, text.lastIndexOf(marker)));
+    return `${head}${marker}${crc32c(Buffer.from(head)).toString(16).padStart(8, "0")}"}\n`;
+  });
+  writeFileSync(path, sealed.join(""));
+}
+
+test("a session saved with one call id in several steps resumes as before, and a new reuse gets an fx id", async () => {
+  const fixture = createFixture("fx-session-reused-call-id-");
+  const write = (id: string, name: string) => fakeGatewayToolCall(id, "write_file", { path: name, content: name });
+  const gateway = startFakeGateway([
+    write("call_a", "a.txt"), write("call_b", "b.txt"), write("call_c", "c.txt"), fakeGatewayFinalText("Saved three files."),
+    write("call_a", "d.txt"), fakeGatewayFinalText("Saved a fourth file."),
+  ]);
+  try {
+    const first = await ask(fixture, gateway, ["Write a, b, and c."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    expect(gateway.requests).toHaveLength(4);
+    // Saved the way fx did before each call got its own id: one id in all three steps.
+    rewriteLogLines(fixture, id, (head) => head.replaceAll('"call_b"', '"call_a"').replaceAll('"call_c"', '"call_a"'));
+    expect(savedText(fixture.home, id)).not.toMatch(/call_[bc]/);
+
+    const second = await ask(fixture, gateway, ["--resume", id, "Write d."]);
+    expect(second.code, second.stdout + second.stderr).toBe(0);
+    expect(readFileSync(join(fixture.workspace, "d.txt"), "utf8")).toBe("d.txt");
+    // The resumed request sends the saved calls as they were, each with its result.
+    const resumed = promptToolParts(gateway.requests[4]!.body);
+    expect(resumed.calls.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a"]);
+    expect(resumed.results.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a"]);
+    // The new call that reuses the saved id runs under an fx id.
+    const next = promptToolParts(gateway.requests[5]!.body);
+    expect(next.calls.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a", "fx_call_1"]);
+    expect(next.results.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a", "fx_call_1"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
 /// Writes parent session `id`'s log again with `edit` applied to the data of each
 /// of its `child_spawned` lines, each line sealed with its CRC32C again. A
 /// snapshot would keep the old data, so the log must have none.
@@ -4612,6 +4660,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
       workspace_root: fixture.workspace,
       saved_model: savedModel(fixture, working!),
       state: "working",
+      pid: holders[0]!.child.pid,
       created_at_ms: expect.any(Number),
       updated_at_ms: expect.any(Number),
       agents: [],
@@ -4619,6 +4668,9 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
 
     const all = await liveSessions(fixture, gateway, ["--all"]);
     expect(all.sessions.map((entry: any) => entry.id)).toEqual([delegating, working]);
+    // `holders[1]` sent the delegating turn and `holders[0]` the held working one.
+    expect(all.sessions[0].pid).toBe(holders[1]!.child.pid);
+    expect(all.sessions[1].pid).toBe(holders[0]!.child.pid);
     expect(all.sessions[0]).toMatchObject({ workspace_root: other, state: "idle", title: "Delegate the live review." });
     expect(all.sessions[0].agents).toEqual([
       { name: "reviewer", address: `${delegating}/reviewer`, id: childId, state: "working", agents: [] },
@@ -4667,6 +4719,59 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     expect(listed.sessions.map((entry: any) => entry.id).sort()).toEqual([saved, working, delegating].sort());
   } finally {
     for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx sessions --live --json reports the holder pid, updates it on resume after SIGKILL, and returns null when the lock file has no pid", async () => {
+  const fixture = createFixture("fx-v2-live-pid-");
+  let firstHeld = false;
+  let secondHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    // The second turn is checked first: its prompt also carries the first turn's text.
+    if (body.includes("Hold the second pid turn.")) {
+      secondHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("Hold the first pid turn.")) {
+      firstHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("PID_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  try {
+    const sessionId = JSON.parse((await ask(fixture, gateway, ["Seed the pid session."])).stdout).session_id;
+    const lockPath = join(storeRoot(fixture.home), sessionId, "lock");
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the first pid turn."]));
+    await until(() => firstHeld, "the first held turn");
+    const first = await liveSessions(fixture, gateway, ["--all"]);
+    expect(first.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(first.sessions[0].pid).toBe(holders[0]!.child.pid);
+
+    holders[0]!.child.kill("SIGKILL");
+    await holders[0]!.exited;
+    // SIGKILL frees the lock but leaves the PID bytes, so only the lock decides what is live.
+    expect(readFileSync(lockPath, "utf8")).toBe(`${holders[0]!.child.pid}\n`);
+    expect(await liveSessions(fixture, gateway, ["--all"])).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the second pid turn."]));
+    await until(() => secondHeld, "the second held turn");
+    expect(holders[1]!.child.pid).not.toBe(holders[0]!.child.pid);
+    const second = await liveSessions(fixture, gateway, ["--all"]);
+    expect(second.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(second.sessions[0].pid).toBe(holders[1]!.child.pid);
+
+    // An older fx left the lock file empty: the session is still live, with no PID.
+    writeFileSync(lockPath, "");
+    const unnamed = await liveSessions(fixture, gateway, ["--all"]);
+    expect(unnamed.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(unnamed.sessions[0].pid).toBeNull();
+  } finally {
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    await Promise.all(holders.map((holder) => holder.exited));
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

@@ -17,6 +17,7 @@ const result_store = @import("../../session/result_store.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_result_display = @import("../../tooling/tool_result_display.zig");
 const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
     @import("../../tooling/command_result_mapping.zig")
@@ -1512,8 +1513,39 @@ pub fn finishExecutedToolStatus(
             .result_memory = presentation_memory,
             .command_artifact_handle = command_artifact_handle,
             .check_found_command_ended = shell_command and try checkFoundCommandEnded(arena, call, result.model_output),
+            .resolved_path = readFileResolvedPath(call, result.status == .success, safe_result),
         },
     });
+}
+
+/// The file a completed read_file call read, as core resolved it with
+/// symlinks followed: the path its result names (`readPathOfResult`), in
+/// the text the session saves, so a resumed row finds the same path. Null
+/// for any other call, and for one that failed, whose path core never
+/// resolved to a file.
+fn readFileResolvedPath(call: ToolCall, succeeded: bool, saved_result: []const u8) ?[]const u8 {
+    if (!succeeded or !std.mem.eql(u8, call.name, "read_file")) return null;
+    return tool_result_display.readPathOfResult(saved_result);
+}
+
+test "a finished read tells the transcript the file core read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    // The call named a symlink; core read the file it points to.
+    const call = ToolCall{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const output = "<path>real/real.md</path>\n<content>\n1\tok\n</content>";
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expectEqualStrings("real/real.md", capture.events.items[0].terminal.resolved_path.?);
+    // A failed read, and a call of another tool, resolved no file.
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{ .status = .failure, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[1].terminal.resolved_path == null);
+    const search = ToolCall{ .id = "search", .name = "grep_files", .arguments_json = "{\"pattern\":\"a\"}" };
+    try finishExecutedToolStatus(&hooks, arena_state.allocator(), 4, search, true, null, .{ .status = .success, .model_output = output }, output, .{}, null, &.{});
+    try std.testing.expect(capture.events.items[2].terminal.resolved_path == null);
 }
 
 fn presentedToolResult(
@@ -1824,7 +1856,15 @@ fn failureStatusDetail(
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
-    if (safe_result.len == 0 or !mcp_call) return null;
+    if (!mcp_call) return null;
+    return mcpFailureCause(arena, safe_result);
+}
+
+/// Why an MCP call failed, from the result the model got, for its status
+/// line: terminal-safe, and null when the result says nothing. A resume
+/// writes a saved call's line with it too, so the line reads as it did live.
+pub fn mcpFailureCause(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    if (safe_result.len == 0) return null;
     // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
     // The cause comes from that head, as it does in the trace.
     const model_text = result_store.storedPreview(safe_result) orelse safe_result;
@@ -1926,6 +1966,9 @@ pub fn finishCommittedFileStatus(
     status_started: bool,
     display_target: ?[]const u8,
     preview: diff.FileChangePreview,
+    /// The file the change wrote, resolved: `CommittedFileHandoff`'s
+    /// tracker path.
+    resolved_path: []const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
@@ -1950,8 +1993,31 @@ pub fn finishCommittedFileStatus(
                 .kind = .completed,
                 .summary = line,
             },
+            .resolved_path = resolved_path,
         },
     });
+}
+
+test "a committed file change tells the transcript the file core resolved" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{ .id = "edit", .name = "edit_file", .arguments_json = "{\"path\":\"./tsec/x.tse\"}" };
+    try finishCommittedFileStatus(&hooks, arena_state.allocator(), 4, call, true, null, .{
+        .path = "./tsec/x.tse",
+        .lines = &.{},
+        .additions = 1,
+        .deletions = 2,
+        .truncated = false,
+    }, "/w/tsec/x.tse", &.{});
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", terminal.resolved_path.?);
+    // What Ctrl+O, ACP, and `fx ask` show of the call does not change.
+    try std.testing.expect(terminal.result == null);
+    try std.testing.expect(std.mem.startsWith(u8, terminal.outcome.summary, "started edit_file"));
 }
 
 fn renderedSubagentSummary(

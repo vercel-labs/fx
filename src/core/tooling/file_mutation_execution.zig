@@ -157,6 +157,38 @@ fn captureFullViewAfterCommit(
     };
 }
 
+/// A committed change's result for the model, such as "edited
+/// src/main.zig (120 bytes)": its verb, the file's path, and its size.
+const success_result_format = "{s} {s} ({d} bytes)";
+
+/// The path a committed change's result names (`success_result_format`):
+/// the file's path in the project, or its resolved path outside it, the same
+/// for every way the call named the file. Null for any other text.
+pub fn changedPathOfResult(output: []const u8) ?[]const u8 {
+    const verb_end = for ([_][]const u8{ "edited ", "wrote " }) |verb| {
+        if (std.mem.startsWith(u8, output, verb)) break verb.len;
+    } else return null;
+    const size = std.mem.findLast(u8, output, " (") orelse return null;
+    if (size <= verb_end or !std.mem.endsWith(u8, output, " bytes)")) return null;
+    const digits = output[size + 2 .. output.len - " bytes)".len];
+    if (digits.len == 0) return null;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+    return output[verb_end..size];
+}
+
+test "a committed change's result names the file it changed" {
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "edited", "wrote" }) |verb| {
+        for ([_][]const u8{ "src/main.zig", "/private/tmp/notes (draft).md" }) |path| {
+            const output = try std.mem.print(&buf, success_result_format, .{ verb, path, 120 });
+            try std.testing.expectEqualStrings(path, changedPathOfResult(output).?);
+        }
+    }
+    for ([_][]const u8{ "edited src/main.zig", "read src/main.zig (120 bytes)", "edited src/main.zig (many bytes)", "edited  (1 bytes)", "edited src/main.zig ( bytes)" }) |output| {
+        try std.testing.expect(changedPathOfResult(output) == null);
+    }
+}
+
 fn prepareFileMutationSuccessResult(
     call_alloc: Allocator,
     result_alloc: Allocator,
@@ -170,7 +202,7 @@ fn prepareFileMutationSuccessResult(
     defer encoded_path.deinit(call_alloc);
 
     const raw_output = try call_alloc.print(
-        "{s} {s} ({d} bytes)",
+        success_result_format,
         .{
             if (prepared.kind == .write) "wrote" else "edited",
             encoded_path.bytes,

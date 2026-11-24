@@ -2614,9 +2614,11 @@ fn hasUsageBannerOutput(output: []const u8) bool {
 /// model can still use, and otherwise only when they are not the default
 /// `captured` and `process`, such as a command that ran on a terminal.
 /// `output_terminal_safe` marks output whose unsafe bytes were written as
-/// escapes (`escaped`). A running captured command also says how long it has
-/// run (`running_ms`) and printed nothing (`quiet_ms`), and once that quiet
-/// time reaches the limit, `quiet_notice` asks the model to check it
+/// escapes (`escaped`). `full_output_handle` comes only when `output_delta`
+/// is not the exact output: cut off, incomplete, or escaped. A running
+/// captured command also says how long it has run (`running_ms`) and printed
+/// nothing (`quiet_ms`), and once that quiet time reaches the limit,
+/// `quiet_notice` asks the model to check it
 /// (`src/core/execution/quiet_notice.zig`).
 fn formatSnapshotRaw(
     alloc: Allocator,
@@ -2659,6 +2661,7 @@ fn formatSnapshotRaw(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const retained = snapshot.retained;
+    const output_exact = !(output_truncated or snapshot.output_incomplete or escaped);
     try std.json.Stringify.value(.{
         .session_id = if (retained) snapshot.execution_id else null,
         .state = snapshotStateName(snapshot.state),
@@ -2667,7 +2670,7 @@ fn formatSnapshotRaw(
         .output_truncated = presentFlag(output_truncated),
         .output_incomplete = presentFlag(snapshot.output_incomplete),
         .output_terminal_safe = presentFlag(escaped),
-        .full_output_handle = snapshot.output_file,
+        .full_output_handle = if (output_exact) null else snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
         .termination_indeterminate = presentFlag(projection.termination_indeterminate),
@@ -3984,6 +3987,102 @@ test "shell snapshot keeps a hostile output tail within the result limit" {
     try std.testing.expect(std.mem.find(u8, output_value.string, "bytes omitted") != null);
     try std.testing.expect(std.mem.find(u8, output_value.string, "CONTROL_TAIL") != null);
     try std.testing.expect(parsed.value.object.get("output_truncated").?.bool);
+}
+
+const test_replay_handle = "fx-command-replay-test.bin";
+
+fn testReplaySnapshot(
+    state: managed_execution.SnapshotState,
+    output: []const u8,
+    output_truncated: bool,
+    output_incomplete: bool,
+    output_file: ?[]const u8,
+) managed_execution.Snapshot {
+    return .{
+        .execution_id = @constCast("shell-replay"),
+        .command = @constCast("replay-fixture"),
+        .cwd = @constCast("/tmp"),
+        .retained = state == .running,
+        .state = state,
+        .output_delta = @constCast(output),
+        .output_truncated = output_truncated,
+        .output_incomplete = output_incomplete,
+        .output_file = if (output_file) |handle| @constCast(handle) else null,
+    };
+}
+
+fn expectReplayHandle(snapshot: managed_execution.Snapshot, expected: ?[]const u8) !void {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, snapshot, null);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const handle = parsed.value.object.get("full_output_handle");
+    if (expected) |value| {
+        try std.testing.expectEqualStrings(value, handle.?.string);
+    } else {
+        try std.testing.expect(handle == null);
+    }
+}
+
+test "a complete printable shell result leaves out its replay handle" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, testReplaySnapshot(
+        .{ .completed = .{ .exit_code = 0 } },
+        "hi\n\x1b[1mbold\x1b[0m\n",
+        false,
+        false,
+        test_replay_handle,
+    ), null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"hi\\n\\u001b[1mbold\\u001b[0m\\n\"}",
+        body,
+    );
+}
+
+test "a shell result without exact output, or without a saved copy, says so through its handle" {
+    const completed: managed_execution.SnapshotState = .{ .completed = .{ .exit_code = 0 } };
+    // Nothing printed, or nothing saved: there is nothing to read back.
+    try expectReplayHandle(testReplaySnapshot(completed, "", false, false, null), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "ok\n", false, false, null), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "\xff\n", false, false, null), null);
+    // Capture dropped bytes, or the output is partial: the handle reads the rest.
+    try expectReplayHandle(testReplaySnapshot(completed, "tail\n", true, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "partial", false, true, test_replay_handle), test_replay_handle);
+    // NUL and invalid UTF-8 are written as escapes, so the text is not the bytes.
+    try expectReplayHandle(testReplaySnapshot(completed, "a\x00b\n", false, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "a\xffb\n", false, false, test_replay_handle), test_replay_handle);
+}
+
+test "each observation of a running command carries a handle only when its own delta is not exact" {
+    const running: managed_execution.SnapshotState = .running;
+    const completed: managed_execution.SnapshotState = .{ .completed = .{ .exit_code = 0 } };
+    try expectReplayHandle(testReplaySnapshot(running, "first\n", false, false, test_replay_handle), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "second\n", false, false, test_replay_handle), null);
+    try expectReplayHandle(testReplaySnapshot(running, "first\xff\n", false, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "second\n", true, false, test_replay_handle), test_replay_handle);
+}
+
+test "a shell result clipped only by the result limit keeps its handle" {
+    const alloc = std.testing.allocator;
+    const output = "HEAD\n" ++ text_utils.repeat("y", 4 * 1024) ++ "\nTAIL";
+    const snapshot = testReplaySnapshot(
+        .{ .completed = .{ .exit_code = 0 } },
+        output,
+        false,
+        false,
+        test_replay_handle,
+    );
+    const body = try formatSnapshotWithLimit(alloc, snapshot, null, 1024);
+    defer alloc.free(body);
+    try std.testing.expect(body.len <= 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("output_truncated").?.bool);
+    try std.testing.expectEqualStrings(test_replay_handle, object.get("full_output_handle").?.string);
+    try std.testing.expect(std.mem.find(u8, object.get("output_delta").?.string, "use full_output_handle") != null);
 }
 
 test "running shell snapshot leaves continuation intent to the caller" {
