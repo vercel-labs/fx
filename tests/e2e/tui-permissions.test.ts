@@ -1413,9 +1413,11 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         await session.waitForText(`${selection} marker complete`, TIMEOUT);
         expect(readFileSync(target, "utf8")).toBe("after\n");
         const scrollback = await session.captureFullScrollbackEscapes();
-        const row = scrollback.split("\n").find((line) =>
-          line.includes("Edited marker.txt") && line.includes("+1") && line.includes("-1")
-        );
+        // The file name links to the file, so the match skips the link.
+        const row = scrollback.split("\n").find((line) => {
+          const text = line.replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+          return text.includes("Edited marker.txt") && text.includes("+1") && text.includes("-1");
+        });
         expect(row).toBeDefined();
         if (selection === "default") {
           expect(row).not.toContain("\x1b[38;5;71m");

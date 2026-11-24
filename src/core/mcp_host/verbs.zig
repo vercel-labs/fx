@@ -7,6 +7,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_depth = @import("../shared/json_depth.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -512,6 +513,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
 const not_plain_words = "isn't a plain file; replace it with one";
 const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
 const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+const too_deep_words = std.fmt.comptimePrint("is nested more than {d} levels deep; flatten it by hand first", .{json_depth.max_depth});
 
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
@@ -564,6 +566,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
+        error.TooDeep => "the file " ++ too_deep_words,
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
         error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
@@ -639,7 +642,12 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
         .missing_env => try arena.print("needs ${s}", .{s.missing orelse "a variable"}),
         .invalid_env => try arena.print("can't use ${s}", .{s.missing orelse "a variable"}),
         else => if (s.needs_login) "needs login" else switch (s.state) {
-            .ready => try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
+            .ready => if (s.tools_error == null)
+                try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" })
+            else if (s.tools == 0)
+                "ready, " ++ tool_list_refused
+            else
+                try arena.print("ready, {d} tool{s}, " ++ newer_list_refused, .{ s.tools, if (s.tools == 1) "" else "s" }),
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
@@ -647,6 +655,24 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
             else => unreachable,
         },
     };
+}
+
+/// What a server's status says when fx refused its tool list and has none, and when it refused its newest one
+/// and still serves an older one it accepted.
+const tool_list_refused = "tool list refused";
+const newer_list_refused = "newer list refused";
+
+/// The same two facts without the rest of the status, for a place too narrow for it.
+pub fn refusedShort(s: Status) []const u8 {
+    return if (s.tools == 0) tool_list_refused else newer_list_refused;
+}
+
+/// The line `show` adds after the status when fx refused the server's tool list: the fixed reason, and, when
+/// an older accepted list is still served, that it is. Nothing for a list fx accepted.
+fn writeListRefusal(w: *Writer, s: Status) !void {
+    const why = s.tools_error orelse return;
+    if (s.tools == 0) return w.print("  tool list  refused: {s}\n", .{why});
+    try w.print("  tool list  " ++ newer_list_refused ++ ": {s}. fx still uses the older list of {d} tool{s}.\n", .{ why, s.tools, if (s.tools == 1) "" else "s" });
 }
 
 fn statusToken(s: Status) []const u8 {
@@ -719,6 +745,8 @@ fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
     try jw.write(statusToken(s));
     try jw.objectField("error");
     try jw.write(s.last_error);
+    try jw.objectField("tools_error");
+    try jw.write(s.tools_error);
 }
 
 /// What loading the config skipped, so a server never vanishes without a reason.
@@ -791,6 +819,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         const w = c.out;
         try w.print("{s}\n", .{try safe(arena, name)});
         try w.print("  status     {s}\n", .{try statusText(arena, status)});
+        try writeListRefusal(w, status);
         if (status.version) |v| try w.print("  version    {s}\n", .{try safe(arena, v)});
         try w.print("  transport  {s}\n", .{@tagName(status.transport)});
         if (server.url) |u| try w.print("  url        {s}\n", .{try safe(arena, u)});
@@ -1441,6 +1470,16 @@ test "status words follow commands.md, held states first" {
     s.state = .ready;
     s.tools = 1;
     try testing.expectEqualStrings("ready, 1 tool", try statusText(a, s));
+    // fx refused the server's newest tool list: a ready server says so, with or without an older list still served.
+    s.tools_error = "a field is written twice";
+    try testing.expectEqualStrings("ready, 1 tool, newer list refused", try statusText(a, s));
+    s.tools = 2;
+    try testing.expectEqualStrings("ready, 2 tools, newer list refused", try statusText(a, s));
+    s.tools = 0;
+    try testing.expectEqualStrings("ready, tool list refused", try statusText(a, s));
+    try testing.expectEqualStrings("ready", statusToken(s));
+    s.tools_error = null;
+    s.tools = 1;
     s.needs_login = true;
     try testing.expectEqualStrings("needs login", try statusText(a, s));
     try testing.expectEqualStrings("needs_login", statusToken(s));
@@ -1503,9 +1542,46 @@ test "list lines up its columns and keeps hostile names inert" {
     var json: Writer.Allocating = .init(a);
     try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
+        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "a refused tool list shows in the status, the JSON and a line of show, and an accepted one in none" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const why = "\"tools\" is not a list";
+    const statuses = [_]Status{
+        .{ .name = "none", .source = .profile, .transport = .stdio, .state = .ready, .tools = 0, .tools_error = why },
+        .{ .name = "older", .source = .profile, .transport = .stdio, .state = .ready, .tools = 3, .tools_error = why },
+        .{ .name = "fine", .source = .profile, .transport = .stdio, .state = .ready, .tools = 3 },
+    };
+    var out: Writer.Allocating = .init(a);
+    try writeList(&out.writer, a, &statuses);
+    try testing.expectEqualStrings(
+        \\NAME   SOURCE          TRANSPORT  STATUS
+        \\none   ~/.fx/mcp.json  stdio      ready, tool list refused
+        \\older  ~/.fx/mcp.json  stdio      ready, 3 tools, newer list refused
+        \\fine   ~/.fx/mcp.json  stdio      ready, 3 tools
+        \\
+    , out.written());
+
+    // `error` still says a server is down, and this one is not; `status` and `tools` keep their meaning.
+    var json: Writer.Allocating = .init(a);
+    try writeListJson(&json.writer, statuses[0..2], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    try testing.expectEqualStrings(
+        \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":3}]}
+        \\
+    , json.written());
+
+    var lines: Writer.Allocating = .init(a);
+    for (statuses) |s| try writeListRefusal(&lines.writer, s);
+    try testing.expectEqualStrings(
+        \\  tool list  refused: "tools" is not a list
+        \\  tool list  newer list refused: "tools" is not a list. fx still uses the older list of 3 tools.
+        \\
+    , lines.written());
 }
 
 test "a name that only a misspelled key holds gets a line with the key and the fix, and no other name does" {

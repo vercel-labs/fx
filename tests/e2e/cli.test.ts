@@ -471,9 +471,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, fork, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).toContain("session resume [last|<id>]");
+        expect(r.stdout).toContain("session fork <last|id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
         // Sessions convert on open; there is nothing to migrate by hand.
         expect(r.stdout).not.toContain("migrate");
@@ -5062,6 +5063,195 @@ describe("cli: session", () => {
     },
     TIMEOUT,
   );
+  // The environment a run gets from `gateway`, with no key but the test's.
+  function forkEnv(home: string, gateway: ReturnType<typeof startFakeGateway>): Record<string, string | undefined> {
+    return {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "session-fork-test-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+  }
+
+  // Starts fx without waiting, so a test can work while it runs. The caller
+  // owns `proc` and must end it.
+  function startFx(args: string[], env: Record<string, string | undefined>, cwd: string) {
+    const proc = Bun.spawn([FX_BIN, ...args], {
+      cwd,
+      env: Object.fromEntries(
+        Object.entries({ ...env, NO_COLOR: "1", FX_SOUND: "0", PATH: process.env.PATH })
+          .filter((entry): entry is [string, string] => entry[1] !== undefined),
+      ),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const finished = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+      .then(([stdout, stderr, code]) => ({ stdout, stderr, code }));
+    return { proc, finished };
+  }
+
+  test(
+    "session fork copies a saved session by id and last, marks its title, leaves source untouched, and resumes cleanly",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const workspaceRoot = realpathSync(workspace);
+      const gateway = startFakeGateway([fakeGatewayFinalText("turn one ok"), fakeGatewayFinalText("follow up ok")]);
+      const env = forkEnv(home, gateway);
+      try {
+        const first = await runFx(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+        const sourceBefore = savedText(home, sourceId);
+
+        const fork = await runFx(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked).toMatchObject({
+          kind: "session_fork",
+          source_id: sourceId,
+          workspace_root: workspaceRoot,
+          history_turns: 1,
+          copied_agents: 0,
+          files_complete: true,
+        });
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(savedText(home, sourceId)).toBe(sourceBefore);
+
+        const follow = await runFx(["ask", "--resume", forked.fork_id, "--json", "follow up"], { cwd: workspace, env });
+        expect(follow.code, follow.stderr).toBe(0);
+        expect(follow.stdout).toContain("follow up ok");
+        const forkDetail = await runFx(["session", forked.fork_id, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(forkDetail.code, forkDetail.stderr).toBe(0);
+        expect(JSON.parse(forkDetail.stdout).history_len).toBe(2);
+        const sourceDetail = await runFx(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(sourceDetail.stdout).history_len).toBe(1);
+
+        const last = await runFx(["session", "fork", "last"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code, last.stderr).toBe(0);
+        expect(last.stderr).toBe("");
+        expect(last.stdout).toContain("[session fork] copied");
+        expect(last.stdout).toContain("history_turns:");
+        expect(last.stdout).toContain("resume: fx --resume");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session fork copies a live mid-turn session without blocking the running agent",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      let signalTurn2Started!: () => void;
+      const turn2Started = new Promise<void>((resolve) => (signalTurn2Started = resolve));
+      let releaseTurn2!: () => void;
+      const turn2Released = new Promise<void>((resolve) => (releaseTurn2 = resolve));
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("turn one ok"),
+        async () => {
+          signalTurn2Started();
+          await turn2Released;
+          return fakeGatewayFinalText("turn two ok");
+        },
+        fakeGatewayFinalText("side answer"),
+      ]);
+      const env = forkEnv(home, gateway);
+      let turn2: ReturnType<typeof startFx> | undefined;
+      try {
+        const first = await runFx(["ask", "--json", "Say the first answer."], { cwd: workspace, env });
+        expect(first.code, first.stderr).toBe(0);
+        const sourceId: string = JSON.parse(first.stdout).session_id;
+
+        turn2 = startFx(["ask", "--resume", sourceId, "--json", "Say the second answer."], env, workspace);
+        await Promise.race([
+          turn2Started,
+          turn2.finished.then((done) => {
+            throw new Error(`turn two ended before the gateway saw it: ${done.stderr}`);
+          }),
+        ]);
+
+        const live = await runFx(["sessions", "--live", "--all", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(live.code, live.stderr).toBe(0);
+        expect(JSON.parse(live.stdout).sessions).toContainEqual(expect.objectContaining({ id: sourceId, state: "working" }));
+
+        const fork = await runFx(["session", "fork", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(fork.code, fork.stderr).toBe(0);
+        expect(fork.stderr).toBe("");
+        const forked = JSON.parse(fork.stdout);
+        expect(forked.fork_id).not.toBe(sourceId);
+        expect(forked).toMatchObject({ kind: "session_fork", source_id: sourceId, history_turns: 1, files_complete: true });
+
+        const side = await runFx(["ask", "--resume", forked.fork_id, "--json", "side question"], { cwd: workspace, env });
+        expect(side.code, side.stderr).toBe(0);
+        expect(side.stdout).toContain("side answer");
+
+        releaseTurn2();
+        const done = await turn2.finished;
+        expect(done.code, done.stderr).toBe(0);
+        expect(done.stdout).toContain("turn two ok");
+        const detail = await runFx(["session", sourceId, "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(JSON.parse(detail.stdout).history_len).toBe(2);
+      } finally {
+        releaseTurn2();
+        if (turn2 && turn2.proc.exitCode === null) turn2.proc.kill();
+        if (turn2) await turn2.finished;
+        gateway.stop();
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "session fork reports usage and lookup errors with stable exit codes",
+    async () => {
+      const root = createIsolatedTestHome();
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      try {
+        const usage = await runFx(["session", "fork"], { cwd: workspace, env: { HOME: home } });
+        expect(usage.code).toBe(2);
+        expect(usage.stderr).toContain("session fork <last|id>|--id <id> [--json]");
+
+        const tail = await runFx(["session", "fork", "id", "--tail", "5", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(tail.code).toBe(2);
+        expect(tail.stderr).toBe("");
+        expect(JSON.parse(tail.stdout)).toEqual({ kind: "session", error: "invalid arguments", code: "InvalidSessionForkArgs" });
+
+        const missing = await runFx(["session", "fork", "missing-session", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(missing.code).toBe(1);
+        expect(missing.stderr).toBe("");
+        expect(JSON.parse(missing.stdout)).toEqual({ kind: "session", error: "record not found", code: "SessionNotFound" });
+
+        const last = await runFx(["session", "fork", "last", "--json"], { cwd: workspace, env: { HOME: home } });
+        expect(last.code).toBe(1);
+        expect(last.stderr).toBe("");
+        expect(JSON.parse(last.stdout)).toMatchObject({ kind: "session", code: "NoSavedSessions" });
+      } finally {
+        cleanupIsolatedTestHome(root);
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: interactive startup", () => {
@@ -5459,6 +5649,101 @@ describe("cli: ask success", () => {
       }
     },
     60_000,
+  );
+
+  test(
+    "fx ask requests compressed model catalog and decodes gzip responses",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-gzip-catalog-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/compressed-catalog-model";
+      let modelsAcceptEncoding: string | null = null;
+      let chatBody = "";
+      const catalogJson = JSON.stringify({
+        object: "list",
+        data: [
+          {
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 500_000,
+            max_tokens: 32_000,
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+          },
+        ],
+      });
+      const gzippedCatalog = Bun.gzipSync(Buffer.from(catalogJson));
+      const sseBody =
+        `data: ${JSON.stringify({ type: "text-delta", id: "a1", delta: "compressed catalog ok\n" })}\n\n` +
+        `data: ${JSON.stringify({
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 4 }, outputTokens: { total: 3 } },
+        })}\n\ndata: [DONE]\n\n`;
+
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/coding-agent/v1/models") {
+            modelsAcceptEncoding = request.headers.get("accept-encoding");
+            return new Response(gzippedCatalog, {
+              headers: {
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+              },
+            });
+          }
+          if (url.pathname === "/ai/v1/chat/completions") {
+            chatBody = await request.text();
+            return new Response(sseBody, {
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          `${JSON.stringify({ model, effort: "high" })}\n`,
+        );
+
+        const baseUrl = `http://127.0.0.1:${server.port}`;
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Check compressed catalog."],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              ...NO_GATEWAY_AUTH,
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-gzip-catalog-key",
+              FX_GATEWAY_BASE_URL: baseUrl,
+              FX_GATEWAY_CHAT_URL: `${baseUrl}/ai/v1/chat/completions`,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(modelsAcceptEncoding ?? "").toContain("gzip");
+        expect(JSON.parse(result.stdout).output.trim()).toBe("compressed catalog ok");
+        expect(JSON.parse(chatBody)).toMatchObject({
+          reasoning: "high",
+          maxOutputTokens: 32_000,
+        });
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 
   test.skipIf(!HAS_API_KEY)(
@@ -6910,6 +7195,200 @@ describe("cli: completion", () => {
         expect(got).toEqual(want.split(" ").filter(Boolean).sort());
       }
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+});
+
+describe("fx login Token Pass status", () => {
+  function startCliLoginIssuer(team: { id: string; slug: string; name: string }) {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const issuer = `http://127.0.0.1:${server.port}`;
+        if (url.pathname === "/.well-known/openid-configuration") {
+          return Response.json({
+            issuer,
+            device_authorization_endpoint: `${issuer}/oauth/device`,
+            token_endpoint: `${issuer}/oauth/token`,
+            revocation_endpoint: `${issuer}/oauth/revoke`,
+          });
+        }
+        if (url.pathname === "/oauth/device") {
+          return Response.json({
+            device_code: "cli-device-code",
+            user_code: "TEST-1234",
+            verification_uri: `${issuer}/device`,
+            verification_uri_complete: `${issuer}/device?code=TEST-1234`,
+            expires_in: 300,
+            interval: 1,
+          });
+        }
+        if (url.pathname === "/oauth/token") {
+          return Response.json({
+            access_token: "cli-login-token",
+            refresh_token: "cli-refresh-token",
+            expires_in: 3600,
+            scope: "openid offline_access use:ai-gateway",
+            token_type: "Bearer",
+          });
+        }
+        if (url.pathname === "/v2/teams") {
+          return Response.json({ teams: [team] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    return {
+      issuerUrl: `http://127.0.0.1:${server.port}`,
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  test("fx login confirms active Token Pass with remaining credit and omits the buy offer", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "120.5", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nVercel Token Pass is active ($120.50 remaining).\n");
+      expect(r.stdout).not.toContain("may still require billing");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx login shows the plain Token Pass offer when credits reports no active pass", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-offer-")));
+    const issuer = startCliLoginIssuer({ id: "team_plain", slug: "plain-team", name: "Plain Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\n");
+      expect(r.stdout).toContain("Get $150 of tokens for $30 with Vercel Token Pass (https://vercel.com/get/token-pass).\n");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx login omits the buy offer when credits fails and catalog has no Token Pass marks", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-unknown-")));
+    const issuer = startCliLoginIssuer({ id: "team_unknown", slug: "unknown-team", name: "Unknown Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx teams confirms active Token Pass with remaining credit", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-teams-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      HOME: home,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_OAUTH_CLIENT_ID: "test-client",
+      FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    };
+    try {
+      const login = await runFx(["login"], { env });
+      expect(login.code).toBe(0);
+      const teams = await runFx(["teams"], { env });
+      expect(teams.code).toBe(0);
+      expect(teams.stdout).toContain("Vercel Token Pass is active ($79.93 remaining).\n");
+      expect(teams.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
       rmSync(home, { recursive: true, force: true });
     }
   }, TIMEOUT);

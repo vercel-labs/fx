@@ -131,5 +131,17 @@
   "new": "Scoped(s) == Pending",
   "invariant": "ScopedGrantsOnlyItsCall",
   "config": "Request.scoped.cfg"
+ },
+ {
+  "description": "A refused line whose id was read ends no request: the id is dropped with the line, and its request waits",
+  "old": "    /\\ IF req[id] = \"inflight\"\n       THEN /\\ Finish(id, \"error\")",
+  "new": "    /\\ IF FALSE\n       THEN /\\ Finish(id, \"error\")",
+  "invariant": "NamedLineEndsRequest"
+ },
+ {
+  "description": "A refused line that names a request not in flight gives every request in flight a grace, as a line that names none does",
+  "old": "       ELSE /\\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, refusals, sentEpoch, graceDue, armedEpoch, timerEpochs, refusedAt, ownProgress, words, foreignGrant, namedGrant>>",
+  "new": "       ELSE /\\ refusals < MaxRefusals\n            /\\ refusals' = refusals + 1\n            /\\ graceDue' = [i \\in Ids |-> IF i \\in Fresh(NoScope) THEN now + GraceTicks ELSE graceDue[i]]\n            /\\ armedEpoch' = [i \\in Ids |-> IF i \\in Fresh(NoScope) THEN refusals + 1 ELSE armedEpoch[i]]\n            /\\ timerEpochs' = IF Fresh(NoScope) = {} THEN timerEpochs ELSE timerEpochs \\cup {refusals + 1}\n            /\\ namedGrant' = (namedGrant \\/ Fresh(NoScope) # {})\n            /\\ UNCHANGED <<req, outcome, delivered, cancelSent, progress, everDone, peerAnswered, progressSeen, now, sentEpoch, refusedAt, ownProgress, words, foreignGrant>>",
+  "invariant": "NamedLinesGiveNoGrace"
  }
 ]

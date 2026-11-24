@@ -355,14 +355,15 @@ pub fn shouldCreateResumeHandoff(state: ResumeHandoffState) bool {
 /// How a replayed interrupted turn ends on screen.
 const InterruptedTurnEnd = enum { none, cancellation, notice };
 
-/// The line that ends `entry` in a replay: a cancel shows as cancelled, a
-/// failure or a crash as its notice. A turn that yielded for an upgrade's
-/// restart shows none, since the turn that continues it says so
+/// The line that ends `entry` in a replay: a cancel shows as cancelled, unless
+/// the cancelled call's row already says the turn stopped (`wrote_cancelled_call`),
+/// as it did live; a failure or a crash shows as its notice. A turn that yielded
+/// for an upgrade's restart shows none, since the turn that continues it says so
 /// (`session.continued_turn_notice`).
-fn interruptedTurnEnd(entry: types.InterruptedHistoryTurn) InterruptedTurnEnd {
+fn interruptedTurnEnd(entry: types.InterruptedHistoryTurn, wrote_cancelled_call: bool) InterruptedTurnEnd {
     if (entry.yielded) return .none;
     return switch (entry.terminal_reason) {
-        .cancelled => if (entry.cancelled_command == null and entry.cancellation_origin == .turn) .cancellation else .none,
+        .cancelled => if (entry.cancelled_command == null and !wrote_cancelled_call and entry.cancellation_origin == .turn) .cancellation else .none,
         .failed => .notice,
     };
 }
@@ -467,14 +468,16 @@ test "a yielded turn's checkpoint holds its prompt and steps and nothing sent" {
 
 test "a replayed turn that yielded for an upgrade ends with no cancelled line" {
     const yielded: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true, .yielded = true };
-    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(yielded));
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(yielded, false));
     // A closed, crashed, or cancelled turn without the marker keeps its line.
     const closed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true };
-    try std.testing.expectEqual(InterruptedTurnEnd.cancellation, interruptedTurnEnd(closed));
+    try std.testing.expectEqual(InterruptedTurnEnd.cancellation, interruptedTurnEnd(closed, false));
+    // The cancelled call's row already says the turn stopped.
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(closed, true));
     const crashed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
-    try std.testing.expectEqual(InterruptedTurnEnd.notice, interruptedTurnEnd(crashed));
+    try std.testing.expectEqual(InterruptedTurnEnd.notice, interruptedTurnEnd(crashed, false));
     const compaction: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .cancellation_origin = .compaction };
-    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(compaction));
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(compaction, false));
 }
 
 /// Owns `session_id`; callers must release it with `deinit`.
@@ -552,6 +555,36 @@ test "a resumed request older than a day, or dated ahead, asks first" {
     try std.testing.expect(!resumeIsStale(now, now_u + std.time.ms_per_min));
     try std.testing.expect(resumeIsStale(now, now_u + 10 * std.time.ms_per_min));
     try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
+}
+
+/// Whether a saved result's file change shows after a resume as it did live,
+/// with its counts and its diff: a change that `call`, the call fx ran, made
+/// with edit_file or write_file. A toolbox run of one saves its result under
+/// toolbox's name, so the result's own tool name does not say.
+fn showsCommittedFilePresentation(call: types.ToolCall, result: types.PersistedToolResult) bool {
+    return result.status == .success and
+        (std.mem.eql(u8, call.name, "write_file") or std.mem.eql(u8, call.name, "edit_file"));
+}
+
+test "a resumed file change shows its diff for the call fx ran, also through toolbox" {
+    const edit: types.ToolCall = .{ .id = "c", .name = "edit_file", .arguments_json = "{}" };
+    const read: types.ToolCall = .{ .id = "c", .name = "read_file", .arguments_json = "{}" };
+    const saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("c"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited a.txt (2 bytes)"),
+        .output_bytes = 22,
+        .stored_output_bytes = 22,
+    };
+    var under_toolbox = saved;
+    under_toolbox.tool_name = @constCast("toolbox");
+    var failed = saved;
+    failed.status = .failure;
+    try std.testing.expect(showsCommittedFilePresentation(edit, saved));
+    try std.testing.expect(showsCommittedFilePresentation(edit, under_toolbox));
+    try std.testing.expect(!showsCommittedFilePresentation(read, saved));
+    try std.testing.expect(!showsCommittedFilePresentation(edit, failed));
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -1654,11 +1687,24 @@ pub fn Runtime(comptime App: type) type {
             // Before the replay: the resume projection copies the window's
             // retention, so the whole newest cycle comes back.
             syncTranscriptWindowSaveMode(app, agent);
+            // A saved call's path relative to its workspace names a file here
+            // only when the session never ran elsewhere. A fork's turns can
+            // come from another session's workspace.
+            setSavedCallsRoot(app, if (notice != .fork and try v2.ranOnlyIn(app.workspace_root)) app.workspace_root else null);
+            defer setSavedCallsRoot(app, null);
             try hydrateResumedSession(app, agent, resumed.state, &display, notice);
             enableSessionStores(app, agent);
             syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) noteInterruptedRequest(agent, v2);
+        }
+
+        /// Tells the transcript the folder a replayed call's relative path is
+        /// in (`TranscriptRuntime.saved_calls_root`), or that it is not known.
+        fn setSavedCallsRoot(app: *App, root: ?[]const u8) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "saved_calls_root")) return;
+            app.shell.saved_calls_root = root;
         }
 
         /// Notes the request the newest turn left unfinished, if a crash or a
@@ -1901,6 +1947,7 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                     .labels = &historical_labels,
+                    .agent = agent,
                 };
                 const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
@@ -1919,7 +1966,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
             } else {
-                var sink = LiveHistorySink(App){ .app = app };
+                var sink = LiveHistorySink(App){ .app = app, .agent = agent };
                 _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
@@ -2649,11 +2696,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// `AgentRuntimeDeps.start_workspace_capture` on v2 (D98).
         pub fn startWorkspaceCapture(app: *App, agent: *AppAgent, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
-            const context = workspaceCaptureContext(app, agent) orelse return;
             const captures = &agent.session_persistence.turn_capture;
+            if (step == .settle) return captures.settle();
+            const context = workspaceCaptureContext(app, agent) orelse return;
             switch (step) {
                 .begin => captures.begin(context, fresh),
                 .capture => captures.start(context, &agent.session_persistence.write_mutex),
+                .settle => unreachable,
             }
         }
 
@@ -3191,6 +3240,8 @@ pub fn Runtime(comptime App: type) type {
         fn LiveHistorySink(comptime SinkApp: type) type {
             return struct {
                 app: *SinkApp,
+                /// Whose history this is, for the names of its MCP calls.
+                agent: ?*AppAgent = null,
 
                 const Self = @This();
 
@@ -3326,6 +3377,12 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
 
+                pub fn attachHistoricalMcpToolName(self: *Self, entry_id: u32, name: types.McpToolName) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalMcpToolName")) {
+                        try self.app.attachHistoricalMcpToolName(entry_id, name);
+                    }
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     if (comptime @hasDecl(SinkApp, "attachHistoricalCommandOutput")) {
                         self.app.attachHistoricalCommandOutput(entry_id);
@@ -3346,6 +3403,12 @@ pub fn Runtime(comptime App: type) type {
                             command_artifact_handle,
                             replayed_output,
                         );
+                    }
+                }
+
+                fn attachHistoricalCancelledCallDetail(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    if (comptime @hasDecl(SinkApp, "attachHistoricalCancelledCallDetail")) {
+                        try self.app.attachHistoricalCancelledCallDetail(entry_id, call);
                     }
                 }
 
@@ -3389,6 +3452,8 @@ pub fn Runtime(comptime App: type) type {
                 app: *App,
                 projection: *Projection,
                 labels: *const HistoricalSessionLabels,
+                /// Whose history this is, for the names of its MCP calls.
+                agent: ?*AppAgent = null,
 
                 const Self = @This();
 
@@ -3634,6 +3699,12 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalBridgeCall(entry_id, tool, outcome);
                 }
 
+                pub fn attachHistoricalMcpToolName(self: *Self, entry_id: u32, name: types.McpToolName) !void {
+                    if (comptime @hasDecl(Projection, "attachHistoricalMcpToolName")) {
+                        try self.projection.attachHistoricalMcpToolName(entry_id, name);
+                    }
+                }
+
                 fn attachHistoricalCommandOutput(self: *Self, entry_id: u32) void {
                     self.projection.attachHistoricalCommandOutput(entry_id);
                 }
@@ -3654,6 +3725,10 @@ pub fn Runtime(comptime App: type) type {
                     // The live row's command metadata, so the compact view
                     // shows the command's short form, as it did live.
                     try self.attachCommandDisplay(entry_id, call);
+                }
+
+                fn attachHistoricalCancelledCallDetail(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    try self.projection.attachHistoricalCancelledCallDetail(entry_id, call, self.activityKind(call));
                 }
 
                 fn appendQuestionResolution(
@@ -4059,6 +4134,7 @@ pub fn Runtime(comptime App: type) type {
                 .app = app,
                 .projection = &projection,
                 .labels = &labels,
+                .agent = agent,
             };
             const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, history, &labels);
             try projection.finalize();
@@ -4182,7 +4258,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn replayHistory(app: *App, agent: *AppAgent, history: []const types.HistoryTurn) !void {
-            var sink = LiveHistorySink(App){ .app = app };
+            var sink = LiveHistorySink(App){ .app = app, .agent = agent };
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             return replayHistoryToSink(app, agent, &sink, history, &labels);
@@ -4242,13 +4318,18 @@ pub fn Runtime(comptime App: type) type {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
                         try writeModelCallNotices(sink, final_calls.after);
+                        var wrote_cancelled_call = false;
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
+                        } else if (cancelledCallOf(app, agent, entry)) |call| {
+                            wrote_cancelled_call = try writeCancelledCallPresentation(app, agent, sink, call, entry.cancelled_wait, labels);
                         }
                         if (entry.tool_call) |call| {
                             try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
                         }
-                        switch (interruptedTurnEnd(entry)) {
+                        // The cancelled call's row says the turn stopped, as
+                        // it did live.
+                        switch (interruptedTurnEnd(entry, wrote_cancelled_call)) {
                             .none => {},
                             .cancellation => try sink.appendTurnCancellation(),
                             .notice => try sink.appendNotice(
@@ -4279,6 +4360,7 @@ pub fn Runtime(comptime App: type) type {
                 .app = app,
                 .projection = projection,
                 .labels = &labels,
+                .agent = agent,
             };
             return replayHistoryToSinkIncremental(
                 app,
@@ -4295,6 +4377,59 @@ pub fn Runtime(comptime App: type) type {
         /// they did live. Any other call as it is.
         fn shownHistoricalCall(app: *App, agent: *AppAgent, arena: std.mem.Allocator, call: types.ToolCall) !types.ToolCall {
             return try toolbox.shownBuiltinRun(arena, app.toolAdvertisementSet(agent).registry, call) orelse call;
+        }
+
+        /// The MCP tool a starting call runs, for its compact rows: from the
+        /// live catalog, which the session then records so a resume knows it
+        /// before the servers connect (D46), else from that record. Null for
+        /// any other call, and for one neither knows. Copied into `arena`.
+        pub fn liveMcpToolName(
+            app: *App,
+            agent: *AppAgent,
+            arena: std.mem.Allocator,
+            tool_name: []const u8,
+            arguments_json: ?[]const u8,
+        ) !?types.McpToolName {
+            const alias = try toolbox.mcpToolAlias(arena, tool_name, arguments_json) orelse return null;
+            if (comptime @hasField(App, "mcp")) {
+                if (try app.mcp.toolIdentity(arena, alias)) |identity| {
+                    rememberMcpToolName(agent, alias, identity);
+                    return .{ .server = identity.server, .tool = identity.tool };
+                }
+            }
+            return recordedMcpToolName(agent, arena, alias);
+        }
+
+        /// Gives a saved MCP call's row the tool it ran: from the session's
+        /// record, which says what the call ran, else from the live catalog.
+        /// A call neither knows keeps a row that names no server.
+        fn attachReplayedMcpToolName(app: *App, agent: *AppAgent, sink: anytype, entry_id: u32, alias: []const u8) !void {
+            if (comptime !@hasDecl(@TypeOf(sink.*), "attachHistoricalMcpToolName")) return;
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const name = try recordedMcpToolName(agent, arena, alias) orelse blk: {
+                if (comptime !@hasField(App, "mcp")) return;
+                const identity = try app.mcp.toolIdentity(arena, alias) orelse return;
+                break :blk types.McpToolName{ .server = identity.server, .tool = identity.tool };
+            };
+            try sink.attachHistoricalMcpToolName(entry_id, name);
+        }
+
+        fn recordedMcpToolName(agent: *AppAgent, arena: std.mem.Allocator, alias: []const u8) !?types.McpToolName {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
+            const session = agent.session_persistence.v2 orelse return null;
+            const identity = try agent.session_persistence.tool_identities.lookup(std.heap.c_allocator, arena, session, alias) orelse return null;
+            return .{ .server = identity.server, .tool = identity.tool };
+        }
+
+        /// A record that cannot be written costs only the resumed rows' names.
+        fn rememberMcpToolName(agent: *AppAgent, alias: []const u8, identity: anytype) void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            const session = agent.session_persistence.v2 orelse return;
+            agent.session_persistence.tool_identities.remember(std.heap.c_allocator, session, alias, identity) catch |err| {
+                debug_trace.logf("session", "MCP tool identity not recorded for resume tool={s} err={s}", .{ alias, @errorName(err) });
+            };
         }
 
         fn writeCancelledCommandPresentation(
@@ -4332,8 +4467,62 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// The open call of a turn the user cancelled whose row a resume
+        /// shows as live did: "Cancelled" and its call. A command's row comes
+        /// from its `cancelled_command` presentation (D100), or not at all,
+        /// and a question shows its prompt live and never a row
+        /// (`startToolVisibleLifecycle`). Null when the turn has no such call.
+        fn cancelledCallOf(app: *App, agent: *AppAgent, entry: types.InterruptedHistoryTurn) ?types.ToolCall {
+            if (entry.cancelled_command != null) return null;
+            if (entry.terminal_reason != .cancelled or entry.cancellation_origin != .turn) return null;
+            const call = entry.tool_call orelse return null;
+            return switch (app.historicalToolActivityKind(agent, call)) {
+                .command, .ask => null,
+                else => call,
+            };
+        }
+
+        /// Writes the row of `model_call`, which the turn cancelled while it
+        /// ran, as live wrote it, and returns whether it wrote one. A
+        /// `subagent` wait names the subagents its row named live (D102); a
+        /// wait saved before that names none. A call that names nothing after
+        /// "Cancelled" gets no row, so the turn's own notice says it stopped.
+        fn writeCancelledCallPresentation(
+            app: *App,
+            agent: *AppAgent,
+            sink: anytype,
+            model_call: types.ToolCall,
+            cancelled_wait: ?types.CancelledWaitPresentation,
+            labels: *HistoricalSessionLabels,
+        ) !bool {
+            var action_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer mem_utils.deinit_arena(action_arena);
+            const arena = action_arena.allocator();
+            const call = try shownHistoricalCall(app, agent, arena, model_call);
+            const target = if (cancelled_wait) |wait|
+                wait.waited_for
+            else
+                historicalSessionTarget(arena, labels, call) orelse
+                    try tool_presentation.readToolResultDisplayTarget(
+                        arena,
+                        app.toolAdvertisementSet(agent).registry,
+                        call,
+                        &labels.saved_output_sources,
+                    );
+            const label = "Cancelled";
+            const action = try app.describeToolActionDeniedWithAdvertised(agent, arena, call, target, label, &.{});
+            if (std.mem.eql(u8, std.mem.trim(u8, action, " "), label)) return false;
+            const entry_id = try writeCompletedToolStatus(sink, .cancelled, action);
+            try sink.attachHistoricalCancelledCallDetail(entry_id, call);
+            // An MCP call's row names the server and tool it ran, as live.
+            if (try toolbox.mcpToolAlias(arena, call.name, call.arguments_json)) |alias| {
+                try attachReplayedMcpToolName(app, agent, sink, entry_id, alias);
+            }
+            return true;
+        }
+
         fn writeExecutionHistory(app: *App, agent: *AppAgent, execution: types.ExecutionMemory) !void {
-            var sink = LiveHistorySink(App){ .app = app };
+            var sink = LiveHistorySink(App){ .app = app, .agent = agent };
             var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer labels.deinit(app.alloc);
             return writeExecutionHistoryToSink(app, agent, &sink, execution, &labels);
@@ -4597,14 +4786,20 @@ pub fn Runtime(comptime App: type) type {
                     try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                     &.{},
                 );
-            const formatted_action = if (outcome_decision) |decision|
-                if (decision.detail) |detail|
-                    try action_arena.allocator().print(
-                        "{s}: {s}",
-                        .{ formatted_action_base, detail },
-                    )
-                else
-                    formatted_action_base
+            // A failed MCP call's line says why, as it did live
+            // (`tool_presentation.mcpFailureCause`).
+            const action_detail = if (outcome_decision) |decision|
+                decision.detail
+            else if (!deferred and permission_denial_reason == null and result.status == .failure and
+                try toolbox.mcpToolAlias(action_arena.allocator(), call.name, call.arguments_json) != null)
+                try tool_presentation.mcpFailureCause(action_arena.allocator(), result.output)
+            else
+                null;
+            const formatted_action = if (action_detail) |detail|
+                try action_arena.allocator().print(
+                    "{s}: {s}",
+                    .{ formatted_action_base, detail },
+                )
             else
                 formatted_action_base;
             const action = try app.alloc.dupe(u8, formatted_action);
@@ -4632,6 +4827,9 @@ pub fn Runtime(comptime App: type) type {
             );
             if (!is_command or deferred or permission_denial_reason != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
+                if (try toolbox.mcpToolAlias(action_arena.allocator(), call.name, call.arguments_json)) |alias| {
+                    try attachReplayedMcpToolName(app, agent, sink, entry_id, alias);
+                }
                 return;
             }
             if (!sink.materializeCommandReplay()) {
@@ -4817,9 +5015,7 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) !bool {
             const presentation = result.committed_file_presentation orelse return false;
-            if (result.status != .success or
-                (!std.mem.eql(u8, result.tool_name, "write_file") and
-                    !std.mem.eql(u8, result.tool_name, "edit_file")) or
+            if (!showsCommittedFilePresentation(call, result) or
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
@@ -4998,6 +5194,9 @@ pub fn Runtime(comptime App: type) type {
                 const kind = record.outcome.toolOutcome();
                 const entry_id = try writeCompletedToolStatus(sink, kind, status);
                 try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
+                if (comptime @hasField(@TypeOf(sink.*), "agent")) if (sink.agent) |agent| {
+                    try attachReplayedMcpToolName(app, agent, sink, entry_id, record.tool);
+                };
             }
         }
 
@@ -6068,6 +6267,11 @@ const TestApp = struct {
     cancelled_command_detail_count: usize = 0,
     cancelled_command_artifact_handle: ?[]u8 = null,
     cancelled_command_replayed_output: bool = false,
+    cancelled_call_detail_count: usize = 0,
+    denied_action_targets: std.ArrayList([]u8) = .empty,
+    /// Describes a refused or cancelled call by its label alone, as fx does
+    /// for a call that names nothing.
+    bare_denied_action: bool = false,
     command_stdout: std.ArrayList(u8) = .empty,
     command_stderr: std.ArrayList(u8) = .empty,
     command_output_writes: std.ArrayList(CapturedCommandOutput) = .empty,
@@ -6190,6 +6394,8 @@ const TestApp = struct {
         self.historical_question_entry_ids.deinit(self.alloc);
         self.historical_tool_detail_entry_ids.deinit(self.alloc);
         if (self.cancelled_command_artifact_handle) |handle| self.alloc.free(handle);
+        for (self.denied_action_targets.items) |target| self.alloc.free(target);
+        self.denied_action_targets.deinit(self.alloc);
         self.command_stdout.deinit(self.alloc);
         self.command_stderr.deinit(self.alloc);
         for (self.command_output_writes.items) |write| self.alloc.free(write.text);
@@ -6331,6 +6537,11 @@ const TestApp = struct {
         }
     }
 
+    pub fn attachHistoricalCancelledCallDetail(self: *TestApp, entry_id: u32, _: types.ToolCall) !void {
+        try self.historical_tool_detail_entry_ids.append(self.alloc, entry_id);
+        self.cancelled_call_detail_count += 1;
+    }
+
     fn allocateTranscriptEntryId(self: *TestApp) u32 {
         const entry_id = self.next_transcript_entry_id;
         self.next_transcript_entry_id +%= 1;
@@ -6371,10 +6582,16 @@ const TestApp = struct {
         return arena.print("● Completed {s}", .{call.name});
     }
 
-    fn describeToolActionDeniedWithAdvertised(self: *TestApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
+    fn describeToolActionDeniedWithAdvertised(self: *TestApp, _: anytype, arena: Allocator, call: types.ToolCall, target: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
+        if (target) |text| {
+            const owned = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(owned);
+            try self.denied_action_targets.append(self.alloc, owned);
+        }
+        if (self.bare_denied_action) return label;
         return arena.print("● {s} {s}", .{ label, call.name });
     }
 
@@ -7515,6 +7732,156 @@ test "a resume shows each saved fx mcp call row right after its shell call's row
     );
 }
 
+test "a resumed MCP call names the server and tool its session recorded, and a failed one keeps its reason" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const persistence = &app.agent().session_persistence;
+    _ = try persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    persistence.v2 = try session_adapter.Session.create(alloc, persistence.v2_store.?, paths.workspace, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    });
+    // The servers' names hold "_" and a space, so each alias alone could be
+    // another server's tool, and no server is connected yet.
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_my_srv_echo", .{ .server = @constCast("my_srv"), .tool = @constCast("echo") });
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_Team_notes_echo", .{ .server = @constCast("Team notes"), .tool = @constCast("echo") });
+
+    const failure = "{\"server\":\"my_srv\",\"tool\":\"mcp_my_srv_echo\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Invalid input: labels require at least one item\"}],\"isError\":true}}";
+    const held = "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"review_caution\"}}";
+    var calls = [_]types.ToolCall{
+        .{ .id = "call_failed", .name = "mcp_my_srv_echo", .arguments_json = "{}" },
+        .{ .id = "call_held", .name = "mcp_Team_notes_echo", .arguments_json = "{}" },
+        .{ .id = "call_unknown", .name = "mcp_other_srv_echo", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("call_failed"), .tool_name = @constCast("mcp_my_srv_echo"), .status = .failure, .output = @constCast(failure), .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        .{ .tool_call_id = @constCast("call_held"), .tool_name = @constCast("mcp_Team_notes_echo"), .status = .failure, .output = @constCast(held), .output_bytes = held.len, .stored_output_bytes = held.len },
+        .{ .tool_call_id = @constCast("call_unknown"), .tool_name = @constCast("mcp_other_srv_echo"), .status = .failure, .output = @constCast(held), .output_bytes = held.len, .stored_output_bytes = held.len },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+        .agent = app.agent(),
+    };
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, app.agent(), &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    // Core's line says why the call failed, as it did live.
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(alloc);
+    for (projection.runtime.notebook.entries.items) |entry| switch (entry) {
+        .raw_bytes => |raw| try lines.appendSlice(alloc, raw.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("lines:\n{s}\n", .{lines.items});
+    try std.testing.expect(std.mem.find(u8, lines.items, "Failed mcp_my_srv_echo: Invalid input: labels require at least one item") != null);
+
+    var group = try tool_group_projection.buildStyled(alloc, projection.runtime.notebook.entries.items, projection.runtime.notebook.tool_details.items, 120, .{}, .{});
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("rows:\n{s}\n", .{text.items});
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't use My_srv to echo") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Didn't use Team notes to echo · safety caution") != null);
+    // A call the record does not name keeps a row that names no server.
+    try std.testing.expect(std.mem.find(u8, text.items, "Didn't use an MCP tool · safety caution") != null);
+    var named: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |detail| {
+        if (detail.mcp_server == null) continue;
+        named += 1;
+        try std.testing.expectEqualStrings("echo", detail.mcp_tool.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), named);
+}
+
+test "a resumed cancelled MCP call names the server and tool its session recorded, as live" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    const persistence = &app.agent().session_persistence;
+    _ = try persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    persistence.v2 = try session_adapter.Session.create(alloc, persistence.v2_store.?, paths.workspace, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    });
+    try persistence.tool_identities.remember(std.heap.c_allocator, persistence.v2.?, "mcp_my_srv_echo", .{ .server = @constCast("my_srv"), .tool = @constCast("echo") });
+
+    // One call the session recorded, and one it did not.
+    const history = [_]types.HistoryTurn{
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("echo it") },
+            .tool_call = .{ .id = "call_cancelled", .name = "mcp_my_srv_echo", .arguments_json = "{}" },
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("echo again") },
+            .tool_call = .{ .id = "call_unknown", .name = "mcp_other_srv_echo", .arguments_json = "{}" },
+        } },
+    };
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    var has_prior_turns = false;
+    try Runtime(TestApp).appendHistoryToDetachedProjection(&app, app.agent(), &projection, &history, &has_prior_turns);
+
+    var group = try tool_group_projection.buildStyled(alloc, projection.runtime.notebook.entries.items, projection.runtime.notebook.tool_details.items, 120, .{}, .{});
+    defer group.deinit(alloc);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (group.entry_actions.items) |action| switch (action) {
+        .override => |override| try text.appendSlice(alloc, override.bytes),
+        else => {},
+    };
+    errdefer std.debug.print("rows:\n{s}\n", .{text.items});
+    try std.testing.expect(std.mem.find(u8, text.items, "Cancelled using My_srv to echo") != null);
+    // A call the record does not name keeps a row that names no server.
+    try std.testing.expect(std.mem.find(u8, text.items, "Cancelled using an MCP tool") != null);
+    var named: usize = 0;
+    for (projection.runtime.notebook.tool_details.items) |detail| {
+        try std.testing.expectEqual(@as(?types.ToolOutcomeKind, .cancelled), detail.outcome);
+        if (detail.mcp_server == null) continue;
+        named += 1;
+        try std.testing.expectEqualStrings("my_srv", detail.mcp_server.?);
+        try std.testing.expectEqualStrings("echo", detail.mcp_tool.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), named);
+}
+
 test "a resumed fx mcp call row joins its shell call's group with no arguments or result (D99)" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7564,9 +7931,9 @@ test "a resumed fx mcp call row joins its shell call's group with no arguments o
         .override => |override| try text.appendSlice(alloc, override.bytes),
         else => {},
     };
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Ran MCP"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "Used Fixture to echo"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items, "×2"));
-    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't run") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Couldn't use Fixture to echo") != null);
 }
 
 test "execution replay shows the user's steering and not fx's own recovery prompt" {
@@ -8895,6 +9262,11 @@ test "execution replay preserves paired deferred tools without command output" {
             .name = "read_file",
             .arguments_json = "{\"path\":\"stale.txt\"}",
         },
+        .{
+            .id = "call_scoped_pending",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"made/input.txt\"}",
+        },
     };
     var results = [_]types.PersistedToolResult{
         .{
@@ -8926,6 +9298,14 @@ test "execution replay preserves paired deferred tools without command output" {
             .output_bytes = types.deferred_tool_result_output.len,
             .stored_output_bytes = types.deferred_tool_result_output.len,
         },
+        .{
+            .tool_call_id = @constCast("call_scoped_pending"),
+            .tool_name = @constCast("read_file"),
+            .status = .failure,
+            .output = @constCast(types.scoped_instructions_pending_tool_result_output),
+            .output_bytes = types.scoped_instructions_pending_tool_result_output.len,
+            .stored_output_bytes = types.scoped_instructions_pending_tool_result_output.len,
+        },
     };
     var steps = [_]types.ToolExecutionStep{.{
         .tool_calls = calls[0..],
@@ -8936,14 +9316,15 @@ test "execution replay preserves paired deferred tools without command output" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .deferred, .deferred, .denied },
+        &.{ .deferred, .deferred, .denied, .denied },
         app.completed_tool_outcomes.items,
     );
-    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 4), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Reading project instructions before continuing: read_file\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● Reading project instructions before continuing: run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
-    try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
+    try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqual(@as(usize, 4), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_output_writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_stdout.items.len);
@@ -8951,7 +9332,7 @@ test "execution replay preserves paired deferred tools without command output" {
     try std.testing.expectEqual(@as(usize, 0), app.command_output_flush_count);
     try std.testing.expectEqualSlices(
         ReplayEvent,
-        &.{ .completed_tool_status, .completed_tool_status, .completed_tool_status },
+        &.{ .completed_tool_status, .completed_tool_status, .completed_tool_status, .completed_tool_status },
         app.replay_events.items,
     );
 }
@@ -10098,6 +10479,63 @@ test "zero-output cancelled command restores detail without an output block" {
     try std.testing.expectEqual(@as(usize, 1), app.cancelled_command_detail_count);
     try std.testing.expect(!app.cancelled_command_replayed_output);
     try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+}
+
+test "a cancelled call that is no command keeps its row on replay, in place of the turn's notice" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        turn: types.InterruptedHistoryTurn,
+        row: bool,
+        /// Whether the turn's own "Cancelled" notice follows.
+        notice: bool = false,
+        target: ?[]const u8 = null,
+        /// Whether fx describes the call by its label alone.
+        bare: bool = false,
+    };
+    const read: types.ToolCall = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const wait: types.ToolCall = .{ .id = "wait", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" };
+    const command: types.ToolCall = .{ .id = "cmd", .name = "shell", .arguments_json = "{\"command\":\"sleep 20\"}" };
+    const question: types.ToolCall = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{\"questions\":[{\"question\":\"Which one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}" };
+    const cases = [_]Case{
+        .{ .name = "read", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = true },
+        .{ .name = "wait with names (D102)", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "lander" } }, .row = true, .target = "lander" },
+        .{ .name = "wait saved before D102", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait }, .row = true },
+        // Unchanged: a command with no presentation, a failed turn, a turn
+        // that compaction cancelled, and a turn with no open call.
+        .{ .name = "command", .turn = .{ .user = .{ .text = @constCast("run") }, .tool_call = command }, .row = false, .notice = true },
+        // A question shows its prompt live, never a row, and a call that names
+        // nothing after "Cancelled" gets none either; the turn's notice stays.
+        .{ .name = "question", .turn = .{ .user = .{ .text = @constCast("ask") }, .tool_call = question }, .row = false, .notice = true },
+        .{ .name = "names nothing", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = false, .notice = true, .bare = true },
+        .{ .name = "failed", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .terminal_reason = .failed }, .row = false },
+        .{ .name = "compaction", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .cancellation_origin = .compaction }, .row = false },
+        .{ .name = "no call", .turn = .{ .user = .{ .text = @constCast("stop") } }, .row = false, .notice = true },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var app = try TestApp.init(alloc, "/workspace");
+        defer app.deinit();
+        app.bare_denied_action = case.bare;
+        const history = [_]types.HistoryTurn{.{ .interrupted = case.turn }};
+        try Runtime(TestApp).replayHistory(&app, (&app).agent(), &history);
+        const rows: usize = if (case.row) 1 else 0;
+        try std.testing.expectEqual(rows, app.completed_tool_statuses.items.len);
+        try std.testing.expectEqual(rows, app.cancelled_call_detail_count);
+        if (case.row) {
+            try std.testing.expect(std.mem.startsWith(u8, app.completed_tool_statuses.items[0], "● Cancelled "));
+            try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, app.completed_tool_outcomes.items[0]);
+        }
+        // A cancelled call's row says the turn stopped, so no notice of the
+        // turn's own follows it.
+        try std.testing.expectEqual(case.notice, std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+        if (case.target) |target| {
+            try std.testing.expectEqual(@as(usize, 1), app.denied_action_targets.items.len);
+            try std.testing.expectEqualStrings(target, app.denied_action_targets.items[0]);
+        } else if (case.row) {
+            try std.testing.expectEqual(@as(usize, 0), app.denied_action_targets.items.len);
+        }
+    }
 }
 
 test "a command cancelled before it printed anything keeps its row across a persisted session restart (D100)" {

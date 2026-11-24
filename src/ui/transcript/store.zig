@@ -681,32 +681,25 @@ fn statusGeometryUnchanged(cols: u16, previous: []const u8, next: []const u8) bo
     return next_lines.next() == null;
 }
 
-fn hasCommittedRetentionSource(self: anytype) bool {
-    if (comptime @hasDecl(@TypeOf(self.*), "committedRetentionIdentity")) {
-        const identity = self.committedRetentionIdentity() orelse return false;
-        return identity.lines.len > 0 and self.retentionSourceCols() != null;
-    }
-    return false;
-}
-
 /// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
 /// with the same cleanup the byte-cap retention runs after it prunes. Ids no
 /// longer present are skipped; a pinned entry is never removed.
+/// With a `transcript_commit_state`, the drop runs on a copy and commits only when every step succeeds, so a failed allocation leaves the transcript and its entries as they were.
 pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     if (ids.len == 0) return false;
     if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
-        if (hasCommittedRetentionSource(self)) {
-            var shadow = try cloneRecordedMutationState(self, alloc);
-            defer shadow.deinit(alloc);
-            const changed = try dropEntries(&shadow, alloc, ids);
-            if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
-            return changed;
-        }
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const changed = try dropEntries(&shadow, alloc, ids);
+        if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
+        return changed;
     }
     return dropEntries(self, alloc, ids);
 }
 
-fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
+/// Drops in place, so a failed allocation can leave the runtime half changed.
+/// Outside `dropEntriesAtomic`, call it only when the caller discards the runtime on failure.
+pub fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
     try rebuildEntryIdSet(self, alloc, &entry_ids);
@@ -771,6 +764,8 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
         if (self.transcript_window) |*window| window.reset(alloc);
         if (comptime @hasDecl(@TypeOf(self.*), "discardTranscriptArchive")) self.discardTranscriptArchive();
     }
+    // This call frees every entry, so the hold ends here, with or without a window.
+    if (comptime @hasField(@TypeOf(self.*), "unpainted_resume_hold")) self.unpainted_resume_hold = false;
     for (self.notebook.folded_command_blocks.items) |*block| block.deinit(alloc);
     self.notebook.folded_command_blocks.clearRetainingCapacity();
     for (self.notebook.command_output_blocks.items) |*block| block.deinit(alloc);
@@ -1983,6 +1978,12 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .call_id = try alloc.dupe(u8, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const resolved_path = if (source.resolved_path) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (resolved_path) |value| alloc.free(value);
+    const mcp_server = if (source.mcp_server) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (mcp_server) |value| alloc.free(value);
+    const mcp_tool = if (source.mcp_tool) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (mcp_tool) |value| alloc.free(value);
 
     return .{
         .entry_id = source.entry_id,
@@ -2006,6 +2007,11 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
+        .check_found_command_ended = source.check_found_command_ended,
+        .resolved_path = resolved_path,
+        .subagent_started = source.subagent_started,
+        .mcp_server = mcp_server,
+        .mcp_tool = mcp_tool,
     };
 }
 
@@ -2021,6 +2027,71 @@ test "a snapshot copy of a tool detail keeps its subagent report mark" {
         });
         defer copy.deinit(alloc);
         try std.testing.expectEqual(marked, copy.subagent_report);
+    }
+}
+
+test "a snapshot copy of a shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |ended| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .arguments_json = @constCast("{\"action\":\"interact\",\"session_id\":\"shell-1\"}"),
+            .outcome = .completed,
+            .check_found_command_ended = ended,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(ended, copy.check_found_command_ended);
+    }
+}
+
+test "a snapshot copy of an edit keeps the file core says it changed" {
+    const alloc = std.testing.allocator;
+    var changed = "tsec/selfhost/checker.tse".*;
+    var copy = try cloneToolDetailForSnapshot(alloc, .{
+        .entry_id = 5,
+        .tool_name = @constCast("edit_file"),
+        .activity_kind = .edit,
+        .arguments_json = @constCast("{\"path\":\"./tsec/selfhost/checker.tse\"}"),
+        .outcome = .completed,
+        .resolved_path = &changed,
+    });
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("tsec/selfhost/checker.tse", copy.resolved_path.?);
+    try std.testing.expect(copy.resolved_path.?.ptr != &changed);
+}
+
+test "a snapshot copy of an MCP call keeps the server and tool core named" {
+    const alloc = std.testing.allocator;
+    var copy = try cloneToolDetailForSnapshot(alloc, .{
+        .entry_id = 5,
+        .tool_name = @constCast("toolbox"),
+        .activity_kind = .mcp,
+        .arguments_json = @constCast("{\"run\":\"mcp_my_srv_echo\"}"),
+        .mcp_server = @constCast("my_srv"),
+        .mcp_tool = @constCast("echo"),
+    });
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("my_srv", copy.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", copy.mcp_tool.?);
+    var unnamed = try cloneToolDetailForSnapshot(alloc, .{ .entry_id = 6, .tool_name = @constCast("read_file") });
+    defer unnamed.deinit(alloc);
+    try std.testing.expect(unnamed.mcp_server == null and unnamed.mcp_tool == null);
+}
+
+test "a snapshot copy of a tool detail keeps its subagent start mark" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |started| {
+        var copy = try cloneToolDetailForSnapshot(alloc, .{
+            .entry_id = 4,
+            .tool_name = @constCast("subagent"),
+            .activity_kind = .subagent,
+            .arguments_json = @constCast("{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}"),
+            .subagent_started = started,
+        });
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(started, copy.subagent_started);
     }
 }
 
@@ -2458,28 +2529,16 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     return entry_id;
 }
 
-/// Takes ownership of `table` only when it returns successfully.
-pub fn appendAssistantTableOwned(
+/// Changes the runtime in place, so a failed allocation can leave the transcript
+/// showing an entry the notebook no longer holds. Only `appendAssistantBlockAtomic` calls it.
+fn appendAssistantBlockInPlace(
     self: anytype,
     alloc: Allocator,
-    table: assistant_presentation.TablePayload,
+    entry: TranscriptEntry,
+    rebuild_reason: []const u8,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantTableOwned(&shadow, alloc, table);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_table_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_table = .{
-        .id = entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .table = table,
-    } });
+    const entry_id = entry.id();
+    try self.notebook.entries.append(alloc, entry);
     errdefer {
         _ = self.notebook.entries.pop();
     }
@@ -2491,11 +2550,48 @@ pub fn appendAssistantTableOwned(
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_table");
+    try rebuildTranscriptFromRendered(self, alloc, rendered, rebuild_reason);
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.notebook.next_entry_id +%= 1;
     return entry_id;
+}
+
+/// With a `transcript_commit_state`, appends on a copy and commits only when every step succeeds,
+/// so a failed allocation leaves the transcript and its entries as they were. The caller keeps the payload on error.
+fn appendAssistantBlockAtomic(
+    self: anytype,
+    alloc: Allocator,
+    entry: TranscriptEntry,
+    commit_reason: []const u8,
+    rebuild_reason: []const u8,
+) !u32 {
+    if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
+        var shadow = try cloneRecordedMutationState(self, alloc);
+        defer shadow.deinit(alloc);
+        const id = try appendAssistantBlockInPlace(&shadow, alloc, entry, rebuild_reason);
+        errdefer {
+            // The caller still owns the payload when the commit fails, so the copy must drop the entry before it is freed.
+            _ = shadow.notebook.entries.pop();
+        }
+        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, commit_reason, .preserve_same_epoch);
+        return id;
+    }
+    return appendAssistantBlockInPlace(self, alloc, entry, rebuild_reason);
+}
+
+/// Takes ownership of `table` only when it returns successfully.
+pub fn appendAssistantTableOwned(
+    self: anytype,
+    alloc: Allocator,
+    table: assistant_presentation.TablePayload,
+) !u32 {
+    const entry: TranscriptEntry = .{ .assistant_table = .{
+        .id = self.notebook.next_entry_id,
+        .created_at_ms = io_mod.milliTimestamp(),
+        .table = table,
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_table_append", "append_assistant_table");
 }
 
 /// Takes ownership of `block` only when it returns successfully.
@@ -2504,69 +2600,20 @@ pub fn appendAssistantCodeBlockOwned(
     alloc: Allocator,
     block: assistant_presentation.CodeBlockPayload,
 ) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantCodeBlockOwned(&shadow, alloc, block);
-        errdefer {
-            _ = shadow.notebook.entries.pop();
-        }
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_code_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_code_block = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_code_block = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_code_block");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_code_append", "append_assistant_code_block");
 }
 
 pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
-    if (hasCommittedRetentionSource(self)) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        const id = try appendAssistantThematicRule(&shadow, alloc);
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_rule_append", .preserve_same_epoch);
-        return id;
-    }
-    const entry_id = self.notebook.next_entry_id;
-    try self.notebook.entries.append(alloc, .{ .assistant_thematic_rule = .{
-        .id = entry_id,
+    const entry: TranscriptEntry = .{ .assistant_thematic_rule = .{
+        .id = self.notebook.next_entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
-    } });
-    errdefer {
-        _ = self.notebook.entries.pop();
-    }
-
-    const rendered = try renderPlainEntries(
-        self,
-        alloc,
-        self.transcriptWrapCols(),
-    );
-    defer alloc.free(rendered);
-    try ensurePaintReservation(self, alloc);
-    try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_thematic_rule");
-    try pruneOrphanedCommandState(self, alloc);
-    requestTranscriptPaint(self);
-    self.notebook.next_entry_id +%= 1;
-    return entry_id;
+    } };
+    return appendAssistantBlockAtomic(self, alloc, entry, "assistant_rule_append", "append_assistant_thematic_rule");
 }
 
 pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {
@@ -2716,6 +2763,8 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
             .activity_kind = .command,
             .arguments_json = "{\"command\":\"printf committed\"}",
         } });
+        // Core names the call right after it starts; until then it has no row.
+        _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running printf committed" } });
         try runtime.writeCommandOutputChunkForLifecycle(alloc, &metrics, .{}, id, .stdout, "COMMITTED_RAW\n", true);
     } else {
         _ = try runtime.appendRawTranscriptEntryClassified(alloc, "COMMITTED_RAW", .unknown_raw);

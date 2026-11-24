@@ -35,7 +35,7 @@ const World = struct {
     log_saved: tw.Seq = 0,
     cycle_starts: [max_seq]tw.Seq = undefined,
     starts: usize = 0,
-    painted: std.StaticBitSet(max_seq) = .empty,
+    painted: std.bit_set.Static(max_seq) = .empty,
 
     fn addStart(self: *World, start: tw.Seq) void {
         for (self.cycle_starts[0..self.starts]) |known| if (known == start) return;

@@ -9,6 +9,8 @@ const build_options = @import("build_options");
 const http_config = @import("../core/mcp/http_config.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+const profile_paths = @import("../core/shared/profile_paths.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -137,12 +139,22 @@ pub fn prepare(
         else => return .{ .failed = try alloc.print("MCP servers could not read the environment: {s}", .{@errorName(err)}) },
     };
     defer inherited.deinit();
+    // Servers shared with other fx sessions live under the profile's folder;
+    // when it can't be named, each server stays in this process.
+    const fx_home: ?[]u8 = profile_paths.rootDir(alloc, home) catch |err| blk: {
+        debug_trace.logf("mcp", "MCP servers run in this session reason=no fx home err={s}", .{@errorName(err)});
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        break :blk null;
+    };
+    defer if (fx_home) |path| alloc.free(path);
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs.items.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .{ .detect = home },
         .workspace_root = workspace_root,
         .questions = questions,
         .url_completions = url_completions,
+        .idle_ms = mcp_host.idleMs(),
+        .share = if (fx_home) |path| .{ .fx_home = path } else null,
     }, builtin_tools.registry) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try alloc.print("MCP servers could not start: {s}", .{@errorName(err)}) },
@@ -249,6 +261,7 @@ noinline fn parseServerInto(
         .scope = .acp_session,
         .required = true,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .command = owned_command,
         .args = owned_args,
         .env = owned_env,
@@ -260,6 +273,13 @@ noinline fn parseServerInto(
 /// `_meta.fx.alwaysLoaded` to false.
 fn alwaysLoadedPreference(object: std.json.ObjectMap) bool {
     return acp_types.fxMetaBool(object, "alwaysLoaded") orelse true;
+}
+
+/// The client's server is shared with other sessions whose launch config
+/// matches, unless it sets `_meta.fx.shared` to false because it keeps state
+/// per client.
+fn sharedPreference(object: std.json.ObjectMap) bool {
+    return acp_types.fxMetaBool(object, "shared") orelse true;
 }
 
 /// MCP over ACP, a draft ACP proposal fx doesn't speak: the server is kept,
@@ -288,6 +308,7 @@ fn parseAcpServerInto(
         .scope = .acp_session,
         .required = false,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .acp_server_id = owned_server_id,
         .transport = .http,
         .url = owned_url,
@@ -319,6 +340,7 @@ fn parseRemoteServerInto(
         .scope = .acp_session,
         .required = true,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .transport = transport,
         .url = owned_url,
         .headers = headers,
@@ -444,6 +466,24 @@ test "ACP MCP parser keeps supplied servers loaded unless meta opts out" {
     try std.testing.expect(!configs.items.items[1].always_loaded);
     try std.testing.expect(configs.items.items[2].always_loaded);
     try std.testing.expect(!configs.items.items[3].always_loaded);
+}
+
+test "ACP MCP parser shares a supplied server unless meta opts out" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(alloc,
+        \\{"mcpServers":[
+        \\{"name":"shared","command":"/bin/a","args":[],"env":[]},
+        \\{"name":"own","command":"/bin/b","args":[],"env":[],"_meta":{"fx":{"shared":false}}},
+        \\{"name":"unreadable","command":"/bin/c","args":[],"env":[],"_meta":{"fx":{"shared":"no"}}}
+        \\]}
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), configs.items.items.len);
+    try std.testing.expect(configs.items.items[0].shared);
+    try std.testing.expect(!configs.items.items[1].shared);
+    // A value that isn't a bool is not an opt-out.
+    try std.testing.expect(configs.items.items[2].shared);
 }
 
 test "ACP MCP parser accepts an authoritative empty list" {

@@ -14,6 +14,7 @@ const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
 const token_pass_check = @import("token_pass_check.zig");
+const update_target = @import("../upgrade/update_target.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -67,10 +68,12 @@ const TraceReportDisposition = union(enum) {
     unavailable,
 };
 
-/// Returns an owned trace notice whose bytes belong to the caller.
+/// Returns an owned trace notice whose bytes belong to the caller. When the
+/// trace includes a saved crash report, the notice says so, with its time.
 fn format_trace_notice(
     alloc: std.mem.Allocator,
     disposition: TraceReportDisposition,
+    crash: ?trace_report.IncludedCrash,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -81,7 +84,14 @@ fn format_trace_notice(
         .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
         .unavailable => try out.writer.writeAll("Could not create trace."),
     }
+    // A trace that was not written contains no crash report to name.
+    if (crash) |included| if (disposition != .unavailable) try writeIncludedCrash(&out.writer, included);
     return out.toOwnedSlice();
+}
+
+fn writeIncludedCrash(writer: *std.Io.Writer, included: trace_report.IncludedCrash) !void {
+    var time_buf: [32]u8 = undefined;
+    try writer.print(" Includes the crash report from {s}.", .{try trace_report.formatUtcMinute(&time_buf, included.at_ms)});
 }
 
 fn persistUserPreferences(
@@ -392,14 +402,14 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.transcript);
             try app.flushBeforeBlockingExternalWork();
 
-            const report = trace_report.build(app) catch {
+            const built = trace_report.build(app) catch {
                 try finish_trace_notice(app, progress_entry_id, .@"error", "Failed to build trace.");
                 return;
             };
-            defer app.alloc.free(report);
+            defer app.alloc.free(built.bytes);
 
             const builtin = @import("builtin");
-            const report_path: ?[]u8 = trace_report.writeFile(app.alloc, report) catch null;
+            const report_path: ?[]u8 = trace_report.writeFile(app.alloc, built.bytes) catch null;
             defer if (report_path) |path| app.alloc.free(path);
             const disposition: TraceReportDisposition = if (report_path) |path| blk: {
                 const copied = if (comptime @hasDecl(App, "clipboard"))
@@ -412,7 +422,7 @@ pub fn Handlers(comptime App: type) type {
             } else blk: {
                 break :blk .unavailable;
             };
-            const body = try format_trace_notice(app.alloc, disposition);
+            const body = try format_trace_notice(app.alloc, disposition, built.crash);
             defer app.alloc.free(body);
             const tone: types.NoticeTone = switch (disposition) {
                 .copied_file, .saved => .neutral,
@@ -1511,10 +1521,17 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowVersion(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            var label_buf: [update_target.max_version_label_bytes]u8 = undefined;
+            const build: update_target.CurrentBuild = .{
+                .channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel else .stable,
+                .version = App.app_version,
+                .revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
+            };
+            const label = try build.writeVersionLabel(&label_buf);
             try app.writeDomainNotice(.{
                 .topic = "version",
                 .tone = .neutral,
-                .body = App.app_version,
+                .body = label,
             }, true);
         }
 
@@ -2394,12 +2411,34 @@ test "trace notice distinguishes file outcomes without a feedback CTA" {
     };
 
     for (cases) |case| {
-        const body = try format_trace_notice(std.testing.allocator, case.disposition);
+        const body = try format_trace_notice(std.testing.allocator, case.disposition, null);
         defer std.testing.allocator.free(body);
         try std.testing.expectEqualStrings(case.expected, body);
         try std.testing.expect(std.mem.find(u8, body, "feedback") == null);
         try std.testing.expect(std.mem.find(u8, body, "Report issue") == null);
     }
+}
+
+test "trace notice says when the trace includes a crash report and when it was saved" {
+    const report_path = "/tmp/trace.jsonl";
+    const timed: trace_report.IncludedCrash = .{ .at_ms = 1_794_966_120_000 };
+    const saved = try format_trace_notice(std.testing.allocator, .{ .saved = report_path }, timed);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings(
+        "Trace saved at /tmp/trace.jsonl. Review and redact it before sharing. Includes the crash report from 2026-11-18 01:42 UTC.",
+        saved,
+    );
+
+    const unavailable = try format_trace_notice(std.testing.allocator, .unavailable, timed);
+    defer std.testing.allocator.free(unavailable);
+    try std.testing.expectEqualStrings("Could not create trace.", unavailable);
+
+    const copied = try format_trace_notice(std.testing.allocator, .{ .copied_file = report_path }, timed);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings(
+        "Trace copied to clipboard. Review and redact it before sharing. Includes the crash report from 2026-11-18 01:42 UTC.",
+        copied,
+    );
 }
 
 test "app_commands exposes active handler API surface" {
@@ -2820,4 +2859,46 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}
+
+fn VersionTestApp(comptime channel: update_target.Channel, comptime revision: []const u8) type {
+    return struct {
+        pub const app_version = "0.0.17";
+        pub const build_update_channel = channel;
+        pub const build_revision = revision;
+
+        alloc: std.mem.Allocator,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notice_body.deinit(self.alloc);
+        }
+
+        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+}
+
+fn expectVersionCommandBody(comptime channel: update_target.Channel, comptime revision: []const u8, expected: []const u8) !void {
+    const App = VersionTestApp(channel, revision);
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(App).commandShowVersion(@ptrCast(&app));
+
+    try std.testing.expectEqualStrings("version", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(expected, app.notice_body.items);
+}
+
+test "/version command writes dev build label and omits unresolved revision" {
+    try expectVersionCommandBody(.stable, "f1862c5061f5", "0.0.17");
+    try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
+    try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
+    try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
 }

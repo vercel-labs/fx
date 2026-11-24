@@ -1680,6 +1680,39 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "each ACP tool call has its own toolCallId when the model reuses, repeats, or leaves out ids",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-call-ids-");
+      const write = (id: string, name: string) => ({ type: "tool-call", toolCallId: id, toolName: "write_file", input: { path: name, content: name } });
+      const finish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+      const gateway = startFakeGateway([
+        fakeGatewaySse([write("dup", "a.txt"), finish]),
+        fakeGatewaySse([write("dup", "b.txt"), write("dup", "c.txt"), write("", "d.txt"), finish]),
+        finalText("ACP_CALL_IDS_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Write a, b, c, and d.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        for (const name of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
+          expect(readFileSync(join(root.workspace, name), "utf8")).toBe(name);
+        }
+        const updates = result.messages.map((message) => message.params?.update).filter(Boolean);
+        const started = updates.filter((update) => update.sessionUpdate === "tool_call").map((update) => update.toolCallId);
+        expect(started).toEqual(["dup", "fx_call_1", "fx_call_2", "fx_call_3"]);
+        for (const update of updates.filter((update) => update.sessionUpdate === "tool_call_update")) {
+          expect(started).toContain(update.toolCallId);
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "host-managed ACP sessions stream without local credentials",
     async () => {
       const root = createIsolatedRoot("fx-acp-host-managed-");
@@ -3945,10 +3978,12 @@ describe("acp: model-independent", () => {
         expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
         expect(processAlive(oldPid)).toBe(true);
 
-        // Closing straight away still stops it: fx never leaves it behind.
+        // Closing straight away still stops it: fx never leaves it behind. A
+        // shared server is stopped by its owner, which gives a server that
+        // ignores its closed stdin the usual grace before SIGTERM.
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
-        expect(processAlive(oldPid)).toBe(false);
+        await waitForCondition("the old server to stop", () => !processAlive(oldPid), 5_000);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -6489,9 +6524,16 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.requestState).toBe("opaque");
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
-        expect(calls[1]?.params?._meta?.[
+        // A shared server hears the union of its sessions' question UIs: the
+        // owner declares form and URL. A session that runs its own copy, as on
+        // a home whose owner socket path is too long, declares only what this
+        // editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.[
           "io.modelcontextprotocol/clientCapabilities"
-        ]).toEqual({ elicitation: { form: {} } });
+        ]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -6740,8 +6782,14 @@ describe("acp: model-independent", () => {
           confirm: { action: "accept", content: { confirmed: true } },
         });
         expect(calls[1]?.params?.requestState).toBe("opaque");
-        expect(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"])
-          .toEqual({ elicitation: { form: {} } });
+        // A shared server hears the union of its sessions' question UIs, which
+        // the owner declares as form and URL. A session that runs its own copy,
+        // as on a home whose owner socket path is too long, declares only what
+        // this editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);

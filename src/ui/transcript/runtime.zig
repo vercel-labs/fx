@@ -4,6 +4,9 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const transcript_window_shell = @import("transcript_window_shell.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
+const agent_tool_presentation = @import("../../core/agent/runtime/tool_presentation.zig");
+const file_mutation_execution = @import("../../core/tooling/file_mutation_execution.zig");
+const tool_result_display = @import("../../core/tooling/tool_result_display.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -2234,6 +2237,49 @@ test "cached compact transcript preserves pending resume flow" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "full resume history") != null);
 }
 
+test "an unpainted resume flow is released, and a painted transcript keeps its flow" {
+    const alloc = std.testing.allocator;
+    const flow = "resume row\n";
+
+    var painted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    painted.layout.cols = 40;
+    defer painted.deinit(alloc);
+    painted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &painted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    painted.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, flow),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 1,
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 1, .partial_skip_rows = 0, .line_count = 1 },
+        .cursor_row = 2,
+        .cursor_col = 1,
+        .occupied_last_row = 1,
+        .occupied_last_row_blank = false,
+        .layout_id = 1,
+        .flow_boundaries = .{ .replay = .{ .offset = 0, .cols = 40, .cursor_col = 1, .pending_wrap = false } },
+    } };
+    try std.testing.expectEqual(@as(usize, 0), painted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(painted.notebook.pending_resume_source != null);
+    try std.testing.expect(!painted.unpainted_resume_hold);
+
+    var unpainted = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    unpainted.layout.cols = 40;
+    defer unpainted.deinit(alloc);
+    unpainted.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &unpainted,
+        alloc,
+        try alloc.dupe(u8, flow),
+    );
+    try std.testing.expect(unpainted.transcript_commit_state == .invalid);
+    try std.testing.expectEqual(@as(usize, flow.len), unpainted.releaseUnpaintedResumeSource(alloc));
+    try std.testing.expect(unpainted.notebook.pending_resume_source == null);
+    try std.testing.expect(unpainted.unpainted_resume_hold);
+}
+
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -2760,6 +2806,34 @@ test "provisional lifecycle owns semantic detail before authoritative reconcilia
     try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
 }
 
+test "a provisional row keeps its call's arguments once they are whole, while the call waits" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 7, .call_id = "saved-search" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+    } });
+    const entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(entry_id).?.arguments_json == null);
+
+    const arguments_json = "{\"handle\":\"result-1111.txt\",\"query\":\"npx\"}";
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = id,
+        .tool_name = "read_tool_result",
+        .activity_kind = .read,
+        .arguments_json = arguments_json,
+    } });
+    const detail = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings(arguments_json, detail.arguments_json.?);
+    try std.testing.expect(detail.arguments_json.?.ptr != arguments_json.ptr);
+    try std.testing.expect(detail.streaming);
+    try std.testing.expectEqual(@as(usize, 1), runtime.notebook.tool_details.items.len);
+}
+
 test "nonzero command remains Ran in the current compact projection" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
@@ -3133,6 +3207,236 @@ test "only a subagent report's detail carries the report mark" {
     try std.testing.expectEqual(types.ToolActivityKind.subagent, report.activity_kind.?);
     try std.testing.expectEqualStrings("Reviewed.", report.result.?);
     try std.testing.expect(!runtime.toolDetailForEntry(call_id).?.subagent_report);
+}
+
+test "an MCP call's detail keeps the server and tool core named, live and after a resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    // Live: the names come with the call's start, while its arguments wait
+    // and once it runs.
+    const waiting = types.ToolLifecycleId{ .turn_id = 1, .call_id = "waiting" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
+        .id = waiting,
+        .tool_name = "toolbox",
+        .activity_kind = .mcp,
+        .arguments_json = "{\"run\":\"mcp_Team_notes_echo\"}",
+        .mcp_tool = .{ .server = "Team notes", .tool = "echo" },
+    } });
+    const running = types.ToolLifecycleId{ .turn_id = 1, .call_id = "running" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = running,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "toolbox",
+        .activity_kind = .mcp,
+        .arguments_json = "{\"run\":\"mcp_my_srv_echo\"}",
+        .mcp_tool = .{ .server = "my_srv", .tool = "echo" },
+    } });
+    const read = types.ToolLifecycleId{ .turn_id = 1, .call_id = "read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = read,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"a\"}",
+    } });
+    const named = runtime.toolDetailForEntry(runtime.toolActivityRecord(running).?.entry_id).?;
+    try std.testing.expectEqualStrings("my_srv", named.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", named.mcp_tool.?);
+    const streaming = runtime.toolDetailForEntry(runtime.toolActivityRecord(waiting).?.entry_id).?;
+    try std.testing.expectEqualStrings("Team notes", streaming.mcp_server.?);
+    const plain = runtime.toolDetailForEntry(runtime.toolActivityRecord(read).?.entry_id).?;
+    try std.testing.expect(plain.mcp_server == null and plain.mcp_tool == null);
+
+    // After a resume: the names the session recorded for the saved call.
+    var metrics: Metrics = .{};
+    const held = "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"review_caution\"}}";
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .denied, "Safety caution mcp___n___echo", true);
+    try runtime.attachHistoricalToolDetail(alloc, entry_id, .{ .id = "held", .name = "toolbox", .arguments_json = "{\"run\":\"mcp___n___echo\"}" }, .mcp, .{
+        .tool_call_id = @constCast("held"),
+        .tool_name = @constCast("toolbox"),
+        .status = .failure,
+        .output = @constCast(held),
+        .output_bytes = held.len,
+        .stored_output_bytes = held.len,
+    });
+    try runtime.attachHistoricalMcpToolName(alloc, entry_id, .{ .server = "ünï", .tool = "echo" });
+    const resumed = runtime.toolDetailForEntry(entry_id).?;
+    try std.testing.expectEqualStrings("ünï", resumed.mcp_server.?);
+    try std.testing.expectEqualStrings("echo", resumed.mcp_tool.?);
+}
+
+test "a resumed shell check keeps whether it found its command ended" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const check: types.ToolCall = .{ .id = "check", .name = "shell", .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}" };
+    const outputs = [_]struct { output: []const u8, ended: bool }{
+        .{ .output = "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"done\"}", .ended = true },
+        .{ .output = "{\"session_id\":\"shell-1\",\"state\":\"running\",\"output_delta\":\"\"}", .ended = false },
+    };
+    for (outputs) |case| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Observed sleep 30", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, check, .command, .{
+            .tool_call_id = @constCast("check"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(case.output),
+            .output_bytes = case.output.len,
+            .stored_output_bytes = case.output.len,
+        });
+        try std.testing.expectEqual(case.ended, runtime.toolDetailForEntry(entry_id).?.check_found_command_ended);
+    }
+}
+
+test "a subagent message's start mark reaches its detail live and on resume" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}";
+    const call: types.ToolCall = .{ .id = "resumed-start", .name = "subagent", .arguments_json = arguments };
+    for ([_]bool{ true, false }) |started| {
+        const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "sent to scout · map it", true);
+        try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .subagent, .{
+            .tool_call_id = @constCast("resumed-start"),
+            .tool_name = @constCast("subagent"),
+            .status = .success,
+            .output = @constCast("{\"ok\":true}"),
+            .output_bytes = 11,
+            .stored_output_bytes = 11,
+            .subagent_started = started,
+        });
+        try std.testing.expectEqual(started, runtime.toolDetailForEntry(entry_id).?.subagent_started);
+    }
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-start" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "subagent",
+        .activity_kind = .subagent,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(!runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "sent to scout · map it" },
+        .result = "{\"ok\":true}",
+        .result_memory = .{ .subagent_started = true },
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.subagent_started);
+}
+
+/// The file a saved call read or changed, as its result names it with
+/// symlinks followed: a committed change's (`changedPathOfResult`), or a
+/// completed read_file's (`readPathOfResult`). Null for any other call. A
+/// read's path is taken only from its whole saved text, as live.
+fn savedResolvedPath(call: types.ToolCall, result: types.PersistedToolResult) ?[]const u8 {
+    if (result.status != .success) return null;
+    if (result.committed_file_presentation != null) {
+        return file_mutation_execution.changedPathOfResult(if (result.output.len > 0) result.output else result.preview orelse "");
+    }
+    if (std.mem.eql(u8, call.name, "read_file")) return tool_result_display.readPathOfResult(result.output);
+    return null;
+}
+
+/// An owned copy of `path`, made absolute in `root` when it is relative and
+/// the root is known; else as it is.
+fn resolvedPathIn(alloc: Allocator, path: []const u8, root: ?[]const u8) ![]u8 {
+    const folder = root orelse return alloc.dupe(u8, path);
+    if (std.Io.Dir.path.isAbsolute(path) or !std.Io.Dir.path.isAbsolute(folder)) return alloc.dupe(u8, path);
+    return std.mem.concat(alloc, u8, &.{ std.mem.trimEnd(u8, folder, "/"), "/", path });
+}
+
+test "a call's resolved file reaches its detail live and on resume, absolute only where its folder is known" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .file_link_root = "/w" };
+    defer runtime.deinit(alloc);
+
+    var metrics: Metrics = .{};
+    const arguments = "{\"path\":\"/w/tsec/x.tse\",\"old_string\":\"a\",\"new_string\":\"b\"}";
+    const call: types.ToolCall = .{ .id = "resumed-edit", .name = "edit_file", .arguments_json = arguments };
+    const saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("resumed-edit"),
+        .tool_name = @constCast("edit_file"),
+        .status = .success,
+        .output = @constCast("edited tsec/x.tse (2 bytes)"),
+        .output_bytes = 27,
+        .stored_output_bytes = 27,
+        .committed_file_presentation = .{ .path = "/w/tsec/x.tse", .kind = .edited, .lines = &.{}, .additions = 1, .deletions = 1, .truncated = false },
+    };
+    // With no folder known for the replay, the path stays as saved: the
+    // session may have run in another workspace.
+    const elsewhere_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, elsewhere_id, call, .edit, saved);
+    try std.testing.expectEqualStrings("tsec/x.tse", runtime.toolDetailForEntry(elsewhere_id).?.resolved_path.?);
+
+    runtime.saved_calls_root = "/w";
+    const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, entry_id, call, .edit, saved);
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", runtime.toolDetailForEntry(entry_id).?.resolved_path.?);
+    // A saved result with no file change kept has none.
+    var bare = saved;
+    bare.committed_file_presentation = null;
+    const bare_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Edited /w/tsec/x.tse +1 / -1", true);
+    try runtime.attachHistoricalToolDetail(alloc, bare_id, call, .edit, bare);
+    try std.testing.expect(runtime.toolDetailForEntry(bare_id).?.resolved_path == null);
+    // A read names the file core read: the target of the symlink it named.
+    const read_call: types.ToolCall = .{ .id = "resumed-read", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" };
+    const read_saved: types.PersistedToolResult = .{
+        .tool_call_id = @constCast("resumed-read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("<path>real/real.md</path>\n<content>\n1\tok\n</content>"),
+        .output_bytes = 48,
+        .stored_output_bytes = 48,
+    };
+    const read_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .completed, "Read notes.md", true);
+    try runtime.attachHistoricalToolDetail(alloc, read_id, read_call, .read, read_saved);
+    try std.testing.expectEqualStrings("/w/real/real.md", runtime.toolDetailForEntry(read_id).?.resolved_path.?);
+    // A failed read resolved no file.
+    var failed = read_saved;
+    failed.status = .failure;
+    const failed_id = try runtime.writeCompletedToolStatusReturningEntryId(alloc, &metrics, .failed, "Couldn't read notes.md", true);
+    try runtime.attachHistoricalToolDetail(alloc, failed_id, read_call, .read, failed);
+    try std.testing.expect(runtime.toolDetailForEntry(failed_id).?.resolved_path == null);
+    runtime.saved_calls_root = null;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-edit" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "edit_file",
+        .activity_kind = .edit,
+        .arguments_json = arguments,
+    } });
+    try std.testing.expect(runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.resolved_path == null);
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Edited /w/tsec/x.tse +1 / -1" },
+        .resolved_path = "/w/tsec/x.tse",
+    } });
+    try std.testing.expectEqualStrings("/w/tsec/x.tse", runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?.resolved_path.?);
+    // A live read's path is in the folder its tools ran in.
+    const read = types.ToolLifecycleId{ .turn_id = 1, .call_id = "live-read" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = read,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"notes.md\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = read,
+        .outcome = .{ .kind = .completed, .summary = "Read notes.md" },
+        .resolved_path = "real/real.md",
+    } });
+    try std.testing.expectEqualStrings("/w/real/real.md", runtime.toolDetailForEntry(runtime.toolActivityRecord(read).?.entry_id).?.resolved_path.?);
 }
 
 test "historical context-withheld tool detail keeps the call without result evidence" {
@@ -3765,6 +4069,8 @@ test "command output consolidation preserves current compact ownership" {
         .activity_kind = .command,
         .arguments_json = "{\"command\":\"stream\"}",
     } });
+    // Core names the call right after it starts; until then it has no row.
+    _ = try runtime.applyToolLifecycle(alloc, .{ .progress = .{ .id = id, .text = "● Running stream" } });
     const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
 
     var metrics: Metrics = .{};
@@ -3793,7 +4099,7 @@ test "command output consolidation preserves current compact ownership" {
     try std.testing.expect(std.mem.find(u8, compact.bytes, "STREAM 001") == null);
     // The running command is still its compact group's header.
     try std.testing.expect(std.mem.find(u8, compact.bytes, "●") != null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "run_command") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "Running") != null);
 
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
@@ -4522,6 +4828,7 @@ const PendingToolDetailTerminal = struct {
     command_process_presentation: ?types.CommandProcessPresentation = null,
     command_output_entry_id: ?u32 = null,
     command_process_entry: ?PendingCommandProcessEntry = null,
+    subagent_started: bool = false,
 
     fn deinit(self: *PendingToolDetailTerminal, alloc: Allocator) void {
         if (self.result) |value| alloc.free(value);
@@ -4740,6 +5047,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
+    "unpainted_resume_hold",
     "resume_handoff_repaint_pending",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
@@ -4809,6 +5117,8 @@ const transcript_screen_fields = [_][:0]const u8{
     "transcript_archive_boundary",
     "transcript_archive_land_index",
     "collapse_tool_calls",
+    "file_link_root",
+    "saved_calls_root",
     "painting",
     "footer_viewport",
     "extra_input_rows",
@@ -4990,6 +5300,17 @@ pub const TranscriptRuntime = struct {
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
+    /// The folder the session's tools resolve a relative path in, which a
+    /// live call's relative resolved path (`ToolDetailRecord.resolved_path`)
+    /// is in. The app owns it and keeps it while the transcript lives; null
+    /// when it has none.
+    file_link_root: ?[]const u8 = null,
+    /// The folder a saved call's relative resolved path is in while a resumed
+    /// session replays: the workspace, when every turn ran in it. Null when
+    /// the turns may have run in another workspace, whose paths would name
+    /// other files here, so the record keeps the path relative and its row
+    /// has no link. The app owns it and sets it only for the replay.
+    saved_calls_root: ?[]const u8 = null,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -5001,6 +5322,13 @@ pub const TranscriptRuntime = struct {
     /// shell rows before the renderer has had a chance to respect
     /// `viewport_top_row`.
     has_painted_transcript: bool = false,
+    /// Set when a resume flow is released before the transcript's first
+    /// paint. The transcript keeps the window drops that the flow would have
+    /// kept until that paint, or until the transcript is cleared. The design
+    /// rule, in `tests/tla/transcript_window/design/DESIGN.md`: "A resumed
+    /// transcript holds every entry until a frame has repainted it from the
+    /// entries".
+    unpainted_resume_hold: bool = false,
     /// The last stable frame handed a resumed transcript's flow to the commit
     /// anchor and invalidated it, so the rows it painted are on screen with
     /// no anchor until the next stable frame. The transcript window holds
@@ -5143,6 +5471,19 @@ pub const TranscriptRuntime = struct {
         return released_bytes;
     }
 
+    /// A resume flow installed into a transcript that is not on screen goes
+    /// stale when the transcript gets new entries before its first show, so
+    /// its owner releases it and the first show paints from the entries. A
+    /// transcript that has painted keeps its flow. A release of bytes sets
+    /// `unpainted_resume_hold`, which keeps the window's drops until the
+    /// first paint.
+    pub fn releaseUnpaintedResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
+        if (self.transcript_commit_state != .invalid) return 0;
+        const released = self.releasePendingResumeSource(alloc);
+        if (released > 0) self.unpainted_resume_hold = true;
+        return released;
+    }
+
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {
         return if (self.notebook.pending_resume_source) |*source| source.bytes else &.{};
     }
@@ -5226,6 +5567,8 @@ pub const TranscriptRuntime = struct {
         self.replaceable_row = source.replaceable_row;
         self.command_output_render = source.command_output_render;
         self.collapse_tool_calls = source.collapse_tool_calls;
+        self.file_link_root = source.file_link_root;
+        self.saved_calls_root = source.saved_calls_root;
         self.full_transcript = source.full_transcript;
         self.transcript_band_dirty = source.transcript_band_dirty;
     }
@@ -5359,6 +5702,7 @@ pub const TranscriptRuntime = struct {
                 provisional.presentation_group_id,
                 provisional.tool_name,
                 provisional.activity_kind,
+                provisional.arguments_json,
             ),
             .authoritative_started => |started| self.applyAuthoritativeLifecycle(
                 alloc,
@@ -5382,6 +5726,8 @@ pub const TranscriptRuntime = struct {
                 terminal.result,
                 terminal.result_memory,
                 terminal.command_artifact_handle,
+                terminal.check_found_command_ended,
+                terminal.resolved_path,
             ),
             .turn_finished => |finished| self.applyTurnFinishedLifecycle(
                 alloc,
@@ -5396,6 +5742,11 @@ pub const TranscriptRuntime = struct {
             );
             return err;
         };
+        switch (event) {
+            .provisional => |provisional| try self.nameMcpTool(alloc, provisional.id, provisional.mcp_tool),
+            .authoritative_started => |started| try self.nameMcpTool(alloc, started.id, started.mcp_tool),
+            else => {},
+        }
         debug_trace.eventf(
             "ui_activity",
             "lifecycle_reduced",
@@ -5819,6 +6170,7 @@ pub const TranscriptRuntime = struct {
         presentation_group_id: ?types.ToolPresentationGroupId,
         tool_name: ?[]const u8,
         activity_kind: types.ToolActivityKind,
+        arguments_json: ?[]const u8,
     ) !?types.ToolActivityKind {
         if (!admitLifecycleStart(&self.notebook.lifecycle_state, id)) return null;
         if (self.notebook.lifecycle_state.recordPtr(id)) |record| {
@@ -5833,7 +6185,7 @@ pub const TranscriptRuntime = struct {
                 id,
                 name,
                 activity_kind,
-                null,
+                arguments_json,
             );
             defer detail_start.deinit(alloc);
             detail_start.streaming = true;
@@ -5864,7 +6216,7 @@ pub const TranscriptRuntime = struct {
             id,
             tool_name orelse "tool",
             activity_kind,
-            null,
+            arguments_json,
         );
         defer detail_start.deinit(alloc);
         detail_start.streaming = true;
@@ -6065,6 +6417,8 @@ pub const TranscriptRuntime = struct {
         result: ?[]const u8,
         result_memory: ?types.ToolResultMemory,
         command_artifact_handle: ?[]const u8,
+        check_found_command_ended: bool,
+        resolved_path: ?[]const u8,
     ) !?types.ToolActivityKind {
         const record = self.notebook.lifecycle_state.recordPtr(id) orelse {
             if (self.notebook.lifecycle_state.isFenced(id.turn_id)) {
@@ -6110,6 +6464,8 @@ pub const TranscriptRuntime = struct {
             @as(u32, @intFromBool(append_turn_cancellation)),
         );
         defer detail_update.deinit(alloc);
+        var owned_resolved_path = if (resolved_path) |path| try resolvedPathIn(alloc, path, self.file_link_root) else null;
+        defer if (owned_resolved_path) |path| alloc.free(path);
         if (!try transcript_store.replacePinnedToolStatusForTerminalAtomic(
             self,
             alloc,
@@ -6144,6 +6500,14 @@ pub const TranscriptRuntime = struct {
             outcome.kind,
             &detail_update,
         );
+        if (self.toolDetailPtr(record.entry_id)) |detail| {
+            detail.check_found_command_ended = check_found_command_ended;
+            if (owned_resolved_path) |path| {
+                if (detail.resolved_path) |old| alloc.free(old);
+                detail.resolved_path = path;
+                owned_resolved_path = null;
+            }
+        }
         return null;
     }
 
@@ -6503,6 +6867,10 @@ pub const TranscriptRuntime = struct {
             null;
         defer if (projected_shell_result) |value| alloc.free(value);
         const presentation_result = projected_shell_result orelse result.output;
+        var check_arena = std.heap.ArenaAllocator.init(alloc);
+        defer check_arena.deinit();
+        const check_found_command_ended = shell_command and
+            try agent_tool_presentation.checkFoundCommandEnded(check_arena.allocator(), call, result.output);
         const command_artifact_handle = if (!deferred and
             !permission_denied and
             activity_kind == .command and
@@ -6539,6 +6907,7 @@ pub const TranscriptRuntime = struct {
                 .command_output_replay = result.command_output_replay,
                 .command_process_presentation = result.command_process_presentation,
                 .terminal_action_presentation = result.terminal_action_presentation,
+                .subagent_started = result.subagent_started,
             },
             command_artifact_handle,
             if (deferred or permission_denied) null else command_output_entry_id,
@@ -6546,7 +6915,39 @@ pub const TranscriptRuntime = struct {
         if (self.toolDetailPtr(entry_id)) |detail| {
             detail.created_at_ms = result.created_at_ms;
             detail.origin = .recorded;
+            detail.check_found_command_ended = check_found_command_ended;
+            // The saved call keeps the path as the call named it; its result
+            // names the file core resolved, as live.
+            if (savedResolvedPath(call, result)) |path| {
+                if (detail.resolved_path) |old| alloc.free(old);
+                detail.resolved_path = try resolvedPathIn(alloc, path, self.saved_calls_root);
+            }
         }
+    }
+
+    /// Gives a starting call's detail the MCP tool core named for it.
+    fn nameMcpTool(self: *TranscriptRuntime, alloc: Allocator, id: types.ToolLifecycleId, name: ?types.McpToolName) !void {
+        const value = name orelse return;
+        const record = self.notebook.lifecycle_state.recordPtr(id) orelse return;
+        const detail = self.toolDetailPtr(record.entry_id) orelse return;
+        try setMcpToolName(alloc, detail, value);
+    }
+
+    /// Gives a resumed MCP call's detail the server and tool its session
+    /// recorded for it, or the live catalog knows.
+    pub fn attachHistoricalMcpToolName(self: *TranscriptRuntime, alloc: Allocator, entry_id: u32, name: types.McpToolName) !void {
+        const detail = self.toolDetailPtr(entry_id) orelse return;
+        try setMcpToolName(alloc, detail, name);
+    }
+
+    fn setMcpToolName(alloc: Allocator, detail: *ToolDetailRecord, name: types.McpToolName) Allocator.Error!void {
+        const server = try alloc.dupe(u8, name.server);
+        errdefer alloc.free(server);
+        const tool = try alloc.dupe(u8, name.tool);
+        if (detail.mcp_server) |old| alloc.free(old);
+        if (detail.mcp_tool) |old| alloc.free(old);
+        detail.mcp_server = server;
+        detail.mcp_tool = tool;
     }
 
     /// Gives a resumed row of a call made through `fx mcp call` the detail
@@ -6609,6 +7010,20 @@ pub const TranscriptRuntime = struct {
             command_artifact_handle,
             if (replayed_output) self.latestCommandOutputEntryId() else null,
         );
+        if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
+    }
+
+    /// The detail of a saved call, no command, that its turn cancelled
+    /// while it ran, as live left it: the call and a cancelled outcome.
+    pub fn attachHistoricalCancelledCallDetail(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        entry_id: u32,
+        call: types.ToolCall,
+        activity_kind: types.ToolActivityKind,
+    ) !void {
+        try self.upsertToolDetailStart(alloc, entry_id, null, call.name, activity_kind, call.arguments_json);
+        try self.updateToolDetailTerminal(alloc, entry_id, null, call.name, activity_kind, .cancelled, null, null, null, null);
         if (self.toolDetailPtr(entry_id)) |detail| detail.origin = .recorded;
     }
 
@@ -6830,6 +7245,7 @@ pub const TranscriptRuntime = struct {
             memory.command_process_presentation
         else
             null;
+        pending.subagent_started = if (result_memory) |memory| memory.subagent_started else false;
         pending.command_output_entry_id = if (activity_kind == .command)
             command_output_entry_id_override orelse
                 self.commandOutputEntryIdForLifecycle(lifecycle_id)
@@ -6887,6 +7303,7 @@ pub const TranscriptRuntime = struct {
             pending.command_output_replay = null;
         }
         detail.command_process_presentation = pending.command_process_presentation;
+        detail.subagent_started = pending.subagent_started;
         if (activity_kind == .command) {
             detail.command_output_entry_id = pending.command_output_entry_id;
         }
@@ -7299,7 +7716,7 @@ pub const TranscriptRuntime = struct {
         window.pending_drops.shrinkRetainingCapacity(still_pending);
 
         _ = transcript_store.dropEntriesAtomic(self, alloc, ready.items) catch |err| {
-            // Only entries still in the notebook go back: the store can remove some before it fails.
+            // Only ids still in the notebook go back, and since a failed drop leaves the notebook as it was, that is every id that left the list.
             var restored: usize = 0;
             for (self.notebook.entries.items) |entry| {
                 if (!going.contains(entry.id())) continue;
@@ -7317,11 +7734,18 @@ pub const TranscriptRuntime = struct {
     /// held cycle. A resumed transcript not painted yet is the exception: the
     /// clear replays its prepared flow, which still shows the cycle before
     /// the newest compaction, so those entries stay until they scroll off.
+    /// A transcript whose resume flow was released before its first paint is
+    /// the same exception until that paint: its replay runs from the entries,
+    /// which still hold the cycle.
     pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
         const window = if (self.transcript_window) |*value| value else return;
         if (window.pending_drops.items.len == 0) return;
         if (self.notebook.pending_resume_source != null) {
             debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=resume_source_pending", .{window.pending_drops.items.len});
+            return;
+        }
+        if (self.unpainted_resume_hold) {
+            debug_trace.logf("transcript_window", "screen cleared: keeping held drops entries={d} reason=unpainted_resume", .{window.pending_drops.items.len});
             return;
         }
         const hold: TranscriptWindowDropHold = .none;
@@ -7355,8 +7779,9 @@ pub const TranscriptRuntime = struct {
         if (self.fullTranscriptActive()) return .all;
         // A resumed transcript not painted yet, or painted and handed off
         // with no anchor yet: everything it holds is on screen or about to
-        // be.
-        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending) return .all;
+        // be. A resume flow released before the first paint holds the same
+        // drops until that paint (`unpainted_resume_hold`).
+        if (self.notebook.pending_resume_source != null or self.resume_handoff_repaint_pending or self.unpainted_resume_hold) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,
@@ -8043,7 +8468,8 @@ pub const TranscriptRuntime = struct {
         const ids = try held.alloc.alloc(u32, drop_count);
         defer held.alloc.free(ids);
         for (entries[0..drop_count], ids) |entry, *id| id.* = entry.id();
-        _ = try transcript_store.dropEntriesAtomic(held.runtime, held.alloc, ids);
+        // The caller discards the archive when the trim fails, so the drop needs no copy.
+        _ = try transcript_store.dropEntries(held.runtime, held.alloc, ids);
         // Indexes count the whole cycle, so what stays must be its newest
         // entries; a kept pin would leave a gap.
         const after = held.runtime.notebook.entries.items;
@@ -9542,7 +9968,10 @@ pub const TranscriptRuntime = struct {
             self.resize_history_row_delta == null and
             !destructive_invalidation and
             target.visual_offset >= target.history_visual_offset and
-            scroll_facts.target_visual_offset < anchor.visual_offset;
+            // Rows between the history offset and the logical offset are on no
+            // screen, so a target at or after the history offset does not rewind
+            // what the terminal shows.
+            scroll_facts.target_visual_offset < committedProjectionVisualOffset(anchor);
     }
 
     fn semanticProgressNeedsStaging(
@@ -10404,6 +10833,18 @@ pub const TranscriptRuntime = struct {
                     scroll_facts.target_visual_offset,
                 },
             );
+            diagnostics.recordRenderEvent(
+                .transition,
+                "target_failed err={s} compatible={} geometry={} recovery={} restore={} target={d}",
+                .{
+                    @errorName(err),
+                    scroll_facts.source_compatible,
+                    scroll_facts.geometry_rebase,
+                    scroll_facts.recovery_rebase,
+                    normal_buffer_recovery_pending,
+                    scroll_facts.target_visual_offset,
+                },
+            );
             return err;
         };
         if (!projection_area.isEmpty() and
@@ -11189,6 +11630,7 @@ pub const TranscriptRuntime = struct {
             if (target_has_content and !self.has_painted_transcript) {
                 self.has_painted_transcript = true;
             }
+            if (target_has_content) self.unpainted_resume_hold = false;
 
             previous_state.deinit(alloc);
             previous_cache.deinit(alloc);
@@ -15458,6 +15900,107 @@ test "preserved source rewrite holds the normal buffer at committed history" {
         },
         .invalid, .recovering => return error.TestExpectedStableTranscript,
     }
+}
+
+test "a target between the on-screen history offset and the logical offset is not a rewind" {
+    const runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+    };
+    const selection: ViewportSelection = .{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 2,
+        .partial_skip_rows = 0,
+        .line_count = 6,
+        .last_visible_row = 4,
+    };
+    // The footer shrank during a long turn: the logical offset is 30, and the
+    // screen shows the history offset, 27.
+    const anchor: CommittedTranscriptAnchor = .{
+        .selection = selection,
+        .visual_offset = 30,
+        .history_visual_offset = 27,
+        .total_visual_rows = 40,
+        .flow = &.{},
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .occupied_last_row = 4,
+        .occupied_last_row_blank = false,
+        .layout_id = 17,
+        .normal_buffer_recovery_pending = true,
+    };
+    const target: TranscriptRuntime.TransitionTarget = .{
+        .selection = selection,
+        .visual_offset = 28,
+        .history_visual_offset = 27,
+        .source_endpoint_visual_offset = 28,
+        .total_visual_rows = 40,
+        .cursor_row = 4,
+        .cursor_col = 1,
+        .measured_history_origin = null,
+    };
+    const facts: TranscriptScrollFacts = .{
+        .source_compatible = true,
+        .geometry_rebase = false,
+        .target_visual_offset = 28,
+    };
+
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(target, anchor, facts, false));
+
+    // The boundaries: a target at the on-screen history offset stays where the
+    // screen is, and a target at the logical offset is the projection itself.
+    // Neither moves back.
+    var on_history = target;
+    on_history.visual_offset = 27;
+    on_history.history_visual_offset = 27;
+    on_history.source_endpoint_visual_offset = 27;
+    var on_history_facts = facts;
+    on_history_facts.target_visual_offset = 27;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_history, anchor, on_history_facts, false));
+
+    var on_logical = target;
+    on_logical.visual_offset = 30;
+    on_logical.history_visual_offset = 30;
+    on_logical.source_endpoint_visual_offset = 30;
+    var on_logical_facts = facts;
+    on_logical_facts.target_visual_offset = 30;
+    try std.testing.expect(!runtime.paintedStableTargetWouldRewind(on_logical, anchor, on_logical_facts, false));
+
+    // A target behind the on-screen offset is still a rewind. Its history
+    // offset matches its visual offset, as TransitionTarget.init sets them.
+    var behind = target;
+    behind.visual_offset = 26;
+    behind.history_visual_offset = 26;
+    behind.source_endpoint_visual_offset = 26;
+    var behind_facts = facts;
+    behind_facts.target_visual_offset = 26;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(behind, anchor, behind_facts, false));
+
+    // Without pending recovery, the logical offset 30 is the projection, so 28
+    // still rewinds.
+    var settled = anchor;
+    settled.normal_buffer_recovery_pending = false;
+    settled.history_visual_offset = 30;
+    try std.testing.expect(runtime.paintedStableTargetWouldRewind(target, settled, facts, false));
 }
 
 test "frame scroll commit consumption releases rows before transition advancement" {

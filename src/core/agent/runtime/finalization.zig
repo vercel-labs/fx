@@ -188,9 +188,10 @@ pub const TurnFinalizationGuard = struct {
 
         self.cleanup_agent_terminal_leases();
         // Decided before the report, since a prompt typed once the turn is
-        // reported can join its ending as steering. The stops run after it:
-        // a command that ignores SIGTERM takes seconds to stop, and the user
-        // sees the turn end without waiting for it.
+        // reported can join its ending as steering. The stops start after
+        // it and run in the background: a command that ignores SIGTERM takes
+        // seconds to stop, and neither the turn's end nor the next prompt
+        // waits for it.
         const stop_detached = self.stops_steering_detached_commands(outcome);
 
         self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {

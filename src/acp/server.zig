@@ -58,7 +58,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -934,8 +934,9 @@ fn destroyActiveSession(state: *ServerState) void {
         if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
-    if (active.v2) |v2| v2.close();
+    // Before the session closes: a start capture still running uses it.
     active.turn_capture.deinit();
+    if (active.v2) |v2| v2.close();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
