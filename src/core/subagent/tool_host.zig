@@ -6949,7 +6949,7 @@ test "wait asks the model to answer the user's message first, once, before it wa
     };
     const next = try waitWithTurn(runtime, arena, "w2", &worker, &told);
     try std.testing.expect(std.mem.find(u8, next, answer_owed) == null);
-    try std.testing.expect(std.mem.find(u8, next, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, next, "no report or message will arrive") != null);
 
     // A wait toolbox ran keeps its call's id, under toolbox's name.
     const told_through_toolbox = [_]types.ChatMessage{
