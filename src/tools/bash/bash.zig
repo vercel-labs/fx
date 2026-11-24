@@ -82,6 +82,8 @@ const start_folder_notice = "fx: the bash session's saved folder could not be us
 /// The notice a call's result carries when `heal` lost the saved state, because a
 /// program removed or replaced the session's files. It is true of every result.
 const state_lost_notice = "fx: the bash session's saved state was lost because its files were removed or replaced, so programs start from a fresh state.";
+/// The failure text when the session could not make a folder. The program did not run.
+const session_folder_failed_text = "fx: bash could not make a folder for its session ({s}), so this program did not run.";
 
 /// The action a call gets, decided by its command: `wait` when the command is
 /// the wait request, else `run`. This is fx's own field, so an `action` the
@@ -219,10 +221,17 @@ fn callRun(
     };
     const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
     // Before the program, the session folder is checked and repaired, so no shell
-    // the program starts waits on a FIFO, a link, or a missing file.
-    const healed = session.heal(io_mod.getIo(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
+    // the program starts waits on a FIFO, a link, or a missing file. Every repair
+    // made is logged, even when a later one fails.
+    const healed = session.heal(io_mod.getIo(), &fx_variables);
     if (swept + healed.swept > 0) debug_trace.logf("bash", "removed {d} bash session folders that ended processes left", .{swept + healed.swept});
     for (healed.items()) |repair| debug_trace.logf("bash", "bash session healed what={s} name={s}", .{ @tagName(repair.what), repair.name });
+    if (healed.repair_failed) |err| debug_trace.logf("bash", "bash session repair failed err={s}", .{@errorName(err)});
+    if (healed.forget_failed) |err| debug_trace.logf("bash", "bash session could not remove its old folder err={s}", .{@errorName(err)});
+    if (healed.fresh_failed) |err| {
+        debug_trace.logf("bash", "bash session could not make a folder err={s}", .{@errorName(err)});
+        return sessionFailure(ctx, err);
+    }
     // Set by the prepare and heal above. Looked up before the program is set, so a
     // missing text fails the call without running a program with no saved state.
     const after_startup = session.afterStartupText() orelse return runtimeFailure(ctx, error.SessionNotPrepared);
@@ -538,6 +547,13 @@ fn unavailableResult(ctx: tool_dispatch.DispatchContext) tool_dispatch.DispatchE
 fn runtimeFailure(ctx: tool_dispatch.DispatchContext, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     return .{ .failure = try ctx.allocator.print("bash could not run the program: {s}.", .{@errorName(err)}) };
+}
+
+/// The result when the session could not make a folder, so the program did not run.
+/// Running out of memory is the caller's to report, so it is returned as is.
+fn sessionFailure(ctx: tool_dispatch.DispatchContext, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    return .{ .failure = try ctx.allocator.print(session_folder_failed_text, .{@errorName(err)}) };
 }
 
 fn cancelRequested(ctx: tool_dispatch.DispatchContext) bool {
@@ -1750,6 +1766,103 @@ test "a program that puts a FIFO where its save record is returns its own result
     const second = try callRun(ctx, read, program_yield_ms);
     defer second.deinit(alloc);
     try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+}
+
+test "a repair that cannot complete starts a fresh session: the next program has the state-lost notice and the trace, and the one after keeps its state" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
+
+    try bash.authorize(&ctx, "x=1");
+    const first = try callRun(ctx, "x=1", program_yield_ms);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+
+    // env.sh is removed, and the folder is read-only, so the repair cannot write env.sh.
+    var old = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{ .iterate = true });
+    defer old.close(bash.io);
+    try old.deleteFile(bash.io, "env.sh");
+    try old.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o500));
+    defer old.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: the mode is restored only so the temporary directory can be removed.
+    // Root or a DAC-override user writes into the read-only folder, so the repair would not fail: skip.
+    if (old.createFile(bash.io, "mode-probe", .{ .exclusive = true })) |probe| {
+        probe.close(bash.io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    // The next program runs in a fresh session, and its result says the state was lost.
+    const read = "echo \"x=${x-unset}\"";
+    try bash.authorize(&ctx, read);
+    const fresh = try callRun(ctx, read, program_yield_ms);
+    defer fresh.deinit(alloc);
+    const fresh_text = try outcomeText(fresh, true);
+    try std.testing.expect(std.mem.startsWith(u8, fresh_text, "x=unset\n"));
+    try std.testing.expect(std.mem.find(u8, fresh_text, state_lost_notice) != null);
+
+    // The program after it saves a state, and the one after that keeps it.
+    try bash.authorize(&ctx, "x=3");
+    const saved = try callRun(ctx, "x=3", program_yield_ms);
+    defer saved.deinit(alloc);
+    const again = "echo \"x=$x\"";
+    try bash.authorize(&ctx, again);
+    const kept = try callRun(ctx, again, program_yield_ms);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings("x=3\n", try outcomeText(kept, true));
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "bash session repair failed err=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "bash session healed what=state_lost name=session") != null);
+}
+
+test "a repair that cannot complete, with no new folder either, fails the call with the session text, and the program does not run" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+
+    try bash.authorize(&ctx, "x=1");
+    const first = try callRun(ctx, "x=1", program_yield_ms);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+
+    // The old folder is read-only without env.sh, and the workspace is read-only, so no folder can be made.
+    var old = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{ .iterate = true });
+    defer old.close(bash.io);
+    try old.deleteFile(bash.io, "env.sh");
+    try old.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o500));
+    defer old.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: the mode is restored only so the temporary directory can be removed.
+    // Opened for iteration, so the handle is a real descriptor that setPermissions and access can use.
+    var workspace = try std.Io.Dir.cwd().openDir(bash.io, bash.workspace, .{ .iterate = true });
+    defer workspace.close(bash.io);
+    try workspace.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o500));
+    defer workspace.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: the mode is restored only so the temporary directory can be removed.
+    // Root or a DAC-override user writes into the read-only folder, so the call would not fail: skip.
+    if (old.createFile(bash.io, "mode-probe", .{ .exclusive = true })) |probe| {
+        probe.close(bash.io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    const marker = "ran.txt";
+    const program = try alloc.print("echo ran > '{s}/{s}'", .{ bash.workspace, marker });
+    defer alloc.free(program);
+    try bash.authorize(&ctx, program);
+    const refused = try callRun(ctx, program, program_yield_ms);
+    defer refused.deinit(alloc);
+    const text = try outcomeText(refused, false);
+    try std.testing.expect(std.mem.startsWith(u8, text, "fx: bash could not make a folder for its session ("));
+    try std.testing.expect(std.mem.endsWith(u8, text, "), so this program did not run."));
+    try std.testing.expect(std.mem.find(u8, text, bash.workspace) == null);
+    // Looking up the marker needs no write access, so its absence is checked while the workspace is read-only.
+    try std.testing.expectError(error.FileNotFound, workspace.access(bash.io, marker, .{}));
 }
 
 test "a refused call carries the folder notice, since the folder it was approved for was dropped" {

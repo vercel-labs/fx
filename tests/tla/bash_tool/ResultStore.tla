@@ -23,6 +23,12 @@
 (* not saved either: the last complete state stays, and the program's      *)
 (* output says so.                                                         *)
 (*                                                                         *)
+(* A program can also damage the session's own files after its save, for   *)
+(* example by removing the session folder or leaving a FIFO where a file   *)
+(* should be. Before the next program starts, fx heals the files: that     *)
+(* program starts from a fresh state, and its result says the saved state  *)
+(* was lost.                                                               *)
+(*                                                                         *)
 (* The server ends a program in three steps, as the code does: it saves    *)
 (* the output, makes the result ready, and then clears its running marker. *)
 (***************************************************************************)
@@ -51,9 +57,12 @@ VARIABLES
     savedBy,   \* programs whose end saved the bash state
     refused,   \* programs whose end did not save a state over the size cap
     noticed,   \* programs whose output says their state was not saved
+    damaged,   \* a program left the session's files damaged after its save
+    lost,      \* programs that started from a fresh state after a heal
+    lostNoticed, \* programs whose result says the saved state was lost
     fxSaved    \* fx command results the current program saved
 
-stateVars == <<saves, torn, how, savedBy, refused, noticed>>
+stateVars == <<saves, torn, how, savedBy, refused, noticed, damaged, lost, lostNoticed>>
 vars == <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved, stateVars>>
 
 \* The running marker the client reads: the program until the server clears it.
@@ -75,6 +84,9 @@ Init ==
     /\ savedBy = {}
     /\ refused = {}
     /\ noticed = {}
+    /\ damaged = FALSE
+    /\ lost = {}
+    /\ lostNoticed = {}
     /\ fxSaved = 0
 
 \* Saving a result appends it and its index line.
@@ -83,7 +95,9 @@ Save(kind, p) ==
     /\ index' = IF Mutation = "skip-index" /\ kind = "fx" THEN index ELSE Append(index, Len(store) + 1)
 
 \* The model sends p while no marker is set. A result nobody read stays
-\* saved and unread. The program loads the last saved bash state.
+\* saved and unread. fx first heals the session's files: when a program
+\* damaged them, p starts from a fresh state and its result says the saved
+\* state was lost. Otherwise p loads the last saved bash state.
 Send(p) ==
     /\ p \notin sent
     /\ phase = "idle"
@@ -94,7 +108,22 @@ Send(p) ==
     /\ ready' = None
     /\ waiting' = p
     /\ fxSaved' = 0
-    /\ UNCHANGED <<shown, store, index, stateVars>>
+    /\ IF damaged
+       THEN /\ damaged' = (Mutation = "skip-heal")
+            /\ lost' = lost \cup {p}
+            /\ lostNoticed' = IF Mutation = "silent-heal" THEN lostNoticed ELSE lostNoticed \cup {p}
+       ELSE UNCHANGED <<damaged, lost, lostNoticed>>
+    /\ UNCHANGED <<shown, store, index, saves, torn, how, savedBy, refused, noticed>>
+
+\* After its save, the last program damages the session's files: its EXIT
+\* trap or a child it left behind removes the folder or puts a FIFO there.
+Damage ==
+    /\ current # None
+    /\ phase # "run"
+    /\ ~damaged
+    /\ damaged' = TRUE
+    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved,
+                   saves, torn, how, savedBy, refused, noticed, lost, lostNoticed>>
 
 \* The running program saves one fx command result.
 SaveFx ==
@@ -132,7 +161,7 @@ Finish(kind, big) ==
             /\ savedBy' = savedBy \cup {current}
             /\ torn' = FALSE
             /\ UNCHANGED <<refused, noticed>>
-    /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved>>
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved, damaged, lost, lostNoticed>>
 
 \* The server clears its running marker.
 Clear ==
@@ -175,6 +204,7 @@ Next ==
     \/ Show
     \/ GiveUp
     \/ WaitMore
+    \/ Damage
 
 Spec ==
     /\ Init /\ [][Next]_vars
@@ -196,6 +226,9 @@ TypeOK ==
     /\ savedBy \subseteq sent
     /\ refused \subseteq sent
     /\ noticed \subseteq sent
+    /\ damaged \in BOOLEAN
+    /\ lost \subseteq sent
+    /\ lostNoticed \subseteq sent
     /\ fxSaved \in 0..MaxFx
 
 \* A program runs at most once, whatever the client and the model do.
@@ -227,6 +260,14 @@ EndedSaves == \A p \in Programs : how[p] \in {"ok", "exit"} => p \in savedBy \cu
 \* A state that was not saved for its size is never dropped silently: the
 \* program's output says so (RULES.md R3.8).
 RefusalNoticed == refused \subseteq noticed
+
+\* fx heals the session's files before a program runs, so no program runs
+\* on damaged files.
+NeverLoadsDamaged == phase = "run" => ~damaged
+
+\* Saved state lost to damaged files is never lost silently: the result of
+\* the program that started fresh says so (RULES.md R3.8).
+LossNoticed == lost \subseteq lostNoticed
 
 \* A saved result is never changed or removed.
 StoreAppendOnly == [][SubSeq(store', 1, Len(store)) = store]_vars

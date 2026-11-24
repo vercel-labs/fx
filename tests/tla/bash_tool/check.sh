@@ -12,6 +12,8 @@
 #   exit-skips-save   a program that ends with exit does not save its state    EndedSaves
 #   silent-refusal    a state over the size cap is not saved, with no notice   RefusalNoticed
 #   big-save-torn     a refused save leaves the bash state half-written        StateNeverTorn
+#   silent-heal       a heal drops the saved state with no notice              LossNoticed
+#   skip-heal         a program runs on damaged session files                  NeverLoadsDamaged
 #
 # No Bun driver runs the built fx along this model yet; the bash tool's unit
 # and e2e tests cover the session part that has landed.
@@ -35,4 +37,6 @@ ResultStore result-store-mutation-torn-save StateNeverTorn
 ResultStore result-store-mutation-exit-skips-save EndedSaves
 ResultStore result-store-mutation-silent-refusal RefusalNoticed
 ResultStore result-store-mutation-big-save-torn StateNeverTorn
+ResultStore result-store-mutation-silent-heal LossNoticed
+ResultStore result-store-mutation-skip-heal NeverLoadsDamaged
 VERDICTS
