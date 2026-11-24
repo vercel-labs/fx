@@ -18,6 +18,7 @@ test {
     _ = @import("core/agent/runtime/parallel_execution.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
+    _ = @import("core/auth/oauth.zig");
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/config/configured_provider.zig");
     _ = @import("core/app/app_agents_runtime.zig");
