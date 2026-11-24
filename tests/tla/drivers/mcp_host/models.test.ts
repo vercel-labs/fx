@@ -11,7 +11,7 @@ import { runModels } from "./model";
 import { save } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
 
-// CI checks the catalog in two parts, because SignIn alone is half of the TLC time: FX_MCP_HOST_MODELS=SignIn runs
+// CI checks the catalog in two model parts beside the drivers part, because SignIn alone is half of the TLC time: FX_MCP_HOST_MODELS=SignIn runs
 // that model, and FX_MCP_HOST_MODELS=-SignIn runs every other. Unset, one run checks them all.
 const part = process.env.FX_MCP_HOST_MODELS;
 const SIGNIN = { smoke: 1, stress: 1, findings: 5, repairs: 1 };

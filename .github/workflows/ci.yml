@@ -202,8 +202,9 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
-  # minutes, the TLA+ MCP jobs (the engine's and the host's two parts) about 20 each, and the TLA+ transcript
-  # window and subagent models a few each. A pull request runs each only when
+  # minutes, the TLA+ MCP jobs 7 to 28 each (the engine's the longest, the host's
+  # three parts the shortest), and the TLA+ transcript window and subagent
+  # models a few each. A pull request runs each only when
   # it changes the code that check covers; see scripts/detect-ci-need.sh.
   # Pushes to main and manual dispatches always run all four, so the main run
   # that Publish libfx waits for includes them.
@@ -688,7 +689,7 @@ jobs:
         run: npm run --prefix sdk test:browser-wasm
 
   # The MCP engine models and the driver that runs src/mcp/ along them. The
-  # host models and drivers run in the next job's two parts, in parallel, so
+  # host models and drivers run in the next job's three parts, in parallel, so
   # no job takes the whole 40 minutes alone. Their planted bugs stay local
   # (tests/tla/mcp/check.sh): they measure the checks, not the code.
   tla-mcp:
@@ -812,6 +813,10 @@ jobs:
               ;;
             *) echo "unknown part: $PART" >&2; exit 1 ;;
           esac
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no test files found in $dir" >&2
+            exit 1
+          fi
           printf 'MCP host %s part runs:\n' "$PART"
           printf '  %s\n' "${files[@]}"
           bun test "${files[@]}" "${args[@]}"

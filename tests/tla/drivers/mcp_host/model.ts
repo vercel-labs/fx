@@ -34,8 +34,14 @@ function verdictOf(run: TlcRun, expect?: { invariant?: string; property?: string
   return run.exit === 13 && run.temporal && run.violated === undefined ? "CAUGHT" : "FAIL";
 }
 
-// `only` is one module's name, or `-NAME` for every module but that one.
+// `only` is one module's name, or `-NAME` for every module but that one. A name that is not in the catalog
+// fails: it would run nothing, or, after the `-`, everything.
 export async function runModels(outDir: string, only?: string): Promise<GateResult[]> {
+  if (only !== undefined) {
+    const name = only.startsWith("-") ? only.slice(1) : only;
+    const names = catalog().map((entry) => entry.module);
+    if (!names.includes(name)) throw new Error(`No model named '${name}' in catalog.json. Models: ${names.join(", ")}`);
+  }
   mkdirSync(outDir, { recursive: true, mode: 0o700 });
   const { java, jar, jarSha256 } = tools();
   const results: GateResult[] = [];
@@ -89,8 +95,10 @@ export async function runModels(outDir: string, only?: string): Promise<GateResu
 
 if (import.meta.main) {
   const out = process.argv[2];
-  if (!out) throw new Error("Usage: bun model.ts NEW_OUTPUT_DIRECTORY [--model NAME]");
+  const usage = "Usage: bun model.ts NEW_OUTPUT_DIRECTORY [--model NAME | --model -NAME]";
+  if (!out) throw new Error(usage);
   const at = process.argv.indexOf("--model");
+  if (at > 0 && !process.argv[at + 1]) throw new Error(usage);
   const results = await runModels(resolve(out), at > 0 ? process.argv[at + 1] : undefined);
   const failed = results.filter((r) => r.verdict === "FAIL");
   console.log(`${results.length} runs, ${failed.length} failed`);
