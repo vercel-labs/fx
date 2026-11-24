@@ -591,3 +591,28 @@ test "a pasted sign-in return is classified on fuzzed bytes, and only a return t
         }) ++ @import("fuzz_corpus").mcp_pasted_return.*),
     });
 }
+
+/// A return to this sign-in's redirect and state, padded with `a` to `len` bytes.
+fn paddedPastedReturn(arena: Allocator, len: usize) Allocator.Error![]u8 {
+    const head = "http://127.0.0.1:41723/callback?code=";
+    const tail = "&state=s1";
+    const text = try arena.alloc(u8, len);
+    @memcpy(text[0..head.len], head);
+    @memset(text[head.len .. len - tail.len], 'a');
+    @memcpy(text[len - tail.len ..], tail);
+    return text;
+}
+
+test "a pasted return of exactly the length limit is this sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const text = try paddedPastedReturn(arena.allocator(), max_pasted_return_bytes);
+    try testing.expectEqual(std.meta.Tag(Pasted).this_sign_in, try pastedTag(arena.allocator(), authorize_with_redirect, text));
+}
+
+test "a pasted return one byte over the length limit is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const text = try paddedPastedReturn(arena.allocator(), max_pasted_return_bytes + 1);
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, text));
+}

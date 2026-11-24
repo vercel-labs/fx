@@ -391,11 +391,13 @@ pub const State = struct {
         self.host_completion_arena = null;
         self.host_completion = &.{};
         // No host is left to notify, and no `/mcp` thread to push.
-        if (self.host_sink) |sink| {
-            sink.deinit();
-            std.heap.c_allocator.destroy(sink);
-            self.host_sink = null;
-        }
+        self.dropHostSink();
+    }
+
+    fn dropHostSink(self: *State) void {
+        const sink = self.host_sink orelse return;
+        self.host_sink = null;
+        sink.release();
     }
 
     pub const HostNotice = struct { text: []u8, warning: bool };
@@ -418,8 +420,9 @@ pub const State = struct {
         /// The sign-in waiting for the browser, as its server, a 0 byte, and
         /// its address, so the menu can say so. Owned; the next one replaces it.
         sign_in: ?[]u8 = null,
-        /// The last sign-in that ended, as `sign_in` is, so its return pasted late is held back, not sent. Owned.
-        ended_sign_in: ?[]u8 = null,
+        /// The sign-ins that stopped waiting, newest first, so a return pasted
+        /// late is held back or finished, not sent to the model. Owned.
+        recent_sign_ins: std.ArrayList(RecentSignIn) = .empty,
         /// The server `/mcp add` just added, to sign in to once the host has
         /// loaded it and it asks for a login (`State.signInAfterAdd`). Owned.
         sign_in_when_loaded: ?[]u8 = null,
@@ -427,17 +430,39 @@ pub const State = struct {
         sign_in_pasted: bool = false,
         /// fx can't open a browser here, so a sign-in offers to take its pasted return.
         offer_paste: bool = false,
+        /// The paste job holds the sink past `destroyHost`, so the last holder frees it.
+        refs: std.atomic.Value(u32) = .init(1),
+
+        const max_recent_sign_ins = 8;
+
+        const RecentSignIn = struct { waiting: []u8, pasted: bool };
+
+        /// A return the paste job finishes, with the exact sign-in text it was
+        /// started for. The strings belong to the arena the decision was made in.
+        const PasteStart = struct { server: []const u8, address: []const u8, waiting: []const u8 };
 
         fn deinit(sink: *HostSink) void {
             if (sink.menu_tools) |*done| done.arena.deinit();
             if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
-            if (sink.ended_sign_in) |ended| std.heap.c_allocator.free(ended);
+            for (sink.recent_sign_ins.items) |recent| std.heap.c_allocator.free(recent.waiting);
+            sink.recent_sign_ins.deinit(std.heap.c_allocator);
             if (sink.sign_in_when_loaded) |name| std.heap.c_allocator.free(name);
             for (sink.notices.items) |n| std.heap.c_allocator.free(n.text);
             sink.notices.deinit(std.heap.c_allocator);
             for (sink.typed.items) |name| std.heap.c_allocator.free(name);
             sink.typed.deinit(std.heap.c_allocator);
             if (sink.news) |text| std.heap.c_allocator.free(text);
+        }
+
+        fn retain(sink: *HostSink) void {
+            _ = sink.refs.fetchAdd(1, .acq_rel);
+        }
+
+        /// Frees the sink with its last reference.
+        fn release(sink: *HostSink) void {
+            if (sink.refs.fetchSub(1, .acq_rel) != 1) return;
+            sink.deinit();
+            std.heap.c_allocator.destroy(sink);
         }
 
         fn notify(sink: *HostSink) mcp_host.Notify {
@@ -518,12 +543,54 @@ pub const State = struct {
         }
 
         /// Locked by the caller. Out of memory, the menu just doesn't say it waits.
+        /// The sign-in it replaces is kept as a recent one. The same sign-in
+        /// posted again changes nothing, so its paste still counts.
         fn waitForSignIn(sink: *HostSink, server: []const u8, url: []const u8) void {
             const a = std.heap.c_allocator;
             const next = std.mem.concat(a, u8, &.{ server, "\x00", url }) catch null;
-            if (sink.sign_in) |old| a.free(old);
+            if (sink.sign_in) |current| {
+                if (next) |text| {
+                    if (std.mem.eql(u8, current, text)) {
+                        a.free(text);
+                        return;
+                    }
+                }
+                sink.rememberSignIn(current, sink.sign_in_pasted);
+            }
             sink.sign_in = next;
             sink.sign_in_pasted = false;
+        }
+
+        /// Locked by the caller. Keeps a sign-in that stopped waiting as the
+        /// newest recent one, and drops the oldest over the cap. Takes `waiting`.
+        fn rememberSignIn(sink: *HostSink, waiting: []u8, pasted: bool) void {
+            const a = std.heap.c_allocator;
+            sink.recent_sign_ins.insert(a, 0, .{ .waiting = waiting, .pasted = pasted }) catch {
+                debug_trace.logf("mcp", "MCP recent sign-in dropped server={s} reason=out of memory", .{serverOf(waiting)});
+                a.free(waiting);
+                return;
+            };
+            if (sink.recent_sign_ins.items.len <= max_recent_sign_ins) return;
+            const oldest = sink.recent_sign_ins.pop() orelse return;
+            debug_trace.logf("mcp", "MCP recent sign-in dropped server={s} reason=more than {d} recent sign-ins", .{ serverOf(oldest.waiting), max_recent_sign_ins });
+            a.free(oldest.waiting);
+        }
+
+        /// Locked by the caller. Clears the paste flag of the one sign-in whose
+        /// text is `waiting`, so a job for an older sign-in never clears a newer one's.
+        fn clearPasteFlag(sink: *HostSink, waiting: []const u8) void {
+            if (sink.sign_in) |current| {
+                if (std.mem.eql(u8, current, waiting)) {
+                    sink.sign_in_pasted = false;
+                    return;
+                }
+            }
+            for (sink.recent_sign_ins.items) |*recent| {
+                if (std.mem.eql(u8, recent.waiting, waiting)) {
+                    recent.pasted = false;
+                    return;
+                }
+            }
         }
 
         const SignInParts = struct { server: []const u8, url: []const u8 };
@@ -534,82 +601,123 @@ pub const State = struct {
             return .{ .server = waiting[0..end], .url = waiting[end + 1 ..] };
         }
 
+        /// The server a waiting or recent sign-in is for. Empty if its text is malformed.
+        fn serverOf(waiting: []const u8) []const u8 {
+            return (splitWaiting(waiting) orelse return "").server;
+        }
+
+        /// Locked by the caller. Whether the sign-in that waits is for `server`.
+        fn waitingIsFor(sink: *const HostSink, server: []const u8) bool {
+            const waiting = sink.sign_in orelse return false;
+            return std.mem.eql(u8, serverOf(waiting), server);
+        }
+
+        /// Locked by the caller. Whether a sign-in for `server` is newer than
+        /// recent entry `k`: the waiting one, or a recent one before it.
+        fn newerSignInFor(sink: *const HostSink, k: usize, server: []const u8) bool {
+            if (waitingIsFor(sink, server)) return true;
+            for (sink.recent_sign_ins.items[0..k]) |newer| {
+                if (std.mem.eql(u8, serverOf(newer.waiting), server)) return true;
+            }
+            return false;
+        }
+
         const PasteDecision = union(enum) {
             not_a_return,
             other_sign_in: []const u8,
             already_pasted: []const u8,
-            ended: []const u8,
-            start: struct { server: []const u8, address: []const u8 },
+            superseded: []const u8,
+            start: PasteStart,
         };
 
         /// Locked by the caller. The strings it returns are owned by `arena`.
         fn decidePaste(sink: *HostSink, arena: Allocator, text: []const u8) !PasteDecision {
             if (try decideWaitingPaste(sink, arena, text)) |decision| return decision;
-            return decideEndedPaste(sink, arena, text);
+            return decideRecentPaste(sink, arena, text);
         }
 
         /// Null when `text` is not a return to the sign-in that waits.
         fn decideWaitingPaste(sink: *HostSink, arena: Allocator, text: []const u8) !?PasteDecision {
-            const waiting = splitWaiting(sink.sign_in orelse return null) orelse return null;
-            switch (try mcp_host.classifyPasted(arena, waiting.url, text)) {
+            const waiting = sink.sign_in orelse return null;
+            const parts = splitWaiting(waiting) orelse return null;
+            switch (try mcp_host.classifyPasted(arena, parts.url, text)) {
                 .unrelated => return null,
-                .other_sign_in => return PasteDecision{ .other_sign_in = try arena.dupe(u8, waiting.server) },
-                .this_sign_in => |address| return try startDecision(sink, arena, waiting.server, address),
+                .other_sign_in => return PasteDecision{ .other_sign_in = try arena.dupe(u8, parts.server) },
+                .this_sign_in => |address| {
+                    if (sink.sign_in_pasted) return PasteDecision{ .already_pasted = try arena.dupe(u8, parts.server) };
+                    const start = try copyStart(arena, parts.server, address, waiting);
+                    sink.sign_in_pasted = true;
+                    return PasteDecision{ .start = start };
+                },
             }
         }
 
-        fn startDecision(sink: *HostSink, arena: Allocator, server: []const u8, address: []const u8) !PasteDecision {
-            const owned_server = try arena.dupe(u8, server);
-            if (sink.sign_in_pasted) return .{ .already_pasted = owned_server };
-            sink.sign_in_pasted = true;
-            return .{ .start = .{ .server = owned_server, .address = address } };
+        /// Walks the recent sign-ins, newest first, until one is not unrelated to `text`.
+        fn decideRecentPaste(sink: *HostSink, arena: Allocator, text: []const u8) !PasteDecision {
+            for (sink.recent_sign_ins.items, 0..) |*recent, k| {
+                const parts = splitWaiting(recent.waiting) orelse continue;
+                switch (try mcp_host.classifyPasted(arena, parts.url, text)) {
+                    .unrelated => {},
+                    .other_sign_in => return .{ .other_sign_in = try arena.dupe(u8, parts.server) },
+                    .this_sign_in => |address| return decideRecentReturn(sink, arena, k, parts.server, address),
+                }
+            }
+            return .not_a_return;
         }
 
-        /// A return to the sign-in that ended, of its state or another's, is held back.
-        fn decideEndedPaste(sink: *HostSink, arena: Allocator, text: []const u8) !PasteDecision {
-            const ended = splitWaiting(sink.ended_sign_in orelse return .not_a_return) orelse return .not_a_return;
-            switch (try mcp_host.classifyPasted(arena, ended.url, text)) {
-                .unrelated => return .not_a_return,
-                .this_sign_in, .other_sign_in => return .{ .ended = try arena.dupe(u8, ended.server) },
-            }
+        fn decideRecentReturn(sink: *HostSink, arena: Allocator, k: usize, server: []const u8, address: []const u8) !PasteDecision {
+            // The runtime keeps one login per server, so an older return sent while a newer sign-in waits would fail that newer one.
+            if (sink.newerSignInFor(k, server)) return .{ .superseded = try arena.dupe(u8, server) };
+            const recent = &sink.recent_sign_ins.items[k];
+            if (recent.pasted) return .{ .already_pasted = try arena.dupe(u8, server) };
+            const start = try copyStart(arena, server, address, recent.waiting);
+            recent.pasted = true;
+            return .{ .start = start };
+        }
+
+        fn copyStart(arena: Allocator, server: []const u8, address: []const u8, waiting: []const u8) !PasteStart {
+            return .{
+                .server = try arena.dupe(u8, server),
+                .address = try arena.dupe(u8, address),
+                .waiting = try arena.dupe(u8, waiting),
+            };
         }
 
         /// Why a paste didn't finish its sign-in, in words for the notice.
         fn pasteFailureReason(err: anyerror) []const u8 {
             return switch (err) {
                 error.NotSigningIn => "the sign-in has ended",
-                error.NoMcpHost => "fx's MCP servers aren't running",
-                else => "fx couldn't start it",
+                error.UnknownServer => "fx no longer has that server",
+                error.NoMcpHost, error.Stopped => "fx's MCP servers aren't running",
+                error.OutOfMemory => "fx ran out of memory",
+                else => "fx couldn't use that address",
             };
         }
 
         /// A paste that didn't finish its sign-in says why, on the UI thread
         /// or off it, and the next paste or `/mcp login` can try again. The
-        /// address never appears.
-        fn pasteFailed(sink: *HostSink, server: []const u8, err: anyerror) void {
+        /// address never appears. `waiting` is the sign-in the paste was for.
+        fn pasteFailed(sink: *HostSink, waiting: []const u8, err: anyerror) void {
+            const server = serverOf(waiting);
             debug_trace.logf("mcp", "MCP pasted sign-in return failed server={s} err={s}", .{ server, @errorName(err) });
             var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
             defer arena.deinit();
             const name = safeText(arena.allocator(), server, 160);
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
-            if (sink.sign_in) |waiting| {
-                if (splitWaiting(waiting)) |parts| {
-                    if (std.mem.eql(u8, parts.server, server)) sink.sign_in_pasted = false;
-                }
-            }
+            sink.clearPasteFlag(waiting);
             const text = std.heap.c_allocator.print("Couldn't finish signing in to {s}: {s}. Try /mcp login {s} again.", .{ name, pasteFailureReason(err), name }) catch return;
             sink.pushLocked(text, true);
         }
 
-        /// Locked by the caller. The sign-in that ends is kept, so a return pasted late is held back.
+        /// Locked by the caller. The sign-in that ends is kept as a recent one,
+        /// so a return pasted late is held back or finished, not sent.
         fn endSignIn(sink: *HostSink, server: []const u8) void {
             const waiting = sink.sign_in orelse return;
             const parts = splitWaiting(waiting) orelse return;
             if (!std.mem.eql(u8, parts.server, server)) return;
-            if (sink.ended_sign_in) |old| std.heap.c_allocator.free(old);
-            sink.ended_sign_in = waiting;
             sink.sign_in = null;
+            sink.rememberSignIn(waiting, sink.sign_in_pasted);
             sink.sign_in_pasted = false;
         }
 
@@ -898,6 +1006,14 @@ pub const State = struct {
         };
     }
 
+    /// Whether a pasted line can be a return: a sign-in waits, or one was recent.
+    pub fn mayTakePastedSignIn(self: *State) bool {
+        const sink = self.host_sink orelse return false;
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        defer sink.mutex.unlock(io_mod.getIo());
+        return sink.sign_in != null or sink.recent_sign_ins.items.len > 0;
+    }
+
     /// What fx did with a line submitted while a sign-in may wait for the browser.
     pub const PastedSignIn = enum {
         /// Not that sign-in's return: the line goes on as usual.
@@ -933,16 +1049,16 @@ pub const State = struct {
                 sink.push(notice, false);
                 return .taken;
             },
-            .ended => |server| {
-                debug_trace.logf("mcp", "MCP pasted sign-in return held server={s} reason=sign-in ended", .{server});
+            .superseded => |server| {
+                debug_trace.logf("mcp", "MCP pasted sign-in return held server={s} reason=earlier sign-in", .{server});
                 const name = HostSink.safeText(aa, server, 160);
-                const notice = std.heap.c_allocator.print("That address is for a sign-in to {s} that has ended. Run /mcp login {s} to sign in again.", .{ name, name }) catch return .kept;
+                const notice = std.heap.c_allocator.print("That address is for an earlier sign-in to {s}. Run /mcp login {s} to sign in again.", .{ name, name }) catch return .kept;
                 sink.push(notice, true);
                 return .taken;
             },
             .start => |start| {
-                self.startPasteJob(start.server, start.address) catch |err| {
-                    sink.pasteFailed(start.server, err);
+                self.startPasteJob(sink, start) catch |err| {
+                    sink.pasteFailed(start.waiting, err);
                     return .kept;
                 };
                 return .taken;
@@ -950,16 +1066,20 @@ pub const State = struct {
         }
     }
 
-    fn startPasteJob(self: *State, server: []const u8, address: []const u8) !void {
+    fn startPasteJob(self: *State, sink: *HostSink, start: HostSink.PasteStart) !void {
         if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         const a = std.heap.c_allocator;
-        const server_copy = try a.dupe(u8, server);
+        const server_copy = try a.dupe(u8, start.server);
         errdefer a.free(server_copy);
-        const address_copy = try a.dupe(u8, address);
+        const address_copy = try a.dupe(u8, start.address);
         errdefer a.free(address_copy);
+        const waiting_copy = try a.dupe(u8, start.waiting);
+        errdefer a.free(waiting_copy);
         const job = try a.create(PasteJob);
         errdefer a.destroy(job);
-        job.* = .{ .state = self, .server = server_copy, .address = address_copy };
+        job.* = .{ .state = self, .sink = sink, .server = server_copy, .address = address_copy, .waiting = waiting_copy };
+        sink.retain();
+        errdefer sink.release();
         _ = self.host_verbs.fetchAdd(1, .acq_rel);
         errdefer _ = self.host_verbs.fetchSub(1, .acq_rel);
         const thread = try std.Thread.spawn(.{}, PasteJob.run, .{job});
@@ -968,26 +1088,30 @@ pub const State = struct {
 
     const PasteJob = struct {
         state: *State,
+        sink: *HostSink,
         server: []u8,
         address: []u8,
+        waiting: []u8,
 
         fn free(job: *PasteJob) void {
             const a = std.heap.c_allocator;
             a.free(job.server);
             a.free(job.address);
+            a.free(job.waiting);
             a.destroy(job);
         }
 
         fn run(job: *PasteJob) void {
             const self = job.state;
+            const sink = job.sink;
             defer {
                 job.free();
+                sink.release();
                 _ = self.host_verbs.fetchSub(1, .acq_rel);
             }
-            const sink = self.host_sink orelse return;
-            const lease = self.leaseHost() orelse return sink.pasteFailed(job.server, error.NoMcpHost);
+            const lease = self.leaseHost() orelse return sink.pasteFailed(job.waiting, error.NoMcpHost);
             defer lease.deinit();
-            lease.host.runtime.finishLogin(job.server, job.address) catch |err| return sink.pasteFailed(job.server, err);
+            lease.host.runtime.finishLogin(job.server, job.address) catch |err| return sink.pasteFailed(job.waiting, err);
         }
     };
 
@@ -1657,7 +1781,7 @@ test "takeSignIn gives the menu no address while a pasted return is being finish
     sink.sign_in_pasted = true;
     _ = state.takeSignIn();
     try std.testing.expect(state.host_menu_sign_in == null);
-    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize_s2);
     try std.testing.expect(state.takeSignIn());
     try std.testing.expect(state.host_menu_sign_in != null);
 }
@@ -1712,19 +1836,19 @@ fn lockedEndSignIn(sink: *State.HostSink, server: []const u8) void {
     sink.endSignIn(server);
 }
 
-const ended_notice = "That address is for a sign-in to fixture that has ended. Run /mcp login fixture to sign in again.";
-
-test "a pasted return after its sign-in ended is taken, with one warning that names the server and shows no code" {
+test "a pasted return after its sign-in ended is sent to finish it, and its failure names the server and shows no code" {
     var state: State = .{};
+    try std.testing.expect(state.leaseHost() == null);
     var sink: State.HostSink = .{};
     defer sink.deinit();
     state.host_sink = &sink;
     lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
     lockedEndSignIn(&sink, "fixture");
     try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn(pasted_return));
+    try waitForPasteJobs(&state);
     try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
     try std.testing.expect(sink.notices.items[0].warning);
-    try std.testing.expectEqualStrings(ended_notice, sink.notices.items[0].text);
+    try std.testing.expectEqualStrings("Couldn't finish signing in to fixture: fx's MCP servers aren't running. Try /mcp login fixture again.", sink.notices.items[0].text);
 }
 
 test "a pasted prompt after its sign-in ended is not a return, and says nothing" {
@@ -1738,17 +1862,17 @@ test "a pasted prompt after its sign-in ended is not a return, and says nothing"
     try std.testing.expectEqual(@as(usize, 0), sink.notices.items.len);
 }
 
-test "a pasted return of another state after its sign-in ended is held too, with the same warning" {
+test "a pasted return of another state after its sign-in ended is kept, with the warning that it is not that sign-in's address" {
     var state: State = .{};
     var sink: State.HostSink = .{};
     defer sink.deinit();
     state.host_sink = &sink;
     lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
     lockedEndSignIn(&sink, "fixture");
-    try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn("http://127.0.0.1:41723/callback?code=c1&state=s2"));
+    try std.testing.expectEqual(State.PastedSignIn.kept, try state.takePastedSignIn("http://127.0.0.1:41723/callback?code=c1&state=s2"));
     try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
     try std.testing.expect(sink.notices.items[0].warning);
-    try std.testing.expectEqualStrings(ended_notice, sink.notices.items[0].text);
+    try std.testing.expectEqualStrings("That isn't the address of the sign-in to fixture. Paste the one the browser ends on after you approve.", sink.notices.items[0].text);
 }
 
 test "a pasted return works as before once the same server waits for a new sign-in" {
@@ -1769,8 +1893,147 @@ test "a pasted return works as before once the same server waits for a new sign-
 test "a pasted return whose sign-in is gone by the time it finishes says the sign-in ended, and shows no code" {
     var sink: State.HostSink = .{};
     defer sink.deinit();
-    sink.pasteFailed("fixture", error.NotSigningIn);
+    sink.pasteFailed("fixture\x00" ++ pasted_authorize, error.NotSigningIn);
     try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
     try std.testing.expect(sink.notices.items[0].warning);
     try std.testing.expectEqualStrings("Couldn't finish signing in to fixture: the sign-in has ended. Try /mcp login fixture again.", sink.notices.items[0].text);
+}
+
+fn pastedAuthorizeOn(comptime port: u16) []const u8 {
+    return std.fmt.comptimePrint("https://as.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A{d}%2Fcallback&state=s{d}", .{ port, port });
+}
+
+fn pastedReturnOn(comptime port: u16) []const u8 {
+    return std.fmt.comptimePrint("http://127.0.0.1:{d}/callback?code=c1&state=s{d}", .{ port, port });
+}
+
+const pasted_authorize_beta = pastedAuthorizeOn(41724);
+
+test "a pasted return to a replaced sign-in of another server is sent, and its failure names that server" {
+    var state: State = .{};
+    try std.testing.expect(state.leaseHost() == null);
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    state.host_sink = &sink;
+    lockedWaitForSignIn(&sink, "alpha", pasted_authorize);
+    lockedWaitForSignIn(&sink, "beta", pasted_authorize_beta);
+    try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn(pasted_return));
+    try waitForPasteJobs(&state);
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Couldn't finish signing in to alpha: fx's MCP servers aren't running. Try /mcp login alpha again.", sink.notices.items[0].text);
+}
+
+test "a pasted return to an older sign-in of a server with a newer one waiting is held, with no job" {
+    var state: State = .{};
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    state.host_sink = &sink;
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    lockedEndSignIn(&sink, "fixture");
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize_beta);
+    try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn(pasted_return));
+    try std.testing.expectEqual(@as(usize, 0), state.host_verbs.load(.acquire));
+    try std.testing.expect(!sink.sign_in_pasted);
+    try std.testing.expect(sink.sign_in != null);
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    try std.testing.expect(sink.notices.items[0].warning);
+    try std.testing.expectEqualStrings("That address is for an earlier sign-in to fixture. Run /mcp login fixture to sign in again.", sink.notices.items[0].text);
+}
+
+test "a pasted return repeated while its sign-in is being finished gives one notice that is not a warning" {
+    var state: State = .{};
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    state.host_sink = &sink;
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    lockedEndSignIn(&sink, "fixture");
+    sink.recent_sign_ins.items[0].pasted = true;
+    try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn(pasted_return));
+    try std.testing.expectEqual(@as(usize, 0), state.host_verbs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    try std.testing.expect(!sink.notices.items[0].warning);
+    try std.testing.expectEqualStrings("fx is already finishing the sign-in to fixture with that address.", sink.notices.items[0].text);
+}
+
+test "a pasted return to the oldest of nine ended sign-ins is not a return, since only eight are kept" {
+    var state: State = .{};
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    state.host_sink = &sink;
+    inline for (0..9) |i| {
+        lockedWaitForSignIn(&sink, "fixture", pastedAuthorizeOn(41000 + i));
+        lockedEndSignIn(&sink, "fixture");
+    }
+    try std.testing.expectEqual(@as(usize, 8), sink.recent_sign_ins.items.len);
+    try std.testing.expectEqual(State.PastedSignIn.not_a_return, try state.takePastedSignIn(pastedReturnOn(41000)));
+    try std.testing.expectEqual(@as(usize, 0), sink.notices.items.len);
+}
+
+test "a pasted failure for an older sign-in leaves a newer sign-in of the same server marked as being finished" {
+    const waiting_older = "fixture\x00" ++ pasted_authorize;
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    sink.sign_in_pasted = true;
+    lockedEndSignIn(&sink, "fixture");
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize_beta);
+    sink.sign_in_pasted = true;
+    sink.pasteFailed(waiting_older, error.NotSigningIn);
+    try std.testing.expect(sink.sign_in_pasted);
+    try std.testing.expect(!sink.recent_sign_ins.items[0].pasted);
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Couldn't finish signing in to fixture: the sign-in has ended. Try /mcp login fixture again.", sink.notices.items[0].text);
+}
+
+test "a pasted sink outlives the state that drops it while a paste job holds it, and still takes a notice" {
+    var state: State = .{};
+    const sink = try std.heap.c_allocator.create(State.HostSink);
+    sink.* = .{};
+    state.host_sink = sink;
+    sink.retain();
+    state.dropHostSink();
+    try std.testing.expect(state.host_sink == null);
+    try std.testing.expectEqual(@as(u32, 1), sink.refs.load(.acquire));
+    sink.push(try std.heap.c_allocator.dupe(u8, "still here"), false);
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    sink.release();
+}
+
+test "a pasted job's hold on a sink is counted by retain and release" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    sink.retain();
+    sink.release();
+    try std.testing.expectEqual(@as(u32, 1), sink.refs.load(.acquire));
+}
+
+test "a pasted return's failure words name each cause, and any other failure says the address was not used" {
+    const cases = [_]struct { err: anyerror, words: []const u8 }{
+        .{ .err = error.NotSigningIn, .words = "the sign-in has ended" },
+        .{ .err = error.UnknownServer, .words = "fx no longer has that server" },
+        .{ .err = error.NoMcpHost, .words = "fx's MCP servers aren't running" },
+        .{ .err = error.Stopped, .words = "fx's MCP servers aren't running" },
+        .{ .err = error.OutOfMemory, .words = "fx ran out of memory" },
+        .{ .err = error.Failed, .words = "fx couldn't use that address" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.words, State.HostSink.pasteFailureReason(case.err));
+}
+
+const pasted_authorize_s2 = "https://as.example/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A41723%2Fcallback&state=s2";
+
+test "a pasted return's sign-in posted again keeps its paste, so a second paste says it is already being finished" {
+    var state: State = .{};
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    state.host_sink = &sink;
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    sink.sign_in_pasted = true;
+    lockedWaitForSignIn(&sink, "fixture", pasted_authorize);
+    try std.testing.expect(sink.sign_in_pasted);
+    try std.testing.expectEqual(@as(usize, 0), sink.recent_sign_ins.items.len);
+    try std.testing.expectEqual(State.PastedSignIn.taken, try state.takePastedSignIn(pasted_return));
+    try std.testing.expectEqual(@as(usize, 0), state.host_verbs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    try std.testing.expect(!sink.notices.items[0].warning);
+    try std.testing.expectEqualStrings("fx is already finishing the sign-in to fixture with that address.", sink.notices.items[0].text);
 }

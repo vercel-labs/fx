@@ -2125,6 +2125,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
             const text = app.input_runtime.edit_state.input.items;
             if (text.len == 0) return false;
+            if (!app.mcp.mayTakePastedSignIn()) return false;
             // A long paste sits in the composer as a placeholder; its text is what counts.
             const expanded = try paste_blocks.expand(app.alloc, text, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
