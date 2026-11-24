@@ -2895,6 +2895,20 @@ pub fn clientInputEnded(session: *ActiveSessionState) bool {
     return state.input_ended;
 }
 
+/// Whether no client can answer a request to the session: it has no member left, or its main client's
+/// input has ended. A permission request that no client can answer is denied at once. With no member left,
+/// `mainLocked` returns the last record that left, whose input was never marked ended, so it is not read.
+pub fn noClientCanAnswer(session: *ActiveSessionState) bool {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    if (session.members.items.len == 0) return true;
+    const main = mainLocked(session).?;
+    const io = io_mod.getIo();
+    main.outbound_mutex.lockUncancelable(io);
+    defer main.outbound_mutex.unlock(io);
+    return main.input_ended;
+}
+
 /// Waits for the answer to `request`, or for a cancel, or for the client's input to end.
 /// The wait has no deadline of its own (R2.3): a cancel, the input ending, or the
 /// session's close each end it, and each one answers the request.

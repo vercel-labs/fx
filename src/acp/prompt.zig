@@ -3008,7 +3008,7 @@ fn requestAcpPermission(
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const question = server.beginPermissionQuestion(ctx.session) orelse {
-        if (!server.clientInputEnded(ctx.session)) return error.PermissionRequestAlreadyPending;
+        if (!server.noClientCanAnswer(ctx.session)) return error.PermissionRequestAlreadyPending;
         debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
         return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
     };
@@ -5312,6 +5312,45 @@ test "ACP permission to a client whose input ended is denied without a request" 
 
     const call = ToolCall{
         .id = "provider_call_9",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    };
+    var response = try requestAcpPermission(&ctx, alloc, .{ .label = "Run ls" }, call, null, null);
+    defer response.deinit();
+    try std.testing.expect(response.decision == .deny);
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "ACP permission with no client left is denied without a request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-permission.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+
+    const call = ToolCall{
+        .id = "provider_call_10",
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
     };

@@ -14977,6 +14977,71 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a kept turn whose only client ends its input before the turn asks is denied the permission and finishes",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-kept-ended-");
+      const target = join(root.workspace, "kept.txt");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([() => heldReply.promise, finalText("ENDED_THEN_DONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let reloaded: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        const sessionId = await startSessionListing(client, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        const asked = (await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "mode", value: "ask" },
+          4,
+        )) as any;
+        expect(asked.error).toBeUndefined();
+        sendPrompt(client, 5, "Write kept.txt and report.");
+        await waitForCondition("the first Gateway request", () => gateway.requests.length === 1);
+        client.endStdin();
+        // No output marks the moment fx reads the end of input and drops the only client, so the
+        // tool call waits a moment for that step, as the disconnect driver does.
+        await Bun.sleep(500);
+        heldReply.resolve(fileToolCall("kept_ended_write_1", target, "kept\n"));
+        const { responses } = await readUntilResponses(client, [5]);
+        expect(responses.get(5)?.error).toBeUndefined();
+        expect(responses.get(5)?.result?.stopReason).toBe("end_turn");
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(existsSync(target)).toBe(false);
+        expect(gateway.requests.length).toBe(2);
+        expect(client.stderr).toBe("");
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        reloaded.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const { responses: loaded, messages } = await readUntilResponses(reloaded, [2]);
+        expect(loaded.get(2)?.error).toBeUndefined();
+        const replayed = messages
+          .map((message) => message.params?.update)
+          .filter((update) => update?.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("");
+        expect(replayed).toContain("ENDED_THEN_DONE");
+        for (const notice of ["cancelled", "failed", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        await client?.close();
+        await reloaded?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a kept turn's queued prompt still runs after its client disconnects",
     async () => {
       const root = createIsolatedRoot("fx-acp-kept-queue-");
