@@ -71,6 +71,7 @@
     {"name": "mcp_elicitation_escapes", "module": "fx", "test": "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings", "iterations": 150000},
     {"name": "mcp_challenge", "module": "fx", "test": "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes", "iterations": 1500000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
+    {"name": "shell_snapshot_payload", "module": "fx", "test": "snapshot payload parsing keeps its laws on fuzzed sections", "iterations": 350000},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
     {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
