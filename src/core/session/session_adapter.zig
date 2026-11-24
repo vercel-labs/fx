@@ -14306,7 +14306,7 @@ test "forkLatest forks an actively open session without locking it and rejects u
     try opening.beginTurn();
     try testing.expectError(
         error.InvalidForkPoint,
-        Session.forkLatest(alloc, &t.store, opening.id(), "/w", .app, "still running"),
+        Session.forkLatest(alloc, &t.store, opening.id(), "/w", .app, "still running", null),
     );
 
     // Session with 2 completed turns held open by this process can be forked cleanly.
