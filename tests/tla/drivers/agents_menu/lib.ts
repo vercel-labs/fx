@@ -107,13 +107,14 @@ export function listRows(paneEscapes: string): Array<{ name: string; instance: b
 /// (the list calls that "finished"). Any other state, such as one that waits
 /// for an approval, or one whose last turn failed or was stopped, is an error
 /// here, since the drivers that read it start no such agent.
+/// A working row's time, such as "working 3s", is part of its state.
 export function listStates(paneEscapes: string): Array<{ name: string; instance: boolean; state: "working" | "idle" }> {
   const rows: Array<{ name: string; instance: boolean; state: "working" | "idle" }> = [];
   for (const line of paneEscapes.split("\n")) {
     const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
     const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S(.*)$/.exec(plain);
     if (!row) continue;
-    const state = /(?: {2,})(working|idle|finished|failed|stopped|needs approval|has a question|needs you)(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
+    const state = /(?: {2,})(working|idle|finished|failed|stopped|needs approval|has a question|needs you)(?: \d+(?:h\d+m\d+s|m\d+s|s))?(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
     if (state === undefined) continue;
     if (state !== "working" && state !== "idle" && state !== "finished") throw new Error(`the list shows a row in state "${state}": ${plain}`);
     rows.push({ name: (row[1] ?? row[2])!, instance: row[1] !== undefined, state: state === "working" ? "working" : "idle" });
@@ -414,7 +415,7 @@ export class World {
     for (;;) {
       const plain = (await this.session.capturePane()) as string;
       const row = plain.split("\n").find((line) => new RegExp(`^ {2}[\\u251c\\u2514] ${sub} {2,}`).test(line));
-      if (row && !/ {2,}working(?: {2,}|$)/.test(row)) return;
+      if (row && !/ {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))?(?: {2,}|$)/.test(row)) return;
       if (!row && !plain.includes(LIST_HINT) && !plain.includes(ARMED_HINT)) return;
       if (Date.now() > deadline) throw new Error(`${sub} never finished:\n${plain}`);
       await Bun.sleep(40);

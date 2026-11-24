@@ -6941,6 +6941,28 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
+test "a working subagent's row shows how long its turn has run, with no call open" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const timed = try addTestChildAgent(&app, "timed");
+    defer timed.agent.session.agent.history.deinit(alloc);
+    timed.agent.worker.worker_processing = true;
+    defer timed.agent.worker.worker_processing = false;
+    // The turn began 2m5s ago and waits on the model, so no tool call is open.
+    timed.agent.stream = .{ .active = true, .turn_started_ms = io_mod.milliTimestamp() - 125 * std.time.ms_per_s };
+    try runtime.openMenu(&app);
+    const state = try menuRowState(runtime.menuProjection(&app), "timed");
+    try std.testing.expect(std.mem.startsWith(u8, state, "working 2m"));
+}
+
 /// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
 /// through the decoder and the open list's key routing.
 fn sendTerminalBytes(app: *App, bytes: []const u8) !void {

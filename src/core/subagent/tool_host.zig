@@ -2974,16 +2974,11 @@ pub const Runtime = struct {
     }
 
     /// Records the start, or with a null `label` the end, of call `call_id`
-    /// in child `child_id`'s running turn, for status and the agent list:
+    /// in child `child_id`'s running turn, for status:
     /// the interactive app calls it for its hosted children, whose events
     /// reach the app instead of the turn.
     pub fn noteChildCall(self: *Runtime, child_id: []const u8, call_id: []const u8, label: ?[]const u8) void {
         self.managed.noteCall(child_id, call_id, label, io_mod.milliTimestamp());
-    }
-
-    /// Child `child_id`'s current tool call, while its turn runs.
-    pub fn childCall(self: *Runtime, child_id: []const u8) ?live_metrics.Call {
-        return self.managed.currentCall(child_id);
     }
 
     const ChildProfile = union(enum) {

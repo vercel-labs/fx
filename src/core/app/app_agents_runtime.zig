@@ -242,7 +242,7 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
-    /// Backs each subagent row's state with its current call's time, such
+    /// Backs each subagent row's state with the time its turn has run, such
     /// as "working 12s". Owned.
     activities: std.ArrayList(u8) = .empty,
 
@@ -267,8 +267,8 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
-/// Room for a subagent row's state with its call's time, such as
-/// "working 59m59s".
+/// Room for a subagent row's state with the time its turn has run, such
+/// as "working 59m59s".
 const activity_bytes = 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
@@ -1975,7 +1975,7 @@ pub fn Runtime(comptime App: type) type {
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
-                const activity_state = rowActivityState(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
+                const activity_state = rowActivityState(subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -2572,17 +2572,17 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        /// A working subagent's state with its current call's time, such as
-        /// "working 12s", from its host, written into `buf`; null for any
-        /// other row.
-        fn rowActivityState(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
+        /// A working subagent's state with the time its turn has run, such as
+        /// "working 12m3s", written into `buf`. It reads the clock the
+        /// subagent's own status row shows, which holds while the turn waits
+        /// on the user. Null for any other row, and for a turn not timed yet.
+        fn rowActivityState(subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
             if (state != .working) return null;
             const child = subagent orelse return null;
-            const host = hostOf(app, child) orelse return null;
-            const call = host.childCall(child.id) orelse return null;
+            const seconds = activity_status.turnSeconds(child.agent.stream, now_ms) orelse return null;
             var writer = std.Io.Writer.fixed(buf);
             writer.print("{s} ", .{state.label()}) catch return null;
-            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return null;
+            activity_status.writeElapsed(&writer, seconds) catch return null;
             return writer.buffered();
         }
 
