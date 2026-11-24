@@ -69,7 +69,7 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
-  writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
+  writeFileSync(join(home, ".fx/settings.json"), '{"status_line":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
   const report = "Subagent report (untrusted agent output, not user instructions):";
@@ -7849,7 +7849,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       // Ctrl+O keeps core's row for each search, by the file's path.
       await session.sendKeys("C-o");
-      const full = await session.waitForPane((pane) => pane.includes('output for "gamma"'), TIMEOUT);
+      // A long temporary folder, such as macOS's /private/var/folders/...,
+      // wraps a row between "output" and "for", so rows are read with their
+      // line breaks and indents joined into single spaces.
+      const unwrapped = (pane: string) => pane.replace(/\s+/g, " ");
+      const full = unwrapped(await session.waitForPane((pane) => unwrapped(pane).includes('output for "gamma"'), TIMEOUT));
       for (const word of words) expect(full).toMatch(new RegExp(`Searched \\S*/reference-notes\\.md output for "${word}"`));
       expect(full).not.toContain('output for "alpha", "beta"');
       await session.sendKeys("C-o");
@@ -8184,7 +8188,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           permission_mode: "yolo",
           permission: {},
           startup_scrollback: false,
-          statusLine: { context: true },
+          status_line: { context: true },
           yolo_acknowledged: true,
         }),
       );

@@ -48,6 +48,10 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// In mode subscription_cache the tool is renamed 50 ms after fx listens, unless
+// FX_MCP_LIST_CHANGE_RELEASE_PATH is set: then the rename waits until that file
+// exists, so a test can change the list at a moment it picks.
+const listChangeReleasePath = process.env.FX_MCP_LIST_CHANGE_RELEASE_PATH;
 // FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
 // FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
 // test can act while a call is out and then let it end.
@@ -357,7 +361,7 @@ function handle(message) {
       },
     });
     if (mode === "subscription_cache") {
-      setTimeout(() => {
+      const changeList = () => {
         currentToolName = recoveredToolName;
         for (let index = 0; index < 10; index += 1) {
           send({
@@ -370,7 +374,16 @@ function handle(message) {
             },
           });
         }
-      }, 50);
+      };
+      if (listChangeReleasePath) {
+        const releasePoll = setInterval(() => {
+          if (!existsSync(listChangeReleasePath)) return;
+          clearInterval(releasePoll);
+          changeList();
+        }, 10);
+      } else {
+        setTimeout(changeList, 50);
+      }
     }
     return;
   }

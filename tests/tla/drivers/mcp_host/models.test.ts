@@ -207,6 +207,23 @@ const controls: { name: string; module: string; constants: Record<string, never>
     ],
     badAt: 1,
   },
+  {
+    name: "subagent access", module: "SubagentAccess",
+    constants: { ObsServers: ["a", "b"], ObsMaxRuns: 1, ObsMaxViews: 1, ObsBridge: true, ObsDeniedFirst: ["a"] },
+    good: [
+      { event: "init", data: { usable: ["a", "b"] } },
+      { event: "create", data: { scope: ["b"], mode: "full" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "a", n: 1, answer: "refused" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "b", n: 1, answer: "ran" } },
+    ],
+    // A call to a server outside the profile's scope that ran.
+    bad: [
+      { event: "init", data: { usable: ["a", "b"] } },
+      { event: "create", data: { scope: ["b"], mode: "full" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "a", n: 1, answer: "ran" } },
+    ],
+    badAt: 2,
+  },
 ];
 
 for (const c of controls) {

@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.17";
+pub const version = "0.0.18";
 
 /// Panics save a crash record for `/trace`, except in tests, which keep the
 /// default handler.
@@ -4304,7 +4304,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
-        std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
         std.mem.eql(u8, command, "update") or
         // Resolve a stored credential, which reads the platform key store out of process.
@@ -4328,7 +4327,6 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
 }
 
 test "every alias of an early threaded io command uses early threaded io" {
