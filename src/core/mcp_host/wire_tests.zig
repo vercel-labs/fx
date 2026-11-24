@@ -387,6 +387,7 @@ fn fuzzWire(_: void, smith: *testing.Smith) !void {
     }
     const line = input.items;
     const valid = try std.json.validate(alloc, line);
+    try testing.expectEqual(expectedResponseId(alloc, line), wire.responseId(line));
 
     if (wire.decode(line)) |message| {
         try testing.expect(valid);
@@ -420,6 +421,50 @@ fn fuzzWire(_: void, smith: *testing.Smith) !void {
         try expectFuzzValue(alloc, line, field.value);
     }
     try testing.expect(valid);
+}
+
+const envelope_names = [_][]const u8{ "jsonrpc", "id", "method", "params", "result", "error" };
+
+/// What `wire.responseId` must read from `line`, found by walking it member by member with a plain `std.json.Scanner`,
+/// without the engine's reader: the top-level `id` read before the line went wrong, and none when the line writes `id` twice,
+/// has a `method`, or goes wrong inside its `params` (`tests/tla/mcp/Request.tla` `RefusedNaming`). An `id` nested in a value,
+/// or after the bad part, is never read. The fuzzed lines nest only a few levels, so the engine's own depth limit does not come in.
+fn expectedResponseId(alloc: Allocator, line: []const u8) ?wire.RequestId {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scanner: std.json.Scanner = .initCompleteInput(arena, line);
+    const opened = scanner.next() catch return null;
+    if (opened != .object_begin) return null;
+    var id: ?wire.RequestId = null;
+    var seen: [envelope_names.len]bool = @splat(false);
+    while (true) {
+        const token = scanner.nextAlloc(arena, .alloc_always) catch return id;
+        const key = switch (token) {
+            .allocated_string => |name| name,
+            else => return id,
+        };
+        const wanted = for (envelope_names, 0..) |name, index| {
+            if (std.mem.eql(u8, key, name)) break index;
+        } else null;
+        const is_id = if (wanted) |index| std.mem.eql(u8, envelope_names[index], "id") else false;
+        const is_method = if (wanted) |index| std.mem.eql(u8, envelope_names[index], "method") else false;
+        const is_params = if (wanted) |index| std.mem.eql(u8, envelope_names[index], "params") else false;
+        if (wanted) |index| {
+            if (seen[index]) return if (is_id or is_method or is_params) null else id;
+            seen[index] = true;
+        }
+        if (is_method) return null;
+        if (is_id) {
+            const value = scanner.next() catch return null;
+            id = switch (value) {
+                .number, .string => |digits| wire.decimal(digits),
+                else => return null,
+            };
+            continue;
+        }
+        scanner.skipValue() catch return if (is_params) null else id;
+    }
 }
 
 /// A returned slice is one whole JSON value inside the line, with nothing

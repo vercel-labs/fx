@@ -11,7 +11,7 @@ const libfx_hooks = @import("libfx_hooks.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -1301,29 +1301,13 @@ fn restoredClientSystemPrompt(
     return text orelse &.{};
 }
 
-/// Returns the tool identity record of a restored session. A record that
-/// cannot be read is reported in the trace and replaced by an empty one.
+/// Returns the tool identity record of a restored session
+/// (`tool_call_identities.restore`).
 fn restoredToolIdentities(
     alloc: Allocator,
     session: *session_adapter.Session,
 ) Allocator.Error!tool_call_identities.Record {
-    const record = blk: {
-        const stored = session.toolIdentities(alloc) catch |err| break :blk err;
-        const bytes = stored orelse return .{};
-        defer alloc.free(bytes);
-        break :blk tool_call_identities.parse(alloc, bytes);
-    };
-    return record catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            debug_trace.logf(
-                "acp",
-                "dropped unreadable tool identity record session={s} err={s}",
-                .{ session.id(), @errorName(err) },
-            );
-            return .{};
-        },
-    };
+    return tool_call_identities.restore(alloc, session);
 }
 
 fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {

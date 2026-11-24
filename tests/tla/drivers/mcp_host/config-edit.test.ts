@@ -17,7 +17,7 @@ import { checkTrace, type TraceRecord, type Value } from "./trace";
 type Cls = "ok" | "bad" | "auth";
 type File = "profile" | "project";
 const NAMES = ["a", "b", "c"];
-const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true };
+const MODEL: Record<string, Value> = { ObsNames: NAMES, ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true };
 
 const OK_URL = "https://ok.example/mcp";
 const BAD_URL = "http://example.com/mcp";
@@ -30,7 +30,7 @@ const argsOf = (cls: Cls) => (cls === "bad" ? [BAD_URL] : cls === "auth" ? [OK_U
 
 /** The files before a scenario's first command, as the model describes them. */
 interface Spec {
-  st: "absent" | "ok" | "broken";
+  st: "absent" | "ok" | "deep" | "broken";
   ent?: Partial<Record<string, Cls>>;
   /** The profile's misspelled servers key: after the real one, after 70 other keys, or holding 64 entries that aren't servers first. */
   typo?: "key" | "last" | "wide";
@@ -41,6 +41,10 @@ interface Spec {
   big?: boolean;
 }
 
+/** An unrelated key nested past the limit an edit writes back (64 levels) and past the 256 the JSON writer holds. */
+const DEEP_LEVELS = 300;
+const nested = (levels: number): unknown => Array.from({ length: levels }).reduce<unknown>((inner) => [inner], []);
+
 const fillers = (count: number) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`note${i}`, i]));
 
 function documentOf(spec: Spec): Record<string, unknown> {
@@ -50,6 +54,7 @@ function documentOf(spec: Spec): Record<string, unknown> {
   doc.mcpServers = servers;
   if (spec.both) doc.mcp = {};
   if (spec.typo === "key" || spec.typo === "last") doc.mcp_servers = { [spec.holds ?? "z"]: { command: "x" } };
+  if (spec.st === "deep") doc.notes = nested(DEEP_LEVELS);
   if (spec.typo === "wide") doc.servers = { ...Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`n${i}`, i])), [spec.holds ?? "real"]: { command: "y" } };
   return doc;
 }
@@ -73,7 +78,7 @@ class Scenario {
     });
     for (const [file, spec] of [["profile", profile], ["project", project]] as const) {
       if (spec.st === "broken") writeFileSync(this.paths[file], "{ nope");
-      if (spec.st === "ok") writeFileSync(this.paths[file], JSON.stringify(documentOf(spec)), { mode: file === "profile" ? 0o600 : 0o644 });
+      if (spec.st === "ok" || spec.st === "deep") writeFileSync(this.paths[file], JSON.stringify(documentOf(spec)), { mode: file === "profile" ? 0o600 : 0o644 });
     }
     this.records.push({ event: "init", data: { profile: model("profile", profile), project: model("project", project) } });
   }
@@ -124,6 +129,8 @@ class Scenario {
       case "both_appear": doc.mcp = {}; write(); break;
       case "both_merged": delete doc.mcp; write(); break;
       case "hand": ((doc.mcpServers ??= {}) as Record<string, unknown>)[name] = entryOf(cls); write(); break;
+      case "deepens": doc.notes = nested(DEEP_LEVELS); write(); break;
+      case "flattens": delete doc.notes; write(); break;
       case "breaks": writeFileSync(path, "{ nope"); break;
       case "repairs": writeFileSync(path, "{}"); break;
       case "deletes": rmSync(path, { force: true }); break;
@@ -283,6 +290,32 @@ test("the hint reads every key, though fx's load scan gives up on that file: a m
     await s.list("profile");
     await s.verify();
   }
+}, 240_000);
+
+test("a file nested past the limit is read, and refused by add and remove, until it is flattened", async () => {
+  const s = new Scenario("config-edit-deep", { st: "deep", ent: { a: "ok" } }, { st: "deep", ent: { b: "ok" } });
+  const bytes = () => [s.paths.profile, s.paths.project].map(sha);
+  const before = bytes();
+  // The reader loads both files, so each server is listed, and a remove finds its name and says why it can't edit.
+  expect(await s.list("profile")).toEqual(["a"]);
+  const added = await s.add("profile", "c", "ok");
+  expect(added.stderr).toContain("is nested more than 64 levels deep");
+  const removed = await s.remove("profile", "a");
+  expect(removed.stderr).toStartWith("Couldn't remove a from ~/.fx/mcp.json: the file is nested more than 64 levels deep");
+  // A name the file doesn't hold is a plain miss, as in any file.
+  await s.remove("profile", "c");
+  await s.add("project", "c", "ok");
+  await s.remove("project", "b");
+  expect(await s.list("project")).toEqual(["b"]);
+  expect(bytes()).toEqual(before);
+  // Flattened by hand, the file is edited again; nested again, it is refused again.
+  s.tamper("flattens", "profile");
+  await s.add("profile", "c", "ok");
+  await s.remove("profile", "a");
+  s.tamper("deepens", "profile");
+  await s.remove("profile", "c");
+  await s.list("profile");
+  await s.verify();
 }, 240_000);
 
 // ---- edges ----

@@ -9,6 +9,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const catalog_state = @import("../mcp/catalog_state.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
 const login_words = @import("../mcp_host/login_words.zig");
@@ -315,6 +316,14 @@ pub const State = struct {
         const h = self.host orelse return null;
         h.leases += 1;
         return .{ .state = self, .host = h };
+    }
+
+    /// Who serves the MCP tool `name` (`Catalog.toolIdentity`), copied into
+    /// `alloc`; null when there is no host or no loaded list has it.
+    pub fn toolIdentity(self: *State, alloc: Allocator, name: []const u8) Allocator.Error!?catalog_state.ToolIdentity {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return lease.host.catalog.toolIdentity(alloc, name);
     }
 
     /// Every configured server's status, copied into `alloc`; null when

@@ -2604,6 +2604,7 @@ fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResul
         .command_output_replay = result.command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .subagent_started = result.subagent_started,
     };
 }
 

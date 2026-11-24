@@ -1551,6 +1551,10 @@ describe("effect-aware command permissions", () => {
       expect(lossyModelResult).toContain("  DIRECT_PADDED  ");
       expect(lossyModelResult).toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
+      // Both results hold their exact output, so neither repeats the replay
+      // handle that Ctrl-O reads.
+      expect(JSON.parse(losslessModelResult)).not.toHaveProperty("full_output_handle");
+      expect(JSON.parse(lossyModelResult)).not.toHaveProperty("full_output_handle");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -1567,8 +1571,8 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).toContain("full_output_handle");
-      expect(publicSession.stdout).toContain("fx-command-replay-");
+      expect(publicSession.stdout).not.toContain("full_output_handle");
+      expect(publicSession.stdout).not.toContain("fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2935,6 +2939,151 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace carries the crash report fx saved when it last ended on an error",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "trace-crash-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // The file `writeCrashReport` saves when fx ends on an error: the trace
+      // header, the fatal error, and one record from the session. It is dated an
+      // hour ago, because `/trace` shows a crash report only within 24 hours of it.
+      const crashAtMs = Date.now() - 60 * 60 * 1000;
+      const crashAt = new Date(crashAtMs).toISOString();
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
+        [
+          JSON.stringify({
+            type: "fx_trace",
+            format_version: 1,
+            fx_version: "9.9.9",
+            git_commit: "abc1234",
+            written_at: crashAt,
+            written_at_ms: crashAtMs,
+            notice: "private",
+          }),
+          JSON.stringify({
+            type: "fatal_error",
+            error: "InvalidTranscriptTransition",
+            message: "invalid transcript transition",
+            at: crashAt,
+            at_ms: crashAtMs,
+          }),
+          JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
+        ].map((line) => `${line}\n`).join(""),
+      );
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "InvalidTranscriptTransition",
+        message: "invalid transcript transition",
+        fx_version: "9.9.9",
+        git_commit: "abc1234",
+        records: 3,
+        skipped: 0,
+      });
+      expect(
+        report.all("last_crash_record").map((record) => (record.record as { type: string }).type),
+      ).toEqual(["fx_trace", "fatal_error", "renderer_event"]);
+      // The live report is not a crash report, so it has no fatal_error record of its own.
+      expect(report.all("fatal_error")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a segfault as a crash report that the next /trace shows",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "segfault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+      const start = () =>
+        TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root), TMPDIR: tmpDir }),
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+      // The signal goes to the one process the tmux pane runs, found the way the
+      // other terminal tests find it. The check first confirms that process is fx.
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      const fxPid = activeSession.processPid();
+      expect(
+        execFileSync("ps", ["-ww", "-o", "args=", "-p", String(fxPid)], { encoding: "utf8" }),
+      ).toContain(FX_BIN);
+      process.kill(fxPid, "SIGSEGV");
+      expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      // Zig's handler ends in abort(), so fx exits with 128 + SIGABRT (6).
+      expect(activeSession.recordedExitStatus()).toBe(134);
+      await activeSession.kill();
+      activeSession = null;
+
+      // Zig's default output still names the signal before the process aborts.
+      expect(readFileSync(stderrPath, "utf8")).toContain("Segmentation fault");
+      const crashPath = join(root.home, ".fx", "diagnostics", "last-crash.jsonl");
+      expect(statSync(crashPath).mode & 0o777).toBe(0o600);
+      const lines = readFileSync(crashPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines[0]).toMatchObject({ type: "fx_trace" });
+      expect(lines[1]).toMatchObject({
+        type: "fatal_error",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();
@@ -3307,7 +3456,10 @@ describe("effect-aware command permissions", () => {
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
-        expect(commandSnapshot.full_output_handle).toMatch(/^fx-command-replay-.+\.bin$/);
+        // The output is exact text, so the result needs no replay handle.
+        expect(commandSnapshot).not.toHaveProperty("output_terminal_safe");
+        expect(commandSnapshot).not.toHaveProperty("output_truncated");
+        expect(commandSnapshot).not.toHaveProperty("full_output_handle");
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
         expect(gateway.requests[1]!.body).not.toContain("\\u0000");
@@ -3427,9 +3579,10 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
-      // The held call is its group's header, which names the caution.
-      expect(pane).toContain(`● Safety caution ${command}`);
-      expect(pane).toContain(`Safety caution ${command}`);
+      // The held call is its group's header: it says the command was held,
+      // then why.
+      expect(pane).toContain(`● Held ${command} · safety caution`);
+      expect(pane).not.toContain("Safety caution");
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
@@ -3461,10 +3614,11 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Safety caution ${command}`),
+        (value) => value.includes(`Held ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain(`● Safety caution ${command}`);
+      expect(resumedPane).toContain(`● Held ${command} · safety caution`);
+      expect(resumedPane).not.toContain("Safety caution");
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);

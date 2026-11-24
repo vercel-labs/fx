@@ -237,6 +237,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MCP_IDLE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"
@@ -358,6 +362,14 @@
       "stability": "internal"
     },
     "FX_TEST_USAGE_CLOCK_FILE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE": {
       "job": "test",
       "stability": "internal"
     },

@@ -41,6 +41,7 @@ test {
     _ = @import("core/output/turn_clock.zig");
     _ = @import("core/mcp_host/credentials.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
+    _ = @import("core/mcp_host/owner_wire.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");

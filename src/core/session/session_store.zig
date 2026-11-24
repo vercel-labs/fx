@@ -53,6 +53,7 @@ pub const ReadOnlyDetail = store_types.ReadOnlyDetail;
 pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
+pub const SessionForkResult = store_types.SessionForkResult;
 pub const SessionSummary = store_types.SessionSummary;
 
 fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {

@@ -35,6 +35,9 @@ const gpa = std.heap.c_allocator;
 /// Connections served at once; more are closed unread.
 const max_connections = 64;
 const poll_ms = 100;
+/// The longest a wait on a wake pipe sleeps when no wake byte comes. A stop or
+/// a request's end always writes one, so this bounds only a wake that is lost.
+const wake_safety_poll_ms = 1000;
 /// How long a client may take to send its request line.
 const request_deadline_ms: i64 = 10_000;
 
@@ -89,6 +92,13 @@ const Bridge = struct {
     live: std.ArrayList(*Live) = .empty,
     next_owner: u32 = 1,
     connections: u32 = 0,
+    /// The pipe that ends the accept loop's wait: read end, then write end.
+    /// It lives as long as the listener, and `closeListenerLocked` closes it.
+    wake: ?[2]posix.fd_t = null,
+    /// Passes of the accept loop's wait in this run. A test waits for one.
+    accept_waits: u32 = 0,
+    /// Passes of a request-line wait in this run. A test waits for one.
+    request_polls: u32 = 0,
 };
 
 var bridge: Bridge = .{};
@@ -137,13 +147,14 @@ pub fn unregister(registration: *Registration) void {
         applyLocked(mcp_call.step(bridge.state, .stopped));
         bridge.phase = .stopping;
         bridge.stop.store(true, .release);
+        if (bridge.wake) |wake| writeWakeByte(wake[1]);
         accept_task = bridge.accept_task;
         bridge.accept_task = null;
     }
     bridge.mutex.unlock(io);
     gpa.destroy(registration);
     if (!last) return;
-    // The accept loop sees `stop` within a poll; after it ends nothing adds
+    // The wake byte ends the accept loop's wait at once; after it ends nothing adds
     // a connection. No owner is left, so the connections still open are
     // unadmitted ones; cancelling ends their wait for a request line.
     if (accept_task) |*task| task.await(io);
@@ -182,13 +193,22 @@ fn startLocked(io: std.Io) !void {
     try std.Io.Dir.cwd().createDir(io, dir_path, .fromMode(0o700));
     errdefer std.Io.Dir.cwd().deleteDir(io, dir_path) catch {};
     const address = try std.Io.net.UnixAddress.init(socket_path);
+    // Ignored: listen may fail before the file exists, and the start already fails with its own error.
+    errdefer std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
     var listener = try address.listen(io, .{});
     errdefer listener.deinit(io);
+    // Errdefers run in reverse: the listener closes, then the socket file goes, then the directory, which needs to be empty.
+    // Close-on-exec, so the commands fx starts do not inherit the wake pipe.
+    const wake = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    errdefer closeWake(wake);
     bridge.listener = listener;
+    bridge.wake = wake;
+    bridge.accept_waits = 0;
+    bridge.request_polls = 0;
     bridge.stop.store(false, .release);
     bridge.accept_task = std.Io.concurrent(io, acceptLoop, .{}) catch |err| {
         bridge.listener = null;
-        std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+        bridge.wake = null;
         return err;
     };
     bridge.dir_path = dir_path;
@@ -201,9 +221,27 @@ fn startLocked(io: std.Io) !void {
     debug_trace.logf("mcp-call", "bridge listening socket={s}", .{socket_path});
 }
 
+/// Writes the byte that ends a wait on a wake pipe. Each pipe gets one byte, so
+/// it never fills and the write does not block. A failed write leaves the wait
+/// to its safety poll, so it is only logged, with the errno name.
+fn writeWakeByte(write_end: posix.fd_t) void {
+    const byte = [1]u8{0};
+    const rc = std.c.write(write_end, &byte, 1);
+    if (rc == 1) return;
+    const reason = if (rc < 0) @tagName(std.posix.errno(rc)) else "short write";
+    debug_trace.logf("mcp-call", "bridge wake not written err={s}; the wait ends at its safety poll", .{reason});
+}
+
+fn closeWake(wake: [2]posix.fd_t) void {
+    _ = std.c.close(wake[0]);
+    _ = std.c.close(wake[1]);
+}
+
 fn closeListenerLocked(io: std.Io) void {
     if (bridge.listener) |*listener| listener.deinit(io);
     bridge.listener = null;
+    if (bridge.wake) |wake| closeWake(wake);
+    bridge.wake = null;
     if (bridge.socket_path) |path| {
         std.Io.Dir.cwd().deleteFile(io, path) catch |err| debug_trace.logf("mcp-call", "bridge socket not removed err={s}", .{@errorName(err)});
         gpa.free(path);
@@ -242,12 +280,24 @@ fn step(event: mcp_call.Event) mcp_call.Output {
 fn acceptLoop() void {
     const io = io_mod.getIo();
     const listener = &bridge.listener.?;
+    const wake_read = bridge.wake.?[0];
     while (!bridge.stop.load(.acquire)) {
-        var fds = [_]posix.pollfd{.{ .fd = listener.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, poll_ms) catch |err| {
+        bridge.mutex.lockUncancelable(io);
+        bridge.accept_waits += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        var fds = [_]posix.pollfd{
+            .{ .fd = listener.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake_read, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, wake_safety_poll_ms) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept loop ended err={s}", .{@errorName(err)});
             return;
         };
+        if (fds[1].revents != 0) {
+            if (fds[0].revents != 0) debug_trace.logf("mcp-call", "bridge accept loop ends on stop; a connection that arrived with the stop is not accepted", .{});
+            return;
+        }
         if (ready == 0) continue;
         const stream = listener.accept(io) catch |err| {
             debug_trace.logf("mcp-call", "bridge accept failed err={s}", .{@errorName(err)});
@@ -262,7 +312,7 @@ fn acceptLoop() void {
             stream.close(io);
             continue;
         }
-        bridge.connection_tasks.concurrent(io, serve, .{stream}) catch |err| {
+        bridge.connection_tasks.concurrent(io, serve, .{ stream, wake_read }) catch |err| {
             debug_trace.logf("mcp-call", "bridge connection dropped: no task err={s}", .{@errorName(err)});
             finishConnection(io, stream);
             continue;
@@ -280,8 +330,9 @@ fn finishConnection(io: std.Io, stream: std.Io.net.Stream) void {
 const ReadError = error{ TooLarge, Silent, Closed, ReadFailed, OutOfMemory, Canceled };
 
 /// Reads one request line within the deadline, without its newline. Ends
-/// with `error.Canceled` when the bridge stops first.
-fn readRequestLine(arena: Allocator, fd: posix.socket_t) ReadError![]const u8 {
+/// with `error.Canceled` when the bridge stops first: the wake byte that
+/// `unregister` writes ends the wait at once.
+fn readRequestLine(arena: Allocator, fd: posix.socket_t, wake_read: posix.fd_t) ReadError![]const u8 {
     const io = io_mod.getIo();
     var line: std.ArrayList(u8) = .empty;
     const deadline = io_mod.milliTimestamp() + request_deadline_ms;
@@ -290,9 +341,17 @@ fn readRequestLine(arena: Allocator, fd: posix.socket_t) ReadError![]const u8 {
         try io.checkCancel();
         const remaining = deadline - io_mod.milliTimestamp();
         if (remaining <= 0) return error.Silent;
-        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, @intCast(@min(remaining, poll_ms))) catch return error.ReadFailed;
-        if (ready == 0) continue;
+        bridge.mutex.lockUncancelable(io);
+        bridge.request_polls += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        var fds = [_]posix.pollfd{
+            .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake_read, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, @intCast(@min(remaining, wake_safety_poll_ms))) catch return error.ReadFailed;
+        if (fds[1].revents != 0) return error.Canceled;
+        if (ready == 0 or fds[0].revents == 0) continue;
         const rc = std.c.recv(fd, &chunk, chunk.len, 0);
         if (rc < 0) {
             if (posix.errno(rc) == .INTR or posix.errno(rc) == .AGAIN) continue;
@@ -336,13 +395,24 @@ fn refusalMessage(reason: wire.Reason) []const u8 {
 const Watch = struct {
     fd: posix.socket_t,
     id: mcp_call.RequestId,
+    /// The pipe that ends `run`: read end, then write end. `serve` closes it.
+    wake: [2]posix.fd_t,
     done: std.atomic.Value(bool) = .init(false),
+    /// Set once the watch has logged why it cannot watch its client: bytes sent after the request line, or a failed peek. Each watch logs one such line.
+    extra_logged: bool = false,
 
     fn run(self: *Watch) void {
         const io = io_mod.getIo();
         while (!self.done.load(.acquire)) {
-            var fds = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, poll_ms) catch return;
+            var fds = [_]posix.pollfd{
+                .{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 },
+            };
+            const ready = posix.poll(&fds, wake_safety_poll_ms) catch |err| {
+                debug_trace.logf("mcp-call", "request={d} disconnect watch ended: poll failed err={s}", .{ @backingInt(self.id), @errorName(err) });
+                return;
+            };
+            if (fds[1].revents != 0) return;
             if (ready == 0) continue;
             var probe: [1]u8 = undefined;
             const rc = std.c.recv(self.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT);
@@ -353,20 +423,35 @@ const Watch = struct {
                 bridge.mutex.unlock(io);
                 return;
             }
-            // The client sent more than its one line: not ours to read.
-            io_mod.sleep(poll_ms * std.time.ns_per_ms);
+            // The client sent more than its one line: not ours to read. Log it once,
+            // then wait on the wake byte alone, so the unread bytes do not spin this loop.
+            if (!self.extra_logged) {
+                self.extra_logged = true;
+                if (rc < 0) {
+                    debug_trace.logf("mcp-call", "request={d} disconnect watch could not peek the client err={s}; it checks again every 100 ms", .{ @backingInt(self.id), @tagName(posix.errno(rc)) });
+                } else {
+                    debug_trace.logf("mcp-call", "request={d} client sent bytes after its request line; the watch leaves them unread", .{@backingInt(self.id)});
+                }
+            }
+            var wake_only = [_]posix.pollfd{.{ .fd = self.wake[0], .events = posix.POLL.IN, .revents = 0 }};
+            _ = posix.poll(&wake_only, poll_ms) catch |err| {
+                debug_trace.logf("mcp-call", "request={d} disconnect watch ended: poll failed err={s}", .{ @backingInt(self.id), @errorName(err) });
+                return;
+            };
+            if (wake_only[0].revents != 0) return;
         }
     }
 };
 
-fn serve(stream: std.Io.net.Stream) void {
+// unregister awaits this task before closeListenerLocked closes wake_read.
+fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     const io = io_mod.getIo();
     defer finishConnection(io, stream);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const line = readRequestLine(arena, stream.socket.handle) catch |err| {
+    const line = readRequestLine(arena, stream.socket.handle, wake_read) catch |err| {
         debug_trace.logf("mcp-call", "bridge request not read err={s}", .{@errorName(err)});
         if (err == error.TooLarge) _ = writeReply(stream, .refused, .too_large, refusalMessage(.too_large));
         if (err == error.Silent) _ = writeReply(stream, .refused, .malformed, refusalMessage(.malformed));
@@ -424,14 +509,23 @@ fn serve(stream: std.Io.net.Stream) void {
         bridge.mutex.unlock(io);
     }
 
-    var watch: Watch = .{ .fd = stream.socket.handle, .id = work.id };
-    var watcher: ?std.Io.Future(void) = std.Io.concurrent(io, Watch.run, .{&watch}) catch |err| blk: {
-        debug_trace.logf("mcp-call", "request={d} runs without a disconnect watch err={s}", .{ @backingInt(work.id), @errorName(err) });
-        break :blk null;
-    };
+    var watch: Watch = .{ .fd = stream.socket.handle, .id = work.id, .wake = undefined };
+    var watcher: ?std.Io.Future(void) = null;
+    if (std.Io.Threaded.pipe2(.{ .CLOEXEC = true })) |wake| {
+        watch.wake = wake;
+        watcher = std.Io.concurrent(io, Watch.run, .{&watch}) catch |err| blk: {
+            debug_trace.logf("mcp-call", "request={d} runs without a disconnect watch err={s}", .{ @backingInt(work.id), @errorName(err) });
+            closeWake(wake);
+            break :blk null;
+        };
+    } else |err| {
+        debug_trace.logf("mcp-call", "request={d} runs without a disconnect watch: no wake pipe err={s}", .{ @backingInt(work.id), @errorName(err) });
+    }
     defer if (watcher) |*task| {
         watch.done.store(true, .release);
+        writeWakeByte(watch.wake[1]);
         task.await(io);
+        closeWake(watch.wake);
     };
 
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
@@ -660,6 +754,40 @@ test "the bridge removes its socket after the last shell call" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, socket_path, .{}));
 }
 
+/// Waits until a counter on the bridge has moved past zero, or fails after five
+/// seconds. A timed wait on the bridge's condition, not a sleep.
+fn waitForCount(io: std.Io, count: *const u32) !void {
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    while (count.* == 0) {
+        const remaining = deadline - io_mod.milliTimestamp();
+        if (remaining <= 0) return error.TestTimedOut;
+        bridge.changed.waitTimeout(io, &bridge.mutex, .{ .duration = .{ .raw = .fromMilliseconds(remaining), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => |e| return e,
+        };
+    }
+}
+
+test "the bridge ends its accept loop when it stops, not at the loop's safety poll" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    // The stop below must be the one that would sit out a full safety poll,
+    // so wait until the accept loop has begun its wait.
+    waitForCount(io, &bridge.accept_waits) catch |err| {
+        unregister(registration);
+        return err;
+    };
+    const started = io_mod.milliTimestamp();
+    unregister(registration);
+    // Without the wake byte this stop waits out wake_safety_poll_ms (1000 ms),
+    // so the bound is half of it.
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+}
+
 test "the bridge stops at once, and ends a silent client's connection with it" {
     if (!supported) return error.SkipZigTest;
     const io = std.testing.io;
@@ -668,20 +796,51 @@ test "the bridge stops at once, and ends a silent client's connection with it" {
     const address = try std.Io.net.UnixAddress.init(registration.environment()[0].value);
     const stream = try address.connect(io);
     defer stream.close(io);
-    const deadline = io_mod.milliTimestamp() + 5_000;
-    while (true) {
-        bridge.mutex.lockUncancelable(io);
-        const open = bridge.connections;
-        bridge.mutex.unlock(io);
-        if (open == 1) break;
-        if (io_mod.milliTimestamp() > deadline) return error.TestTimedOut;
-        io_mod.sleep(10 * std.time.ns_per_ms);
-    }
+    // The stop must find the connection inside its request-line wait, so wait
+    // until the connection has begun one.
+    waitForCount(io, &bridge.request_polls) catch |err| {
+        unregister(registration);
+        return err;
+    };
     const started = io_mod.milliTimestamp();
     unregister(registration);
-    // The connection's wait for a request line ended with the bridge, well
-    // before its own deadline.
-    try std.testing.expect(io_mod.milliTimestamp() - started < request_deadline_ms / 2);
+    // Without the wake byte this stop waits for the request poll's safety timeout (wake_safety_poll_ms).
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
     try std.testing.expectEqual(@as(u32, 0), bridge.connections);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a client that stays connected after its lookup does not hold the bridge's stop" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    var stopped = false;
+    errdefer if (!stopped) unregister(registration);
+    const variables = registration.environment();
+    const address = try std.Io.net.UnixAddress.init(variables[0].value);
+    const stream = try address.connect(io);
+    defer stream.close(io);
+    var write_buffer: [4096]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try wire.writeRequest(&writer.interface, wire.parseToken(variables[1].value).?, .{ .help = "mcp_linear_list_issues" });
+    try writer.interface.flush();
+    // Read the whole reply and keep the socket open: the request's watch must end
+    // without the client leaving.
+    var read_buffer: [wire.max_header_bytes]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    const line = (try reader.interface.takeDelimiter('\n')) orelse return error.TestUnexpectedResult;
+    const header = try wire.parseHeader(arena, line);
+    try std.testing.expectEqual(wire.Status.ok, header.status);
+    _ = try reader.interface.readAllocAll(arena, @intCast(header.bytes));
+    const started = io_mod.milliTimestamp();
+    stopped = true;
+    unregister(registration);
+    // unregister waits for this request's watch to end, which needs the watch's
+    // wake byte. Without it the watch would wait out wake_safety_poll_ms (1000 ms).
+    try std.testing.expect(io_mod.milliTimestamp() - started < 500);
+    try std.testing.expectEqual(@as(u32, 0), bridge.connections);
 }

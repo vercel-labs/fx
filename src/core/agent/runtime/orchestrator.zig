@@ -34,6 +34,7 @@ const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
+const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -220,7 +221,11 @@ fn appendContinuationPrompt(
 }
 
 const ignored_effort_notice =
-    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+    "Effort {s} is not available for {s}, so it is not sent.";
+/// Only a custom connection offers a level through its settings, so only its
+/// notice says where to add one.
+const custom_effort_hint =
+    " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -2995,15 +3000,42 @@ fn preparedCallApplicableTargetsFresh(
     };
 }
 
+const LateTargetResolution = enum {
+    may_run,
+    scoped_instructions_pending,
+    stale,
+};
+
+const NotExecutedReason = struct {
+    result_kind: []const u8,
+    model_output: []const u8,
+};
+
+fn lateTargetNotExecutedReason(resolution: LateTargetResolution) ?NotExecutedReason {
+    return switch (resolution) {
+        .may_run => null,
+        .scoped_instructions_pending => .{
+            .result_kind = "scoped_instructions_pending",
+            .model_output = types.scoped_instructions_pending_tool_result_output,
+        },
+        .stale => .{
+            .result_kind = "applicable_targets_changed",
+            .model_output = types.deferred_tool_result_output,
+        },
+    };
+}
+
 /// A target that did not exist when the step was prepared and that brings no
 /// new scoped instructions is safe to run, so a read after an earlier write in
 /// the same step is not skipped (test "same-batch read of a file an earlier
 /// call created runs when no scoped instructions apply" in
-/// src/core/agent/runtime/tests/tool_flow.zig). Returns true only when the
-/// call prepared as `.legacy_target_resolution` resolves now and the registry
-/// has nothing new to deliver for it. The call keeps its legacy preparation,
-/// so execution still classifies it.
-fn lateResolvedCallMayRun(
+/// src/core/agent/runtime/tests/tool_flow.zig). Returns `.may_run` only when
+/// the call prepared as `.legacy_target_resolution` resolves now and the
+/// registry has nothing new to deliver for it, and
+/// `.scoped_instructions_pending` when it resolves but the registry would
+/// deliver new rules, which only a reissue loads. The call keeps its legacy
+/// preparation, so execution still classifies it.
+fn lateTargetResolution(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
@@ -3011,11 +3043,11 @@ fn lateResolvedCallMayRun(
     step_ctx: TraceContext,
     tool_call: ToolCall,
     maybe_preparation: ?tool_preparation.Result,
-) !bool {
-    const context_registry = deps.context_registry orelse return false;
-    const preparation = maybe_preparation orelse return false;
+) !LateTargetResolution {
+    const context_registry = deps.context_registry orelse return .stale;
+    const preparation = maybe_preparation orelse return .stale;
     const stale_candidate = switch (preparation) {
-        .terminal => return false,
+        .terminal => return .stale,
         .candidate => |*candidate| candidate,
     };
     const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
@@ -3025,7 +3057,7 @@ fn lateResolvedCallMayRun(
         config.workspace_root,
         config.access_scope,
         stale_candidate,
-    )) orelse return false;
+    )) orelse return .stale;
     // The probe is only a question to the registry.
     var resolved_candidate: tool_preparation.Candidate = .{
         .kind = .registered,
@@ -3046,7 +3078,7 @@ fn lateResolvedCallMayRun(
             "call_id={s} name={s} targets={d}",
             .{ tool_call.id, tool_call.name, late_targets.len },
         );
-        return false;
+        return .scoped_instructions_pending;
     }
     debug_trace.eventf(
         "tool",
@@ -3055,7 +3087,7 @@ fn lateResolvedCallMayRun(
         "call_id={s} name={s} targets={d}",
         .{ tool_call.id, tool_call.name, late_targets.len },
     );
-    return true;
+    return .may_run;
 }
 
 fn parallelApplicableTargetsFresh(
@@ -3316,6 +3348,7 @@ fn appendNotExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
     result_kind: []const u8,
+    model_output: []const u8,
 ) !void {
     _ = try provisional_statuses.settleAdmittedCall(
         deps,
@@ -3331,7 +3364,7 @@ fn appendNotExecutedToolResult(
         "execution_result",
         step_ctx,
         "call_id={s} name={s} result_kind={s} model_output_bytes={d}",
-        .{ call.id, call.name, result_kind, types.deferred_tool_result_output.len },
+        .{ call.id, call.name, result_kind, model_output.len },
     );
     try runtime_tool_batch.appendToolResultContent(
         arena,
@@ -3339,7 +3372,7 @@ fn appendNotExecutedToolResult(
         completed_tool_names,
         batch,
         call,
-        types.deferred_tool_result_output,
+        model_output,
         null,
         .{
             .increment_total = false,
@@ -5084,8 +5117,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // A saved login's slug is not checked when it loads, so only a valid team
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
@@ -6839,7 +6871,7 @@ fn processQueuedPromptInner(
         }
         start(deps.ctx, fresh, .capture);
     }
-    // The turn owns the start capture's thread: however it ends, failed or
+    // The turn owns the start capture's task: however it ends, failed or
     // paused before any tool and before any end capture included, the
     // capture is saved before the turn returns, never after its session
     // closes.
@@ -8659,14 +8691,28 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it. One the person set and the model does not
-            // declare is left out, and the session says so once
+            // settings declare it, and the Gateway only when its catalog lists
+            // it. One the person set and the model does not declare is left
+            // out, and the session says so once
             // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession).
-            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
+            // that failed cannot say what it lists, so its drop stays quiet
+            // (`deps.zig` model_catalog_failure).
+            const effort_catalog_known = job.provider == .configured or
+                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+            if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
+                    const notice = if (job.provider == .configured)
+                        try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
+                    else
+                        sentence;
+                    try push(deps.ctx, notice);
                 }
             }
             // Fast drops silently when the catalog cannot confirm support.
@@ -12145,10 +12191,10 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            const applicable_targets_resolved_late = if (applicable_targets_fresh)
-                false
+            const late_resolution: LateTargetResolution = if (applicable_targets_fresh)
+                .may_run
             else
-                lateResolvedCallMayRun(
+                lateTargetResolution(
                     arena,
                     deps,
                     config,
@@ -12167,7 +12213,7 @@ fn processQueuedPromptLoop(
                         err,
                     );
                 };
-            if (!applicable_targets_fresh and !applicable_targets_resolved_late) {
+            if (lateTargetNotExecutedReason(late_resolution)) |not_executed| {
                 try appendNotExecutedToolResult(
                     deps,
                     &stream_ctx.provisional_statuses,
@@ -12180,7 +12226,8 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     &completed_tool_names,
                     &step_batch,
-                    "applicable_targets_changed",
+                    not_executed.result_kind,
+                    not_executed.model_output,
                 );
                 continue;
             }
@@ -12250,6 +12297,7 @@ fn processQueuedPromptLoop(
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
+                        types.deferred_tool_result_output,
                     );
                     continue;
                 }
@@ -12924,6 +12972,13 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                // A wait has no result to name whom it waited for, so the turn
+                // keeps the names its row showed (D102).
+                const cancelled_wait: ?types.CancelledWaitPresentation = if (!execution_is_command and
+                    try tooling_presentation.subagentRoster(arena, identity_call) == .working)
+                    .{ .waited_for = tool_display_target }
+                else
+                    null;
                 const persist_error = if (execution_is_command)
                     runtime_interruption.persistInterruptedCommandTurnOnce(
                         deps,
@@ -12938,6 +12993,21 @@ fn processQueuedPromptLoop(
                         stop_state.retained_candidate,
                         &stop_state.terminal_materializing,
                         cancelled_command,
+                    )
+                else if (cancelled_wait) |wait|
+                    runtime_interruption.persistInterruptedWaitTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        identity_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                        wait,
                     )
                 else
                     runtime_interruption.persistInterruptedTurnOnce(

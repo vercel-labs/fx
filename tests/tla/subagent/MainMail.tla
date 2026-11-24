@@ -19,6 +19,11 @@
 (* `wait` (`Runtime.waitForMail` in src/core/subagent/tool_host.zig) wakes *)
 (* on any waiting mail. It says the mail follows only when some of it      *)
 (* joined the running turn, and otherwise that it starts the next turn.    *)
+(* It can also return at once, before it looks at mail: while the user's   *)
+(* latest message in the turn has no visible answer, it asks the model to  *)
+(* answer first, until the model takes a step after that return            *)
+(* (`userAnswerOwed`). That return takes no mail and says neither, so this *)
+(* model leaves it out; the inline tests in tool_host.zig pin it.          *)
 (*                                                                         *)
 (* Rules:                                                                  *)
 (*   JoinsOpenTurn  where turns take mail, mail posted while main's turn   *)
@@ -200,7 +205,9 @@ NextTurn ==
   /\ Read(<<Head(queue).m>>, turns + 1)
   /\ UNCHANGED <<posted, due, aborted, waits, uncommitted, owed>>
 
-\* `wait` wakes on waiting mail and says whether it follows.
+\* `wait` wakes on waiting mail and says whether it follows. Its return
+\* that asks the model to answer the user first takes no mail, so it is
+\* not an action here (see the header).
 Wait ==
   /\ turn # 0
   /\ open

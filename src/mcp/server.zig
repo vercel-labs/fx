@@ -57,13 +57,30 @@ const excerpt_max = 80;
 /// Bytes of a progress note the host is shown, before "...".
 const note_max = 160;
 
-/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
-/// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
+/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: valid
+/// UTF-8 that never ends in a cut sequence, control bytes and bytes that are no
+/// part of a sequence as '?', and "..." when cut. A server's line may hold
+/// bytes that are not UTF-8, and the excerpt goes into a JSON string.
 fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
     const n = process.maskedPrefix(buf[0..max], line).len;
+    maskBytesOutsideSequences(buf[0..n]);
     if (n == line.len) return buf[0..n];
     @memcpy(buf[n..][0..3], "...");
     return buf[0 .. n + 3];
+}
+
+/// Each byte of `text` that is not part of a valid UTF-8 sequence becomes '?'.
+fn maskBytesOutsideSequences(text: []u8) void {
+    var at: usize = 0;
+    while (at < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[at]) catch 0;
+        if (len != 0 and at + len <= text.len and std.unicode.utf8ValidateSlice(text[at..][0..len])) {
+            at += len;
+        } else {
+            text[at] = '?';
+            at += 1;
+        }
+    }
 }
 
 pub const Link = union(enum) {
@@ -113,6 +130,24 @@ pub const Failure = union(enum) {
 /// How a call ended: the exchange's outcomes, and a chain's.
 pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable };
 
+/// Why a call ended lost: the ending that lost it, or the process going away.
+pub const LostWhy = enum {
+    /// The stream broke before the answer.
+    stream_broken,
+    /// The stream ended without the answer.
+    stream_ended,
+    /// The answer was over the message limit.
+    too_large,
+    /// A resumed stream was refused.
+    resume_refused,
+    /// The session expired while the call was resuming.
+    session_expired,
+    /// The session changed, or was not ready, when the call was to resume.
+    session_changed,
+    /// The stdio process went away.
+    link_down,
+};
+
 pub const Event = union(enum) {
     /// Detection finished; requests carry this version.
     ready: []const u8,
@@ -131,7 +166,9 @@ pub const Event = union(enum) {
     /// `refused_body` says which it was: a 2xx HTTP body that is no JSON-RPC message, or, when
     /// it is false, the last line with no readable id that the server wrote before the call's
     /// grace ran out (see `request.Timeouts.refused_ms`). Both are 0 and false for any other call.
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
+    /// `lost_why` and `status` are null and 0 unless the outcome is `lost`: why it was lost, and the
+    /// HTTP status of the ending that lost it (0 when none).
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false, lost_why: ?LostWhy = null, status: u16 = 0 },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
     /// next `next`.
@@ -211,6 +248,14 @@ const Logical = struct {
     /// (see `Event.called`).
     refused_bytes: u32 = 0,
     refused_body: bool = false,
+    /// Why the call was lost, set where the call is decided to be lost.
+    lost_why: ?LostWhy = null,
+    /// The HTTP status of the ending that lost the call; 0 when none.
+    lost_status: u16 = 0,
+    /// A `tools/list` that an HTTP ending answered with no usable message, and the status it carried: why fx
+    /// refuses it (`httpListRefusal`). Null when the ending is no answer, or another flow reads it.
+    list_why: ?tools.Refusal = null,
+    list_status: u16 = 0,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -299,6 +344,9 @@ pub const Server = struct {
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
+    /// Why the line is unreadable, while `onRefusedLine` hands the answer it made of that line to a request. A list that
+    /// meets it was matched but not read, so it says so (`pageEvent`) and does not say the server answered with an error.
+    refused_decode: ?wire.DecodeError = null,
     /// The length of the last refused line that named no request. A call whose grace runs out
     /// takes it into `Logical.refused_bytes`; it is the last such line the server wrote, not
     /// necessarily the one that gave that call its grace.
@@ -311,6 +359,10 @@ pub const Server = struct {
     note: [note_max + 3]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
+    /// The words of why the last page fx refused was refused, written when it was refused (`refuse`). They mean
+    /// something only while `catalog.refused` holds.
+    list_refusal_buf: [tools.text_max]u8 = undefined,
+    list_refusal_len: u8 = 0,
 
     // A 2025 session.
     legacy: ?http_legacy.Session = null,
@@ -413,6 +465,22 @@ pub const Server = struct {
         return &r.store.current;
     }
 
+    /// Why fx refused the last list the server answered, in the words of `tools.Refusal` (with the HTTP status
+    /// number fx read, for an HTTP refusal); null when it did not. A list that is accepted, and a new process,
+    /// clear it. An older accepted list is still `toolList`. The words stay valid until the next page is refused:
+    /// copy them.
+    pub fn listRefusal(r: *const Server) ?[]const u8 {
+        return if (r.catalog.refused and r.list_refusal_len > 0) r.list_refusal_buf[0..r.list_refusal_len] else null;
+    }
+
+    /// Records why fx refuses a page, in the words of `tools.Refusal`: `status` goes into `http_status`'s words.
+    fn refuse(r: *Server, why: tools.Refusal, status: u16) void {
+        var words_buf: [tools.text_max]u8 = undefined;
+        const words = why.text(status, &words_buf);
+        @memcpy(r.list_refusal_buf[0..words.len], words);
+        r.list_refusal_len = @intCast(words.len);
+    }
+
     /// Starts era detection. Over HTTP the endpoint is the "process".
     pub fn detect(r: *Server) Error!void {
         try r.stepEra(.process_started);
@@ -483,6 +551,9 @@ pub const Server = struct {
                 try r.stepRequest(.{ .transport_lost = id });
                 try r.closeKey(id, .forgotten);
             }
+            // A listing on the dropped link fails, as a stdio one does when its
+            // process ends, so the next link lists again.
+            if (l.what == .list and r.catalog.pending != .none) try r.stepCatalog(.page_failed);
             l.used = false;
         };
         if (r.listen_key) |key| try r.closeKey(key, .forgotten);
@@ -815,11 +886,14 @@ pub const Server = struct {
 
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
-    /// wrong and the start of the line. One that names a request not in
-    /// flight is ignored, and so is one on an HTTP request's stream that names
-    /// another request (`stream` is that request's key). One that names none
-    /// gives a short deadline (`request.Timeouts.refused_ms`) to each normal
-    /// request in flight, or, on an HTTP request's stream, to that request alone.
+    /// wrong and the start of the line. It names a request by the id read
+    /// before the line went wrong (`wire.responseId`), so a reply cut or
+    /// broken after its id ends at once. One that names a request not in
+    /// flight is ignored, as a late reply is, and so is one on an HTTP request's
+    /// stream that names another request (`stream` is that request's key). One that
+    /// names none gives a short deadline (`request.Timeouts.refused_ms`) to each normal
+    /// request in flight, or, on an HTTP request's stream, to that request alone
+    /// (`tests/tla/mcp/Request.tla` `RefusedNaming`, `RefusedLine`).
     fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8, stream: ?u64) Error!void {
         // Empty for a process that has gone since.
         if (line.len == 0) return;
@@ -844,6 +918,8 @@ pub const Server = struct {
         const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(excerpt_max, &buf, line) }) catch unreachable;
         var w: std.Io.Writer = .fixed(&r.refused_reply);
         std.json.Stringify.value(plain, .{}, &w) catch unreachable;
+        r.refused_decode = err;
+        defer r.refused_decode = null;
         try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
     }
 
@@ -917,6 +993,8 @@ pub const Server = struct {
     /// A stdio request ended in the request table: its logical request ends.
     fn stdioDelivered(r: *Server, id: request.Id, outcome: request.Outcome) Error!void {
         const l = r.logicalFor(id) orelse return;
+        // A stdio call that ends without its answer lost its process (`onProcessChanged`).
+        if (outcome == .none or outcome == .lost or outcome == .ended) l.lost_why = .link_down;
         const answered = outcome == .result or outcome == .peer_error;
         if (r.legacyEra() and (l.what == .call or l.what == .list)) return r.legacyDelivered(id, switch (outcome) {
             .result, .peer_error => .result,
@@ -1076,10 +1154,7 @@ pub const Server = struct {
                 }
                 // An answer was routed where it arrived; here only an exchange
                 // that ended without one.
-                if (d.outcome != .result and d.outcome != .failure and l.what == .list) {
-                    r.page_needs_auth = l.needs_auth;
-                    try r.stepCatalog(.page_failed);
-                }
+                if (d.outcome != .result and d.outcome != .failure and l.what == .list) try r.listFailed(l);
                 l.used = false;
             },
         };
@@ -1287,7 +1362,36 @@ pub const Server = struct {
             l.refused_bytes = bytes;
             l.refused_body = true;
         };
+        if (r.logicalFor(key)) |l| if (l.what == .list) {
+            l.list_why = httpListRefusal(how, status, r.legacy != null);
+            l.list_status = status;
+        };
         try r.onEndedDomain(key, status, if (how == .rejected or how == .unreadable) .http_failure else how);
+    }
+
+    /// Whether the end of an HTTP request for a `tools/list` is an answer that refuses the list. The server
+    /// answered, so this is no lost page, unless another flow reads the ending: a sign-in (401, and 403 with a
+    /// challenge), a 2025 session's end (404), or nothing that came back at all (no status, a broken stream, an
+    /// answer over the limit). Any other status, a 2xx body that is no message and a 2xx answer that is no JSON
+    /// are refusals.
+    fn httpListRefusal(how: http.Ending, status: u16, in_session: bool) ?tools.Refusal {
+        return switch (how) {
+            .rejected => null,
+            .http_failure => if (status == 0 or (status == 404 and in_session)) null else if (status / 100 == 2) .not_json else .http_status,
+            .unreadable => .unreadable,
+            .complete, .accepted, .broken, .too_large => null,
+        };
+    }
+
+    /// A `tools/list` ended with no usable answer: refused when an HTTP ending carried an answer that no other
+    /// flow reads, failed when it did not.
+    fn listFailed(r: *Server, l: *const Logical) Error!void {
+        r.page_needs_auth = l.needs_auth;
+        if (l.list_why) |why| if (!l.needs_auth and !l.unrenewed) {
+            r.refuse(why, l.list_status);
+            return r.stepCatalog(.page_refused);
+        };
+        try r.stepCatalog(.page_failed);
     }
 
     fn onEndedDomain(r: *Server, key: u64, status: u16, how: http.Ending) Error!void {
@@ -1316,21 +1420,51 @@ pub const Server = struct {
         if (how == .too_large) {
             r.losing_oversized = true;
             defer r.losing_oversized = false;
+            l.lost_why = .too_large;
+            l.lost_status = status;
             return r.stepExchange(l, .too_large);
         }
+        l.lost_why = if (how == .broken) .stream_broken else .stream_ended;
+        l.lost_status = status;
         try r.stepExchange(l, .stream_broken);
     }
 
     fn pageEvent(r: *Server, body: @FieldType(wire.Response, "body")) Error!catalog.Event {
         switch (body) {
-            .failure => |f| return if (f.code == wire.code.invalid_params and r.catalog.pending == .next) .invalid_cursor else .page_failed,
+            .failure => |f| {
+                if (r.refused_decode) |err| {
+                    r.refuse(tools.refusalOf(err), 0);
+                    return .page_refused;
+                }
+                if (f.code == wire.code.invalid_params and r.catalog.pending == .next) {
+                    // The first invalid cursor only restarts the listing, which refuses nothing, so the words stay
+                    // those of the last refusal. A second one, after the restart, refuses the list.
+                    if (r.catalog.restarts != 0) r.refuse(.error_reply, 0);
+                    return .invalid_cursor;
+                }
+                r.refuse(.error_reply, 0);
+                return .page_refused;
+            },
             .result => |res| {
-                if (res.kind != .complete) return .page_failed;
-                const page = tools.parsePage(res.raw) catch return .page_failed;
+                if (res.kind != .complete) {
+                    r.refuse(.not_complete, 0);
+                    return .page_refused;
+                }
+                const page = tools.parsePage(res.raw) catch |err| {
+                    r.refuse(tools.refusalOf(err), 0);
+                    return .page_refused;
+                };
                 // `x-mcp-header` is a 2026 annotation: a 2025 server's tools
                 // keep theirs unchecked, as nothing projects them.
                 r.store.check_headers = !r.legacyEra();
-                const added = r.store.addPage(r.gpa, page) catch return .page_failed;
+                const added = r.store.addPage(r.gpa, page) catch |err| switch (err) {
+                    // Running out of memory says nothing about what the server sent.
+                    error.OutOfMemory => return .page_failed,
+                    else => |decode| {
+                        r.refuse(tools.refusalOf(decode), 0);
+                        return .page_refused;
+                    },
+                };
                 r.last_added = added;
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
@@ -1412,6 +1546,8 @@ pub const Server = struct {
                         .oversized = o == .lost and r.losing_oversized,
                         .refused_bytes = l.refused_bytes,
                         .refused_body = l.refused_body,
+                        .lost_why = if (o == .lost) l.lost_why else null,
+                        .status = if (o == .lost) l.lost_status else 0,
                     },
                 });
                 l.used = false;
@@ -1573,7 +1709,14 @@ pub const Server = struct {
         try http_headers.sessionHeaders(arena.allocator(), method == .get, version, r.session_id, last_event_id, &headers);
         r.send(key, method, body, headers.items) catch |err| switch (err) {
             // Nothing could go out: the same as a stream that broke at once.
-            error.TooManyInFlight, error.ConcurrencyUnavailable => if (key < aux_base) try r.stepLegacy(.{ .broke = key }),
+            error.TooManyInFlight, error.ConcurrencyUnavailable => if (key < aux_base) {
+                // Nothing went out, so a call this ends lost is reported as a broken stream.
+                if (r.logicalFor(key)) |l| {
+                    l.lost_why = .stream_broken;
+                    l.lost_status = 0;
+                }
+                try r.stepLegacy(.{ .broke = key });
+            },
             else => return err,
         };
     }
@@ -1714,7 +1857,6 @@ pub const Server = struct {
     }
 
     fn onLegacyEnded(r: *Server, l: *Logical, key: u64, status: u16, how: http.Ending) Error!void {
-        _ = l;
         const s = &r.legacy.?;
         const req = s.find(key) orelse return;
         if (req.state != .posted and req.state != .resuming) return;
@@ -1731,6 +1873,14 @@ pub const Server = struct {
             .too_large => .{ .too_large = key },
             .http_failure, .rejected, .unreadable => .{ .refused = key },
         };
+        // The same branches as `event` above, so a call that this ending loses carries the reason.
+        l.lost_why = if (status == 404) .session_expired else if (status >= 300) .resume_refused else switch (how) {
+            .complete, .accepted => .stream_ended,
+            .broken => .stream_broken,
+            .too_large => .too_large,
+            .http_failure, .rejected, .unreadable => .resume_refused,
+        };
+        l.lost_status = status;
         r.losing_oversized = event == .too_large;
         defer r.losing_oversized = false;
         try r.stepLegacy(event);
@@ -1779,12 +1929,11 @@ pub const Server = struct {
                 .oversized = outcome == .lost and r.losing_oversized,
                 .refused_bytes = l.refused_bytes,
                 .refused_body = l.refused_body,
+                .lost_why = if (outcome == .lost) l.lost_why else null,
+                .status = if (outcome == .lost) l.lost_status else 0,
             },
         });
-        if (l.what == .list and outcome != .result) {
-            r.page_needs_auth = l.needs_auth;
-            try r.stepCatalog(.page_failed);
-        }
+        if (l.what == .list and outcome != .result) try r.listFailed(l);
         l.used = false;
     }
 
@@ -2247,7 +2396,11 @@ pub const Server = struct {
                 .request => |timer| try r.stepRequest(.{ .timer_fired = timer }),
                 .probe => |probe| try r.stepEra(.{ .probe_timer_fired = probe }),
                 .expiry => |generation| try r.stepCatalog(.{ .expired = generation }),
-                .resume_stream => |id| try r.stepLegacy(.{ .resume_due = id }),
+                .resume_stream => |id| {
+                    // A resume that finds the session changed, or not ready, ends the call lost.
+                    if (r.logicalFor(id)) |l| l.lost_why = .session_changed;
+                    try r.stepLegacy(.{ .resume_due = id });
+                },
                 .listen => try r.stepLegacy(.listen_due),
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
@@ -2348,4 +2501,257 @@ test "a line with no readable id gives a grace to the request whose stream carri
     try std.testing.expectEqual(@as(usize, 2), refusedTimers(&r));
     try std.testing.expect(holdsGrace(&r, 1));
     try std.testing.expect(holdsGrace(&r, 3));
+}
+
+test "an excerpt of a line is valid UTF-8: a byte that is no part of a sequence, and a control byte, show as ?" {
+    var buf: [20 + 3]u8 = undefined;
+    const got = excerptOf(20, &buf, "a\xffb\xc3\xa9\xe2\x82c\x1b");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+    try std.testing.expectEqualStrings("a?b\xc3\xa9??c?", got);
+    // Cut at the limit, with a lead byte whose sequence would run past it.
+    var short: [4 + 3]u8 = undefined;
+    const cut = excerptOf(4, &short, "ab\xe2\x82\xac\xe2\x82\xac");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+fn stdioTestServer(r: *Server) !void {
+    // Nothing starts the process: only the requests and their lines are real.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .stdio = .{ .argv = &.{"fx-test-never-started"} } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+/// A `tools/list` waiting for its answer on a stdio server, and its request's id.
+fn listInFlight(r: *Server) !request.Id {
+    const l = try listLogical(r);
+    l.id = try r.newRequest(.normal);
+    return l.id.?;
+}
+
+fn refusalError(line: []const u8) wire.DecodeError {
+    if (wire.decode(line)) |_| unreachable else |err| return err;
+}
+
+test "a list reply that fx matched by its id but could not read ends the list at once, with the words of an unreadable list" {
+    const alloc = std.testing.allocator;
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(alloc);
+    try deep.appendSlice(alloc, "\"jsonrpc\":\"2.0\",\"result\":");
+    try deep.appendNTimes(alloc, '[', 5000);
+    try deep.appendNTimes(alloc, ']', 5000);
+    const cases = [_]struct { rest: []const u8, words: []const u8 }{
+        // Bad parts after the id: not JSON, nested past the scanner's stack, a repeated key.
+        .{ .rest = "\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[nope]}", .words = "the answer is not a readable tool list" },
+        .{ .rest = deep.items, .words = "the answer is not a readable tool list" },
+        .{ .rest = "\"jsonrpc\":\"2.0\",\"result\":{},\"result\":{}", .words = "a field is written twice" },
+        // A line that decodes but is no reply, as a server's error is not what it said.
+        .{ .rest = "\"jsonrpc\":\"1.0\",\"result\":{\"tools\":[]}", .words = "the answer is not a readable tool list" },
+    };
+    for (cases) |case| {
+        var r: Server = undefined;
+        try stdioTestServer(&r);
+        defer r.deinit();
+        const id = try listInFlight(&r);
+        const line = try alloc.print("{{\"id\":{d},{s}}}", .{ id, case.rest });
+        defer alloc.free(line);
+        try r.onRefusedLine(refusalError(line), line, null);
+        // The list ended with its refusal, and no grace is left waiting for 30 s.
+        try std.testing.expect(r.logicalFor(id) == null);
+        try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+        try std.testing.expect(r.catalog.refused);
+        try std.testing.expectEqualStrings(case.words, r.listRefusal() orelse return error.TestExpectedRefusal);
+    }
+}
+
+test "a refused line that names no request in flight is ignored, and gives no grace to the requests that are" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+
+    // An id read before the bad part, for a request that is not in flight, is a stray like any late reply.
+    const stray = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":nope}}", .{id + 1});
+    try r.onRefusedLine(error.InvalidJson, stray, null);
+    try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
+    try std.testing.expect(!holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+
+    // Lines that name nothing, however it comes about, still give it a grace.
+    const after = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"result\":nope,\"id\":{d}}}", .{id});
+    try r.onRefusedLine(error.InvalidJson, after, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
+}
+
+test "two ids on a refused line name no request, and give every request in flight a grace" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+    const twice = try std.mem.print(&line, "{{\"id\":{d},\"id\":{d},\"result\":nope}}", .{ id, id });
+    try r.onRefusedLine(error.InvalidJson, twice, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+}
+
+fn pageTestServer(r: *Server) !void {
+    // No request goes out: it waits for a place, and there is none.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 0 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+fn failurePage(code: i64) @FieldType(wire.Response, "body") {
+    return .{ .failure = .{ .code = code, .message = "\"no\"", .data = null } };
+}
+
+test "the words of a refusal are those of the last answer that refused the list, not of a cursor that only restarted it" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    var out: catalog.Output = .{};
+    const c = &r.catalog;
+    try c.step(.{ .process_started = .modern }, &out);
+
+    // A list that is no list is refused, with its words.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(.{ .result = .{ .raw = "{\"tools\":7}", .kind = .complete } }), &out);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", (r.listRefusal() orelse return error.TestExpectedRefusal));
+
+    // The next listing has a second page, and its cursor is invalid: that restarts the listing and refuses nothing,
+    // so the words are still the refusal's.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(.{ .result = .{ .raw = "{\"tools\":[],\"nextCursor\":\"c\"}", .kind = .complete } }), &out);
+    const first = try r.pageEvent(failurePage(wire.code.invalid_params));
+    try std.testing.expectEqual(catalog.Event.invalid_cursor, first);
+    try c.step(first, &out);
+    try std.testing.expectEqual(@as(u1, 1), c.restarts);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", (r.listRefusal() orelse return error.TestExpectedRefusal));
+
+    // A second invalid cursor, after the restart, refuses the list: now the words are the error's.
+    try c.step(try r.pageEvent(.{ .result = .{ .raw = "{\"tools\":[],\"nextCursor\":\"c\"}", .kind = .complete } }), &out);
+    const second = try r.pageEvent(failurePage(wire.code.invalid_params));
+    try c.step(second, &out);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("the server answered the list with an error", (r.listRefusal() orelse return error.TestExpectedRefusal));
+}
+
+test "a later listing's first invalid cursor only restarts it, and leaves the words of an older refusal" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    var out: catalog.Output = .{};
+    const c = &r.catalog;
+    const more: @FieldType(wire.Response, "body") = .{ .result = .{ .raw = "{\"tools\":[],\"nextCursor\":\"c\"}", .kind = .complete } };
+    const last: @FieldType(wire.Response, "body") = .{ .result = .{ .raw = "{\"tools\":[]}", .kind = .complete } };
+    try c.step(.{ .process_started = .modern }, &out);
+
+    // Listing 1 restarts once, on its first invalid cursor, and ends.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(more), &out);
+    try c.step(try r.pageEvent(failurePage(wire.code.invalid_params)), &out);
+    try std.testing.expectEqual(@as(u1, 1), c.restarts);
+    try c.step(try r.pageEvent(last), &out);
+    try std.testing.expect(!c.refused);
+
+    // Listing 2 is refused, with its words.
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(.{ .result = .{ .raw = "{\"tools\":7}", .kind = .complete } }), &out);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", r.listRefusal() orelse return error.TestExpectedRefusal);
+
+    // Listing 3 has its own count: its first invalid cursor restarts it, and the words are still listing 2's.
+    try c.step(.need, &out);
+    try c.step(try r.pageEvent(more), &out);
+    const first = try r.pageEvent(failurePage(wire.code.invalid_params));
+    try std.testing.expectEqual(catalog.Event.invalid_cursor, first);
+    try c.step(first, &out);
+    try std.testing.expectEqual(@as(u1, 1), c.restarts);
+    try std.testing.expect(c.refused);
+    try std.testing.expectEqualStrings("\"tools\" is not a list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "an HTTP ending refuses a tool list, unless another flow reads it" {
+    // A status that nothing else reads, with no message in the body, is an answer that refuses the list. The number is the status.
+    for ([_]u16{ 400, 403, 404, 405, 408, 410, 429, 500, 502, 503, 504, 301 }) |status| {
+        try std.testing.expectEqual(@as(?tools.Refusal, .http_status), Server.httpListRefusal(.http_failure, status, false));
+    }
+    // A 2xx answer that is no JSON, and a 2xx body that is no message.
+    try std.testing.expectEqual(@as(?tools.Refusal, .not_json), Server.httpListRefusal(.http_failure, 200, false));
+    try std.testing.expectEqual(@as(?tools.Refusal, .not_json), Server.httpListRefusal(.http_failure, 200, true));
+    try std.testing.expectEqual(@as(?tools.Refusal, .unreadable), Server.httpListRefusal(.unreadable, 200, false));
+
+    // The sign-in reads a 401, and a 403 with a challenge.
+    try std.testing.expectEqual(@as(?tools.Refusal, null), Server.httpListRefusal(.rejected, 401, false));
+    try std.testing.expectEqual(@as(?tools.Refusal, null), Server.httpListRefusal(.rejected, 403, true));
+    // A 2025 session's 404 is the session's end; without a session it is an answer.
+    try std.testing.expectEqual(@as(?tools.Refusal, null), Server.httpListRefusal(.http_failure, 404, true));
+    try std.testing.expectEqual(@as(?tools.Refusal, .http_status), Server.httpListRefusal(.http_failure, 404, false));
+    try std.testing.expectEqual(@as(?tools.Refusal, .http_status), Server.httpListRefusal(.http_failure, 500, true));
+    // Nothing came back: no status, a broken stream, an answer over the limit, or one read in full.
+    try std.testing.expectEqual(@as(?tools.Refusal, null), Server.httpListRefusal(.http_failure, 0, false));
+    for ([_]http.Ending{ .broken, .too_large, .complete, .accepted }) |how| {
+        try std.testing.expectEqual(@as(?tools.Refusal, null), Server.httpListRefusal(how, 200, false));
+    }
+}
+
+fn listLogical(r: *Server) !*Logical {
+    var out: catalog.Output = .{};
+    try r.catalog.step(.{ .process_started = .modern }, &out);
+    try r.catalog.step(.need, &out);
+    // The request the listing would send: nothing goes out, as no session is ready.
+    return r.newLogical(.list, .idempotent);
+}
+
+test "a tool list that ends with an HTTP answer is refused with the status in its words, and a sign-in or no answer is not" {
+    {
+        var r: Server = undefined;
+        try pageTestServer(&r);
+        defer r.deinit();
+        const l = try listLogical(&r);
+        l.list_why = Server.httpListRefusal(.http_failure, 500, false);
+        l.list_status = 500;
+        try r.listFailed(l);
+        try std.testing.expect(r.catalog.refused);
+        try std.testing.expectEqualStrings("the server answered the list with HTTP 500", (r.listRefusal() orelse return error.TestExpectedRefusal));
+    }
+    {
+        var r: Server = undefined;
+        try pageTestServer(&r);
+        defer r.deinit();
+        const l = try listLogical(&r);
+        l.list_why = Server.httpListRefusal(.http_failure, 200, false);
+        l.list_status = 200;
+        try r.listFailed(l);
+        try std.testing.expectEqualStrings("the list is not valid JSON", (r.listRefusal() orelse return error.TestExpectedRefusal));
+    }
+    // A request that waits for a sign-in, and one that had no answer, refuse nothing.
+    {
+        var r: Server = undefined;
+        try pageTestServer(&r);
+        defer r.deinit();
+        const l = try listLogical(&r);
+        l.list_why = Server.httpListRefusal(.http_failure, 500, false);
+        l.list_status = 500;
+        l.needs_auth = true;
+        try r.listFailed(l);
+        try std.testing.expect(!r.catalog.refused);
+        try std.testing.expect(r.listRefusal() == null);
+    }
+    {
+        var r: Server = undefined;
+        try pageTestServer(&r);
+        defer r.deinit();
+        const l = try listLogical(&r);
+        try r.listFailed(l);
+        try std.testing.expect(!r.catalog.refused);
+        try std.testing.expect(r.listRefusal() == null);
+    }
 }

@@ -40,7 +40,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -330,6 +330,17 @@ function workspaceCaptures(fixture: Fixture, id: string): any[] {
     .map((line) => (typeof line.data === "string" ? JSON.parse(line.data) : line.data));
 }
 
+/// Whether any session in the fixture's profile has saved a
+/// `workspace_capture` item yet, read while its fx still runs.
+function anyWorkspaceCaptureSaved(fixture: Fixture): boolean {
+  const root = storeRoot(fixture.home);
+  if (!existsSync(root)) return false;
+  return readdirSync(root).some((id) => {
+    const log = join(root, id, "log.jsonl");
+    return existsSync(log) && readFileSync(log, "utf8").includes('"type":"workspace_capture"');
+  });
+}
+
 /// The one repository store under `~/.fx/captures`, beside retention's files.
 function captureStore(fixture: Fixture): string {
   const captures = join(fixture.home, ".fx", "captures");
@@ -510,6 +521,92 @@ test("fx ask captures another repository a tool writes in before the write, with
     const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
     expect(names(otherRecords[0].tree)).toEqual(["base.txt"]);
     expect(names(otherRecords[1].tree).sort()).toEqual(["base.txt", "made.txt"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask sends the turn's request while its start capture runs, and saves that capture before the tool writes, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-beside-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The start capture waits at its hold until the turn's request arrives,
+  // so the request never follows a saved start capture by chance.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  const target = join(fixture.workspace, "made.txt");
+  const savedAtRequest: boolean[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("beside-write")) return fakeGatewayFinalText("WROTE");
+    savedAtRequest.push(anyWorkspaceCaptureSaved(fixture));
+    writeFileSync(release, "");
+    return fakeGatewayToolCall("beside-write", "write_file", { path: target, content: "made\n" });
+  }, { classifierDecision: "clear" });
+  try {
+    const result = await runFx(["ask", "--json", "--auto", "Write the file."], {
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("WROTE");
+    expect(readFileSync(target, "utf8")).toBe("made\n");
+    // The turn's first request left before its start capture was saved.
+    expect(savedAtRequest).toEqual([false]);
+    expect(existsSync(held)).toBe(true);
+    // The tool waited for the start capture: only the end tree has its file.
+    const records = workspaceCaptures(fixture, JSON.parse(result.stdout).session_id);
+    expect(records.map((record) => record.phase)).toEqual(["start", "end"]);
+    const store = captureStore(fixture);
+    const names = (tree: string) => fixtureGit(fixture, ["ls-tree", "--name-only", tree], store).split("\n");
+    expect(names(records[0].tree)).not.toContain("made.txt");
+    expect(names(records[1].tree)).toContain("made.txt");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
+test("fx ask killed while its start capture is held keeps the prompt, and the resumed turn records its own captures, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-kill-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  // The release never comes, so the start capture is still held at the kill.
+  const held = join(fixture.root, "start-capture-held");
+  const release = join(fixture.root, "start-capture-release");
+  let requested!: () => void;
+  const turnRequested = new Promise<void>((resolve) => {
+    requested = resolve;
+  });
+  const gateway = startDynamicFakeGateway((body) => {
+    if (body.includes("After the kill.")) return fakeGatewayFinalText("AFTER_KILL");
+    requested();
+    return new Promise<Response>(() => {});
+  });
+  try {
+    const child = spawn(FX_BIN, ["ask", "--json", "--auto", "Before the kill."], {
+      cwd: fixture.workspace,
+      env: { ...process.env, ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release } as Record<string, string>,
+      stdio: "ignore",
+    });
+    const exited = new Promise((resolve) => child.on("exit", resolve));
+    await turnRequested;
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(held) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(held)).toBe(true);
+    child.kill("SIGKILL");
+    await exited;
+
+    const id = onlySessionId(fixture.home);
+    expect(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8")).toContain("Before the kill.");
+    expect(workspaceCaptures(fixture, id)).toEqual([]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the kill."]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_KILL");
+    expect(workspaceCaptures(fixture, id).map((record) => record.phase)).toEqual(["start", "end"]);
+    expect(logLines(fixture.home, id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -729,14 +826,16 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
     // The first turn saves the runtime context it captured right after its
-    // user message (D94), then the model call that answered it, at the
-    // start of its only step (D96).
+    // user message (D94), checkpoints recovery before the model call and
+    // clears it after the call completes, alongside the model call (D96).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
       "item:runtime_context",
+      "item:recovery",
       "item:model_call",
+      "item:recovery",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
@@ -3651,11 +3750,13 @@ test("waiting for a committed root turn skips what fx has not written yet and re
 
 test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
+  // The child answers only once the parent has saved the turn that sent its
+  // message, so its report starts the next turn instead of joining that one.
+  const hold = holdChildAnswer(fixture.home);
   const gateway = startDynamicFakeGateway(async (body) => {
     if (isChildRequest(body)) {
-      // A report that arrives while the parent's first turn runs joins that
-      // turn, so the child answers only once that turn is saved.
-      await waitForRootTurnCommitted(fixture.home);
+      const refused = await hold.wait();
+      if (refused) return refused;
       return fakeGatewayFinalText("CHILD_ANSWER_5521");
     }
     if (isReportTurn(body)) {
@@ -3668,6 +3769,7 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
   try {
     // A subagent run prints its progress on stderr.
     const result = await ask(fixture, gateway, ["Delegate the marker report."]);
+    hold.check();
     expect(result.code).toBe(0);
     expect(result.stderr).not.toContain("panic");
     const output = JSON.parse(result.stdout);
@@ -4512,6 +4614,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
       workspace_root: fixture.workspace,
       saved_model: savedModel(fixture, working!),
       state: "working",
+      pid: holders[0]!.child.pid,
       created_at_ms: expect.any(Number),
       updated_at_ms: expect.any(Number),
       agents: [],
@@ -4519,6 +4622,9 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
 
     const all = await liveSessions(fixture, gateway, ["--all"]);
     expect(all.sessions.map((entry: any) => entry.id)).toEqual([delegating, working]);
+    // `holders[1]` sent the delegating turn and `holders[0]` the held working one.
+    expect(all.sessions[0].pid).toBe(holders[1]!.child.pid);
+    expect(all.sessions[1].pid).toBe(holders[0]!.child.pid);
     expect(all.sessions[0]).toMatchObject({ workspace_root: other, state: "idle", title: "Delegate the live review." });
     expect(all.sessions[0].agents).toEqual([
       { name: "reviewer", address: `${delegating}/reviewer`, id: childId, state: "working", agents: [] },
@@ -4567,6 +4673,59 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     expect(listed.sessions.map((entry: any) => entry.id).sort()).toEqual([saved, working, delegating].sort());
   } finally {
     for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx sessions --live --json reports the holder pid, updates it on resume after SIGKILL, and returns null when the lock file has no pid", async () => {
+  const fixture = createFixture("fx-v2-live-pid-");
+  let firstHeld = false;
+  let secondHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    // The second turn is checked first: its prompt also carries the first turn's text.
+    if (body.includes("Hold the second pid turn.")) {
+      secondHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("Hold the first pid turn.")) {
+      firstHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("PID_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  try {
+    const sessionId = JSON.parse((await ask(fixture, gateway, ["Seed the pid session."])).stdout).session_id;
+    const lockPath = join(storeRoot(fixture.home), sessionId, "lock");
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the first pid turn."]));
+    await until(() => firstHeld, "the first held turn");
+    const first = await liveSessions(fixture, gateway, ["--all"]);
+    expect(first.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(first.sessions[0].pid).toBe(holders[0]!.child.pid);
+
+    holders[0]!.child.kill("SIGKILL");
+    await holders[0]!.exited;
+    // SIGKILL frees the lock but leaves the PID bytes, so only the lock decides what is live.
+    expect(readFileSync(lockPath, "utf8")).toBe(`${holders[0]!.child.pid}\n`);
+    expect(await liveSessions(fixture, gateway, ["--all"])).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the second pid turn."]));
+    await until(() => secondHeld, "the second held turn");
+    expect(holders[1]!.child.pid).not.toBe(holders[0]!.child.pid);
+    const second = await liveSessions(fixture, gateway, ["--all"]);
+    expect(second.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(second.sessions[0].pid).toBe(holders[1]!.child.pid);
+
+    // An older fx left the lock file empty: the session is still live, with no PID.
+    writeFileSync(lockPath, "");
+    const unnamed = await liveSessions(fixture, gateway, ["--all"]);
+    expect(unnamed.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(unnamed.sessions[0].pid).toBeNull();
+  } finally {
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    await Promise.all(holders.map((holder) => holder.exited));
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

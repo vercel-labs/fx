@@ -634,7 +634,7 @@ const Candidate = struct {
 /// Every session with captures, but `current_key`'s, with its refs. A store
 /// whose refs cannot be listed offers none, and the trace names it.
 fn inventory(arena: Allocator, ready: safe_git.StoreReady, stores: []const []const u8, current_key: []const u8, limits: safe_git.Limits) Allocator.Error![]Candidate {
-    var by_key: std.StringArrayHashMapUnmanaged(Candidate) = .empty;
+    var by_key: std.array_hash_map.String(Candidate) = .empty;
     for (stores, 0..) |store, index| {
         const listing = switch (try capture_store.storeOutput(arena, ready, try capture_store.refStore(arena, store), .list_refs, limits)) {
             .ok => |stdout| stdout,

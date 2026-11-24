@@ -876,7 +876,7 @@ test "transcript window: each command's output is bounded on its own" {
     };
     var line: [16]u8 = undefined;
     for (0..40) |index| {
-        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "line-{d:0>2}\n", .{index}), true);
+        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.mem.print(&line, "line-{d:0>2}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
     const first = runtime.notebook.command_output_blocks.items[0];
@@ -887,7 +887,7 @@ test "transcript window: each command's output is bounded on its own" {
     // The next command keeps all of its output though the transcript holds
     // more than the cap.
     for (0..3) |index| {
-        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "next-{d}\n", .{index}), true);
+        try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.mem.print(&line, "next-{d}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
     try std.testing.expectEqual(@as(usize, 2), runtime.notebook.command_output_blocks.items.len);
@@ -1100,6 +1100,52 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
     try std.testing.expect(fail_after > 0);
 }
 
+test "a transcript window drop that runs out of memory before a frame commits leaves the transcript as it was" {
+    // No frame has committed, so there is no committed source to rebase onto, and a
+    // failed allocation must still leave the transcript and its entries as they were.
+    const backing = testing_allocator.no_resize;
+    var induced_failures: usize = 0;
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        var failing = std.testing.FailingAllocator.init(backing, .{});
+        const alloc = failing.allocator();
+        var runtime = testRuntime(alloc);
+        defer runtime.deinit(alloc);
+        var metrics: types.Metrics = .{};
+        try runTurn(alloc, &runtime, &metrics, "DROPPED_PROMPT", "DROPPED_ANSWER\n");
+        const dropped_count = runtime.notebook.entries.items.len;
+        try runTurn(alloc, &runtime, &metrics, "KEPT_PROMPT", "KEPT_ANSWER\n");
+        try std.testing.expect(runtime.transcript_commit_state == .invalid);
+
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(backing);
+        for (runtime.notebook.entries.items) |entry| try ids.append(backing, entry.id());
+        const transcript_before = try backing.dupe(u8, runtime.notebook.transcript.items);
+        defer backing.free(transcript_before);
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = transcript_store.dropEntriesAtomic(&runtime, alloc, ids.items[0..dropped_count]);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) induced_failures += 1;
+        if (result) |changed| {
+            try std.testing.expect(!induced);
+            try std.testing.expect(changed);
+            try std.testing.expect(!holds(&runtime, "DROPPED_PROMPT") and holds(&runtime, "KEPT_PROMPT"));
+            try std.testing.expect(!std.mem.eql(u8, transcript_before, runtime.notebook.transcript.items));
+            try std.testing.expectEqual(ids.items.len - dropped_count, runtime.notebook.entries.items.len);
+            break;
+        } else |err| {
+            try std.testing.expect(induced);
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
+            try std.testing.expectEqual(ids.items.len, runtime.notebook.entries.items.len);
+            for (ids.items, runtime.notebook.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
+        }
+    }
+    try std.testing.expect(induced_failures > 0);
+}
+
 test "a resume that brings back the cycle before the newest compaction holds it until the next turn ends" {
     const alloc = std.testing.allocator;
     var runtime = testRuntime(alloc);
@@ -1240,5 +1286,86 @@ test "a resumed transcript that leaves the screen before its repaint lets its wi
     try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
     try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
     try std.testing.expect(holds(&runtime, "HIDDEN_TURN"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript released before its first paint keeps the cycle before the newest compaction until that paint" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The child is hidden, so its flow is released before any frame paints it.
+    try std.testing.expect(runtime.releaseUnpaintedResumeSource(alloc) > 0);
+    try std.testing.expect(runtime.notebook.pending_resume_source == null);
+    try std.testing.expect(runtime.unpainted_resume_hold);
+
+    // A turn ends while hidden. The drop of the cycle is held, and the new turn stays.
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "HIDDEN_TURN"));
+
+    // The first show clears the screen and replays the entries, so the cycle is still among them.
+    try runtime.transcriptWindowScreenCleared(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The first paint shows the entries with their rows in terminal history, and it ends the hold.
+    var first_paint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer first_paint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &first_paint, committedFrameResult());
+    try std.testing.expect(runtime.transcript_commit_state == .stable);
+    try std.testing.expect(!runtime.unpainted_resume_hold);
+
+    // After the paint, the held drop applies at the next sync, as in a painted transcript.
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+
+    // The next turn keeps the cycle dropped.
+    try runTurn(alloc, &runtime, &metrics, "NEXT_TURN", "REPLY\n");
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try std.testing.expect(holds(&runtime, "NEXT_TURN"));
+    try expectWindowMatchesEntries(&runtime);
+}
+
+test "a resumed transcript released before its first paint keeps the cycle before the newest compaction through a visual epoch reset" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+
+    // The child is hidden, so its flow is released before any frame paints it.
+    try std.testing.expect(runtime.releaseUnpaintedResumeSource(alloc) > 0);
+    try runTurn(alloc, &runtime, &metrics, "HIDDEN_TURN", "REPLY\n");
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // Ctrl+L runs a visual epoch reset before the first paint, and it must not end the hold.
+    try runtime.resetVisualEpoch(alloc, "welcome\n");
+    try std.testing.expect(runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+
+    // The first paint ends the hold, and the next sync drops the cycle.
+    var first_paint = try transcriptFrame(alloc, &runtime, null, .all);
+    defer first_paint.deinit(alloc);
+    runtime.consumeTranscriptTransition(alloc, &first_paint, committedFrameResult());
+    try std.testing.expect(!runtime.unpainted_resume_hold);
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
     try expectWindowMatchesEntries(&runtime);
 }

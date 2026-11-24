@@ -35,6 +35,7 @@
     {"name": "session_log_scan", "module": "session_manager", "test": "scanning never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_schema_header", "module": "session_manager", "test": "header parsing never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_child_copy", "module": "session_manager", "test": "a child copy of a child log with arbitrary bytes after its lines never panics and copies whole lines (D97)", "iterations": 20000},
+    {"name": "session_lock_pid", "module": "session_manager", "test": "lock pid parsing never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "subagent_call_label", "module": "fx", "test": "a subagent's call label stays bounded, one line, and terminal-safe on fuzzed bytes", "iterations": 20000},
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},
     {"name": "network_call_text", "module": "fx", "test": "fuzzed network call text stays a bounded prefix that keeps UTF-8 whole", "iterations": 2000000},
@@ -94,10 +95,12 @@
     {"name": "snapshot_alias_lines", "module": "fx", "test": "alias line reading stays bounded on fuzzed bytes", "iterations": 3000000},
     {"name": "mcp_error_data", "module": "fx", "test": "a failed call's error data is kept whole or cut at a character, within the cap, on fuzzed bytes", "iterations": 8000},
     {"name": "mcp_json_depth", "module": "fx", "test": "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes", "iterations": 100000},
+    {"name": "mcp_owner_wire", "module": "fx", "test": "an owner wire frame decodes or is refused on fuzzed bytes, and what decodes writes back the same", "iterations": 300000},
     {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000},
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
-    {"name": "bash_call_text", "module": "fx", "test": "bash calls sent as JSON text decode or are refused on arbitrary bytes", "iterations": 250000}
+    {"name": "bash_call_text", "module": "fx", "test": "bash calls sent as JSON text decode or are refused on arbitrary bytes", "iterations": 250000},
+    {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000}
   ]
 }

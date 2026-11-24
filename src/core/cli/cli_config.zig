@@ -538,7 +538,7 @@ fn string(value: []const u8) Effective {
 
 fn integer(arena: Allocator, value: usize) Allocator.Error!Effective {
     if (std.math.cast(i64, value)) |fits| return .{ .value = .{ .integer = fits } };
-    return .{ .value = .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{value}) } };
+    return .{ .value = .{ .number_string = try arena.print("{d}", .{value}) } };
 }
 
 /// The entries `fx config get` looks a key up in when no scope is chosen.
@@ -1012,7 +1012,7 @@ test "every plain setting is resolved or deliberately shown from the files" {
         if (key.kind == .switches) {
             for (key.children) |child| {
                 var buf: [96]u8 = undefined;
-                const path = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ key.name, child });
+                const path = try std.mem.print(&buf, "{s}.{s}", .{ key.name, child });
                 try std.testing.expect(inList(&resolved_keys, path) or inList(&files_only_keys, key.name));
             }
             continue;

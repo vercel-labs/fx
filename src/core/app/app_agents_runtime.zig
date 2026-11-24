@@ -702,7 +702,8 @@ pub fn postAndWait(handoffs: *Handoffs, post: *Post, cancel: *std.atomic.Value(b
     {
         handoffs.mutex.lockUncancelable(io_mod.getIo());
         defer handoffs.mutex.unlock(io_mod.getIo());
-        if (handoffs.closed) return error.Cancelled;
+        // A cancel that is already set never queues the post, so the main loop cannot take it.
+        if (handoffs.closed or cancel.load(.seq_cst)) return error.Cancelled;
         try handoffs.posts.append(handoff_alloc, post);
     }
     while (true) {
@@ -2854,7 +2855,7 @@ pub fn Runtime(comptime App: type) type {
                     post.settle(.taken);
                 } else |err| {
                     debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind={s} reason={s}", .{ post.turn.child_id orelse "", kind, @errorName(err) });
-                    post.settle(.failed);
+                    post.settle(if (err == error.Cancelled) .closed else .failed);
                 }
             }
             if (held.items.len == 0) return;
@@ -2928,6 +2929,13 @@ pub fn Runtime(comptime App: type) type {
             if (child.purpose.len == 0) if (post.turn.child_purpose) |purpose| {
                 child.purpose = try app.alloc.dupe(u8, purpose);
             };
+            // The owner counts the work's unread messages until its turn
+            // begins, which is here. A stop that came first set the cancel:
+            // the turn does not begin, and the run goes back to its slot.
+            if (!post.turn.hostedTurnBegins()) {
+                debug_trace.logf("host", "child run refused agent={s} work_id={s}: its stop came first, so its turn does not begin and the stop counted its messages", .{ child.id, post.run.?.work_id });
+                return error.Cancelled;
+            }
             installChildRun(app, child, post.run.?);
             post.run = null;
             const start: Start = .{ .post = post, .child = child };
@@ -2953,17 +2961,31 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "child_session_opened", .{}, "agent={s} turns={d}", .{ child.id, agent.session.agent.history.items.len });
         }
 
+        /// Builds a subagent's first-run view from its saved conversation.
+        pub fn buildFirstRunView(app: *App, agent: *agents.Agent, child: *ChildAgent) !void {
+            const history = agent.session.agent.history.items;
+            try buildView(app, agent, history);
+            child.view_built = true;
+            debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ child.id, history.len });
+            releaseHiddenResumeFlow(app, child, "hidden_first_run");
+        }
+
+        /// Releases a child's frozen resume flow when it is not on screen, so its first
+        /// show paints its entries. Runs inside `visit`, where `app.shell` holds the child's
+        /// slot: a hidden child writes its next turn there, and the frozen flow misses those rows.
+        pub fn releaseHiddenResumeFlow(app: *App, child: *ChildAgent, reason: []const u8) void {
+            if (app.agent_on_screen != child) {
+                const released = app.shell.releaseUnpaintedResumeSource(app.alloc);
+                if (released > 0) debug_trace.logf("host", "resume flow released before first show agent={s} bytes={d} reason={s}", .{ child.id, released, reason });
+            }
+        }
+
         fn startInContext(start: Start, app: *App, agent: *agents.Agent) anyerror!void {
             const post = start.post;
             if (!start.child.session_attached) try attachSession(app, agent, start.child);
             // The child's own session holds its conversation. The first
             // run in this process shows it, after a restart too.
-            if (!start.child.view_built) {
-                const history = agent.session.agent.history.items;
-                try buildView(app, agent, history);
-                start.child.view_built = true;
-                debug_trace.eventf("host", "agent_view_rebuilt", .{}, "agent={s} turns={d}", .{ start.child.id, history.len });
-            }
+            if (!start.child.view_built) try buildFirstRunView(app, agent, start.child);
             // The worker writes the message's card when its turn begins. The
             // turn carries main's work id, so it is saved with it.
             agent.prompt_work_id = start.child.agent.child_run.?.work_id;
@@ -3590,6 +3612,17 @@ test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches th
     cancel.store(false, .seq_cst);
     try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
     try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+}
+
+test "a hand-off whose cancel is already set is never queued for the main loop" {
+    // The list allocates on its first append, so capacity 0 shows that no post was ever queued.
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
+    var cancel = std.atomic.Value(bool).init(true);
+    var post = Post{ .turn = undefined };
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.capacity);
 }
 
 test "the cancel a run's wait repeats ends the question that run waits on" {
