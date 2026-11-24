@@ -2178,6 +2178,57 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "main's stop refuses a subagent's approval request, and its command never runs",
+    async () => {
+      let tracePath = "";
+      let mainCalls = 0;
+      let childCalls = 0;
+      const env: Record<string, string> = {};
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) return toolCall("child_shell", "shell", { action: "run", command: "touch stopped.txt" });
+          return text("child_done", "SWITCH_WRITER_DONE");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "writer", message: "SWITCH_RUN_TASK", profile: "writer" },
+          });
+        }
+        if (body.includes("I wait for your approval to run") && !body.includes("main_stop")) {
+          return toolCall("main_stop", "subagent", { action: "stop", agent: "writer" });
+        }
+        const reportTurn = body.includes(REPORT_HEADER);
+        if (body.includes("main_stop") && !reportTurn) return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_STOPPED", 60_000);
+        // fx answered and stays up: it quits from the composer, cleanly.
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // The refused command never ran.
+        expect(existsSync(join(workspace, "stopped.txt"))).toBe(false);
+        // The stop refused the request with its ids and counts in the trace.
+        expect(readFileSync(tracePath, "utf8")).toMatch(/approval requests refused child=\S+ refused=1 gone=0 ids=\S+/);
+      }, (home) => {
+        const folder = join(home, ".fx", "agents", "writer");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({
+          description: "Runs one command",
+          tools: ["shell"],
+          permission_mode: "ask",
+        }));
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+        env.FX_TRACE_SCOPES = "subagent,mailbox";
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's question shows on main's screen, named for it, and is answered there",
     async () => {
       let mainCalls = 0;

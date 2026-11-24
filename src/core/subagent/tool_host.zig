@@ -400,6 +400,15 @@ pub const ApprovalCheck = struct {
 /// What a child reads when main's own check could not be made (R4.2).
 const unchecked_approval_feedback = "fx could not check this request against your parent's permissions, so it was refused.";
 
+/// What a subagent reads when its parent stopped it before answering.
+const stopped_approval_feedback = "Your parent stopped you before answering this request. Do not retry it.";
+
+/// What a subagent reads when its parent closed it before answering.
+const parent_closed_approval_feedback = "Your parent closed you before answering this request. Do not retry it.";
+
+/// What a subagent reads when the person closed it before its request was answered.
+const user_closed_approval_feedback = "The person closed you before this request was answered. Do not retry it.";
+
 /// What a child reads when fx ask refuses a request main left unanswered.
 const unanswered_approval_feedback = "Your parent ended its turn without answering, so this request was refused.";
 
@@ -2656,6 +2665,13 @@ pub const Runtime = struct {
             const child = registry.findPersistent(agent) orelse break :blk null;
             break :blk try a.dupe(u8, child.id);
         } orelse return self.refuseNotOpen(alloc, agent);
+        // Refuse the request the child waits on before the stop takes
+        // admission: the stopper holds admission and the owner's mutex while it
+        // waits for the child's worker, and `refuseChild` takes neither (it
+        // releases the registry mutex before it answers the worker), so the
+        // note path's worker -> registry order and this registry -> owner ->
+        // worker order cannot cycle (the E1 rule).
+        _ = self.approvals.refuseChild(child_id, stopped_approval_feedback);
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -2845,6 +2861,10 @@ pub const Runtime = struct {
             @memcpy(name_buf[0..value.len], value);
             break :blk name_buf[0..value.len];
         };
+        // As a stop does, refuse the request this child waits on before the
+        // close takes admission, so the call is refused with the reason and
+        // nothing runs. `refuseChild` holds no lock across its wait (see it).
+        _ = self.approvals.refuseChild(child_id, if (by == .user) user_closed_approval_feedback else parent_closed_approval_feedback);
         const result: Closed, const settle_now = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -12173,5 +12193,60 @@ test "an answer whose request ends during the check says it is no longer waiting
     const result = try t.runtime.answerApproval(t.arena(), "reviewer", .once, null, check.hook());
     try expectAnswerHas(result.body, "reviewer's request: run touch marker is no longer waiting.");
     // Nothing reached the worker: the request had already ended.
+    try std.testing.expect(t.worker.decision == null);
+}
+
+test "a stop refuses the child's waiting request once, with the reason" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.register("run touch marker");
+
+    const stopped = try t.runtime.stopChild(t.arena(), "reviewer");
+    // The fixture's work already ended, so the stop answers that it was not
+    // working; the refusal is what this test reads.
+    try expectAnswerHas(stopped.body, "reviewer");
+    try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+    try expectAnswerHas(t.worker.feedbackText(), "Your parent stopped you before answering this request");
+    try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+
+    // A second stop finds nothing to refuse.
+    t.worker = .{};
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    try std.testing.expectEqualStrings("", t.worker.feedbackText());
+}
+
+test "a close refuses the child's waiting request with the reason of who closed it" {
+    for ([_]Runtime.CloseBy{ .parent, .user }) |by| {
+        var t: ApprovalFixture = undefined;
+        try t.init();
+        defer t.deinit();
+        try t.register("run touch marker");
+
+        // The close's own result is not what this test reads: the refusal comes first.
+        _ = t.runtime.closeChild("child-1", by) catch |err| switch (err) {
+            error.CloseNotSaved => null,
+            else => return err,
+        };
+        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), t.worker.decision);
+        if (by == .user) {
+            try expectAnswerHas(t.worker.feedbackText(), "The person closed you before this request was answered");
+        } else {
+            try expectAnswerHas(t.worker.feedbackText(), "Your parent closed you before answering this request");
+        }
+        try std.testing.expect((try t.runtime.approvals.firstPendingForChild(t.arena(), "child-1")) == null);
+    }
+}
+
+test "a stop or close with nothing waiting refuses nothing" {
+    var t: ApprovalFixture = undefined;
+    try t.init();
+    defer t.deinit();
+
+    _ = try t.runtime.stopChild(t.arena(), "reviewer");
+    try std.testing.expect(t.worker.decision == null);
+    // The close's own result is not what this test reads.
+    _ = t.runtime.closeChild("child-1", .parent) catch {};
     try std.testing.expect(t.worker.decision == null);
 }
