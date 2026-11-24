@@ -134,6 +134,24 @@ const NAMES_ONLY: StoryStep[] = [
   { at: 2, text: "The notes are saved." },
 ];
 
+// Twelve commands one after the other, of nine different steps. The last one,
+// sh wait.sh, runs until the test lets it end.
+const TWELVE_COMMANDS: StoryStep[] = [
+  "ls desktop",
+  "cat desktop/src/main.ts",
+  "wc -l desktop/src/main.ts",
+  "grep -c export desktop/src/window.ts",
+  "ls desktop/src",
+  "sed -n 1p desktop/src/main.ts",
+  "head -1 desktop/src/window.ts",
+  "sh check.sh status",
+  "cat desktop/src/window.ts",
+  "tail -1 desktop/src/main.ts",
+  "sh check.sh remote",
+  "sh wait.sh",
+].map((command, at): StoryStep => ({ at, calls: [sh(command)] }));
+TWELVE_COMMANDS.push({ at: TWELVE_COMMANDS.length, text: "The desktop app has two source files." });
+
 // A command that nests `$( )` deeper than any stack, in a request the shell
 // refuses before it runs anything, so fx draws its row and nothing runs.
 const NESTED_WITHOUT_END: StoryStep[] = [
@@ -309,10 +327,10 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(await session.waitForText(/^ {2}1 file changed \+1 -1 · ran 4 commands · /m, TIMEOUT));
 
     const checks = group(lines, "● Ran commands ✗");
-    // The two passing checks share a row by their step; the failure keeps
-    // its own, with the error's line after it.
+    // The two passing checks share a row by their step, which counts them;
+    // the failure keeps its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh",
+      "├ Ran sh check.sh · 2 calls",
       expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
@@ -802,6 +820,55 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The notes are saved.", TIMEOUT);
     expectNames(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a row of several commands counts its calls while it runs, once it ran, at a narrow width, and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    writeFileSync(join(root.workspace, "wait.sh"), "while [ ! -f released ]; do sleep 0.1; done\n");
+    const gateway = startStoryGateway(TWELVE_COMMANDS);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("look around the desktop app");
+
+    // The row names each of its nine steps once, where it last ran, so only
+    // its count says it holds twelve calls, and the count stays as the row
+    // goes from running to ran.
+    const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
+    expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
+    writeFileSync(join(root.workspace, "released"), "");
+    await session.waitForText("The desktop app has two source files.", TIMEOUT);
+    const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
+    const expectRow = (pane: string, row: string) => {
+      expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
+    };
+    expectRow(await session.waitForComposer(TIMEOUT), ran);
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+
+    // After resume the row reads the same. A narrow terminal counts more of
+    // its older steps in front, and keeps its newest step and its count.
+    const resumedRows: Array<[number, string]> = [[110, ran], [40, "● Ran +8, sh wait.sh · 12 calls ✓"]];
+    for (const [width, row] of resumedRows) {
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The desktop app has two source files.", TIMEOUT);
+      expectRow(await resumed.waitForComposer(TIMEOUT), row);
+      await resumed.kill();
+      sessions.splice(sessions.indexOf(resumed), 1);
+    }
   },
   TIMEOUT * 3,
 );

@@ -201,6 +201,24 @@ pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
 
+    /// What `wait_for_handoff_mail` ended on.
+    pub const HandoffMailWait = enum {
+        /// Nothing waits in the hand-off for this agent, so the call did not wait.
+        none,
+        /// The mail reached the worker's queue and joins the turn.
+        joined,
+        /// The mail does not join the turn, either because older work waits
+        /// ahead of it or because the hand-off no longer holds it, so it goes to
+        /// a later turn.
+        delivered,
+        /// The turn takes no more mail, so the call did not wait.
+        closed,
+        /// A stop, a shutdown, or a cancel ended the wait.
+        interrupted,
+        /// The time ran out with the mail still in the hand-off.
+        timed_out,
+    };
+
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -230,6 +248,13 @@ pub const AgentRuntimeDeps = struct {
         turn_id: u64,
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
+    /// Set only by a host whose subagents' reports and messages reach this
+    /// agent's worker through a hand-off that the worker cannot see, as the
+    /// TUI's main loop is. Called as an empty reply's step ends, with no lock
+    /// held. When the hand-off holds mail for this agent, it waits at most
+    /// `bound_ms` for that mail to reach the worker's queue, so the check for
+    /// mail that follows finds it.
+    wait_for_handoff_mail: ?*const fn (ctx: *anyopaque, turn_id: u64, bound_ms: i64) HandoffMailWait = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     /// Whether turn `turn_id`, which ends interrupted, ends because the user
     /// cancelled it rather than because steering ended it. Asked before the

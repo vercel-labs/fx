@@ -109,6 +109,26 @@ const empty_reply_nudge_prompt =
 const empty_reply_asking = "Asking it to continue.";
 const empty_reply_follow_up = "Continue with a follow-up prompt if needed.";
 
+/// The longest an empty reply waits for mail that still sits in the host's
+/// hand-off before the nudge goes out.
+const handoff_mail_wait_ms: i64 = 1000;
+
+/// An empty reply's step has ended. A subagent's report or message for this
+/// agent may still sit in the host's hand-off, a moment from the worker's queue,
+/// where the check for mail that follows cannot see it. Waits for it, at most
+/// `handoff_mail_wait_ms`, so the mail takes the nudge's place. A host with no
+/// hand-off waits for nothing
+/// (`tests/tla/subagent/MainMail.tla` NoNudgeWithMail, WaitBounded).
+fn awaitHandoffMail(deps: *const AgentRuntimeDeps, turn_id: u64, step_ctx: TraceContext) void {
+    const wait = deps.wait_for_handoff_mail orelse return;
+    const outcome = wait(deps.ctx, turn_id, handoff_mail_wait_ms);
+    if (outcome == .none) return;
+    debug_trace.eventf("agent", "empty_reply_mail_wait", step_ctx, "outcome={s}", .{@tagName(outcome)});
+    if (outcome == .timed_out) {
+        debug_trace.logf("agent", "empty reply: mail for this agent did not land in the worker within {d} ms, so the nudge goes out", .{handoff_mail_wait_ms});
+    }
+}
+
 /// What fx shows for a reply that stopped for `other` with no text and no tool
 /// call: the provider's own reason when it sent one, then `next_step`.
 fn emptyReplyNotice(arena: Allocator, provider_reason: []const u8, next_step: []const u8) ![]const u8 {
@@ -10599,6 +10619,11 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
+            // After the nudge the check below has closed the turn to mail, so a
+            // second empty reply waits for nothing.
+            if (empty_other and !empty_reply_nudged and !lifecycle.view.hasStop() and agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                awaitHandoffMail(deps, turn_id, step_ctx);
+            }
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {

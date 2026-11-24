@@ -2148,6 +2148,7 @@ const StoryRow = struct {
     entry_id: u32,
     detail: ?*const ToolDetailRecord,
     identity: StoryIdentity,
+    /// How many calls share the row.
     count: usize = 1,
     /// How many of the calls that share the row failed.
     failures: usize = 0,
@@ -4304,6 +4305,7 @@ fn collectStoryRows(
                         try last.combined.append(scratch, last.detail.?);
                     }
                     try last.combined.append(scratch, detail.?);
+                    last.count += 1;
                     last.entry = entry;
                     last.entry_id = entry_id;
                     last.detail = detail;
@@ -4372,7 +4374,7 @@ fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) 
         if (try repeatKey(scratch, &row)) |key| {
             const first = try firsts.getOrPut(scratch, key);
             if (first.found_existing) {
-                rows.items[first.value_ptr.*].joined_calls += rowCalls(&row);
+                rows.items[first.value_ptr.*].joined_calls += row.count;
                 continue;
             }
             first.value_ptr.* = kept;
@@ -4406,9 +4408,10 @@ fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     return if (phraseShowsProgress(body)) null else body;
 }
 
-/// How many calls a row stands for.
+/// How many calls a row stands for, with those of the later rows
+/// joinRepeatedRows folded into it.
 fn rowCalls(row: *const StoryRow) usize {
-    return if (row.identity.kind == .commands) row.combined.items.len else row.count;
+    return row.count + row.joined_calls;
 }
 
 /// How many calls a row that later repeats joined stands for, such as
@@ -4417,7 +4420,7 @@ fn rowCalls(row: *const StoryRow) usize {
 fn joinedNote(scratch: std.mem.Allocator, row: *const StoryRow) ![]const u8 {
     if (row.joined_calls == 0) return "";
     const messages = isSubagentMessage(scratch, row.detail.?);
-    return countNote(scratch, " · ", rowCalls(row) + row.joined_calls, if (messages) " messages" else " calls");
+    return countNote(scratch, " · ", rowCalls(row), if (messages) " messages" else " calls");
 }
 
 /// Whether a call is main's message to a subagent, not a report, wait, or
@@ -4548,7 +4551,9 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         const label = try checkRowPhrase(scratch, row, own_label) orelse own_label;
         var steps = try combinedCommandSteps(scratch, row.combined.items);
         var display = try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, steps, style.text_style) });
-        const note = try joinedNote(scratch, row);
+        // The row names each step once, so only its count says how many
+        // calls it holds, which are two or more.
+        const note = try countNote(scratch, " · ", rowCalls(row), " calls");
         // A narrow row leaves out its oldest steps first, so the newest stays
         // in view. The budget leaves room for the connector and the mark.
         const budget: usize = if (cols > 4) cols - 4 else 1;
@@ -4650,6 +4655,117 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .suffix = suffix,
         .reason = reason,
     };
+}
+
+test "a row of several commands counts its calls wherever it shows" {
+    const alloc = std.testing.allocator;
+    // Twelve calls of ten steps: the row names each step once, where it last
+    // ran, so only its count says how many calls it holds. A read comes
+    // first, so the row can show under a header too.
+    const commands = [_][]const u8{ "git status", "git diff", "ls", "cat notes.md", "rg retry", "sed -n 1p notes.md", "wc -l notes.md", "git status", "git diff", "git rev-parse HEAD", "head -5 notes.md", "git log -1" };
+    var entries: [commands.len + 1]TranscriptEntry = undefined;
+    var details: [commands.len + 1]ToolDetailRecord = undefined;
+    var json_bufs: [commands.len][64]u8 = undefined;
+    var status_bufs: [commands.len][64]u8 = undefined;
+    entries[0] = .{ .raw_bytes = .{ .id = 1, .bytes = "● Read notes.md\n", .class = .tool_status } };
+    details[0] = storyReadDetailForTest(1, "notes.md");
+    for (commands, json_bufs[0..], status_bufs[0..], 1..) |command, *json_buf, *status_buf, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = .{ .raw_bytes = .{ .id = id, .bytes = try std.mem.print(status_buf, "● Ran {s}\n", .{command}), .class = .tool_status } };
+        details[index] = storyCommandDetail(id, try std.mem.print(json_buf, "{{\"command\":\"{s}\"}}", .{command}), 0, null);
+        details[index].command_display = @constCast(command);
+    }
+    const ran = "Ran +7, git rev-parse, head, git log · 12 calls";
+    try expectLiveAndResumedRowsForTest(alloc, entries[1..], details[1..], "● " ++ ran ++ " ✓");
+    {
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("under a header:\n{s}\n", .{text});
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, text, "\n"), "\n└ " ++ ran));
+    }
+    {
+        var running_entries = entries;
+        var running = details;
+        running_entries[commands.len].raw_bytes.bytes = "● Running git log -1\n";
+        running[commands.len].outcome = null;
+        running[commands.len].command_process_presentation = null;
+        try expectLiveAndResumedRowsForTest(alloc, running_entries[1..], running[1..], "● Running +7, git rev-parse, head, git log · 12 calls");
+    }
+    // A narrow row counts more of its older steps in front, and keeps its
+    // newest step and its count in view.
+    const Narrow = struct { cols: u16, want: []const u8 };
+    for ([_]Narrow{
+        .{ .cols = 40, .want = "● Ran +8, head, git log · 12 calls ✓" },
+        .{ .cols = 30, .want = "● Ran +9, git log · 12 calls ✓" },
+    }) |narrow| {
+        const painted = try paintedGroupForTest(alloc, entries[1..], details[1..], narrow.cols);
+        defer alloc.free(painted);
+        const text = try visibleLinesForTest(alloc, painted, narrow.cols);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(narrow.want, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A row of one call gets no count, whatever its command runs.
+    {
+        const command = "git status && git diff && echo a && ls && pwd";
+        const one = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Ran " ++ command ++ "\n", .class = .tool_status } }};
+        var one_details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"command\":\"" ++ command ++ "\"}", 0, null)};
+        one_details[0].command_display = @constCast(command);
+        try expectLiveAndResumedRowsForTest(alloc, &one, &one_details, "● Ran git status, git diff, echo +2 more ✓");
+    }
+
+    // Later calls to a session the row started count too, though the row
+    // names their command once.
+    {
+        var first = storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"printf a\"}", 0, null);
+        first.command_display = @constCast("printf a");
+        var run = storyCommandDetail(2, "{\"action\":\"run\",\"command\":\"sh loop.sh\"}", 0, "1 108\n");
+        run.command_process_presentation = null;
+        run.command_display = @constCast("sh loop.sh");
+        var observe = storyCommandDetail(3, "{\"action\":\"interact\",\"session_id\":\"shell-9\"}", 0, null);
+        observe.command_process_presentation = null;
+        observe.command_display = @constCast("sh loop.sh");
+        var stop = storyCommandDetail(4, "{\"action\":\"stop\",\"session_id\":\"shell-9\"}", 0, null);
+        stop.command_display = @constCast("sh loop.sh");
+        const session_entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran printf a\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Still running sh loop.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Observed sh loop.sh\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Stopped sh loop.sh\n", .class = .tool_status } },
+        };
+        const session_details = [_]ToolDetailRecord{ first, run, observe, stop };
+        const wants = [_][]const u8{ "● Still running printf, sh loop.sh · 2 calls", "● Waiting for printf, sh loop.sh · 3 calls", "● Stopped printf, sh loop.sh · 4 calls ✓" };
+        for (wants, 2..) |want, count| try expectLiveAndResumedRowsForTest(alloc, session_entries[0..count], session_details[0..count], want);
+    }
+
+    // A row of commands said again later in its group keeps one count, of
+    // every call of both.
+    {
+        const steps = [_][]const u8{ "sed -n 1p a.ts", "grep -c x a.ts", "sed -n 2p b.ts", "grep -c y b.ts" };
+        const said_again = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran sed -n 1p a.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran grep -c x a.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Read b.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Ran sed -n 2p b.ts\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 5, .bytes = "● Ran grep -c y b.ts\n", .class = .tool_status } },
+        };
+        var said_details = [_]ToolDetailRecord{
+            storyCommandDetail(1, "{\"command\":\"sed -n 1p a.ts\"}", 0, null),
+            storyCommandDetail(2, "{\"command\":\"grep -c x a.ts\"}", 0, null),
+            storyReadDetailForTest(3, "b.ts"),
+            storyCommandDetail(4, "{\"command\":\"sed -n 2p b.ts\"}", 0, null),
+            storyCommandDetail(5, "{\"command\":\"grep -c y b.ts\"}", 0, null),
+        };
+        for ([_]usize{ 0, 1, 3, 4 }, steps) |index, command| said_details[index].command_display = @constCast(command);
+        const text = try groupTextForTest(alloc, &said_again, &said_details);
+        defer alloc.free(text);
+        errdefer std.debug.print("said again:\n{s}\n", .{text});
+        var rows = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+        _ = rows.next();
+        try std.testing.expectEqualStrings("├ Ran sed, grep · 4 calls", rows.next().?);
+        try std.testing.expectEqualStrings("└ Read b.ts", rows.next().?);
+        try std.testing.expect(rows.next() == null);
+    }
 }
 
 /// `before`, `count`, then `after`, such as " ×3" or " +2 more", in
@@ -8062,7 +8178,7 @@ test "a command still running when its call returned gets no check mark" {
     defer alloc.free(group_text);
     errdefer std.debug.print("group:\n{s}\n", .{group_text});
     const trimmed = std.mem.trim(u8, group_text, "\n");
-    try std.testing.expectEqualStrings("● Still running echo, sleep, printf", trimmed);
+    try std.testing.expectEqualStrings("● Still running echo, sleep, printf · 2 calls", trimmed);
 
     // Alone, the row is the header, and it gets no ✓ either.
     var single = try build(alloc, entries[1..], details[1..], 120);
@@ -8495,7 +8611,7 @@ test "a call joins its row at once, without a row of its own first" {
         };
         const text = try groupTextForTest(alloc, &entries, &details);
         defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Running echo, sleep", std.mem.trim(u8, text, "\n"));
+        try std.testing.expectEqualStrings("● Running echo, sleep · 2 calls", std.mem.trim(u8, text, "\n"));
     }
     // A read, a search, and an edit with no arguments yet wait in the row
     // they will join, so the group keeps one line.
@@ -10401,9 +10517,9 @@ test "commands one after the other share a row, and reads show the file by name"
         "├ Read \x1b]8;;file:///Users/example/fx%20worktree/src/core/agent/runtime/orchestrator.zig\x1b\\orchestrator.zig" ++ link_close ++ " L15-200",
         rows.next().?,
     );
-    // The passing commands before the failure share one row, each step once.
-    // rg ran again after sed, so it is the newest step.
-    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m", rows.next().?);
+    // The passing commands before the failure share one row, each step once,
+    // and count their calls. rg ran again after sed, so it is the newest step.
+    try std.testing.expectEqualStrings("├ Ran \x1b[38;5;252msed\x1b[39m, \x1b[38;5;252mrg\x1b[39m · 3 calls", rows.next().?);
     // The failure keeps its own row and reason line, and the command after it
     // starts a new row.
     try std.testing.expect(std.mem.startsWith(u8, rows.next().?, "├ Exited 1 "));
@@ -13171,7 +13287,7 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     }
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py", std.mem.trim(u8, text, "\n"));
+    try std.testing.expectEqualStrings("● Running +2, git status, sed, python3 run.py · 5 calls", std.mem.trim(u8, text, "\n"));
 
     var narrow = try build(alloc, &entries, &details, 30);
     defer narrow.deinit(alloc);
@@ -13187,7 +13303,9 @@ test "a row of commands shows its newest steps and counts the older ones first" 
     errdefer std.debug.print("narrow group:\n{s}\n", .{painted.items});
     const narrow_text = try visibleLinesForTest(alloc, painted.items, 30);
     defer alloc.free(narrow_text);
-    try std.testing.expectEqualStrings("● Running +4, python3 run.py", std.mem.trim(u8, narrow_text, "\n"));
+    // With no room for the whole newest step and the count, the step clips
+    // and the count stays.
+    try std.testing.expectEqualStrings("● Running +4, pytho… · 5 calls", std.mem.trim(u8, narrow_text, "\n"));
 }
 
 test "a session's input finds its run after a quick command joined the run's row" {
