@@ -911,7 +911,7 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     io_mod.getIo().random(&nonce_raw);
     const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
     const script = try shell_resolver.snapshotCaptureScript(scratch, kind, &nonce);
-    const invocation = try shell_resolver.capturedInvocation(scratch, .{ .user = request.shell_path }, script);
+    const invocation = try shell_resolver.capturedInvocation(scratch, .{ .user = request.shell_path }, "", script);
     const end_marker = try markerText(scratch, &nonce, "END", "\x00", "\x00");
 
     // The capture runs an interactive login shell. Without its own session

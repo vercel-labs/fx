@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
+const bash_session = @import("../core/bash_session/bash_session.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -14,6 +15,7 @@ const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
+const bash_tools = @import("../builtins/bash_tools.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -377,6 +379,8 @@ pub const ServerState = struct {
     cache_warming: bool = true,
     /// `experimental.workspace_capture`, from startup.
     workspace_capture: bool = false,
+    /// `experimental.bash_tool`, from startup.
+    bash_tool: bool = false,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -391,6 +395,7 @@ pub const ServerState = struct {
     report_mutex: std.Io.Mutex = .init,
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
+    bash_session: bash_session.Session = bash_session.Session.init(std.heap.c_allocator),
     /// A v2 session's children (D22), borrowed by `subagent_host`.
     subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
@@ -425,6 +430,7 @@ pub const ServerState = struct {
         // subagent inside a command here.
         disableSubagentHost(self);
         self.managed_executions.deinit();
+        tool_dispatch.closeBashSession(&self.bash_session, io_mod.getIo());
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
             debug_trace.logf(
@@ -917,6 +923,11 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
 }
 
 fn destroyActiveSession(state: *ServerState) void {
+    // One bash state serves the whole server: a switch or close ends it here, and exit ends it in deinit.
+    debug_trace.logf("bash", "bash state reset for a session switch or close had_program={}", .{
+        tool_dispatch.bashProgramRunning(&state.bash_session, &state.managed_executions),
+    });
+    tool_dispatch.closeBashSession(&state.bash_session, io_mod.getIo());
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
@@ -1100,7 +1111,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = builtin_tools.advertisement_set,
+            .tool_set = bash_tools.select(state.bash_tool, builtin_tools.advertisement_set),
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -1157,6 +1168,7 @@ pub fn runWithTransport(
             cfg.process_provider,
         ),
         .managed_executions = managed_execution.Runtime.init(alloc),
+        .bash_session = bash_session.Session.init(alloc),
         .lifecycle_runtime = lifecycle_runtime,
         .lifecycle_view = lifecycle_view,
     };
@@ -3242,6 +3254,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.session_titles = startup.session_title_generation;
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
+    state.bash_tool = startup.bash_tool;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {

@@ -1273,6 +1273,38 @@ describe("cli: status", () => {
   );
 
   test(
+    "fx config set and unset experimental.bash_tool and keep other experiments",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-experimental-bash-tool-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, JSON.stringify({ experimental: { workspace_capture: true } }) + "\n", { mode: 0o600 });
+        const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
+
+        const set = await runFx(["config", "set", "experimental.bash_tool", "on"], { cwd, env });
+        expect([set.code, set.stdout, set.stderr]).toEqual([0, "experimental.bash_tool set to true in ~/.fx/settings.json.\n", ""]);
+        expect(settings()).toEqual({ experimental: { workspace_capture: true, bash_tool: true } });
+        const on = await runFx(["config", "get", "experimental.bash_tool"], { cwd, env });
+        expect(on.stdout).toBe("true\n");
+
+        const unset = await runFx(["config", "unset", "experimental.bash_tool"], { cwd, env });
+        expect([unset.code, unset.stdout]).toEqual([0, "experimental.bash_tool removed from ~/.fx/settings.json.\n"]);
+        expect(settings()).toEqual({ experimental: { workspace_capture: true } });
+        const off = await runFx(["config", "get", "experimental.bash_tool"], { cwd, env });
+        expect(off.stdout).toBe("false\n");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "status and doctor share the missing auth snapshot",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-noauth-"));

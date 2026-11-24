@@ -60,6 +60,10 @@ pub const Registration = struct {
     }
 };
 
+/// The names of the variables `Registration.environment` adds to a command. The
+/// bash session never saves these variables, so each name is listed for it.
+pub const variable_names = [_][]const u8{ wire.socket_env, wire.token_env };
+
 /// A request being served, so a `cancel` effect can reach its call.
 const Live = struct {
     id: mcp_call.RequestId,

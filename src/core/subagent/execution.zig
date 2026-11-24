@@ -1,5 +1,6 @@
 const std = @import("std");
 const managed_execution = @import("../execution/managed_execution.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
@@ -293,6 +294,9 @@ pub const TurnContext = struct {
     /// is not freed while a slot thread still holds its worker.
     hosted_release: ?*HostedRelease = null,
     managed_executions: managed_execution.Runtime,
+    /// This turn's saved bash state. It belongs to this turn alone, so a child
+    /// never shares its parent's session.
+    bash_session: bash_session.Session,
     /// The child session the turn writes, through the adapter. Null
     /// for a hosted run, whose child's own agent saves its turns.
     child: ?*session_adapter.Session,
@@ -358,6 +362,7 @@ pub const TurnContext = struct {
             .alloc = alloc,
             .runtime = runtime,
             .managed_executions = managed_execution.Runtime.init(alloc),
+            .bash_session = bash_session.Session.init(alloc),
             .child = child,
         };
     }
@@ -370,6 +375,7 @@ pub const TurnContext = struct {
             .alloc = alloc,
             .runtime = .{ .max_history_turns = max_history_turns },
             .managed_executions = managed_execution.Runtime.init(alloc),
+            .bash_session = bash_session.Session.init(alloc),
             .child = null,
         };
     }
@@ -417,7 +423,9 @@ pub const TurnContext = struct {
 
     pub fn deinit(self: *TurnContext) void {
         if (self.hosted_release) |hosted| hosted.release();
+        debug_trace.logf("bash", "bash state reset at the end of a subagent run", .{});
         self.managed_executions.deinit();
+        tool_dispatch.closeBashSession(&self.bash_session, io_mod.getIo());
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
         self.turn_capture.deinit();

@@ -126,6 +126,8 @@ pub const UserSettingsPatch = struct {
     provider_strict: ?bool = null,
     context: ?bool = null,
     cache_warming: ?bool = null,
+    /// `experimental.bash_tool`.
+    experimental_bash_tool: ?bool = null,
     /// One `tool_placement.<tool>` entry.
     tool_placement: ?ToolPlacementPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `status_line.context`,
@@ -161,6 +163,7 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.cache_warming == null and
+            self.experimental_bash_tool == null and
             self.tool_placement == null and
             self.remove == null;
     }
@@ -1278,6 +1281,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("prompt_history").?;
         };
         application.changed = try putBool(arena, &prompt_history.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.experimental_bash_tool) |enabled| {
+        var experimental = if (root.object.getPtr("experimental")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "experimental", .{ .object = .empty });
+            break :blk root.object.getPtr("experimental").?;
+        };
+        application.changed = try putBool(arena, &experimental.object, "bash_tool", enabled) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {
@@ -2659,6 +2673,48 @@ test "notification user patch preserves sibling fields and valid workspace overr
     try std.testing.expectEqual(false, workspace_sound.get("turn_end").?.bool);
     try std.testing.expectEqual(false, workspace_sound.get("attention_required").?.bool);
     try std.testing.expectEqual(@as(i64, 8), workspace_sound.get("future").?.integer);
+}
+
+test "experimental.bash_tool patch writes the experimental group and keeps its other children" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"experimental\":{\"workspace_capture\":true},\"theme\":\"dark\"}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .experimental_bash_tool = true });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const experimental = parsed.value.object.get("experimental").?.object;
+    try std.testing.expectEqual(true, experimental.get("bash_tool").?.bool);
+    try std.testing.expectEqual(true, experimental.get("workspace_capture").?.bool);
+    try std.testing.expectEqualStrings("dark", parsed.value.object.get("theme").?.string);
+
+    var removed = try store.applyUserPatch(alloc, .{ .remove = "experimental.bash_tool" });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+
+    const after = try store.readPrimaryForTest(alloc);
+    defer alloc.free(after);
+    const reparsed = try std.json.parseFromSlice(std.json.Value, alloc, after, .{});
+    defer reparsed.deinit();
+    const left = reparsed.value.object.get("experimental").?.object;
+    try std.testing.expectEqual(@as(usize, 1), left.count());
+    try std.testing.expectEqual(true, left.get("workspace_capture").?.bool);
 }
 
 test "user patch snapshots and removes legacy workspace copies" {

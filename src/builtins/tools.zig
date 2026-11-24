@@ -695,9 +695,12 @@ pub const all = [_]tool_dispatch.Tool{
 /// never take one.
 pub const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_tools) all[0..] else names_only[0..] };
 
-const names_only = blk: {
-    var tools: [all.len]tool_dispatch.Tool = undefined;
-    for (&tools, all) |*tool, real| tool.* = .{
+/// The names-only copy of `tools`: each tool keeps its name, is not visible to
+/// the model, and answers the Unsupported tool text when called. A build without
+/// the tools' code uses it, and `bash_tools.zig` builds its set from it too.
+pub fn namesOnly(comptime tools: []const tool_dispatch.Tool) [tools.len]tool_dispatch.Tool {
+    var names: [tools.len]tool_dispatch.Tool = undefined;
+    for (&names, tools) |*tool, real| tool.* = .{
         .name = real.name,
         .description = "",
         .model_schema = .{ .name = real.name, .description = "" },
@@ -707,8 +710,10 @@ const names_only = blk: {
         .reads_only_fn = unavailableReadsOnly,
         .irreversible_fn = unavailableIrreversible,
     };
-    break :blk tools;
-};
+    return names;
+}
+
+const names_only = namesOnly(&all);
 
 // A call that reaches a tool kept only by name gets the answer fx gives for
 // any tool it doesn't have, which the model can read and recover from.

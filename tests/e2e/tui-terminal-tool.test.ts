@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { rootSessionIds } from "./saved-sessions";
+import { requestToolNames, toolResultText } from "./fixtures/request-body";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -35,7 +36,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function createFixture(prefix: string) {
+function createFixture(prefix: string, settings: Record<string, unknown> = {}) {
   const root = realpathSync(mkdtempSync(join("/tmp", prefix)));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -50,6 +51,7 @@ function createFixture(prefix: string) {
       sandbox: "os",
       yolo_acknowledged: true,
       permission: {},
+      ...settings,
     }) + "\n",
   );
   writeFileSync(tracePath, "");
@@ -68,6 +70,7 @@ async function launch(
   fixture: ReturnType<typeof createFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
   cmd = FX_BIN,
+  extraEnv: Record<string, string> = {},
 ) {
   const session = await TmuxSession.create({
     isolated: true,
@@ -85,6 +88,7 @@ async function launch(
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TRACE_LOG: fixture.tracePath,
       FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
+      ...extraEnv,
     },
     width: 120,
     height: 32,
@@ -144,6 +148,11 @@ function schemaFromRequest(body: string): Record<string, unknown> {
   const shell = tools.find((tool) => tool.name === "shell");
   if (!shell) throw new Error("missing shell schema");
   return shell.inputSchema as Record<string, unknown>;
+}
+
+/** The bash session folders fx left in `tmp`. */
+function bashFolders(tmp: string): string[] {
+  return readdirSync(tmp).filter((name) => name.startsWith("fx-bash-"));
 }
 
 /// Every hosted terminal's record; their state lives under `~/.fx/terminal`
@@ -1523,3 +1532,64 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
   );
   expect(records.every((record) => record.lifecycle === "lost")).toBe(true);
 }, 150_000);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI with experimental.bash_tool offers the bash tool and not shell",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-tool-", { experimental: { bash_tool: true } });
+    const gateway = startFakeGateway([fakeGatewayFinalText("BASH_TOOL_TUI_OK")]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("List the tools.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_TOOL_TUI_OK", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(1);
+    const names = requestToolNames(gateway.requests[0]!.body);
+    expect(names).toContain("bash");
+    expect(names).not.toContain("shell");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash state starts fresh after /new, and the bash folder is freed at exit",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-fresh-", { experimental: { bash_tool: true } });
+    const tmp = join(fixture.root, "tmp");
+    mkdirSync(tmp);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_set_x", "bash", { command: "x=41" }),
+      fakeGatewayFinalText("BASH_SET_DONE"),
+      fakeGatewayToolCall("bash_read_x", "bash", { command: 'echo "${x:-unset}"' }),
+      fakeGatewayFinalText("BASH_READ_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { TMPDIR: tmp });
+
+    await active.sendText("Set x.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_SET_DONE", TIMEOUT);
+    expect(bashFolders(tmp)).toHaveLength(1);
+
+    await active.sendText("/new");
+    await active.waitForComposer(TIMEOUT);
+    await active.sendText("Read x.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_READ_DONE", TIMEOUT);
+
+    const readOutput = gateway.requests
+      .map((request) => toolResultText(request.body, "bash_read_x"))
+      .find((output) => output !== "") ?? "";
+    expect(readOutput).toContain("unset");
+    expect(readOutput).not.toContain("41");
+    expect(bashFolders(tmp)).toHaveLength(1);
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(bashFolders(tmp)).toEqual([]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);

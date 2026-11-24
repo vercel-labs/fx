@@ -97,8 +97,9 @@ const status_line_child_descriptions = [_][]const u8{
     "Show the session title in the footer",
     "Show the workspace path and Git branch in the footer",
 };
-const experimental_children = [_][]const u8{"workspace_capture"};
+const experimental_children = [_][]const u8{ "bash_tool", "workspace_capture" };
 const experimental_child_descriptions = [_][]const u8{
+    "Give the model one bash tool that keeps its state between calls, in place of the built-in tools",
     "Record the repository's state at each turn's start and end in the session, for evals",
 };
 const retired_description = "No longer used; fx ignores it";

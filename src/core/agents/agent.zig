@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
+const bash_session = @import("../bash_session/bash_session.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const diff = @import("../output/diff.zig");
@@ -58,6 +59,7 @@ pub const Agent = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
+    bash_session: bash_session.Session = bash_session.Session.init(std.heap.c_allocator),
     change_tracker: change_tracker.ChangeTracker = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     effort: types.ReasoningEffort = .auto,

@@ -1427,8 +1427,8 @@ fn project_read_tool_result_request_messages(
 
 /// Returns the arguments a shell call is stored and admitted with: an exact
 /// {"request":{...}} unwrapped, its wrapper an object or JSON text of one,
-/// and a missing action filled in when
-/// `infer_action` names exactly one. Null keeps the call as it was sent.
+/// and the action `infer_action` names, which replaces one the model sent.
+/// Null keeps the call as it was sent.
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1454,6 +1454,8 @@ fn normalized_terminal_request_arguments(
             try with_action.object.put(arena, "action", .{ .string = action });
             var fields = args.object.iterator();
             while (fields.next()) |entry| {
+                // The inferred action replaces one the model sent.
+                if (std.mem.eql(u8, entry.key_ptr.*, "action")) continue;
                 try with_action.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
             }
             args = with_action;
@@ -2640,6 +2642,20 @@ test "terminal intake adds the action a call leaves out before it is stored" {
         &calls,
     );
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
+}
+
+// Stands in for a tool whose action is always wait, whatever the model sent.
+fn testInferWaitAction(_: std.json.ObjectMap) ?[]const u8 {
+    return "wait";
+}
+
+test "terminal request normalization replaces an action the model sent with the inferred one" {
+    const alloc = std.testing.allocator;
+    const sent = "{\"command\":\"wait_more\",\"action\":\"run\"}";
+    const normalized = (try normalized_terminal_request_arguments(alloc, sent, testInferWaitAction)).?;
+    defer alloc.free(normalized);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, normalized, "\"action\""));
+    try std.testing.expectEqualStrings("{\"action\":\"wait\",\"command\":\"wait_more\"}", normalized);
 }
 
 test "terminal request normalization cleans every partial allocation failure" {

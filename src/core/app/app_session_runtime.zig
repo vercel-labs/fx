@@ -1183,6 +1183,14 @@ pub fn Runtime(comptime App: type) type {
             app.terminal_input_runtime.resetEscapeDecoder();
             app_permission_runtime.Runtime(App).clearSessionGrants(app, agent);
             app.clearPendingImages(agent);
+            // A new conversation starts with a fresh bash state; a program the
+            // last one started keeps running, as shell commands do.
+            if (comptime agents.hasAgentField(App, "bash_session") and agents.hasAgentField(App, "managed_executions")) {
+                debug_trace.logf("bash", "bash state reset for a new conversation had_program={}", .{
+                    tool_dispatch.bashProgramRunning(&agent.bash_session, &agent.managed_executions),
+                });
+            }
+            if (comptime agents.hasAgentField(App, "bash_session")) tool_dispatch.closeBashSession(&agent.bash_session, io_mod.getIo());
             agent.change_tracker.clear(std.heap.c_allocator);
             diagnostics.resetSession();
             _ = background_policy;

@@ -128,6 +128,7 @@ const Writable = enum {
     collapse_tool_calls,
     context,
     effort,
+    @"experimental.bash_tool",
     fast_mode,
     max_agent_steps,
     max_tool_result_bytes,
@@ -230,6 +231,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
+        .@"experimental.bash_tool" => patch.experimental_bash_tool = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
@@ -448,16 +450,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
-    "collapse_tool_calls",            "context",                  "effort",
-    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
-    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
-    "prompt_history.enabled",         "provider",                 "provider_order",
-    "provider_strict",                "review_model",             "session_titles",
-    "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",   "auto_upgrade",                   "cache_warming",
+    "collapse_tool_calls",    "context",                        "effort",
+    "experimental.bash_tool", "experimental.workspace_capture", "fast_mode",
+    "first_call_tool_choice", "max_agent_steps",                "max_tool_result_bytes",
+    "permission_mode",        "prompt_history.enabled",         "provider",
+    "provider_order",         "provider_strict",                "review_model",
+    "session_titles",         "slash_menu_categories",          "sound.attention_required",
+    "sound.max",              "sound.turn_end",                 "startup_scrollback",
+    "status_line.context",    "status_line.session",            "status_line.workspace",
+    "theme",                  "ultrafast_mode",                 "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -486,6 +488,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
+    if (eql(u8, key, "experimental.bash_tool")) return boolean(state.bash_tool);
     if (eql(u8, key, "experimental.workspace_capture")) return boolean(state.workspace_capture);
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
@@ -762,6 +765,18 @@ test "config set turns each value into the patch the save path writes" {
     const removed = try changeForTest(&.{ "unset", "sound.max" }, &problem);
     try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
     try std.testing.expect(removed.value == null);
+}
+
+test "experimental.bash_tool is writable by config set and --config, and sets its experimental child" {
+    var problem: WriteProblem = .none;
+    const planned = try changeForTest(&.{ "set", "experimental.bash_tool", "true" }, &problem);
+    try std.testing.expectEqual(true, planned.patch.experimental_bash_tool.?);
+    try std.testing.expect(planned.value.?.bool);
+
+    var override_problem: OverrideProblem = .none;
+    const override = try parseOverride("experimental.bash_tool=true", &override_problem);
+    try std.testing.expectEqualStrings("experimental.bash_tool", override.key);
+    try std.testing.expect(override.value.bool);
 }
 
 test "config set explains a bad value or a key it doesn't change" {

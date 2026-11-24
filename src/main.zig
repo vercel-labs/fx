@@ -136,6 +136,7 @@ const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
+const bash_tools = @import("builtins/bash_tools.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
 const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
@@ -659,6 +660,8 @@ const App = struct {
     /// The built-in tools offered through toolbox, fixed for the process, so
     /// a conversation's tools never change while it runs.
     toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
+    /// `experimental.bash_tool`, fixed for the process, so a conversation's tools never change while it runs.
+    bash_tool: bool = false,
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     /// Resolved review-model override for automatic permission review
@@ -744,7 +747,7 @@ const App = struct {
 
         if (launch.modifiers.profile_name) |name| {
             if (comptime host_profile.tools) {
-                try ProfileAppRuntime.applyLaunchProfile(&app, name, builtin_context.prompt_policy.system_prompt, builtin_tools.advertisement_set);
+                try ProfileAppRuntime.applyLaunchProfile(&app, name, builtin_context.prompt_policy.system_prompt, app.builtinToolSet());
             }
         }
         const launch_profile = &app.main_agent.profile.profile;
@@ -807,7 +810,7 @@ const App = struct {
         // toolbox.
         if (launch.modifiers.profile_name != null) {
             if (comptime host_profile.tools) {
-                try ProfileAppRuntime.narrowProfileTools(&app, &app.main_agent, builtin_tools.advertisement_set);
+                try ProfileAppRuntime.narrowProfileTools(&app, &app.main_agent, app.builtinToolSet());
             }
         }
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
@@ -1029,6 +1032,9 @@ const App = struct {
         // The worker mutates session state, so it stops before persistence.
         if (main_agent.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // The main worker is joined, so no bash call can start. This exit path
+        // never runs `App.deinit`, so the session folder is freed here (R3.9).
+        tool_dispatch.closeBashSession(&main_agent.bash_session, io_mod.getIo());
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self, main_agent) catch |err| {
             SessionAppRuntime.recordShutdownFailure(main_agent, err);
         };
@@ -1116,6 +1122,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         main_agent.managed_executions.deinit();
+        tool_dispatch.closeBashSession(&main_agent.bash_session, io_mod.getIo());
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();
@@ -1982,7 +1989,7 @@ const App = struct {
 
     fn effectiveToolSet(self: *const App, agent: *const agents.Agent) tool_set_contract.ToolSet {
         if (comptime host_profile.tools) {
-            return agent.profile_tools orelse builtin_tools.advertisement_set;
+            return agent.profile_tools orelse self.builtinToolSet();
         }
         return browser_workspace_tools.selectToolSet(
             false,
@@ -2001,8 +2008,14 @@ const App = struct {
     /// fx's tools before any agent profile narrows them: what a profile that
     /// sets tools chooses from.
     pub fn baseToolSet(self: *const App) tool_set_contract.ToolSet {
-        if (comptime host_profile.tools) return builtin_tools.advertisement_set;
+        if (comptime host_profile.tools) return self.builtinToolSet();
         return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
+    }
+
+    /// The built-in tools this process offers: the bash tool set when
+    /// `experimental.bash_tool` is on, else fx's full built-in set.
+    fn builtinToolSet(self: *const App) tool_set_contract.ToolSet {
+        return bash_tools.select(self.bash_tool, builtin_tools.advertisement_set);
     }
 
     pub fn hasMcpTool(self: *App, name: []const u8, access: tool_mcp_runtime.Access) bool {
@@ -3566,7 +3579,7 @@ const App = struct {
     /// Applies profile `name` to instance `agent`.
     pub fn applyInstanceProfile(self: *App, agent: *agents.Agent, name: []const u8) !void {
         if (comptime host_profile.tools) {
-            try ProfileAppRuntime.applyProfile(self, agent, name, builtin_context.prompt_policy.system_prompt, builtin_tools.advertisement_set);
+            try ProfileAppRuntime.applyProfile(self, agent, name, builtin_context.prompt_policy.system_prompt, self.builtinToolSet());
             try ProfileAppRuntime.reportProfile(self, agent, "instance");
         }
     }
@@ -3575,7 +3588,7 @@ const App = struct {
     /// `--profile` would have: its tools, prompt, and permission mode.
     pub fn applyFirstInstanceProfile(self: *App, name: []const u8) !void {
         if (comptime host_profile.tools) {
-            try ProfileAppRuntime.applyLaunchProfile(self, name, builtin_context.prompt_policy.system_prompt, builtin_tools.advertisement_set);
+            try ProfileAppRuntime.applyLaunchProfile(self, name, builtin_context.prompt_policy.system_prompt, self.builtinToolSet());
             try ProfileAppRuntime.applyLaunchMode(self);
         }
     }
@@ -5449,6 +5462,9 @@ test {
     _ = @import("core/mcp_host/mcp_call_wire.zig");
     _ = @import("core/mcp_host/mcp_call_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
+    _ = @import("core/bash_session/bash_session.zig");
+    _ = @import("tools/bash/bash.zig");
+    _ = @import("builtins/bash_tools.zig");
     _ = @import("core/mcp_host/verbs.zig");
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");

@@ -460,6 +460,7 @@ pub fn Runtime(comptime App: type) type {
                     &agent.managed_executions
                 else
                     null,
+                .bash_session = if (comptime agents.hasAgentField(App, "bash_session")) &agent.bash_session else null,
                 .ephemeral_command_replay = if (comptime agents.hasAgentField(App, "managed_executions"))
                     agent.managed_executions.replayStore()
                 else
