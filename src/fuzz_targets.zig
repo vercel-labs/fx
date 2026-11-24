@@ -45,6 +45,7 @@ test {
     _ = @import("core/mcp_host/owner_wire.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/profiles/started_with.zig");
