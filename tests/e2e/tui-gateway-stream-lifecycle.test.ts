@@ -7847,11 +7847,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(live).toContain(done);
       expect(live.filter((row) => row.includes("/reference-notes.md") || row.includes("result-") || row.includes("Searching"))).toEqual([]);
 
-      // Ctrl+O keeps core's row for each search, by the file's path.
+      // Ctrl+O keeps core's row for each search, by the file's path. Long
+      // temp paths (such as macOS tmpdir) can wrap between `output` and `for`.
+      const fullSearchRow = (word: string) =>
+        new RegExp(`Searched \\S*/reference-notes\\.md output\\s+for "${word}"`);
       await session.sendKeys("C-o");
-      const full = await session.waitForPane((pane) => pane.includes('output for "gamma"'), TIMEOUT);
-      for (const word of words) expect(full).toMatch(new RegExp(`Searched \\S*/reference-notes\\.md output for "${word}"`));
-      expect(full).not.toContain('output for "alpha", "beta"');
+      const full = await session.waitForPane((pane) => fullSearchRow("gamma").test(pane), TIMEOUT);
+      for (const word of words) expect(full).toMatch(fullSearchRow(word));
+      expect(full).not.toMatch(/output\s+for "alpha", "beta"/);
       await session.sendKeys("C-o");
       await session.waitForComposer(TIMEOUT);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
