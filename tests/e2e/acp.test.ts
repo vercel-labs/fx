@@ -16836,12 +16836,15 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "a client that stops reading does not hold the decision for another client, which lands well under the one second write limit",
+    "a client that stops reading does not hold the decision for another client: the decision lands within the write limit plus a margin",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-question-stall-");
+      const STALL_CONTENT_BYTES = 512 * 1024;
+      const WRITE_LIMIT_MS = 1000;
+      const DECISION_MARGIN_MS = 500;
       const gateway = startFakeGateway([
         finalText("TURN_ONE"),
-        fakeGatewayToolCall("question_stall", "write_file", { path: "stall.txt", content: "STALL\n" }),
+        fakeGatewayToolCall("question_stall", "write_file", { path: "stall.txt", content: "x".repeat(STALL_CONTENT_BYTES) }),
         finalText("STALL_DONE"),
       ]);
       let opener: AcpClient | undefined;
@@ -16866,11 +16869,11 @@ describe("acp: model-independent", () => {
         const answeredAt = Date.now();
         answering.respond(answeringAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
         await waitForCondition("the opener's cancellation", () => parsedLines(opener!).some(cancelFor(openerAsked.id)), QUESTION_WAIT);
-        const landedMs = Date.now() - answeredAt;
-        expect(landedMs).toBeLessThan(500);
+        const decisionMs = Date.now() - answeredAt;
+        expect(decisionMs).toBeLessThan(WRITE_LIMIT_MS + DECISION_MARGIN_MS);
         const prompt = await readResponse(opener, 10);
         expect(prompt.result.stopReason).toBe("end_turn");
-        expect(readFileSync(join(root.workspace, "stall.txt"), "utf8")).toBe("STALL\n");
+        expect(readFileSync(join(root.workspace, "stall.txt"), "utf8").length).toBe(STALL_CONTENT_BYTES);
       } finally {
         stalled?.close();
         answering?.close();

@@ -233,6 +233,16 @@ const PendingOutbound = struct {
     question: ?u64 = null,
     /// Whether the client was offered "allow for this session" with its question.
     may_always: bool = false,
+    /// Whether the request reached its client. A question's copy that never did is never cancelled.
+    written: bool = false,
+};
+
+/// The copies of the open permission question, kept so a client that joins while it waits gets the same
+/// params. Owned by the process allocator; freed when the question ends. Read and freed under `audience_mutex`.
+pub const OpenQuestion = struct {
+    id: u64,
+    sender_params: []u8,
+    other_params: []u8,
 };
 
 /// The client requests one session's turns have open, with their answers. The
@@ -246,6 +256,8 @@ pub const SessionOutbound = struct {
     pending: std.AutoHashMapUnmanaged(OutboundRequest, PendingOutbound) = .empty,
     /// The id the next permission question takes. Guarded by `mutex`.
     next_question: u64 = 1,
+    /// The question that is open, if any. Guarded by `mutex`; changed under `audience_mutex` too.
+    open_question: ?OpenQuestion = null,
 };
 
 /// The most requests to the client that one session's turns can wait for.
@@ -2009,8 +2021,9 @@ pub fn leaveMember(state: *ServerState, session: *ActiveSessionState, leave: Fol
 }
 
 /// Answers each request that `leaver` still owes `session` and nobody has answered yet.
-/// When another member remains (`new_main`), a permission becomes `moved`, so its turn asks
-/// again of the new main. Otherwise, or for any other request, it becomes `no_client`.
+/// When another member remains (`new_main`), a non-question permission becomes `moved`, so its
+/// turn asks again of the new main. Otherwise, or for any other request, it becomes `no_client`.
+/// A question's open copy of the leaver is dropped instead: the others keep the question.
 fn markOwedRequests(session: *ActiveSessionState, leaver: ConnectionId, new_main: bool) void {
     const io = io_mod.getIo();
     session.outbound.mutex.lockUncancelable(io);
@@ -2018,8 +2031,10 @@ fn markOwedRequests(session: *ActiveSessionState, leaver: ConnectionId, new_main
     var pending = session.outbound.pending.iterator();
     while (pending.next()) |entry| {
         if (entry.key_ptr.connection != leaver or entry.value_ptr.response != null) continue;
+        if (entry.value_ptr.question != null) continue;
         entry.value_ptr.response = if (new_main and entry.value_ptr.kind == .permission) .{ .moved = true } else .{ .no_client = true };
     }
+    dropOpenCopiesLocked(session, leaver);
     session.outbound.cond.broadcast(io);
 }
 
@@ -2986,6 +3001,7 @@ fn cancelSessionPending(session: *ActiveSessionState, notify_client: bool) void 
     while (pending.next()) |entry| {
         if (entry.value_ptr.response != null) continue;
         entry.value_ptr.response = .{ .cancelled = true };
+        if (entry.value_ptr.question != null and !entry.value_ptr.written) continue;
         if (cancelled_count < cancelled_requests.len) {
             cancelled_requests[cancelled_count] = entry.key_ptr.*;
             cancelled_count += 1;
@@ -3013,9 +3029,10 @@ pub fn endClientInput(state: *ServerState) void {
         var pending = session.outbound.pending.iterator();
         while (pending.next()) |entry| {
             if (entry.key_ptr.connection != own_connection) continue;
-            if (entry.value_ptr.response != null) continue;
+            if (entry.value_ptr.response != null or entry.value_ptr.question != null) continue;
             entry.value_ptr.response = .{ .no_client = true };
         }
+        dropOpenCopiesLocked(session, own_connection);
         session.outbound.cond.broadcast(io);
         session.outbound.mutex.unlock(io);
     }
@@ -3037,11 +3054,16 @@ fn markMemberInputEnded(session: *ActiveSessionState, connection_id: ConnectionI
     member.input_ended = true;
 }
 
-/// Tells the client that `request` was sent to to stop it, on that client's writer. Nothing is sent
-/// when that client is no longer a member.
 fn publishRequestCancellation(session: *ActiveSessionState, request: OutboundRequest) void {
     var audience = lockAudience(session);
     defer audience.unlock();
+    publishRequestCancellationLocked(session, &audience, request);
+}
+
+/// Tells the client that `request` was sent to to stop it, on that client's writer, with the audience lock
+/// already held. Nothing is sent when that client is no longer a member. A follower whose write fails or passes
+/// the write limit is dropped, as it is for a notification; the main client's failure is only traced.
+fn publishRequestCancellationLocked(session: *ActiveSessionState, audience: *Audience, request: OutboundRequest) void {
     const state = findMemberLocked(session, request.connection) orelse return;
     if (state.gone) return;
     var params: std.Io.Writer.Allocating = .init(state.alloc);
@@ -3056,6 +3078,7 @@ fn publishRequestCancellation(session: *ActiveSessionState, request: OutboundReq
         params.writer.buffered(),
     ) catch |err| {
         debug_trace.logf("acp", "request cancellation publication failed id={d} err={s}", .{ request.id, @errorName(err) });
+        if (state != mainLocked(session).?) audience.dropMember(state, "$/cancel_request", .{ .write_failed = err });
     };
 }
 
@@ -3410,10 +3433,11 @@ fn putQuestionRequest(session: *ActiveSessionState, member: *Member, question: P
     });
 }
 
-/// Writes `question` to each client it holds a request for, in join order: `sender_params` to the client that
-/// sent the prompt, `other_params` to the rest. A client whose write fails leaves the session, and its request
-/// answers `no_client`. The writes run under the audience lock, as the turn's notifications do, because a
-/// writer is used only under that lock.
+/// Writes `question` to each client of `session`, in join order: `sender_params` to the client that sent the
+/// prompt, `other_params` to the rest. A client that joined after the question began gets its request here.
+/// The writes run under the audience lock, as the turn's notifications do, because a writer is used only under
+/// that lock. A follower whose write fails, or passes the write limit, is dropped; the main client's failure
+/// removes it, and the next client becomes main.
 pub fn writePermissionQuestion(
     session: *ActiveSessionState,
     question: PermissionQuestion,
@@ -3423,6 +3447,12 @@ pub fn writePermissionQuestion(
 ) !void {
     var audience = lockAudience(session);
     defer audience.unlock();
+    try storeOpenQuestion(session, question, sender_params, other_params);
+    const sender = promptSender(session);
+    for (session.members.items) |member| {
+        if (hasQuestionEntry(session, question.id, member.connection_id)) continue;
+        _ = putQuestionRequest(session, member, question, sender) catch null;
+    }
     while (audience.next()) |member| {
         const target = questionTarget(session, question.id, member.connection_id) orelse continue;
         const params = if (target.may_always) sender_params else other_params;
@@ -3435,8 +3465,78 @@ pub fn writePermissionQuestion(
             } else {
                 audience.dropMember(member, "session/request_permission", .{ .write_failed = err });
             }
+            continue;
         };
+        markWritten(session, target.request);
     }
+}
+
+fn storeOpenQuestion(session: *ActiveSessionState, question: PermissionQuestion, sender_params: []const u8, other_params: []const u8) !void {
+    const alloc = mainLocked(session).?.alloc;
+    const sender_copy = try alloc.dupe(u8, sender_params);
+    errdefer alloc.free(sender_copy);
+    const other_copy = try alloc.dupe(u8, other_params);
+    errdefer alloc.free(other_copy);
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    session.outbound.open_question = .{ .id = question.id, .sender_params = sender_copy, .other_params = other_copy };
+}
+
+/// Frees the open question's copies when it is `question_id`. The caller holds `audience_mutex` and `mutex`.
+fn clearOpenQuestionLocked(session: *ActiveSessionState, alloc: Allocator, question_id: u64) void {
+    const open = session.outbound.open_question orelse return;
+    if (open.id != question_id) return;
+    alloc.free(open.sender_params);
+    alloc.free(open.other_params);
+    session.outbound.open_question = null;
+}
+
+fn markWritten(session: *ActiveSessionState, request: OutboundRequest) void {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    if (session.outbound.pending.getPtr(request)) |entry| entry.written = true;
+}
+
+fn hasQuestionEntry(session: *ActiveSessionState, question_id: u64, owner: ConnectionId) bool {
+    return questionTarget(session, question_id, owner) != null;
+}
+
+/// Gives a client that joins while a question waits its own copy of that question. The caller holds
+/// `audience_mutex` and lists the client after this call; the audience lock keeps the question from changing
+/// until then. A join calls this after the replay and before the load answer.
+pub fn offerOpenPermissionQuestion(session: *ActiveSessionState, joiner: *Member, alloc: Allocator) !void {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    const open = session.outbound.open_question;
+    session.outbound.mutex.unlock(io);
+    const copy = open orelse return;
+    const sender = promptSender(session);
+    const question: PermissionQuestion = .{ .id = copy.id };
+    const request = (try putQuestionRequest(session, joiner, question, sender)) orelse return;
+    const params = if (joiner.connection_id == sender) copy.sender_params else copy.other_params;
+    joiner.writer.writeRequest(alloc, .{ .integer = @intCast(request.id) }, "session/request_permission", params) catch |err| {
+        forgetRequest(session, request);
+        return err;
+    };
+    markWritten(session, request);
+}
+
+/// Drops the open question's copies held by `connection`, when its join fails before it is listed.
+pub fn dropOpenPermissionCopies(session: *ActiveSessionState, owner: ConnectionId) void {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    dropOpenCopiesLocked(session, owner);
+    session.outbound.cond.broadcast(io);
+}
+
+fn forgetRequest(session: *ActiveSessionState, request: OutboundRequest) void {
+    const io = io_mod.getIo();
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    _ = session.outbound.pending.fetchRemove(request);
 }
 
 const QuestionTarget = struct {
@@ -3444,7 +3544,7 @@ const QuestionTarget = struct {
     may_always: bool,
 };
 
-/// The open request of `question_id` that `connection` holds, if any.
+/// The open request of `question_id` that `owner` holds, if any.
 fn questionTarget(session: *ActiveSessionState, question_id: u64, owner: ConnectionId) ?QuestionTarget {
     const io = io_mod.getIo();
     session.outbound.mutex.lockUncancelable(io);
@@ -3459,14 +3559,32 @@ fn questionTarget(session: *ActiveSessionState, question_id: u64, owner: Connect
     return null;
 }
 
-/// Waits until one answer decides `question`, then returns that decision and forgets the rest of the question.
-/// An answer from a client that left, or whose input ended, does not decide it. With no open request left,
-/// the question is denied. A cancel decides it, as a cancel decides one request.
+/// The requests a decision cancels. Each one is an open request of the question that reached its client.
+const RequestList = struct {
+    items: [max_pending_outbound]OutboundRequest = undefined,
+    len: usize = 0,
+
+    fn push(self: *RequestList, request: OutboundRequest) void {
+        self.items[self.len] = request;
+        self.len += 1;
+    }
+};
+
+/// Waits until one answer decides `question`, then takes that decision and ends the question. Each other
+/// request of the question that is still open and reached its client gets `$/cancel_request` with its own id.
+/// The winner gets none. An answer from a client that left does not decide the question. With no decisive
+/// answer, the question is denied.
 pub fn awaitPermissionQuestion(session: *ActiveSessionState, question: PermissionQuestion) types.ToolPermissionDecision {
     const main_record = holdMain(session);
     defer main_record.drop();
     const alloc = main_record.alloc;
-    var winner = takeQuestionWinner(session, alloc, question.id) orelse return .deny;
+    waitForQuestionDecision(session, question.id);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    var cancels: RequestList = .{};
+    const winner_or_null = takeQuestionWinner(session, alloc, question.id, &cancels);
+    for (cancels.items[0..cancels.len]) |request| publishRequestCancellationLocked(session, &audience, request);
+    var winner = winner_or_null orelse return .deny;
     defer winner.deinit(alloc);
     if (winner.cancelled or winner.error_json != null) return .deny;
     const raw = winner.result_json orelse return .deny;
@@ -3475,22 +3593,12 @@ pub fn awaitPermissionQuestion(session: *ActiveSessionState, question: Permissio
     return parsePermissionDecision(parsed.value) orelse .deny;
 }
 
-/// Takes the first decisive answer to `question_id` and forgets the question. Returns null when no request of it is
-/// open or decisive. Waits while a request is open and none is decisive.
-fn takeQuestionWinner(session: *ActiveSessionState, alloc: Allocator, question_id: u64) ?OutboundResponse {
+/// Waits until `question_id` has a decisive answer or no request of it is open. The caller holds no lock.
+fn waitForQuestionDecision(session: *ActiveSessionState, question_id: u64) void {
     const io = io_mod.getIo();
     session.outbound.mutex.lockUncancelable(io);
     defer session.outbound.mutex.unlock(io);
-    while (true) {
-        if (decisiveRequestLocked(session, question_id)) |request| {
-            const removed = session.outbound.pending.fetchRemove(request) orelse unreachable;
-            forgetQuestionLocked(session, alloc, question_id);
-            return removed.value.response orelse unreachable;
-        }
-        if (!questionOpenLocked(session, question_id)) {
-            forgetQuestionLocked(session, alloc, question_id);
-            return null;
-        }
+    while (decisiveRequestLocked(session, question_id) == null and questionOpenLocked(session, question_id)) {
         prompt_test_controls.noteOutboundWaiting();
         session.outbound.cond.wait(io, &session.outbound.mutex) catch {
             cancelQuestionLocked(session, question_id);
@@ -3498,33 +3606,52 @@ fn takeQuestionWinner(session: *ActiveSessionState, alloc: Allocator, question_i
     }
 }
 
-/// Cancels each open request of `question`, and tells each client about its own request.
-pub fn cancelPermissionQuestion(session: *ActiveSessionState, question: PermissionQuestion) void {
+/// Removes the question `question_id` from the session. Its decisive answer, if any, is returned; each open
+/// request that reached its client is added to `cancels`. The caller holds `audience_mutex`.
+fn takeQuestionWinner(session: *ActiveSessionState, alloc: Allocator, question_id: u64, cancels: *RequestList) ?OutboundResponse {
     const io = io_mod.getIo();
-    var cancelled: [max_pending_outbound]OutboundRequest = undefined;
-    var cancelled_count: usize = 0;
+    session.outbound.mutex.lockUncancelable(io);
+    defer session.outbound.mutex.unlock(io);
+    var pending = session.outbound.pending.iterator();
+    while (pending.next()) |entry| {
+        if (entry.value_ptr.question != question_id) continue;
+        if (entry.value_ptr.response == null and entry.value_ptr.written) cancels.push(entry.key_ptr.*);
+    }
+    var winner: ?OutboundResponse = null;
+    if (decisiveRequestLocked(session, question_id)) |key| {
+        const removed = session.outbound.pending.fetchRemove(key) orelse unreachable;
+        winner = removed.value.response orelse unreachable;
+    }
+    forgetQuestionLocked(session, alloc, question_id);
+    clearOpenQuestionLocked(session, alloc, question_id);
+    return winner;
+}
+
+/// Cancels each open request of `question`, and tells each client that received its request.
+pub fn cancelPermissionQuestion(session: *ActiveSessionState, question: PermissionQuestion) void {
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const io = io_mod.getIo();
+    var cancels: RequestList = .{};
     session.outbound.mutex.lockUncancelable(io);
     var pending = session.outbound.pending.iterator();
     while (pending.next()) |entry| {
         if (entry.value_ptr.question != question.id) continue;
         if (entry.value_ptr.response != null) continue;
         entry.value_ptr.response = .{ .cancelled = true };
-        cancelled[cancelled_count] = entry.key_ptr.*;
-        cancelled_count += 1;
+        if (entry.value_ptr.written) cancels.push(entry.key_ptr.*);
     }
     session.outbound.cond.broadcast(io);
     session.outbound.mutex.unlock(io);
-    for (cancelled[0..cancelled_count]) |request| publishRequestCancellation(session, request);
+    for (cancels.items[0..cancels.len]) |request| publishRequestCancellationLocked(session, &audience, request);
 }
 
-/// Whether one request of `question_id` holds an answer that decides it: a client's answer, a cancel, or an error.
-/// A request that moved or whose client has no client left does not decide. The caller holds `mutex`.
+/// Whether one request of `question_id` holds an answer. The caller holds `mutex`.
 fn decisiveRequestLocked(session: *ActiveSessionState, question_id: u64) ?OutboundRequest {
     var pending = session.outbound.pending.iterator();
     while (pending.next()) |entry| {
         if (entry.value_ptr.question != question_id) continue;
-        const response = entry.value_ptr.response orelse continue;
-        if (response.moved or response.no_client) continue;
+        if (entry.value_ptr.response == null) continue;
         return entry.key_ptr.*;
     }
     return null;
@@ -3572,6 +3699,21 @@ fn forgetQuestionLocked(session: *ActiveSessionState, alloc: Allocator, question
             owned.deinit(alloc);
         }
     }
+}
+
+/// Removes the open requests of `connection` that belong to a question. An answer it already gave stays, so the
+/// decision it made is still taken. The caller holds `mutex`.
+fn dropOpenCopiesLocked(session: *ActiveSessionState, owner: ConnectionId) void {
+    var keys: [max_pending_outbound]OutboundRequest = undefined;
+    var count: usize = 0;
+    var pending = session.outbound.pending.iterator();
+    while (pending.next()) |entry| {
+        if (entry.key_ptr.connection != owner) continue;
+        if (entry.value_ptr.question == null or entry.value_ptr.response != null) continue;
+        keys[count] = entry.key_ptr.*;
+        count += 1;
+    }
+    for (keys[0..count]) |key| _ = session.outbound.pending.fetchRemove(key);
 }
 
 fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -8289,10 +8431,182 @@ test "a permission question drops a client whose write fails and keeps the other
     try writePermissionQuestion(session, question, alloc, "{}", "{}");
     try std.testing.expectEqual(@as(usize, 1), leader_frames.count);
     try std.testing.expectEqual(@as(usize, 1), session.members.items.len);
-    const follower_entry = session.outbound.pending.get(.{ .connection = 2, .id = 1 }) orelse return error.TestExpectedEqual;
-    try std.testing.expect(follower_entry.response.?.no_client);
+    try std.testing.expect(session.outbound.pending.get(.{ .connection = 2, .id = 1 }) == null);
     const leader_entry = session.outbound.pending.get(.{ .connection = 1, .id = 1 }) orelse return error.TestExpectedEqual;
     try std.testing.expect(leader_entry.response == null);
+
+    cancelPermissionQuestion(session, question);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionQuestion(session, question));
+    try std.testing.expectEqual(@as(usize, 0), session.outbound.pending.count());
+}
+
+test "a decision cancels each other written request of the question, and not the winner's" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var leader_cancels = CountingWriter{ .needle = "$/cancel_request" };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&leader_cancels, CountingWriter.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var first_cancels = CountingWriter{ .needle = "$/cancel_request" };
+    var first = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&first_cancels, CountingWriter.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer first.deinit();
+    var second_cancels = CountingWriter{ .needle = "$/cancel_request" };
+    var second = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&second_cancels, CountingWriter.write),
+        .connection_id = 3,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer second.deinit();
+    const session = try openHandOffTestSession(&state, "session_decision_cancels");
+    try joinMemberForTest(session, &first);
+    try joinMemberForTest(session, &second);
+
+    const question = beginPermissionQuestion(session) orelse return error.TestExpectedEqual;
+    try writePermissionQuestion(session, question, alloc, "{}", "{}");
+    const answer = try alloc.dupe(u8, "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}");
+    try std.testing.expectEqual(AnswerOutcome.stored, storeAnswer(session, .{ .connection = 1, .id = 1 }, .once, answer, null));
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, awaitPermissionQuestion(session, question));
+
+    try std.testing.expectEqual(@as(usize, 0), leader_cancels.count);
+    try std.testing.expectEqual(@as(usize, 1), first_cancels.count);
+    try std.testing.expectEqual(@as(usize, 1), second_cancels.count);
+    try std.testing.expectEqual(@as(usize, 0), session.outbound.pending.count());
+}
+
+test "refused answers change nothing and send nothing: an option not offered, a foreign id, and an answer after the decision" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var leader_cancels = CountingWriter{ .needle = "$/cancel_request" };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&leader_cancels, CountingWriter.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower_cancels = CountingWriter{ .needle = "$/cancel_request" };
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_cancels, CountingWriter.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    const session = try openHandOffTestSession(&state, "session_refused_answers");
+    try joinMemberForTest(session, &follower);
+
+    const question = beginPermissionQuestion(session) orelse return error.TestExpectedEqual;
+    try writePermissionQuestion(session, question, alloc, "{}", "{}");
+
+    const not_offered = try alloc.dupe(u8, "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_always\"}}");
+    try std.testing.expectEqual(AnswerOutcome.refused, storeAnswer(session, .{ .connection = 2, .id = 1 }, .always, not_offered, null));
+    alloc.free(not_offered);
+    const foreign = try alloc.dupe(u8, "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}");
+    try std.testing.expectEqual(AnswerOutcome.not_found, storeAnswer(session, .{ .connection = 9, .id = 9 }, .once, foreign, null));
+    alloc.free(foreign);
+
+    const winning = try alloc.dupe(u8, "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"reject_once\"}}");
+    try std.testing.expectEqual(AnswerOutcome.stored, storeAnswer(session, .{ .connection = 1, .id = 1 }, .deny, winning, null));
+    const late = try alloc.dupe(u8, "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}");
+    try std.testing.expectEqual(AnswerOutcome.refused, storeAnswer(session, .{ .connection = 2, .id = 1 }, .once, late, null));
+    alloc.free(late);
+
+    try std.testing.expectEqual(@as(usize, 0), leader_cancels.count);
+    try std.testing.expectEqual(@as(usize, 0), follower_cancels.count);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionQuestion(session, question));
+    try std.testing.expectEqual(@as(usize, 0), leader_cancels.count);
+    try std.testing.expectEqual(@as(usize, 1), follower_cancels.count);
+    try std.testing.expectEqual(@as(usize, 0), session.outbound.pending.count());
+}
+
+test "the last target's leave denies the question at once" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(null, DiscardFrames.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer follower.deinit();
+    const session = try openHandOffTestSession(&state, "session_last_leaves");
+    try joinMemberForTest(session, &follower);
+
+    const question = beginPermissionQuestion(session) orelse return error.TestExpectedEqual;
+    try writePermissionQuestion(session, question, alloc, "{}", "{}");
+    _ = leaveMember(&follower, session, .left);
+    try std.testing.expectEqual(@as(usize, 1), session.outbound.pending.count());
+    _ = leaveMember(&state, session, .left);
+    try std.testing.expectEqual(@as(usize, 0), session.outbound.pending.count());
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionQuestion(session, question));
+}
+
+test "a joiner gets its own request for the open question, with its own id" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var leader_frames = CountingWriter{ .needle = "session/request_permission" };
+    var state = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&leader_frames, CountingWriter.write),
+        .connection_id = 1,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer state.deinit();
+    var joiner_frames = CountingWriter{ .needle = "session/request_permission" };
+    var joiner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&joiner_frames, CountingWriter.write),
+        .connection_id = 2,
+        .launch = .{ .root = try alloc.dupe(u8, "/tmp/workspace") },
+    };
+    defer joiner.deinit();
+    const session = try openHandOffTestSession(&state, "session_joiner_question");
+
+    const question = beginPermissionQuestion(session) orelse return error.TestExpectedEqual;
+    try writePermissionQuestion(session, question, alloc, "{}", "{}");
+    try joinMemberForTest(session, &joiner);
+    {
+        var audience = lockAudience(session);
+        defer audience.unlock();
+        try offerOpenPermissionQuestion(session, session.members.items[1], alloc);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), joiner_frames.count);
+    const entry = session.outbound.pending.get(.{ .connection = 2, .id = 1 }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(question.id, entry.question orelse return error.TestExpectedEqual);
+    try std.testing.expect(!entry.may_always);
+    try std.testing.expect(entry.written);
+    try std.testing.expectEqual(@as(u64, 2), session.members.items[1].next_outbound_request_id);
 
     cancelPermissionQuestion(session, question);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionQuestion(session, question));
