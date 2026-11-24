@@ -138,19 +138,8 @@ pub fn noteJoinPassed() void {
     }
 }
 
-/// Set by a unit test. A permission request's write parks before it takes the session's
-/// audience lock, and before it checks that its main client is still the one the request was
-/// made to (`writeRequestToMain`). Null outside a test.
-pub var permission_write_gate: ?*Gate = null;
-
-pub fn notePermissionWrite() void {
-    if (comptime builtin.is_test) {
-        if (permission_write_gate) |gate| gate.park();
-    }
-}
-
 /// Set by a unit test. A member's leave parks after its record has left the audience and before
-/// the requests it still owes are answered `moved` (`removeMemberLocked`). Null outside a test.
+/// the requests it still owes are answered (`removeMemberLocked`). Null outside a test.
 pub var leave_gate: ?*Gate = null;
 
 pub fn noteMemberRemoved() void {

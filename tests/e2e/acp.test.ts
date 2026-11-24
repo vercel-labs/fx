@@ -16686,7 +16686,7 @@ describe("acp: model-independent", () => {
         const firstAsked = first.received.find(permissionFor("question_leave"));
         const secondAsked = second.received.find(permissionFor("question_leave"));
 
-        // session/close is answered after the leave is handled, so a re-ask would already be sent.
+        // session/close is answered after the leave is handled, so the question has already settled its copies.
         const closed = (await opener.request("session/close", { sessionId: started.sessionId }, 20)) as any;
         expect(closed.error).toBeUndefined();
         expect(closed.result).toEqual({});
