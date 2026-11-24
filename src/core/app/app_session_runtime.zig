@@ -1740,9 +1740,12 @@ pub fn Runtime(comptime App: type) type {
             // A turn that stopped for an upgrade's restart goes on as the
             // same turn, with no note to the model; if it cannot, the note
             // resume still sends the request again.
-            if (yielded) {
-                if (continueYieldedTurn(app, agent, resumed)) return else |err| {
-                    debug_trace.logf("recovery", "event=yield_continue_failed err={s} fallback=resume_note", .{@errorName(err)});
+            // Only a host that restarts for an upgrade stops a turn so.
+            if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                if (yielded) {
+                    if (continueYieldedTurn(app, agent, resumed)) return else |err| {
+                        debug_trace.logf("recovery", "event=yield_continue_failed err={s} fallback=resume_note", .{@errorName(err)});
+                    }
                 }
             }
             _ = app.queueResumedRequest(agent, session_runtime.resumed_request_prompt, resumed) catch |err| {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
@@ -627,7 +628,8 @@ pub fn SubmitRuntime(comptime App: type) type {
             // would be lost with the process, and the restart waits for an
             // empty composer, so the text stays where it is. `/quit` still
             // quits.
-            if (comptime @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits")) {
+            // A host that never upgrades itself has no restart to wait for.
+            if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits")) {
                 if (app.upgrader.restart_waits and !submitsQuit(app)) {
                     debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
                     try app.writeDomainNotice(.{

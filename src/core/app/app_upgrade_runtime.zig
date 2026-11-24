@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
@@ -34,8 +35,9 @@ const restart_waits_for_subagents_notice = "fx restarts for the upgrade when the
 
 /// Whether `App` can stop running turns between steps for the restart.
 /// Without it, Ctrl+G still refuses while a response streams.
+/// A host that never upgrades itself, such as the browser terminal, has no restart to wait for.
 fn supportsYield(comptime App: type) bool {
-    return @hasDecl(App, "anyTurnRunning") and @hasDecl(App, "requestTurnYields") and
+    return runtime_profile.allows(App, .auto_upgrade) and @hasDecl(App, "anyTurnRunning") and @hasDecl(App, "requestTurnYields") and
         @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits");
 }
 
@@ -125,6 +127,12 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             deps: Deps,
         ) !ApplyOutcome {
+            // A host that never upgrades itself, such as the browser
+            // terminal, says so at once: nothing after this runs there.
+            if (comptime !runtime_profile.allows(App, .auto_upgrade)) {
+                try writeUpgradeNotice(app, .neutral, "auto-upgrade is disabled");
+                return .not_ready;
+            }
             // A second Ctrl+G while the relaunch waits changes nothing.
             if (comptime supportsYield(App)) {
                 if (app.upgrader.restart_waits) {
@@ -696,6 +704,62 @@ test "app_upgrade_runtime still refuses while a response streams in an app that 
     try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
     try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
     try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
+}
+
+const NoUpgradeUpgrader = struct {
+    state: auto_upgrade.State = .ready,
+    restart_waits: bool = false,
+
+    fn getState(self: *NoUpgradeUpgrader) auto_upgrade.State {
+        return self.state;
+    }
+};
+
+/// A host that never upgrades itself, such as the browser terminal. A turn
+/// can run on it, but nothing restarts the host, so it asks no turn to stop.
+const NoUpgradeHostApp = struct {
+    pub const host_profile = runtime_profile.wasm;
+
+    alloc: std.mem.Allocator,
+    main_agent: struct {} = .{},
+    upgrader: NoUpgradeUpgrader = .{},
+    notices: std.ArrayList(u8) = .empty,
+    turn_running: bool = false,
+    yield_request_count: usize = 0,
+
+    pub fn anyTurnRunning(self: *NoUpgradeHostApp) bool {
+        return self.turn_running;
+    }
+
+    pub fn requestTurnYields(self: *NoUpgradeHostApp) void {
+        self.yield_request_count += 1;
+    }
+
+    fn prepareResumeHandoffForUpgrade(_: *NoUpgradeHostApp, _: anytype) !void {}
+    fn requestUpgradeRelaunch(_: *NoUpgradeHostApp, _: []const u8) !void {}
+    fn requestResumeHandoffForUpgrade(_: *NoUpgradeHostApp, _: anytype) void {}
+
+    fn writeDomainNotice(self: *NoUpgradeHostApp, notice: types.SemanticNotice, _: bool) !void {
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: *NoUpgradeHostApp) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+};
+
+test "app_upgrade_runtime on a host that never upgrades itself says so and asks no turn to stop" {
+    var app = NoUpgradeHostApp{ .alloc = std.testing.allocator };
+    defer app.notices.deinit(std.testing.allocator);
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    const outcome = try Runtime(NoUpgradeHostApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
+    try std.testing.expectEqualStrings("auto-upgrade is disabled", app.notices.items);
+    try std.testing.expectEqual(@as(usize, 0), app.yield_request_count);
+    try std.testing.expect(!app.upgrader.restart_waits);
+    try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
 }
 
 test "app_upgrade_runtime asks running turns to yield and exits once they stop" {
