@@ -8,9 +8,11 @@ import { world } from "../durable/world.mjs";
 
 const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
 const opened = [];
+// What `local()` sets for its own World: an app's World does not get it.
+const writeUiInOrder = Symbol.for("libfx.durability.writeUiInOrder");
 
 export async function appWorldAt(dir, options = {}) {
-  const { world: _create, owned: _owned, name: _name, ...settings } = local({ dir, ...options });
+  const { world: _create, owned: _owned, name: _name, [writeUiInOrder]: _inOrder, ...settings } = local({ dir, ...options });
   const instance = createWorld({ dataDir: dir, recoverActiveRuns: false });
   await instance.start();
   opened.push(instance);

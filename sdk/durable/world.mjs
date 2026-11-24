@@ -3,6 +3,14 @@
 // the World libfx bundles for each.
 
 const durabilityTag = Symbol.for("libfx.durability");
+// Set by libfx's own `local()`, and by no app: `ui.write` of sdk/durable.js
+// then gives the World one stream chunk at a time. world-local before 5.2
+// lands the chunks of one `writeMulti` call in any order and its live reader
+// shows any chunk that is on disk, so a chunk that lands late shows after the
+// ones behind it (`tests/tla/sdk/UiStreamOrder.tla` DeliveredInOrder). An app
+// that passes its own world-local older than 5.2 to `world()` keeps that
+// race; a newer one lands a call's chunks in order.
+const writeUiInOrder = Symbol.for("libfx.durability.writeUiInOrder");
 
 /**
  * `source` is the World, or a function that creates it. libfx starts and
@@ -61,6 +69,8 @@ export function world(source, options = {}) {
   for (const [key, value] of Object.entries({ alive, holderInfo, gatewayKey, waitUntil })) {
     if (value !== undefined && typeof value !== "function") throw new TypeError(`${name}() ${key} must be a function`);
   }
+  const inOrder = options[writeUiInOrder];
+  if (inOrder !== undefined && typeof inOrder !== "boolean") throw new TypeError(`${name}() writeUiInOrder must be a boolean`);
   if (livenessKnown && !alive) throw new TypeError(`${name}() livenessKnown needs alive()`);
   // Only the backstop's own message coming back continues a turn a dead
   // request ran.
@@ -75,6 +85,7 @@ export function world(source, options = {}) {
     queueLeases,
     runInRequest,
     queueDurable,
+    ...(inOrder === true ? { [writeUiInOrder]: true } : {}),
     ...(pollMs === undefined ? {} : { pollMs }),
     ...(leaseMs === undefined ? {} : { leaseMs }),
     ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
