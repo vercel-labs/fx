@@ -344,6 +344,11 @@ pub const snapshot_marker_prefix = "FXSNAP:";
 // replayed `run-help () {` a parse error that stops the whole replay. The
 // captured `alias -L` lines then restore exactly the user's aliases.
 //
+// ZDOTDIR gets its own section because a startup file may set it without
+// exporting it, as `ZDOTDIR=~/.config/zsh` in ~/.zshenv does, and then the
+// environment does not show it. The replay restores it with a plain
+// assignment, which leaves it unexported unless the environment exports it.
+//
 // Completion functions start with `_`, a setup often has a thousand of them,
 // and a command never uses them, so the replay leaves them out. zsh autoloads
 // each one from a file of the same name, as compinit does for every
@@ -357,11 +362,13 @@ const zsh_capture_script =
     \\\builtin zmodload zsh/parameter 2>/dev/null
     \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
     \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:ZDOTDIR\0%s\0' "${ZDOTDIR-}"
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
+    \\if [[ -n ${ZDOTDIR+set} ]]; then \builtin print -r -- "ZDOTDIR=${(qq)ZDOTDIR}"; fi
     \\for __fx_snapshot_name in ${(ko)functions}; do
     \\  case $__fx_snapshot_name in (prompt_*|__fx_snapshot_*) continue;; esac
     \\  if [[ $__fx_snapshot_name == _* ]]; then
@@ -388,9 +395,11 @@ const zsh_capture_script =
 // replay leaves out a `_` function only when `declare -F`, with `extdebug`
 // on, reports such a file; the name alone does not decide. Under `extdebug`
 // a DEBUG trap that fails skips the next command, so the trap is cleared
-// first. bash parses a function's patterns when it reads the definition, so
-// the replay sets options such as `extglob` before the functions that use
-// them.
+// first. bash parses a function's patterns when it reads the definition, and
+// the replay shell starts with extglob off, so the replay turns extglob on
+// before the first function. The `shopt -p` lines after the aliases then set
+// the options the way the startup files left them, before the command runs,
+// even for a file that had extglob on only while it defined its functions.
 const bash_capture_script =
     \\{
     \\\unset -f builtin
@@ -399,9 +408,7 @@ const bash_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
-    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
-    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
-    \\done
+    \\\builtin printf '%s\n' 'shopt -s extglob'
     \\\builtin trap - DEBUG
     \\\builtin shopt -s extdebug
     \\__fx_snapshot_sources=$(\builtin declare -F $(\builtin compgen -A function))
@@ -412,13 +419,17 @@ const bash_capture_script =
     \\  \builtin declare -f -- "$__fx_snapshot_name"
     \\done <<< "$__fx_snapshot_sources"
     \\\builtin alias -p
+    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
+    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
+    \\done
     \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
     \\} 2>/dev/null
 ;
 
 /// Builds the script a login shell runs once to capture its state as a
-/// NUL-delimited payload: exported environment, alias and function names, and
-/// a replay of functions, aliases, and selected options. Every section marker
+/// NUL-delimited payload: exported environment, zsh's ZDOTDIR parameter,
+/// alias and function names, and a replay of functions, aliases, and selected
+/// options. Every section marker
 /// carries `nonce`, so output printed by the user's startup files cannot be
 /// mistaken for the payload. `nonce` must be ASCII hex.
 pub fn snapshotCaptureScript(
