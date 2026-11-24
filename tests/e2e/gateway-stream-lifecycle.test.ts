@@ -14443,6 +14443,95 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
   }
 
+  test("cyber policy HTTP error that also reads like a prefill rejection is not repaired or sent again", async () => {
+    const root = createFixtureRoot("post-tool-cyber-policy-prefill-text");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "notes\n");
+    const message = "This content was flagged for possible cybersecurity risk. " +
+      "This model does not support assistant message prefill. The conversation must end with a user message.";
+    const responses = [
+      () => fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" }),
+      () => new Response(JSON.stringify({ error: { type: "cyber_policy", message } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+    ];
+    const gateway = startGateway(() => (responses.shift() ?? (() => new Response("unexpected request", { status: 500 })))());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the notes."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("assistant_prefill_recovery");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("cyber policy error event before a content filter finish ends the turn once under its own cause", async () => {
+    const root = createFixtureRoot("cyber-policy-then-content-filter-finish");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      fakeGatewaySse([
+        { type: "error", error: { type: "cyber_policy", message: cyberPolicyMessage } },
+        { type: "finish", finishReason: { unified: "content-filter", raw: "content_filter" } },
+      ])
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the binary."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(gateway.requestCount()).toBe(1);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("event=content_filter_resend");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("an echoed active key that crosses the kept length of a streamed error is masked whole", async () => {
+    const root = createFixtureRoot("cyber-policy-key-at-cut");
+    const tracePath = join(root.root, "trace.log");
+    const key = "fake-gateway-lifecycle-key";
+    // The detail reads "cyber_policy: <message>", and fx keeps its first 600
+    // bytes, so the key starts 10 bytes before the cut.
+    const message = `${"x".repeat(600 - 10 - "cyber_policy: ".length)}${key} trailing text`;
+    const gateway = startGateway(() =>
+      fakeGatewaySse([{ type: "error", error: { type: "cyber_policy", message } }])
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Inspect the binary."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const keyStart = key.slice(0, 8);
+
+      expect(result.code).toBe(1);
+      expect(result.stdout).not.toContain(keyStart);
+      expect(result.stderr).not.toContain(keyStart);
+      expect(readFileSync(tracePath, "utf8")).not.toContain(keyStart);
+      const saved = readdirSync(join(root.home, ".fx"), { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => join(entry.parentPath, entry.name));
+      expect(saved.some((file) => file.includes("sessions"))).toBe(true);
+      for (const file of saved) expect(readFileSync(file).toString("latin1")).not.toContain(keyStart);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("cyber policy block masks the active key the provider echoes, on screen and in the saved session", async () => {
     const root = createFixtureRoot("cyber-policy-echoed-key");
     const tracePath = join(root.root, "trace.log");

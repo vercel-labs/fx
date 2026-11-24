@@ -222,15 +222,22 @@ fn post(
         return err;
     }
     // A reply that reports its own failure may quote a secret, as an error
-    // body may.
-    if (result == .failed and result.failed.ownership == .owned) {
-        if (result.failed.detail) |detail| {
-            result.failed.detail = null;
-            result.failed.detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+    // body may, whether it failed to stream or streamed its failure.
+    switch (result) {
+        .failed => |*failed| if (failed.ownership == .owned) if (failed.detail) |detail| {
+            failed.detail = null;
+            failed.detail = headers.mask(alloc, detail, token) catch |err| {
                 result.deinit(alloc);
                 return err;
             };
-        }
+        },
+        .completed => |*completed| if (completed.ownership == .owned) if (completed.completion.provider_failure_detail) |detail| {
+            completed.completion.provider_failure_detail = null;
+            completed.completion.provider_failure_detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+                result.deinit(alloc);
+                return err;
+            };
+        },
     }
     return result;
 }

@@ -5901,8 +5901,9 @@ fn pushCyberPolicyStatus(
     });
 }
 
-/// The most a cyber policy notice keeps of the provider's message, which is
-/// longer than a diagnostic holds and ends in the provider's guidance.
+/// The most a cyber policy notice shows of the provider's message. The
+/// gateway keeps up to 600 bytes of it, more than a diagnostic holds, and
+/// making it terminal-safe can make it longer.
 const cyber_policy_notice_max_bytes = 1024;
 
 /// The notice for a cyber policy block: fx's name for it, then the
@@ -5913,8 +5914,7 @@ fn cyberPolicyNotice(
     detail: []const u8,
     diagnostic: types.ModelFailureDiagnostic,
 ) ![]const u8 {
-    const masked = try text_utils.maskSecrets(arena, std.mem.trim(u8, detail, " \t\r\n"));
-    var encoded = try text_utils.encodeTerminalSafe(arena, masked, cyber_policy_notice_max_bytes);
+    var encoded = try maskedTerminalSafe(arena, std.mem.trim(u8, detail, " \t\r\n"), cyber_policy_notice_max_bytes);
     defer encoded.deinit(arena);
     const message = if (encoded.bytes.len > 0) encoded.bytes else diagnostic.view();
     return arena.print("{s} · {s}", .{ types.RouteRecoveryStatus.cyber_policy_block_name, message });
@@ -6059,17 +6059,18 @@ fn safeFailureDiagnostic(
     source: []const u8,
     fallback: []const u8,
 ) !types.ModelFailureDiagnostic {
-    const masked = try text_utils.maskSecrets(alloc, source);
-    defer if (masked.ptr != source.ptr) alloc.free(masked);
-
-    var encoded = try text_utils.encodeTerminalSafe(
-        alloc,
-        masked,
-        types.ModelFailureDiagnostic.max_bytes,
-    );
+    var encoded = try maskedTerminalSafe(alloc, source, types.ModelFailureDiagnostic.max_bytes);
     defer encoded.deinit(alloc);
     if (encoded.bytes.len == 0) return types.ModelFailureDiagnostic.init(fallback);
     return types.ModelFailureDiagnostic.init(encoded.bytes);
+}
+
+/// Provider text as fx shows it: secrets masked, made terminal-safe, and at
+/// most `max_bytes`. The caller owns the result.
+fn maskedTerminalSafe(alloc: Allocator, source: []const u8, max_bytes: usize) !text_utils.EncodedText {
+    const masked = try text_utils.maskSecrets(alloc, source);
+    defer if (masked.ptr != source.ptr) alloc.free(masked);
+    return text_utils.encodeTerminalSafe(alloc, masked, max_bytes);
 }
 
 fn hasDiagnosticIdentifier(text: []const u8) bool {
@@ -9615,8 +9616,11 @@ fn processQueuedPromptLoop(
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
             // `assistant_prefill_recovery_used` caps this repair at one resend
-            // per step; it does not go through the recovery module.
+            // per step; it does not go through the recovery module. A cyber
+            // policy block is never repaired, whatever its text says.
+            const policy_blocked = if (response_failure) |failure| failure.kind == .cyber_policy else false;
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
+                !policy_blocked and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureStatus(failure) else .ok,

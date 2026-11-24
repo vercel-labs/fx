@@ -171,6 +171,7 @@ pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: stream_provide
     var events = request.events;
     var reducer = try responses_protocol.Reducer.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages });
     defer reducer.deinit(alloc);
+    reducer.credential = request.credential.secret() orelse "";
     var lines: sse.Reader = .{ .max_event_bytes = max_event_bytes, .max_total_bytes = max_stream_bytes, .progress = progress };
     defer lines.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{

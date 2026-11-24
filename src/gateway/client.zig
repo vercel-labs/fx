@@ -241,6 +241,11 @@ const gateway_connection_setup_timeout_ms: i64 = 30_000;
 const gateway_retry_after_max_ns: u64 = 5 * std.time.ns_per_s;
 const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
+/// What a stream keeps of a provider's error text while it reads, before
+/// `keptFailureDetail` masks the credential and cuts it to
+/// `provider_failure_detail_max_bytes`: long enough that a credential that
+/// starts inside the kept part also ends inside this one.
+const provider_failure_detail_raw_max_bytes: usize = 64 * 1024;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
 const e2e_gateway_chat_url_env = "FX_TEST_GATEWAY_CHAT_URL";
@@ -2365,6 +2370,7 @@ fn streamGatewayCompletionCoreWithOptions(
             request.content_capture_limit,
             active_connected_watch,
             request.conversation,
+            request.api_key orelse "",
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -4252,13 +4258,32 @@ fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCom
 
 fn clippedDupe(alloc: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     const trimmed = std.mem.trim(u8, text, " \r\n\t");
-    const clipped = trimmed[0..@min(trimmed.len, max_bytes)];
-    return try alloc.dupe(u8, clipped);
+    return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(trimmed, max_bytes));
+}
+
+/// The error text a completion keeps: `raw` with every copy of `credential`
+/// masked, as sent and as JSON escapes it, then cut to
+/// `provider_failure_detail_max_bytes` on a character boundary. Masking
+/// first means the cut never leaves the start of a key behind. Takes `raw`;
+/// the caller owns the result.
+fn keptFailureDetail(alloc: std.mem.Allocator, raw: ?[]u8, credential: []const u8) !?[]u8 {
+    const detail = raw orelse return null;
+    errdefer alloc.free(detail);
+    text_utils.maskLiteral(detail, credential);
+    if (credential.len > 0) {
+        const escaped = try std.json.Stringify.valueAlloc(alloc, credential, .{});
+        defer alloc.free(escaped);
+        text_utils.maskLiteral(detail, escaped[1 .. escaped.len - 1]);
+    }
+    const kept = text_utils.utf8PrefixByBytes(detail, provider_failure_detail_max_bytes);
+    if (kept.len == detail.len) return detail;
+    defer alloc.free(detail);
+    return try alloc.dupe(u8, kept);
 }
 
 fn replaceProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, text: []const u8) !void {
     if (text.len == 0) return;
-    const owned = try clippedDupe(alloc, text, provider_failure_detail_max_bytes);
+    const owned = try clippedDupe(alloc, text, provider_failure_detail_raw_max_bytes);
     if (owned.len == 0) {
         alloc.free(owned);
         return;
@@ -4591,9 +4616,12 @@ fn streamFailureCause(
 
 /// The finish a stream's error events give it. The code wins: an error event
 /// whose code, or HTTP status in place of one, classifies the failure makes
-/// the stream a provider error even when no finish followed it. A content
-/// filter block makes a missing or error finish a content filter finish, so
-/// it reads like the provider's own. A stream timeout keeps its own path, an
+/// the stream a provider error even when no finish followed it. A cyber
+/// policy block makes a missing, error, or content filter finish a provider
+/// error, so the block ends the turn instead of being resent as a content
+/// filter's is. A content filter block makes a missing or error finish a
+/// content filter finish, so it reads like the provider's own. A stream
+/// timeout keeps its own path, an
 /// event with neither a code nor a usable status says nothing, and any other
 /// finish decides on its own.
 fn finishFromErrorEvents(
@@ -4601,6 +4629,7 @@ fn finishFromErrorEvents(
     finish: ?types.ProviderFinishReason,
 ) ?types.ProviderFinishReason {
     const error_or_missing = finish == null or finish == .provider_error;
+    if (class == .cyber_policy and (error_or_missing or finish == .content_filter)) return .provider_error;
     if (class == .content_filter and error_or_missing) return .content_filter;
     if (finish != null) return finish;
     return switch (class) {
@@ -5088,7 +5117,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null, .{});
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null, .{}, "");
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -5106,6 +5135,8 @@ pub fn consumeGatewaySseStream(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     conversation: tool_call_ids.Conversation,
+    /// The credential the request sent, masked out of the error text it keeps.
+    credential: []const u8,
 ) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
@@ -5122,6 +5153,7 @@ pub fn consumeGatewaySseStream(
         content_capture_limit,
         null,
         conversation,
+        credential,
     );
 }
 
@@ -5140,6 +5172,8 @@ fn consumeSseStreamTraced(
     content_capture_limit: ?usize,
     progress_watch: ?*ConnectedRequestWatch,
     conversation: tool_call_ids.Conversation,
+    /// The credential the request sent, masked out of the error text it keeps.
+    credential: []const u8,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
@@ -5638,7 +5672,7 @@ fn consumeSseStreamTraced(
     }
     completion.provider_result_identity_failure = provider_result_identity_failure;
     completion.provider_failure_cause = streamFailureCause(error_event_class, finish_reason_holder, finish_timeout);
-    completion.provider_failure_detail = provider_failure_detail;
+    completion.provider_failure_detail = try keptFailureDetail(alloc, provider_failure_detail, credential);
     provider_failure_detail = null;
     completion.generation_id = generation_id;
     generation_id = null;
@@ -5887,7 +5921,7 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null, .{});
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null, .{}, "");
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
@@ -6494,6 +6528,57 @@ test "consumeSseStream lets a cyber policy block decide over any other error eve
     var rate_limited = try testStreamOutcome(rate_limit_event ++ test_bad_request_event);
     defer deinitGatewayCompletion(std.testing.allocator, &rate_limited);
     try std.testing.expectEqual(@as(?types.ProviderFailureCause, .rate_limited), rate_limited.provider_failure_cause);
+}
+
+test "consumeSseStream keeps a cyber policy block through a content filter finish" {
+    const content_filter_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\",\"raw\":\"content_filter\"}}\n\n";
+    for ([_][]const u8{
+        test_cyber_type_event ++ content_filter_finish,
+        test_filter_type_event ++ test_cyber_type_event ++ content_filter_finish,
+        test_cyber_type_event ++ test_filter_type_event ++ content_filter_finish,
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("cyber_policy", @tagName(completion.provider_failure_cause.?));
+        try std.testing.expectEqualStrings("cyber_policy: " ++ test_cyber_message, completion.provider_failure_detail.?);
+    }
+    // Without a cyber policy block, a content filter finish still decides.
+    for ([_][]const u8{ content_filter_finish, test_filter_type_event ++ content_filter_finish }) |payload| {
+        var filtered = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &filtered);
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .content_filter), filtered.finish_reason);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), filtered.provider_failure_cause);
+    }
+}
+
+test "keptFailureDetail masks the credential before it cuts the text" {
+    const alloc = std.testing.allocator;
+    const key = "test-credential-0123456789";
+    const max = provider_failure_detail_max_bytes;
+    // A key that starts 10 bytes before the cut, and one in JSON's escaped form.
+    const straddling = try std.mem.concat(alloc, u8, &.{ text_utils.repeat("x", max - 10), key, " tail" });
+    defer alloc.free(straddling);
+    const kept = (try keptFailureDetail(alloc, try alloc.dupe(u8, straddling), key)).?;
+    defer alloc.free(kept);
+    try std.testing.expectEqual(max, kept.len);
+    try std.testing.expect(std.mem.endsWith(u8, kept, text_utils.repeat("*", 10)));
+
+    const quoted_key = "test\"credential";
+    const escaped = (try keptFailureDetail(alloc, try alloc.dupe(u8, "{\"error\":\"bad test\\\"credential\"}"), quoted_key)).?;
+    defer alloc.free(escaped);
+    try std.testing.expectEqualStrings("{\"error\":\"bad ****************\"}", escaped);
+
+    // The cut never splits a character: "é" is two bytes across the cut.
+    const accented = try std.mem.concat(alloc, u8, &.{ text_utils.repeat("x", max - 1), "\xc3\xa9" });
+    defer alloc.free(accented);
+    const whole = (try keptFailureDetail(alloc, try alloc.dupe(u8, accented), "")).?;
+    defer alloc.free(whole);
+    try std.testing.expectEqual(max - 1, whole.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(whole));
+
+    try std.testing.expectEqual(@as(?[]u8, null), try keptFailureDetail(alloc, null, key));
 }
 
 test "httpFailureKind names a cyber policy block in any HTTP error body" {
@@ -7335,7 +7420,7 @@ test "Gateway separates provider message items in assistant text" {
         var reader = std.Io.Reader.fixed(payload.written());
         var cancelled = std.atomic.Value(bool).init(false);
         const first_len = "Hi! What would you like help with?".len;
-        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1, .{});
+        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1, .{}, "");
         defer deinitGatewayCompletion(alloc, &completion);
         try std.testing.expectEqualStrings("Hi! What would you like help with?\n", completion.content.?);
         try std.testing.expectEqualStrings(cases[0].expected, chunks.text.items);
@@ -8582,7 +8667,7 @@ fn consumeTestReply(alloc: std.mem.Allocator, payload: []const u8, conversation:
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, conversation);
+    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, conversation, "");
 }
 
 fn testCallIds(alloc: std.mem.Allocator, completion: types.ModelCompletion) ![]u8 {

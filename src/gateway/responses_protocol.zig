@@ -883,6 +883,9 @@ pub const Reducer = struct {
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
     call_ids: tool_call_ids.ReplyIds,
+    /// The credential the request sent, borrowed until deinit. A failure's
+    /// code and message are kept with it masked, before they are cut short.
+    credential: []const u8 = "",
 
     /// Borrows `conversation` until deinit.
     pub fn init(alloc: std.mem.Allocator, conversation: tool_call_ids.Conversation) !Reducer {
@@ -1186,8 +1189,10 @@ pub const Reducer = struct {
     /// The AI Gateway's SSE classifier differs on purpose: `client.zig` `ErrorEventClass`.
     fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
         self.failure_explained = true;
-        const code = stringField(fields, "code") orelse "provider_error";
-        const message = stringField(fields, "message") orelse "Provider response failed";
+        const code = try self.maskedCopy(alloc, stringField(fields, "code") orelse "provider_error");
+        defer alloc.free(code);
+        const message = try self.maskedCopy(alloc, stringField(fields, "message") orelse "Provider response failed");
+        defer alloc.free(message);
         const bounded_code = types.ModelFailureDiagnostic.init(code);
         const bounded_message = types.ModelFailureDiagnostic.init(message);
         var buffer: [2 * types.ModelFailureDiagnostic.max_bytes + 2]u8 = undefined;
@@ -1202,6 +1207,14 @@ pub const Reducer = struct {
             .cyber_policy
         else
             .non_retryable;
+    }
+
+    /// `text` with every copy of the request's credential masked. The caller
+    /// owns the result.
+    fn maskedCopy(self: *const Reducer, alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+        const copy = try alloc.dupe(u8, text);
+        text_utils.maskLiteral(copy, self.credential);
+        return copy;
     }
 
     fn accept_text(
@@ -2002,6 +2015,23 @@ test "Responses names a cyber policy failure as its own cause" {
             completion.provider_failure_detail.?,
         );
     }
+}
+
+test "Responses masks the request's credential in a failure before it cuts it short" {
+    const key = "test-credential-0123456789";
+    // The detail reads "cyber_policy: <message>" and keeps 253 bytes, so the
+    // key starts 9 bytes before the cut.
+    const message = text_utils.repeat("x", 253 - 9 - "cyber_policy: ".len) ++ key ++ " was flagged.";
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    stream.reducer.credential = key;
+    try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"cyber_policy\",\"message\":\"" ++ message ++ "\"}}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    const detail = completion.provider_failure_detail.?;
+    try std.testing.expect(detail.len <= types.ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.mem.find(u8, detail, key[0..4]) == null);
+    try std.testing.expect(std.mem.find(u8, detail, "*********...") != null);
 }
 
 test "Responses terminal metadata rejects contradictions before publishing final text" {
