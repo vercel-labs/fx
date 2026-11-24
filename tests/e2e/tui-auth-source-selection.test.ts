@@ -6416,6 +6416,13 @@ test("Grok logout keeps a sign-out xAI refuses and finishes it at the next logou
     expect(second.stderr).toBe("");
     const revoked = working.requests.filter((request) => request.path === "/oauth2/revoke");
     expect(revoked.map((request) => new URLSearchParams(request.body ?? "").get("token"))).toEqual(["grok-refresh"]);
+    const grokRevokeForms = [...refusing.requests, ...working.requests]
+      .filter((request) => request.path === "/oauth2/revoke")
+      .map((request) => Object.fromEntries(new URLSearchParams(request.body ?? "")));
+    expect(grokRevokeForms).toEqual([
+      { token: "grok-refresh", client_id: "b1a00492-073a-47ea-816f-4c329264a828" },
+      { token: "grok-refresh", client_id: "b1a00492-073a-47ea-816f-4c329264a828" },
+    ]);
     expect(existsSync(pendingPath)).toBe(false);
   } finally {
     refusing.stop();
