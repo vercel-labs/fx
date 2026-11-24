@@ -5360,6 +5360,143 @@ test "ACP permission with no client left is denied without a request" {
     try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
 }
 
+test "a client whose input ended is marked ended as it leaves, so the record a kept turn reads says so" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const session = server.firstSession(&state).?;
+    try std.testing.expect(!server.clientInputEnded(session));
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+    try std.testing.expect(server.clientInputEnded(session));
+}
+
+test "a host tool with no client left says the client is gone, even when the request table is full" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-host-tool.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+
+    while (try server.beginOutboundRequest(session, .host_tool)) |_| {}
+    const result = try callHostTool(@ptrCast(session), alloc, "sample_tool", "call_host_1", "{}", 1024, null);
+    switch (result) {
+        .failure => |text| try std.testing.expectEqualStrings(host_tool_gone_text, text),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "an elicitation with no client left is refused at once, and no request is written" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-elicitation.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var context = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    var responder = AcpElicitationResponderContext{
+        .acp = &context,
+        .tool_call_id = "call_elicit_1",
+        .operation_cancel_flag = null,
+    };
+    defer responder.deinit();
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+
+    const origin = tool_mcp_runtime.InputOrigin{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "fixture",
+        .operation = .{ .tools_call = "echo" },
+        .runtime_generation = 1,
+        .connection_generation = 1,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .request_generation = 4,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+    const input_request = mcp_elicitation.Request{
+        .wire = .legacy_mcp_2025_11,
+        .mode = .form,
+        .message = try alloc.dupe(u8, "Pick one"),
+        .raw_params_json = try alloc.dupe(u8, "{\"message\":\"Pick one\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}"),
+        .requested_schema_json = try alloc.dupe(u8, "{\"type\":\"object\",\"properties\":{}}"),
+    };
+    try std.testing.expectError(error.McpInputRequired, requestAcpElicitation(&responder, alloc, origin, input_request));
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "ACP permission after the only client closed its session is denied without a request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-closed-permission.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+    try std.testing.expect(!server.leaveMember(&state, session, .closed));
+
+    const call = ToolCall{
+        .id = "provider_call_11",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    };
+    var response = try requestAcpPermission(&ctx, alloc, .{ .label = "Run ls" }, call, null, null);
+    defer response.deinit();
+    try std.testing.expect(response.decision == .deny);
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
 test "ACP permission arguments are validated and reserialized before emission" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);

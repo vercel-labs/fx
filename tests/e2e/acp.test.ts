@@ -7621,6 +7621,91 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a kept turn whose only client ends its input gets an error result from an MCP server's input request, and the turn goes on",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-kept-elicitation-");
+      const pidPath = join(root.root, "mcp-kept-elicitation.pid");
+      const heldRun = deferred<Response>();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_kept", "toolbox", { open: MCP_TOOL_NAME }),
+        () => heldRun.promise,
+        finalText("KEPT_ELICITATION_DONE"),
+      ]);
+      const gatewayAfter = startFakeGateway([]);
+      let reloaded: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request(
+          "initialize",
+          {
+            protocolVersion: 1,
+            clientCapabilities: {
+              elicitation: { form: {} },
+              _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+            },
+          },
+          1,
+        );
+        const created = (await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [acpStdioServer("unused", pidPath, "mrtr_input_required", { FX_MCP_EXPECT_ELICITATION: "form" })],
+          },
+          2,
+        )) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+
+        sendPrompt(client, 4, "Start an MCP elicitation and wait for the client.");
+        await waitForCondition("the run call's Gateway request", () => gateway.requests.length === 2);
+        client.endStdin();
+        // No output marks the moment fx reads the end of input and drops the only client, so the
+        // MCP call waits a moment for that step, as the disconnect driver does.
+        await Bun.sleep(500);
+        heldRun.resolve(fakeGatewayToolCall("call_kept", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "kept" } }));
+        const { responses } = await readUntilResponses(client, [4]);
+        expect(responses.get(4)?.error).toBeUndefined();
+        expect(responses.get(4)?.result?.stopReason).toBe("end_turn");
+        expect(await client.waitForExit(TIMEOUT)).toBe(0);
+        expect(client.stderr).toBe("");
+        expect(gateway.requests.length).toBe(3);
+        expect(String(gateway.requests[2]?.body)).toContain("the server asked for input fx can't give");
+        await expectMcpProcessExited(pidPath);
+
+        reloaded = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gatewayAfter) });
+        await reloaded.request("initialize", { protocolVersion: 1 }, 1);
+        reloaded.send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const { responses: loaded, messages } = await readUntilResponses(reloaded, [2]);
+        expect(loaded.get(2)?.error).toBeUndefined();
+        const replayed = messages
+          .map((message) => message.params?.update)
+          .filter((update) => update?.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("");
+        expect(replayed).toContain("KEPT_ELICITATION_DONE");
+        for (const notice of ["cancelled", "failed", "fx stopped before this turn finished"]) {
+          expect(replayed).not.toContain(notice);
+        }
+      } finally {
+        await client?.close();
+        await reloaded?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "secret-like form fields are rejected before ACP publication or model exposure",
     async () => {
       const sentinel = "S10_SECRET_SENTINEL_7f3c";

@@ -1998,6 +1998,11 @@ pub fn leaveMember(state: *ServerState, session: *ActiveSessionState, leave: Fol
     if (session.members.items.len > 1) {
         if (findMemberLocked(session, state.connection_id)) |member| withdrawFollowerInput(member, session, leave);
     }
+    // An ended input is recorded on the record before it leaves. A kept turn that is left with no member reads
+    // the record that left last (`mainLocked`), so its input must already say that it has ended.
+    if (leave == .left) {
+        if (findMemberLocked(session, state.connection_id)) |member| markInputEndedLocked(member);
+    }
     return removeMemberLocked(session, state.connection_id);
 }
 
@@ -2897,7 +2902,8 @@ pub fn clientInputEnded(session: *ActiveSessionState) bool {
 
 /// Whether no client can answer a request to the session: it has no member left, or its main client's
 /// input has ended. A permission request that no client can answer is denied at once. With no member left,
-/// `mainLocked` returns the last record that left, whose input was never marked ended, so it is not read.
+/// `mainLocked` returns the record that left last. A client that ended its input is marked on that record as it
+/// leaves, but a client whose session was closed still has its input open, so only the member count covers it.
 pub fn noClientCanAnswer(session: *ActiveSessionState) bool {
     var audience = lockAudience(session);
     defer audience.unlock();
@@ -3026,6 +3032,11 @@ fn markMemberInputEnded(session: *ActiveSessionState, connection_id: ConnectionI
     var audience = lockAudience(session);
     defer audience.unlock();
     const member = findMemberLocked(session, connection_id) orelse return;
+    markInputEndedLocked(member);
+}
+
+/// Records on `member` that its input has ended. The caller holds `audience_mutex`.
+fn markInputEndedLocked(member: *Member) void {
     const io = io_mod.getIo();
     member.outbound_mutex.lockUncancelable(io);
     defer member.outbound_mutex.unlock(io);
