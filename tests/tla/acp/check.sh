@@ -67,6 +67,19 @@
 # bug that its named invariant must catch, and the simulate-* configs run random
 # behaviors. Ideal has no crash and no input end.
 #
+# AcpApprovals: approvals across the clients of one session. A turn's permission
+# question goes to every client that has the session open. The first valid answer
+# decides, and the other clients are told. Only the client that sent the turn's
+# prompt may choose "allow for this session". A leaving client's question is not
+# asked again, and it is denied when no client is left. A joiner gets the open
+# question after its replay. Design A gives each client its own request id, and
+# design B gives the session one id space, shared with host tool requests. The
+# current-* configs are today's code, which sends the question to the main client
+# only and asks it again when the main leaves. Each mutant-* config plants one bug
+# that its named invariant or property must catch, and the simulate-* configs run
+# random behaviors. The witness-* configs must reach a state that a rule forbids,
+# so the model is not vacuous. Time and the cost of a stuck client are not modelled.
+#
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
 #   bun ../drivers/acp/permission_modes/check-spec.ts
@@ -99,6 +112,8 @@
 #   bun ../drivers/acp/session_readers/check-spec.ts
 #   bun ../drivers/acp/shared_input/check-spec.ts
 #   bun ../drivers/acp/shared_input/driver.ts   # the real fx acp with a follower's input, against AcpSharedInputTrace
+#   bun ../drivers/acp/approvals/check-spec.ts
+#   bun ../drivers/acp/approvals/driver.ts   # the real fx acp with a follower's permission question, against AcpApprovalsTrace
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -210,6 +225,29 @@ AcpSessionStaysOpen simulate-ideal-a simulate -simulate num=20000 -depth 20 -see
 AcpSessionStaysOpen simulate-nonideal-a simulate -simulate num=20000 -depth 20 -seed 1
 AcpSessionStaysOpen simulate-ideal-b simulate -simulate num=20000 -depth 20 -seed 1
 AcpSessionStaysOpen simulate-nonideal-b simulate -simulate num=20000 -depth 20 -seed 1
+AcpApprovals approvals-design-a -
+AcpApprovals approvals-design-b -
+AcpApprovals approvals-current-fanout EveryClientGetsQuestion
+AcpApprovals approvals-current-reask NoReAsk
+AcpApprovals approvals-current-sender-always OnlySenderAlways
+AcpApprovals approvals-mutant-a-always-anyone OnlySenderAlways
+AcpApprovals approvals-mutant-a-second-answer DecisionStable
+AcpApprovals approvals-mutant-a-no-cancel OthersTold
+AcpApprovals approvals-mutant-a-reask NoReAsk
+AcpApprovals approvals-mutant-a-joiner-misses EveryClientGetsQuestion
+AcpApprovals approvals-mutant-a-no-deny-last DeniedWhenNoClient
+AcpApprovals approvals-mutant-a-foreign-id WinnerHadRequest
+AcpApprovals approvals-mutant-a-write-after OthersTold
+AcpApprovals approvals-mutant-a-follower-dropped ValidAnswerNotRefused
+AcpApprovals approvals-mutant-b-host-collide IdsDistinct
+AcpApprovals approvals-simulate-ideal-a simulate -simulate num=20000 -depth 20 -seed 1
+AcpApprovals approvals-simulate-nonideal-a simulate -simulate num=20000 -depth 20 -seed 1
+AcpApprovals approvals-simulate-ideal-b simulate -simulate num=20000 -depth 20 -seed 1
+AcpApprovals approvals-simulate-nonideal-b simulate -simulate num=20000 -depth 20 -seed 1
+AcpApprovals approvals-witness-follower NoFollowerWin
+AcpApprovals approvals-witness-always NoAlwaysWin
+AcpApprovals approvals-single-a -
+AcpApprovals approvals-single-b -
 EOF
 
 if [ "$ci" = true ]; then

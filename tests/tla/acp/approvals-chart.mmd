@@ -1,0 +1,49 @@
+stateDiagram-v2
+  %% Today's code (the "current" design of AcpApprovals.tla), as a person sees a shared session.
+  %% Drawn from TLC's shortest counterexamples for the three rules it breaks.
+  [*] --> OpenAlone
+  state "Open, only the opener" as OpenAlone
+  state "Open, the opener and a follower" as Pair
+  state "Turn running" as Running
+  state "Question open, the main client holds it" as Asked
+  state "Main left, the next client asked again" as Reasked
+  state "Main picks allow for this session on a turn it did not start" as Granted
+  state "Question decided, turn goes on" as Decided
+  state "Nobody open, question denied" as Denied
+
+  OpenAlone --> Pair : a second client opens the session
+  OpenAlone --> Running : the opener sends a prompt
+  Pair --> Running : the opener sends a prompt
+  Running --> Asked : the turn asks for permission
+  Asked --> Decided : the main answers once or rejects
+  Asked --> Reasked : the main client leaves, another stays
+  Asked --> Granted : the main answers allow for this session, and a follower sent the prompt
+  Asked --> Denied : the last client leaves
+  Reasked --> Decided : the new main answers
+  Granted --> Decided : the grant is kept for the session
+  Decided --> Running : the turn goes on
+  Running --> OpenAlone : the turn ends with one client
+  Running --> Pair : the turn ends with two clients
+
+  note right of Asked
+    BROKEN: EveryClientGetsQuestion. A follower is open, and the question
+    is held by the main only. Shortest path: the opener prompts, a second
+    client joins, the turn asks (3 steps from the start).
+  end note
+
+  note right of Reasked
+    BROKEN: NoReAsk. The main left, and the next client got the question
+    again under a new id. Shortest path: a third client joins, the opener
+    prompts, the turn asks, the opener leaves (4 steps).
+  end note
+
+  note right of Granted
+    BROKEN: OnlySenderAlways. The main client, which did not send the prompt,
+    decided "allow for this session", and that grant is kept for the whole
+    session. Shortest path: a third client joins, that client prompts, the
+    turn asks, the main answers always (4 steps).
+  end note
+
+  note left of Denied
+    Holds: DeniedWhenNoClient. A question is denied once no client is left.
+  end note

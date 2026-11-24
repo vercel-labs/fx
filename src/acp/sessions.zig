@@ -870,8 +870,11 @@ fn joinSession(
         try sendSessionInfoUpdate(joiner, session, alloc, false);
         try server.replayRunningCopy(joiner, alloc, session);
     }
+    try server.offerOpenPermissionQuestion(session, joiner, alloc);
+    errdefer server.dropOpenPermissionCopies(session, joiner.connection_id);
     try state.writer.writeResponse(alloc, msg.id, answer);
     if (!server.listMemberLocked(session, joiner)) {
+        server.dropOpenPermissionCopies(session, joiner.connection_id);
         joiner.destroy();
         return;
     }

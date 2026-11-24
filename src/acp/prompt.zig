@@ -1079,7 +1079,7 @@ fn callHostTool(
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(session, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse {
-        if (!server.clientInputEnded(session)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        if (!server.noClientCanAnswer(session)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
         debug_trace.logf("acp", "event=host_tool_unavailable reason=client_input_ended tool={s}", .{name});
         return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
     };
@@ -3007,20 +3007,41 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var request_id = server.beginPermissionRequest(ctx.session) orelse {
-        if (!server.clientInputEnded(ctx.session)) return error.PermissionRequestAlreadyPending;
+    const question = server.beginPermissionQuestion(ctx.session) orelse {
+        if (!server.noClientCanAnswer(ctx.session)) return error.PermissionRequestAlreadyPending;
         debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
         return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
     };
     errdefer {
-        server.cancelPermissionRequest(ctx.session, request_id);
-        _ = server.awaitPermissionDecision(ctx.session, request_id);
+        server.cancelPermissionQuestion(ctx.session, question);
+        _ = server.awaitPermissionQuestion(ctx.session, question);
     }
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();
     const tool_call_id = try ctx.sendToolCallPending(pending_arena.allocator(), call);
 
+    const sender_params = try permissionQuestionParams(alloc, ctx, request, call, tool_call_id, validated_arguments.written(), true);
+    defer alloc.free(sender_params);
+    const other_params = try permissionQuestionParams(alloc, ctx, request, call, tool_call_id, validated_arguments.written(), false);
+    defer alloc.free(other_params);
+    try server.writePermissionQuestion(ctx.session, question, alloc, sender_params, other_params);
+
+    const decision = server.awaitPermissionQuestion(ctx.session, question);
+    return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
+}
+
+/// The `session/request_permission` params for one client of a permission question. Only the client that
+/// sent the prompt is offered "allow for this session" (`offers_always`).
+fn permissionQuestionParams(
+    alloc: Allocator,
+    ctx: *AcpContext,
+    request: permission_request.PermissionRequest,
+    call: ToolCall,
+    tool_call_id: []const u8,
+    arguments_json: []const u8,
+    offers_always: bool,
+) ![]u8 {
     var params: std.Io.Writer.Allocating = .init(alloc);
     defer params.deinit();
     try params.writer.writeAll("{\"sessionId\":");
@@ -3034,7 +3055,7 @@ fn requestAcpPermission(
     try params.writer.writeAll(",\"kind\":");
     try jsonrpc.writeJsonStr(mapToolKind(call.name).jsonString(), &params.writer);
     try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
-    try params.writer.writeAll(validated_arguments.written());
+    try params.writer.writeAll(arguments_json);
     // An edit shows the change it asks to make.
     if (request.file) |file| if (file.change) |change| if (fittingDiff(tool_call_id, .{
         .path = change.path,
@@ -3048,51 +3069,13 @@ fn requestAcpPermission(
     try params.writer.writeAll("},\"options\":[");
     try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
-    try params.writer.writeByte(',');
+    if (offers_always) {
+        try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
+        try params.writer.writeByte(',');
+    }
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
     try params.writer.writeAll("]}");
-
-    // A permission follows the main client through at most this many hand-offs. Each
-    // hand-off asks the new main again, with the same request, under a new id.
-    const max_asks: usize = 8;
-    var asks: usize = 0;
-    while (true) {
-        asks += 1;
-        const main_record = server.holdMain(ctx.session);
-        defer main_record.drop();
-        const main = main_record;
-        const written = server.writeRequestToMain(ctx.session, request_id, alloc, "session/request_permission", params.writer.buffered());
-        if (written) |_| {
-            switch (server.awaitPermissionAnswer(ctx.session, request_id)) {
-                .decided => |decision| return permission_request.OwnedPermissionResponse.init(alloc, decision, null),
-                .moved => {},
-            }
-        } else |err| switch (err) {
-            // The main changed after the request began. The hand-off already answered the
-            // request `moved`, so waiting for it only takes that answer.
-            error.MainChanged => _ = server.awaitPermissionAnswer(ctx.session, request_id),
-            error.BrokenPipe => {
-                // Returning a value skips the errdefer above, so the pending request
-                // is ended here: the client closed its output and can't answer.
-                server.cancelPermissionRequest(ctx.session, request_id);
-                _ = server.awaitPermissionDecision(ctx.session, request_id);
-                if (!server.mainWriteFailed(ctx.session, main)) {
-                    debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
-                    return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-                }
-            },
-            else => return err,
-        }
-        if (asks >= max_asks) {
-            debug_trace.logf("acp", "event=permission_denied reason=too_many_main_changes tool={s}", .{call.name});
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        }
-        request_id = server.beginPermissionRequest(ctx.session) orelse {
-            debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        };
-    }
+    return alloc.dupe(u8, params.writer.buffered());
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
@@ -4447,7 +4430,7 @@ fn requestAcpElicitation(
     defer main_record.drop();
     const state = main_record;
     const outbound_id = (try server.beginOutboundRequest(session, .elicitation)) orelse {
-        if (server.clientInputEnded(responder.acp.session)) {
+        if (server.noClientCanAnswer(responder.acp.session)) {
             debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
         }
         return error.McpInputRequired;
@@ -5329,6 +5312,182 @@ test "ACP permission to a client whose input ended is denied without a request" 
 
     const call = ToolCall{
         .id = "provider_call_9",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    };
+    var response = try requestAcpPermission(&ctx, alloc, .{ .label = "Run ls" }, call, null, null);
+    defer response.deinit();
+    try std.testing.expect(response.decision == .deny);
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "ACP permission with no client left is denied without a request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-permission.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+
+    const call = ToolCall{
+        .id = "provider_call_10",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    };
+    var response = try requestAcpPermission(&ctx, alloc, .{ .label = "Run ls" }, call, null, null);
+    defer response.deinit();
+    try std.testing.expect(response.decision == .deny);
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "a client whose input ended is marked ended as it leaves, so the record a kept turn reads says so" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const session = server.firstSession(&state).?;
+    try std.testing.expect(!server.noClientCanAnswer(session));
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+    try std.testing.expect(session.last_main.?.input_ended);
+}
+
+test "a host tool after the last client closed its session says the client is gone, even when the request table is full" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-host-tool.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    try std.testing.expect(!server.leaveMember(&state, session, .closed));
+
+    while (try server.beginOutboundRequest(session, .host_tool)) |_| {}
+    const result = try callHostTool(@ptrCast(session), alloc, "sample_tool", "call_host_1", "{}", 1024, null);
+    switch (result) {
+        .failure => |text| try std.testing.expectEqualStrings(host_tool_gone_text, text),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "an elicitation with no client left is refused at once, and no request is written" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-elicitation.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var context = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    var responder = AcpElicitationResponderContext{
+        .acp = &context,
+        .tool_call_id = "call_elicit_1",
+        .operation_cancel_flag = null,
+    };
+    defer responder.deinit();
+    try std.testing.expect(!server.leaveMember(&state, session, .left));
+
+    const origin = tool_mcp_runtime.InputOrigin{
+        .wire = .legacy_mcp_2025_11,
+        .server_name = "fixture",
+        .operation = .{ .tools_call = "echo" },
+        .runtime_generation = 1,
+        .connection_generation = 1,
+        .client_generation = 2,
+        .catalog_generation = 3,
+        .request_generation = 4,
+        .auth_generation = 5,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+    const input_request = mcp_elicitation.Request{
+        .wire = .legacy_mcp_2025_11,
+        .mode = .form,
+        .message = try alloc.dupe(u8, "Pick one"),
+        .raw_params_json = try alloc.dupe(u8, "{\"message\":\"Pick one\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}"),
+        .requested_schema_json = try alloc.dupe(u8, "{\"type\":\"object\",\"properties\":{}}"),
+    };
+    try std.testing.expectError(error.McpInputRequired, requestAcpElicitation(&responder, alloc, origin, input_request));
+    try std.testing.expectEqual(@as(u64, 0), try capture.length(io_mod.getIo()));
+}
+
+test "ACP permission after the only client closed its session is denied without a request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-closed-permission.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state: server.ServerState = undefined;
+    try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    const session = server.firstSession(&state).?;
+    var turn_settings = try TurnSettings.capture(alloc, session);
+    defer turn_settings.deinit(alloc);
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .host = state.host,
+        .session = session,
+        .turn = &turn_settings,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+    try std.testing.expect(!server.leaveMember(&state, session, .closed));
+
+    const call = ToolCall{
+        .id = "provider_call_11",
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
     };
