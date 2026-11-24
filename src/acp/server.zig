@@ -407,6 +407,7 @@ pub const ServerState = struct {
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
+    outbound_closed: bool = false,
     next_outbound_request_id: u64 = 1,
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
@@ -1219,8 +1220,10 @@ pub fn runWithTransport(
         };
         if (state.terminate_connection) break;
     }
-    // Release any prompt thread parked on a pending approval before
-    // state.deinit() joins it, or shutdown deadlocks.
+    // Close outbound admission before cancelling existing waiters so a prompt
+    // entering `beginOutboundRequest` after the sweep cannot block forever
+    // (`tests/tla/acp_eof/AcpEof.tla` NoWaitAfterEof).
+    closeOutboundOnEof(&state);
     handleCancel(&state, false);
 }
 
@@ -1275,10 +1278,29 @@ fn parsePermissionDecision(root: std.json.Value) ?types.ToolPermissionDecision {
     return null;
 }
 
+fn outboundRefusedLocked(state: *const ServerState) bool {
+    if (state.outbound_closed) return true;
+    const session = if (state.active_session) |*active| active else return false;
+    return session.cancel_flag.load(.seq_cst);
+}
+
+pub fn closeOutboundOnEof(state: *ServerState) void {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    state.outbound_closed = true;
+}
+
+pub fn outboundClosedOrCancelled(state: *ServerState) bool {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    return outboundRefusedLocked(state);
+}
+
 pub fn beginOutboundRequest(state: *ServerState, kind: OutboundKind) !?u64 {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
-    if (state.pending_outbound.count() >= max_pending_outbound or
+    if (outboundRefusedLocked(state) or
+        state.pending_outbound.count() >= max_pending_outbound or
         state.next_outbound_request_id > @as(u64, @intCast(std.math.maxInt(i64))))
     {
         return null;
@@ -4901,6 +4923,117 @@ test "ACP outbound responses correlate out of order and ignore unknown ids" {
     var first_response = awaitOutboundResponse(&state, first, .elicitation).?;
     defer first_response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"action\":\"cancel\"}", first_response.result_json.?);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "ACP outbound requests return ids across kinds and cancel existing waiters on handleCancel" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+    };
+    defer state.pending_outbound.deinit(alloc);
+
+    const permission_id = (try beginOutboundRequest(&state, .permission)).?;
+    const host_tool_id = (try beginOutboundRequest(&state, .host_tool)).?;
+    const journal_id = (try beginOutboundRequest(&state, .journal)).?;
+    try std.testing.expect(permission_id != host_tool_id);
+    try std.testing.expect(host_tool_id != journal_id);
+
+    handleCancel(&state, false);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, permission_id));
+
+    var host_tool_response = awaitOutboundResponse(&state, host_tool_id, .host_tool).?;
+    defer host_tool_response.deinit(alloc);
+    try std.testing.expect(host_tool_response.cancelled);
+
+    var journal_response = awaitOutboundResponse(&state, journal_id, .journal).?;
+    defer journal_response.deinit(alloc);
+    try std.testing.expect(journal_response.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "ACP closeOutboundOnEof blocks new outbound requests while cancelling waiting ones" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+    };
+    defer state.pending_outbound.deinit(alloc);
+
+    const waiting_permission = (try beginOutboundRequest(&state, .permission)).?;
+    const waiting_host_tool = (try beginOutboundRequest(&state, .host_tool)).?;
+    closeOutboundOnEof(&state);
+    try std.testing.expect(outboundClosedOrCancelled(&state));
+    try std.testing.expect((try beginOutboundRequest(&state, .permission)) == null);
+    try std.testing.expect((try beginOutboundRequest(&state, .host_tool)) == null);
+    try std.testing.expect((try beginOutboundRequest(&state, .journal)) == null);
+
+    handleCancel(&state, false);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, waiting_permission));
+    var host_tool_response = awaitOutboundResponse(&state, waiting_host_tool, .host_tool).?;
+    defer host_tool_response.deinit(alloc);
+    try std.testing.expect(host_tool_response.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "ACP session cancel_flag blocks new outbound requests until a new prompt clears it" {
+    const Capture = struct {
+        saw_cancel: bool = false,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "\"$/cancel_request\"") != null) {
+                self.saw_cancel = true;
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    var capture = Capture{};
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
+    };
+    defer state.pending_outbound.deinit(alloc);
+    state.active_session = .{
+        .session_id = @constCast("session"),
+        .model = @constCast("model"),
+        .mode = "ask",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+
+    const before_cancel = (try beginOutboundRequest(&state, .permission)).?;
+    handleCancel(&state, true);
+    try std.testing.expect(capture.saw_cancel);
+    try std.testing.expect(!state.outbound_closed);
+    try std.testing.expect(outboundClosedOrCancelled(&state));
+    try std.testing.expect((try beginOutboundRequest(&state, .permission)) == null);
+    try std.testing.expect((try beginOutboundRequest(&state, .host_tool)) == null);
+    try std.testing.expect((try beginOutboundRequest(&state, .journal)) == null);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, before_cancel));
+
+    state.active_session.?.cancel_flag.store(false, .seq_cst);
+    try std.testing.expect(!outboundClosedOrCancelled(&state));
+    const after_reset = (try beginOutboundRequest(&state, .permission)).?;
+    handleClientResponse(&state, alloc, &.{
+        .id = .{ .integer = @intCast(after_reset) },
+        .result_raw = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}",
+    });
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, awaitPermissionDecision(&state, after_reset));
     try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
 }
 
