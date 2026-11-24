@@ -3444,9 +3444,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// A hosted subagent's tool events reach the app instead of its
-        /// turn: its current call goes to its host, for status and the agent
-        /// list, and a shell command that crossed the quiet limit is relayed
-        /// to its parent (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
+        /// turn: its current call goes to its host, for status, and a shell
+        /// command that crossed the quiet limit is relayed to its parent
+        /// (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
         pub fn noteChildToolLifecycle(app: *App, agent: *AppAgent, lifecycle: types.ToolLifecycleEvent) void {
             if (agent.role != .subagent) return;
             const child = hostedOf(app, agent) orelse return;
