@@ -5441,6 +5441,27 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
     "two subagents wait at once, and main answers both",
     async () => {
       const childCalls = { writer: 0, helper: 0 };
+      const approveCalls = { writer: 0, helper: 0 };
+      const approve = (agent: "writer" | "helper") =>
+        toolCall(`main_e5_approve_${agent}_${approveCalls[agent]++}`, "subagent", { action: "approve", agent });
+      const approvalAllowed = (body: string, agent: string): boolean => {
+        let allowed = false;
+        const walk = (value: any) => {
+          if (allowed) return;
+          if (Array.isArray(value)) value.forEach(walk);
+          else if (value && typeof value === "object") {
+            if (
+              value.type === "tool-result" &&
+              typeof value.toolCallId === "string" &&
+              value.toolCallId.startsWith(`main_e5_approve_${agent}`) &&
+              JSON.stringify(value.output).includes("Allowed")
+            ) allowed = true;
+            else Object.values(value).forEach(walk);
+          }
+        };
+        walk(JSON.parse(body));
+        return allowed;
+      };
       await withFx((body) => {
         if (!SPIKE_MAIN(body)) {
           const who = body.includes("SPIKE_E5_WRITER") ? "writer" : "helper";
@@ -5457,14 +5478,36 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
           ]);
         }
         if (body.includes(SPIKE_NOTE)) {
-          if (!body.includes("main_e5_approve_writer")) {
-            return toolCall("main_e5_approve_writer", "subagent", { action: "approve", agent: "writer" });
+          // Approve the agent the newest note names, once per agent: a fixed
+          // order approved writer before writer's request had reached fx ("has
+          // no approval request waiting"), and helper's earlier note then made
+          // the later one find both approve calls in the history and never get
+          // answered. The note's quotes arrive JSON-escaped inside its message,
+          // so match the agent's name, not `agent "name"`.
+          const note = latestUserText(body);
+          const named: "writer" | "helper" | null = note.includes(SPIKE_NOTE)
+            ? note.includes("helper") ? "helper" : note.includes("writer") ? "writer" : null
+            : null;
+          if (named && !approvalAllowed(body, named)) return approve(named);
+          // An approve that came too early is made again once that agent's note
+          // is in the history, under a new call id.
+          const noted = (agent: "writer" | "helper") =>
+            userTexts(body).some((text) => text.includes(SPIKE_NOTE) && text.includes(agent));
+          for (const agent of ["writer", "helper"] as const) {
+            if (approvalAllowed(body, agent)) continue;
+            if (!noted(agent)) continue;
+            return approve(agent);
           }
-          if (!body.includes("main_e5_approve_helper")) {
-            return toolCall("main_e5_approve_helper", "subagent", { action: "approve", agent: "helper" });
+          // Both answered only once both approve results said the request was
+          // answered; otherwise end the turn so the next note starts another.
+          if (approvalAllowed(body, "writer") && approvalAllowed(body, "helper")) {
+            return text("main_e5_tail", "SPIKE_E5_BOTH_ANSWERED");
           }
+          return text("main_e5_waiting", "SPIKE_E5_WAITING");
         }
-        return text("main_e5_tail", "SPIKE_E5_BOTH_ANSWERED");
+        // Not a note turn (the opening turn's later request): nothing is
+        // answered yet, so only a note turn may say both were.
+        return text("main_e5_tail", "SPIKE_E5_STARTED");
       }, async (session, { workspace }) => {
         await session.sendText("SPIKE_USER_e5");
         await session.waitForText("SPIKE_E5_BOTH_ANSWERED", 30_000);
