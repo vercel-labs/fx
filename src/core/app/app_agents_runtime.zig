@@ -29,6 +29,7 @@ const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_reports = @import("../subagent/reports.zig");
+const subagent_delivery_test_controls = @import("../subagent/delivery_test_controls.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -2727,23 +2728,64 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Gives each posted delivery to its agent, in the order they were
-        /// posted (`App.postAgentMessage`). One whose agent is gone is
-        /// dropped; a report stays owed in the log.
+        /// posted (`App.postAgentMessage`). A delivery stays in the list until
+        /// its agent's worker has it, so mail is always in the list or in the
+        /// worker's queue, and `handoffMailWaiting` never misses it. One whose
+        /// agent is gone is dropped; a report stays owed in the log.
         fn deliverReports(app: *App) void {
-            var posted: std.ArrayList(*ReportPost) = .empty;
-            {
-                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
-                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-                if (app.child_handoffs.closed) return;
-                std.mem.swap(std.ArrayList(*ReportPost), &posted, &app.child_handoffs.reports);
-            }
-            defer posted.deinit(handoff_alloc);
-            for (posted.items) |post| {
-                defer post.destroy();
+            while (oldestReport(app)) |post| {
+                if (subagent_delivery_test_controls.deferred(post.child_id)) return;
                 deliverReport(app, post) catch |err| {
                     debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} kind={s} reason={s}", .{ post.child_id, post.work_id, @tagName(post.kind), @errorName(err) });
                 };
+                removeDelivered(app, post);
             }
+        }
+
+        /// The oldest delivery in the hand-off, which stays in the list. Only the
+        /// main loop removes one, so it stays valid until `removeDelivered`.
+        fn oldestReport(app: *App) ?*ReportPost {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.closed or app.child_handoffs.reports.items.len == 0) return null;
+            return app.child_handoffs.reports.items[0];
+        }
+
+        /// Takes `post`, the oldest delivery, out of the list once its agent's
+        /// worker has it or it was dropped, and frees it.
+        fn removeDelivered(app: *App, post: *ReportPost) void {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            std.debug.assert(app.child_handoffs.reports.items[0] == post);
+            _ = app.child_handoffs.reports.orderedRemove(0);
+            post.destroy();
+        }
+
+        /// Whether the hand-off holds a report or message that `deliverReport`
+        /// will give `agent`, which its worker's queue does not have yet. Runs
+        /// on the agent's worker thread with no lock held. It takes
+        /// `child_handoffs.mutex` to copy what it needs, releases it, and only
+        /// then takes `authority_mutex` to find the receivers, the way
+        /// `reserveMessagePlace` does, so no lock is held while another is taken.
+        pub fn handoffMailWaiting(app: *App, agent: *AppAgent) bool {
+            const Waiting = struct { host: *subagent_tool_host.Runtime, from_owner: bool };
+            var waiting: std.ArrayList(Waiting) = .empty;
+            defer waiting.deinit(handoff_alloc);
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return false;
+                for (app.child_handoffs.reports.items) |post| {
+                    waiting.append(handoff_alloc, .{ .host = post.host, .from_owner = post.from_owner }) catch return false;
+                }
+            }
+            if (waiting.items.len == 0) return false;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            for (waiting.items) |entry| {
+                if (receiverOf(app, entry.host, entry.from_owner) == agent) return true;
+            }
+            return false;
         }
 
         /// The agent a subagent's delivery from `host` goes to: the host's
