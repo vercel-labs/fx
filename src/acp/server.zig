@@ -2889,21 +2889,11 @@ fn answerIfMemberGone(session: *ActiveSessionState, member: *Member, request: Ou
     session.outbound.cond.broadcast(io);
 }
 
-/// Whether the main client's input has ended (`endClientInput`), so a request to
-/// it can't get an answer.
-pub fn clientInputEnded(session: *ActiveSessionState) bool {
-    const main_record = holdMain(session);
-    defer main_record.drop();
-    const state = main_record;
-    state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    defer state.outbound_mutex.unlock(io_mod.getIo());
-    return state.input_ended;
-}
-
-/// Whether no client can answer a request to the session: it has no member left, or its main client's
-/// input has ended. A permission request that no client can answer is denied at once. With no member left,
-/// `mainLocked` returns the record that left last. A client that ended its input is marked on that record as it
-/// leaves, but a client whose session was closed still has its input open, so only the member count covers it.
+/// Whether no client can answer a request to the session, so the request can't get an answer: the session has
+/// no member left, or its main client's input has ended. Every caller that asks whether a request can be
+/// answered uses this one check. With no member left, `mainLocked` returns the record that left last. A client
+/// whose input ended is marked on that record as it leaves, but a client whose session was closed still has
+/// its input open, so the member count is the check for that case.
 pub fn noClientCanAnswer(session: *ActiveSessionState) bool {
     var audience = lockAudience(session);
     defer audience.unlock();

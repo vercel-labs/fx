@@ -1079,7 +1079,7 @@ fn callHostTool(
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
     const outbound_id = (server.beginOutboundRequest(session, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse {
-        if (!server.clientInputEnded(session)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
+        if (!server.noClientCanAnswer(session)) return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
         debug_trace.logf("acp", "event=host_tool_unavailable reason=client_input_ended tool={s}", .{name});
         return .{ .failure = try alloc.dupe(u8, host_tool_gone_text) };
     };
@@ -4430,7 +4430,7 @@ fn requestAcpElicitation(
     defer main_record.drop();
     const state = main_record;
     const outbound_id = (try server.beginOutboundRequest(session, .elicitation)) orelse {
-        if (server.clientInputEnded(responder.acp.session)) {
+        if (server.noClientCanAnswer(responder.acp.session)) {
             debug_trace.logf("acp", "event=elicitation_unavailable reason=client_input_ended server={s}", .{origin.server_name});
         }
         return error.McpInputRequired;
@@ -5370,12 +5370,12 @@ test "a client whose input ended is marked ended as it leaves, so the record a k
     try initTestAcpState(&test_host, &state, alloc, "/tmp/workspace", .ask);
     defer state.deinit();
     const session = server.firstSession(&state).?;
-    try std.testing.expect(!server.clientInputEnded(session));
+    try std.testing.expect(!server.noClientCanAnswer(session));
     try std.testing.expect(!server.leaveMember(&state, session, .left));
-    try std.testing.expect(server.clientInputEnded(session));
+    try std.testing.expect(session.last_main.?.input_ended);
 }
 
-test "a host tool with no client left says the client is gone, even when the request table is full" {
+test "a host tool after the last client closed its session says the client is gone, even when the request table is full" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -5391,7 +5391,7 @@ test "a host tool with no client left says the client is gone, even when the req
     defer state.deinit();
     state.writer = .{ .stdout = capture };
     const session = server.firstSession(&state).?;
-    try std.testing.expect(!server.leaveMember(&state, session, .left));
+    try std.testing.expect(!server.leaveMember(&state, session, .closed));
 
     while (try server.beginOutboundRequest(session, .host_tool)) |_| {}
     const result = try callHostTool(@ptrCast(session), alloc, "sample_tool", "call_host_1", "{}", 1024, null);
