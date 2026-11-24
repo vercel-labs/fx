@@ -5664,6 +5664,33 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
+  // A server held back for an unset ${VAR} needs no login. A command's `list` and `search` say what `toolbox search`
+  // and `toolbox open` say for it (`Catalog.unavailableText`, src/core/mcp_host/model.zig).
+  const heldRoot = (label: string, variable: string) => {
+    const root = bridgeRoot(label);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.keyed = { type: "http", url: "https://keyed.example/mcp", bearer_token_env: variable };
+    writeFileSync(profilePath, JSON.stringify(profile));
+    return root;
+  };
+
+  test("list and search name the variable a server needs, not a login", async () => {
+    const root = heldRoot("bridge-held-variable", "FX_BRIDGE_NOT_SET_ANYWHERE");
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list keyed 2>&1; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search keyed 2>&1; echo "search=$?"`,
+      `"${FX_BIN}" mcp call list fixture 2>&1; echo "other=$?"`,
+    ].join("\n")));
+    const words = "fx mcp call: MCP server 'keyed' needs FX_BRIDGE_NOT_SET_ANYWHERE set before fx starts.";
+    expect(seen).toContain(`${words}\nlist=1`);
+    expect(seen).toContain(`${words}\nsearch=1`);
+    expect(seen).not.toContain("needs a login");
+    // The server that loads is listed as before.
+    expect(seen).toContain(`${TOOL_NAME}\tEcho text through the modern MCP fixture\nother=0`);
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
   test("a tool name with control bytes shows as visible escapes in a command's messages", async () => {
     const root = bridgeRoot("bridge-odd-name");
     // The name is a word the model wrote, so it can hold an escape sequence.
