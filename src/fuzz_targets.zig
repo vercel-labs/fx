@@ -35,6 +35,7 @@ test {
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/subscription_session.zig");
+    _ = @import("core/images/clipboard_read.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");

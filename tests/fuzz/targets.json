@@ -21,6 +21,7 @@
     {"name": "subagent_started_with", "module": "fx", "test": "a saved profile block stays canonical for fuzzed spawn data", "iterations": 1000000},
     {"name": "image_dimensions", "module": "fx", "test": "image dimension parsing stays bounded on arbitrary bytes", "iterations": 5000000},
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
+    {"name": "clipboard_read", "module": "fx", "test": "clipboard reads keep one read at a time on fuzzed step sequences", "iterations": 50000},
     {"name": "earlier_image_notes", "module": "fx", "test": "earlier images withheld from a request always leave a note", "iterations": 100000},
     {"name": "attached_selection", "module": "fx", "test": "attached files and carried-in omissions keep the selection bounded and inside the workspace", "iterations": 300000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
