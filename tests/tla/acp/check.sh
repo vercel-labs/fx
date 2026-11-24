@@ -113,6 +113,7 @@
 #   bun ../drivers/acp/shared_input/check-spec.ts
 #   bun ../drivers/acp/shared_input/driver.ts   # the real fx acp with a follower's input, against AcpSharedInputTrace
 #   bun ../drivers/acp/approvals/check-spec.ts
+#   bun ../drivers/acp/approvals/driver.ts   # the real fx acp with a follower's permission question, against AcpApprovalsTrace
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
