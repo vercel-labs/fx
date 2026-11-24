@@ -686,6 +686,7 @@ class AcpClient {
   private pendingNewSessions = new Set<number | string>();
   readonly rawLines: string[] = [];
   private permissionOptionId: "allow_once" | "allow_always" | "reject_once" = "reject_once";
+  private answersPermissions = true;
   private elicitationHandler?: (
     params: Record<string, unknown>,
     id: number | string,
@@ -764,6 +765,12 @@ class AcpClient {
 
   setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
     this.permissionOptionId = optionId;
+  }
+
+  /// Stops answering session/request_permission on the client's behalf, so the test
+  /// answers each request itself with send().
+  holdPermissionRequests(): void {
+    this.answersPermissions = false;
   }
 
   setElicitationHandler(handler: (
@@ -852,7 +859,7 @@ class AcpClient {
         if (message.error === undefined) this.activeSessionId = sessionId;
       }
     }
-    if (message.method === "session/request_permission" && message.id !== undefined) {
+    if (message.method === "session/request_permission" && message.id !== undefined && this.answersPermissions) {
       this.send({
         jsonrpc: "2.0",
         id: message.id,
@@ -16400,7 +16407,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "with two followers, the first to join gets the permission request still open when the opener leaves, and the second gets none",
+    "with two followers, both get the permission request still open when the opener leaves, and the first follower's allow once decides it for both",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-stays-open-two-");
       const gateway = startFakeGateway([
@@ -16424,15 +16431,450 @@ describe("acp: model-independent", () => {
         owner.endStdin();
 
         await first.waitForMessage(permissionFor("perm_2"), "the permission request for perm_2");
+        await second.waitForMessage(permissionFor("perm_2"), "the permission request for perm_2 on the second follower", QUESTION_WAIT);
         const asked = first.received.find(permissionFor("perm_2"));
+        const secondAsked = second.received.find(permissionFor("perm_2"));
         first.respond(asked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
         await first.waitForMessage(agentChunk("TWO_DONE"), "the turn's last text");
-        expect(second.received.some((message) => message.method === "session/request_permission")).toBe(false);
+        await second.waitForMessage(cancelFor(secondAsked.id), "the second follower's cancellation of its request", QUESTION_WAIT);
         expect(readFileSync(join(root.workspace, "two_target.txt"), "utf8")).toBe("TWO_WRITTEN\n");
       } finally {
         first?.close();
         second?.close();
         await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  /// How long a test waits for a question or a cancellation to reach a client. A missing one fails the test
+  /// by name, well before the test's own timeout.
+  const QUESTION_WAIT = 10_000;
+
+  /// Whether a message is the `$/cancel_request` for request `requestId`.
+  function cancelFor(requestId: number): (message: any) => boolean {
+    return (message) => message.method === "$/cancel_request" && message.params?.requestId === requestId;
+  }
+
+  /// Whether a message reports tool call `toolCallId` with `status`.
+  function toolStatusFor(toolCallId: string, status: string): (message: any) => boolean {
+    return (message) =>
+      message.method === "session/update" &&
+      message.params?.update?.sessionUpdate === "tool_call_update" &&
+      message.params.update.toolCallId === toolCallId &&
+      message.params.update.status === status;
+  }
+
+  /// The option ids a permission request offers, in order.
+  function offeredOptions(request: any): string[] {
+    return request.params.options.map((option: any) => option.optionId);
+  }
+
+  /// Answers a permission request the opener read, with an option id.
+  function answerFromOpener(opener: AcpClient, request: any, optionId: string): void {
+    opener.send({ jsonrpc: "2.0", id: request.id, result: { outcome: { outcome: "selected", optionId } } });
+  }
+
+  /// Joins the session as a follower, sends the prompt from it, and returns the prompt's request id.
+  function startPromptFromFollower(follower: LeaderSocketClient, sessionId: string, text: string): number {
+    return follower.start("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+  }
+
+  test(
+    "a follower that did not send the prompt gets the permission question, and its allow once decides the turn",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-follower-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_follower", "write_file", { path: "follower_once.txt", content: "FOLLOWER_ONCE\n" }),
+        finalText("FOLLOWER_ONCE_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_follower")), QUESTION_WAIT);
+        await follower.waitForMessage(permissionFor("question_follower"), "the question for the follower", QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_follower"));
+        const followerAsked = follower.received.find(permissionFor("question_follower"));
+        follower.respond(followerAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+
+        await waitForCondition("the opener's cancellation", () => parsedLines(opener!).some(cancelFor(openerAsked.id)), QUESTION_WAIT);
+        const prompt = await readResponse(opener, 10);
+        expect(prompt.result.stopReason).toBe("end_turn");
+        await follower.waitForMessage(toolStatusFor("question_follower", "completed"), "the tool's result on the follower", QUESTION_WAIT);
+        await waitForCondition("the tool's result on the opener", () => parsedLines(opener!).some(toolStatusFor("question_follower", "completed")), QUESTION_WAIT);
+        expect(readFileSync(join(root.workspace, "follower_once.txt"), "utf8")).toBe("FOLLOWER_ONCE\n");
+        expect(opener.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the question offered to a client that did not send the prompt has no allow for this session option, and the sender's has it",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-options-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_options", "write_file", { path: "options.txt", content: "OPTIONS\n" }),
+        finalText("OPTIONS_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        const promptId = startPromptFromFollower(follower, started.sessionId, "FOLLOWER_WRITE");
+        await follower.waitForMessage(permissionFor("question_options"), "the question for the sender", QUESTION_WAIT);
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_options")), QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_options"));
+        const senderAsked = follower.received.find(permissionFor("question_options"));
+        expect(offeredOptions(openerAsked)).toEqual(["allow_once", "reject_once"]);
+        expect(offeredOptions(senderAsked)).toEqual(["allow_once", "allow_always", "reject_once"]);
+
+        follower.respond(senderAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await follower.waitForMessage((message) => message.id === promptId && message.result !== undefined, "the sender's prompt answer");
+        expect(follower.received.find((message) => message.id === promptId).result.stopReason).toBe("end_turn");
+        expect(readFileSync(join(root.workspace, "options.txt"), "utf8")).toBe("OPTIONS\n");
+      } finally {
+        follower?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that did not send the prompt and picks allow for this session is refused, and the question stays open for the sender",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-refused-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_refused", "write_file", { path: "refused.txt", content: "REFUSED\n" }),
+        finalText("REFUSED_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        const promptId = startPromptFromFollower(follower, started.sessionId, "FOLLOWER_WRITE");
+        await follower.waitForMessage(permissionFor("question_refused"), "the question for the sender", QUESTION_WAIT);
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_refused")), QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_refused"));
+        const senderAsked = follower.received.find(permissionFor("question_refused"));
+
+        answerFromOpener(opener, openerAsked, "allow_always");
+        // A request on the opener's connection is answered after its earlier line is handled,
+        // so the refused answer is settled before the sender answers.
+        await opener.request("fx/settled", {}, 40);
+        expect(follower.received.some(cancelFor(senderAsked.id))).toBe(false);
+        expect(parsedLines(opener).some(cancelFor(openerAsked.id))).toBe(false);
+
+        follower.respond(senderAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await follower.waitForMessage((message) => message.id === promptId && message.result !== undefined, "the sender's prompt answer");
+        expect(follower.received.find((message) => message.id === promptId).result.stopReason).toBe("end_turn");
+        await waitForCondition("the opener's cancellation", () => parsedLines(opener!).some(cancelFor(openerAsked.id)), QUESTION_WAIT);
+        expect(readFileSync(join(root.workspace, "refused.txt"), "utf8")).toBe("REFUSED\n");
+      } finally {
+        follower?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a second answer after the decision changes nothing",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-second-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_second", "write_file", { path: "second.txt", content: "SECOND\n" }),
+        finalText("SECOND_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        follower = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_second")), QUESTION_WAIT);
+        await follower.waitForMessage(permissionFor("question_second"), "the question for the follower", QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_second"));
+        const followerAsked = follower.received.find(permissionFor("question_second"));
+
+        answerFromOpener(opener, openerAsked, "reject_once");
+        await follower.waitForMessage(cancelFor(followerAsked.id), "the follower's cancellation after the decision", QUESTION_WAIT);
+        follower.respond(followerAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await follower.request("fx/settled", {});
+
+        const prompt = await readResponse(opener, 10);
+        expect(prompt.result.stopReason).toBe("end_turn");
+        await waitForCondition("the tool's failure on the opener", () => parsedLines(opener!).some(toolStatusFor("question_second", "failed")), QUESTION_WAIT);
+        expect(existsSync(join(root.workspace, "second.txt"))).toBe(false);
+        expect(opener.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the main client leaves while the question waits: the others keep it, nobody is asked again, and a remaining client's answer decides",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-leave-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_leave", "write_file", { path: "leave.txt", content: "LEAVE\n" }),
+        finalText("LEAVE_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let first: LeaderSocketClient | undefined;
+      let second: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        first = await followSession(started.socket, started.sessionId, root);
+        second = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_leave")), QUESTION_WAIT);
+        await first.waitForMessage(permissionFor("question_leave"), "the question for the first follower", QUESTION_WAIT);
+        await second.waitForMessage(permissionFor("question_leave"), "the question for the second follower", QUESTION_WAIT);
+        const firstAsked = first.received.find(permissionFor("question_leave"));
+        const secondAsked = second.received.find(permissionFor("question_leave"));
+
+        // session/close is answered after the leave is handled, so a re-ask would already be sent.
+        const closed = (await opener.request("session/close", { sessionId: started.sessionId }, 20)) as any;
+        expect(closed.error).toBeUndefined();
+        expect(closed.result).toEqual({});
+
+        first.respond(firstAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await first.waitForMessage(toolStatusFor("question_leave", "completed"), "the tool's result on the first follower", QUESTION_WAIT);
+        await second.waitForMessage(cancelFor(secondAsked.id), "the second follower's cancellation", QUESTION_WAIT);
+        expect(first.received.filter(permissionFor("question_leave"))).toHaveLength(1);
+        expect(second.received.filter(permissionFor("question_leave"))).toHaveLength(1);
+        expect(readFileSync(join(root.workspace, "leave.txt"), "utf8")).toBe("LEAVE\n");
+      } finally {
+        first?.close();
+        second?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that joins while the question waits gets it before its load answer, and its allow once decides the turn",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-join-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_join", "write_file", { path: "join.txt", content: "JOIN\n" }),
+        finalText("JOIN_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let joiner: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_join")), QUESTION_WAIT);
+
+        joiner = await LeaderSocketClient.connect(started.socket);
+        await joiner.request("initialize", { protocolVersion: 1, clientCapabilities: fxClientCapabilities });
+        const loaded = await joiner.request("session/load", { sessionId: started.sessionId, cwd: root.workspace, mcpServers: [] });
+        expect(loaded.answer.error).toBeUndefined();
+        const questionAt = joiner.received.findIndex(permissionFor("question_join"));
+        expect(questionAt).toBeGreaterThanOrEqual(0);
+        expect(questionAt).toBeLessThan(joiner.received.indexOf(loaded.answer));
+
+        const joinerAsked = joiner.received.find(permissionFor("question_join"));
+        joiner.respond(joinerAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        const prompt = await readResponse(opener, 10);
+        expect(prompt.result.stopReason).toBe("end_turn");
+        expect(readFileSync(join(root.workspace, "join.txt"), "utf8")).toBe("JOIN\n");
+      } finally {
+        joiner?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the last client leaves while a kept turn's question waits: the question is denied at once and the turn goes on",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-keep-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_keep", "write_file", { path: "kept.txt", content: "KEPT\n" }),
+        finalText("KEPT_AFTER_DENIAL"),
+      ]);
+      let owner: AcpClient | undefined;
+      try {
+        owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        await startSessionListing(owner, {
+          _meta: { ...Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])), "sh.fx/keepTurnOnDisconnect": {} },
+        });
+        expect((await runPrompt(owner, "TURN_ONE_PROMPT", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        const mode = (await owner.request("session/set_mode", { modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        owner.holdPermissionRequests();
+
+        sendPrompt(owner, 10, "KEEP_WRITE");
+        await waitForCondition("the question", () => parsedLines(owner!).some(permissionFor("question_keep")), QUESTION_WAIT);
+        owner.endStdin();
+
+        await waitForCondition("the turn's reply after the denial", () => gateway.requests.length === 3, QUESTION_WAIT);
+        expect(existsSync(join(root.workspace, "kept.txt"))).toBe(false);
+        expect(await owner.waitForExit(TIMEOUT)).toBe(0);
+      } finally {
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the turn is cancelled while the question waits: every client gets the cancellation for its own request id",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-cancel-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_cancel", "write_file", { path: "cancel.txt", content: "CANCEL\n" }),
+        finalText("CANCEL_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let first: LeaderSocketClient | undefined;
+      let second: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        first = await followSession(started.socket, started.sessionId, root);
+        second = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_cancel")), QUESTION_WAIT);
+        await first.waitForMessage(permissionFor("question_cancel"), "the question for the first follower", QUESTION_WAIT);
+        await second.waitForMessage(permissionFor("question_cancel"), "the question for the second follower", QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_cancel"));
+        const firstAsked = first.received.find(permissionFor("question_cancel"));
+        const secondAsked = second.received.find(permissionFor("question_cancel"));
+
+        first.notify("session/cancel", { sessionId: started.sessionId });
+        await waitForCondition("the opener's cancellation", () => parsedLines(opener!).some(cancelFor(openerAsked.id)), QUESTION_WAIT);
+        await first.waitForMessage(cancelFor(firstAsked.id), "the first follower's cancellation", QUESTION_WAIT);
+        await second.waitForMessage(cancelFor(secondAsked.id), "the second follower's cancellation", QUESTION_WAIT);
+        const prompt = await readResponse(opener, 10);
+        expect(prompt.result.stopReason).toBe("cancelled");
+        expect(existsSync(join(root.workspace, "cancel.txt"))).toBe(false);
+      } finally {
+        first?.close();
+        second?.close();
+        await opener?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that stops reading does not hold the decision for another client, which lands well under the one second write limit",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-question-stall-");
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        fakeGatewayToolCall("question_stall", "write_file", { path: "stall.txt", content: "STALL\n" }),
+        finalText("STALL_DONE"),
+      ]);
+      let opener: AcpClient | undefined;
+      let stalled: LeaderSocketClient | undefined;
+      let answering: LeaderSocketClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        opener = started.owner;
+        opener.holdPermissionRequests();
+        const mode = (await opener.request("session/set_mode", { sessionId: started.sessionId, modeId: "ask" }, 21)) as any;
+        expect(mode.error).toBeUndefined();
+        stalled = await followSession(started.socket, started.sessionId, root);
+        stalled.pauseReads();
+        answering = await followSession(started.socket, started.sessionId, root);
+
+        sendPrompt(opener, 10, "WRITE_PROMPT");
+        await answering.waitForMessage(permissionFor("question_stall"), "the question for the answering follower", QUESTION_WAIT);
+        await waitForCondition("the opener's question", () => parsedLines(opener!).some(permissionFor("question_stall")), QUESTION_WAIT);
+        const openerAsked = parsedLines(opener).find(permissionFor("question_stall"));
+        const answeringAsked = answering.received.find(permissionFor("question_stall"));
+
+        const answeredAt = Date.now();
+        answering.respond(answeringAsked.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+        await waitForCondition("the opener's cancellation", () => parsedLines(opener!).some(cancelFor(openerAsked.id)), QUESTION_WAIT);
+        const landedMs = Date.now() - answeredAt;
+        expect(landedMs).toBeLessThan(500);
+        const prompt = await readResponse(opener, 10);
+        expect(prompt.result.stopReason).toBe("end_turn");
+        expect(readFileSync(join(root.workspace, "stall.txt"), "utf8")).toBe("STALL\n");
+      } finally {
+        stalled?.close();
+        answering?.close();
+        await opener?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
