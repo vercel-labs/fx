@@ -551,6 +551,8 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
           bun tests/tla/drivers/drive-steer.mjs faults --walks 8 --seed 8 --stream-lag 400
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts
+          TLA2TOOLS_JAR="$jar" bun tests/tla/drivers/sdk/ui-order.ts --fuzz 20 --seed 3
 
       - name: Test libfx on a World
         run: |

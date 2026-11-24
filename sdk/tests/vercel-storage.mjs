@@ -20,7 +20,8 @@ const { createWorld } = await import(new URL("../durable/node_modules/@workflow/
 
 /** `local()` with Vercel's World holding what `local()` keeps in files. */
 export function vercelStorage(options) {
-  const base = local(options);
+  // `local()` sets one flag for its own World, which Vercel's does not need.
+  const { [Symbol.for("libfx.durability.writeUiInOrder")]: _inOrder, ...base } = local(options);
   return {
     ...base,
     name: "vercel",
