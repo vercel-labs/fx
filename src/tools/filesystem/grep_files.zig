@@ -507,6 +507,7 @@ fn candidateCompleteness(result: anytype) tool_files.Completeness {
         .cap_reached = result.candidate_cap_reached,
         .candidate_cap = result.candidate_cap,
         .skipped_overlong = result.skipped_overlong,
+        .skipped_by_name = result.skipped_by_name,
     };
 }
 
@@ -1135,6 +1136,41 @@ test "grep_files walks multiple files without sorting" {
     try std.testing.expect(std.mem.find(u8, result.body, "src/a.txt:1: needle a") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "src/nested/b.txt:1: needle b") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "src/c.txt") == null);
+}
+
+test "grep_files outside a repository names the entries it skipped by name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    // The temporary folder sits below an ignored path, so the skipped names
+    // apply as they do outside a repository.
+    for ([_][]const u8{ "src/app.py", "build/config.py", "dist/old.py", "coverage/c.py", "app/build/gen.py" }) |sub_path| {
+        alloc.free(try writeTempFile(alloc, &tmp, sub_path, "MAX_RETRIES = 3\n"));
+    }
+    const note = "... skipped 4 entries named build, coverage, dist outside a git repository; pass path to search one\n";
+
+    var files = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"MAX_RETRIES\",\"mode\":\"files_with_matches\"}");
+    defer files.deinit(alloc);
+    try std.testing.expectEqual(.success, files.status);
+    try std.testing.expectEqualStrings("[grep] 1 files with matches for MAX_RETRIES\n - src/app.py\n" ++ note, files.body);
+
+    var lines = try dispatchGrepFiles(alloc, workspace, "MAX_RETRIES", null, null, null, null, null);
+    defer lines.deinit(alloc);
+    try std.testing.expect(std.mem.endsWith(u8, lines.body, note));
+
+    var count = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"MAX_RETRIES\",\"mode\":\"count\"}");
+    defer count.deinit(alloc);
+    try std.testing.expectEqualStrings("[grep] count 1 matching lines in 1 files for MAX_RETRIES\n" ++ note, count.body);
+
+    var app = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"MAX_RETRIES\",\"mode\":\"files_with_matches\",\"path\":\"app\"}");
+    defer app.deinit(alloc);
+    try std.testing.expectEqualStrings("[grep] no files with matches for MAX_RETRIES\n... skipped 1 entry named build outside a git repository; pass path to search one\n", app.body);
+
+    var inside = try dispatchGrepFilesRaw(alloc, workspace, "{\"pattern\":\"MAX_RETRIES\",\"mode\":\"files_with_matches\",\"path\":\"app/build\"}");
+    defer inside.deinit(alloc);
+    try std.testing.expectEqualStrings("[grep] 1 files with matches for MAX_RETRIES\n - app/build/gen.py\n", inside.body);
 }
 
 test "grep_files finds match beyond former traversal cap" {

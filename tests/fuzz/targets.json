@@ -109,6 +109,7 @@
     {"name": "acp_notice_title", "module": "fx", "test": "a notice title is trimmed text or none on fuzzed text", "iterations": 160000},
     {"name": "subscription_expiry", "module": "fx", "test": "a stored subscription expiry reads as expired or live on fuzzed values", "iterations": 30000},
     {"name": "grok_refresh_reply", "module": "fx", "test": "a Grok refresh frees each token once on fuzzed replies", "iterations": 30000},
-    {"name": "codex_refresh_reply", "module": "fx", "test": "a Codex refresh frees each token once on fuzzed replies", "iterations": 30000}
+    {"name": "codex_refresh_reply", "module": "fx", "test": "a Codex refresh frees each token once on fuzzed replies", "iterations": 30000},
+    {"name": "file_index_snapshot", "module": "fx", "test": "a saved file-index snapshot loads or is refused on fuzzed bytes", "iterations": 3000}
   ]
 }

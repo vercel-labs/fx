@@ -1,10 +1,11 @@
-//! Saved trees for one scope (format v3), so `@` can paint at launch and a
+//! Saved trees for one scope (format v4), so `@` can paint at launch and a
 //! refresh can confirm nothing changed without reading folders again. The
 //! caller chooses the file path. A file is used only when it is a private
 //! regular file with one link, at most `max_bytes`, matching digest, exactly
 //! the requested roots and well-formed contents; anything else is ignored
 //! with a trace and a new scan follows. Older formats fail the magic check
-//! and are overwritten by the next save.
+//! and are overwritten by the next save: v3 had no list of the entries
+//! skipped by name, so a listing reused from it would hide them silently.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -15,7 +16,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Tree = tree_mod.Tree;
 
-const magic = "fx-file-index-v3\n";
+const magic = "fx-file-index-v4\n";
 const max_bytes: usize = 64 * 1024 * 1024;
 const max_path_bytes: usize = 4096;
 
@@ -141,6 +142,8 @@ fn encode(writer: *std.Io.Writer, trees: []const Tree) !void {
         try writeInt(writer, u64, tree.skipped_overlong);
         try writeInt(writer, u32, @intCast(tree.skipped_names.len));
         for (tree.skipped_names) |name| try writeString(writer, name);
+        try writeInt(writer, u32, @intCast(tree.skipped.len));
+        for (tree.skipped) |path| try writeString(writer, path);
         try writeInt(writer, u32, @intCast(tree.entries.len));
         for (tree.entries) |entry| {
             try writer.writeByte(@backingInt(entry.kind));
@@ -213,6 +216,8 @@ fn decode(arena: Allocator, bytes: []const u8, roots: []const []const u8) (Alloc
         const skipped_overlong = try decoder.int(u64);
         const names = try arena.alloc([]const u8, try decoder.count(4));
         for (names) |*name| name.* = try decoder.string(arena, 255, false);
+        const skipped = try arena.alloc([]const u8, try decoder.count(4));
+        for (skipped) |*path| path.* = try decoder.string(arena, max_path_bytes, false);
         const entries = try arena.alloc(tree_mod.Entry, try decoder.count(5));
         for (entries) |*entry| {
             const kind = (try decoder.take(1))[0];
@@ -263,6 +268,7 @@ fn decode(arena: Allocator, bytes: []const u8, roots: []const []const u8) (Alloc
             .cap_reached = flags & 4 != 0,
             .skipped_overlong = std.math.cast(usize, skipped_overlong) orelse return error.InvalidSnapshot,
             .skipped_names = names,
+            .skipped = skipped,
             .entries = entries,
             .folders = folders,
             .sources = stamps,
@@ -282,6 +288,7 @@ fn testTree(root: []const u8, entries: []const tree_mod.Entry) Tree {
         .cap_reached = false,
         .skipped_overlong = 2,
         .skipped_names = &.{ "node_modules", "dist" },
+        .skipped = &.{ "dist", "web/node_modules" },
         .entries = entries,
         .folders = &.{
             .{ .rel = "", .inode = 7, .mtime_ns = 5, .ctime_ns = 6, .reusable = true },
@@ -321,6 +328,8 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
         try std.testing.expect(first.repository and !first.incomplete and !first.cap_reached);
         try std.testing.expectEqual(@as(usize, 2), first.skipped_overlong);
         try std.testing.expectEqualStrings("dist", first.skipped_names[1]);
+        try std.testing.expectEqual(@as(usize, 2), first.skipped.len);
+        try std.testing.expectEqualStrings("web/node_modules", first.skipped[1]);
         try std.testing.expectEqualStrings("src", first.entries[1].path);
         try std.testing.expectEqual(tree_mod.Kind.directory, first.entries[1].kind);
         try std.testing.expectEqualStrings("", first.folders[0].rel);
@@ -344,6 +353,19 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
     // Older formats fail the magic check. A v2 file stamped every source
     // without following symlinks.
     for ([_][]const u8{ "fx-file-index-v1\n{}", "fx-file-index-v2\n" }) |old| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = .fromMode(0o600) } });
+        try std.testing.expect((try load(alloc, path, &roots)) == null);
+    }
+    // A v3 file kept no skipped entries; its magic alone refuses it, even
+    // with an intact digest.
+    {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        try encode(&payload.writer, &trees);
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(payload.written(), &digest, .{});
+        const old = try std.mem.concat(alloc, u8, &.{ "fx-file-index-v3\n", &digest, payload.written() });
+        defer alloc.free(old);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = .fromMode(0o600) } });
         try std.testing.expect((try load(alloc, path, &roots)) == null);
     }
