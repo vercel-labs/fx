@@ -1037,6 +1037,33 @@ test "a turn whose closing saves all fail runs to its end and is never marked" {
     try std.testing.expectEqual(@as(usize, 0), hooks.turn_yielded_marks);
 }
 
+test "a turn that yields before any tool settles its start capture before it is marked" {
+    const alloc = std.testing.allocator;
+    // An empty reply gets the nudge and a second request, with no tool between them.
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var fixture = PromptFixture{};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_recovery_record = true;
+    hooks.record_workspace_capture = true;
+    // Set before the turn starts: the first request still goes out.
+    var yield_flag = std.atomic.Value(bool).init(true);
+    var config = fixture.config();
+    config.yield_flag = &yield_flag;
+
+    try std.testing.expectError(error.TurnYielded, runFakePrompt(&gateway, &hooks, config, fixture.job()));
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.turn_yielded_marks);
+    // No tool ran, so only the settle in `yieldTurn` can save the start capture before the mark.
+    try std.testing.expect((hooks.settles_when_marked orelse 0) >= 1);
+}
+
 test "a turn whose flag stays clear never yields" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_search", "web_search", "{\"query\":\"current news\"}")};

@@ -680,6 +680,8 @@ pub const FakeAgentRuntimeDeps = struct {
     /// tool the turn executes, in order in `capture_log`.
     record_workspace_capture: bool = false,
     capture_log: std.ArrayList([]u8) = .empty,
+    /// How many `capture:settle` lines `capture_log` held when the turn was marked.
+    settles_when_marked: ?usize = null,
     /// Keeps the recovery module's record, as a host that resumes requests
     /// does.
     enable_recovery_record: bool = false,
@@ -1072,6 +1074,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.turn_yield_mark_error) |err| return err;
         self.turn_yielded_marks += 1;
+        var settles: usize = 0;
+        for (self.capture_log.items) |line| {
+            if (std.mem.eql(u8, line, "capture:settle")) settles += 1;
+        }
+        self.settles_when_marked = settles;
     }
 
     fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {

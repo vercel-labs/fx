@@ -1098,7 +1098,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 37) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 38) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }

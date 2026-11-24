@@ -4605,8 +4605,9 @@ fn canStopForRestart(
 /// record is saved: marked clean, as a closing fx saves it, so the next
 /// launch resumes it without counting a death, and the session marks the turn
 /// as yielded, so the launch continues it as the same turn
-/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion). Only
-/// a turn `canStopForRestart` allows gets here. When the clean record does
+/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// Its start capture is settled first, so it never lands after the marker.
+/// Only a turn `canStopForRestart` allows gets here. When the clean record does
 /// not land, nothing is marked and it returns false: the request is still
 /// open with its send's record, so the turn goes on and the next boundary
 /// asks again (`Resume.tla` YieldSaveFails). A marker that cannot be written
@@ -4617,6 +4618,9 @@ fn yieldTurn(
     request_recovery: *runtime_request_recovery.RequestRecovery,
     trace_ctx: TraceContext,
 ) bool {
+    // The turn's start capture is saved first (D98), so the record and the
+    // marker after it stay the turn's newest items (`interruptedRequest`).
+    if (deps.start_workspace_capture) |capture| capture(deps.ctx, false, .settle);
     if (!request_recovery.closeForYield()) {
         debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason=closing_save_failed", .{});
         return false;
