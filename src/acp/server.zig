@@ -430,7 +430,7 @@ pub const ServerState = struct {
         // subagent inside a command here.
         disableSubagentHost(self);
         self.managed_executions.deinit();
-        self.bash_session.deinit(io_mod.getIo());
+        if (self.bash_session.deinitReport(io_mod.getIo()) > 0) debug_trace.logf("bash", "bash session folder left behind", .{});
         self.terminal_client.deinit();
         closeActiveSession(self) catch |err| {
             debug_trace.logf(
@@ -927,7 +927,7 @@ fn destroyActiveSession(state: *ServerState) void {
     debug_trace.logf("bash", "bash state reset for a session switch or close had_program={}", .{
         tool_dispatch.bashProgramRunning(&state.bash_session, &state.managed_executions),
     });
-    state.bash_session.deinit(io_mod.getIo());
+    if (state.bash_session.deinitReport(io_mod.getIo()) > 0) debug_trace.logf("bash", "bash session folder left behind", .{});
     const active = if (state.active_session) |*session| session else return;
     if (active.title_task) |task| {
         debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});

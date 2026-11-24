@@ -238,9 +238,12 @@ fn callRun(
     // A background program may have ended since the approval and left another folder.
     // A drop by this refresh, or one the last program's end recorded, gives this call its notice.
     refreshFolder(session);
+    // A loss that an earlier call's failed fresh folder left is still pending, so this call reports it too.
+    const lost = healed.stateLost() or session.lossPending();
+    if (lost and !healed.stateLost()) debug_trace.logf("bash", "bash session healed what=state_lost name=session", .{});
     const notes: CallNotes = .{
         .folder = if (session.takeFolderDropped()) start_folder_notice else null,
-        .state = if (healed.stateLost()) state_lost_notice else null,
+        .state = if (lost) state_lost_notice else null,
     };
     const folder = session.startFolder() orelse ctx.workspace_root;
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -309,7 +312,12 @@ fn callRun(
         return startFailure(ctx, err, leftover, notes);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared, leftover, notes);
+    const outcome = finish(ctx, runtime, &prepared, leftover, notes);
+    // The program started and its result, with the state-lost notice, was delivered, so the loss has been reported.
+    if (outcome) |_| {
+        if (notes.state != null) session.clearLossPending();
+    } else |_| {} // Not delivered: the notice did not reach the model, so the mark stays.
+    return outcome;
 }
 
 /// Waits up to `yield_ms` for the session's program, or says that nothing is
@@ -1828,6 +1836,11 @@ test "a repair that cannot complete, with no new folder either, fails the call w
     defer bash.deinit();
     var ctx = bash.context();
     _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+    defer debug_trace.resetForTest();
 
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
@@ -1863,6 +1876,23 @@ test "a repair that cannot complete, with no new folder either, fails the call w
     try std.testing.expect(std.mem.find(u8, text, bash.workspace) == null);
     // Looking up the marker needs no write access, so its absence is checked while the workspace is read-only.
     try std.testing.expectError(error.FileNotFound, workspace.access(bash.io, marker, .{}));
+
+    // The workspace is writable again. The next call makes a folder, and its heal retries the old folder, which is
+    // still read-only, so the removal reaches it. Its program says the state was lost, and the one after keeps its state.
+    try workspace.setPermissions(bash.io, std.Io.File.Permissions.fromMode(0o700));
+    try bash.authorize(&ctx, "x=2");
+    const started = try callRun(ctx, "x=2", program_yield_ms);
+    defer started.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(started, true), state_lost_notice) != null);
+    const read_again = "echo \"x=$x\"";
+    try bash.authorize(&ctx, read_again);
+    const kept = try callRun(ctx, read_again, program_yield_ms);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings("x=2\n", try outcomeText(kept, true));
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(bash.io, trace_path, alloc, .limited(1 << 16));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "bash session healed what=state_lost name=session") != null);
 }
 
 test "a refused call carries the folder notice, since the folder it was approved for was dropped" {

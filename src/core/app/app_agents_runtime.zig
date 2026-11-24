@@ -3530,7 +3530,7 @@ pub fn Runtime(comptime App: type) type {
         /// thread holds its worker.
         fn freeInContext(_: void, app: *App, agent: *agents.Agent) anyerror!void {
             agent.managed_executions.deinit();
-            agent.bash_session.deinit(io_mod.getIo());
+            if (agent.bash_session.deinitReport(io_mod.getIo()) > 0) debug_trace.logf("bash", "bash session folder left behind", .{});
             agent.worker.deinit(std.heap.c_allocator);
             app.clearPendingImages(agent);
             agent.pending_images.deinit(app.alloc);

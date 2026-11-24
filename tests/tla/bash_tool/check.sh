@@ -14,6 +14,7 @@
 #   big-save-torn     a refused save leaves the bash state half-written        StateNeverTorn
 #   silent-heal       a heal drops the saved state with no notice              LossNoticed
 #   skip-heal         a program runs on damaged session files                  NeverLoadsDamaged
+#   forget-on-fail    a failed heal forgets an unreported loss                 ReportedBeforeRun
 #
 # No Bun driver runs the built fx along this model yet; the bash tool's unit
 # and e2e tests cover the session part that has landed.
@@ -39,4 +40,5 @@ ResultStore result-store-mutation-silent-refusal RefusalNoticed
 ResultStore result-store-mutation-big-save-torn StateNeverTorn
 ResultStore result-store-mutation-silent-heal LossNoticed
 ResultStore result-store-mutation-skip-heal NeverLoadsDamaged
+ResultStore result-store-mutation-forget-on-fail ReportedBeforeRun
 VERDICTS

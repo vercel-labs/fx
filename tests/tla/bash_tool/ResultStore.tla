@@ -60,9 +60,10 @@ VARIABLES
     damaged,   \* a program left the session's files damaged after its save
     lost,      \* programs that started from a fresh state after a heal
     lostNoticed, \* programs whose result says the saved state was lost
+    unreported, \* a loss of saved state that no result has reported yet
     fxSaved    \* fx command results the current program saved
 
-stateVars == <<saves, torn, how, savedBy, refused, noticed, damaged, lost, lostNoticed>>
+stateVars == <<saves, torn, how, savedBy, refused, noticed, damaged, lost, lostNoticed, unreported>>
 vars == <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved, stateVars>>
 
 \* The running marker the client reads: the program until the server clears it.
@@ -87,6 +88,7 @@ Init ==
     /\ damaged = FALSE
     /\ lost = {}
     /\ lostNoticed = {}
+    /\ unreported = FALSE
     /\ fxSaved = 0
 
 \* Saving a result appends it and its index line.
@@ -112,7 +114,8 @@ Send(p) ==
        THEN /\ damaged' = (Mutation = "skip-heal")
             /\ lost' = lost \cup {p}
             /\ lostNoticed' = IF Mutation = "silent-heal" THEN lostNoticed ELSE lostNoticed \cup {p}
-       ELSE UNCHANGED <<damaged, lost, lostNoticed>>
+            /\ unreported' = (Mutation = "silent-heal")
+       ELSE UNCHANGED <<damaged, lost, lostNoticed, unreported>>
     /\ UNCHANGED <<shown, store, index, saves, torn, how, savedBy, refused, noticed>>
 
 \* After its save, the last program damages the session's files: its EXIT
@@ -122,8 +125,19 @@ Damage ==
     /\ phase # "run"
     /\ ~damaged
     /\ damaged' = TRUE
+    /\ unreported' = TRUE
     /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved,
                    saves, torn, how, savedBy, refused, noticed, lost, lostNoticed>>
+
+\* fx cannot make a fresh session folder for the next program, so that call
+\* fails and runs nothing. The loss stays unreported until a later program
+\* starts, whose heal reports it.
+HealFails ==
+    /\ phase = "idle"
+    /\ damaged
+    /\ damaged' = (Mutation # "forget-on-fail")
+    /\ UNCHANGED <<sent, current, phase, ready, waiting, shown, store, index, runs, fxSaved,
+                   saves, torn, how, savedBy, refused, noticed, lost, lostNoticed, unreported>>
 
 \* The running program saves one fx command result.
 SaveFx ==
@@ -161,7 +175,7 @@ Finish(kind, big) ==
             /\ savedBy' = savedBy \cup {current}
             /\ torn' = FALSE
             /\ UNCHANGED <<refused, noticed>>
-    /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved, damaged, lost, lostNoticed>>
+    /\ UNCHANGED <<sent, current, waiting, shown, runs, fxSaved, damaged, lost, lostNoticed, unreported>>
 
 \* The server clears its running marker.
 Clear ==
@@ -205,6 +219,7 @@ Next ==
     \/ GiveUp
     \/ WaitMore
     \/ Damage
+    \/ HealFails
 
 Spec ==
     /\ Init /\ [][Next]_vars
@@ -229,6 +244,7 @@ TypeOK ==
     /\ damaged \in BOOLEAN
     /\ lost \subseteq sent
     /\ lostNoticed \subseteq sent
+    /\ unreported \in BOOLEAN
     /\ fxSaved \in 0..MaxFx
 
 \* A program runs at most once, whatever the client and the model do.
@@ -268,6 +284,10 @@ NeverLoadsDamaged == phase = "run" => ~damaged
 \* Saved state lost to damaged files is never lost silently: the result of
 \* the program that started fresh says so (RULES.md R3.8).
 LossNoticed == lost \subseteq lostNoticed
+
+\* No program runs while a loss of saved state is unreported, even when an
+\* earlier heal failed (RULES.md R3.8).
+ReportedBeforeRun == phase = "run" => ~unreported
 
 \* A saved result is never changed or removed.
 StoreAppendOnly == [][SubSeq(store', 1, Len(store)) = store]_vars

@@ -170,9 +170,16 @@ pub const Session = struct {
     /// The folder the next program starts in, as the last saved state left it.
     /// Null means the workspace root. Owned.
     start_folder: ?[]u8 = null,
+    /// Set when a repair discarded the saved state. It stays set through a failed
+    /// fresh folder, and `lossPending` reads it until a program starts with the
+    /// state-lost notice in its result, so the loss is never silent.
+    loss_pending: bool = false,
     /// Set when a refresh dropped the start folder. `takeFolderDropped` reads and
     /// clears it, so the next call reports the drop once.
     folder_dropped: bool = false,
+    /// Old folders whose removal failed, kept for a later removal. Owned. A later
+    /// `heal` retries them, and `deinitReport` retries them last.
+    left_behind: std.ArrayList([]u8) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) Session {
         return .{ .alloc = alloc };
@@ -356,6 +363,7 @@ pub const Session = struct {
     /// is not a regular file is replaced, a directory included. Call it after
     /// `prepare`. It does not fail: anything that could not be done is in the result.
     pub fn heal(self: *Session, io: std.Io, fx_variables: []const []const u8) Healed {
+        self.retryLeftBehind(io);
         var healed: Healed = .{};
         self.repairFolder(io, fx_variables, &healed) catch |err| {
             healed.repair_failed = err;
@@ -373,19 +381,58 @@ pub const Session = struct {
         const dir_path = self.dir orelse return cause;
         std.Io.Dir.cwd().deleteTree(io, dir_path) catch |err| {
             healed.forget_failed = err;
+            // The folder stays on disk, so it is kept for a later removal. When the list is full, the reported failure names the folder.
+            self.keepLeftBehind(dir_path) catch {};
         };
         try self.makeFresh(io, fx_variables, healed);
     }
 
     /// Forgets the session's folder and makes a new one as `prepare` does. The state
-    /// the old folder held is lost, and the result says so.
+    /// the old folder held is lost. `loss_pending` is set before the folder is
+    /// forgotten, so the loss stays marked even when the new folder cannot be made.
     fn makeFresh(self: *Session, io: std.Io, fx_variables: []const []const u8, healed: *Healed) !void {
         const dir_path = self.dir orelse return error.SessionNotPrepared;
         const root = try self.alloc.dupe(u8, std.Io.Dir.path.dirname(dir_path) orelse return error.SessionNotPrepared);
         defer self.alloc.free(root);
+        self.loss_pending = true;
         self.forgetFolder();
         healed.swept = try self.prepare(io, root, fx_variables);
         healed.add(.state_lost, "session");
+    }
+
+    /// Whether a repair discarded the saved state, and no program has started since
+    /// with the state-lost notice in its result.
+    pub fn lossPending(self: *const Session) bool {
+        return self.loss_pending;
+    }
+
+    /// Clears the loss mark. The caller does this only after a program started and
+    /// its result, which carries the state-lost notice, was delivered.
+    pub fn clearLossPending(self: *Session) void {
+        self.loss_pending = false;
+    }
+
+    /// Keeps `path`, an old folder whose removal failed, for a later removal. The
+    /// list is bounded, so a full list refuses the path, and the caller reports it.
+    fn keepLeftBehind(self: *Session, path: []const u8) !void {
+        if (self.left_behind.items.len >= max_left_behind) return error.TooManyLeftBehind;
+        const owned = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(owned);
+        try self.left_behind.append(self.alloc, owned);
+    }
+
+    /// Retries the removal of each kept old folder, and keeps the ones that still
+    /// cannot be removed. A retry that fails is tried again later.
+    fn retryLeftBehind(self: *Session, io: std.Io) void {
+        var index: usize = 0;
+        while (index < self.left_behind.items.len) {
+            if (removeAbandoned(io, self.left_behind.items[index])) |_| {
+                self.alloc.free(self.left_behind.orderedRemove(index));
+            } else |_| {
+                // Still on disk: the folder stays in the list and the next retry tries it again.
+                index += 1;
+            }
+        }
     }
 
     /// Runs the repairs in order, into `healed`. The first error stops them, and the
@@ -399,25 +446,26 @@ pub const Session = struct {
         }
         var folder = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
         defer folder.close(io);
-        const env_kind = try entryKind(io, folder, env_file);
-        if (env_kind) |kind| {
-            if (kind != .file) try removeEntry(io, folder, env_file, kind);
+        const env_stat = try entryStat(io, folder, env_file);
+        if (env_stat) |stat| {
+            if (stat.kind != .file) try removeEntry(io, folder, env_file, stat.kind);
         }
-        if (env_kind == null or env_kind.? != .file) {
+        if (env_stat == null or isDamaged(env_stat.?)) {
             try self.writeEnv(io, folder, dir_path, fx_variables);
             healed.add(.env_rewritten, env_file);
         }
-        if (try entryKind(io, folder, state_file)) |kind| {
-            if (kind != .file) {
-                try removeEntry(io, folder, state_file, kind);
+        if (try entryStat(io, folder, state_file)) |stat| {
+            if (isDamaged(stat)) {
+                try removeEntry(io, folder, state_file, stat.kind);
+                self.loss_pending = true;
                 healed.add(.state_lost, state_file);
             }
         }
-        if (try entryKind(io, folder, folder_file)) |kind| {
-            if (kind != .file) {
+        if (try entryStat(io, folder, folder_file)) |stat| {
+            if (isDamaged(stat)) {
                 // The start folder the file named is dropped, and the next call reports that once.
                 self.folder_dropped = true;
-                if (removeEntry(io, folder, folder_file, kind)) |_| healed.add(.record_replaced, folder_file) else |_| {} // A folder file that stays is refused by refresh, and reported again.
+                if (removeEntry(io, folder, folder_file, stat.kind)) |_| healed.add(.record_replaced, folder_file) else |_| {} // A folder file that stays is refused by refresh, and reported again.
             }
         }
         if (try entryKind(io, folder, save_status_file)) |kind| {
@@ -449,20 +497,37 @@ pub const Session = struct {
         try writePrivateFile(io, folder, env_file, script);
     }
 
-    /// Deletes the session folder and frees what the session holds. The session is
-    /// then unprepared, so `prepare` can make a new folder.
-    pub fn deinit(self: *Session, io: std.Io) void {
+    /// Deletes the session folder and frees what the session holds, after one more
+    /// retry for each old folder a failed removal left behind. Returns how many of
+    /// those are still on disk, so the caller can log them. The session is then
+    /// unprepared, so `prepare` can make a new folder.
+    pub fn deinitReport(self: *Session, io: std.Io) usize {
         const alloc = self.alloc;
         if (self.dir) |dir| {
             removeTree(io, dir);
             alloc.free(dir);
         }
+        self.retryLeftBehind(io);
+        const left = self.left_behind.items.len;
+        for (self.left_behind.items) |path| alloc.free(path);
+        self.left_behind.deinit(alloc);
         if (self.after_startup) |text| alloc.free(text);
         if (self.program_id) |id| alloc.free(id);
         if (self.start_folder) |folder| alloc.free(folder);
         self.* = .{ .alloc = alloc };
+        return left;
+    }
+
+    /// Deletes the session folder and frees what the session holds, as `deinitReport`
+    /// does. Callers that log what stays use `deinitReport`.
+    pub fn deinit(self: *Session, io: std.Io) void {
+        _ = self.deinitReport(io);
     }
 };
+
+/// How many old folders a session keeps for a later removal. A fresh folder is made
+/// only after a repair fails, so this bound is far above what happens.
+const max_left_behind = 8;
 
 /// The prefix of every bash session folder's name, which the sweep looks for.
 const folder_prefix = "fx-bash-";
@@ -562,9 +627,9 @@ fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
 /// regular file are left alone. Returns false, and leaves the entry, when it cannot
 /// be removed.
 fn replaceRecordEntry(io: std.Io, folder: std.Io.Dir, name: []const u8) !bool {
-    const kind = (try entryKind(io, folder, name)) orelse return false;
-    if (kind == .file) return false;
-    removeEntry(io, folder, name, kind) catch return false;
+    const stat = (try entryStat(io, folder, name)) orelse return false;
+    if (!isDamaged(stat)) return false;
+    removeEntry(io, folder, name, stat.kind) catch return false;
     try writePrivateFile(io, folder, name, "");
     return true;
 }
@@ -636,11 +701,41 @@ fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []c
 /// The kind of the entry `name` in `folder`, without following a link, or null
 /// when there is no entry.
 fn entryKind(io: std.Io, folder: std.Io.Dir, name: []const u8) !?std.Io.File.Kind {
-    const stat = folder.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
+    const stat = (try entryStat(io, folder, name)) orelse return null;
     return stat.kind;
+}
+
+/// The stat of the entry `name` in `folder`, without following a link, or null when
+/// there is no entry. The link count is in it, so a hard link is seen.
+fn entryStat(io: std.Io, folder: std.Io.Dir, name: []const u8) !?std.Io.File.Stat {
+    return folder.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+/// Whether a fixed name of the session folder is damaged: not a regular file, or a
+/// regular file that another name also links to. A write through the other name
+/// would reach a file outside the folder, so a damaged name is replaced and never
+/// written.
+fn isDamaged(stat: std.Io.File.Stat) bool {
+    return stat.kind != .file or stat.nlink > 1;
+}
+
+/// Removes an old session folder whose earlier removal failed. The path is opened
+/// without following a link, and only as a directory, so a link that took its place
+/// is removed, never followed. The mode is restored on that open folder, so its
+/// entries can be removed, and then the tree is deleted by path.
+fn removeAbandoned(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const kind = (try entryKind(io, cwd, path)) orelse return;
+    if (kind != .directory) return removeEntry(io, cwd, path, kind);
+    const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true };
+    const fd = try std.posix.openat(cwd.handle, path, flags, 0);
+    var folder = std.Io.Dir{ .handle = fd };
+    defer folder.close(io);
+    try folder.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+    try cwd.deleteTree(io, path);
 }
 
 /// Whether `path` names a directory, without following a link.
@@ -670,8 +765,9 @@ const Access = enum { read_only, read_write };
 /// that the session makes of files the program can also write. The open does not
 /// follow a link and does not wait: a program can put a FIFO or a device at
 /// either name, and a plain open of a FIFO waits for a writer. The file is
-/// checked once it is open, so anything but a regular file is an error. The
-/// caller closes the returned file.
+/// checked once it is open, so anything but a regular file is an error. A file that
+/// another name also links to is not regular here, because a read or the truncate
+/// would reach the other name's file. The caller closes the returned file.
 fn openRegularFile(io: std.Io, dir: std.Io.Dir, name: []const u8, access: Access) !std.Io.File {
     const flags: std.posix.O = .{
         .ACCMODE = switch (access) {
@@ -688,7 +784,7 @@ fn openRegularFile(io: std.Io, dir: std.Io.Dir, name: []const u8, access: Access
     };
     errdefer file.close(io);
     const stat = try file.stat(io);
-    if (stat.kind != .file) return error.NotRegularFile;
+    if (stat.kind != .file or stat.nlink > 1) return error.NotRegularFile;
     return file;
 }
 
@@ -1027,6 +1123,22 @@ fn makeFifo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     const result = try std.process.run(alloc, io, .{ .argv = &.{ "/usr/bin/mkfifo", path } });
     defer freeRun(alloc, result);
     try expectExit(result, 0);
+}
+
+/// Makes `path` a second name for `target`, a hard link, with the `ln` tool, since
+/// std has no call for it.
+fn makeHardLink(alloc: std.mem.Allocator, io: std.Io, target: []const u8, path: []const u8) !void {
+    const result = try std.process.run(alloc, io, .{ .argv = &.{ "/bin/ln", target, path } });
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+}
+
+/// Whether `healed` made the repair `what` to the file `name`.
+fn healedHas(healed: *const Healed, what: RepairKind, name: []const u8) bool {
+    for (healed.items()) |repair| {
+        if (repair.what == what and std.mem.eql(u8, repair.name, name)) return true;
+    }
+    return false;
 }
 
 fn freeRun(alloc: std.mem.Allocator, result: std.process.RunResult) void {
@@ -3221,6 +3333,224 @@ test "a publish that cannot clear the start folder is recorded as failed, and th
     defer freeRun(alloc, third);
     try expectExit(third, 0);
     try std.testing.expectEqualStrings("x=1\n", third.stdout);
+}
+
+test "a link to an outside file at the save record is replaced, and the outside file is not written" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "keep\n" });
+    const outside = try alloc.print("{s}/outside", .{root});
+    defer alloc.free(outside);
+    const record = try alloc.print("{s}/{s}", .{ dir, save_status_file });
+    defer alloc.free(record);
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, save_status_file);
+    try makeHardLink(alloc, io, outside, record);
+
+    // The record is not a regular file of its own, so it reads as failed, and the outside file keeps its bytes.
+    switch (session.takeSaveStatus(io) orelse return error.TestNoSaveStatus) {
+        .failed => {},
+        .over_cap, .not_saved => return error.TestUnexpectedStatus,
+    }
+    const kept = try tmp.dir.readFileAlloc(io, "outside", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+
+    // The record is now an empty owner-only file with no other name.
+    const replaced = try folder.statFile(io, save_status_file, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, replaced.kind);
+    try std.testing.expectEqual(@as(std.posix.nlink_t, 1), replaced.nlink);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), replaced.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u64, 0), replaced.size);
+}
+
+test "a link to an outside file at a startup record is replaced before the next load, which does not write the outside file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "keep\n" });
+    const outside = try alloc.print("{s}/outside", .{root});
+    defer alloc.free(outside);
+    const record = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
+    defer alloc.free(record);
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    try folder.deleteFile(io, startup_functions_file);
+    try makeHardLink(alloc, io, outside, record);
+
+    // The call's heal runs before the program's load, as in every call.
+    const healed = session.heal(io, &test_fx_variables);
+    try std.testing.expect(healed.repair_failed == null);
+    try std.testing.expect(healedHas(&healed, .record_replaced, startup_functions_file));
+
+    const first = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+    const kept = try tmp.dir.readFileAlloc(io, "outside", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+
+    const next = try runProgram(alloc, io, &session, root, "t2", "echo \"x=$x\"");
+    defer freeRun(alloc, next);
+    try expectExit(next, 0);
+    try std.testing.expectEqualStrings("x=1\n", next.stdout);
+}
+
+test "a link to an outside file at env.sh or state.sh is replaced by heal, and the outside file is not written" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const dir = session.dir.?;
+    const first = try runProgram(alloc, io, &session, root, "t1", "x=1");
+    defer freeRun(alloc, first);
+    try expectExit(first, 0);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "keep\n" });
+    const outside = try alloc.print("{s}/outside", .{root});
+    defer alloc.free(outside);
+    var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer folder.close(io);
+    const env_path = try alloc.print("{s}/{s}", .{ dir, env_file });
+    defer alloc.free(env_path);
+    const state_path = try alloc.print("{s}/{s}", .{ dir, state_file });
+    defer alloc.free(state_path);
+    try folder.deleteFile(io, env_file);
+    try makeHardLink(alloc, io, outside, env_path);
+    try folder.deleteFile(io, state_file);
+    try makeHardLink(alloc, io, outside, state_path);
+
+    const healed = session.heal(io, &test_fx_variables);
+    try std.testing.expect(healed.repair_failed == null);
+    try std.testing.expect(healedHas(&healed, .env_rewritten, env_file));
+    try std.testing.expect(healedHas(&healed, .state_lost, state_file));
+    try std.testing.expect(session.lossPending());
+    const kept = try tmp.dir.readFileAlloc(io, "outside", alloc, .limited(64));
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+}
+
+test "a fresh folder made because the old one could not be repaired leaves the old folder, and a later heal removes it" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const old_path = try alloc.dupe(u8, session.dir.?);
+    defer alloc.free(old_path);
+
+    // env.sh is gone and the old folder is read-only, so its repair cannot write env.sh and its removal cannot unlink its entries.
+    var old = try std.Io.Dir.cwd().openDir(io, old_path, .{ .iterate = true });
+    defer old.close(io);
+    defer old.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: restored so the temporary directory can be removed.
+    try old.deleteFile(io, env_file);
+    try old.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+    // Root or a DAC-override user writes into the read-only folder, so the repair would not fail: skip.
+    if (modeIgnored(io, old)) return error.SkipZigTest;
+
+    const first = session.heal(io, &test_fx_variables);
+    try std.testing.expect(first.repair_failed != null);
+    try std.testing.expect(first.forget_failed != null);
+    try std.testing.expect(first.fresh_failed == null);
+    _ = try std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false });
+
+    // A later heal retries the removal, which now reaches the old folder, and the new folder is healthy.
+    const second = session.heal(io, &test_fx_variables);
+    try std.testing.expect(second.repair_failed == null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }));
+}
+
+test "deinitReport removes an old folder that a later removal reaches, and reports none left" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const old_path = try alloc.dupe(u8, session.dir.?);
+    defer alloc.free(old_path);
+
+    var old = try std.Io.Dir.cwd().openDir(io, old_path, .{ .iterate = true });
+    defer old.close(io);
+    defer old.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: restored so the temporary directory can be removed.
+    try old.deleteFile(io, env_file);
+    try old.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+    if (modeIgnored(io, old)) return error.SkipZigTest;
+
+    const first = session.heal(io, &test_fx_variables);
+    try std.testing.expect(first.forget_failed != null);
+    try std.testing.expectEqual(@as(usize, 0), session.deinitReport(io));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }));
+}
+
+test "deinitReport reports an old folder that a child keeps, and leaves it on disk" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+
+    var session = Session.init(alloc);
+    defer session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables);
+    const old_path = try alloc.dupe(u8, session.dir.?);
+    defer alloc.free(old_path);
+
+    // A read-only child that holds a file cannot be emptied, so the old folder's removal stays,
+    // whatever the old folder's own mode is.
+    var old = try std.Io.Dir.cwd().openDir(io, old_path, .{ .iterate = true });
+    defer old.close(io);
+    defer old.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: restored so the temporary directory can be removed.
+    try old.createDirPath(io, "kept");
+    try old.writeFile(io, .{ .sub_path = "kept/f", .data = "" });
+    var kept = try old.openDir(io, "kept", .{ .iterate = true });
+    defer kept.close(io);
+    defer kept.setPermissions(io, std.Io.File.Permissions.fromMode(0o700)) catch {}; // Best effort: restored so the temporary directory can be removed.
+    try kept.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+    if (modeIgnored(io, kept)) return error.SkipZigTest;
+    try old.deleteFile(io, env_file);
+    try old.setPermissions(io, std.Io.File.Permissions.fromMode(0o500));
+
+    const first = session.heal(io, &test_fx_variables);
+    try std.testing.expect(first.forget_failed != null);
+    try std.testing.expectEqual(@as(usize, 1), session.deinitReport(io));
+    _ = try std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false });
 }
 
 test "a save record too long to read is reported once, and then emptied" {
