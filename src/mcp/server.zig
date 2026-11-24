@@ -887,12 +887,13 @@ pub const Server = struct {
         }
     }
 
-    /// A line that names no request is about every request in flight, so it is a list's own answer only when
-    /// no other request could have written it: it came on the list's own stream, or the list is the one
-    /// request in flight. Otherwise the list's answer is only late, and when the grace runs out the list ends
-    /// with no reason, as a lost page does (`tests/tla/mcp/Catalog.tla` `PageUnreadable`).
+    /// A line that names no request is about every normal request in flight (`request.Table.refusedLine`), so it is
+    /// a list's own answer only when no other such request could have written it: it came on the list's own
+    /// stream, or the list is the one normal request in flight. A listen is not one of them: it is waited on for no
+    /// reply, and a modern server always has one open. Otherwise the list's answer is only late, and when the grace
+    /// runs out the list ends with no reason, as a lost page does (`tests/tla/mcp/Catalog.tla` `PageSharedGrace`).
     fn markOwnLine(r: *Server, stream: ?u64) void {
-        const own = if (stream) |key| r.logicalFor(key) else if (r.table.inFlightCount() == 1) r.soleList() else null;
+        const own = if (stream) |key| r.logicalFor(key) else if (r.table.normalInFlightCount() == 1) r.soleList() else null;
         if (own) |l| l.own_line = true;
     }
 
@@ -2733,20 +2734,19 @@ test "a later bad line, when the list is the one request left, is the list's own
     try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
 }
 
-test "a list is not the only request in flight while a listen is open, so a bad line that names no request refuses nothing" {
+test "a list is still the one request a bad line can be about while a listen is open, because the listen gets no grace" {
     var r: Server = undefined;
     try stdioTestServer(&r);
     defer r.deinit();
     const list = try listInFlight(&r);
-    // A listen's notifications are lines too: this one could be its.
     try r.stepRequest(.{ .send = .listen });
     try r.onRefusedLine(error.InvalidJson, "not json", null);
     try std.testing.expect(holdsGrace(&r, list));
 
     try fireAllRefusedTimers(&r);
     try std.testing.expect(r.logicalFor(list) == null);
-    try std.testing.expect(!r.catalog.refused);
-    try std.testing.expect(r.listRefusal() == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
 }
 
 fn pageTestServer(r: *Server) !void {
