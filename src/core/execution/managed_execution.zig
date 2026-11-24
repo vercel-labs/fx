@@ -22,8 +22,8 @@ const captured_stop_settle_timeout_ms: i64 = if (builtin.is_test)
 else
     command_runner.termination_settle_timeout_ms + 1_000;
 /// The longest a captured wait blocks between its checks. The worker wakes
-/// the wait when it settles the entry; the poll still drives the cancel,
-/// yield, steering and quiet checks, which have no wake signal.
+/// every captured wait when it settles the entry; the poll still drives the
+/// cancel, yield, steering and quiet checks, which have no wake signal.
 const captured_wait_poll_ms: i64 = 10;
 /// Tests set a long poll, so a run that misses its wake-up shows as slow.
 var test_captured_wait_poll_ms: ?i64 = null;
@@ -285,7 +285,7 @@ const Entry = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     force_cancel: std.atomic.Value(bool) = .init(false),
     start_gate: std.Io.Event = .unset,
-    /// Set by `workerMain` once it has settled the entry, to wake `startCaptured`.
+    /// Set by `workerMain` once it has settled the entry; wakes every captured wait.
     worker_done: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
@@ -657,6 +657,19 @@ const Entry = struct {
         self.worker_done.set(zio);
     }
 
+    /// Blocks until the worker settles the entry or `poll_ms` passes, so every
+    /// captured wait runs its checks again as soon as the command ends.
+    fn waitForWorkerOrPoll(self: *Entry, io: std.Io, poll_ms: i64) void {
+        self.worker_done.waitTimeout(io, .{ .duration = .{
+            .raw = .fromMilliseconds(poll_ms),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            // Canceled is ignored, as io_mod.sleep ignored it before. Every
+            // caller's loop re-runs its checks, so both errors fall through.
+            error.Timeout, error.Canceled => {},
+        };
+    }
+
     fn finalizeReplayLocked(self: *Entry) void {
         if (self.output_handle != null) return;
         const capture = self.replay_capture orelse return;
@@ -814,14 +827,7 @@ pub const Runtime = struct {
                     break;
                 }
             }
-            entry.worker_done.waitTimeout(zio, .{ .duration = .{
-                .raw = .fromMilliseconds(poll_ms),
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                // Canceled is ignored, as io_mod.sleep ignored it before. Every
-                // pass re-runs the checks above, so both errors fall through.
-                error.Timeout, error.Canceled => {},
-            };
+            entry.waitForWorkerOrPoll(zio, poll_ms);
         }
 
         var prepared = try self.prepareSnapshot(alloc, entry.execution_id);
@@ -1129,6 +1135,7 @@ pub const Runtime = struct {
         var quiet_wait = quiet_notice.beginWait(wait_started_ms, entry.last_output_ms, wait_ceiling_ms, limit_ms);
         entry.mutex.unlock(zio);
         defer self.clearActiveWaiter(entry, waiter_id);
+        const poll_ms = capturedWaitPollMs();
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
@@ -1156,7 +1163,7 @@ pub const Runtime = struct {
                 }
                 break;
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            entry.waitForWorkerOrPoll(zio, poll_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
     }
@@ -1204,6 +1211,7 @@ pub const Runtime = struct {
         }
         entry.mutex.unlock(zio);
         const started_ms = io_mod.milliTimestamp();
+        const poll_ms = capturedWaitPollMs();
         while (true) {
             entry.mutex.lockUncancelable(zio);
             const terminal = entry.isTerminal();
@@ -1232,7 +1240,7 @@ pub const Runtime = struct {
                 }
                 return prepared;
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            entry.waitForWorkerOrPoll(zio, poll_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
     }
@@ -2378,6 +2386,101 @@ test "captured run returns when its command ends without waiting out the poll" {
         else => return error.TestUnexpectedResult,
     }
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "captured wait returns when its command ends without waiting out the poll" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    test_captured_wait_poll_ms = 5_000;
+    defer test_captured_wait_poll_ms = null;
+    var input = StartCapturedInput{
+        .execution_id = "managed-wait-on-end",
+        .command = "sleep 0.3",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    const wait_started_ms = io_mod.milliTimestamp();
+    var completed = try runtime.wait(alloc, input.execution_id, 30_000, null);
+    defer completed.deinit(alloc);
+    const elapsed_ms = io_mod.milliTimestamp() - wait_started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+    switch (completed.snapshot.state) {
+        .completed => |status| try std.testing.expectEqual(command_contract.CommandStatus{ .exit_code = 0 }, status),
+        else => return error.TestUnexpectedResult,
+    }
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "captured stop returns when the command settles without waiting out the poll" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    test_captured_wait_poll_ms = 5_000;
+    defer test_captured_wait_poll_ms = null;
+
+    const OutputSeen = struct {
+        event: std.Io.Event = .unset,
+
+        fn append(
+            raw: *anyopaque,
+            _: ?types.ToolLifecycleId,
+            _: command_contract.CommandOutputStream,
+            _: []const u8,
+        ) !void {
+            const seen: *@This() = @ptrCast(@alignCast(raw));
+            seen.event.set(io_mod.getIo());
+        }
+    };
+    var output_seen: OutputSeen = .{};
+    var input = StartCapturedInput{
+        .execution_id = "managed-stop-on-settle",
+        .command = "printf 'ready\\n'; sleep 5",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+        .output_chunk_ctx = &output_seen,
+        .on_output_chunk = OutputSeen.append,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    // The stop must follow the command's start, or it lands before the child spawns.
+    const output_wait_ms: i64 = 2_000;
+    try output_seen.event.waitTimeout(io_mod.getIo(), .{ .duration = .{
+        .raw = .fromMilliseconds(output_wait_ms),
+        .clock = .awake,
+    } });
+
+    const stop_started_ms = io_mod.milliTimestamp();
+    var stopped = try runtime.stop(alloc, input.execution_id, false);
+    defer stopped.deinit(alloc);
+    const elapsed_ms = io_mod.milliTimestamp() - stop_started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+    switch (stopped.snapshot.state) {
+        .stopped => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
 }
 
 test "a cancel takes only the running commands steering detached in its turn" {
