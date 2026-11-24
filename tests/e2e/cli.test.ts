@@ -979,6 +979,82 @@ describe("cli: status", () => {
   );
 
   test(
+    "status and doctor skip one bad entry of ~/.fx/mcp.json with a note, and still show its good entry and the project's server",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-profile-entry-")));
+      const gateway = startFakeGateway([]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        // Disabled, so doctor makes no connection: both still show, as configured.
+        writeFileSync(
+          join(home, ".fx", "mcp.json"),
+          JSON.stringify({
+            mcp: {
+              bad: { type: "http", url: "http://example.com/mcp" },
+              good: { type: "http", url: "http://127.0.0.1:1/mcp", enabled: false },
+            },
+          }) + "\n",
+          { mode: 0o600 },
+        );
+        writeFileSync(join(workspace, ".mcp.json"), JSON.stringify({ mcpServers: { project: { type: "http", url: "http://127.0.0.1:2/mcp", enabled: false } } }) + "\n");
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-profile-entry-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        };
+        const statusText = await runFx(["status"], { cwd: workspace, env });
+        const statusJson = await runFx(["status", "--json"], { cwd: workspace, env });
+        const doctorText = await runFx(["doctor"], { cwd: workspace, env });
+        const doctorJson = await runFx(["doctor", "--json"], { cwd: workspace, env });
+
+        const note = "~/.fx/mcp.json server 'bad' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https.";
+        const fix = "fix ~/.fx/mcp.json, then run fx doctor again";
+        const named = (stdout: string) =>
+          (JSON.parse(stdout).mcp.servers as { name: string; source: string }[]).map((server) => `${server.source}:${server.name}`).sort();
+
+        expect(statusText.code, statusText.stderr).toBe(0);
+        expect(statusText.stderr).toBe("");
+        expect(statusText.stdout).not.toContain("mcp_config_error");
+        expect(statusText.stdout).toContain(`[status] mcp_configuration_issue=${note}\n`);
+        expect(statusText.stdout).toContain("[status] mcp_servers=2 mcp_configuration_issues=1\n");
+
+        expect(statusJson.code, statusJson.stderr).toBe(0);
+        const status = JSON.parse(statusJson.stdout);
+        expect(status).not.toHaveProperty("mcp_config_error");
+        expect(status.mcp.servers.map((server: { source: string }) => server.source).sort()).toEqual(["profile", "workspace"]);
+        expect(named(statusJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(status.mcp.configuration_issues).toEqual([note]);
+        expect(status.mcp.inspection_error).toBeNull();
+        expect(status.mcp.connection_check).toBe("not_checked");
+
+        const doctor = JSON.parse(doctorJson.stdout);
+        expect(doctor.mcp.connection_check).toBe("checked");
+        expect(named(doctorJson.stdout)).toEqual(["profile:good", "workspace:project"]);
+        expect(doctor.mcp.configuration_issues).toEqual([note]);
+        expect(doctor.mcp.inspection_error).toBeNull();
+        const configChecks = doctor.checks.filter((check: { name: string }) => check.name === "mcp_config");
+        expect(configChecks).toEqual([{ name: "mcp_config", status: "fail", detail: note, fix }]);
+        expect(doctorJson.code, doctorJson.stderr).toBe(1);
+        expect(doctorText.stdout).toContain(`  \u2717 mcp_config ${note}\n               fix: ${fix}\n`);
+        expect(doctorText.stdout).not.toContain("failed to load");
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "doctor names unknown settings keys while status stays quiet",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-unknown-settings-")));

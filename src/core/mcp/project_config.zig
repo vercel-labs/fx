@@ -420,6 +420,12 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
     return parseProfileDocumentInto(alloc, json_text, null);
 }
 
+/// The profile's document as the runtime reads it (`parseProfileServers`): an entry fx can't read is left out and
+/// noted in `skipped`, with the notes about a misspelled or ignored key, and `diagnostic` still holds the warning.
+pub fn parseProfileDocumentSkipping(alloc: Allocator, json_text: []const u8, skipped: *std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
+    return parseProfileDocumentInto(alloc, json_text, skipped);
+}
+
 fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),

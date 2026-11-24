@@ -19,6 +19,9 @@
 \*                             or "hinted" (the same, and a line that says the
 \*                             profile's misspelled key holds the name)
 \*   list {file, loaded}       the names `fx mcp list --json` shows from the file
+\*   inspect {file, shown, noted}
+\*                             the servers `fx status --json` lists from the file, and the
+\*                             entries of the file its configuration issues note as skipped
 \*   tamper {kind, file, name, class}
 \*                             the harness edits a file itself, as an editor would:
 \*                             typo_appears (name: the server the key holds, or
@@ -34,7 +37,9 @@ Viol ==
     (IF NoRewriteOfMisspelled THEN {} ELSE {"NoRewriteOfMisspelled"}) \cup
     (IF NoWriteOfDeep THEN {} ELSE {"NoWriteOfDeep"}) \cup
     (IF HintMatchesHeldName THEN {} ELSE {"HintMatchesHeldName"}) \cup
-    (IF OthersKept THEN {} ELSE {"OthersKept"})
+    (IF OthersKept THEN {} ELSE {"OthersKept"}) \cup
+    (IF InspectKeepsGood THEN {} ELSE {"InspectKeepsGood"}) \cup
+    (IF InspectNotesSkipped THEN {} ELSE {"InspectNotesSkipped"})
 
 
 Step(rec) ==
@@ -55,6 +60,10 @@ Step(rec) ==
             /\ same' = rec.data.same
       [] rec.event = "list" ->
             /\ LoadedNames(rec.data.file) = rec.data.loaded
+            /\ UNCHANGED vars
+      [] rec.event = "inspect" ->
+            /\ InspectShown(rec.data.file) = rec.data.shown
+            /\ InspectNoted(rec.data.file) = rec.data.noted
             /\ UNCHANGED vars
       [] rec.event = "tamper" ->
             \/ rec.data.kind = "typo_appears" /\ TypoAppears(IF rec.data.name \in Names THEN rec.data.name ELSE OtherTypo)
