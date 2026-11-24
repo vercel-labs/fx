@@ -60,25 +60,28 @@ const startup_aliases_file = "startup-aliases";
 const save_status_file = "save-status";
 const max_status_bytes = 64;
 
-/// Appends `path` in single quotes. A `'` in `path` becomes `'\''`, so the path
-/// stays one shell word.
-fn appendQuotedWord(alloc: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8) !void {
+/// Appends the path that `parts` join with `/`, in single quotes. A `'` in a part
+/// becomes `'\''`, so the path stays one shell word.
+fn appendQuotedWord(alloc: std.mem.Allocator, out: *std.ArrayList(u8), parts: []const []const u8) !void {
     try out.append(alloc, '\'');
-    for (path) |byte| {
-        if (byte == '\'') {
-            try out.appendSlice(alloc, "'\\''");
-        } else {
-            try out.append(alloc, byte);
+    for (parts, 0..) |part, index| {
+        if (index > 0) try out.append(alloc, '/');
+        for (part) |byte| {
+            if (byte == '\'') {
+                try out.appendSlice(alloc, "'\\''");
+            } else {
+                try out.append(alloc, byte);
+            }
         }
     }
     try out.append(alloc, '\'');
 }
 
-/// Appends `name='<path>'` and a newline.
-fn appendQuotedAssignment(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, path: []const u8) !void {
+/// Appends `name='<dir>/<file>'` and a newline.
+fn appendQuotedAssignment(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, dir: []const u8, file: []const u8) !void {
     try out.appendSlice(alloc, name);
     try out.append(alloc, '=');
-    try appendQuotedWord(alloc, out, path);
+    try appendQuotedWord(alloc, out, &.{ dir, file });
     try out.append(alloc, '\n');
 }
 
@@ -90,37 +93,6 @@ fn isVariableName(name: []const u8) bool {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
     }
     return true;
-}
-
-/// The env.sh script for a session whose state file is `state_path`. The caller
-/// owns the result. Its paths are single-quoted, so each stays one shell word.
-/// `fx_variables` are the names fx adds to every program; the script skips them
-/// when it saves, so they never reach the saved state.
-fn envScript(
-    alloc: std.mem.Allocator,
-    state_path: []const u8,
-    folder_path: []const u8,
-    startup_functions_path: []const u8,
-    startup_aliases_path: []const u8,
-    status_path: []const u8,
-    fx_variables: []const []const u8,
-) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, env_header);
-    try appendQuotedAssignment(alloc, &out, "__fx_state", state_path);
-    try appendQuotedAssignment(alloc, &out, "__fx_folder", folder_path);
-    try appendQuotedAssignment(alloc, &out, "__fx_startup_functions", startup_functions_path);
-    try appendQuotedAssignment(alloc, &out, "__fx_startup_aliases", startup_aliases_path);
-    try appendQuotedAssignment(alloc, &out, "__fx_status", status_path);
-    try out.appendSlice(alloc, std.fmt.comptimePrint("__fx_max={d}\n", .{max_state_bytes}));
-    try out.appendSlice(alloc, body_before_skip);
-    for (fx_variables) |name| {
-        try out.append(alloc, '|');
-        try out.appendSlice(alloc, name);
-    }
-    try out.appendSlice(alloc, body_after_skip);
-    return out.toOwnedSlice(alloc);
 }
 
 /// Why the last program's state was not saved. `over_cap` holds the size of the
@@ -210,11 +182,9 @@ pub const Session = struct {
         const hex = std.fmt.bytesToHex(suffix, .lower);
         const dir = try alloc.print("{s}/{s}{d}-{s}", .{ tmp_root, folder_prefix, processId(), &hex });
         errdefer alloc.free(dir);
-        const env_path = try alloc.print("{s}/{s}", .{ dir, env_file });
-        defer alloc.free(env_path);
         const script = try sessionEnvScript(alloc, dir, fx_variables);
         defer alloc.free(script);
-        const after_startup = try startupTextFor(alloc, env_path);
+        const after_startup = try startupTextFor(alloc, dir);
         errdefer alloc.free(after_startup);
 
         try std.Io.Dir.cwd().createDir(io, dir, .fromMode(0o700));
@@ -606,13 +576,13 @@ fn writeViaTemp(io: std.Io, folder: std.Io.Dir, name: []const u8, bytes: []const
     try folder.rename(temp, folder, name, io);
 }
 
-/// The after-startup text for the script at `env_path`: `. '<env_path>'`. The
-/// caller owns the result.
-fn startupTextFor(alloc: std.mem.Allocator, env_path: []const u8) ![]u8 {
+/// The after-startup text that loads the env.sh of the session folder `dir`:
+/// `\builtin . '<dir>/env.sh'`. The caller owns the result.
+fn startupTextFor(alloc: std.mem.Allocator, dir: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "\\builtin . ");
-    try appendQuotedWord(alloc, &out, env_path);
+    try appendQuotedWord(alloc, &out, &.{ dir, env_file });
     return out.toOwnedSlice(alloc);
 }
 
@@ -678,20 +648,33 @@ const Healed = struct {
     }
 };
 
-/// The env.sh text for the session folder `dir`: the paths of its files, and the
-/// names fx adds to every program. `prepare` and `heal` write it.
+/// The script variables that name the session's files, in the order the script
+/// reads them.
+const script_files = [_]struct { name: []const u8, file: []const u8 }{
+    .{ .name = "__fx_state", .file = state_file },
+    .{ .name = "__fx_folder", .file = folder_file },
+    .{ .name = "__fx_startup_functions", .file = startup_functions_file },
+    .{ .name = "__fx_startup_aliases", .file = startup_aliases_file },
+    .{ .name = "__fx_status", .file = save_status_file },
+};
+
+/// The env.sh text for the session folder `dir`: the quoted paths of its files, the
+/// state cap, and the script body. `fx_variables` are the names fx adds to every
+/// program; the script skips them when it saves, so they never reach the saved
+/// state. `prepare` and `heal` write it. The caller owns the result.
 fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []const []const u8) ![]u8 {
-    const state_path = try alloc.print("{s}/{s}", .{ dir, state_file });
-    defer alloc.free(state_path);
-    const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
-    defer alloc.free(folder_path);
-    const startup_functions_path = try alloc.print("{s}/{s}", .{ dir, startup_functions_file });
-    defer alloc.free(startup_functions_path);
-    const startup_aliases_path = try alloc.print("{s}/{s}", .{ dir, startup_aliases_file });
-    defer alloc.free(startup_aliases_path);
-    const status_path = try alloc.print("{s}/{s}", .{ dir, save_status_file });
-    defer alloc.free(status_path);
-    return envScript(alloc, state_path, folder_path, startup_functions_path, startup_aliases_path, status_path, fx_variables);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, env_header);
+    for (script_files) |entry| try appendQuotedAssignment(alloc, &out, entry.name, dir, entry.file);
+    try out.appendSlice(alloc, std.fmt.comptimePrint("__fx_max={d}\n", .{max_state_bytes}));
+    try out.appendSlice(alloc, body_before_skip);
+    for (fx_variables) |name| {
+        try out.append(alloc, '|');
+        try out.appendSlice(alloc, name);
+    }
+    try out.appendSlice(alloc, body_after_skip);
+    return out.toOwnedSlice(alloc);
 }
 
 /// The kind of the entry `name` in `folder`, without following a link, or null
@@ -1002,9 +985,9 @@ test "bashPath keeps an absolute bash and falls back to /bin/bash" {
     try std.testing.expectEqualStrings("/bin/bash", bashPath("bash"));
 }
 
-test "envScript quotes the state path, keeps the header, and installs the save trap" {
+test "the script quotes the session folder, keeps the header, and installs the save trap" {
     const alloc = std.testing.allocator;
-    const script = try envScript(alloc, "/tmp/a'b/state.sh", "/tmp/a'b/folder", "/tmp/a'b/startup-functions", "/tmp/a'b/startup-aliases", "/tmp/a'b/save-status", &test_fx_variables);
+    const script = try sessionEnvScript(alloc, "/tmp/a'b", &test_fx_variables);
     defer alloc.free(script);
     var lines = std.mem.splitScalar(u8, script, '\n');
     try std.testing.expectEqualStrings("# fx bash tool: load the bash state the last program saved, and save it again", lines.next().?);
@@ -1019,7 +1002,7 @@ test "envScript quotes the state path, keeps the header, and installs the save t
 }
 
 test "the bash script keeps the reviewed bytes" {
-    const script = try envScript(std.testing.allocator, "/tmp/fx-pinned/state.sh", "/tmp/fx-pinned/folder", "/tmp/fx-pinned/startup-functions", "/tmp/fx-pinned/startup-aliases", "/tmp/fx-pinned/save-status", &test_fx_variables);
+    const script = try sessionEnvScript(std.testing.allocator, "/tmp/fx-pinned", &test_fx_variables);
     defer std.testing.allocator.free(script);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});

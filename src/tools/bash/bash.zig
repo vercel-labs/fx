@@ -82,8 +82,6 @@ const start_folder_notice = "fx: the bash session's saved folder could not be us
 /// The notice a call's result carries when `heal` lost the saved state, because a
 /// program removed or replaced the session's files. It is true of every result.
 const state_lost_notice = "fx: the bash session's saved state was lost because its files were removed or replaced, so programs start from a fresh state.";
-/// The failure text when the session could not make a folder. The program did not run.
-const session_folder_failed_text = "fx: bash could not make a folder for its session ({s}), so this program did not run.";
 
 /// The action a call gets, decided by its command: `wait` when the command is
 /// the wait request, else `run`. This is fx's own field, so an `action` the
@@ -116,7 +114,7 @@ fn parseArguments(arena: Allocator, args_json: []const u8) Allocator.Error!Decod
     while (keys.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "command") or std.mem.eql(u8, key, "action")) continue;
-        return .{ .failure = try arena.print("bash takes only \"command\"; remove \"{s}\".", .{key}) };
+        return .{ .failure = try joinParts(arena, &.{ "bash takes only \"command\"; remove \"", key, "\"." }) };
     }
 
     const action: Action = if (object.get("action")) |value| explicit: {
@@ -225,11 +223,11 @@ fn callRun(
     // made is logged, even when a later one fails.
     const healed = session.heal(io_mod.getIo(), &fx_variables);
     if (swept + healed.swept > 0) debug_trace.logf("bash", "removed {d} bash session folders that ended processes left", .{swept + healed.swept});
-    for (healed.items()) |repair| debug_trace.logf("bash", "bash session healed what={s} name={s}", .{ @tagName(repair.what), repair.name });
-    if (healed.repair_failed) |err| debug_trace.logf("bash", "bash session repair failed err={s}", .{@errorName(err)});
-    if (healed.forget_failed) |err| debug_trace.logf("bash", "bash session could not remove its old folder err={s}", .{@errorName(err)});
+    for (healed.items()) |repair| traceRepair(@tagName(repair.what), repair.name);
+    if (healed.repair_failed) |err| traceError("bash session repair failed", err);
+    if (healed.forget_failed) |err| traceError("bash session could not remove its old folder", err);
     if (healed.fresh_failed) |err| {
-        debug_trace.logf("bash", "bash session could not make a folder err={s}", .{@errorName(err)});
+        traceError("bash session could not make a folder", err);
         return sessionFailure(ctx, err);
     }
     // Set by the prepare and heal above. Looked up before the program is set, so a
@@ -240,7 +238,7 @@ fn callRun(
     refreshFolder(session);
     // A loss that an earlier call's failed fresh folder left is still pending, so this call reports it too.
     const lost = healed.stateLost() or session.lossPending();
-    if (lost and !healed.stateLost()) debug_trace.logf("bash", "bash session healed what=state_lost name=session", .{});
+    if (lost and !healed.stateLost()) traceRepair("state_lost", "session");
     const notes: CallNotes = .{
         .folder = if (session.takeFolderDropped()) start_folder_notice else null,
         .state = if (lost) state_lost_notice else null,
@@ -270,13 +268,12 @@ fn callRun(
     const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
         const capability = ctx.mcp_call_capability orelse break :registration null;
         break :registration mcp_call_bridge.register(capability) catch |err| {
-            debug_trace.logf("bash", "bash call not registered with the bridge err={s}", .{@errorName(err)});
+            traceError("bash call not registered with the bridge", err);
             break :registration null;
         };
     } else null;
     defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
-    var variables: std.ArrayList(managed_execution.EnvironmentVariable) = .empty;
-    if (bridge_registration) |registration| try variables.appendSlice(request_arena, registration.environment());
+    const extra_environment: []const managed_execution.EnvironmentVariable = if (bridge_registration) |registration| registration.environment() else &.{};
     // A save record that a program left after it ended, with its end never
     // delivered, is this program's to report. It is taken here, just before this
     // program starts, and its notice goes into this program's result.
@@ -287,7 +284,7 @@ fn callRun(
         .cwd = folder,
         .environment = environment,
         .authority = authority,
-        .extra_environment = variables.items,
+        .extra_environment = extra_environment,
         .after_startup = after_startup,
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
@@ -348,6 +345,19 @@ fn callWait(
 /// the notice, and `previous` is a program that ended before that call.
 const NoticeOwner = enum { own, previous };
 
+/// The most bytes a decimal number of a 64-bit value takes, with its sign.
+const max_decimal_bytes = 20;
+
+/// The decimal text of `value`, written into `buf`.
+fn decimal(buf: *[max_decimal_bytes]u8, value: i64) []u8 {
+    return buf[0..std.fmt.printInt(buf, value, 10, .lower, .{})];
+}
+
+/// A new slice holding `parts` in order. The caller frees it.
+fn joinParts(alloc: Allocator, parts: []const []const u8) Allocator.Error![]u8 {
+    return std.mem.concat(alloc, u8, parts);
+}
+
 /// Takes the save record the last program's save left, if there is one, logs why
 /// that program's state was not saved, and returns the notice for the result. The
 /// caller frees a non-null result.
@@ -358,39 +368,36 @@ fn takeSaveNotice(alloc: Allocator, session: *bash_session.Session, owner: Notic
         .failed, .not_saved => 0,
     };
     debug_trace.logf("bash", "bash state not saved: reason={s} bytes={d}", .{ @tagName(status), bytes });
+    const previous = owner == .previous;
+    var digits: [max_decimal_bytes]u8 = undefined;
     return switch (status) {
-        .over_cap => |size| if (owner == .previous)
-            try alloc.print("fx: the previous program's bash state was {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; the last saved state stays.", .{size})
-        else
-            try alloc.print("fx: this program's bash state is {d} bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; the next program starts from the last saved state.", .{size}),
-        .failed => try alloc.dupe(u8, if (owner == .previous)
+        .over_cap => |size| try joinParts(alloc, &.{
+            if (previous) "fx: the previous program's bash state was " else "fx: this program's bash state is ",
+            decimal(&digits, @intCast(size)),
+            " bytes, over the " ++ max_state_text ++ "-byte limit, so it was not saved; ",
+            if (previous) "the last saved state stays." else "the next program starts from the last saved state.",
+        }),
+        .failed => try alloc.dupe(u8, if (previous)
             "fx: the previous program's bash state could not be saved; the last saved state stays."
         else
             "fx: this program's bash state could not be saved; the next program starts from the last saved state."),
-        .not_saved => try alloc.dupe(u8, if (owner == .previous)
+        .not_saved => try alloc.dupe(u8, if (previous)
             "fx: the previous program ended before fx could save its bash state, so it was not saved; the last saved state stays."
         else
             "fx: this program ended before fx could save its bash state, so it was not saved; the next program starts from the last saved state."),
     };
 }
 
-/// `body` with each present notice on its own line after it. Frees `body`, also
-/// when it fails.
-fn withNotices(alloc: Allocator, body: []u8, notices: []const ?[]const u8) Allocator.Error![]u8 {
-    defer alloc.free(body);
+/// `body` with each present notice on its own line after it. Borrows `body`; the
+/// caller frees the result.
+fn withNotices(alloc: Allocator, body: []const u8, notices: []const ?[]const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, body);
     for (notices) |notice| {
-        if (notice) |text| try appendLine(alloc, &out, text);
+        if (notice) |text| try appendLine(alloc, &out, &.{text});
     }
     return out.toOwnedSlice(alloc);
-}
-
-/// The result text for `snapshot`, with `notices` after it. The caller frees it.
-fn formatWithNotices(alloc: Allocator, snapshot: managed_execution.Snapshot, max_bytes: usize, notices: []const ?[]const u8) ![]u8 {
-    const formatted = try formatResult(alloc, snapshot, max_bytes);
-    return withNotices(alloc, formatted, notices);
 }
 
 /// Refreshes the session's start folder, and logs a drop by its reason, never by
@@ -419,8 +426,12 @@ const CallNotes = struct {
 
 /// `text` as a failure result, with the notices after it.
 fn failureWithNote(ctx: tool_dispatch.DispatchContext, text: []const u8, notes: CallNotes) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const body = try ctx.allocator.dupe(u8, text);
-    return .{ .failure = try withNotices(ctx.allocator, body, &.{ notes.folder, notes.state }) };
+    return .{ .failure = try withNotices(ctx.allocator, text, &.{ notes.folder, notes.state }) };
+}
+
+/// The text of a bash program that could not run because of `err`.
+fn runtimeFailureText(alloc: Allocator, err: anyerror) Allocator.Error![]u8 {
+    return joinParts(alloc, &.{ "bash could not run the program: ", @errorName(err), "." });
 }
 
 /// The result when the program did not start. The previous program's notice, if
@@ -437,16 +448,17 @@ fn startFailure(
         if (leftover != null or notes.present()) logDroppedNotice(err);
         return error.OutOfMemory;
     }
-    const failure = ctx.allocator.print("bash could not run the program: {s}.", .{@errorName(err)}) catch |alloc_err| {
+    const failure = runtimeFailureText(ctx.allocator, err) catch |alloc_err| {
         if (leftover != null or notes.present()) logDroppedNotice(alloc_err);
         return alloc_err;
     };
+    defer ctx.allocator.free(failure);
     const notices = [_]?[]const u8{ leftover, notes.folder, notes.state };
     const body = withNotices(ctx.allocator, failure, &notices) catch |attach_err| {
         if (leftover != null or notes.present()) logDroppedNotice(attach_err);
         return attach_err;
     };
-    if (leftover != null) debug_trace.logf("bash", "the previous program's not-saved notice went with a start failure err={s}", .{@errorName(err)});
+    if (leftover != null) traceError("the previous program's not-saved notice went with a start failure", err);
     return .{ .failure = body };
 }
 
@@ -460,15 +472,11 @@ fn undeliveredResult(ctx: tool_dispatch.DispatchContext, text: []const u8, notic
         if (has_notice) logDroppedNotice(err);
         return error.OutOfMemory;
     }
-    const body = ctx.allocator.dupe(u8, text) catch |alloc_err| {
-        if (has_notice) logDroppedNotice(alloc_err);
-        return alloc_err;
-    };
-    const with_notices = withNotices(ctx.allocator, body, notices) catch |attach_err| {
+    const with_notices = withNotices(ctx.allocator, text, notices) catch |attach_err| {
         if (has_notice) logDroppedNotice(attach_err);
         return attach_err;
     };
-    if (has_notice) debug_trace.logf("bash", "a save notice went with a result failure err={s}", .{@errorName(err)});
+    if (has_notice) traceError("a save notice went with a result failure", err);
     return .{ .failure = with_notices };
 }
 
@@ -480,9 +488,28 @@ fn hasNotice(notices: []const ?[]const u8) bool {
     return false;
 }
 
+/// Logs `what` with the name of `err`. Every bash failure line goes through here, so
+/// they share one format.
+fn traceError(what: []const u8, err: anyerror) void {
+    debug_trace.logf("bash", "{s} err={s}", .{ what, @errorName(err) });
+}
+
+/// Logs a repair `heal` made, by its kind and the name of the entry it changed.
+fn traceRepair(what: []const u8, name: []const u8) void {
+    debug_trace.logf("bash", "bash session healed what={s} name={s}", .{ what, name });
+}
+
 /// Logs that a save notice reached no result, and why.
 fn logDroppedNotice(err: anyerror) void {
-    debug_trace.logf("bash", "a save notice was dropped with no result to carry it err={s}", .{@errorName(err)});
+    traceError("a save notice was dropped with no result to carry it", err);
+}
+
+/// Cancels the reservation of `prepared`, after a failure in `what`. A cancel that
+/// fails is logged, because the reservation may then stay.
+fn cancelDelivery(runtime: *managed_execution.Runtime, prepared: *const managed_execution.PreparedSnapshot, what: []const u8) void {
+    runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |err| {
+        debug_trace.logf("bash", "delivery cancel failed after {s} err={s}", .{ what, @errorName(err) });
+    };
 }
 
 /// Turns a program's snapshot into the result the model reads, then hands the
@@ -503,9 +530,7 @@ fn finish(
         if (std.meta.activeTag(prepared.snapshot.state) == .running) break :blk null;
         break :blk takeSaveNotice(ctx.allocator, session, .own) catch |err| {
             // The reservation is made, so it is cancelled on this failure too.
-            runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
-                debug_trace.logf("bash", "delivery cancel failed after a notice error err={s}", .{@errorName(cancel_err)});
-            };
+            cancelDelivery(runtime, prepared, "a notice error");
             if (leftover != null or notes.present()) logDroppedNotice(err);
             return err;
         };
@@ -513,18 +538,14 @@ fn finish(
     defer if (own) |text| ctx.allocator.free(text);
     const notices = [_]?[]const u8{ leftover, own, notes.folder, notes.state };
     const budget = @max(ctx.max_tool_result_bytes, min_result_bytes);
-    const body = formatWithNotices(ctx.allocator, prepared.snapshot, budget, &notices) catch |err| {
-        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
-            debug_trace.logf("bash", "delivery cancel failed after a format error err={s}", .{@errorName(cancel_err)});
-        };
+    const body = formatResult(ctx.allocator, prepared.snapshot, budget, &notices) catch |err| {
+        cancelDelivery(runtime, prepared, "a format error");
         return undeliveredResult(ctx, "bash result is unavailable", &notices, err);
     };
     managed_delivery.handoff(ctx, runtime, prepared.reservation_id) catch |err| {
-        debug_trace.logf("bash", "result commit failed err={s}", .{@errorName(err)});
+        traceError("result commit failed", err);
         ctx.allocator.free(body);
-        runtime.cancelDelivery(prepared.snapshot.execution_id, prepared.reservation_id) catch |cancel_err| {
-            debug_trace.logf("bash", "delivery cancel failed after a commit failure err={s}", .{@errorName(cancel_err)});
-        };
+        cancelDelivery(runtime, prepared, "a commit failure");
         return undeliveredResult(ctx, "bash result commit failed", &notices, err);
     };
     // The program has ended, so the next program starts where it left off. A folder
@@ -554,14 +575,14 @@ fn unavailableResult(ctx: tool_dispatch.DispatchContext) tool_dispatch.DispatchE
 /// to report, so it is returned as is.
 fn runtimeFailure(ctx: tool_dispatch.DispatchContext, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .failure = try ctx.allocator.print("bash could not run the program: {s}.", .{@errorName(err)}) };
+    return .{ .failure = try runtimeFailureText(ctx.allocator, err) };
 }
 
 /// The result when the session could not make a folder, so the program did not run.
 /// Running out of memory is the caller's to report, so it is returned as is.
 fn sessionFailure(ctx: tool_dispatch.DispatchContext, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .failure = try ctx.allocator.print(session_folder_failed_text, .{@errorName(err)}) };
+    return .{ .failure = try joinParts(ctx.allocator, &.{ "fx: bash could not make a folder for its session (", @errorName(err), "), so this program did not run." }) };
 }
 
 fn cancelRequested(ctx: tool_dispatch.DispatchContext) bool {
@@ -599,9 +620,9 @@ test "tmpRoot uses an absolute TMPDIR without trailing slashes, and /tmp otherwi
 }
 
 /// The text the model sees for one snapshot of a bash program: its output, cut
-/// to `max_bytes` when needed, then at most one status line, then the flags.
-/// The caller frees the result.
-fn formatResult(alloc: Allocator, snapshot: managed_execution.Snapshot, max_bytes: usize) ![]u8 {
+/// to `max_bytes` when needed, then at most one status line, then the flags, then
+/// `notices`, each on its own line. The caller frees the result.
+fn formatResult(alloc: Allocator, snapshot: managed_execution.Snapshot, max_bytes: usize, notices: []const ?[]const u8) ![]u8 {
     if (max_bytes < min_result_bytes) return error.ResultBudgetTooSmall;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -612,12 +633,12 @@ fn formatResult(alloc: Allocator, snapshot: managed_execution.Snapshot, max_byte
     } else {
         try out.appendSlice(alloc, output);
     }
-    if (try statusLine(alloc, snapshot)) |line| {
-        defer alloc.free(line);
-        try appendLine(alloc, &out, line);
+    try appendStatusLine(alloc, &out, snapshot);
+    if (snapshot.output_truncated) try appendLine(alloc, &out, &.{"[some output was cut]"});
+    if (snapshot.output_incomplete) try appendLine(alloc, &out, &.{"[some output could not be read]"});
+    for (notices) |notice| {
+        if (notice) |text| try appendLine(alloc, &out, &.{text});
     }
-    if (snapshot.output_truncated) try appendLine(alloc, &out, "[some output was cut]");
-    if (snapshot.output_incomplete) try appendLine(alloc, &out, "[some output could not be read]");
     return out.toOwnedSlice(alloc);
 }
 
@@ -629,43 +650,42 @@ fn appendCutOutput(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, 
     const tail_budget = keep - head_budget;
     const head_end = text_utils.utf8BackwardBoundary(text, head_budget);
     const tail_start = text_utils.utf8ForwardBoundary(text, text.len - tail_budget);
-    const marker = try alloc.print("[... {d} bytes cut ...]", .{tail_start - head_end});
-    defer alloc.free(marker);
+    var digits: [max_decimal_bytes]u8 = undefined;
     try out.appendSlice(alloc, text[0..head_end]);
-    try appendLine(alloc, out, marker);
-    try appendLine(alloc, out, text[tail_start..]);
+    try appendLine(alloc, out, &.{ "[... ", decimal(&digits, @intCast(tail_start - head_end)), " bytes cut ...]" });
+    try appendLine(alloc, out, &.{text[tail_start..]});
 }
 
-/// Appends `line` on its own line, first adding a line end when `out` does not
+/// Appends `parts` on their own line, first adding a line end when `out` does not
 /// already end with one.
-fn appendLine(alloc: Allocator, out: *std.ArrayList(u8), line: []const u8) !void {
+fn appendLine(alloc: Allocator, out: *std.ArrayList(u8), parts: []const []const u8) Allocator.Error!void {
     if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(alloc, '\n');
-    try out.appendSlice(alloc, line);
+    for (parts) |part| try out.appendSlice(alloc, part);
 }
 
-/// The one status line for `snapshot`, or null when its state needs none. The
-/// caller frees a non-null result.
-fn statusLine(alloc: Allocator, snapshot: managed_execution.Snapshot) Allocator.Error!?[]u8 {
+/// Appends the one status line for `snapshot`, when its state needs one.
+fn appendStatusLine(alloc: Allocator, out: *std.ArrayList(u8), snapshot: managed_execution.Snapshot) Allocator.Error!void {
+    var digits: [max_decimal_bytes]u8 = undefined;
     const no_output = snapshot.output_delta.len == 0;
-    return switch (snapshot.state) {
-        .running => if (snapshot.running_ms) |ms|
-            try alloc.print("[still running after {d} s. " ++ wait_hint ++ "]", .{ms / 1000})
-        else
-            try alloc.dupe(u8, "[still running. " ++ wait_hint ++ "]"),
-        .completed => |status| switch (status) {
-            .exit_code => |code| if (code != 0)
-                try alloc.print("[exit {d}]", .{code})
-            else if (no_output)
-                try alloc.dupe(u8, "[done, no output]")
-            else
-                null,
-            .finished => if (no_output) try alloc.dupe(u8, "[done, no output]") else null,
-            .signal => |signal| try alloc.print("[killed by signal {d}]", .{signal}),
-            .indeterminate => try alloc.dupe(u8, "[ended; exit status unknown]"),
+    switch (snapshot.state) {
+        .running => if (snapshot.running_ms) |ms| {
+            try appendLine(alloc, out, &.{ "[still running after ", decimal(&digits, @intCast(ms / 1000)), " s. ", wait_hint, "]" });
+        } else {
+            try appendLine(alloc, out, &.{"[still running. " ++ wait_hint ++ "]"});
         },
-        .stopped => try alloc.dupe(u8, "[stopped]"),
-        .lost => try alloc.dupe(u8, "[fx lost this program]"),
-    };
+        .completed => |status| switch (status) {
+            .exit_code => |code| if (code != 0) {
+                try appendLine(alloc, out, &.{ "[exit ", decimal(&digits, code), "]" });
+            } else if (no_output) {
+                try appendLine(alloc, out, &.{"[done, no output]"});
+            },
+            .finished => if (no_output) try appendLine(alloc, out, &.{"[done, no output]"}),
+            .signal => |signal| try appendLine(alloc, out, &.{ "[killed by signal ", decimal(&digits, @intCast(signal)), "]" }),
+            .indeterminate => try appendLine(alloc, out, &.{"[ended; exit status unknown]"}),
+        },
+        .stopped => try appendLine(alloc, out, &.{"[stopped]"}),
+        .lost => try appendLine(alloc, out, &.{"[fx lost this program]"}),
+    }
 }
 
 fn parseObject(arena: Allocator, text: []const u8) !std.json.ObjectMap {
@@ -921,7 +941,7 @@ test "formatResult shows one status line for each state" {
     for (cases) |case| {
         var snapshot = testSnapshot(case.output, case.state);
         snapshot.running_ms = case.running_ms;
-        const got = try formatResult(alloc, snapshot, 4096);
+        const got = try formatResult(alloc, snapshot, 4096, &.{});
         defer alloc.free(got);
         try std.testing.expectEqualStrings(case.want, got);
     }
@@ -932,7 +952,7 @@ test "formatResult adds the cut and read flags on their own lines" {
     var snapshot = testSnapshot("ok\n", .{ .completed = .finished });
     snapshot.output_truncated = true;
     snapshot.output_incomplete = true;
-    const got = try formatResult(alloc, snapshot, 4096);
+    const got = try formatResult(alloc, snapshot, 4096, &.{});
     defer alloc.free(got);
     try std.testing.expectEqualStrings("ok\n[some output was cut]\n[some output could not be read]", got);
 }
@@ -947,7 +967,7 @@ test "formatResult keeps the head and tail of a long output within max_bytes, on
     for (0..735) |_| try output.append(alloc, 'a');
     for (0..1000) |_| try output.appendSlice(alloc, "€");
     const snapshot = testSnapshot(output.items, .{ .completed = .{ .exit_code = 0 } });
-    const got = try formatResult(alloc, snapshot, 2048);
+    const got = try formatResult(alloc, snapshot, 2048, &.{});
     defer alloc.free(got);
     try std.testing.expect(got.len <= 2048);
     try std.testing.expect(std.unicode.utf8ValidateSlice(got));
@@ -960,7 +980,7 @@ test "formatResult keeps the head and tail of a long output within max_bytes, on
 test "formatResult refuses a budget too small for its reserves" {
     try std.testing.expectError(
         error.ResultBudgetTooSmall,
-        formatResult(std.testing.allocator, testSnapshot("x", .{ .completed = .finished }), 100),
+        formatResult(std.testing.allocator, testSnapshot("x", .{ .completed = .finished }), 100, &.{}),
     );
 }
 
