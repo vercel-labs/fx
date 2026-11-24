@@ -166,10 +166,12 @@ class Run {
   async prompt(r: Req, kind: Kind) {
     const params: Record<string, unknown> = { sessionId: this.sessionId, prompt: [{ type: "text", text: marker(r) }] };
     if (kind !== "none") params._meta = { "sh.fx/delivery": kind };
+    // The counts are taken before the send: fx can answer and trace the prompt before this
+    // process runs its next line, and a count taken after the send would already include it.
+    const before = { queued: this.fixture.traceCount(QUEUED), steered: this.fixture.traceCount(STEERED) };
     const id = r.who === "owner" ? this.owner!.send("session/prompt", params) : this.follower!.send("session/prompt", params);
     this.ids.set(key(r), id);
     this.kinds.set(key(r), kind);
-    const before = { queued: this.fixture.traceCount(QUEUED), steered: this.fixture.traceCount(STEERED) };
     const deadline = Date.now() + WAIT_MS;
     let outcome: "start" | "queued" | "pending" | "refuse" | null = null;
     let code = 0;
