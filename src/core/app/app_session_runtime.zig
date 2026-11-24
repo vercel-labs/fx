@@ -9093,6 +9093,11 @@ test "execution replay preserves paired deferred tools without command output" {
             .name = "read_file",
             .arguments_json = "{\"path\":\"stale.txt\"}",
         },
+        .{
+            .id = "call_scoped_pending",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"made/input.txt\"}",
+        },
     };
     var results = [_]types.PersistedToolResult{
         .{
@@ -9124,6 +9129,14 @@ test "execution replay preserves paired deferred tools without command output" {
             .output_bytes = types.deferred_tool_result_output.len,
             .stored_output_bytes = types.deferred_tool_result_output.len,
         },
+        .{
+            .tool_call_id = @constCast("call_scoped_pending"),
+            .tool_name = @constCast("read_file"),
+            .status = .failure,
+            .output = @constCast(types.scoped_instructions_pending_tool_result_output),
+            .output_bytes = types.scoped_instructions_pending_tool_result_output.len,
+            .stored_output_bytes = types.scoped_instructions_pending_tool_result_output.len,
+        },
     };
     var steps = [_]types.ToolExecutionStep{.{
         .tool_calls = calls[0..],
@@ -9134,14 +9147,15 @@ test "execution replay preserves paired deferred tools without command output" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .deferred, .deferred, .denied },
+        &.{ .deferred, .deferred, .denied, .denied },
         app.completed_tool_outcomes.items,
     );
-    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 4), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Reading project instructions before continuing: read_file\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● Reading project instructions before continuing: run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
-    try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
+    try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqual(@as(usize, 4), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_output_writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_stdout.items.len);
@@ -9149,7 +9163,7 @@ test "execution replay preserves paired deferred tools without command output" {
     try std.testing.expectEqual(@as(usize, 0), app.command_output_flush_count);
     try std.testing.expectEqualSlices(
         ReplayEvent,
-        &.{ .completed_tool_status, .completed_tool_status, .completed_tool_status },
+        &.{ .completed_tool_status, .completed_tool_status, .completed_tool_status, .completed_tool_status },
         app.replay_events.items,
     );
 }
