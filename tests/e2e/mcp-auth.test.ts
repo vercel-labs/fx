@@ -2222,6 +2222,43 @@ describe("MCP login", () => {
     expect((await transcript()).join("\n")).toContain("Signed in to fixture.");
   }, 60_000);
 
+  test.skipIf(!tmuxAvailable())("a typed /mcp login in the TUI finishes with the browser's return pasted into the composer, and the model never sees it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const tapePath = join(root.root, "typed-paste.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    const transcript = async () => {
+      const lines = (await tui!.captureFullScrollback()).split("\n");
+      const composer = lines.findLastIndex(isComposerLine);
+      return composer < 0 ? lines : lines.slice(0, composer);
+    };
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    expect((await transcript()).join("\n")).toContain("Browser on another computer? Paste the address it ends on.");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    // The user approves in another browser; that browser's return is not fetched here.
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = approved.headers.get("location")!;
+    expect(new URL(back).hostname).toBe("127.0.0.1");
+    const code = new URL(back).searchParams.get("code")!;
+    expect(code).toBeTruthy();
+    await tui.sendText(back);
+    await tui.waitForText("Signed in to fixture.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(gateway.requests.length).toBe(0);
+    expect(gateway.requests.map((r) => String(r.body ?? "")).join("\n")).not.toContain(code);
+    expect(await tui.captureFullScrollback()).not.toContain(code);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("the /mcp menu's Log in signs in, and the server's tools follow", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -2308,6 +2345,43 @@ describe("MCP login", () => {
     expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("the /mcp menu's waiting screen offers to take a pasted return, and a long pasted return signs in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const tapePath = join(root.root, "menu-paste.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 100, height: 40,
+      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
+    expect(await tui.capturePane()).toContain("Browser on another computer? Paste the address it ends on.");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = approved.headers.get("location")!;
+    expect(new URL(back).hostname).toBe("127.0.0.1");
+    const code = new URL(back).searchParams.get("code")!;
+    expect(code).toBeTruthy();
+    // Longer than the 1000-character fold, so the paste lands as a placeholder.
+    await tui.pasteText(`${back}&pad=${"a".repeat(1200)}`);
+    await tui.waitForText("[Pasted text #1, 1 line]", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Log out       /mcp logout fixture", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(gateway.requests.map((r) => String(r.body ?? "")).join("\n")).not.toContain(code);
+    expect(await tui.captureFullScrollback()).not.toContain(code);
   }, 60_000);
 
   // Before, nothing changed on the screen until the address came, which a

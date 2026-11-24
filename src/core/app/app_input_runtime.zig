@@ -1455,6 +1455,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try submitPastedSignIn(app)) return;
                     if (try submitEffortMenuSelection(app, agent)) return;
                     if (try submitAgentsMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app, agent)) return;
@@ -2100,6 +2101,8 @@ pub fn Runtime(comptime App: type) type {
             if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
             if (app.mcp.host_menu.screen == .server and byte != '\r') return false;
             if (byte == '\r') {
+                // On the server screen Enter runs the selected choice, so a pasted return is taken first.
+                if (app.mcp.host_menu.screen == .server and try submitPastedSignIn(app)) return true;
                 try app.mcpHostMenuKey(.enter);
                 return true;
             }
@@ -2114,6 +2117,33 @@ pub fn Runtime(comptime App: type) type {
             if (!mcpHostMenuActive(app)) return false;
             try app.mcpHostMenuKey(.enter);
             return true;
+        }
+
+        /// A sign-in's return pasted in the composer finishes that sign-in, menu
+        /// open or not, and never reaches the model or the prompt history.
+        fn submitPastedSignIn(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            const text = app.input_runtime.edit_state.input.items;
+            if (text.len == 0) return false;
+            // A long paste sits in the composer as a placeholder; its text is what counts.
+            const expanded = try paste_blocks.expand(app.alloc, text, app.input_runtime.entities.pasted_blocks.items);
+            defer if (expanded.owned) app.alloc.free(expanded.text);
+            const bytes = expanded.text.len;
+            switch (try app.mcp.takePastedSignIn(expanded.text)) {
+                .not_a_return => return false,
+                .taken => {
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                    debug_trace.logf("input", "composer cleared reason=pasted MCP sign-in return taken bytes={d}", .{bytes});
+                    syncMcpHostMenu(app);
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                },
+                .kept => {
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                },
+            }
         }
 
         const CompactCommandMenuKind = enum {

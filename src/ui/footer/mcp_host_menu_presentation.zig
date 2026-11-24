@@ -31,6 +31,8 @@ pub const Projection = struct {
     notes: usize = 0,
     /// While the open server's sign-in waits for the browser, its address.
     sign_in_url: ?[]const u8 = null,
+    /// fx can't open a browser here, so a waiting sign-in offers to take its pasted return.
+    paste_hint: bool = false,
     /// The project config file, as shown. The profile file is named by
     /// `profile_paths.displayText`.
     project_file: []const u8 = ".mcp.json",
@@ -65,11 +67,18 @@ pub const Projection = struct {
 
     /// The address's own lines below the heading: none when the heading
     /// links it, else the whole address, wrapped.
-    fn waitingLines(p: Projection, r: menu.Row, width: u16) usize {
+    fn addressLines(p: Projection, r: menu.Row, width: u16) usize {
         const url = p.waitingAddress(r) orelse return 0;
         if (headingLinks(url, width)) return 0;
         const w = addressWidth(width);
         return (url.len + w - 1) / w;
+    }
+
+    /// What a waiting sign-in takes below its heading: the address's lines,
+    /// then the paste hint.
+    fn waitingLines(p: Projection, r: menu.Row, width: u16) usize {
+        if (p.waitingAddress(r) == null) return 0;
+        return p.addressLines(r, width) + @intFromBool(p.paste_hint);
     }
 
     fn fileOf(p: Projection, r: menu.Row) []const u8 {
@@ -138,6 +147,21 @@ fn signInLinkRow(alloc: Allocator, url: []const u8, width: u16) !Row {
     try row.appendSlice(alloc, ".");
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
+}
+
+/// The paste hint's wordings, longest first; the first that fits after its
+/// indent is shown, and the shortest is cut to fit when none does.
+const paste_hints = [_][]const u8{
+    "Browser on another computer? Paste the address it ends on.",
+    "Paste the address the browser ends on.",
+    "Paste the address here.",
+};
+
+fn pasteHint(width: u16) []const u8 {
+    for (paste_hints) |candidate| {
+        if (2 + candidate.len <= width) return candidate;
+    }
+    return paste_hints[paste_hints.len - 1];
 }
 
 /// The list's lines below its title: a line per server, and before the
@@ -361,7 +385,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             return row_text.composeTextRow(alloc, "Waiting for the browser. Didn't open? Go to:", width, ui_render.dim_style, 2);
         }
     }
-    if (after >= 2 and after < 2 + l.waiting) {
+    if (after >= 2 and after < 2 + p.addressLines(r, width)) {
         // Where the heading can't link it: the whole address, wrapped, never cut.
         const url = p.sign_in_url orelse return .empty;
         const w = addressWidth(width);
@@ -381,6 +405,8 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         if (linked) try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
         return row;
     }
+    if (p.waitingAddress(r) != null and p.paste_hint and after == 2 + p.addressLines(r, width))
+        return row_text.composeTextRow(alloc, pasteHint(width), width, ui_render.dim_style, 2);
     // From Log in until the address comes, the requests before it can take seconds.
     if (after == 1 and r.status.signing_in and menu.toolsFor(r, p.tools) != .ready)
         return row_text.composeTextRow(alloc, "Signing in…", width, ui_render.dim_style, 2);
@@ -954,6 +980,7 @@ fn fuzzWaitingAddress(_: void, smith: *testing.Smith) !void {
     var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    p.paste_hint = smith.valueRangeAtMost(u8, 0, 1) == 1;
     const width = smith.valueRangeAtMost(u16, 20, 140);
     const count = menuRowCount(p, width, max_inline_rows);
     const open = "\x1b]8;id=fx-mcp-sign-in;";
@@ -1028,6 +1055,92 @@ test "a login under way says so until its address comes" {
     defer testing.allocator.free(ready);
     try testing.expect(std.mem.find(u8, ready, "It has no tools.") != null);
     try testing.expect(std.mem.find(u8, ready, "Signing in…") == null);
+}
+
+test "a pasted return hint is one dim row under the link when fx can't open a browser" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    const url = "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1";
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url, .paste_hint = true };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const text = try render(p, 80);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.find(u8, text, "  Waiting for the browser. Didn't open? Open the sign-in page.\n  Browser on another computer? Paste the address it ends on.\n") != null);
+    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 80, 40));
+}
+
+test "a pasted return hint takes the shorter wording that fits the width, and every row fits" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    const url = "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1";
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url, .paste_hint = true };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const cases = [_]struct { width: u16, wording: []const u8 }{
+        .{ .width = 48, .wording = "Paste the address the browser ends on." },
+        .{ .width = 30, .wording = "Paste the address here." },
+    };
+    for (cases) |case| {
+        const count = menuRowCount(p, case.width, 40);
+        var last = try composeRow(testing.allocator, p, count - 1, case.width, count);
+        defer last.deinit(testing.allocator);
+        try testing.expect(std.mem.find(u8, last.items, case.wording) != null);
+        try testing.expect(std.mem.find(u8, last.items, "Browser on another") == null);
+        for (0..count) |i| {
+            var row = try composeRow(testing.allocator, p, @intCast(i), case.width, count);
+            defer row.deinit(testing.allocator);
+            try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
+        }
+    }
+}
+
+test "a pasted return hint comes right after the wrapped address at width 22, and every row fits" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    const url = "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1";
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url, .paste_hint = true };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    // The heading, five rows of address, then the hint, which is the last row.
+    const count = menuRowCount(p, 22, 40);
+    var heading = try composeRow(testing.allocator, p, count - 7, 22, count);
+    defer heading.deinit(testing.allocator);
+    try testing.expect(std.mem.find(u8, heading.items, "Waiting for the") != null);
+    for (0..5) |i| {
+        var row = try composeRow(testing.allocator, p, count - 6 + @as(u16, @intCast(i)), 22, count);
+        defer row.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, row.items, "    \x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4m"));
+    }
+    var hint = try composeRow(testing.allocator, p, count - 1, 22, count);
+    defer hint.deinit(testing.allocator);
+    try testing.expect(std.mem.find(u8, hint.items, "Paste the") != null);
+    try testing.expect(std.mem.find(u8, hint.items, "\x1b]") == null);
+    for (0..count) |i| {
+        var row = try composeRow(testing.allocator, p, @intCast(i), 22, count);
+        defer row.deinit(testing.allocator);
+        try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 22);
+    }
+}
+
+test "a pasted return hint is not shown while a login signs in with no address yet" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    linear.signing_in = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .paste_hint = true };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const text = try render(p, 80);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.find(u8, text, "Signing in…") != null);
+    try testing.expect(std.mem.find(u8, text, "Paste the address") == null);
+    const with_hint = menuRowCount(p, 80, 40);
+    p.paste_hint = false;
+    try testing.expectEqual(menuRowCount(p, 80, 40), with_hint);
 }
 
 test "names and errors from config and servers stay inert" {

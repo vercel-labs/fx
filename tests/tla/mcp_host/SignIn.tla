@@ -10,9 +10,11 @@
 \*     `GET /callback`, or for a bridged server the first form posted from
 \*     the bridge's origin, carrying the state `.authorize` gave the
 \*     listener, is posted as finish_login; the task then ends),
-\*     finishLogin (`fx mcp login NAME --no-browser`: a pasted address,
-\*     past the listener), `.finish_login` (engine.finishSignIn: the engine's
-\*     flow checks the state),
+\*     finishLogin (a pasted address, past the listener, from `fx mcp login
+\*     NAME --no-browser` on stdin, or from the TUI's Enter on this sign-in's
+\*     return in the composer, `takePastedSignIn` in
+\*     src/core/app/app_mcp_runtime.zig), `.finish_login` (engine.finishSignIn:
+\*     the engine's flow checks the state),
 \*     onServer `.authorize` / `.signed_in` / `.sign_in_failed`, expireLogins
 \*     (5 minutes), shutdown (endLogin for every login, each with a
 \*     `.sign_in_failed`: the MCP config changed). While another
