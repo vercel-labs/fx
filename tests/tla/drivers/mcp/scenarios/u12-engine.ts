@@ -1258,6 +1258,24 @@ export const scenarios: Scenario[] = [
       ),
   }),
   engineScenario({
+    name: "u12-list-and-call-refused-line",
+    description:
+      "A tool list and a call are in flight together and the call's reply is a line fx cannot read: both get the grace and end, the call as malformed and the list with no reason, because the line is no more the list's than the call's",
+    servers: {
+      a: {
+        rules: [discover, { method: "tools/list", noReply: true }, { method: "tools/call", tool: "silent", delayMs: 400, rawBytes: 40, noReply: true }],
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "20000", "--refused-ms", "600"],
+    script: ["tools a", "call a silent", "expect a.called.1.malformed 5000", "expect a.tools.fail 5000", "status"],
+    machines: { a: [...BASE, "catalog"] },
+    check: (lines, _logs, trace) =>
+      first(
+        same(trace.filter((t) => t.machine === "request" && t.event === "grace_expired").length, 2, "grace_expired steps in the request trace"),
+        expectThat(status(lines, "a")?.list_refusal == null, `the list was refused: ${JSON.stringify(status(lines, "a")?.list_refusal)}`),
+      ),
+  }),
+  engineScenario({
     name: "u12-refused-http-json-body",
     description: "An HTTP JSON body the engine cannot read ends its call at once as malformed, not as an HTTP failure",
     http: {
