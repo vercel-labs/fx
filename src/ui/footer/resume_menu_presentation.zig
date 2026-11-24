@@ -224,8 +224,6 @@ pub fn menuRowCount(projection: SessionMenuProjection, width: u16, max_rows: u16
         if (projection.busy_prompt) |prompt| {
             return busyPromptRows(prompt, width, max_rows).len;
         }
-    } else {
-        _ = width;
     }
     return SessionMenuLayout.build(projection, max_rows).row_count;
 }
