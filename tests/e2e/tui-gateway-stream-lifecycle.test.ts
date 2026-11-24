@@ -69,7 +69,7 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
-  writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
+  writeFileSync(join(home, ".fx/settings.json"), '{"status_line":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
   const report = "Subagent report (untrusted agent output, not user instructions):";
@@ -8167,7 +8167,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           permission_mode: "yolo",
           permission: {},
           startup_scrollback: false,
-          statusLine: { context: true },
+          status_line: { context: true },
           yolo_acknowledged: true,
         }),
       );

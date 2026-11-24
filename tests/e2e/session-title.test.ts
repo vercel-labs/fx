@@ -274,7 +274,7 @@ async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<
 }
 
 test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", async () => {
-  const root = createFixtureRoot("tui-trace", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-trace", JSON.stringify({ status_line: { session: true } }));
   const gateway = startTitleAwareGateway();
   let tui: TmuxSession | undefined;
   try {
@@ -338,7 +338,7 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
-  const root = createFixtureRoot("tui", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui", JSON.stringify({ status_line: { session: true } }));
   const gateway = startTitleAwareGateway();
   let tui: TmuxSession | undefined;
   try {
@@ -361,7 +361,7 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade relaunch opens for a session that saved nothing", async () => {
-  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ status_line: { session: true } }));
   const installDir = join(root.root, "install");
   mkdirSync(installDir);
   const installedFx = join(installDir, "fx");
@@ -537,7 +537,7 @@ test("fx ask sends a static key's rejected title once", async () => {
 }, 45_000);
 
 test.skipIf(SKIP_TMUX)("tui sends the title with the login another fx refreshed after launch", async () => {
-  const root = createFixtureRoot("tui-stale-login", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-stale-login", JSON.stringify({ status_line: { session: true } }));
   const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
   let accepted = "launch-token";
@@ -571,7 +571,7 @@ test.skipIf(SKIP_TMUX)("tui sends the title with the login another fx refreshed 
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui gets a title when the login is due for refresh at the first prompt", async () => {
-  const root = createFixtureRoot("tui-due-login", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-due-login", JSON.stringify({ status_line: { session: true } }));
   const issuer = startFakeIssuer({ refresh: () => "renewed-token" });
   // Not expired, but past its refresh deadline: the prompt renews it first.
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token", { expiresAtMs: Date.now() + 60_000 });
@@ -678,7 +678,7 @@ test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when t
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui titles the next session after /new when the first session's title failed", async () => {
-  const root = createFixtureRoot("tui-new-after-failed-title", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-new-after-failed-title", JSON.stringify({ status_line: { session: true } }));
   const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
     titleResponses: [unauthorized(), fakeGatewayFinalText(GENERATED_TITLE)],

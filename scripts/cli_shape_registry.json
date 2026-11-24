@@ -528,9 +528,7 @@
     "flag_names": {
       "--resume-": "Prefix of the removed --resume-<id> alias, kept so the removed spelling fails with a hint."
     },
-    "setting_keys": {
-      "statusLine": "Older spelling of status_line, still read so existing settings files keep working; fx writes only status_line."
-    }
+    "setting_keys": {}
   },
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",

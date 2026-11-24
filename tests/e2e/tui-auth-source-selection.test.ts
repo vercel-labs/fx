@@ -2080,7 +2080,7 @@ tmuxTest(
   60_000,
 );
 
-for (const command of ["/provider", "/login", "/setup"]) {
+for (const command of ["/provider", "/login"]) {
   tmuxTest(`provider picker retains type-ahead after ${command} Enter`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-provider-typeahead-"));
     stderrPath = join(home, "stderr.log");
@@ -2133,7 +2133,6 @@ tmuxTest("provider picker consumes selection keys while inventory is pending", a
 
 for (const scenario of [
   { name: "bare provider", command: "/provider" },
-  { name: "setup alias", command: "/setup" },
   { name: "login alias", command: "/login" },
   { name: "typed provider query", command: "/provider " },
 ]) {
@@ -6925,7 +6924,7 @@ tmuxTest(
       writeSeededGrokLogin(home, grok.initialAccessToken);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", statusLine: { context: true } }) + "\n",
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", status_line: { context: true } }) + "\n",
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -8823,7 +8822,7 @@ tmuxTest(
     await session.waitForText("Signed out of fx.", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
 
-    await session.sendText("/setup");
+    await session.sendText("/provider");
     const picker = await session.waitForPane(
       (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
       TIMEOUT,

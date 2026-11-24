@@ -392,16 +392,14 @@ describe("fx mcp", () => {
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
-    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    // `--global` names ~/.fx/mcp.json.
     const global = await mcp(root, "remove", "--global", "twin");
     expect(global.code).toBe(0);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
-    expect(profile.code).toBe(1);
-    // The older --profile still names the profile file, with a warning.
-    expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
-    );
+    expect(profile.code).toBe(2);
+    expect(profile.stdout).toBe("");
+    expect(profile.stderr).toBe("fx mcp remove: --profile was removed; use --global\nusage: fx mcp remove [--global | --project] NAME\n");
   });
 
   test("approve and reject say exactly what they trust", async () => {

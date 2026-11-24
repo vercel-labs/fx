@@ -372,7 +372,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                 fast_mode: false,
                 startup_scrollback: true,
                 prompt_history: { enabled: true, future: "keep-a-history" },
-                statusLine: {
+                status_line: {
                   sandbox: false,
                   context: false,
                   session: false,
@@ -388,7 +388,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
                 fast_mode: false,
                 startup_scrollback: true,
                 prompt_history: { enabled: true, future: "keep-b-history" },
-                statusLine: {
+                status_line: {
                   sandbox: false,
                   context: false,
                   session: false,
@@ -467,7 +467,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           expect(override).not.toHaveProperty("fast_mode");
           expect(override).not.toHaveProperty("startup_scrollback");
           expect(override.prompt_history).toEqual({ future: historyFuture });
-          expect(override.statusLine).toEqual({ sandbox: false, workspace: false, future: statusFuture });
+          expect(override.status_line).toEqual({ sandbox: false, workspace: false, future: statusFuture });
           expect(override.future_workspace).toEqual({ nested: futureWorkspace });
         }
         expect(readFileSync(join(workspaceA, ".fx.json"), "utf8")).toBe(projectABytes);
@@ -641,8 +641,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const localEffective = await session.waitForText("local-b *", TIMEOUT);
         expect(localEffective).not.toContain("user *");
 
-        // The older `user` scope word still works.
-        await session.sendText('/allowlist user remove command "user *"');
+        await session.sendText('/allowlist global remove command "user *"');
         await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -1683,8 +1682,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const stderrPath = join(root, "stderr.log");
         mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
-        writeFileSync(settingsPath, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
-        writeFileSync(externalSettings, '{"statusLine":{"workspace":false}}\n', { mode: 0o600 });
+        writeFileSync(settingsPath, '{"status_line":{"workspace":false}}\n', { mode: 0o600 });
+        writeFileSync(externalSettings, '{"status_line":{"workspace":false}}\n', { mode: 0o600 });
 
         session = await TmuxSession.create({
           cwd: realpathSync(workspace),
@@ -1702,7 +1701,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           (pane) => pane.includes("workspace-write-failure-visible"),
           TIMEOUT,
         );
-        expect(JSON.parse(readFileSync(externalSettings, "utf8")).statusLine.workspace).toBe(false);
+        expect(JSON.parse(readFileSync(externalSettings, "utf8")).status_line.workspace).toBe(false);
 
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
@@ -1735,7 +1734,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       expect(malformedStatus.stderr).toContain("malformed_settings");
       expect(readFileSync(settingsPath, "utf8")).toBe(malformed);
 
-      const malformedStatusLine = "{\"statusLine\":{\"context\":1}}\n";
+      const malformedStatusLine = "{\"status_line\":{\"context\":1}}\n";
       writeFileSync(settingsPath, malformedStatusLine, { mode: 0o600 });
       const malformedStatusLineStatus = await runFx(["status", "--json"], {
         cwd: workspaceRoot,
