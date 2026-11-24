@@ -64,8 +64,6 @@ export interface PathsOptions {
 
 /** The file, in the workspace, that makes the small server change its tool list (see `listChange`). */
 export const LIST_CHANGE_RELEASE = "list-change-release";
-/** The file the small server creates, in the workspace, once its tool list has changed. */
-export const LIST_CHANGED = "list-changed";
 
 /** One call the fake model makes, by its tool call id. */
 export interface ScriptStep { id: string; name: string; args: Record<string, unknown> }
@@ -143,7 +141,6 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
               FX_MCP_MODE: "subscription_cache",
               FX_MCP_RECOVERED_TOOL_NAME: options.listChange.to,
               FX_MCP_LIST_CHANGE_RELEASE_PATH: join(workspace, LIST_CHANGE_RELEASE),
-              FX_MCP_LIST_CHANGED_PATH: join(workspace, LIST_CHANGED),
             }
             : {}),
         },

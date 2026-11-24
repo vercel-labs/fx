@@ -5,7 +5,7 @@
 // tests/tla/drivers/mcp_host/subagent-access.test.ts runs the same scripts against the model.
 import { describe, expect, test } from "bun:test";
 import { FX_BIN } from "../evals/eval-helpers";
-import { LARGE_RESULT, LARGE_TOOL, LIST_CHANGE_RELEASE, LIST_CHANGED, OTHER_TOOL, SMALL_RESULT, SMALL_TOOL, runPaths, seen, shellStep, type PathsRun } from "./mcp-rules-paths";
+import { LARGE_RESULT, LARGE_TOOL, LIST_CHANGE_RELEASE, OTHER_TOOL, SMALL_RESULT, SMALL_TOOL, runPaths, seen, shellStep, type PathsRun } from "./mcp-rules-paths";
 
 /** The words fx mcp call prints, with its exit code 5, when the agent may not call the tool. */
 const refusal = (tool: string) =>
@@ -86,15 +86,22 @@ describe("a subagent's fx mcp call", () => {
     expect(run.fixtureCalls).toEqual(["echo"]);
   }, 240_000);
 
-  test("runs a tool that list_changed added to a server in its view, after a search in an earlier call", async () => {
+  test("runs a tool that list_changed added to a server in its view, once fx has read the change", async () => {
     const added = "mcp_fixture_added";
+    const POLLS = 100;
+    const listsTheTool = [
+      `n=0; until ${mcp("search added")} 2>&1 | grep -q ${added}; do`,
+      `n=$((n+1)); if [ $n -ge ${POLLS} ]; then echo "fx never listed ${added} after the server changed its list: ${POLLS} searches"; break; fi;`,
+      `sleep 0.1; done; [ $n -lt ${POLLS} ]`,
+    ].join(" ");
     const run = await runPaths({
       bin: FX_BIN, mode: "full", agent: "child", rules: {}, only: [], listChange: { to: "added" },
       extra: [
         shellStep("search_first", mcp("search echo")),
         shellStep("call_before", mcp(`${added} '{"text":"hello"}'`)),
-        // The server creates LIST_CHANGED once its list has changed; the wait is bounded at 10 s.
-        shellStep("change_list", `touch ${LIST_CHANGE_RELEASE}; n=0; while [ ! -e ${LIST_CHANGED} ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done; [ -e ${LIST_CHANGED} ]`),
+        // The server's file says it sent list_changed, not that fx read it. fx has read it when a search lists the tool,
+        // so the step polls the search, for at most POLLS tries, and only then does the call run.
+        shellStep("change_list", `{ touch ${LIST_CHANGE_RELEASE}; ${listsTheTool}; }`),
         shellStep("call_after", mcp(`${added} '{"text":"hello"}'`)),
       ],
       label: "list-changed",
@@ -102,7 +109,7 @@ describe("a subagent's fx mcp call", () => {
     ok(run);
     expect(run.texts.search_first).toContain(SMALL_TOOL);
     expectRefused(run.texts.call_before!, added);
-    expect(run.texts.change_list).toContain("exit=0");
+    expect(run.texts.change_list, "fx should list the added tool before the call runs").toContain("exit=0");
     expectRan(run.texts.call_after!, SMALL_RESULT);
     expect(run.fixtureCalls).toEqual(["added"]);
   }, 240_000);
