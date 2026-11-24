@@ -754,8 +754,8 @@ test "a call after its shell call returned says why and how to check a slow job"
     const reply = try client.call(arena, std.testing.io, socket_path, token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
     try std.testing.expectEqual(wire.Status.refused, reply.header.status);
     try std.testing.expectEqual(wire.Reason.unauthorized, reply.header.reason.?);
-    try std.testing.expect(std.mem.indexOf(u8, reply.bytes, "that call has ended") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reply.bytes, capability_mod.short_checks_advice) != null);
+    try std.testing.expect(std.mem.find(u8, reply.bytes, "that call has ended") != null);
+    try std.testing.expect(std.mem.find(u8, reply.bytes, capability_mod.short_checks_advice) != null);
 }
 
 test "a command that leaves while its call waits for permission runs nothing, and holds the yield meanwhile" {
