@@ -3051,6 +3051,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const encoder = new TextEncoder();
       let timer: ReturnType<typeof setInterval> | undefined;
       let sendRest: (() => void) | undefined;
+      let sendFinish: (() => void) | undefined;
       const { stderrPath } = await launchRouteRecoveryTui("fx-tui-subagent-pending-row-", [
         () => fakeGatewayToolCall("status_first", "subagent", { action: "status" }),
         () =>
@@ -3067,6 +3068,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
                   send({ type: "tool-input-delta", id: "status_second", delta: 'ion":"status"}' });
                   send({ type: "tool-input-end", id: "status_second" });
                   send({ type: "tool-call", toolCallId: "status_second", toolName: "subagent", input: { action: "status" } });
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold-after-tool-call\n\n")), 50);
+                };
+                sendFinish = () => {
+                  clearInterval(timer);
                   send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
                   controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                   controller.close();
@@ -3092,6 +3097,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       sendRest?.();
+      // Its arguments have ended but it has not run yet: core still says
+      // "Managing", which a slow machine can paint before the call runs.
+      for (let i = 0; i < 15; i += 1) {
+        frames.push(treeRows(await session!.capturePane()));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      sendFinish?.();
       for (let i = 0; i < 200; i += 1) {
         const pane = await session!.capturePane();
         frames.push(treeRows(pane));
