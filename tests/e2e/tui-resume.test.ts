@@ -2750,7 +2750,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText(prompt);
-      await waitForScrollback(active, finalMarker);
+      await active.waitForPane((pane) => pane.includes(finalMarker) && turnSettled(pane), TIMEOUT);
 
       const inlineVisible = await captureFullScrollbackArtifacts(
         active,
@@ -2988,7 +2988,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a session before testing Cmd+R.");
-      await active.waitForText(saved, TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(saved) && turnSettled(pane), TIMEOUT);
       await active.sendLiteralText(draft);
       await active.waitForText(draft, TIMEOUT);
 
@@ -3623,8 +3623,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await waitForScrollback(active, afterMarker);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(afterMarker) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       const compactGrid = await active.capturePaneGrid();
       const compactTool = compactGrid.findIndex((line) => line.includes("Ran "));
       if (compactTool < 0) {
@@ -3732,7 +3731,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Return the prepared Markdown response.");
-      await waitForScrollback(active, doneMarker);
+      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
 
       await active.sendKeys("C-o");
       await Bun.sleep(250);
@@ -3790,7 +3789,7 @@ test.skipIf(!tmuxAvailable())(
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Show the prepared paragraphs.");
-          await active.waitForText("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", TIMEOUT);
+          await active.waitForPane((pane) => pane.includes("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") && turnSettled(pane), TIMEOUT);
           await active.waitForStableComposer(TIMEOUT);
           await active.sendLiteral(draft);
           await active.waitForText(`┃ ${draft}`, TIMEOUT);
@@ -4051,7 +4050,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const beforeHandoff = await waitForScrollback(active, priorSummary);
+      await active.waitForPane((pane) => pane.includes(priorSummary) && turnSettled(pane), TIMEOUT);
+      const beforeHandoff = await active.captureFullScrollback();
       expect(beforeHandoff).not.toContain("lines more (ctrl+o to view)");
       expect(countOccurrences(beforeHandoff, priorSummary)).toBe(1);
       const compactOutputRows = beforeHandoff.match(/CTRL_O_FILE_FOLD_\d{4}/g) ?? [];
@@ -4489,6 +4489,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
+      await active.waitForPane((pane) => pane.includes(setupSentinel) && turnSettled(pane), TIMEOUT);
       const setupScrollback = await waitForScrollbackMarkers(active, [
         assistantHead,
         assistantTail,
@@ -6618,8 +6619,7 @@ async function captureCtrlGRelaunch(options: {
     await active.waitForComposer(TIMEOUT);
     if (options.reply !== null) {
       await active.sendText(prompt);
-      await active.waitForText(options.reply.split("\n").at(-1)!, TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(options.reply.split("\n").at(-1)!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
     await active.waitForStableComposer(TIMEOUT, 250);
@@ -6795,7 +6795,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Main's turn ends while its subagent still works.
       await active.sendText("UPGRADE_MAIN start solo");
-      await active.waitForText("MAIN_DONE", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
       for (const deadline = Date.now() + TIMEOUT; !soloAsked; await Bun.sleep(50)) {
         if (Date.now() > deadline) throw new Error("the subagent never asked the model");
       }
@@ -6806,8 +6806,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Once the subagent is done, the same key upgrades.
       releaseSolo();
-      await active.waitForText("MAIN_SAW_REPORT", TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
       await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
@@ -9070,8 +9069,7 @@ test.skipIf(!tmuxAvailable())(
         ["Latest visible request", "LATEST_VISIBLE_RESPONSE"],
       ]) {
         await active.sendText(prompt!);
-        await active.waitForText(response!, TIMEOUT);
-        await active.waitForComposer(TIMEOUT);
+        await active.waitForPane((pane) => pane.includes(response!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       const sessionId = sessionIdFromHome(home);
       const historyPath = logOf(home, sessionId);

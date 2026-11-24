@@ -30,6 +30,7 @@ import {
   TmuxSession,
   tmuxAvailable,
   tmuxRawPasteFlags,
+  turnSettled,
 } from "./tmux-helpers";
 import {
   findActiveFileApprovalBlock,
@@ -2136,7 +2137,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           });
           await session.waitForStableComposer(15_000);
           await session.sendText("Produce the old command output and labeled response.");
-          await session.waitForText(oldLabels.at(-1)!, TIMEOUT);
+          await session.waitForPane((pane) => pane.includes(oldLabels.at(-1)!) && turnSettled(pane), TIMEOUT);
           await session.waitForStableComposer(15_000);
           const seeded = await capture("seeded");
           check("seeded history", () => expectHistory(seeded, false));

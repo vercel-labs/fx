@@ -1689,7 +1689,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["OLD_WRAP_TAIL", "NEW_WRAP_TAIL"],
       });
       await decide(session, 1);
-      await session.waitForText("WRAP_DIFF_COMPLETE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("WRAP_DIFF_COMPLETE") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe(newLine);
 
       const inline = await session.captureFullScrollback();
@@ -2024,7 +2024,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(approval).toContain("+ hostile");
       expect(existsSync(target)).toBe(false);
       await decide(session, 1);
-      let settled = await session.waitForText("hostile write complete", TIMEOUT);
+      let settled = await session.waitForPane((pane) => pane.includes("hostile write complete") && turnSettled(pane), TIMEOUT);
 
       expect(readFileSync(target, "utf8")).toBe("hostile\n");
       expect(settled).toContain(encodedName);

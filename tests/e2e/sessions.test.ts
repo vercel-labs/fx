@@ -39,6 +39,7 @@ import {
   TmuxSession,
   tmuxAvailable,
   turnSettled,
+  hasEmptyComposer,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
@@ -1409,7 +1410,7 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
@@ -1670,7 +1671,7 @@ test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with 
   try {
     const first = await startApp(fixture, gateway, []);
     await first.session.sendText("First interactive question.");
-    await first.session.waitForText("APP_V2_FIRST", TIMEOUT);
+    await first.session.waitForPane((pane) => pane.includes("APP_V2_FIRST") && turnSettled(pane), TIMEOUT);
     await quitApp(first);
     const id = onlySessionId(fixture.home);
     expectNoV1Sessions(fixture);
@@ -1842,7 +1843,7 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
   try {
     const owner = await startApp(fixture, gateway, []);
     await owner.session.sendText("Hold this session open.");
-    await owner.session.waitForText("PICKER_BUSY_SAVED", TIMEOUT);
+    await owner.session.waitForPane((pane) => pane.includes("PICKER_BUSY_SAVED") && turnSettled(pane), TIMEOUT);
     const id = onlySessionId(fixture.home);
 
     const contenderStderr = join(fixture.root, "contender-stderr.log");
@@ -1952,7 +1953,7 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     const app = await startApp(fixture, gateway, [], true, wiringTrace(trace));
     for (const [prompt, answer] of [["Fork prompt one.", "FORK_ONE"], ["Fork prompt two.", "FORK_TWO"], ["Fork prompt three.", "FORK_THREE"]]) {
       await app.session.sendText(prompt!);
-      await app.session.waitForText(answer!, TIMEOUT);
+      await app.session.waitForPane((pane) => pane.includes(answer!) && turnSettled(pane), TIMEOUT);
     }
     await app.session.sendText("/rename Fork source");
     await app.session.waitForText('renamed to "Fork source"', TIMEOUT);
@@ -2391,6 +2392,7 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     await app.session.waitForStableComposer();
     await app.session.sendText("Keep prompt two.");
     await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => held, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
@@ -2732,6 +2734,7 @@ test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first p
     await app.session.waitForStableComposer();
     await app.session.sendText("Twice prompt two.");
     await scrollbackContains(app.session, "TWICE_PARENT_TWO");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
 
@@ -3661,7 +3664,7 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
@@ -4488,7 +4491,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
       for (const [prompt, answer] of turns) {
         await session.sendText(prompt!);
         await scrollbackContains(session, answer!);
-        await session.waitForComposer(TIMEOUT);
+        await session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       await session.sendText("/compact");
       await waitForSavedText(join(fixture.home, ".fx", "sessions"), "fx-compactor-v1");
@@ -5541,7 +5544,7 @@ test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summ
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");

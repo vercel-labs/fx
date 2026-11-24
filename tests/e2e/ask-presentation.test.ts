@@ -31,6 +31,7 @@ import {
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -1607,7 +1608,7 @@ describe("fx ask shell startup files", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Check the secret.");
-        await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("SECRET_CHECK_DONE") && turnSettled(pane), TIMEOUT);
         await session.sendText("/trace");
         await session.waitForText("Trace saved at", TIMEOUT);
       } finally {

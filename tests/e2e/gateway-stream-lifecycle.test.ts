@@ -355,17 +355,17 @@ test("the user talks to the parent while its subagent works, and a stop ends the
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_FIRST");
-    await tui.waitForText("FIRST_ACCEPTED", 10000);
+    await tui.waitForPane((pane) => pane.includes("FIRST_ACCEPTED") && turnSettled(pane), 10000);
     // Still the one piece of work, still running.
     expect(work()).toEqual(original);
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_STOP");
-    await tui.waitForText("STOP_DONE", 10000);
+    await tui.waitForPane((pane) => pane.includes("STOP_DONE") && turnSettled(pane), 10000);
     await tui.waitForPane(() => work().outcome === "cancelled", 10000);
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForText("LATER_OK", 10000);
+    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
     expect(childRequests).toBe(1);
     // A stop is answered by the stop call, never by a report.
     expect(reportTurns).toBe(0);

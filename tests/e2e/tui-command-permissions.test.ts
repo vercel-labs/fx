@@ -1655,7 +1655,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/output quiet");
-      await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes(responseRows.at(-1)!) && turnSettled(pane), TIMEOUT);
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
@@ -1815,7 +1815,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("diagnostic fixture complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
 
       await activeSession.sendText("/trace");
@@ -1942,10 +1942,10 @@ describe("effect-aware command permissions", () => {
     await activeSession.waitForComposer(TIMEOUT);
     await activeSession.sendText(rootPrompt);
     if (shipFails) {
-      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 1") && turnSettled(pane), TIMEOUT * 2);
       await activeSession.waitForText("ship needs you", TIMEOUT);
     } else {
-      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 2") && turnSettled(pane), TIMEOUT * 2);
     }
     await activeSession.waitForComposer(TIMEOUT);
 
@@ -2348,7 +2348,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("wrapped secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("wrapped secrets done") && turnSettled(pane), 120_000);
       // The prose and the table are on screen in pieces: no row holds a whole
       // secret. The command output is folded once the turn ends, and its
       // entries keep the rows it was wrapped into.

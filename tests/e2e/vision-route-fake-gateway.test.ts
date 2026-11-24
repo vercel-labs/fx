@@ -3790,7 +3790,7 @@ describe("Vision route fake Gateway", () => {
         session = await launch(FX_BIN);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendText("Describe the logo file in this folder.");
-        const live = await session.waitForText("Vision unavailable final answer", TIMEOUT);
+        const live = await session.waitForPane((pane) => pane.includes("Vision unavailable final answer") && turnSettled(pane), TIMEOUT);
         // fx sent the notice to the model on its own; the user never saw it.
         expect(live).not.toContain("None of the requested images were read");
         const turnEnd = gateway.chatRequests.length - 1;
@@ -3818,7 +3818,7 @@ describe("Vision route fake Gateway", () => {
         await session.waitForComposer(TIMEOUT);
 
         await session.sendText("And once more.");
-        await session.waitForText("answered in the resumed terminal", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("answered in the resumed terminal") && turnSettled(pane), TIMEOUT);
         expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
         expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
         const scrollback = await session.captureFullScrollback();

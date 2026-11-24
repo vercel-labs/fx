@@ -576,7 +576,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(steered[0]).toContain("<user_steering>");
       expect(steered[0]).toContain("INTERNAL_HANDOFF_4e12");
       f.ordinaryHold.release("CURRENT_TURN_OK_OVERFLOW_STEER");
-      await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_OVERFLOW_STEER") && hasEmptyComposer(pane), 20_000);
+      await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_OVERFLOW_STEER") && hasEmptyComposer(pane) && turnSettled(pane), 20_000);
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -954,8 +954,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.waitForStableComposer(15_000);
       for (const [index, answer] of answers.slice(0, 3).entries()) {
         await terminal.sendText(`Answer ${index + 1}.`);
-        await terminal.waitForText(answer.split("\n").at(-1)!, 15_000);
-        await terminal.waitForComposer(15_000);
+        await terminal.waitForPane((pane) => pane.includes(answer.split("\n").at(-1)!) && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       }
       const id = onlySessionId(home);
       await terminal.sendText("/compact");
@@ -964,8 +963,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       // The turn across the compaction ends, so the window lets the older
       // cycle go and Ctrl+O's newest page joins it from the log.
       await terminal.sendText("One more turn.");
-      await terminal.waitForText("CTRLO_AFTER_COMPACTION_5c1", 15_000);
-      await terminal.waitForComposer(15_000);
+      await terminal.waitForPane((pane) => pane.includes("CTRLO_AFTER_COMPACTION_5c1") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       // Between turns the cycle is read in the background and kept.
       await until(() => trace().includes("archive_loaded back=1"), "the background read of the joined cycle", 15_000);
       const openAt = trace().length;
@@ -1049,7 +1047,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       await terminal.waitForStableComposer(20_000);
       for (let turn = 1; turn <= seedTurns; turn++) {
         await terminal.sendText(`Read the seed notes, part ${turn}.`);
-        await terminal.waitForPane((pane) => pane.includes(`SEED_DONE_${turn}`) && hasEmptyComposer(pane), 20_000);
+        await terminal.waitForPane((pane) => pane.includes(`SEED_DONE_${turn}`) && hasEmptyComposer(pane) && turnSettled(pane), 20_000);
       }
       await terminal.sendText("/compact");
       await until(() => summaryTokens.length >= 2, "the renewed summary request");
