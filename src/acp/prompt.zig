@@ -3007,20 +3007,41 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var request_id = server.beginPermissionRequest(ctx.session) orelse {
+    const question = server.beginPermissionQuestion(ctx.session) orelse {
         if (!server.clientInputEnded(ctx.session)) return error.PermissionRequestAlreadyPending;
         debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
         return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
     };
     errdefer {
-        server.cancelPermissionRequest(ctx.session, request_id);
-        _ = server.awaitPermissionDecision(ctx.session, request_id);
+        server.cancelPermissionQuestion(ctx.session, question);
+        _ = server.awaitPermissionQuestion(ctx.session, question);
     }
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();
     const tool_call_id = try ctx.sendToolCallPending(pending_arena.allocator(), call);
 
+    const sender_params = try permissionQuestionParams(alloc, ctx, request, call, tool_call_id, validated_arguments.written(), true);
+    defer alloc.free(sender_params);
+    const other_params = try permissionQuestionParams(alloc, ctx, request, call, tool_call_id, validated_arguments.written(), false);
+    defer alloc.free(other_params);
+    try server.writePermissionQuestion(ctx.session, question, alloc, sender_params, other_params);
+
+    const decision = server.awaitPermissionQuestion(ctx.session, question);
+    return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
+}
+
+/// The `session/request_permission` params for one client of a permission question. Only the client that
+/// sent the prompt is offered "allow for this session" (`offers_always`).
+fn permissionQuestionParams(
+    alloc: Allocator,
+    ctx: *AcpContext,
+    request: permission_request.PermissionRequest,
+    call: ToolCall,
+    tool_call_id: []const u8,
+    arguments_json: []const u8,
+    offers_always: bool,
+) ![]u8 {
     var params: std.Io.Writer.Allocating = .init(alloc);
     defer params.deinit();
     try params.writer.writeAll("{\"sessionId\":");
@@ -3034,7 +3055,7 @@ fn requestAcpPermission(
     try params.writer.writeAll(",\"kind\":");
     try jsonrpc.writeJsonStr(mapToolKind(call.name).jsonString(), &params.writer);
     try params.writer.writeAll(",\"status\":\"pending\",\"rawInput\":");
-    try params.writer.writeAll(validated_arguments.written());
+    try params.writer.writeAll(arguments_json);
     // An edit shows the change it asks to make.
     if (request.file) |file| if (file.change) |change| if (fittingDiff(tool_call_id, .{
         .path = change.path,
@@ -3048,51 +3069,13 @@ fn requestAcpPermission(
     try params.writer.writeAll("},\"options\":[");
     try writePermissionOption(&params.writer, "allow_once", "Allow once", "allow_once");
     try params.writer.writeByte(',');
-    try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
-    try params.writer.writeByte(',');
+    if (offers_always) {
+        try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
+        try params.writer.writeByte(',');
+    }
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
     try params.writer.writeAll("]}");
-
-    // A permission follows the main client through at most this many hand-offs. Each
-    // hand-off asks the new main again, with the same request, under a new id.
-    const max_asks: usize = 8;
-    var asks: usize = 0;
-    while (true) {
-        asks += 1;
-        const main_record = server.holdMain(ctx.session);
-        defer main_record.drop();
-        const main = main_record;
-        const written = server.writeRequestToMain(ctx.session, request_id, alloc, "session/request_permission", params.writer.buffered());
-        if (written) |_| {
-            switch (server.awaitPermissionAnswer(ctx.session, request_id)) {
-                .decided => |decision| return permission_request.OwnedPermissionResponse.init(alloc, decision, null),
-                .moved => {},
-            }
-        } else |err| switch (err) {
-            // The main changed after the request began. The hand-off already answered the
-            // request `moved`, so waiting for it only takes that answer.
-            error.MainChanged => _ = server.awaitPermissionAnswer(ctx.session, request_id),
-            error.BrokenPipe => {
-                // Returning a value skips the errdefer above, so the pending request
-                // is ended here: the client closed its output and can't answer.
-                server.cancelPermissionRequest(ctx.session, request_id);
-                _ = server.awaitPermissionDecision(ctx.session, request_id);
-                if (!server.mainWriteFailed(ctx.session, main)) {
-                    debug_trace.logf("acp", "event=permission_denied reason=client_output_closed tool={s}", .{call.name});
-                    return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-                }
-            },
-            else => return err,
-        }
-        if (asks >= max_asks) {
-            debug_trace.logf("acp", "event=permission_denied reason=too_many_main_changes tool={s}", .{call.name});
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        }
-        request_id = server.beginPermissionRequest(ctx.session) orelse {
-            debug_trace.logf("acp", "event=permission_denied reason=client_input_ended tool={s}", .{call.name});
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
-        };
-    }
+    return alloc.dupe(u8, params.writer.buffered());
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {
