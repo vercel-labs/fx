@@ -1,9 +1,11 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -18,6 +20,27 @@ const title_rows: u16 = 1;
 pub const max_visible_items: u16 = 20;
 pub const max_inline_rows: u16 = header_rows + roomy_top_gap_rows + max_visible_items;
 const minimum_title_column_width: usize = 12;
+
+/// Hints shown while the busy-session fork prompt is open, widest first.
+pub const busy_prompt_hint_variants = [_][]const u8{
+    "1–2 choose     ↑↓ navigate     enter confirm     y fork     n / esc back",
+    "1–2 choose   ↑↓ navigate   enter confirm   n / esc back",
+    "1–2 choose  enter confirm  esc back",
+    "y fork  esc back",
+};
+
+/// Hints shown when the busy-session fork prompt reports an unrecoverable fork refusal.
+pub const busy_prompt_error_hint_variants = [_][]const u8{
+    "enter / esc back to sessions",
+    "enter / esc back",
+    "esc back",
+};
+
+/// Hints shown while opening or forking a chosen session, widest first.
+pub const pending_action_hint_variants = [_][]const u8{
+    "esc cancel",
+    "esc",
+};
 // Each session is a single line now: the workspace, age, and turn count live
 // in the title row's right cluster, so there is no separate path row or gap.
 const path_rows: u16 = 0;
@@ -192,11 +215,23 @@ const SessionMenuLayout = struct {
     }
 };
 
-pub fn menuRowCount(projection: SessionMenuProjection, _: u16, max_rows: u16) u16 {
+pub fn menuRowCount(projection: SessionMenuProjection, width: u16, max_rows: u16) u16 {
+    if (max_rows == 0) return 0;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action != null) {
+            return @min(max_rows, header_rows + roomy_top_gap_rows + 1);
+        }
+        if (projection.busy_prompt) |prompt| {
+            return busyPromptRows(prompt, width, max_rows).len;
+        }
+    }
     return SessionMenuLayout.build(projection, max_rows).row_count;
 }
 
 pub fn visibleNavigationItemsForBudget(projection: SessionMenuProjection, row_budget: u16) u16 {
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action != null or projection.busy_prompt != null) return 0;
+    }
     return SessionMenuLayout.build(projection, row_budget).visible_items;
 }
 
@@ -209,6 +244,15 @@ pub fn composeSessionMenuRow(
 ) !std.ArrayList(u8) {
     const row: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= row_budget) return row;
+
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action) |action| {
+            return composePendingActionRow(alloc, projection, action, row_index, width, row_budget);
+        }
+        if (projection.busy_prompt) |prompt| {
+            return composeBusyForkPromptRow(alloc, prompt, row_index, width, row_budget);
+        }
+    }
 
     const layout = SessionMenuLayout.build(projection, row_budget);
     if (row_index >= layout.row_count) return row;
@@ -450,6 +494,248 @@ fn composeStateRow(alloc: Allocator, projection: SessionMenuProjection, width: u
     return row;
 }
 
+fn composePendingActionRow(
+    alloc: Allocator,
+    projection: SessionMenuProjection,
+    action: session_catalog.PendingAction,
+    row_index: u16,
+    width: u16,
+    row_budget: u16,
+) !std.ArrayList(u8) {
+    const total = @min(row_budget, header_rows + roomy_top_gap_rows + 1);
+    if (row_index >= total) return .empty;
+    if (total > 1 and row_index == 0) return composeHeaderRow(alloc, projection, width);
+    if (row_index < total - 1) return .empty;
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    const indent_width: usize = if (width > 4) 2 else 0;
+    if (indent_width > 0) try row.appendSlice(alloc, "  ");
+    try row.appendSlice(alloc, ui_render.selected_completion_style);
+    const label = switch (action) {
+        .opening => "Opening session…",
+        .forking => "Forking session…",
+    };
+    try row_text.appendSingleLineEllipsized(alloc, &row, label, @as(usize, width) -| indent_width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+const busy_wide_min_width: u16 = 72;
+const busy_description_col: usize = 33;
+
+const BusyRowKind = enum {
+    headline,
+    subtitle,
+    blank,
+    error_line,
+    option_fork,
+    option_fork_desc,
+    option_back,
+    option_back_desc,
+};
+
+const BusyRowPlan = struct {
+    items: [7]BusyRowKind = undefined,
+    len: u16 = 0,
+
+    fn fromSlice(slice: []const BusyRowKind) BusyRowPlan {
+        var plan: BusyRowPlan = .{ .len = @intCast(slice.len) };
+        @memcpy(plan.items[0..slice.len], slice);
+        return plan;
+    }
+};
+
+fn busyPromptRows(prompt: render_input.BusyForkPromptProjection, width: u16, row_budget: u16) BusyRowPlan {
+    if (row_budget == 0) return .{};
+    const wide = width >= busy_wide_min_width;
+    if (prompt.error_message != null) {
+        if (!wide and row_budget >= 7) {
+            return BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .blank, .error_line, .blank, .option_back, .option_back_desc });
+        }
+        if (row_budget >= 6) {
+            return BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .blank, .error_line, .blank, .option_back });
+        }
+        return switch (row_budget) {
+            5 => BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .blank, .error_line, .option_back }),
+            4 => BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .error_line, .option_back }),
+            3 => BusyRowPlan.fromSlice(&.{ .headline, .error_line, .option_back }),
+            2 => BusyRowPlan.fromSlice(&.{ .error_line, .option_back }),
+            else => BusyRowPlan.fromSlice(&.{.error_line}),
+        };
+    }
+
+    if (!wide and row_budget >= 7) {
+        return BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .blank, .option_fork, .option_fork_desc, .option_back, .option_back_desc });
+    }
+    if (row_budget >= 5) {
+        return BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .blank, .option_fork, .option_back });
+    }
+    const chosen: BusyRowKind = if (prompt.selected_yes) .option_fork else .option_back;
+    return switch (row_budget) {
+        4 => BusyRowPlan.fromSlice(&.{ .headline, .subtitle, .option_fork, .option_back }),
+        3 => BusyRowPlan.fromSlice(&.{ .headline, .option_fork, .option_back }),
+        2 => BusyRowPlan.fromSlice(&.{ .headline, chosen }),
+        else => BusyRowPlan.fromSlice(&.{chosen}),
+    };
+}
+
+fn appendBusyOptionRow(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    indent_width: usize,
+    width: u16,
+    selected: bool,
+    ordinal: []const u8,
+    label: []const u8,
+    description: []const u8,
+) !void {
+    if (indent_width > 0) try row.appendSlice(alloc, "  ");
+    const available: usize = @as(usize, width) -| indent_width;
+    const style = if (selected) ui_render.selected_completion_style else ui_render.dim_style;
+    try row.appendSlice(alloc, style);
+    if (width >= busy_wide_min_width and description.len > 0) {
+        try row_text.appendSingleLineEllipsized(alloc, row, ordinal, available);
+        const after_ord = display_width.visibleWidthIgnoringAnsi(row.items);
+        const label_budget = (busy_description_col -| 2) -| after_ord;
+        try row_text.appendSingleLineEllipsized(alloc, row, label, label_budget);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try row_text.appendSpacesToColumn(alloc, row, busy_description_col);
+        const desc_budget = @as(usize, width) -| display_width.visibleWidthIgnoringAnsi(row.items);
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row_text.appendSingleLineEllipsized(alloc, row, description, desc_budget);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return;
+    }
+
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(alloc);
+    try combined.appendSlice(alloc, ordinal);
+    try combined.appendSlice(alloc, label);
+    try row_text.appendSingleLineEllipsized(alloc, row, combined.items, available);
+    try row.appendSlice(alloc, ui_render.reset_style);
+}
+
+const busy_fork_description = "Copy through the last finished turn";
+const busy_back_description = "Keep the running session untouched";
+const busy_back_retry_description = "Close the other fx and retry";
+
+fn busyBackDescription(buf: []u8, prompt: render_input.BusyForkPromptProjection) []const u8 {
+    if (prompt.error_message == null) return busy_back_description;
+    if (prompt.pid) |pid| {
+        return std.mem.print(buf, "Wait for turn 1 or close pid {d}", .{pid}) catch busy_back_retry_description;
+    }
+    return busy_back_retry_description;
+}
+
+fn composeBusyForkPromptRow(
+    alloc: Allocator,
+    prompt: render_input.BusyForkPromptProjection,
+    row_index: u16,
+    width: u16,
+    row_budget: u16,
+) !std.ArrayList(u8) {
+    const plan = busyPromptRows(prompt, width, row_budget);
+    if (row_index >= plan.len) return .empty;
+
+    const indent_width: usize = if (width > 4) 2 else 0;
+    const available: usize = @as(usize, width) -| indent_width;
+    const has_error = prompt.error_message != null;
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+
+    switch (plan.items[row_index]) {
+        .headline => {
+            if (indent_width > 0) try row.appendSlice(alloc, "  ");
+            var msg_buf: [96]u8 = undefined;
+            const msg = if (prompt.pid) |pid|
+                std.mem.print(&msg_buf, "This session is running in pid {d}", .{pid}) catch "This session is open in another fx"
+            else
+                "This session is open in another fx";
+            try row.appendSlice(alloc, ui_render.selected_completion_style);
+            try row_text.appendSingleLineEllipsized(alloc, &row, msg, available);
+            try row.appendSlice(alloc, ui_render.reset_style);
+        },
+        .subtitle => {
+            if (indent_width > 0) try row.appendSlice(alloc, "  ");
+            const safe_title = try alloc.print("{f}", .{text_utils.terminalSafe(prompt.title)});
+            defer alloc.free(safe_title);
+            try row.appendSlice(alloc, ui_render.dim_style);
+            if (!has_error and width >= 64 and prompt.workspace_label.len > 0 and prompt.turn_count > 0) {
+                const safe_ws = try alloc.print("{f}", .{text_utils.terminalSafe(prompt.workspace_label)});
+                defer alloc.free(safe_ws);
+                var turns_buf: [32]u8 = undefined;
+                const turns = sessionTurnsText(&turns_buf, prompt.turn_count);
+                const suffix = try alloc.print(" · {s} · {s}", .{ safe_ws, turns });
+                defer alloc.free(suffix);
+                const suffix_width = display_width.visibleWidth(suffix);
+                if (available >= suffix_width + minimum_title_column_width) {
+                    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_title, available - suffix_width);
+                    try row.appendSlice(alloc, suffix);
+                } else {
+                    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_title, available);
+                }
+            } else {
+                try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_title, available);
+            }
+            try row.appendSlice(alloc, ui_render.reset_style);
+        },
+        .blank => {},
+        .error_line => {
+            if (prompt.error_message) |err_msg| {
+                if (indent_width > 0) try row.appendSlice(alloc, "  ");
+                try row.appendSlice(alloc, ui_render.selected_completion_style);
+                try row.appendSlice(alloc, "! ");
+                try row_text.appendSingleLineEllipsized(alloc, &row, err_msg, available -| 2);
+                try row.appendSlice(alloc, ui_render.reset_style);
+            }
+        },
+        .option_fork => {
+            try appendBusyOptionRow(
+                alloc,
+                &row,
+                indent_width,
+                width,
+                prompt.selected_yes,
+                "1) ",
+                "Fork and continue here",
+                busy_fork_description,
+            );
+        },
+        .option_fork_desc => {
+            const desc_indent: usize = if (width > 6) 5 else indent_width;
+            try row.appendNTimes(alloc, ' ', desc_indent);
+            try row.appendSlice(alloc, ui_render.dim_style);
+            try row_text.appendSingleLineEllipsized(alloc, &row, busy_fork_description, @as(usize, width) -| desc_indent);
+            try row.appendSlice(alloc, ui_render.reset_style);
+        },
+        .option_back => {
+            var desc_buf: [64]u8 = undefined;
+            const desc = busyBackDescription(&desc_buf, prompt);
+            try appendBusyOptionRow(
+                alloc,
+                &row,
+                indent_width,
+                width,
+                has_error or !prompt.selected_yes,
+                if (has_error) "1) " else "2) ",
+                "Back to sessions",
+                desc,
+            );
+        },
+        .option_back_desc => {
+            const desc_indent: usize = if (width > 6) 5 else indent_width;
+            var desc_buf: [64]u8 = undefined;
+            const desc = busyBackDescription(&desc_buf, prompt);
+            try row.appendNTimes(alloc, ' ', desc_indent);
+            try row.appendSlice(alloc, ui_render.dim_style);
+            try row_text.appendSingleLineEllipsized(alloc, &row, desc, @as(usize, width) -| desc_indent);
+            try row.appendSlice(alloc, ui_render.reset_style);
+        },
+    }
+    return row;
+}
+
 fn composeSelectionFailureRow(
     alloc: Allocator,
     failure: session_catalog.ResumeFailure,
@@ -459,10 +745,12 @@ fn composeSelectionFailureRow(
     errdefer row.deinit(alloc);
     const indent_width: usize = if (width > 4) 2 else 0;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
-    try row.appendSlice(alloc, ui_render.red_style);
+    try row.appendSlice(alloc, ui_render.selected_completion_style);
+    try row.appendSlice(alloc, "! ");
     const message = switch (failure) {
         .open_elsewhere => "This session is open in another fx. Close it there, then press enter to retry.",
         .being_updated => "This session is being updated. Wait a moment, then press enter to retry.",
+        .busy_starting => "Still closing the previous open. Press enter to try again.",
         .connection_changed => "This session's custom connection changed in settings. Change it back, or start a new session.",
         .connection_removed => "This session's custom connection is no longer in settings. Add it back, or start a new session.",
         .unavailable => "Unable to resume this session.",
@@ -471,7 +759,7 @@ fn composeSelectionFailureRow(
         alloc,
         &row,
         message,
-        @as(usize, width) -| indent_width,
+        @as(usize, width) -| indent_width -| 2,
     );
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -1013,4 +1301,103 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu renders pending opening and forking working states" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { action: session_catalog.PendingAction, label: []const u8 }{
+        .{ .action = .opening, .label = "Opening session…" },
+        .{ .action = .forking, .label = "Forking session…" },
+    };
+    for (cases) |case| {
+        const projection: SessionMenuProjection = .{
+            .active = true,
+            .load_state = .ready,
+            .pending_action = case.action,
+        };
+        try std.testing.expectEqual(@as(u16, 3), menuRowCount(projection, 80, 10));
+        try std.testing.expectEqual(@as(u16, 0), visibleNavigationItemsForBudget(projection, 10));
+        var row = try composeSessionMenuRow(alloc, projection, 2, 80, 10);
+        defer row.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, row.items, case.label) != null);
+    }
+}
+
+test "resume menu renders Option A busy fork prompt across wide, narrow, error, and fallback states" {
+    const alloc = std.testing.allocator;
+    const normal: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .busy_prompt = .{
+            .title = "fix\x1b]0;owned\x07 resume",
+            .workspace_label = "workspace",
+            .turn_count = 4,
+            .pid = 4242,
+            .selected_yes = true,
+        },
+    };
+    try std.testing.expectEqual(@as(u16, 5), menuRowCount(normal, 100, 10));
+    try std.testing.expectEqual(@as(u16, 0), visibleNavigationItemsForBudget(normal, 10));
+
+    var headline = try composeSessionMenuRow(alloc, normal, 0, 100, 10);
+    defer headline.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, headline.items, "This session is running in pid 4242") != null);
+
+    var subtitle = try composeSessionMenuRow(alloc, normal, 1, 100, 10);
+    defer subtitle.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, subtitle.items, "\x1b]0;") == null);
+    try std.testing.expect(std.mem.find(u8, subtitle.items, "resume") != null);
+    try std.testing.expect(std.mem.find(u8, subtitle.items, "workspace · 4 turns") != null);
+
+    var opt1 = try composeSessionMenuRow(alloc, normal, 3, 100, 10);
+    defer opt1.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opt1.items, "1) Fork and continue here") != null);
+    try std.testing.expect(std.mem.find(u8, opt1.items, "Copy through the last finished turn") != null);
+
+    var opt2 = try composeSessionMenuRow(alloc, normal, 4, 100, 10);
+    defer opt2.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, opt2.items, "2) Back to sessions") != null);
+    try std.testing.expect(std.mem.find(u8, opt2.items, "Keep the running session untouched") != null);
+
+    // Narrow layout stacks descriptions beneath each option and never overflows.
+    try std.testing.expectEqual(@as(u16, 7), menuRowCount(normal, 52, 10));
+    var r: u16 = 0;
+    while (r < 7) : (r += 1) {
+        var row = try composeSessionMenuRow(alloc, normal, r, 52, 10);
+        defer row.deinit(alloc);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 52);
+    }
+
+    // Error state shows the refusal banner and a single Back option.
+    const errored: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .busy_prompt = .{
+            .title = "Long running task",
+            .pid = 4242,
+            .error_message = "Cannot fork yet · turn 1 still running.",
+        },
+    };
+    try std.testing.expectEqual(@as(u16, 6), menuRowCount(errored, 100, 10));
+    var err_row = try composeSessionMenuRow(alloc, errored, 3, 100, 10);
+    defer err_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, err_row.items, "! Cannot fork yet") != null);
+
+    var err_back = try composeSessionMenuRow(alloc, errored, 5, 100, 10);
+    defer err_back.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, err_back.items, "1) Back to sessions") != null);
+    try std.testing.expect(std.mem.find(u8, err_back.items, "Wait for turn 1 or close pid 4242") != null);
+
+    const no_pid: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .busy_prompt = .{
+            .title = "Legacy session",
+            .pid = null,
+            .selected_yes = false,
+        },
+    };
+    var fallback_row = try composeSessionMenuRow(alloc, no_pid, 0, 100, 10);
+    defer fallback_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, fallback_row.items, "This session is open in another fx") != null);
 }

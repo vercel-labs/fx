@@ -648,6 +648,13 @@ pub fn CompletionRuntime(comptime App: type) type {
                 .window_start = picker.window_start,
                 .query = picker.query(),
                 .selection_failure = picker.selection_failure,
+                .pending_action = picker.pending_action,
+                .busy_prompt = if (picker.busy_prompt) |prompt| .{
+                    .title = prompt.title,
+                    .pid = prompt.pid,
+                    .selected_yes = prompt.selected_yes,
+                    .error_message = prompt.error_message,
+                } else null,
             };
             return resume_menu_presentation.visibleNavigationItemsForBudget(
                 projection,

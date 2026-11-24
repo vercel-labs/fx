@@ -18,15 +18,34 @@ pub const LoadState = enum {
     failed,
 };
 
+pub const PendingAction = enum {
+    opening,
+    forking,
+};
+
 pub const ResumeFailure = enum {
     open_elsewhere,
     being_updated,
+    busy_starting,
     /// The session's custom connection changed or was removed in settings
     /// (`config_runtime.sessionConnectionNotice`).
     connection_changed,
     connection_removed,
     unavailable,
 };
+
+pub fn classifyResumeFailure(err: anyerror) ResumeFailure {
+    return switch (err) {
+        error.SessionBusy => .open_elsewhere,
+        error.SessionPickerResumeBusy => .busy_starting,
+        error.SessionAuthorityBoundaryUnavailable,
+        error.SessionCommitBoundaryUnavailable,
+        => .being_updated,
+        error.ConfiguredProviderChanged => .connection_changed,
+        error.ConfiguredProviderRemoved => .connection_removed,
+        else => .unavailable,
+    };
+}
 
 pub fn filteredCount(summaries: []const session_store.SessionSummary, query: []const u8) usize {
     return pickerFilter(summaries, null, query, .any).count();

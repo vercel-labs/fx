@@ -208,6 +208,8 @@ pub const Session = struct {
     sync_mutex: std.Io.Mutex = .init,
 
     identity: Identity,
+    /// Host currently using this open session (created by or resumed by).
+    active_host: schema.Host,
     /// Under `mutex`.
     state: fold.State = .{},
     phase: Phase,
@@ -313,7 +315,10 @@ pub const Session = struct {
         defer session.mutex.unlock(io);
         var copy = try session.state.clone(gpa);
         copy.created_ms = session.created_ms orelse 0;
-        copy.updated_ms = session.updated_ms;
+        copy.updated_ms = if (session.state.last_activity_ms != 0)
+            @max(session.state.last_activity_ms, copy.created_ms)
+        else
+            session.updated_ms;
         return copy;
     }
 
@@ -334,7 +339,10 @@ pub const Session = struct {
         last_seq: u64,
         /// This call published the session (its first turn).
         published: bool,
-        /// The batch set the title or the workspace.
+        /// The batch holds a message or turn event that advances activity time
+        /// or turn count.
+        activity_changed: bool,
+        /// The batch set the title, workspace, or language.
         listing_changed: bool,
     };
 
@@ -357,6 +365,7 @@ pub const Session = struct {
                 .last_seq = last,
                 .published = was_held and session.phase == .live,
                 // Only a published session is in the index.
+                .activity_changed = session.phase == .live and events.len > 0 and bodiesHaveActivity(session.bodies.items),
                 .listing_changed = session.phase == .live and changesListing(events),
             };
         };
@@ -450,14 +459,16 @@ pub const Session = struct {
             session.bounds.shrinkRetainingCapacity(first);
         }
         for (bodies, 0..) |body, i| try session.frameMarked(first + 1 + i, ts, body);
+        const prev_activity = session.state.last_activity_ms;
         for (bodies, 0..) |body, i| {
             try fold.apply(gpa, &session.state, 0, .{
                 .seq = first + 1 + i,
                 .offset = session.bounds.items[first + i - 1],
+                .ts_ms = ts,
                 .body = body,
             });
         }
-        session.wrote(ts);
+        if (session.updated_ms == 0 or session.state.last_activity_ms > prev_activity) session.wrote(ts);
     }
 
     /// Import only (D59): writes every held line through the staged publish
@@ -528,6 +539,7 @@ pub const Session = struct {
             try fold.apply(gpa, &session.state, 0, .{
                 .seq = first_batch_seq + i,
                 .offset = session.bounds.items[line_index - 1],
+                .ts_ms = ts,
                 .body = body,
             });
         }
@@ -743,11 +755,14 @@ pub const Session = struct {
             return fault;
         };
         const fork_seq = session.identity.forkSeq();
+        const prev_activity = session.state.last_activity_ms;
         for (bodies, 0..) |body, i| {
             const offset = base + if (i == 0) 0 else session.bounds.items[i - 1];
-            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .body = body });
+            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .ts_ms = ts, .body = body });
         }
-        session.wrote(ts);
+        if (cause == .host and (session.updated_ms == 0 or session.state.last_activity_ms > prev_activity)) {
+            session.wrote(ts);
+        }
         session.written_seq.store(session.env.s.io, session.state.last_seq);
     }
 
@@ -837,7 +852,7 @@ pub const Session = struct {
     fn frameFolded(session: *Session, seq: u64, ts: u64, body: schema.Body, fork_seq: u64) AppendError!void {
         const start = session.batch.items.len;
         try session.frameMarked(seq, ts, body);
-        try fold.apply(session.env.gpa, &session.state, fork_seq, .{ .seq = seq, .offset = start, .body = body });
+        try fold.apply(session.env.gpa, &session.state, fork_seq, .{ .seq = seq, .offset = start, .ts_ms = ts, .body = body });
     }
 
     /// Returns once every line through `seq` is synced. Runs outside
@@ -1092,6 +1107,13 @@ fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []c
     s.sync(to) catch |io_err| return storage.ioFault(io_err);
 }
 
+fn bodiesHaveActivity(bodies: []const schema.Body) bool {
+    for (bodies) |body| {
+        if (fold.isActivityBody(body)) return true;
+    }
+    return false;
+}
+
 fn changesListing(events: []const fold.Event) bool {
     for (events) |event| switch (event) {
         .set => |s| if (s.key == .title or s.key == .workspace or s.key == .language) return true,
@@ -1160,7 +1182,7 @@ pub fn openNew(env: *const Env, options: NewOptions) error{OutOfMemory}!*Session
     });
     errdefer identity.deinit(gpa);
     const session = try gpa.create(Session);
-    session.* = .{ .env = env, .identity = identity, .phase = .held, .created_ms = options.created_ms, .import = options.import };
+    session.* = .{ .env = env, .identity = identity, .active_host = options.host, .phase = .held, .created_ms = options.created_ms, .import = options.import };
     session.observe(.opened_new);
     return session;
 }
@@ -1190,6 +1212,7 @@ pub fn openResume(env: *const Env, options: ResumeOptions) OpenError!*Session {
     session.* = .{
         .env = env,
         .identity = parts.loaded.identity,
+        .active_host = options.host,
         .state = parts.loaded.state,
         .phase = .{ .live = .{ .dir = parts.dir, .log = parts.log, .lock = parts.lock } },
         .snapshot_base = parts.loaded.snapshot_end,
@@ -1371,7 +1394,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         from = snap.end;
         expected = snap.seq + 1;
     }
-    var updated_ms = if (snapshot) |snap| snap.ts_ms else line1.header.ts_ms;
+    var fallback_updated_ms = if (snapshot) |snap| snap.ts_ms else line1.header.ts_ms;
     const created_ms = line1.header.ts_ms;
     var tail = log_mod.ForwardReader.init(gpa, env.s, file, from, end, expected);
     defer tail.deinit();
@@ -1382,22 +1405,23 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         return mapRead(err);
     }) |line| {
         _ = line_arena.reset(.retain_capacity);
-        updated_ms = line.header.ts_ms;
+        if (line.header.kind != .closed) fallback_updated_ms = line.header.ts_ms;
         const kind = line.header.kind orelse {
             state.last_seq = line.header.seq; // unknown kinds are skipped
             state.clean_exit = false;
             continue;
         };
         const body = schema.parseBody(line_arena.allocator(), kind, line.body()) catch return error.Corrupt;
-        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
+        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .ts_ms = line.header.ts_ms, .body = body });
     }
+    const effective_updated = if (state.last_activity_ms != 0) state.last_activity_ms else fallback_updated_ms;
     return .{
         .identity = identity,
         .state = state,
         .snapshot_end = if (snapshot) |snap| snap.end else 0,
         .created_ms = created_ms,
         // A fork's copied lines keep the source's older times (D20).
-        .updated_ms = @max(updated_ms, created_ms),
+        .updated_ms = @max(effective_updated, created_ms),
     };
 }
 
@@ -1734,6 +1758,9 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: schema.Host,
+    /// Optional cooperative cancellation flag polled during fork copy so
+    /// abandoning or exiting stops before staging a new session directory.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 /// A child of a fork's source that the fork takes a copy of (D97): its log
@@ -1755,7 +1782,12 @@ pub const Forked = struct {
     copies: []*Session,
 };
 
-pub const ForkError = OpenError || error{InvalidForkPoint};
+pub const ForkError = if (builtin.target.cpu.arch.isWasm())
+    OpenError || error{InvalidForkPoint}
+else
+    OpenError || error{ InvalidForkPoint, Cancelled };
+
+const CopyFoldedError = if (builtin.target.cpu.arch.isWasm()) AppendError else AppendError || error{Cancelled};
 
 /// A new root session whose lines 2..S are the source's, unchanged, where
 /// S ends a turn (D5). The source is read without its lock and never
@@ -1849,10 +1881,21 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const created = env.nowMs();
     session.frameMarked(1, created, .{ .session_created = session.identity.created() }) catch |err| return forkError(err);
     session.created_ms = created;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    }
     const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, point.seq) catch |err| return forkError(err);
+    copyFolded(session, copied, point.seq, options.cancel) catch |err| return if (comptime builtin.target.cpu.arch.isWasm())
+        forkError(err)
+    else switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => |append_err| forkError(append_err),
+    };
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    }
     // Then one finished work item per copy, after S, so the fork owns them.
     var seq = point.seq;
     for (children, copies) |child, copy| {
@@ -1939,7 +1982,12 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, cut.seq) catch |err| return forkError(err);
+    copyFolded(session, copied, cut.seq, null) catch |err| return if (comptime builtin.target.cpu.arch.isWasm())
+        forkError(err)
+    else switch (err) {
+        error.Cancelled => error.Cancelled,
+        else => |append_err| forkError(append_err),
+    };
     var seq = cut.seq;
     if (session.state.open_turn) |turn| {
         // At the last copied line's time, which is at or before the cut.
@@ -2185,7 +2233,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
 /// crc holds, except snapshots: a snapshot records byte offsets, and the
 /// fork's line 1 has a different length, so each snapshot is encoded again
 /// from the fork's own fold at that point, with the same seq and time.
-fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!void {
+fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64, cancel: ?*const std.atomic.Value(bool)) CopyFoldedError!void {
     const gpa = session.env.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2193,6 +2241,9 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
     defer encoded.deinit(gpa);
     var at: usize = 0;
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+        }
         _ = arena.reset(.retain_capacity);
         const source_line = copied[at .. nl + 1];
         const source_header = log_mod.checkLine(source_line) catch |io_err| return storage.ioFault(io_err);
@@ -2208,7 +2259,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
         const header = log_mod.checkLine(line) catch |io_err| return storage.ioFault(io_err);
         if (header.kind) |kind| {
             const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
-            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });
+            try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .ts_ms = header.ts_ms, .body = body });
             if (kind == .snapshot) session.snapshot_base = session.batch.items.len;
         } else {
             session.state.last_seq = header.seq;
@@ -2507,13 +2558,18 @@ pub fn verifySession(env: *const Env, id_: []const u8, options: VerifyOptions) O
                 defer decoded.deinit(gpa);
                 decoded.last_seq = state.last_seq;
                 decoded.clean_exit = state.clean_exit;
+                // Snapshots from older builds omit `activity`; accept them
+                // during verify while still checking snapshots that wrote it.
+                if (decoded.last_activity_ms == 0 and std.mem.find(u8, snap.state, "\"activity\":") == null) {
+                    decoded.last_activity_ms = state.last_activity_ms;
+                }
                 // A snapshot copied from a fork's source carries its children.
                 if (line.header.seq <= fork_seq) decoded.clearChildren(gpa);
                 if (!decoded.eql(&state)) result.bad_snapshots += 1;
             },
             else => {},
         }
-        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
+        try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .ts_ms = line.header.ts_ms, .body = body });
     }
     return result;
 }
@@ -2804,7 +2860,7 @@ const session_tests = struct {
                 state.clean_exit = false;
                 continue;
             }
-            try fold.apply(gpa, &state, 0, .{ .seq = entry.seq, .offset = entry.offset, .body = body });
+            try fold.apply(gpa, &state, 0, .{ .seq = entry.seq, .offset = entry.offset, .ts_ms = entry.ts_ms, .body = body });
         }
         return state;
     }
@@ -3218,6 +3274,14 @@ const session_tests = struct {
         try closeAndDestroy(zero);
         try expectKinds(&t, zero_id, &.{ .session_created, .closed });
         try testing.expectError(error.NotFound, session_mod.openFork(&t.env, .{ .source = "missing", .at = .last_good, .workspace = "/w", .host = .app }));
+        var cancelled = std.atomic.Value(bool).init(true);
+        try testing.expectError(error.Cancelled, session_mod.openFork(&t.env, .{
+            .source = source.id,
+            .at = .last_good,
+            .workspace = "/w",
+            .host = .app,
+            .cancel = &cancelled,
+        }));
     }
 
     test "recover: a damaged source forks up to its last good turn, untouched" {

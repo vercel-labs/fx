@@ -104,6 +104,15 @@ pub const ModelMenuProjection = struct {
     }
 };
 
+pub const BusyForkPromptProjection = struct {
+    title: []const u8 = "",
+    workspace_label: []const u8 = "",
+    turn_count: usize = 0,
+    pid: ?u32 = null,
+    selected_yes: bool = true,
+    error_message: ?[]const u8 = null,
+};
+
 pub const SessionMenuProjection = struct {
     active: bool = false,
     load_state: session_catalog.LoadState = .loading,
@@ -116,6 +125,8 @@ pub const SessionMenuProjection = struct {
     query: []const u8 = "",
     now_ms: i64 = 0,
     selection_failure: ?session_catalog.ResumeFailure = null,
+    pending_action: ?session_catalog.PendingAction = null,
+    busy_prompt: ?BusyForkPromptProjection = null,
 
     pub fn filteredItemCount(self: SessionMenuProjection) usize {
         return session_catalog.filteredCount(self.summaries, self.query);

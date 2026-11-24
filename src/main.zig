@@ -1323,7 +1323,8 @@ const App = struct {
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
         return self.shell.fullTranscriptFocusedWorkActive() or
             (self.shell.fullTranscriptOpenOrOpening() and
-                self.screenAgent().session_persistence.transcript_archive_read.busy());
+                self.screenAgent().session_persistence.transcript_archive_read.busy()) or
+            self.screenAgent().session_persistence.session_picker_resume.busy();
     }
 
     fn processNextCooperativePrompt(self: *App, agent: *agents.Agent) !void {
@@ -1576,6 +1577,26 @@ const App = struct {
         const resumed = try SessionAppRuntime.resumeSelectedSession(self, agent);
         if (resumed and startup_pick) InstancesAppRuntime.restoreGroup(self);
         return resumed;
+    }
+
+    pub fn startSessionPickerResume(self: *App, agent: *agents.Agent) !bool {
+        return SessionAppRuntime.startSessionPickerResume(self, agent);
+    }
+
+    pub fn startSessionPickerBusyFork(self: *App, agent: *agents.Agent) !bool {
+        return SessionAppRuntime.startSessionPickerBusyFork(self, agent);
+    }
+
+    pub fn consumeStartupPickerGroupRestore(self: *App, agent: *agents.Agent, restore_group: bool) bool {
+        const startup_pick = restore_group and self.instances.restore_on_pick and
+            agent == &self.main_agent and
+            SessionAppRuntime.activeSessionId(agent) == null;
+        if (agent == &self.main_agent) self.instances.restore_on_pick = false;
+        return startup_pick;
+    }
+
+    pub fn finishStartupPickerGroupRestore(self: *App) void {
+        InstancesAppRuntime.restoreGroup(self);
     }
 
     pub fn submitForkMenu(self: *App, agent: *agents.Agent, bring: ?bool) !?[]u8 {

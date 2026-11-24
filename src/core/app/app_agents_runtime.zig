@@ -82,6 +82,10 @@ pub const ChildAgent = struct {
     /// Whether this agent holds its own session, opened on its first run in
     /// this process and kept until main's session ends.
     session_attached: bool = false,
+    /// Whether this lazily restored child's saved title and last reply time
+    /// have been read from its log. Deferred until `/agents` lists it so
+    /// resuming a session with many subagents does not scan every child log.
+    metadata_loaded: bool = true,
     /// Last reply in a lazily restored child's saved history. Live turns use
     /// the agent's history; this cache avoids reading disk on every redraw.
     saved_reply_at_ms: i64 = 0,
@@ -1391,13 +1395,10 @@ pub fn Runtime(comptime App: type) type {
                         // How its last work ended, as the host saved it: a
                         // restart, `/resume`, and a fork's copy keep it.
                         restored_child.last_end = LastEnd.of(entry.last_outcome);
-                        try showSavedTitle(app, host, restored_child);
-                        const history = host.childHistory(app.alloc, entry.id) catch |err| {
-                            debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
-                            break :restored restored_child;
-                        };
-                        defer types.freeHistoryTurnSlice(app.alloc, history);
-                        restored_child.saved_reply_at_ms = latestReplyAt(history);
+                        // Defer child log reads (title + latest reply time)
+                        // until `/agents` needs them so resuming a session
+                        // with many subagents stays instant.
+                        restored_child.metadata_loaded = false;
                         break :restored restored_child;
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
@@ -1461,8 +1462,24 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Hydrates saved title and latest reply time for lazily restored
+        /// subagents when `/agents` or agent switching needs their ordering.
+        fn hydrateRestoredSubagentMetadata(app: *App) !void {
+            for (app.child_agents.items) |child| {
+                if (child.metadata_loaded or child.agent.role != .subagent) continue;
+                child.metadata_loaded = true;
+                const host = child.parent_host orelse continue;
+                try showSavedTitle(app, host, child);
+                child.saved_reply_at_ms = host.childLatestReplyAt(app.alloc, child.id) catch |err| blk: {
+                    debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ child.id, @errorName(err) });
+                    break :blk 0;
+                };
+            }
+        }
+
         /// Every open agent in switch order, whatever the agent list's search.
         fn fullSwitchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
+            try hydrateRestoredSubagentMetadata(app);
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
             defer app.alloc.free(entries);
