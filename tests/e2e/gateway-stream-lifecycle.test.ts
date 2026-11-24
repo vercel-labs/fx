@@ -47,6 +47,7 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 
@@ -354,17 +355,17 @@ test("the user talks to the parent while its subagent works, and a stop ends the
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_FIRST");
-    await tui.waitForText("FIRST_ACCEPTED", 10000);
+    await tui.waitForPane((pane) => pane.includes("FIRST_ACCEPTED") && turnSettled(pane), 10000);
     // Still the one piece of work, still running.
     expect(work()).toEqual(original);
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_STOP");
-    await tui.waitForText("STOP_DONE", 10000);
+    await tui.waitForPane((pane) => pane.includes("STOP_DONE") && turnSettled(pane), 10000);
     await tui.waitForPane(() => work().outcome === "cancelled", 10000);
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForText("LATER_OK", 10000);
+    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
     expect(childRequests).toBe(1);
     // A stop is answered by the stop call, never by a report.
     expect(reportTurns).toBe(0);
@@ -1351,7 +1352,7 @@ describe("gateway stream lifecycle", () => {
       tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath, width: 100, height: 36 });
       await tui.waitForComposer(15_000);
       await tui.sendText("Use $status-first and $status-second.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const first = await tui.captureFullScrollback();
       expect(first).toContain("2 requested skills loaded");
       expect(first).toContain("Loaded skill status-first");
@@ -1362,7 +1363,7 @@ describe("gateway stream lifecycle", () => {
       expect(first).not.toContain("tool call");
       await tui.resizeWindow(48, 36);
       await tui.sendText("Use $status-first and $status-duplicate.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const mixed = await tui.captureFullScrollback();
       expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
       expect(mixed).toContain("Could not load status-duplicate");
@@ -1415,7 +1416,7 @@ describe("gateway stream lifecycle", () => {
       await tui.sendKeys("C-c");
       await tui.waitForComposer(10_000);
       await tui.sendText("Please use $cancel-workflow again after cancellation.");
-      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       expect(gateway.requests).toHaveLength(2);
       const first = advertisedSkillOpenKeys(gateway.requests[0]!.body, "cancel-workflow")[0]!;
       const second = advertisedSkillOpenKeys(gateway.requests[1]!.body, "cancel-workflow")[0]!;
@@ -2654,8 +2655,8 @@ describe("gateway stream lifecycle", () => {
         await tui.sendText("verify the bounded project context");
         let compact: string;
         try {
-          compact = await tui.waitForText(
-            "CONTEXT_LIMIT_FIRST_COMPLETE",
+          compact = await tui.waitForPane(
+            (text) => text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") && turnSettled(text),
             30_000,
           );
         } catch (error) {
@@ -2704,7 +2705,7 @@ describe("gateway stream lifecycle", () => {
         expect(restored).not.toContain("toolbox menu shortened");
 
         await tui.sendText("verify the bounded project context again");
-        await tui.waitForText("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
+        await tui.waitForPane((text) => text.includes("CONTEXT_LIMIT_SECOND_COMPLETE") && turnSettled(text), 30_000);
         expect(gateway.requestCount()).toBe(2);
         await tui.resizeWindow(119, 32);
         await tui.resizeWindow(123, 34);
@@ -2820,8 +2821,8 @@ describe("gateway stream lifecycle", () => {
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("inspect the deeply scoped target");
-        const compact = await tui.waitForText(
-          "PROJECT_OMISSION_TUI_COMPLETE",
+        const compact = await tui.waitForPane(
+          (text) => text.includes("PROJECT_OMISSION_TUI_COMPLETE") && turnSettled(text),
           30_000,
         );
         const compactScrollback = await tui.captureFullScrollback();
@@ -2910,8 +2911,8 @@ describe("gateway stream lifecycle", () => {
         await tui.waitForComposer(15_000);
         await waitForMcpServerReady(tui, "fixture", mcp);
         await tui.sendText("Load the bounded skill and select the MCP tool.");
-        const compact = await tui.waitForText(
-          "TOOL_TIME_CONTEXT_COMPLETE",
+        const compact = await tui.waitForPane(
+          (text) => text.includes("TOOL_TIME_CONTEXT_COMPLETE") && turnSettled(text),
           30_000,
         );
         const compactScrollback = await tui.captureFullScrollback();
@@ -3491,7 +3492,7 @@ describe("gateway stream lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read the workflow and its supporting rules.");
-      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const scrollback = await tui.captureFullScrollback();
       expect(scrollback).toContain(`Opened ${skillName}`);
       expect(scrollback).toContain("Read skill resource references/rules.md");
@@ -3684,7 +3685,7 @@ describe("gateway stream lifecycle", () => {
             releaseFinish();
           } else {
             releaseFinish();
-            await tui.waitForText("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
+            await tui.waitForPane((pane) => pane.includes("HELD_SKILL_RESOURCE_COMPLETE") && turnSettled(pane), 15_000);
             await tui.waitForStableComposer(10_000);
             const completed = await tui.captureFullScrollback();
             expect(completed).toContain(`Read skill resource ${resource}`);
@@ -3693,7 +3694,7 @@ describe("gateway stream lifecycle", () => {
             expect(gateway.requestCount()).toBe(heldRequestCount + 1);
           }
           await tui.sendText("Confirm later input still works.");
-          await tui.waitForText("HELD_SKILL_LATER_INPUT_OK", 15_000);
+          await tui.waitForPane((pane) => pane.includes("HELD_SKILL_LATER_INPUT_OK") && turnSettled(pane), 15_000);
           await tui.waitForStableComposer(10_000);
           expect(gateway.requestCount()).toBe(heldRequestCount + (scenario.cancel ? 1 : 2));
           const scrollback = await tui.captureFullScrollback();
@@ -6149,12 +6150,12 @@ describe("gateway stream lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("Run the fixture and recover from its rejected input.");
-      await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const recovered = await tui.captureFullScrollback();
       expect(recovered.match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       expect(recovered).not.toContain("MUST_NOT_EXECUTE");
       await tui.sendText("Run the next fixture command once.");
-      await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
       await tui.waitForText("Trace saved at", 10_000);
@@ -8759,13 +8760,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read sentinel.txt six times, then finish.");
-      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
       expect(automatic).toContain("REPLAY_TURN_DONE");
       expect(automatic).not.toContain("request failed:");
       expect(summaries).toBe(1);
       await tui.sendText("Remember the result and acknowledge this short follow-up.");
-      await tui.waitForText("RECENT_TURN_DONE", 15_000);
-      await tui.waitForComposer(15_000);
+      await tui.waitForPane((text) => text.includes("RECENT_TURN_DONE") && hasEmptyComposer(text) && turnSettled(text), 15_000);
       await compactAndWait(tui, root, 20_000);
       expect(summaries).toBe(3);
       expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
@@ -8979,7 +8979,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
         expect(pane).not.toContain("request failed:");
         expect(pane).toContain("READ_TEXT_COMPLETE");
         expect(readOutput).toContain(`${marker} found`);
@@ -9044,7 +9044,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output for a long text.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
         expect(pane).not.toContain("request failed:");
         expect(pane).toContain("READ_LONG_COMPLETE");
         expect(readOutput).not.toContain("must be an object");
@@ -9172,7 +9172,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
           await tui.waitForComposer(15000);
           await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
           // The read names the command whose saved output it searches, by the
@@ -9278,12 +9278,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("FIRST_PROMPT_COMPACTION_SENTINEL");
-        await tui.waitForText("FIRST_REPLY_COMPACTION_SENTINEL", 15_000);
+        await tui.waitForPane((pane) => pane.includes("FIRST_REPLY_COMPACTION_SENTINEL") && turnSettled(pane), 15_000);
         await tui.sendText("SECOND_PROMPT_COMPACTION_SENTINEL");
         await tui.waitForPane(
           (pane) =>
             pane.includes("SECOND_REPLY_COMPACTION_SENTINEL") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           15_000,
         );
         await tui.sendText("/quit");
@@ -9582,7 +9583,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const before = readFileSync(logPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
@@ -9675,12 +9676,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForComposer(15_000);
         await tui.sendText("Create the first manual compaction cancellation turn.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_FIRST_READY") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_FIRST_READY") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
         await tui.sendText("Create the second manual compaction cancellation turn.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_SECOND_READY") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_SECOND_READY") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
 
@@ -9732,7 +9733,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         await tui.sendText("Continue after the cancelled manual compaction.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
         expect(gateway.requests).toHaveLength(5);
@@ -9828,14 +9829,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForPane(
           (pane) =>
             pane.includes("SKILL_BEFORE_COMPACTION_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await tui.sendText("Create a second turn before compaction.");
         await tui.waitForPane(
           (pane) =>
             pane.includes("SECOND_COMPACTION_TURN_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await compactAndWait(tui, root, 15_000);
@@ -9843,7 +9846,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForPane(
           (pane) =>
             pane.includes("SKILL_AFTER_COMPACTION_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await tui.sendText("/quit");
@@ -10983,7 +10987,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");
-      await session.waitForText("APPROVAL_RECOVERY_COMPLETE", 15_000);
+      await session.waitForPane((pane) => pane.includes("APPROVAL_RECOVERY_COMPLETE") && turnSettled(pane), 15_000);
       await session.waitForStableComposer(15_000);
       expect(childRequests).toBe(3);
       const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
