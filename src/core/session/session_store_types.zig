@@ -140,6 +140,8 @@ pub const LiveSession = struct {
     saved_model: ?[]const u8,
     state: LiveState,
     agents: []const LiveAgent,
+    /// OS process ID holding the session lock, or null when unavailable.
+    pid: ?i64 = null,
 };
 
 /// `fx sessions --live`, newest first. Every slice lives in `arena`.

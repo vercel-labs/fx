@@ -1790,7 +1790,9 @@ pub const LiveSessionListSnapshot = struct {
             try std.json.Stringify.value(entry.summary.workspace_root, .{}, &out.writer);
             try out.writer.writeAll(",\"saved_model\":");
             try std.json.Stringify.value(entry.saved_model, .{}, &out.writer);
-            try out.writer.print(",\"state\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ @tagName(entry.state), entry.summary.created_at_ms, entry.summary.updated_at_ms });
+            try out.writer.print(",\"state\":\"{s}\",\"pid\":", .{@tagName(entry.state)});
+            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
+            try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ entry.summary.created_at_ms, entry.summary.updated_at_ms });
             try writeLiveAgentsJson(&out.writer, entry.agents);
             try out.writer.writeByte('}');
         }
@@ -1824,6 +1826,14 @@ test "a live listing prints each subagent under the one that started it, and esc
         .saved_model = "openai/gpt-5",
         .state = .working,
         .agents = &.{lead},
+        .pid = 4242,
+    }};
+    const no_pid = [_]session_store.LiveSession{.{
+        .summary = .{ .id = @constCast("def"), .created_at_ms = 3, .updated_at_ms = 4, .conversation_language = types.ConversationLanguage.default(), .history_len = 0 },
+        .saved_model = null,
+        .state = .idle,
+        .agents = &.{},
+        .pid = null,
     }};
     const text = try (LiveSessionListSnapshot{ .sessions = &sessions, .all_workspaces = true }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
@@ -1834,6 +1844,10 @@ test "a live listing prints each subagent under the one that started it, and esc
     const json = try (LiveSessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"agents\":[{\"name\":\"lead\",\"address\":\"abc/lead\",\"id\":\"l1\",\"state\":\"idle\",\"agents\":[{\"name\":\"helper\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"state\":\"working\",\"pid\":4242,\"created_at_ms\":1,") != null);
+    const no_pid_json = try (LiveSessionListSnapshot{ .sessions = &no_pid }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(no_pid_json);
+    try std.testing.expect(std.mem.find(u8, no_pid_json, "\"state\":\"idle\",\"pid\":null,\"created_at_ms\":3,") != null);
     const empty = try (LiveSessionListSnapshot{ .sessions = &.{} }).render(std.testing.allocator, .json);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqualStrings("{\"kind\":\"live_sessions\",\"count\":0,\"sessions\":[]}", empty);

@@ -48,6 +48,7 @@ pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
 pub const VerifyOptions = session_mod.VerifyOptions;
 pub const Stop = session_mod.Stop;
+pub const LockStatus = session_mod.LockStatus;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;
@@ -466,6 +467,14 @@ pub const Manager = struct {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
         return session_mod.isBusy(&m.env, id);
+    }
+
+    /// Whether another process has session `id` open for writing, and its PID
+    /// when recorded (`session.zig` `lockStatus`).
+    pub fn lockStatus(m: *Manager, id: []const u8) OpenError!LockStatus {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.lockStatus(&m.env, id);
     }
 
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
