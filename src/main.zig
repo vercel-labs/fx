@@ -1030,7 +1030,7 @@ const App = struct {
         shutdown_trace.mark("worker_thread_joined");
         // The main worker is joined, so no bash call can start. This exit path
         // never runs `App.deinit`, so the session folder is freed here (R3.9).
-        main_agent.bash_session.deinit(io_mod.getIo());
+        tool_dispatch.closeBashSession(&main_agent.bash_session, io_mod.getIo());
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self, main_agent) catch |err| {
             SessionAppRuntime.recordShutdownFailure(main_agent, err);
         };
@@ -1118,7 +1118,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         main_agent.managed_executions.deinit();
-        main_agent.bash_session.deinit(io_mod.getIo());
+        tool_dispatch.closeBashSession(&main_agent.bash_session, io_mod.getIo());
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         self.credits_lookup.deinit();

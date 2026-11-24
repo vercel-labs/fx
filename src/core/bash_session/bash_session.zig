@@ -178,7 +178,7 @@ pub const Session = struct {
     /// clears it, so the next call reports the drop once.
     folder_dropped: bool = false,
     /// Old folders whose removal failed, kept for a later removal. Owned. A later
-    /// `heal` retries them, and `deinitReport` retries them last.
+    /// `heal` retries them, and `deinit` retries them last.
     left_behind: std.ArrayList([]u8) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) Session {
@@ -500,8 +500,10 @@ pub const Session = struct {
     /// Deletes the session folder and frees what the session holds, after one more
     /// retry for each old folder a failed removal left behind. Returns how many of
     /// those are still on disk, so the caller can log them. The session is then
-    /// unprepared, so `prepare` can make a new folder.
-    pub fn deinitReport(self: *Session, io: std.Io) usize {
+    /// unprepared, so `prepare` can make a new folder. The count is a result, not
+    /// a flag: a caller that drops it does not compile, so every end of a session
+    /// goes through `tool_dispatch.closeBashSession`, which logs it.
+    pub fn deinit(self: *Session, io: std.Io) usize {
         const alloc = self.alloc;
         if (self.dir) |dir| {
             removeTree(io, dir);
@@ -516,12 +518,6 @@ pub const Session = struct {
         if (self.start_folder) |folder| alloc.free(folder);
         self.* = .{ .alloc = alloc };
         return left;
-    }
-
-    /// Deletes the session folder and frees what the session holds, as `deinitReport`
-    /// does. Callers that log what stays use `deinitReport`.
-    pub fn deinit(self: *Session, io: std.Io) void {
-        _ = self.deinitReport(io);
     }
 };
 
@@ -1049,7 +1045,7 @@ test "deinit deletes the session folder" {
     _ = try session.prepare(io, root, &.{});
     const dir = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(dir);
-    session.deinit(io);
+    _ = session.deinit(io);
     try std.testing.expect(session.dir == null and session.after_startup == null);
     if (std.Io.Dir.cwd().openDir(io, dir, .{})) |opened| {
         var folder = opened;
@@ -1170,7 +1166,7 @@ test "a bash tool program saves its state for the next, and a killed one saves n
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1219,7 +1215,7 @@ test "a program's own EXIT trap keeps fx's save, and its handler sees the exit s
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1262,7 +1258,7 @@ test "a subshell that sets its own EXIT trap never saves state" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1286,7 +1282,7 @@ test "a subshell's state is never kept when its program is killed after it" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1314,7 +1310,7 @@ test "variables fx passes in are never saved, and the program's own exports are"
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1345,7 +1341,7 @@ test "the saved state is readable by its owner only" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1369,7 +1365,7 @@ test "a program that sets 300 variables has all of them restored" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1393,7 +1389,7 @@ test "the start folder is the folder the last saved program ended in" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1415,7 +1411,7 @@ test "a program over the size cap leaves the start folder unchanged" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1447,7 +1443,7 @@ test "a folder file that names a removed directory gives no start folder" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1470,7 +1466,7 @@ test "refreshStartFolder says why it kept or dropped the saved folder" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
     defer folder.close(io);
@@ -1523,7 +1519,7 @@ test "the saved state holds no cd line" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1542,7 +1538,7 @@ test "prepare refuses a temp root with a dollar sign, a backquote, or a backslas
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     for ([_][]const u8{ "/tmp/a$b", "/tmp/a`b", "/tmp/a\\b" }) |root| {
         try std.testing.expectError(error.UnsafeTmpRoot, session.prepare(io, root, &.{}));
         try std.testing.expect(session.dir == null);
@@ -1559,7 +1555,7 @@ test "a child bash of a program does not load the saved state" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1584,7 +1580,7 @@ test "a child bash of a program changes neither the saved state nor the folder" 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1614,7 +1610,7 @@ test "a background child that ends after its program changes neither the saved s
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1680,7 +1676,7 @@ test "a program's functions and aliases named like the save's words do not stop 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1726,7 +1722,7 @@ test "a state that cannot be written is not saved, and the save records why" {
     if (modeIgnored(io, probe)) return error.SkipZigTest;
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var session_folder = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
@@ -1766,7 +1762,7 @@ test "a program's alias for a name the startup defines carries to the next progr
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1791,7 +1787,7 @@ test "a startup function the program leaves alone is not saved" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1823,7 +1819,7 @@ test "a startup function the program never defined takes the next startup's defi
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1847,7 +1843,7 @@ test "a startup alias named like a word of the script does not stop the save" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1873,7 +1869,7 @@ test "prepare makes the startup records owner-only, and the after-startup text s
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1898,7 +1894,7 @@ test "startup aliases named like the script's own words do not stop the save" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -1921,7 +1917,7 @@ test "startup aliases named like the script's own words do not stop the save" {
 
 test "setting a program twice frees the first id" {
     var session = Session.init(std.testing.allocator);
-    defer session.deinit(std.testing.io);
+    defer _ = session.deinit(std.testing.io);
     try session.setProgram("first");
     try session.setProgram("second");
     try std.testing.expectEqualStrings("second", session.program().?);
@@ -1930,7 +1926,7 @@ test "setting a program twice frees the first id" {
 test "deinit frees the program id and leaves none" {
     var session = Session.init(std.testing.allocator);
     try session.setProgram("first");
-    session.deinit(std.testing.io);
+    _ = session.deinit(std.testing.io);
     try std.testing.expect(session.program() == null);
 }
 
@@ -1944,7 +1940,7 @@ test "prepare removes a folder a dead process left in the temp root" {
     try tmp.dir.createDir(io, "fx-bash-2147483646-dead", .default_dir);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &.{});
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "fx-bash-2147483646-dead", .{}));
 }
@@ -1962,7 +1958,7 @@ test "prepare keeps the folders of this process and of a live process" {
     try tmp.dir.createDir(io, "fx-bash-1-live", .default_dir);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &.{});
     try tmp.dir.access(io, own_name, .{});
     try tmp.dir.access(io, "fx-bash-1-live", .{});
@@ -1984,7 +1980,7 @@ test "prepare never follows or removes a link named like a bash folder" {
     try tmp.dir.symLink(io, target_path, "fx-bash-2147483646-link", .{ .is_directory = true });
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &.{});
 
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -2004,7 +2000,7 @@ test "prepare keeps a file named like a bash folder" {
     try tmp.dir.writeFile(io, .{ .sub_path = "fx-bash-2147483646-file", .data = "x" });
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &.{});
     try tmp.dir.access(io, "fx-bash-2147483646-file", .{});
 }
@@ -2018,7 +2014,7 @@ test "a new bash folder is named with this process's id" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &.{});
     const name = std.Io.Dir.path.basename(session.dir.?);
     const prefix = try alloc.print("fx-bash-{d}-", .{processId()});
@@ -2040,7 +2036,7 @@ test "a state over the size cap is not saved, and the save records why" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2073,7 +2069,7 @@ test "the save records an over-cap state, and a state it keeps leaves no record"
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2102,7 +2098,7 @@ test "a save record is read as the save wrote it, and any other record counts as
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
@@ -2148,7 +2144,7 @@ test "a program that runs trap - EXIT ends without its save, and its record says
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2181,7 +2177,7 @@ test "a program that runs exec ends without its save, and its record says not sa
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2213,7 +2209,7 @@ test "a program killed with SIGKILL ends without its save, and its record says n
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2248,7 +2244,7 @@ test "a program that sets xtrace is traced, and the save adds no line to its out
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2278,7 +2274,7 @@ test "a program's own EXIT trap gets fx's save once, and a trap on another signa
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2307,7 +2303,7 @@ test "a program's own EXIT handler still traces after the save" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2331,7 +2327,7 @@ test "a program that sets IFS to a tab keeps its state, and the save writes no n
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2357,7 +2353,7 @@ test "a program that sets IFS to letters keeps its state" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2383,7 +2379,7 @@ test "a program that sets IFS to nothing keeps its state" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2409,7 +2405,7 @@ test "a program that sets nocasematch keeps the variables of the next program" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2435,7 +2431,7 @@ test "a saved alias named shopt, set, declare, or alias leaves the next program'
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -2463,7 +2459,7 @@ test "a folder file that is a FIFO is a bad record: the start folder is the work
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const folder_path = try alloc.print("{s}/{s}", .{ session.dir.?, folder_file });
     defer alloc.free(folder_path);
@@ -2484,7 +2480,7 @@ test "a folder file that is a symlink is a bad record, even when the link leads 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     // The target holds a folder path that would be accepted, so only the no-follow open refuses the link.
     try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = root });
@@ -2508,7 +2504,7 @@ test "a save-status that is a FIFO is replaced by an empty owner-only file, and 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
@@ -2548,7 +2544,7 @@ test "a save-status that is a link is replaced by an empty owner-only file, and 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
@@ -2580,7 +2576,7 @@ test "a folder file that is a FIFO is bad once, and then there is no folder file
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
@@ -2605,7 +2601,7 @@ test "a startup record that is a FIFO or a link is replaced, and a regular one i
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var folder = try std.Io.Dir.cwd().openDir(io, dir, .{});
@@ -2655,7 +2651,7 @@ test "heal makes a session folder that a program removed again, and the state it
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const old_dir = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(old_dir);
@@ -2687,7 +2683,7 @@ test "heal removes a state file that is not a regular file, and the state is los
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
     defer freeRun(alloc, saved);
@@ -2722,7 +2718,7 @@ test "heal writes env.sh again when a program replaced it, and the saved state s
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
     defer freeRun(alloc, saved);
@@ -2756,7 +2752,7 @@ test "heal replaces a directory at the folder file, the save record, or a startu
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
     defer freeRun(alloc, saved);
@@ -2823,7 +2819,7 @@ test "a write whose temporary entry is a link to a file outside the folder is re
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
     defer folder.close(io);
@@ -2854,7 +2850,7 @@ test "a link at the old env.sh.tmp name, pointing at a file outside the folder, 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "keep\n" });
     const outside = try alloc.print("{s}/outside", .{root});
@@ -2890,7 +2886,7 @@ test "a directory and then a FIFO at env.sh are replaced by a fresh env.sh befor
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
     defer freeRun(alloc, saved);
@@ -2935,7 +2931,7 @@ test "a FIFO at the old env.sh.tmp name does not block the repair of a missing e
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
     defer folder.close(io);
@@ -2966,7 +2962,7 @@ test "a repair that cannot complete starts a fresh session, which keeps the stat
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const saved = try runProgram(alloc, io, &session, root, "t1", "x=1");
     defer freeRun(alloc, saved);
@@ -3013,7 +3009,7 @@ test "a refresh that drops the start folder sets the flag, which is read once" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     const folder_path = try alloc.print("{s}/{s}", .{ dir, folder_file });
@@ -3038,7 +3034,7 @@ test "a program that puts a FIFO where its save record is still saves its state,
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     // The program replaces its own save record with a FIFO, then sets x. Its save must not wait on the FIFO.
@@ -3072,7 +3068,7 @@ test "a program that puts a link at its save record to a directory saves its sta
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     // A directory with a file in it, outside the session folder, which the link names.
@@ -3108,7 +3104,7 @@ test "a program that plants a FIFO at the save's state temp name is not blocked:
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     // The save writes `<state>.<pid>.tmp` with the pid of the program's own shell, so the FIFO is at the name it opens.
@@ -3133,7 +3129,7 @@ test "a program that plants a link at the save's folder temp name, pointing outs
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     // A file outside the session folder, which the link names, and the directory the program moves to.
@@ -3172,7 +3168,7 @@ test "a program that plants FIFOs at the save's functions and aliases temp names
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     const saved = try runProgram(alloc, io, &session, root, "t1", "/usr/bin/mkfifo \"$__fx_state.$$.functions\"; /usr/bin/mkfifo \"$__fx_state.$$.aliases\"; x=1");
@@ -3196,7 +3192,7 @@ test "a program that leaves a directory at its state file saves its state over i
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     // The save moves its temporary file over the state file, so the directory must go first.
@@ -3227,7 +3223,7 @@ test "a program that leaves a directory at its start folder file saves its start
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     try tmp.dir.createDirPath(io, "sub");
@@ -3258,7 +3254,7 @@ test "a program that leaves a link at its state file, pointing outside the folde
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "outside", .data = "keep\n" });
@@ -3301,7 +3297,7 @@ test "a publish that cannot clear the start folder is recorded as failed, and th
     if (modeIgnored(io, probe)) return error.SkipZigTest;
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     var session_folder = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
@@ -3343,7 +3339,7 @@ test "a link to an outside file at the save record is replaced, and the outside 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3383,7 +3379,7 @@ test "a link to an outside file at a startup record is replaced before the next 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3424,7 +3420,7 @@ test "a link to an outside file at env.sh or state.sh is replaced by heal, and t
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
     const first = try runProgram(alloc, io, &session, root, "t1", "x=1");
@@ -3464,7 +3460,7 @@ test "a fresh folder made because the old one could not be repaired leaves the o
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const old_path = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(old_path);
@@ -3490,7 +3486,7 @@ test "a fresh folder made because the old one could not be repaired leaves the o
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }));
 }
 
-test "deinitReport removes an old folder that a later removal reaches, and reports none left" {
+test "deinit removes an old folder that a later removal reaches, and reports none left" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3499,7 +3495,7 @@ test "deinitReport removes an old folder that a later removal reaches, and repor
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const old_path = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(old_path);
@@ -3513,11 +3509,11 @@ test "deinitReport removes an old folder that a later removal reaches, and repor
 
     const first = session.heal(io, &test_fx_variables);
     try std.testing.expect(first.forget_failed != null);
-    try std.testing.expectEqual(@as(usize, 0), session.deinitReport(io));
+    try std.testing.expectEqual(@as(usize, 0), session.deinit(io));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false }));
 }
 
-test "deinitReport reports an old folder that a child keeps, and leaves it on disk" {
+test "deinit reports an old folder that a child keeps, and leaves it on disk" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3526,7 +3522,7 @@ test "deinitReport reports an old folder that a child keeps, and leaves it on di
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const old_path = try alloc.dupe(u8, session.dir.?);
     defer alloc.free(old_path);
@@ -3548,7 +3544,7 @@ test "deinitReport reports an old folder that a child keeps, and leaves it on di
 
     const first = session.heal(io, &test_fx_variables);
     try std.testing.expect(first.forget_failed != null);
-    try std.testing.expectEqual(@as(usize, 1), session.deinitReport(io));
+    try std.testing.expectEqual(@as(usize, 1), session.deinit(io));
     _ = try std.Io.Dir.cwd().statFile(io, old_path, .{ .follow_symlinks = false });
 }
 
@@ -3561,7 +3557,7 @@ test "a save record too long to read is reported once, and then emptied" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
     defer folder.close(io);
@@ -3586,7 +3582,7 @@ test "a save-status that is a FIFO is a failed record, and the call returns" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
     defer folder.close(io);
@@ -3612,7 +3608,7 @@ test "a save-status that is a symlink is a failed record, and the file it names 
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     try tmp.dir.writeFile(io, .{ .sub_path = "target", .data = "cap 42\n" });
     const target_path = try alloc.print("{s}/target", .{root});
@@ -3641,7 +3637,7 @@ test "a program that hides awk and mv from PATH still saves its state" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3667,7 +3663,7 @@ test "a startup that sets noclobber writes its records and saves no startup func
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3695,7 +3691,7 @@ test "a startup that sets IFS to letters does not stop the save" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3720,7 +3716,7 @@ test "a program that ends after its folder is gone saves nothing and prints noth
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3742,7 +3738,7 @@ test "variables fx adds to every program are not restored in the next one" {
     defer alloc.free(root);
 
     var session = Session.init(alloc);
-    defer session.deinit(io);
+    defer _ = session.deinit(io);
     _ = try session.prepare(io, root, &test_fx_variables);
     const dir = session.dir.?;
 
@@ -3766,7 +3762,7 @@ test "prepare refuses a variable name that is not a plain word" {
 
     for ([_][]const u8{ "", "BAD NAME", "A|B", "A-B" }) |name| {
         var session = Session.init(alloc);
-        defer session.deinit(io);
+        defer _ = session.deinit(io);
         try std.testing.expectError(error.InvalidVariableName, session.prepare(io, root, &.{name}));
         try std.testing.expect(session.dir == null);
     }

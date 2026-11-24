@@ -1001,7 +1001,7 @@ const TestBash = struct {
 
     fn deinit(self: *TestBash) void {
         self.arena_state.deinit();
-        self.session.deinit(self.io);
+        _ = self.session.deinit(self.io);
         self.runtime.deinit();
         if (self.gate) |file| file.close(self.io);
         self.alloc.free(self.workspace);

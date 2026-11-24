@@ -1190,7 +1190,7 @@ pub fn Runtime(comptime App: type) type {
                     tool_dispatch.bashProgramRunning(&agent.bash_session, &agent.managed_executions),
                 });
             }
-            if (comptime agents.hasAgentField(App, "bash_session")) if (agent.bash_session.deinitReport(io_mod.getIo()) > 0) debug_trace.logf("bash", "bash session folder left behind", .{});
+            if (comptime agents.hasAgentField(App, "bash_session")) tool_dispatch.closeBashSession(&agent.bash_session, io_mod.getIo());
             agent.change_tracker.clear(std.heap.c_allocator);
             diagnostics.resetSession();
             _ = background_policy;

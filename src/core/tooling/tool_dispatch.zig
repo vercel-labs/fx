@@ -254,6 +254,14 @@ pub fn bashProgramRunning(session: *const bash_session.Session, runtime: *manage
     return std.meta.activeTag(state) == .running;
 }
 
+/// Ends a bash session: deletes its folder and frees what it holds. Every end of a
+/// session goes through here, so the leftover is logged by count in one place
+/// (RULES.md R1.8). A path is never logged.
+pub fn closeBashSession(session: *bash_session.Session, io: std.Io) void {
+    const left = session.deinit(io);
+    if (left > 0) debug_trace.logf("bash", "bash session folder left behind count={d}", .{left});
+}
+
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,

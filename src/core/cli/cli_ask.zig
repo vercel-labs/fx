@@ -778,7 +778,7 @@ const AskContext = struct {
         }
         self.v2_children = null;
         self.managed_executions.deinit();
-        self.bash_session.deinit(io_mod.getIo());
+        tool_dispatch.closeBashSession(&self.bash_session, io_mod.getIo());
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);

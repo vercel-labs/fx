@@ -36,6 +36,7 @@ const io_mod = @import("../shared/io.zig");
 const testing_event = @import("../shared/testing_event.zig");
 const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const shared_theme = @import("../shared/theme.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const ascii_case = @import("../shared/ascii_case.zig");
@@ -3530,7 +3531,7 @@ pub fn Runtime(comptime App: type) type {
         /// thread holds its worker.
         fn freeInContext(_: void, app: *App, agent: *agents.Agent) anyerror!void {
             agent.managed_executions.deinit();
-            if (agent.bash_session.deinitReport(io_mod.getIo()) > 0) debug_trace.logf("bash", "bash session folder left behind", .{});
+            tool_dispatch.closeBashSession(&agent.bash_session, io_mod.getIo());
             agent.worker.deinit(std.heap.c_allocator);
             app.clearPendingImages(agent);
             agent.pending_images.deinit(app.alloc);

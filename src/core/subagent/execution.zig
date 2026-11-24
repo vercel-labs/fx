@@ -425,7 +425,7 @@ pub const TurnContext = struct {
         if (self.hosted_release) |hosted| hosted.release();
         debug_trace.logf("bash", "bash state reset at the end of a subagent run", .{});
         self.managed_executions.deinit();
-        self.bash_session.deinit(io_mod.getIo());
+        tool_dispatch.closeBashSession(&self.bash_session, io_mod.getIo());
         self.worker.deinit(self.alloc);
         self.runtime.deinit(self.alloc);
         self.turn_capture.deinit();
