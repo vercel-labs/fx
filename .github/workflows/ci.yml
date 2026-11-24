@@ -109,6 +109,9 @@ jobs:
       - name: Test the zig skill's scripts and examples
         run: python3 -m unittest discover -s .fx/skills/zig/scripts
 
+      - name: Check fx for deprecated Zig declarations
+        run: python3 .fx/skills/zig/scripts/check_deprecated.py src build.zig benchmarks tests
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
