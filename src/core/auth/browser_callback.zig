@@ -1,6 +1,8 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const secret = @import("secret.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -161,7 +163,8 @@ const Request = struct {
     cors_origin: ?[]const u8 = null,
 
     fn deinit(self: *Request, alloc: Allocator) void {
-        alloc.free(self.target);
+        // The target can hold the authorization code.
+        secret.zeroAndFree(alloc, self.target);
         self.* = undefined;
     }
 };
@@ -838,4 +841,17 @@ test "browser callback permits the xAI CORS private-network preflight" {
     try std.testing.expect(std.mem.find(u8, callback, "<svg class=\"brand\"") != null);
     try std.testing.expect(std.mem.find(u8, callback, "</p></main><footer>") != null);
     try std.testing.expect(std.mem.endsWith(u8, callback, "<a href=\"https://vercel.com/labs\">Vercel Labs</a></footer></body></html>"));
+}
+
+test "a callback request gives its target back without the authorization code" {
+    // Safe build modes overwrite every freed block, so this test tells a wipe
+    // from that overwrite only in ReleaseFast and ReleaseSmall builds.
+    var scan: testing_allocator.ReleaseScan = .{ .needle = "AUTH_CODE_MARK" };
+    const alloc = scan.allocator();
+    var request: Request = .{
+        .kind = .callback,
+        .target = try alloc.dupe(u8, "/callback?code=AUTH_CODE_MARK&state=s"),
+    };
+    request.deinit(alloc);
+    try scan.expectWiped();
 }
