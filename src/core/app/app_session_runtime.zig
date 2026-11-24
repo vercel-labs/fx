@@ -1493,6 +1493,11 @@ pub fn Runtime(comptime App: type) type {
         /// Starts opening the selected picker session off the UI thread so the
         /// terminal immediately shows a working state (`RULES.md` R2.1).
         pub fn startSessionPickerResume(app: *App, agent: *AppAgent) !bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (!picker.active or picker.load_state != .ready) return false;
             if (picker.actionPending() or picker.busyPromptActive()) return true;
@@ -1518,6 +1523,11 @@ pub fn Runtime(comptime App: type) type {
         /// Starts forking the busy session named by the picker's modal off the
         /// UI thread without locking or changing the running source session.
         pub fn startSessionPickerBusyFork(app: *App, agent: *AppAgent) !bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (!picker.busyPromptActive()) return false;
             if (picker.actionPending()) return true;
@@ -1543,6 +1553,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn dismissSessionPickerBusyPrompt(app: *App, agent: *AppAgent) bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (!picker.busyPromptActive()) return false;
             agent.session_persistence.session_picker_resume.cancel();
@@ -1553,6 +1568,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn cancelSessionPickerPendingAction(app: *App, agent: *AppAgent) bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             const action = picker.pending_action orelse return false;
             debug_trace.logf("session", "picker pending action cancelled action={s}", .{@tagName(action)});
@@ -1563,6 +1583,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn toggleSessionPickerBusyPrompt(app: *App, agent: *AppAgent) bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (!picker.busyPromptActive() or picker.actionPending()) return false;
             picker.toggleBusyPromptChoice();
@@ -1571,6 +1596,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn selectSessionPickerBusyPrompt(app: *App, agent: *AppAgent, choice: session_persistence.BusyPromptChoice) bool {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                _ = choice;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (!picker.busyPromptActive() or picker.actionPending()) return false;
             picker.selectBusyPromptChoice(choice);
@@ -2207,6 +2238,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn pollSessionPickerResume(app: *App, agent: *AppAgent) !void {
+            if (comptime builtin.target.cpu.arch.isWasm()) {
+                _ = app;
+                _ = agent;
+                return;
+            }
             const task = agent.session_persistence.session_picker_resume.takeCompleted() orelse return;
             defer task.deinit();
 

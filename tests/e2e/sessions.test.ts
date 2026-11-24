@@ -4620,6 +4620,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
       workspace_root: fixture.workspace,
       saved_model: savedModel(fixture, working!),
       state: "working",
+      pid: holders[0]!.child.pid,
       created_at_ms: expect.any(Number),
       updated_at_ms: expect.any(Number),
       agents: [],
@@ -4627,6 +4628,9 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
 
     const all = await liveSessions(fixture, gateway, ["--all"]);
     expect(all.sessions.map((entry: any) => entry.id)).toEqual([delegating, working]);
+    // `holders[1]` sent the delegating turn and `holders[0]` the held working one.
+    expect(all.sessions[0].pid).toBe(holders[1]!.child.pid);
+    expect(all.sessions[1].pid).toBe(holders[0]!.child.pid);
     expect(all.sessions[0]).toMatchObject({ workspace_root: other, state: "idle", title: "Delegate the live review." });
     expect(all.sessions[0].agents).toEqual([
       { name: "reviewer", address: `${delegating}/reviewer`, id: childId, state: "working", agents: [] },
@@ -4675,6 +4679,59 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     expect(listed.sessions.map((entry: any) => entry.id).sort()).toEqual([saved, working, delegating].sort());
   } finally {
     for (const holder of holders) holder.child.kill("SIGKILL");
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx sessions --live --json reports the holder pid, updates it on resume after SIGKILL, and returns null when the lock file has no pid", async () => {
+  const fixture = createFixture("fx-v2-live-pid-");
+  let firstHeld = false;
+  let secondHeld = false;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    // The second turn is checked first: its prompt also carries the first turn's text.
+    if (body.includes("Hold the second pid turn.")) {
+      secondHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    if (body.includes("Hold the first pid turn.")) {
+      firstHeld = true;
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("PID_SAVED_ANSWER");
+  }, { classifierDecision: "clear" });
+  const holders: ReturnType<typeof spawnAsk>[] = [];
+  try {
+    const sessionId = JSON.parse((await ask(fixture, gateway, ["Seed the pid session."])).stdout).session_id;
+    const lockPath = join(storeRoot(fixture.home), sessionId, "lock");
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the first pid turn."]));
+    await until(() => firstHeld, "the first held turn");
+    const first = await liveSessions(fixture, gateway, ["--all"]);
+    expect(first.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(first.sessions[0].pid).toBe(holders[0]!.child.pid);
+
+    holders[0]!.child.kill("SIGKILL");
+    await holders[0]!.exited;
+    // SIGKILL frees the lock but leaves the PID bytes, so only the lock decides what is live.
+    expect(readFileSync(lockPath, "utf8")).toBe(`${holders[0]!.child.pid}\n`);
+    expect(await liveSessions(fixture, gateway, ["--all"])).toEqual({ kind: "live_sessions", count: 0, sessions: [] });
+
+    holders.push(spawnAsk(fixture, gateway, ["--resume", sessionId, "Hold the second pid turn."]));
+    await until(() => secondHeld, "the second held turn");
+    expect(holders[1]!.child.pid).not.toBe(holders[0]!.child.pid);
+    const second = await liveSessions(fixture, gateway, ["--all"]);
+    expect(second.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(second.sessions[0].pid).toBe(holders[1]!.child.pid);
+
+    // An older fx left the lock file empty: the session is still live, with no PID.
+    writeFileSync(lockPath, "");
+    const unnamed = await liveSessions(fixture, gateway, ["--all"]);
+    expect(unnamed.sessions.map((entry: any) => entry.id)).toEqual([sessionId]);
+    expect(unnamed.sessions[0].pid).toBeNull();
+  } finally {
+    for (const holder of holders) holder.child.kill("SIGKILL");
+    await Promise.all(holders.map((holder) => holder.exited));
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

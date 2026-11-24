@@ -4250,6 +4250,9 @@ const ErrorEventClass = enum {
     /// A code a resend cannot fix, or a code fx does not recognize and no
     /// status to say more: a resend repeats the same request.
     non_retryable,
+    /// The provider's output content filter blocked the answer, sent as an
+    /// error event rather than as a content filter finish.
+    content_filter,
 
     /// Whether `next` replaces `current` as the stream's class: only when it
     /// says more. A code or a usable HTTP status beats an event with neither,
@@ -4265,18 +4268,65 @@ const ErrorEventClass = enum {
             .uncoded => 0,
             .transient => 1,
             .stream_timeout => 2,
-            .rate_limited, .non_retryable => 3,
+            .rate_limited, .non_retryable, .content_filter => 3,
         };
     }
 };
 
 fn errorEventClass(root: std.json.Value) ErrorEventClass {
+    if (isContentFilterBlock(root)) return .content_filter;
     const status_class = if (providerErrorEventStatus(root)) |status| httpStatusClass(status) else null;
     const code = providerErrorEventCode(root) orelse return status_class orelse .uncoded;
     // A code fx recognizes decides. One it does not, such as an upstream
     // provider's own `upstream_error`, says less than the status that came
     // with it.
     return recognizedCodeClass(code) orelse status_class orelse .non_retryable;
+}
+
+/// The code and message phrase of an output content filter block that a
+/// provider streams as an error event instead of a content filter finish.
+const content_filter_block_code = "invalid_request_error";
+const content_filter_block_phrase = "Output blocked by content filtering policy";
+
+/// Whether an error event is an output content filter block: the error that
+/// carries the code has the block's code and phrase, and the event's
+/// statuses are absent or all 400.
+fn isContentFilterBlock(root: std.json.Value) bool {
+    const source = providerErrorEventSource(root) orelse return false;
+    if (!std.mem.eql(u8, source.code, content_filter_block_code)) return false;
+    const message_value = source.object.get("message") orelse return false;
+    const message = jsonValueString(message_value) orelse return false;
+    if (std.mem.find(u8, message, content_filter_block_phrase) == null) return false;
+    return statusesAllowContentFilterBlock(root, source.object);
+}
+
+/// Whether every `statusCode` on the event, its `error`/`providerError`
+/// wrappers (and their `param`), and the nested object carrying `code` is
+/// absent or exactly 400. A malformed or different one rules the block out.
+fn statusesAllowContentFilterBlock(root: std.json.Value, source: std.json.ObjectMap) bool {
+    const bad_request_status = 400;
+    if (root != .object) return false;
+    if (!statusCodeFieldIsAbsentOr(root.object, bad_request_status)) return false;
+    if (!statusCodeFieldIsAbsentOr(source, bad_request_status)) return false;
+    if (source.get("param")) |param| {
+        if (param == .object and !statusCodeFieldIsAbsentOr(param.object, bad_request_status)) return false;
+    }
+    inline for (.{ "error", "providerError" }) |key| {
+        if (root.object.get(key)) |err| {
+            if (err == .object) {
+                if (!statusCodeFieldIsAbsentOr(err.object, bad_request_status)) return false;
+                if (err.object.get("param")) |param| {
+                    if (param == .object and !statusCodeFieldIsAbsentOr(param.object, bad_request_status)) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+fn statusCodeFieldIsAbsentOr(object: std.json.ObjectMap, status: i64) bool {
+    const value = object.get("statusCode") orelse return true;
+    return value == .integer and value.integer == status;
 }
 
 fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
@@ -4356,6 +4406,9 @@ fn streamFailureCause(
         return if (error_finish) .unexplained_error_finish else null;
     };
     return switch (event) {
+        // `finishFromErrorEvents` makes a missing or error finish a content
+        // filter finish, which returned above.
+        .content_filter => null,
         // A classified code beats a timeout the finish names.
         .non_retryable => .non_retryable,
         .rate_limited => .rate_limited,
@@ -4367,6 +4420,26 @@ fn streamFailureCause(
             .uncoded_error
         else
             null,
+    };
+}
+
+/// The finish a stream's error events give it. The code wins: an error event
+/// whose code, or HTTP status in place of one, classifies the failure makes
+/// the stream a provider error even when no finish followed it. A content
+/// filter block makes a missing or error finish a content filter finish, so
+/// it reads like the provider's own. A stream timeout keeps its own path, an
+/// event with neither a code nor a usable status says nothing, and any other
+/// finish decides on its own.
+fn finishFromErrorEvents(
+    class: ErrorEventClass,
+    finish: ?types.ProviderFinishReason,
+) ?types.ProviderFinishReason {
+    const error_or_missing = finish == null or finish == .provider_error;
+    if (class == .content_filter and error_or_missing) return .content_filter;
+    if (finish != null) return finish;
+    return switch (class) {
+        .transient, .rate_limited, .non_retryable => .provider_error,
+        .uncoded, .stream_timeout, .content_filter => null,
     };
 }
 
@@ -4390,18 +4463,30 @@ fn statusCodeField(object: std.json.ObjectMap) ?u16 {
     return @intCast(value.integer);
 }
 
+/// An error event's code and the object that carries it, so its message
+/// is read from the same error. `object` borrows from the event.
+const ErrorEventSource = struct {
+    code: []const u8,
+    object: std.json.ObjectMap,
+};
+
+fn providerErrorEventCode(root: std.json.Value) ?[]const u8 {
+    const source = providerErrorEventSource(root) orelse return null;
+    return source.code;
+}
+
 /// The event's top-level `code`, or the `code`, then the `type`, of its
 /// `error` or `providerError` object, as `gateway_error_format` reads an
 /// error body. The event's own `type` is always "error".
-fn providerErrorEventCode(root: std.json.Value) ?[]const u8 {
+fn providerErrorEventSource(root: std.json.Value) ?ErrorEventSource {
     if (root != .object) return null;
     if (root.object.get("code")) |value| {
-        if (jsonValueString(value)) |code| return code;
+        if (jsonValueString(value)) |code| return .{ .code = code, .object = root.object };
     }
     inline for (.{ "error", "providerError" }) |key| {
         if (root.object.get(key)) |value| {
             if (value == .object) {
-                if (errorObjectCode(value.object)) |code| return code;
+                if (errorObjectSource(value.object)) |source| return source;
             }
         }
     }
@@ -4412,16 +4497,18 @@ fn providerErrorEventCode(root: std.json.Value) ?[]const u8 {
 /// provider's own error body nests the real error one level down, as
 /// `{"type":"error","error":{"type":"overloaded_error"}}`, so an object with
 /// neither reads its nested `error` the same way.
-fn errorObjectCode(object: std.json.ObjectMap) ?[]const u8 {
+fn errorObjectSource(object: std.json.ObjectMap) ?ErrorEventSource {
+    if (errorObjectOwnCode(object)) |code| return .{ .code = code, .object = object };
+    const nested = nestedErrorObject(object) orelse return null;
+    const code = errorObjectOwnCode(nested) orelse return null;
+    return .{ .code = code, .object = nested };
+}
+
+fn errorObjectOwnCode(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("code")) |value| {
         if (jsonValueString(value)) |code| return code;
     }
-    if (errorObjectType(object)) |code| return code;
-    const nested = nestedErrorObject(object) orelse return null;
-    if (nested.get("code")) |value| {
-        if (jsonValueString(value)) |code| return code;
-    }
-    return errorObjectType(nested);
+    return errorObjectType(object);
 }
 
 /// The object's `type`, unless it is one of `error_type_names`.
@@ -4455,7 +4542,7 @@ fn captureProviderFailureObject(
     if (include_type) {
         // A provider's wrapper, `{"type":"error","error":{...}}`, names
         // nothing itself: its nested error does. Read exactly one level down,
-        // as `errorObjectCode` does, so the detail and the class come from the
+        // as `errorObjectSource` does, so the detail and the class come from the
         // same object. When neither level names anything, the caller renders
         // the value instead, and `replaceProviderFailureRendered` bounds how
         // deep a value it renders.
@@ -5369,21 +5456,12 @@ fn consumeSseStreamTraced(
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
     }
 
-    // The code wins: an error event whose code, or HTTP status in place of
-    // one, classifies the failure makes the stream a provider error even when
-    // no finish followed it. A stream timeout keeps its own path, and an
-    // event with neither a code nor a usable status says nothing, so the
-    // stream stays one that ended early.
-    if (finish_reason_holder == null) {
-        if (error_event_class) |class| {
-            switch (class) {
-                .transient, .rate_limited, .non_retryable => {
-                    finish_reason_holder = .provider_error;
-                    debug_trace.logf("stream", "sse error event without finish class={s}", .{@tagName(class)});
-                },
-                .uncoded, .stream_timeout => {},
-            }
+    if (error_event_class) |class| {
+        const finish = finishFromErrorEvents(class, finish_reason_holder);
+        if (finish != finish_reason_holder) {
+            debug_trace.logf("stream", "sse error event decided finish class={s}", .{@tagName(class)});
         }
+        finish_reason_holder = finish;
     }
     completion.provider_result_identity_failure = provider_result_identity_failure;
     completion.provider_failure_cause = streamFailureCause(error_event_class, finish_reason_holder, finish_timeout);
@@ -6086,6 +6164,82 @@ test "consumeSseStream lets a content filter finish decide on its own" {
         errdefer std.debug.print("payload: {s}\n", .{payload});
         try std.testing.expectEqual(types.ProviderFinishReason.content_filter, completion.finish_reason.?);
         try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+    }
+}
+
+const test_filter_message = "Output blocked by content filtering policy";
+const test_filter_detail = "invalid_request_error: " ++ test_filter_message;
+const test_filter_type_event = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\"}}\n\n";
+const test_bad_request_event = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.1.content: field required\"}}\n\n";
+const test_partial_tool_input = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"Now the main cracker.\"}\n\n" ++
+    "data: {\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"write_file\"}\n\n" ++
+    "data: {\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":\"{\\\"path\\\":\\\"x.py\\\",\\\"content\\\":\\\"pri\"}\n\n";
+
+test "consumeSseStream reads a streamed output filter error as a content filter finish" {
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    for ([_][]const u8{
+        test_partial_tool_input ++ test_filter_type_event,
+        test_filter_type_event,
+        "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\n" ++
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}}\n\n",
+        "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ ".\"}}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ ".\",\"statusCode\":400}}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"param\":{\"statusCode\":400}}}\n\n",
+        test_filter_type_event ++ error_finish,
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n" ++ test_filter_type_event,
+        test_filter_type_event ++ test_bad_request_event,
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .content_filter), completion.finish_reason);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+        try std.testing.expect(std.mem.startsWith(u8, completion.provider_failure_detail.?, test_filter_detail));
+        try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
+    }
+}
+
+test "consumeSseStream keeps every other invalid request error and an explicit finish as they were" {
+    const Case = struct {
+        payload: []const u8,
+        finish: ?types.ProviderFinishReason = .provider_error,
+        cause: ?types.ProviderFailureCause = .non_retryable,
+    };
+    const cases = [_]Case{
+        // A genuine bad request, with and without a partial tool input.
+        .{ .payload = test_bad_request_event },
+        .{ .payload = test_partial_tool_input ++ test_bad_request_event },
+        // The message with another code, or a different case.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"" ++ test_filter_message ++ "\"}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"output blocked by content filtering policy\"}}\n\n" },
+        // A status other than 400, a malformed one, or two that disagree.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"providerError\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":503}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":\"400\"}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":200}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"statusCode\":500,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"" ++ test_filter_message ++ "\",\"statusCode\":400}}\n\n" },
+        // The phrase outside the error that carries the code.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"" ++ test_filter_message ++ "\"}\n\n" ++ test_bad_request_event },
+        .{ .payload = "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"error\":{\"message\":\"" ++ test_filter_message ++ "\"}}\n\n" },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"},\"providerError\":{\"message\":\"" ++ test_filter_message ++ "\"}}\n\n" },
+        // The first classified event decides.
+        .{ .payload = test_bad_request_event ++ test_filter_type_event },
+        // A normal finish decides on its own.
+        .{
+            .payload = test_filter_type_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+            .finish = .stop,
+            .cause = null,
+        },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.finish, completion.finish_reason);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+        try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
     }
 }
 

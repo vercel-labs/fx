@@ -420,7 +420,10 @@ pub const Store = struct {
     /// The advisory PID of the process holding session `id`, or null when
     /// free, unknown, or held by an older build.
     pub fn lockHolderPid(store: *Store, id: []const u8) ?u32 {
-        return store.manager.lockHolderPid(id) catch null;
+        return switch (store.manager.lockStatus(id) catch return null) {
+            .busy => |pid| if (pid) |p| std.math.cast(u32, p) else null,
+            .free => null,
+        };
     }
 
     fn parseTurnEndCompletedAt(arena: Allocator, data: []const u8) i64 {
@@ -792,7 +795,7 @@ const live_scan_page = 4096;
 /// subagents (`tests/tla/session/LiveSessions.tla`). A session is live while
 /// a process holds its writer lock, which the kernel frees however the
 /// process ends. The scan tries each lock without waiting and lets a free
-/// one go at once (`isBusy`), then reads the live session's log without the
+/// one go at once (`lockStatus`), then reads the live session's log without the
 /// lock (D37). It writes nothing. A session whose lock can't be tried is not
 /// live, and one whose log can't be read is listed as `unknown`; both are
 /// traced. The caller frees the list with `deinit`.
@@ -810,16 +813,19 @@ pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !sessio
         defer page.deinit();
         for (page.items) |item| {
             if (item.role != .root) continue;
-            const live = store.manager.isBusy(item.id) catch |err| switch (err) {
+            const status = store.manager.lockStatus(item.id) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     debug_trace.logf("session", "event=live_probe_failed session={s} err={s}", .{ item.id, @errorName(err) });
                     continue;
                 },
             };
-            if (!live) continue;
+            const pid = switch (status) {
+                .free => continue,
+                .busy => |owner| owner,
+            };
             _ = scratch.reset(.retain_capacity);
-            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item));
+            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item, pid));
         }
         cursor = page.next orelse break;
     }
@@ -827,14 +833,15 @@ pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !sessio
     return list;
 }
 
-/// Live root session `item`, read from its log into `arena`.
-fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary) !session_store.LiveSession {
+/// Live root session `item`, read from its log into `arena`, holding its
+/// writer lock as `pid` names it.
+fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary, pid: ?i64) !session_store.LiveSession {
     const summary = try summaryOf(arena, scratch, item);
     const peeked = store.manager.peek(scratch, item.id) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=live_peek_failed session={s} err={s}", .{ item.id, @errorName(err) });
-            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{} };
+            return .{ .summary = summary, .saved_model = null, .state = .unknown, .agents = &.{}, .pid = pid };
         },
     };
     return .{
@@ -842,6 +849,7 @@ fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Sum
         .saved_model = savedModel(arena, peeked.state.prefs),
         .state = if (peeked.state.open_turn != null) .working else .idle,
         .agents = try liveAgents(store, arena, scratch, item.id, peeked.state.children.items, 1),
+        .pid = pid,
     };
 }
 
@@ -1184,6 +1192,146 @@ fn salvageV1(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
     defer conversion.deinit();
     return conversion.salvage(id);
+}
+
+pub const Forked = struct {
+    id: []u8,
+    workspace_root: []u8,
+    /// Entries in the fork's history at the fork point.
+    history_len: usize,
+    /// Subagents the fork took a copy of (D97).
+    copied_agents: usize,
+    /// False when a side file could not be copied.
+    files_complete: bool,
+
+    pub fn deinit(forked: *Forked, alloc: Allocator) void {
+        alloc.free(forked.id);
+        alloc.free(forked.workspace_root);
+        forked.* = undefined;
+    }
+};
+
+/// `fx session fork`: a new root session copied from root `id` up to its
+/// last finished turn, or an empty fork when no turn has finished (D5).
+/// Reads the source without its lock, so it works while another fx has it
+/// open. Copies the subagents a fork can take (D97), marks the title as a
+/// fork (D58), copies the unmoved side files, and closes the fork so a
+/// caller can resume it at once. The source is never changed. Caller owns
+/// the result.
+pub fn forkSession(store: *Store, alloc: Allocator, id: []const u8) !Forked {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const peeked = try peekRootForFork(store, sa, id);
+    const at: sm.ForkPoint = .{ .turn = latestForkTurn(peeked.state) };
+    var state_at = try forkStateAt(store, id, at);
+    defer state_at.deinit(store.manager.gpa);
+    const workspace = try resolveSessionWorkspace(sa, peeked.workspace, peeked.state.workspace);
+    const copies = try copyableChildren(sa, &state_at);
+    const copy = try openForkCopy(store, id, at, workspace, copies);
+    defer copy.release();
+    try markForkTitle(sa, copy, peeked.state.title);
+    var restored = try restoreFrom(.{ .store = store, .id = copy.id(), .handle = copy }, alloc, sa, try copy.state(sa), null);
+    defer restored.deinit(alloc);
+    return finishFork(store, alloc, id, copy, workspace, .{
+        .history_len = restored.history.len,
+        .copied_agents = copies.len,
+    });
+}
+
+fn peekRootForFork(store: *Store, sa: Allocator, id: []const u8) !sm.Peeked {
+    const peeked = store.manager.peek(sa, id) catch |err| return switch (err) {
+        error.NotFound => error.SessionNotFound,
+        else => err,
+    };
+    if (peeked.role != .root) return error.SessionNotFound;
+    return peeked;
+}
+
+fn forkStateAt(store: *Store, id: []const u8, at: sm.ForkPoint) !sm.State {
+    return store.manager.stateAt(id, at) catch |err| return switch (err) {
+        error.NotFound, error.ChildSession => error.SessionNotFound,
+        error.InvalidForkPoint => error.Corrupt,
+        else => err,
+    };
+}
+
+fn openForkCopy(store: *Store, source: []const u8, at: sm.ForkPoint, workspace: []const u8, children: []const sm.ChildCopy) !sm.Session {
+    return store.manager.openFork(.{
+        .source = source,
+        .at = at,
+        .workspace = workspace,
+        .host = .ask,
+        .children = children,
+    }) catch |err| return switch (err) {
+        error.NotFound, error.ChildSession => error.SessionNotFound,
+        error.InvalidForkPoint => error.Corrupt,
+        else => err,
+    };
+}
+
+/// The children of `state` a fork can copy, each as its newest work stood
+/// at the fork point. Caller owns nothing; the slice lives in `sa`.
+fn copyableChildren(sa: Allocator, state: *const sm.State) ![]sm.ChildCopy {
+    var copies: std.ArrayList(sm.ChildCopy) = .empty;
+    for (state.children.items) |child| {
+        const entry = foldedChild(child);
+        if (!child_state.copyableAtFork(entry)) continue;
+        try copies.append(sa, try child_state.forkCopy(sa, entry));
+    }
+    return copies.toOwnedSlice(sa);
+}
+
+/// Sets the fork's title to the source's, marked once as a fork (D58).
+fn markForkTitle(sa: Allocator, copy: sm.Session, raw_title: ?[]const u8) !void {
+    const title = (try decodeOptionalTitle(sa, raw_title)) orelse return;
+    const encoded = try jsonString(sa, try forkTitle(sa, title));
+    _ = try copy.append(&.{.{ .set = .{ .key = .title, .value = encoded } }});
+}
+
+fn finishFork(store: *Store, alloc: Allocator, source: []const u8, copy: sm.Session, workspace: []const u8, counts: struct { history_len: usize, copied_agents: usize }) !Forked {
+    const copy_id = try alloc.dupe(u8, copy.id());
+    errdefer alloc.free(copy_id);
+    const owned_workspace = try alloc.dupe(u8, workspace);
+    errdefer alloc.free(owned_workspace);
+    const files_complete = store.copyFiles(source, copy_id);
+    copy.close() catch |err| debug_trace.logf("session", "event=sessions_v2_fork_close_failed session={s} err={s}", .{ copy_id, @errorName(err) });
+    return .{
+        .id = copy_id,
+        .workspace_root = owned_workspace,
+        .history_len = counts.history_len,
+        .copied_agents = counts.copied_agents,
+        .files_complete = files_complete,
+    };
+}
+
+/// The turn a fork at the source's current state keeps: the last turn that
+/// ended. An open turn ends the one before it, so 0 means before the first.
+fn latestForkTurn(state: sm.State) u64 {
+    if (state.committed + state.interrupted == 0) return 0;
+    if (state.open_turn) |open| return if (open > 0) open - 1 else 0;
+    return state.last_turn;
+}
+
+/// The fork's workspace: the source's own when it saved a non-empty one,
+/// else the one its first line names. Borrows from its arguments and `arena`.
+fn resolveSessionWorkspace(arena: Allocator, line1_workspace: []const u8, state_workspace: ?[]const u8) ![]const u8 {
+    const raw = state_workspace orelse return line1_workspace;
+    const saved = json_decode.parseFromSliceLeaky([]const u8, arena, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return line1_workspace,
+    };
+    if (saved.len == 0) return line1_workspace;
+    return saved;
+}
+
+/// The saved title as text, or null when there is none or it cannot be read.
+fn decodeOptionalTitle(arena: Allocator, raw_title: ?[]const u8) error{OutOfMemory}!?[]const u8 {
+    const raw = raw_title orelse return null;
+    return json_decode.parseFromSliceLeaky([]const u8, arena, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
 }
 
 pub const Doctor = struct {
@@ -14571,4 +14719,225 @@ test "childLatestReplyAt returns 0 when a child has no completed reply" {
     s.close();
 
     try testing.expectEqual(@as(i64, 0), try t.store.childLatestReplyAt(alloc, id));
+}
+
+fn savedLogPath(alloc: Allocator, id: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+}
+
+fn restoredHistoryLen(t: *TestHome, id: []const u8) !usize {
+    const resumed = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer resumed.close();
+    var restored = try resumed.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    return restored.history.len;
+}
+
+test "forkSession copies finished turns, marks title once, leaves source untouched, and resumes cleanly" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const source = try Session.create(alloc, &t.store, "/w", .app, testSeed(&model));
+    try source.commitTurn(assistantTurn("first question", "first answer"), types.ConversationLanguage.default());
+    try source.commitTurn(assistantTurn("second question", "second answer"), types.ConversationLanguage.default());
+    // Set after the last turn, so the fork must read the current title.
+    try source.rename("Plan");
+    const source_id = try alloc.dupe(u8, source.id());
+    defer alloc.free(source_id);
+    source.close();
+    const log_path = try savedLogPath(alloc, source_id);
+    defer alloc.free(log_path);
+    const before = try t.tmp.dir.readFileAlloc(io, log_path, alloc, .limited(1 << 20));
+    defer alloc.free(before);
+
+    var forked = try forkSession(&t.store, alloc, source_id);
+    defer forked.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), forked.history_len);
+    try testing.expectEqual(@as(usize, 0), forked.copied_agents);
+    try testing.expect(forked.files_complete);
+    try testing.expectEqualStrings("/w", forked.workspace_root);
+    try testing.expect(!std.mem.eql(u8, forked.id, source_id));
+    var copy = try t.store.manager.peek(alloc, forked.id);
+    defer copy.deinit(alloc);
+    try testing.expectEqualStrings("\"Plan (fork)\"", copy.state.title.?);
+    try testing.expectEqual(@as(usize, 2), try restoredHistoryLen(&t, forked.id));
+
+    var again = try forkSession(&t.store, alloc, forked.id);
+    defer again.deinit(alloc);
+    var again_copy = try t.store.manager.peek(alloc, again.id);
+    defer again_copy.deinit(alloc);
+    try testing.expectEqualStrings("\"Plan (fork)\"", again_copy.state.title.?);
+
+    const after = try t.tmp.dir.readFileAlloc(io, log_path, alloc, .limited(1 << 20));
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+    const last = (try t.store.manager.lastOpened(alloc, "/w", .app)).?;
+    defer alloc.free(last);
+    try testing.expectEqualStrings(source_id, last);
+}
+
+test "forkSession forks a live session with an open turn without taking its lock" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const source = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer source.close();
+    try source.commitTurn(assistantTurn("first question", "first answer"), types.ConversationLanguage.default());
+    try source.beginTurn();
+    try testing.expect(try t.store.manager.isBusy(source.id()));
+
+    var forked = try forkSession(&t.store, alloc, source.id());
+    defer forked.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), forked.history_len);
+    try testing.expectEqual(@as(usize, 1), try restoredHistoryLen(&t, forked.id));
+
+    try source.commitTurn(assistantTurn("second question", "second answer"), types.ConversationLanguage.default());
+    var restored = try source.restore(alloc);
+    defer restored.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+}
+
+test "forkSession makes an empty fork when 0 turns have finished (empty and mid-first-turn)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const midturn = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer midturn.close();
+    try midturn.beginTurn();
+    var from_midturn = try forkSession(&t.store, alloc, midturn.id());
+    defer from_midturn.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), from_midturn.history_len);
+    try testing.expectEqual(@as(usize, 0), try restoredHistoryLen(&t, from_midturn.id));
+
+    // A fork with no turn is saved (D90), so it forks too.
+    var empty = try forkSession(&t.store, alloc, from_midturn.id);
+    defer empty.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), empty.history_len);
+    try testing.expectEqual(@as(usize, 0), try restoredHistoryLen(&t, empty.id));
+}
+
+test "forkSession copies copyable subagents and skips closed ones (D97)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    // The fork point is the end of a turn, so the children are spawned in one it keeps.
+    try parent.beginTurn();
+    const kept_id = "1786460757753-kept";
+    const closed_id = "1786460757753-closed";
+    try parent.appendChildLines(&.{
+        .{ .spawned = .{ .child = kept_id, .work_id = "w1" } },
+        .{ .spawned = .{ .child = closed_id, .work_id = "w2" } },
+    });
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), kept_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+    }
+    try parent.appendChildLines(&.{.{ .finished = .{ .child = kept_id, .work_id = "w1", .outcome = .ok, .data = "{}" } }});
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), closed_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try child.commitTurn(assistantTurn("task two", "done two"), types.ConversationLanguage.default());
+    }
+    try parent.appendChildLines(&.{.{ .finished = .{ .child = closed_id, .work_id = "w2", .outcome = .ok, .data = "{\"closed\":true}" } }});
+    try parent.commitTurn(assistantTurn("delegate", "delegated"), types.ConversationLanguage.default());
+
+    var forked = try forkSession(&t.store, alloc, parent.id());
+    defer forked.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), forked.copied_agents);
+    const copy = try Session.resumeSession(alloc, &t.store, .{ .id = forked.id }, "/w", .ask);
+    defer copy.close();
+    const copied = try copy.children(alloc);
+    defer freeChildren(alloc, copied);
+    try testing.expectEqual(@as(usize, 1), copied.len);
+    try testing.expectEqualStrings("w1", copied[0].work_id);
+    try testing.expect(!std.mem.eql(u8, kept_id, copied[0].id));
+    const history = try t.store.childHistory(alloc, copied[0].id);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try testing.expectEqual(@as(usize, 1), history.len);
+
+    const source_children = try parent.children(alloc);
+    defer freeChildren(alloc, source_children);
+    try testing.expectEqual(@as(usize, 2), source_children.len);
+}
+
+test "forkSession refuses missing, invalid, child, and corrupt sessions" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "test-model".*;
+    try testing.expectError(error.SessionNotFound, forkSession(&t.store, alloc, "missing-session"));
+    try testing.expectError(error.InvalidArgument, forkSession(&t.store, alloc, "bad/id"));
+    try testing.expectEqual(error.InvalidSessionId, commandError(error.InvalidArgument));
+
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate", "ok"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-kid";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try child.commitTurn(assistantTurn("task", "done"), types.ConversationLanguage.default());
+    }
+    try testing.expectError(error.SessionNotFound, forkSession(&t.store, alloc, child_id));
+
+    const corrupt = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    const corrupt_id = try alloc.dupe(u8, corrupt.id());
+    defer alloc.free(corrupt_id);
+    try corrupt.commitTurn(assistantTurn("question", "answer"), types.ConversationLanguage.default());
+    corrupt.close();
+    const log_path = try savedLogPath(alloc, corrupt_id);
+    defer alloc.free(log_path);
+    try t.tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "not a log\n" });
+    try testing.expectError(error.Corrupt, forkSession(&t.store, alloc, corrupt_id));
+}
+
+test "forkSession copies side folders, never a link, and reports when one is skipped" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, id);
+        defer owner.close();
+        try owner.dir.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+        try owner.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+
+    var forked = try forkSession(&t.store, testing.allocator, id);
+    defer forked.deinit(testing.allocator);
+    try testing.expect(!forked.files_complete);
+    try testing.expectEqual(@as(usize, 1), forked.history_len);
+    const copy = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", terminal_dir_name, forked.id });
+    defer testing.allocator.free(copy);
+    var dir = try t.tmp.dir.openDir(io, copy, .{});
+    defer dir.close(io);
+    const top = try dir.readFileAlloc(io, "top.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(top);
+    try testing.expectEqualStrings("top", top);
+    try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
 }

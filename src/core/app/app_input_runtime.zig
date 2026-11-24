@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -1722,7 +1723,7 @@ pub fn Runtime(comptime App: type) type {
 
             if (picker.selectedId() == null) return true;
 
-            if (comptime @hasDecl(App, "startSessionPickerResume")) {
+            if (comptime !builtin.target.cpu.arch.isWasm() and @hasDecl(App, "startSessionPickerResume")) {
                 _ = app.startSessionPickerResume(agent) catch |err| {
                     debug_trace.logf(
                         "session",
@@ -1788,7 +1789,12 @@ pub fn Runtime(comptime App: type) type {
         /// modal, keys stay on that modal instead of leaking into the search
         /// box behind it. Control bytes (Ctrl+C, Esc) still pass through.
         fn routeSessionBusyPromptByte(app: *App, agent: *AppAgent, byte: u8) !bool {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (comptime builtin.target.cpu.arch.isWasm() or !agents.hasAgentField(App, "session_persistence")) {
+                _ = app;
+                _ = agent;
+                _ = byte;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (picker.actionPending()) {
                 if (byte < 0x20 and byte != '\r' and byte != '\n' and byte != '\t' and byte != 8) return false;
@@ -1857,7 +1863,12 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             resolved: input_action.Action,
         ) bool {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (comptime builtin.target.cpu.arch.isWasm() or !agents.hasAgentField(App, "session_persistence")) {
+                _ = app;
+                _ = agent;
+                _ = resolved;
+                return false;
+            }
             const picker = &agent.session_persistence.session_picker;
             if (picker.actionPending()) {
                 return switch (resolved) {
@@ -1885,7 +1896,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cancelSessionBusyPromptOnEscape(app: *App, agent: *AppAgent) bool {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (comptime builtin.target.cpu.arch.isWasm() or !agents.hasAgentField(App, "session_persistence")) {
+                _ = app;
+                _ = agent;
+                return false;
+            }
             if (app_session_runtime.Runtime(App).cancelSessionPickerPendingAction(app, agent)) return true;
             return app_session_runtime.Runtime(App).dismissSessionPickerBusyPrompt(app, agent);
         }

@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const question_state = @import("../../core/agent/question_prompt.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -1002,9 +1003,9 @@ pub fn composeFooterFrame(
         )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .sessions and ctx.session_menu.pending_action != null)
+    else if (!builtin.target.cpu.arch.isWasm() and input.show_picker and input.picker_kind == .sessions and ctx.session_menu.pending_action != null)
         try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, &resume_menu_presentation.pending_action_hint_variants)
-    else if (input.show_picker and input.picker_kind == .sessions and ctx.session_menu.busy_prompt != null)
+    else if (!builtin.target.cpu.arch.isWasm() and input.show_picker and input.picker_kind == .sessions and ctx.session_menu.busy_prompt != null)
         try input_presentation.composeVariantHintRow(
             alloc,
             shell.layout.cols,

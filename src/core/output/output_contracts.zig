@@ -1790,7 +1790,9 @@ pub const LiveSessionListSnapshot = struct {
             try std.json.Stringify.value(entry.summary.workspace_root, .{}, &out.writer);
             try out.writer.writeAll(",\"saved_model\":");
             try std.json.Stringify.value(entry.saved_model, .{}, &out.writer);
-            try out.writer.print(",\"state\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ @tagName(entry.state), entry.summary.created_at_ms, entry.summary.updated_at_ms });
+            try out.writer.print(",\"state\":\"{s}\",\"pid\":", .{@tagName(entry.state)});
+            try std.json.Stringify.value(entry.pid, .{}, &out.writer);
+            try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ entry.summary.created_at_ms, entry.summary.updated_at_ms });
             try writeLiveAgentsJson(&out.writer, entry.agents);
             try out.writer.writeByte('}');
         }
@@ -1824,6 +1826,14 @@ test "a live listing prints each subagent under the one that started it, and esc
         .saved_model = "openai/gpt-5",
         .state = .working,
         .agents = &.{lead},
+        .pid = 4242,
+    }};
+    const no_pid = [_]session_store.LiveSession{.{
+        .summary = .{ .id = @constCast("def"), .created_at_ms = 3, .updated_at_ms = 4, .conversation_language = types.ConversationLanguage.default(), .history_len = 0 },
+        .saved_model = null,
+        .state = .idle,
+        .agents = &.{},
+        .pid = null,
     }};
     const text = try (LiveSessionListSnapshot{ .sessions = &sessions, .all_workspaces = true }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
@@ -1834,6 +1844,10 @@ test "a live listing prints each subagent under the one that started it, and esc
     const json = try (LiveSessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"agents\":[{\"name\":\"lead\",\"address\":\"abc/lead\",\"id\":\"l1\",\"state\":\"idle\",\"agents\":[{\"name\":\"helper\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"state\":\"working\",\"pid\":4242,\"created_at_ms\":1,") != null);
+    const no_pid_json = try (LiveSessionListSnapshot{ .sessions = &no_pid }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(no_pid_json);
+    try std.testing.expect(std.mem.find(u8, no_pid_json, "\"state\":\"idle\",\"pid\":null,\"created_at_ms\":3,") != null);
     const empty = try (LiveSessionListSnapshot{ .sessions = &.{} }).render(std.testing.allocator, .json);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqualStrings("{\"kind\":\"live_sessions\",\"count\":0,\"sessions\":[]}", empty);
@@ -1906,6 +1920,63 @@ pub const SessionRecoverySnapshot = struct {
             .{ self.result.history_len, self.result.permission_rules_dropped },
         );
         try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const SessionForkSnapshot = struct {
+    result: session_store.SessionForkResult,
+
+    pub fn render(
+        self: SessionForkSnapshot,
+        alloc: Allocator,
+        format: OutputFormat,
+    ) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(
+        self: SessionForkSnapshot,
+        alloc: Allocator,
+    ) ![]u8 {
+        const result = self.result;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("[session fork] copied {s} to {s}\nhistory_turns: {d}\n", .{
+            result.source_session_id,
+            result.fork_session_id,
+            result.history_len,
+        });
+        if (result.copied_agents > 0) {
+            try out.writer.print("copied_agents: {d}\n", .{result.copied_agents});
+        }
+        if (!result.files_complete) {
+            try out.writer.writeAll("warning: some side files could not be copied\n");
+        }
+        try out.writer.print("resume: fx --resume {s}\n", .{result.fork_session_id});
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(
+        self: SessionForkSnapshot,
+        alloc: Allocator,
+    ) ![]u8 {
+        const result = self.result;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"session_fork\",\"source_id\":");
+        try std.json.Stringify.value(result.source_session_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"fork_id\":");
+        try std.json.Stringify.value(result.fork_session_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"workspace_root\":");
+        try std.json.Stringify.value(result.workspace_root, .{}, &out.writer);
+        try out.writer.print(
+            ",\"history_turns\":{d},\"copied_agents\":{d},\"files_complete\":{}}}",
+            .{ result.history_len, result.copied_agents, result.files_complete },
+        );
         return try out.toOwnedSlice();
     }
 };
@@ -3903,6 +3974,67 @@ test "core session recovery snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"ruleless-session\",\"status\":\"recovered\",\"history_turns\":4,\"permission_rules_dropped\":true}",
         without_rules_json,
+    );
+}
+
+test "core session fork snapshot text and json stay stable" {
+    const alone: session_store.SessionForkResult = .{
+        .source_session_id = @constCast("source-session"),
+        .fork_session_id = @constCast("fork-session"),
+        .workspace_root = @constCast("/w"),
+        .history_len = 4,
+    };
+    const alone_text = try (SessionForkSnapshot{ .result = alone }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(alone_text);
+    try std.testing.expectEqualStrings(
+        "[session fork] copied source-session to fork-session\nhistory_turns: 4\nresume: fx --resume fork-session\n",
+        alone_text,
+    );
+    const alone_json = try (SessionForkSnapshot{ .result = alone }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(alone_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":0,\"files_complete\":true}",
+        alone_json,
+    );
+
+    const with_agents: session_store.SessionForkResult = .{
+        .source_session_id = @constCast("source-session"),
+        .fork_session_id = @constCast("fork-session"),
+        .workspace_root = @constCast("/w"),
+        .history_len = 4,
+        .copied_agents = 2,
+    };
+    const agents_text = try (SessionForkSnapshot{ .result = with_agents }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(agents_text);
+    try std.testing.expectEqualStrings(
+        "[session fork] copied source-session to fork-session\nhistory_turns: 4\ncopied_agents: 2\nresume: fx --resume fork-session\n",
+        agents_text,
+    );
+    const agents_json = try (SessionForkSnapshot{ .result = with_agents }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(agents_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":2,\"files_complete\":true}",
+        agents_json,
+    );
+
+    const partial: session_store.SessionForkResult = .{
+        .source_session_id = @constCast("source-session"),
+        .fork_session_id = @constCast("fork-session"),
+        .workspace_root = @constCast("/w"),
+        .history_len = 4,
+        .files_complete = false,
+    };
+    const partial_text = try (SessionForkSnapshot{ .result = partial }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(partial_text);
+    try std.testing.expectEqualStrings(
+        "[session fork] copied source-session to fork-session\nhistory_turns: 4\nwarning: some side files could not be copied\nresume: fx --resume fork-session\n",
+        partial_text,
+    );
+    const partial_json = try (SessionForkSnapshot{ .result = partial }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(partial_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_fork\",\"source_id\":\"source-session\",\"fork_id\":\"fork-session\",\"workspace_root\":\"/w\",\"history_turns\":4,\"copied_agents\":0,\"files_complete\":false}",
+        partial_json,
     );
 }
 

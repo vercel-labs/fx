@@ -48,6 +48,7 @@ pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
 pub const VerifyOptions = session_mod.VerifyOptions;
 pub const Stop = session_mod.Stop;
+pub const LockStatus = session_mod.LockStatus;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;
@@ -471,12 +472,12 @@ pub const Manager = struct {
         return session_mod.isBusy(&m.env, id);
     }
 
-    /// The advisory PID of the process holding `id`'s writer lock, or null if
-    /// free or recorded by an older build without a PID.
-    pub fn lockHolderPid(m: *Manager, id: []const u8) OpenError!?u32 {
+    /// Whether another process has session `id` open for writing, and its PID
+    /// when recorded (`session.zig` `lockStatus`).
+    pub fn lockStatus(m: *Manager, id: []const u8) OpenError!LockStatus {
         try checkId(id);
         if (!try readyToRead(m)) return error.NotFound;
-        return session_mod.lockHolderPid(&m.env, id);
+        return session_mod.lockStatus(&m.env, id);
     }
 
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
@@ -2447,27 +2448,6 @@ const api_tests = struct {
         var after_steer = try m.list(gpa, .all, null, 10);
         defer after_steer.deinit();
         try testing.expect(after_steer.items[0].updated_ms > start_ms);
-    }
-
-    test "lockHolderPid returns the active writer pid and null once closed" {
-        var f: Fixture = undefined;
-        try f.init();
-        defer f.deinit();
-        const m = f.manager;
-        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
-        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
-        const id = try gpa.dupe(u8, s.id());
-        defer gpa.free(id);
-
-        const expected: u32 = @intCast(std.c.getpid());
-        try testing.expectEqual(@as(?u32, expected), try m.lockHolderPid(id));
-        s.release();
-        try testing.expectEqual(@as(?u32, null), try m.lockHolderPid(id));
-
-        const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
-        try testing.expectEqual(@as(?u32, expected), try m.lockHolderPid(id));
-        reopened.release();
-        try testing.expectEqual(@as(?u32, null), try m.lockHolderPid(id));
     }
 };
 

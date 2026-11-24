@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
@@ -216,17 +217,23 @@ const SessionMenuLayout = struct {
 
 pub fn menuRowCount(projection: SessionMenuProjection, width: u16, max_rows: u16) u16 {
     if (max_rows == 0) return 0;
-    if (projection.pending_action != null) {
-        return @min(max_rows, header_rows + roomy_top_gap_rows + 1);
-    }
-    if (projection.busy_prompt) |prompt| {
-        return busyPromptRows(prompt, width, max_rows).len;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action != null) {
+            return @min(max_rows, header_rows + roomy_top_gap_rows + 1);
+        }
+        if (projection.busy_prompt) |prompt| {
+            return busyPromptRows(prompt, width, max_rows).len;
+        }
+    } else {
+        _ = width;
     }
     return SessionMenuLayout.build(projection, max_rows).row_count;
 }
 
 pub fn visibleNavigationItemsForBudget(projection: SessionMenuProjection, row_budget: u16) u16 {
-    if (projection.pending_action != null or projection.busy_prompt != null) return 0;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action != null or projection.busy_prompt != null) return 0;
+    }
     return SessionMenuLayout.build(projection, row_budget).visible_items;
 }
 
@@ -240,11 +247,13 @@ pub fn composeSessionMenuRow(
     const row: std.ArrayList(u8) = .empty;
     if (width == 0 or row_index >= row_budget) return row;
 
-    if (projection.pending_action) |action| {
-        return composePendingActionRow(alloc, projection, action, row_index, width, row_budget);
-    }
-    if (projection.busy_prompt) |prompt| {
-        return composeBusyForkPromptRow(alloc, prompt, row_index, width, row_budget);
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (projection.pending_action) |action| {
+            return composePendingActionRow(alloc, projection, action, row_index, width, row_budget);
+        }
+        if (projection.busy_prompt) |prompt| {
+            return composeBusyForkPromptRow(alloc, prompt, row_index, width, row_budget);
+        }
     }
 
     const layout = SessionMenuLayout.build(projection, row_budget);

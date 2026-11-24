@@ -621,6 +621,25 @@ function contentFilterResponse(): Response {
   );
 }
 
+const partialWriteFileEvents =
+  'data: {"type":"text-delta","id":"t1","delta":"Now the main cracker."}\n\n' +
+  'data: {"type":"tool-input-start","id":"c1","toolName":"write_file"}\n\n' +
+  `data: ${JSON.stringify({ type: "tool-input-delta", id: "c1", delta: '{"path":"blocked.py","content":"pri' })}\n\n`;
+
+function streamedErrorAfterPartialToolResponse(error: Record<string, unknown>): Response {
+  return sse(partialWriteFileEvents + `data: ${JSON.stringify({ type: "error", error })}\n\n`);
+}
+
+const outputFilterMessage = "Output blocked by content filtering policy";
+
+function streamedFilterErrorResponse(form: "type" | "code"): Response {
+  return streamedErrorAfterPartialToolResponse(
+    form === "type"
+      ? { type: "invalid_request_error", message: outputFilterMessage }
+      : { code: "invalid_request_error", message: outputFilterMessage, statusCode: 400 },
+  );
+}
+
 function providerErrorAfterToolStartResponse(): Response {
   return sse(
     'data: {"type":"tool-input-start","id":"read_1","toolName":"read_file"}\n\n' +
@@ -14224,6 +14243,81 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(3);
       expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
       expect(result.stderr).not.toContain("press Esc");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("streamed filter error resends like a content filter finish without running the partial tool", async () => {
+    const root = createFixtureRoot("streamed-filter-error-recovered");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      streamedFilterErrorResponse("type"),
+      streamedFilterErrorResponse("code"),
+      fakeGatewayFinalText("ALLOWED_AFTER_TWO_STREAMED_BLOCKS"),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger content filter fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.error ?? null).toBeNull();
+      expect(json.final_output).toBe("ALLOWED_AFTER_TWO_STREAMED_BLOCKS");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3, cause: "content_filter" });
+      expect(gateway.requestCount()).toBe(3);
+      expect(trace.split("event=content_filter_resend").length - 1).toBe(2);
+      expect(trace).toContain(`detail=invalid_request_error: ${outputFilterMessage}`);
+      expect(trace).not.toContain("event=before_tool_execution");
+      expect(existsSync(join(root.workspace, "blocked.py"))).toBe(false);
+      for (const request of gateway.requests) {
+        expect(request.body).not.toContain("blocked.py");
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("genuine bad request in a stream ends the turn after one model request", async () => {
+    const root = createFixtureRoot("streamed-genuine-bad-request");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      streamedErrorAfterPartialToolResponse({
+        type: "invalid_request_error",
+        message: "messages.1.content: field required",
+      })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Trigger content filter fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("invalid_request_error: messages.1.content: field required");
+      expect(trace).not.toContain("event=content_filter_resend");
+      expect(trace).not.toContain("event=before_tool_execution");
+      expect(existsSync(join(root.workspace, "blocked.py"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
