@@ -646,7 +646,7 @@ test "ask presentation draws a provisional tail and drops it when committed text
 
     var runtime = try Runtime.initConfigured(
         alloc,
-        .{ .text = @constCast("show tail") },
+        .{ .model = "openai/gpt-5" },
         false,
         output,
         zeroFooterLayout(.{
