@@ -117,7 +117,7 @@ test "command approval retains its committed screen state across review sync" {
         .document_scrollable = true,
     });
 
-    try std.testing.expect(!prompt.syncReview(null));
+    try std.testing.expect(!try prompt.syncReview(alloc, null));
     try std.testing.expect(prompt.review == null);
     try std.testing.expectEqual(@as(usize, 6), screen.document_scroll_rows);
     try std.testing.expectEqual(request.id, screen.screen_commit.?.request_id);

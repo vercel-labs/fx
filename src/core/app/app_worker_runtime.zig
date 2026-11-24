@@ -878,7 +878,7 @@ pub fn Runtime(comptime App: type) type {
                         null
                 else
                     null;
-                break :blk agent.approval_prompt.syncReview(review);
+                break :blk agent.approval_prompt.syncReview(app.alloc, review) catch false;
             } else false;
             if (approval_changed and in_child and agent.approval_prompt.isActive()) {
                 debug_trace.eventf("host", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
@@ -2088,7 +2088,7 @@ const FakeApprovalPrompt = struct {
         return changed;
     }
 
-    pub fn syncReview(self: *FakeApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
+    pub fn syncReview(self: *FakeApprovalPrompt, _: std.mem.Allocator, review: ?*const diff_mod.FileReview) std.mem.Allocator.Error!bool {
         const request = self.request orelse {
             const changed = self.review != null;
             self.review = null;

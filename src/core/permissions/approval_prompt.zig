@@ -50,7 +50,10 @@ pub const Projection = struct {
 pub const ApprovalPrompt = struct {
     request: ?permission_request.OwnedPermissionRequest = null,
     decision: approval_decision.State = .{},
-    review: ?*const diff_mod.FileReview = null,
+    review: ?diff_mod.OwnedReview = null,
+    /// The review the owned copy was taken from, only to tell one review from
+    /// another without copying it again on every pass.
+    review_source: ?*const diff_mod.FileReview = null,
     review_request_id: u64 = 0,
     rule_management: ?session_permission_state.OwnedConfirmedRuleEvent = null,
 
@@ -88,7 +91,7 @@ pub const ApprovalPrompt = struct {
         self.rule_management = null;
         self.request = null;
         self.decision.reset(alloc, reason);
-        self.clearReview();
+        self.clearReview(alloc);
     }
 
     pub fn syncRequest(
@@ -145,28 +148,40 @@ pub const ApprovalPrompt = struct {
         self.decision.setConfirmationOnly(true);
     }
 
-    pub fn syncReview(self: *ApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
+    /// Copies the review once per request, because the call that built it frees
+    /// it as soon as its tool call ends (`tests/tla/subagent/TuiParentApproval.tla`
+    /// NoStalePrompt).
+    pub fn syncReview(
+        self: *ApprovalPrompt,
+        alloc: Allocator,
+        review: ?*const diff_mod.FileReview,
+    ) Allocator.Error!bool {
         const request = self.request orelse {
             const changed = self.review != null or self.review_request_id != 0;
-            self.clearReview();
+            self.clearReview(alloc);
             return changed;
         };
         if (request.file == null) {
             const changed = self.review != null or self.review_request_id != 0;
-            self.clearReview();
+            self.clearReview(alloc);
             return changed;
         }
 
-        if (self.review == review and self.review_request_id == request.id) return false;
-        self.review = review;
-        self.review_request_id = if (review == null) 0 else request.id;
+        if (self.review_source == review and self.review_request_id == request.id) return false;
+        self.clearReview(alloc);
+        if (review) |source| {
+            self.review = try diff_mod.OwnedReview.init(alloc, source);
+            self.review_source = source;
+            self.review_request_id = request.id;
+        }
         return true;
     }
 
-    pub fn currentReview(self: ApprovalPrompt) ?*const diff_mod.FileReview {
+    pub fn currentReview(self: *const ApprovalPrompt) ?*const diff_mod.FileReview {
         const request = self.request orelse return null;
         if (request.file == null or self.review_request_id != request.id) return null;
-        return self.review;
+        if (self.review) |*owned| return owned.view();
+        return null;
     }
 
     pub fn isAmending(self: ApprovalPrompt) bool {
@@ -196,11 +211,13 @@ pub const ApprovalPrompt = struct {
         self.rule_management = null;
         self.request = null;
         self.decision.resetAfterSubmission(alloc);
-        self.clearReview();
+        self.clearReview(alloc);
     }
 
-    fn clearReview(self: *ApprovalPrompt) void {
+    fn clearReview(self: *ApprovalPrompt, alloc: Allocator) void {
+        if (self.review) |*owned| owned.deinit(alloc);
         self.review = null;
+        self.review_source = null;
         self.review_request_id = 0;
     }
 };
@@ -290,7 +307,6 @@ test "approval prompt treats byte-identical replacement ids as new requests" {
 test "approval prompt keeps full review request-bound" {
     const alloc = std.testing.allocator;
     var review = try diff_mod.FileReview.init(alloc, "", "one\ntwo\n");
-    defer review.deinit(alloc);
 
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
@@ -301,8 +317,22 @@ test "approval prompt keeps full review request-bound" {
         .file = approvalFileRequest(approvalPreview()),
     };
     try std.testing.expect(try prompt.syncRequest(alloc, request_a));
-    try std.testing.expect(prompt.syncReview(&review));
-    try std.testing.expect(prompt.currentReview() == &review);
+    try std.testing.expect(try prompt.syncReview(alloc, &review));
+    // The prompt keeps its own copy, so the review can go with the tool call
+    // that built it and the prompt still reads the same rows.
+    try std.testing.expect(prompt.currentReview() != &review);
+    const kept = prompt.currentReview().?;
+    const rows = kept.rowCount();
+    const before = try kept.viewport(alloc, 0, rows);
+    defer alloc.free(before.lines);
+    const first_row = try alloc.dupe(u8, before.lines[0].text);
+    defer alloc.free(first_row);
+    review.deinit(alloc);
+
+    try std.testing.expectEqual(rows, prompt.currentReview().?.rowCount());
+    const after = try prompt.currentReview().?.viewport(alloc, 0, rows);
+    defer alloc.free(after.lines);
+    try std.testing.expectEqualStrings(first_row, after.lines[0].text);
 
     var request_b = request_a;
     request_b.id = 11;
@@ -313,7 +343,6 @@ test "approval prompt keeps full review request-bound" {
 test "approval projection borrows immutable active state" {
     const alloc = std.testing.allocator;
     var review = try diff_mod.FileReview.init(alloc, "", "one\ntwo\n");
-    defer review.deinit(alloc);
 
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
@@ -323,7 +352,11 @@ test "approval projection borrows immutable active state" {
         .label = "edit_file note.txt",
         .file = approvalFileRequest(approvalPreview()),
     }));
-    try std.testing.expect(prompt.syncReview(&review));
+    try std.testing.expect(try prompt.syncReview(alloc, &review));
+    const kept_rows = prompt.currentReview().?.rowCount();
+    // The projection reads the prompt's own copy, so it outlives the review the
+    // tool call built.
+    review.deinit(alloc);
     _ = try prompt.decision.apply(alloc, .tab, true, null);
     _ = try prompt.decision.apply(alloc, .{ .insert_ascii = 'y' }, true, null);
     _ = try prompt.decision.apply(alloc, .{ .move_choice = .previous }, true, null);
@@ -341,7 +374,7 @@ test "approval projection borrows immutable active state" {
     try std.testing.expectEqualStrings("n", projection.draftForChoice(2));
     try std.testing.expectEqual(@as(usize, 1), projection.draftCursorForChoice(0));
     try std.testing.expectEqual(@as(usize, 1), projection.draftCursorForChoice(2));
-    try std.testing.expect(projection.currentReview() == &review);
+    try std.testing.expectEqual(kept_rows, projection.currentReview().?.rowCount());
 }
 
 test "command approval ignores absent file review" {
@@ -353,7 +386,7 @@ test "command approval ignores absent file review" {
         .label = "shell.run printf '%s' command-review",
     }));
 
-    try std.testing.expect(!prompt.syncReview(null));
+    try std.testing.expect(!try prompt.syncReview(alloc, null));
     try std.testing.expect(prompt.review == null);
     try std.testing.expectEqual(@as(u64, 0), prompt.review_request_id);
 }

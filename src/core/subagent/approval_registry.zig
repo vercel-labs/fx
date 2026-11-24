@@ -3,6 +3,7 @@ const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 pub const max_pending: usize = 64;
@@ -448,6 +449,32 @@ pub const Registry = struct {
             return index;
         }
         return null;
+    }
+
+    /// Drops every binding of `child_id` without answering its worker: the
+    /// person already answered it on the child's own screen, so the worker has
+    /// its decision and the binding must not outlive it. Main's later answer
+    /// then finds nothing and says the request is no longer waiting. Takes the
+    /// registry's mutex and no other lock, so a listener's worker never waits
+    /// behind it.
+    pub fn withdrawChild(self: *Registry, child_id: []const u8) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        var removed: usize = 0;
+        var index = self.bindings.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
+            var binding = self.bindings.items[index];
+            _ = self.bindings.orderedRemove(index);
+            binding.deinit(self.alloc);
+            removed += 1;
+        }
+        if (removed > 0) {
+            self.pending_revision +|= 1;
+            debug_trace.logf("subagent", "approval requests withdrawn child={s} count={d} reason=answered_on_screen", .{ child_id, removed });
+        }
+        self.mutex.unlock(io_mod.getIo());
+        return removed;
     }
 
     pub fn invalidateChild(

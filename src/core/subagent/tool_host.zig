@@ -3130,6 +3130,14 @@ pub const Runtime = struct {
             debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
     }
 
+    /// The person answered `child_id`'s request on its own screen, so its
+    /// registry binding goes with it: main's later answer finds nothing and
+    /// reads that the request is no longer waiting
+    /// (`tests/tla/subagent/TuiParentApproval.tla` AnswerOnce).
+    pub fn withdrawAnsweredApproval(self: *Runtime, child_id: []const u8) usize {
+        return self.approvals.withdrawChild(child_id);
+    }
+
     /// Tells the owner, as child `child_id`'s own message, that it waits on
     /// the owner's approval for `label`, so a parent that would otherwise
     /// wait hears of it. A note for a child that is closing or gone, or one
