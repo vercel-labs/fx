@@ -99,7 +99,7 @@ BridgeCall(v, t) ==
     /\ Bridge
     /\ calls' = {[tool |-> t, view |-> v, loaded |-> t[1] \in loaded,
                   inView |-> InView(v, t), denied |-> t \in DeniedFor(v), ran |-> BridgeRuns(v, t)]}
-    /\ loaded' = IF BridgeRuns(v, t) THEN loaded \cup {t[1]} ELSE loaded
+    /\ loaded' = IF BridgeRuns(v, t) /\ t[1] \in usable THEN loaded \cup {t[1]} ELSE loaded
     /\ UNCHANGED <<run, usable, views>>
 
 Next == (\E s \in Servers : Load(s)) \/ Create \/ Reload \/ (\E v \in views, t \in Tools : BridgeCall(v, t))
