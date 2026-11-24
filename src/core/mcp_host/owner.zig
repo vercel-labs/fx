@@ -1536,7 +1536,7 @@ fn testSocketPair(tag: []const u8) !struct { server: std.Io.net.Stream, peer: st
     const io = testing.io;
     const n = socket_count.fetchAdd(1, .monotonic);
     var buffer: [129]u8 = undefined;
-    const path = try std.fmt.bufPrint(buffer[0..128], "/tmp/fx-owner-{s}-{d}-{d}.sock", .{ tag, std.c.getpid(), n });
+    const path = try std.mem.print(buffer[0..128], "/tmp/fx-owner-{s}-{d}-{d}.sock", .{ tag, std.c.getpid(), n });
     buffer[path.len] = 0;
     const path_z = buffer[0..path.len :0];
     // A file an earlier run left; there need not be one.
