@@ -178,6 +178,20 @@ const controls: { name: string; module: string; constants: Record<string, never>
     badAt: 1,
   },
   {
+    name: "config edit inspect", module: "ConfigEdit",
+    constants: { ObsNames: ["a", "b"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "inspect", data: { file: "profile", shown: ["a"], noted: ["b"] } },
+    ],
+    // The good entry hidden by the bad one, as `fx status` did before it read the profile as the runtime does: the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "inspect", data: { file: "profile", shown: [], noted: [] } },
+    ],
+    badAt: 1,
+  },
+  {
     name: "MCP rules", module: "McpRules",
     constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
     good: [
