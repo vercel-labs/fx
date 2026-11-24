@@ -640,7 +640,7 @@ fn scanLines(
                 // The line is longer than the buffer. Take what is buffered,
                 // up to the last whole UTF-8 sequence, and keep reading it.
                 const buffered = reader.buffered();
-                const piece = buffered[0 .. buffered.len - incompleteUtf8Tail(buffered)];
+                const piece = buffered[0 .. buffered.len - text_utils.incompleteUtf8Tail(buffered)];
                 if (!isLineText(display_path, piece)) return .not_text;
                 try long.add(scratch, piece, pattern, case_insensitive);
                 reader.toss(piece.len);
@@ -723,19 +723,6 @@ const LongLine = struct {
         }
     }
 };
-
-/// Number of bytes at the end of `bytes` that start a UTF-8 sequence the
-/// buffer cut short, at most 3.
-fn incompleteUtf8Tail(bytes: []const u8) usize {
-    var back: usize = 1;
-    while (back <= @min(3, bytes.len)) : (back += 1) {
-        const byte = bytes[bytes.len - back];
-        if (byte & 0b1100_0000 == 0b1000_0000) continue;
-        const needed = std.unicode.utf8ByteSequenceLength(byte) catch return 0;
-        return if (needed > back) back else 0;
-    }
-    return 0;
-}
 
 fn isLineText(display_path: []const u8, line: []const u8) bool {
     if (text_utils.isModelSafeText(line)) return true;
