@@ -379,9 +379,10 @@ const AttachmentTable = struct {
     }
 };
 
-/// How long `FetchBridge.next` waits for response bytes before it returns
-/// `-3`, the cooperative pulse of the core's stream reader.
-const next_idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+/// How long one wait on the host lasts before it returns, so the caller
+/// checks its request's cancel flag and deadline: `FetchBridge.statusFn`
+/// returns `0` (pending) and `FetchBridge.next` returns `-3`.
+const host_wait_pulse: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
 
 const FetchBridge = struct {
     mutex: std.Io.Mutex = .init,
@@ -465,7 +466,10 @@ const FetchBridge = struct {
         while (true) switch (self.phase) {
             .request_pending, .awaiting_response => |active| {
                 if (active != handle) return -2;
-                self.wake.waitUncancelable(io, &self.mutex);
+                self.wake.waitTimeout(io, &self.mutex, host_wait_pulse) catch |err| switch (err) {
+                    error.Timeout => return 0,
+                    error.Canceled => return -2,
+                };
             },
             .streaming => |active| {
                 if (active != handle) return -2;
@@ -532,7 +536,7 @@ const FetchBridge = struct {
             // flag and deadline every pulse, so a cancel the core sets, such
             // as a libfx steer cutting a reply short, does not wait for the
             // model's next byte.
-            self.wake.waitTimeout(io, &self.mutex, next_idle_wait) catch |err| switch (err) {
+            self.wake.waitTimeout(io, &self.mutex, host_wait_pulse) catch |err| switch (err) {
                 error.Timeout => return -3,
                 error.Canceled => return -2,
             };
