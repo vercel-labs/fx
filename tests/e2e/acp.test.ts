@@ -9594,7 +9594,7 @@ describe("acp: model-independent", () => {
         }
 
         expect(response.error).toBeUndefined();
-        expect(response.result.stopReason).toBe("refused");
+        expect(response.result.stopReason).toBe("refusal");
         const texts = messages
           .filter((message) =>
             message.method === "session/update" &&
@@ -9649,7 +9649,7 @@ describe("acp: model-independent", () => {
         }
 
         expect(response.error).toBeUndefined();
-        expect(response.result.stopReason).toBe("refused");
+        expect(response.result.stopReason).toBe("refusal");
         const authUpdate = messages.find((message) =>
           message.method === "session/update" &&
           message.params?.update?.sessionUpdate === "agent_message_chunk"
@@ -10765,7 +10765,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         expect(JSON.stringify(result.messages)).toContain("ACP partial output");
         expect(JSON.stringify(result.messages)).toContain("did not run them");
         expect(existsSync(sentinelPath)).toBe(false);
@@ -10805,7 +10805,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         // The empty reply's one retry sends the same request with an output
         // limit; neither request asks for a summary.
         expect(gateway.requests).toHaveLength(4);
@@ -13692,8 +13692,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  // A report turn the gateway rejects ends the prompt as refused. The rejected
-  // request reported no usage, so the prompt's is the turns before it.
+  // A report turn the gateway rejects ends the prompt as end_turn: fx saves the
+  // failed turn and the next prompt holds it. The rejected request reported no
+  // usage, so the prompt's is the turns before it.
   test(
     "ACP's prompt usage keeps the earlier turns when the report turn is refused",
     async () => {
@@ -13718,7 +13719,7 @@ describe("acp: model-independent", () => {
         client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
         await startAutoSession(client);
         const result = await runPrompt(client, "Delegate the failing task.", TIMEOUT);
-        expect(result.promptResult.result.stopReason).toBe("refused");
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(result.promptResult.result.usage).toEqual({ inputTokens: 300, outputTokens: 3, cacheReadTokens: 30 });
         expect(client.stderr).toBe("");
       } finally {
