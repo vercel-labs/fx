@@ -1467,7 +1467,7 @@ pub fn Bindings(comptime App: type) type {
                 }),
                 // The same text, marked once it shows, so the main screen
                 // draws the turn's later calls below it.
-                .operational => |text| {
+                .operational, .turn_failure, .saved_reply => |text| {
                     try app_worker_runtime.Runtime(App).pushText(app, agent, text);
                     try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
                         .assistant_presentation = .operational_text_shown,

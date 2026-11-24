@@ -9072,8 +9072,8 @@ fn processQueuedPromptLoop(
                     // connection fx could not make.
                     const failure = if (deps.model_catalog_failure) |catalog_failure| catalog_failure(deps.ctx) else null;
                     if (try catalogUnreachableImageLine(overlay_arena, failure, model_catalog.serviceName(job.provider))) |line| {
-                        try deps.push_text(deps.ctx, .{ .operational = line });
-                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                        try deps.push_text(deps.ctx, .{ .turn_failure = line });
+                        try deps.push_text(deps.ctx, .{ .turn_failure = "\n" });
                     }
                     return error.ModelImageCapabilityUnavailable;
                 },
@@ -10435,7 +10435,7 @@ fn processQueuedPromptLoop(
                             continue;
                         }
                         stream_ctx.drop_staged_response_language_candidate();
-                        try deps.pushWarningNotice(response_language_failure_notice);
+                        try deps.pushTurnFailureWarning(response_language_failure_notice);
                         finish_trace.finish("response_language_mismatch");
                         return error.ResponseLanguageMismatch;
                     },
@@ -10686,7 +10686,7 @@ fn processQueuedPromptLoop(
                     attempt_completion.tool_calls.len,
                 });
                 if (attempt_completion.provider_failure_cause == .non_retryable) {
-                    try deps.push_system_notice(deps.ctx, diagnostic.view());
+                    try deps.pushTurnFailureNotice(diagnostic.view());
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
                     if (stop_state.retained_candidate == null and
@@ -11390,7 +11390,7 @@ fn processQueuedPromptLoop(
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
-                    try deps.push_text(deps.ctx, .{ .operational = rendered });
+                    try deps.push_text(deps.ctx, .{ .saved_reply = rendered });
                 }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -11443,7 +11443,7 @@ fn processQueuedPromptLoop(
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
             if (!has_content) {
-                try deps.push_text(deps.ctx, .{ .operational = rendered });
+                try deps.push_text(deps.ctx, .{ .saved_reply = rendered });
             }
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
@@ -14338,8 +14338,8 @@ fn finishFailedTurnWithNotice(
     notice: []const u8,
     trace_outcome: []const u8,
 ) !void {
-    try deps.push_text(deps.ctx, .{ .operational = notice });
-    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+    try deps.push_text(deps.ctx, .{ .turn_failure = notice });
+    try deps.push_text(deps.ctx, .{ .turn_failure = "\n" });
     if (stop_state.retained_candidate != null) {
         const assistant_text = try runtime_finalization.stopTerminalText(
             arena,

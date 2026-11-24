@@ -6316,6 +6316,41 @@ test "processQueuedPrompt fails a second clear language mismatch without assista
     ) != null);
 }
 
+const TurnFailureCapture = struct {
+    text: ?[]const u8 = null,
+
+    fn push(raw: *anyopaque, text: []const u8) !void {
+        const self: *TurnFailureCapture = @ptrCast(@alignCast(raw));
+        self.text = text;
+    }
+};
+
+test "a turn failure warning goes to the turn-failure hook, or else as a warning notice" {
+    const alloc = std.testing.allocator;
+    const text = "The model answered in a different language.";
+
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.enable_interactive_notices = true;
+    var deps = hooks.deps();
+
+    var capture = TurnFailureCapture{};
+    deps.push_turn_failure_notice = TurnFailureCapture.push;
+    deps.ctx = @ptrCast(&capture);
+    try deps.pushTurnFailureWarning(text);
+    try std.testing.expect(capture.text != null);
+    try std.testing.expectEqualStrings(text, capture.text.?);
+    try std.testing.expectEqual(@as(usize, 0), hooks.interactive_notices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+
+    deps = hooks.deps();
+    try deps.pushTurnFailureWarning(text);
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interactive_notices.items.len);
+    try std.testing.expectEqual(types.NoticeTone.warning, hooks.interactive_notices.items[0].tone);
+    try std.testing.expectEqualStrings(text, hooks.interactive_notices.items[0].body);
+}
+
 test "processQueuedPrompt preserves explicit language switches without runtime correction" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"次にロックファイルを確認します。"};
