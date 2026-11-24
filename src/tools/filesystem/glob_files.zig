@@ -587,6 +587,41 @@ test "glob_files explicit ignored directory root follows active behavior" {
     try std.testing.expectEqualStrings("[glob] 1 matches for **/*.zig\n - node_modules/pkg/file.zig\n", result.body);
 }
 
+test "glob_files outside a repository names the entries it skipped by name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The temporary folder sits below an ignored path, so the skipped names
+    // apply as they do outside a repository.
+    for ([_][]const u8{ "src/app.py", "build/config.py", "dist/old.py", "coverage/c.py" }) |sub_path| {
+        alloc.free(try writeTempFile(alloc, &tmp, sub_path, "MAX_RETRIES = 3\n"));
+    }
+    const note = "... skipped 3 entries named build, coverage, dist outside a git repository; pass path to search one\n";
+
+    var whole = try dispatchGlobFiles(alloc, workspace, "**/*.py", null);
+    defer whole.deinit(alloc);
+    try std.testing.expectEqual(.success, whole.status);
+    try std.testing.expectEqualStrings("[glob] 1 matches for **/*.py\n - src/app.py\n" ++ note, whole.body);
+
+    var count = try dispatchGlobFilesRaw(alloc, workspace, "{\"pattern\":\"**/*.py\",\"mode\":\"count\"}");
+    defer count.deinit(alloc);
+    try std.testing.expectEqualStrings("[glob] count 1 matches for **/*.py\n" ++ note, count.body);
+
+    var none = try dispatchGlobFiles(alloc, workspace, "**/*.txt", null);
+    defer none.deinit(alloc);
+    try std.testing.expectEqualStrings("[glob] no matches for **/*.txt\n" ++ note, none.body);
+
+    var inside = try dispatchGlobFiles(alloc, workspace, "**/*.py", "build");
+    defer inside.deinit(alloc);
+    try std.testing.expectEqualStrings("[glob] 1 matches for **/*.py\n - build/config.py\n", inside.body);
+
+    var static_base = try dispatchGlobFiles(alloc, workspace, "dist/*.py", null);
+    defer static_base.deinit(alloc);
+    try std.testing.expectEqualStrings("[glob] 1 matches for dist/*.py\n - dist/old.py\n", static_base.body);
+}
+
 test "glob_files resolver error for missing path returns failure result" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

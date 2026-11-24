@@ -72,6 +72,7 @@ test {
     _ = @import("core/workspace/capture_retention.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/tool_call_metrics.zig");
+    _ = @import("core/workspace/tool_files.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/openai_codex.zig");
