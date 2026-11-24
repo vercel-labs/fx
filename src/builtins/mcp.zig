@@ -406,21 +406,24 @@ fn loadProfileDocumentFromPath(
     const json_text = (try config_file.read(alloc, path)) orelse return .{};
     defer alloc.free(json_text);
     var notes: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
-    defer {
-        for (notes.items) |*note| note.deinit(alloc);
-        notes.deinit(alloc);
-    }
-    const document = try project_config.parseProfileDocumentSkipping(alloc, json_text, &notes);
+    defer freeDiagnostics(alloc, &notes);
+    const document = try project_config.parseProfileDocument(alloc, json_text, &notes);
     errdefer {
         var unused = document;
         unused.deinit(alloc);
     }
     try skipped.ensureUnusedCapacity(alloc, notes.items.len);
-    // From here nothing can fail: each note moves to `skipped` or is freed, and `notes` is left empty.
-    for (notes.items) |*note| {
-        if (note.cause == .invalid_entry) skipped.appendAssumeCapacity(note.*) else note.deinit(alloc);
+    // From here nothing can fail. The notes of skipped entries move to `skipped`; the rest stay in `notes` and are freed.
+    var rest: usize = 0;
+    for (notes.items) |note| {
+        if (note.cause == .invalid_entry) {
+            skipped.appendAssumeCapacity(note);
+        } else {
+            notes.items[rest] = note;
+            rest += 1;
+        }
     }
-    notes.clearRetainingCapacity();
+    notes.shrinkRetainingCapacity(rest);
     return document;
 }
 
