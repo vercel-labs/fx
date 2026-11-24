@@ -114,7 +114,8 @@ export function listStates(paneEscapes: string): Array<{ name: string; instance:
     const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
     const row = /^ {2}(?:(fx \d+|main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S(.*)$/.exec(plain);
     if (!row) continue;
-    const state = /(?: {2,})(working|idle|finished|failed|stopped|needs approval|has a question|needs you)(?: \d+(?:h\d+m\d+s|m\d+s|s))?(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
+    const shown = /(?: {2,})(working(?: \d+(?:h\d+m\d+s|m\d+s|s))?|idle|finished|failed|stopped|needs approval|has a question|needs you)(?: {2,}|$)/.exec(row[3] ?? "")?.[1];
+    const state = shown?.startsWith("working") ? "working" : shown;
     if (state === undefined) continue;
     if (state !== "working" && state !== "idle" && state !== "finished") throw new Error(`the list shows a row in state "${state}": ${plain}`);
     rows.push({ name: (row[1] ?? row[2])!, instance: row[1] !== undefined, state: state === "working" ? "working" : "idle" });
