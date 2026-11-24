@@ -16,6 +16,7 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const json_depth = @import("../core/shared/json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
@@ -1826,6 +1827,9 @@ pub const StreamRequest = struct {
     on_tool_input_chunk: ?StreamCallback = null,
     on_tool_input_progress: ?ToolInputProgressCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// The conversation the reply answers, borrowed until the stream returns:
+    /// the reply's calls may not take its call ids.
+    conversation: tool_call_ids.Conversation = .{},
     /// Long-lived pooled HTTP client owned by the provider runtime. When set,
     /// requests reuse pooled keep-alive connections instead of dialing per
     /// attempt. Borrowed; must outlive every in-flight stream.
@@ -2360,6 +2364,7 @@ fn streamGatewayCompletionCoreWithOptions(
             expected_provider_tool_name,
             request.content_capture_limit,
             active_connected_watch,
+            request.conversation,
         ) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
@@ -3820,6 +3825,152 @@ const SseStreamedToolInput = struct {
     }
 };
 
+/// Gives each call of one AI Gateway reply the id fx keeps for it
+/// (`tool_call_ids.ReplyIds`). It rewrites the reply's tool events before the
+/// parser or the replay builder reads them, so a call, its streamed input, and
+/// its replay part all carry that id. A call the provider ran keeps its own
+/// id, which its `tool-result` names, so neither of them is rewritten.
+const SseCallIds = struct {
+    const Stream = struct {
+        /// The id the input events name. Owned.
+        source: []u8,
+        /// The id the call keeps, owned by `reply` or `source`.
+        id: []const u8,
+        called: bool = false,
+    };
+
+    reply: tool_call_ids.ReplyIds,
+    streams: std.ArrayList(Stream) = .empty,
+    /// The id each call's events named, by the other id fx gave the call.
+    /// Keys are owned by `reply` or by a stream's source; values are owned.
+    renamed: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn init(alloc: std.mem.Allocator, conversation: tool_call_ids.Conversation) !SseCallIds {
+        return .{ .reply = try tool_call_ids.ReplyIds.init(alloc, conversation) };
+    }
+
+    fn deinit(self: *SseCallIds, alloc: std.mem.Allocator) void {
+        for (self.streams.items) |stream| alloc.free(stream.source);
+        self.streams.deinit(alloc);
+        var sources = self.renamed.valueIterator();
+        while (sources.next()) |source| alloc.free(source.*);
+        self.renamed.deinit(alloc);
+        self.reply.deinit();
+    }
+
+    /// Gives a call that repeats a call from an earlier reply, the same id,
+    /// tool, and arguments, that id back (`tool_call_ids.ReplyIds.sameCallAgain`).
+    /// The id fx gave it as it arrived stays its provisional id, so its live
+    /// start and its replay part still find it.
+    fn restoreCallsSentAgain(self: *SseCallIds, alloc: std.mem.Allocator, calls: []SseToolCallAccumulator) !void {
+        for (calls) |*call| {
+            if (call.provenance != .fx_local or call.final_identity != .valid) continue;
+            // Its streamed input already names another id.
+            if (call.provisional_id.items.len != 0) continue;
+            const source = self.renamed.get(call.id.items) orelse continue;
+            if (!try self.reply.sameCallAgain(source, call.name.items, call.arguments.items)) continue;
+            try call.provisional_id.appendSlice(alloc, call.id.items);
+            call.id.clearRetainingCapacity();
+            try call.id.appendSlice(alloc, source);
+        }
+    }
+
+    fn rememberRename(self: *SseCallIds, alloc: std.mem.Allocator, id: []const u8, source: []const u8) !void {
+        const entry = try self.renamed.getOrPut(alloc, id);
+        if (entry.found_existing) return;
+        entry.value_ptr.* = alloc.dupe(u8, source) catch |err| {
+            self.renamed.removeByPtr(entry.key_ptr);
+            return err;
+        };
+    }
+
+    /// Sets the call id of one tool event to the id fx keeps. `event_alloc`
+    /// owns `root`; the id it writes stays valid until deinit.
+    fn rewrite(
+        self: *SseCallIds,
+        alloc: std.mem.Allocator,
+        event_alloc: std.mem.Allocator,
+        root: *std.json.Value,
+        event_type: []const u8,
+        expected_provider_tool_name: ?[]const u8,
+    ) !void {
+        const is_call = std.mem.eql(u8, event_type, "tool-call");
+        const is_start = std.mem.eql(u8, event_type, "tool-input-start");
+        const is_input = std.mem.eql(u8, event_type, "tool-input-delta") or
+            std.mem.eql(u8, event_type, "tool-input-end");
+        if (!is_call and !is_start and !is_input) return;
+        const key = if (is_call) "toolCallId" else "id";
+        const field = root.object.get(key);
+        // An id of the wrong type stays as sent, and the parser refuses it.
+        if (field) |value| if (value != .string) return;
+        const source = if (field) |value| value.string else "";
+        const provider_runs = providerRunsCall(root.*, expected_provider_tool_name);
+        const id = if (is_call)
+            try self.callId(alloc, source, provider_runs)
+        else if (is_start)
+            try self.startId(alloc, source, provider_runs)
+        else
+            self.inputId(source) orelse return;
+        if (std.mem.eql(u8, id, source)) return;
+        try root.object.put(event_alloc, key, .{ .string = id });
+    }
+
+    fn startId(self: *SseCallIds, alloc: std.mem.Allocator, source: []const u8, provider_runs: bool) ![]const u8 {
+        // The same call's input started again.
+        if (self.openStream(source)) |stream| return stream.id;
+        const owned_source = try alloc.dupe(u8, source);
+        errdefer alloc.free(owned_source);
+        const id = if (provider_runs) owned_source else try self.reply.assign(source);
+        if (provider_runs) try self.reply.keep(source);
+        try self.streams.append(alloc, .{ .source = owned_source, .id = id });
+        return id;
+    }
+
+    fn callId(self: *SseCallIds, alloc: std.mem.Allocator, source: []const u8, provider_runs: bool) ![]const u8 {
+        const stream = self.openStream(source);
+        if (stream) |open| open.called = true;
+        if (provider_runs) {
+            try self.reply.keep(source);
+            return source;
+        }
+        const id = if (stream) |open| open.id else try self.reply.assign(source);
+        if (!std.mem.eql(u8, id, source)) try self.rememberRename(alloc, id, source);
+        return id;
+    }
+
+    /// Input goes to the open stream with its id, or to the last one with it
+    /// when it comes late; the parser decides what late input means.
+    fn inputId(self: *SseCallIds, source: []const u8) ?[]const u8 {
+        if (self.openStream(source)) |stream| return stream.id;
+        var index = self.streams.items.len;
+        while (index > 0) {
+            index -= 1;
+            const stream = self.streams.items[index];
+            if (std.mem.eql(u8, stream.source, source)) return stream.id;
+        }
+        return null;
+    }
+
+    fn openStream(self: *SseCallIds, source: []const u8) ?*Stream {
+        var index = self.streams.items.len;
+        while (index > 0) {
+            index -= 1;
+            const stream = &self.streams.items[index];
+            if (!stream.called and std.mem.eql(u8, stream.source, source)) return stream;
+        }
+        return null;
+    }
+};
+
+/// Whether the provider runs this call, by the rule the `tool-call` branch
+/// of `consumeSseStreamTraced` uses.
+fn providerRunsCall(root: std.json.Value, expected_provider_tool_name: ?[]const u8) bool {
+    if (root.object.get("providerExecuted")) |value| return value == .bool and value.bool;
+    const expected = expected_provider_tool_name orelse return false;
+    const name = root.object.get("toolName") orelse return false;
+    return name == .string and std.mem.eql(u8, name.string, expected);
+}
+
 const ProviderResultState = enum {
     none,
     preliminary,
@@ -4922,7 +5073,7 @@ fn consumeSseStream(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !types.ModelCompletion {
-    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null);
+    return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, null, cancel_flag, null, null, null, null, .{});
 }
 
 /// Decodes an AI Gateway SSE response from a transport-owned reader.
@@ -4939,6 +5090,7 @@ pub fn consumeGatewaySseStream(
     on_reasoning_chunk: ?StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
@@ -4954,6 +5106,7 @@ pub fn consumeGatewaySseStream(
         null,
         content_capture_limit,
         null,
+        conversation,
     );
 }
 
@@ -4971,11 +5124,14 @@ fn consumeSseStreamTraced(
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
     progress_watch: ?*ConnectedRequestWatch,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
     var replay = GatewayReplayBuilder{ .alloc = alloc };
     defer replay.deinit();
+    var call_ids = try SseCallIds.init(alloc, conversation);
+    defer call_ids.deinit(alloc);
     var text_messages: TextMessageBoundary = .{};
     // Reuse event storage instead of pinning old response buffers in the caller's arena.
     var event_arena = std.heap.ArenaAllocator.init(alloc);
@@ -5055,7 +5211,7 @@ fn consumeSseStreamTraced(
             debug_trace.logf("sse", "event type=too_deep bytes={d} max_depth={d}", .{ json_text.len, json_depth.max_depth });
             return error.InvalidGatewaySseEvent;
         }
-        const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
+        var root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
             // A duplicate key is valid JSON that fx refuses, so resending
             // would get the same event back.
@@ -5078,6 +5234,7 @@ fn consumeSseStreamTraced(
         const type_val = root.object.get("type") orelse continue;
         if (type_val != .string) continue;
         const event_type = type_val.string;
+        try call_ids.rewrite(alloc, event_arena.allocator(), &root, event_type, expected_provider_tool_name);
 
         const separated = text_messages.observe(event_type, root);
         if (separated) {
@@ -5451,6 +5608,7 @@ fn consumeSseStreamTraced(
         completion.content = try content_buf.toOwnedSlice(alloc);
     }
 
+    try call_ids.restoreCallsSentAgain(alloc, tool_accumulators.items);
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
     if (finish_reason_holder == .stop or finish_reason_holder == .tool_calls) {
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
@@ -5714,7 +5872,7 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null);
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, null, &cancelled, null, null, null, null, .{});
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
@@ -7059,7 +7217,7 @@ test "Gateway separates provider message items in assistant text" {
         var reader = std.Io.Reader.fixed(payload.written());
         var cancelled = std.atomic.Value(bool).init(false);
         const first_len = "Hi! What would you like help with?".len;
-        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1);
+        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1, .{});
         defer deinitGatewayCompletion(alloc, &completion);
         try std.testing.expectEqualStrings("Hi! What would you like help with?\n", completion.content.?);
         try std.testing.expectEqualStrings(cases[0].expected, chunks.text.items);
@@ -7802,8 +7960,10 @@ test "consumeSseStream malformed final identity borrows no streamed state" {
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
-    try std.testing.expectEqual(.absent, completion.tool_calls[0].final_identity);
-    try std.testing.expectEqualStrings("", completion.tool_calls[0].id);
+    // A call with no id gets an fx id, and borrows nothing from the input
+    // streamed before it.
+    try std.testing.expectEqual(.valid, completion.tool_calls[0].final_identity);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].id);
     try std.testing.expectEqualStrings("", completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("", completion.tool_calls[0].arguments_json);
     try std.testing.expect(completion.tool_calls[0].provisional_id == null);
@@ -7816,8 +7976,9 @@ test "consumeSseStream preserves final identity states without recency aliases" 
         expected_id: []const u8,
     };
     const cases = [_]Case{
-        .{ .final_field = "", .expected = .absent, .expected_id = "" },
-        .{ .final_field = ",\"toolCallId\":\"\"", .expected = .empty, .expected_id = "" },
+        // A missing or empty id gets an fx id; one of the wrong type stays refused.
+        .{ .final_field = "", .expected = .valid, .expected_id = "fx_call_1" },
+        .{ .final_field = ",\"toolCallId\":\"\"", .expected = .valid, .expected_id = "fx_call_1" },
         .{ .final_field = ",\"toolCallId\":7", .expected = .wrong_type, .expected_id = "" },
         .{ .final_field = ",\"toolCallId\":\"final_1\"", .expected = .valid, .expected_id = "final_1" },
     };
@@ -8123,7 +8284,9 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
     defer deinitGatewayCompletion(alloc, &completion);
     debug_trace.shutdown();
 
-    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    // The start after call X ended opens the input of a new call, which gets
+    // an fx id; it never reaches X.
+    try std.testing.expectEqual(@as(usize, 2), capture.starts);
     try std.testing.expectEqual(@as(usize, 1), capture.labels);
     try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
     try std.testing.expectEqualStrings("{\"path\":\"stable.txt\"}", completion.tool_calls[0].arguments_json);
@@ -8242,7 +8405,7 @@ test "consumeSseStream keeps unmatched valid finals independent and alias-free" 
     try std.testing.expect(completion.provider_result_identity_failure == null);
 }
 
-test "consumeSseStream preserves duplicate final ids for duplicate admission" {
+test "consumeSseStream gives a call id repeated in one reply an fx id" {
     const payload =
         "data: {\"type\":\"tool-call\",\"toolCallId\":\"duplicate\",\"toolName\":\"read_file\",\"input\":{\"path\":\"a\"}}\n\n" ++
         "data: {\"type\":\"tool-call\",\"toolCallId\":\"duplicate\",\"toolName\":\"read_file\",\"input\":{\"path\":\"b\"}}\n\n" ++
@@ -8257,9 +8420,12 @@ test "consumeSseStream preserves duplicate final ids for duplicate admission" {
     defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("duplicate", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[1].id);
+    try std.testing.expectEqualStrings("{\"path\":\"b\"}", completion.tool_calls[1].arguments_json);
     try std.testing.expect(completion.provider_result_identity_failure == null);
     try std.testing.expectEqual(
-        types.AuthoritativeToolAdmission.reject_duplicate_identity,
+        types.AuthoritativeToolAdmission.admitted,
         types.authoritativeToolAdmission(completion),
     );
 }
@@ -8283,12 +8449,208 @@ test "consumeSseStream duplicate final ids do not reuse finalized stream fallbac
 
     try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[1].id);
     try std.testing.expectEqualStrings("", completion.tool_calls[1].arguments_json);
-    try std.testing.expect(completion.provider_result_identity_failure == null);
-    try std.testing.expectEqual(
-        types.AuthoritativeToolAdmission.reject_duplicate_identity,
-        types.authoritativeToolAdmission(completion),
+    // The second call has no input of its own, so the reply stays refused.
+    try std.testing.expectEqual(types.ProviderResultIdentityFailure.invalid_tool_input, completion.provider_result_identity_failure.?);
+    try std.testing.expect(types.authoritativeToolAdmission(completion) != .admitted);
+}
+
+const test_tool_calls_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\",\"raw\":\"tool-calls\"}}\n\n";
+
+fn consumeTestReply(alloc: std.mem.Allocator, payload: []const u8, conversation: tool_call_ids.Conversation) !types.ModelCompletion {
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    return consumeSseStreamTraced(alloc, &reader, undefined, Noop.chunk, null, null, null, null, &cancel_flag, null, null, null, null, conversation);
+}
+
+fn testCallIds(alloc: std.mem.Allocator, completion: types.ModelCompletion) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (completion.tool_calls) |call| try out.print(alloc, "{s};", .{call.id});
+    return out.toOwnedSlice(alloc);
+}
+
+test "consumeSseStream keeps each repeated-id call's replay part on its own id" {
+    const alloc = std.testing.allocator;
+    const call = "data: {{\"type\":\"tool-call\",\"toolCallId\":\"same\",\"toolName\":\"edit_file\",\"input\":{{\"path\":\"{s}\"}},\"providerMetadata\":{{\"vertex\":{{\"thoughtSignature\":\"sig-{s}\"}}}}}}\n\n";
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    for ([_][]const u8{ "a", "b", "c" }) |name| try payload.print(alloc, call, .{ name, name });
+    try payload.appendSlice(alloc, test_tool_calls_finish);
+    var reader = std.Io.Reader.fixed(payload.items);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var completion = try consumeSseStream(alloc, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    const ids = try testCallIds(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("same;fx_call_1;fx_call_2;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"tool-call\",\"toolCallId\":\"same\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-a\"}}}," ++
+            "{\"type\":\"tool-call\",\"toolCallId\":\"fx_call_1\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-b\"}}}," ++
+            "{\"type\":\"tool-call\",\"toolCallId\":\"fx_call_2\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-c\"}}}]",
+        completion.provider_state_json.?,
     );
+}
+
+test "consumeSseStream gives calls with missing, empty, blank, or oversized ids fx ids" {
+    const alloc = std.testing.allocator;
+    const long_id = text_utils.repeat("i", types.ConversationIdentity.max_bytes + 1);
+    const payload =
+        "data: {\"type\":\"tool-call\",\"toolName\":\"read_file\",\"input\":{\"path\":\"missing\"}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"\",\"toolName\":\"read_file\",\"input\":{\"path\":\"empty\"}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\" \\t\",\"toolName\":\"read_file\",\"input\":{\"path\":\"blank\"}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"" ++ long_id ++ "\",\"toolName\":\"read_file\",\"input\":{\"path\":\"long\"}}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"delta\":\"{\\\"path\\\":\\\"streamed\\\"}\"}\n\n" ++
+        "data: {\"type\":\"tool-input-end\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolName\":\"read_file\"}\n\n" ++
+        test_tool_calls_finish;
+    const Capture = struct {
+        started: std.ArrayList(u8) = .empty,
+
+        fn onContent(_: *anyopaque, _: []const u8) void {}
+
+        fn onToolStart(ctx: *anyopaque, id: []const u8, _: []const u8, label: ?[]const u8, _: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (label == null) self.started.print(std.testing.allocator, "{s};", .{id}) catch @panic("test capture");
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.started.deinit(alloc);
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(alloc, &reader, &capture, Capture.onContent, Capture.onToolStart, &cancel_flag);
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    const ids = try testCallIds(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("fx_call_1;fx_call_2;fx_call_3;fx_call_4;fx_call_5;", ids);
+    try std.testing.expectEqualStrings("{\"path\":\"streamed\"}", completion.tool_calls[4].arguments_json);
+    try std.testing.expectEqualStrings("fx_call_5;", capture.started.items);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
+test "an AI Gateway call id an earlier step, this turn, or the wire already uses gets an fx id" {
+    const alloc = std.testing.allocator;
+    var projection = try tool_call_ids.Projection.init(alloc, &.{.{ .role = .assistant, .tool_calls = &.{.{ .id = "functions.read:0", .name = "read_file", .arguments_json = "{}" }} }});
+    defer projection.deinit(alloc);
+    const alias = projection.resolve("functions.read:0");
+    const earlier = [_]types.ToolCall{
+        .{ .id = "dup", .name = "edit_file", .arguments_json = "{}" },
+        .{ .id = "functions.read:0", .name = "read_file", .arguments_json = "{}" },
+    };
+    const compacted = [_]types.ToolCall{.{ .id = "gone", .name = "edit_file", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .content = "edited" },
+        .{ .role = .tool, .tool_call_id = "functions.read:0", .content = "read" },
+    };
+    const current_turn_messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &compacted }};
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    for ([_][]const u8{ "dup", "gone", alias, "fresh" }) |id| {
+        try payload.print(alloc, "data: {{\"type\":\"tool-call\",\"toolCallId\":\"{s}\",\"toolName\":\"edit_file\",\"input\":{{\"path\":\"new\"}}}}\n\n", .{id});
+    }
+    try payload.appendSlice(alloc, test_tool_calls_finish);
+    var completion = try consumeTestReply(alloc, payload.items, .{ .messages = &messages, .current_turn_messages = &current_turn_messages });
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    const ids = try testCallIds(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("fx_call_1;fx_call_2;fx_call_3;fresh;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
+test "an AI Gateway call sent again with an earlier call's id, tool, and arguments keeps that id" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "subagent", .arguments_json = "{\"agent\":\"a\",\"message\":\"go\"}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .content = "sent" },
+    };
+    const payload =
+        "data: {\"type\":\"tool-input-start\",\"id\":\"dup\",\"toolName\":\"subagent\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"dup\",\"delta\":\"{ \\\"message\\\": \\\"go\\\", \\\"agent\\\": \\\"a\\\" }\"}\n\n" ++
+        "data: {\"type\":\"tool-input-end\",\"id\":\"dup\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"dup\",\"toolName\":\"subagent\",\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-1\"}}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"dup\",\"toolName\":\"subagent\",\"input\":{\"agent\":\"a\",\"message\":\"go\"},\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig-2\"}}}\n\n" ++
+        test_tool_calls_finish;
+    var completion = try consumeTestReply(alloc, payload, .{ .messages = &messages });
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    // The first is the earlier call sent again; the second repeats it in the same reply.
+    const ids = try testCallIds(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("dup;fx_call_2;", ids);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].provisional_id.?);
+    try std.testing.expect(completion.tool_calls[1].provisional_id == null);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+    try std.testing.expectEqualStrings(
+        "[{\"type\":\"tool-call\",\"toolCallId\":\"dup\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-1\"}}}," ++
+            "{\"type\":\"tool-call\",\"toolCallId\":\"fx_call_2\",\"providerOptions\":{\"vertex\":{\"thoughtSignature\":\"sig-2\"}}}]",
+        completion.provider_state_json.?,
+    );
+}
+
+test "a call the AI Gateway provider runs keeps its own id, even one already used" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "ws_1", .name = "web_search", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "ws_1", .content = "found" },
+    };
+    const payload =
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"ws_1\",\"toolName\":\"web_search\",\"providerExecuted\":true,\"input\":{\"query\":\"zig\"}}\n\n" ++
+        "data: {\"type\":\"tool-result\",\"toolCallId\":\"ws_1\",\"result\":{\"content\":\"found\"}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"ws_1\",\"toolName\":\"read_file\",\"input\":{\"path\":\"a\"}}\n\n" ++
+        test_tool_calls_finish;
+    var completion = try consumeTestReply(alloc, payload, .{ .messages = &messages });
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    const ids = try testCallIds(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("ws_1;fx_call_1;", ids);
+    try std.testing.expectEqual(types.ToolExecutionProvenance.provider_executed, completion.tool_calls[0].provenance);
+    try std.testing.expectEqualStrings("{\"content\":\"found\"}", completion.tool_calls[0].provider_result.?);
+}
+
+test "unique AI Gateway call ids come through byte for byte" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "call_0", .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "call_0", .content = "read" },
+    };
+    const payload =
+        "data: {\"type\":\"tool-input-start\",\"id\":\"call_1\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"call_1\",\"delta\":\"{\\\"path\\\":\\\"a\\\"}\"}\n\n" ++
+        "data: {\"type\":\"tool-input-end\",\"id\":\"call_1\"}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"call_1\",\"toolName\":\"read_file\",\"providerMetadata\":{\"vertex\":{\"thoughtSignature\":\"sig\"}}}\n\n" ++
+        "data: {\"type\":\"tool-call\",\"toolCallId\":\"functions.read:1\",\"toolName\":\"read_file\",\"input\":{\"path\":\"b\"}}\n\n" ++
+        test_tool_calls_finish;
+    var with_history = try consumeTestReply(alloc, payload, .{ .messages = &messages });
+    defer deinitGatewayCompletion(alloc, &with_history);
+    var alone = try consumeTestReply(alloc, payload, .{});
+    defer deinitGatewayCompletion(alloc, &alone);
+
+    const ids = try testCallIds(alloc, with_history);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("call_1;functions.read:1;", ids);
+    try std.testing.expectEqualStrings(alone.provider_state_json.?, with_history.provider_state_json.?);
+    for (alone.tool_calls, with_history.tool_calls) |a, b| {
+        try std.testing.expectEqualStrings(a.id, b.id);
+        try std.testing.expectEqualStrings(a.arguments_json, b.arguments_json);
+        try std.testing.expect(b.provisional_id == null);
+    }
 }
 
 test "consumeSseStream records malformed provider result correlation identity" {

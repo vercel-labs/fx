@@ -7199,3 +7199,197 @@ describe("cli: completion", () => {
     }
   }, TIMEOUT);
 });
+
+describe("fx login Token Pass status", () => {
+  function startCliLoginIssuer(team: { id: string; slug: string; name: string }) {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        const issuer = `http://127.0.0.1:${server.port}`;
+        if (url.pathname === "/.well-known/openid-configuration") {
+          return Response.json({
+            issuer,
+            device_authorization_endpoint: `${issuer}/oauth/device`,
+            token_endpoint: `${issuer}/oauth/token`,
+            revocation_endpoint: `${issuer}/oauth/revoke`,
+          });
+        }
+        if (url.pathname === "/oauth/device") {
+          return Response.json({
+            device_code: "cli-device-code",
+            user_code: "TEST-1234",
+            verification_uri: `${issuer}/device`,
+            verification_uri_complete: `${issuer}/device?code=TEST-1234`,
+            expires_in: 300,
+            interval: 1,
+          });
+        }
+        if (url.pathname === "/oauth/token") {
+          return Response.json({
+            access_token: "cli-login-token",
+            refresh_token: "cli-refresh-token",
+            expires_in: 3600,
+            scope: "openid offline_access use:ai-gateway",
+            token_type: "Bearer",
+          });
+        }
+        if (url.pathname === "/v2/teams") {
+          return Response.json({ teams: [team] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    return {
+      issuerUrl: `http://127.0.0.1:${server.port}`,
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  test("fx login confirms active Token Pass with remaining credit and omits the buy offer", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "120.5", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nVercel Token Pass is active ($120.50 remaining).\n");
+      expect(r.stdout).not.toContain("may still require billing");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx login shows the plain Token Pass offer when credits reports no active pass", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-offer-")));
+    const issuer = startCliLoginIssuer({ id: "team_plain", slug: "plain-team", name: "Plain Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\n");
+      expect(r.stdout).toContain("Get $150 of tokens for $30 with Vercel Token Pass (https://vercel.com/get/token-pass).\n");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx login omits the buy offer when credits fails and catalog has no Token Pass marks", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-login-tp-unknown-")));
+    const issuer = startCliLoginIssuer({ id: "team_unknown", slug: "unknown-team", name: "Unknown Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    try {
+      const r = await runFx(["login"], {
+        env: {
+          ...NO_GATEWAY_AUTH,
+          HOME: home,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_OAUTH_CLIENT_ID: "test-client",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        },
+      });
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain("Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n");
+      expect(r.stdout).not.toContain("Get $150 of tokens");
+      expect(r.stdout).not.toContain("Vercel Token Pass is active");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx teams confirms active Token Pass with remaining credit", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-teams-tp-active-")));
+    const issuer = startCliLoginIssuer({ id: "team_tp", slug: "tp-team", name: "Token Pass Team" });
+    const gateway = startFakeGateway([], {
+      models: () => [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", tags: ["tool-use"], token_pass: true },
+      ],
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      HOME: home,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_OAUTH_CLIENT_ID: "test-client",
+      FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    };
+    try {
+      const login = await runFx(["login"], { env });
+      expect(login.code).toBe(0);
+      const teams = await runFx(["teams"], { env });
+      expect(teams.code).toBe(0);
+      expect(teams.stdout).toContain("Vercel Token Pass is active ($79.93 remaining).\n");
+      expect(teams.stdout).not.toContain("Get $150 of tokens");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+});
