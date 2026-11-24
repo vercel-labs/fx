@@ -385,6 +385,9 @@ pub const AgentCapabilities = struct {
     /// Set only by the leader socket, so it can answer with its pid and the
     /// sessions it leads. Stdio leaves it null, and its answer is unchanged.
     leader: ?LeaderMeta = null,
+    /// The caller's connection number, written as `sh.fx/clientId` (`c<number>`) in the answer's
+    /// top-level `_meta`. Null leaves the key out.
+    client_id: ?u64 = null,
 };
 
 pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
@@ -408,19 +411,27 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]");
-    if (capabilities.leader) |leader| try writeLeaderMeta(w, leader);
+    try writeTopMeta(w, capabilities);
     try w.writeByte('}');
 }
 
-/// Writes the leader socket's `_meta` at the result's top level, after
-/// `authMethods`, so a client finds it beside the capabilities it reads.
-fn writeLeaderMeta(w: *std.Io.Writer, leader: LeaderMeta) !void {
-    try w.print(",\"_meta\":{{\"sh.fx/leader\":{{\"pid\":{d},\"sessions\":[", .{leader.pid});
-    for (leader.sessions, 0..) |session_id, index| {
-        if (index > 0) try w.writeByte(',');
-        try writeJsonStr(session_id, w);
+/// Writes the result's top-level `_meta`, after `authMethods`, so a client finds it beside the
+/// capabilities it reads: the leader socket's entry when there is one, then the caller's client id.
+fn writeTopMeta(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
+    if (capabilities.leader == null and capabilities.client_id == null) return;
+    try w.writeAll(",\"_meta\":{");
+    if (capabilities.leader) |leader| {
+        try w.print("\"sh.fx/leader\":{{\"pid\":{d},\"sessions\":[", .{leader.pid});
+        for (leader.sessions, 0..) |session_id, index| {
+            if (index > 0) try w.writeByte(',');
+            try writeJsonStr(session_id, w);
+        }
+        try w.writeByte(']');
+        try w.writeByte('}');
+        if (capabilities.client_id != null) try w.writeByte(',');
     }
-    try w.writeAll("]}}");
+    if (capabilities.client_id) |client_id| try w.print("\"sh.fx/clientId\":\"c{d}\"", .{client_id});
+    try w.writeByte('}');
 }
 
 /// Writes fx's extensions as `agentCapabilities._meta`, or nothing when fx
@@ -1136,4 +1147,26 @@ test "toolDiffFits takes each side up to the limit, in UTF-8 only" {
     try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = null, .new_text = big }));
     try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = big, .new_text = "x" }));
     try std.testing.expect(!toolDiffFits(.{ .path = "/a", .old_text = "\xff\xfe", .new_text = "x" }));
+}
+
+test "the initialize answer names the caller's client id as c and its connection number" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = false, .client_id = 7 });
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"_meta\":{\"sh.fx/clientId\":\"c7\"}") != null);
+}
+
+test "the initialize answer's leader entry and client id share the top-level _meta" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{
+        .image_prompts = false,
+        .client_id = 2,
+        .leader = .{ .pid = 42, .sessions = &.{"s1"} },
+    });
+    try std.testing.expect(std.mem.find(
+        u8,
+        out.writer.buffered(),
+        "\"_meta\":{\"sh.fx/leader\":{\"pid\":42,\"sessions\":[\"s1\"]},\"sh.fx/clientId\":\"c2\"}",
+    ) != null);
 }

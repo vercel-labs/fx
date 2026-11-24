@@ -8,6 +8,7 @@ const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const client_info = @import("client_info.zig");
 const sessions = @import("sessions.zig");
 const leader_mod = @import("leader.zig");
 const prompt_handler = @import("prompt.zig");
@@ -321,6 +322,8 @@ pub const Member = struct {
     extensions: sh_fx.Set,
     host_tools: host_tool_runtime.Runtime,
     terminal_client: terminal_client_runtime.Runtime,
+    /// The client's `clientInfo`, copied from the connection when the client joined.
+    client_info: ?client_info.Info = null,
     /// The connection default credential, copied when the client joined. A turn that changes it
     /// changes this copy, never the connection's.
     gateway_source_preference: ?types.CredentialSource = null,
@@ -360,6 +363,7 @@ pub const Member = struct {
     pub fn destroy(self: *Member) void {
         self.host_tools.deinit();
         self.terminal_client.deinit();
+        if (self.client_info) |*info| info.deinit();
         for (self.pending_legacy_urls.items) |*pending| pending.deinit(self.alloc);
         self.pending_legacy_urls.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -622,6 +626,8 @@ pub const ServerState = struct {
     /// The client takes ACP v1's compaction updates (`session.compaction`).
     client_compaction: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
+    /// The client's `clientInfo` from `initialize`, copied into each member the connection joins.
+    client_info: ?client_info.Info = null,
     /// The directory `fx acp` was launched in, or `--workspace`'s: the
     /// workspace of the libfx kernel's and the web core's one session, and
     /// where a native session's workspace starts before its `cwd`.
@@ -713,6 +719,7 @@ pub const ServerState = struct {
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
         self.host_tools.deinit();
+        if (self.client_info) |*info| info.deinit();
         self.configured_providers.deinit(self.alloc);
     }
 };
@@ -1837,6 +1844,7 @@ pub fn newMember(alloc: Allocator, state: *ServerState) !*Member {
         .client_elicitation = state.client_elicitation,
         .extensions = state.extensions,
         .host_tools = state.host_tools,
+        .client_info = if (state.client_info) |info| try info.dupe(alloc) else null,
         .terminal_client = state.terminal_client,
         .credential_source = state.credential_source,
         .gateway_source_preference = state.gateway_source_preference,
@@ -5665,9 +5673,12 @@ const InitializeRequest = struct {
     host_tools: host_tool_runtime.Runtime = .{},
     /// The extensions the client lists in `clientCapabilities._meta`.
     client_extensions: sh_fx.Set = .empty,
+    /// The client's `clientInfo`, or null when it sent none.
+    client_info: ?client_info.Info = null,
 
     fn deinit(self: *InitializeRequest) void {
         self.host_tools.deinit();
+        if (self.client_info) |*info| info.deinit();
         self.* = .{};
     }
 };
@@ -5692,6 +5703,8 @@ fn parseInitializeRequest(
     var request = InitializeRequest{
         .terminal_ui = acp_types.metaBool(parsed.value.object, "sh.fx/terminalUi") orelse true,
     };
+    errdefer request.deinit();
+    request.client_info = try client_info.fromValue(alloc, parsed.value.object.get("clientInfo"));
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
     if (capabilities != .object) return request;
@@ -5729,6 +5742,21 @@ fn parseInitializeRequest(
         );
     };
     return request;
+}
+
+test "ACP initialize keeps the clientInfo the client sent, and keeps nothing when it sent none" {
+    const alloc = std.testing.allocator;
+    var sent = try parseInitializeRequest(
+        alloc,
+        "{\"protocolVersion\":1,\"clientInfo\":{\"name\":\"zed\",\"version\":\"0.190.0\"}}",
+        false,
+    );
+    defer sent.deinit();
+    try std.testing.expectEqualStrings("{\"name\":\"zed\",\"version\":\"0.190.0\"}", sent.client_info.?.json);
+
+    var missing = try parseInitializeRequest(alloc, "{\"protocolVersion\":1}", false);
+    defer missing.deinit();
+    try std.testing.expect(missing.client_info == null);
 }
 
 test "ACP initialize owns the tools a host lists in sh.fx/hostTools" {
@@ -6083,6 +6111,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
     request.host_tools = .{};
+    state.client_info = request.client_info;
+    request.client_info = null;
     const agent_extensions = agentExtensions(state.host.cfg.minimal_kernel);
     state.extensions = agent_extensions.intersectWith(request.client_extensions);
     debug_trace.logf("acp", "initialize host_tools={d} extensions={d}", .{
@@ -6135,6 +6165,7 @@ fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
         // HTTP.
         .mcp_over_acp = false,
         .mcp_sse = false,
+        .client_id = connection.clientNumber(state.connection_id),
     };
 }
 
@@ -6143,7 +6174,7 @@ fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
 /// tools. Every build sends hooks, tool call identities, permission modes,
 /// model recovery, and turn events to a client that lists them.
 fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
-    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result, .keep_turn_on_disconnect });
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result, .keep_turn_on_disconnect, .session_clients });
     if (minimal_kernel) {
         set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
     } else if (!host_target.is_wasm) {
