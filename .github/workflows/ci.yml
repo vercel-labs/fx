@@ -86,6 +86,9 @@ jobs:
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
+      - name: Model-check how the TUI ends on an outside signal
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -117,6 +120,14 @@ jobs:
 
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
+
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          tmux -V
+
+      - name: Walk the TUI's close paths along their model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/tui_close/
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
