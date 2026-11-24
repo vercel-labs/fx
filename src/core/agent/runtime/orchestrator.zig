@@ -9410,7 +9410,8 @@ fn processQueuedPromptLoop(
                 if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
-                armCacheWarming(deps, .{
+                // A ping would send the blocked request again.
+                if (completion.provider_failure_cause != .cyber_policy) armCacheWarming(deps, .{
                     .candidate = .{
                         .gateway_with_direct_credential = job.provider == .gateway and
                             job.credential_source != .host_managed and active_api_key.len > 0,

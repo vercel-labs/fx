@@ -14411,6 +14411,71 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  for (const path of ["HTTP", "stream"] as const) {
+    test(`cyber policy block after a tool result in an ${path} reply sends nothing more`, async () => {
+      const root = createFixtureRoot(`post-tool-cyber-policy-${path}`);
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "notes\n");
+      const responses = [
+        () => fakeGatewayToolCall("notes_1", "read_file", { path: "notes.txt" }),
+        () => path === "HTTP"
+          ? cyberPolicyHttpResponse()
+          : streamedErrorAfterPartialToolResponse({ type: "cyber_policy", message: cyberPolicyMessage }),
+      ];
+      const gateway = startGateway(() => (responses.shift() ?? (() => new Response("unexpected request", { status: 500 })))());
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read the notes."],
+          { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+        );
+        const json = parseAskJson(result.stdout);
+        const trace = readFileSync(tracePath, "utf8");
+
+        expect(result.code).toBe(1);
+        expect(json.recovery?.cause).toBe("cyber_policy");
+        expect(gateway.requestCount()).toBe(2);
+        expect(trace).not.toContain("assistant_prefill_recovery");
+        expect(trace).not.toContain("event=content_filter_resend");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("cyber policy block masks the active key the provider echoes, on screen and in the saved session", async () => {
+    const root = createFixtureRoot("cyber-policy-echoed-key");
+    const tracePath = join(root.root, "trace.log");
+    const key = "fake-gateway-lifecycle-key";
+    const gateway = startGateway(() =>
+      fakeGatewaySse([{ type: "error", error: { type: "cyber_policy", message: `Request with ${key} was flagged.` } }])
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Inspect the binary."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+      const masked = "*".repeat(key.length);
+
+      expect(result.code).toBe(1);
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(json.recovery?.message).toContain(`Request with ${masked} was flagged.`);
+      expect(result.stderr).toContain(`cyber_policy: Request with ${masked} was flagged.`);
+      expect(result.stdout).not.toContain(key);
+      expect(result.stderr).not.toContain(key);
+      expect(readFileSync(tracePath, "utf8")).not.toContain(key);
+      const saved = readdirSync(join(root.home, ".fx"), { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => join(entry.parentPath, entry.name));
+      expect(saved.some((file) => file.includes("sessions"))).toBe(true);
+      for (const file of saved) expect(readFileSync(file).toString("latin1")).not.toContain(key);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("genuine bad request in a stream ends the turn after one model request", async () => {
     const root = createFixtureRoot("streamed-genuine-bad-request");
     const tracePath = join(root.root, "trace.log");

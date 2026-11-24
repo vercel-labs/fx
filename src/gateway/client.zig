@@ -4411,9 +4411,13 @@ const ErrorEventClass = enum {
     /// Whether `next` replaces `current` as the stream's class: only when it
     /// says more. A code or a usable HTTP status beats an event with neither,
     /// a stream timeout beats a transient class, and a classified one beats
-    /// both. Between two classified events the first wins.
+    /// both. Between two classified events the first wins, except that a
+    /// cyber policy block beats every other class, so no earlier event can
+    /// make a blocked stream one fx resends.
     fn decides(current: ?ErrorEventClass, next: ErrorEventClass) bool {
         const held = current orelse return true;
+        if (held == .cyber_policy) return false;
+        if (next == .cyber_policy) return true;
         return next.rank() > held.rank();
     }
 
@@ -6447,8 +6451,6 @@ test "consumeSseStream keeps other codes, the code in text, and a normal finish 
         // The code only in the text or the message is not the code.
         .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"cyber_policy\"}\n\n" ++ test_bad_request_event },
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"cyber_policy: " ++ test_cyber_message ++ "\"}}\n\n" },
-        // The first classified event decides.
-        .{ .payload = test_bad_request_event ++ test_cyber_type_event },
         // A normal finish decides on its own.
         .{
             .payload = test_cyber_type_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
@@ -6469,6 +6471,29 @@ test "consumeSseStream keeps other codes, the code in text, and a normal finish 
     var filtered = try testStreamOutcome(test_filter_type_event);
     defer deinitGatewayCompletion(std.testing.allocator, &filtered);
     try std.testing.expectEqual(@as(?types.ProviderFinishReason, .content_filter), filtered.finish_reason);
+}
+
+test "consumeSseStream lets a cyber policy block decide over any other error event" {
+    const rate_limit_event = "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n";
+    for ([_][]const u8{
+        rate_limit_event ++ test_cyber_type_event,
+        test_cyber_type_event ++ rate_limit_event,
+        test_bad_request_event ++ test_cyber_type_event,
+        test_filter_type_event ++ test_cyber_type_event,
+        test_cyber_type_event ++ test_filter_type_event,
+        rate_limit_event ++ test_cyber_type_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n",
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("cyber_policy", @tagName(completion.provider_failure_cause.?));
+        try std.testing.expectEqualStrings("cyber_policy: " ++ test_cyber_message, completion.provider_failure_detail.?);
+    }
+    // Without a cyber policy block, the first classified event still decides.
+    var rate_limited = try testStreamOutcome(rate_limit_event ++ test_bad_request_event);
+    defer deinitGatewayCompletion(std.testing.allocator, &rate_limited);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, .rate_limited), rate_limited.provider_failure_cause);
 }
 
 test "httpFailureKind names a cyber policy block in any HTTP error body" {

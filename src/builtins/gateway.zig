@@ -11,6 +11,7 @@ const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
@@ -755,6 +756,11 @@ fn streamAgentCompletion(
             .ownership = .owned,
         },
     };
+    // A streamed error's text can echo the credential too, and it reaches
+    // the screen, the trace, and the saved session.
+    if (result.completion.provider_failure_detail) |detail| {
+        text_utils.maskLiteral(@constCast(detail), request.credential.secret() orelse "");
+    }
     return .{ .completed = .{
         .completion = result.completion,
         .ownership = .owned,
