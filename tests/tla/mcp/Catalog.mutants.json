@@ -112,5 +112,17 @@
     "old": "               /\\ refused' = TRUE\n               /\\ lastAnswer' = \"refused\"",
     "new": "               /\\ refused' = refused\n               /\\ lastAnswer' = \"refused\"",
     "invariant": "RefusedIffLastAnswerRefused"
+  },
+  {
+    "description": "A page whose line fx could not read, ended by the grace, is not a refusal: fx says nothing about the list",
+    "old": "    /\\ refused' = TRUE\n    /\\ lastAnswer' = \"unreadable\"",
+    "new": "    /\\ refused' = refused\n    /\\ lastAnswer' = \"unreadable\"",
+    "invariant": "RefusedIffLastAnswerRefused"
+  },
+  {
+    "description": "A page that a grace ended on a line another request could have written is refused as unreadable, though its own answer is only late",
+    "old": "    /\\ lastAnswer' = lastAnswer\n    /\\ refused' = refused\n    /\\ graceLine' = IF",
+    "new": "    /\\ lastAnswer' = \"unreadable\"\n    /\\ refused' = TRUE\n    /\\ graceLine' = IF",
+    "invariant": "NoReasonFromAnotherRequestsLine"
   }
 ]

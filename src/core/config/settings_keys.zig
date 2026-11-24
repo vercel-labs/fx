@@ -48,7 +48,7 @@ pub const Key = struct {
     where: Where,
     kind: Kind,
     description: []const u8,
-    /// Fixed child keys of an object setting, such as `statusLine.context`.
+    /// Fixed child keys of an object setting, such as `status_line.context`.
     /// Empty for plain values and for maps. Every child is a switch.
     children: []const []const u8 = &.{},
     /// What each of `children` does, in the same order.
@@ -64,10 +64,6 @@ pub const Key = struct {
     max_items: ?usize = null,
     /// An object whose keys are free-form, such as `models.codex`.
     map: bool = false,
-    /// The current name of a setting that was renamed. fx still reads the
-    /// older name, writes only the current one, and the current one wins for
-    /// any value both set.
-    renamed_to: ?[]const u8 = null,
     /// The key that replaced an older form fx still reads but no longer
     /// writes, such as `models.gateway` for `model`.
     superseded_by: ?[]const u8 = null,
@@ -83,10 +79,9 @@ pub const Key = struct {
         return false;
     }
 
-    /// Whether editors should mark the key as old: retired, renamed, or
-    /// superseded.
+    /// Whether editors should mark the key as old: retired or superseded.
     pub fn deprecated(self: Key) bool {
-        return self.where == .retired or self.renamed_to != null or self.superseded_by != null;
+        return self.where == .retired or self.superseded_by != null;
     }
 };
 
@@ -135,7 +130,6 @@ pub const keys = [_]Key{
     .{ .name = "maxxing_mode", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "model", .where = .profile, .kind = .string, .superseded_by = "models.gateway", .description = "Older form of models.gateway" },
     .{ .name = "models", .where = .profile, .kind = .string_map, .map = true, .description = "The saved model for each provider or connection, such as {\"gateway\": \"<model id>\"}" },
-    .{ .name = "notifications", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .renamed_to = "sound", .description = "Renamed to sound" },
     .{ .name = "permission", .where = .profile, .kind = .object, .map = true, .description = "Permission rules; manage them with /permissions" },
     .{ .name = "permission_mode", .where = .profile, .kind = .string, .values = &.{ "ask", "auto", "full-access", "yolo" }, .description = "How fx handles tool calls that need permission; yolo is an older name for full-access" },
     .{ .name = "prompt_history", .where = .profile, .kind = .switches, .children = &.{"enabled"}, .child_descriptions = &.{"Save prompts and slash commands for input history"}, .description = "Input history" },
@@ -152,7 +146,6 @@ pub const keys = [_]Key{
     .{ .name = "slash_menu_categories", .where = .profile, .kind = .boolean, .description = "Show command categories and skill sources in slash menu results" },
     .{ .name = "sound", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .description = "Sounds" },
     .{ .name = "startup_scrollback", .where = .profile, .kind = .boolean, .description = "Restore terminal output at startup" },
-    .{ .name = "statusLine", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .renamed_to = "status_line", .description = "Renamed to status_line" },
     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.fx/themes" },
     .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
@@ -183,75 +176,12 @@ pub fn ignoredInProject(name: []const u8) bool {
     return key.where == .profile;
 }
 
-/// `path` under a renamed setting's current name, such as
-/// `status_line.context` for `statusLine.context`. Any other path comes back
-/// unchanged. The result is `path` or a string in the list.
-pub fn currentPath(path: []const u8) []const u8 {
-    inline for (keys) |key| {
-        if (key.renamed_to) |current| {
-            if (std.mem.eql(u8, path, key.name)) return current;
-            inline for (key.children) |child| {
-                if (std.mem.eql(u8, path, key.name ++ "." ++ child)) return current ++ "." ++ child;
-            }
-        }
-    }
-    return path;
-}
-
 pub const File = enum { profile, project };
-
-pub const OlderName = struct {
-    older: []const u8,
-    current: []const u8,
-    /// Whether the current name is set beside it.
-    both: bool = true,
-    /// The workspace override holding both, borrowed from the parsed
-    /// settings, or null at the top level.
-    workspace: ?[]const u8 = null,
-};
-
-/// Lists the renamed settings that `root` sets under both their older and
-/// their current name, where the current one wins. A profile `settings.json`
-/// is also checked inside each `workspaces` override. Caller owns the
-/// returned slice; its strings borrow from `root` and the list.
-pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
-    var found: std.ArrayList(OlderName) = .empty;
-    errdefer found.deinit(alloc);
-    if (root != .object) return found.toOwnedSlice(alloc);
-    try appendOlderNames(alloc, &found, root.object, null);
-    if (file == .profile) {
-        if (root.object.get("workspaces")) |workspaces| {
-            if (workspaces == .object) {
-                var iterator = workspaces.object.iterator();
-                while (iterator.next()) |entry| {
-                    if (entry.value_ptr.* != .object) continue;
-                    try appendOlderNames(alloc, &found, entry.value_ptr.object, entry.key_ptr.*);
-                }
-            }
-        }
-    }
-    return found.toOwnedSlice(alloc);
-}
-
-fn appendOlderNames(alloc: Allocator, found: *std.ArrayList(OlderName), object: std.json.ObjectMap, workspace: ?[]const u8) !void {
-    for (keys) |key| {
-        const current = key.renamed_to orelse continue;
-        const older_value = object.get(key.name) orelse continue;
-        const current_value = object.get(current) orelse {
-            try found.append(alloc, .{ .older = key.name, .current = current, .both = false, .workspace = workspace });
-            continue;
-        };
-        // fx ignores a current group that isn't an object and keeps using the
-        // older one, so advising to remove the older one would lose settings.
-        if (older_value == .object and current_value != .object) continue;
-        try found.append(alloc, .{ .older = key.name, .current = current, .workspace = workspace });
-    }
-}
 
 pub const UnknownKey = struct {
     /// The key, borrowed from the parsed settings.
     name: []const u8,
-    /// The object setting holding the key, such as `statusLine`, or null at
+    /// The object setting holding the key, such as `status_line`, or null at
     /// the top level.
     parent: ?[]const u8 = null,
     /// The workspace override holding the key, borrowed from the parsed
@@ -315,14 +245,14 @@ fn appendUnknown(
 pub const UnknownPart = struct {
     /// The part of the path that names no setting.
     name: []const u8,
-    /// The setting holding it, such as `statusLine`, or null at the top level.
+    /// The setting holding it, such as `status_line`, or null at the top level.
     parent: ?[]const u8 = null,
     /// The known keys at the same level, for a "did you mean" suggestion.
     known: []const []const u8,
 };
 
 /// Null when a dotted `path` names a setting: a listed key, a fixed child
-/// such as `statusLine.context`, or any path into a map such as
+/// such as `status_line.context`, or any path into a map such as
 /// `models.codex`. Otherwise the part that isn't known. Retired keys aren't
 /// settings. Slices borrow from `path` and the list.
 pub fn unknownPart(path: []const u8) ?UnknownPart {
@@ -333,7 +263,7 @@ pub fn unknownPart(path: []const u8) ?UnknownPart {
     const at = dot orelse return null;
     if (key.map) return null;
     const rest = path[at + 1 ..];
-    const parent = key.renamed_to orelse key.name;
+    const parent = key.name;
     if (key.children.len == 0) return .{ .name = rest, .parent = parent, .known = &.{} };
     if (std.mem.findScalar(u8, rest, '.') == null and key.hasChild(rest)) return null;
     return .{ .name = rest, .parent = parent, .known = key.children };
@@ -357,68 +287,10 @@ test "every key says what it holds and what it does" {
     }
 }
 
-test "both spellings are reported only when fx would use the current one" {
-    const alloc = std.testing.allocator;
-    const text =
-        \\{"notifications":{"turn_end":true},"sound":false,
-        \\ "statusLine":{"context":true},"status_line":{"context":false}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
-    defer parsed.deinit();
-
-    const found = try findOlderNames(alloc, parsed.value, .profile);
-    defer alloc.free(found);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("statusLine", found[0].older);
-}
-
 test "keys are unique and sorted so the list stays easy to scan" {
     for (keys[1..], 1..) |key, index| {
         try std.testing.expect(std.mem.order(u8, keys[index - 1].name, key.name) == .lt);
     }
-}
-
-test "renamed settings point to a current key with the same children" {
-    for (keys) |key| {
-        const current = find(key.renamed_to orelse continue).?;
-        try std.testing.expect(current.renamed_to == null);
-        try std.testing.expectEqual(key.where, current.where);
-        try std.testing.expectEqual(key.children.len, current.children.len);
-        for (key.children) |child| try std.testing.expect(current.hasChild(child));
-    }
-}
-
-test "older names map to the current ones, in paths and in files" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { path: []const u8, expected: []const u8 }{
-        .{ .path = "statusLine.context", .expected = "status_line.context" },
-        .{ .path = "statusLine", .expected = "status_line" },
-        .{ .path = "notifications.max", .expected = "sound.max" },
-        .{ .path = "status_line.context", .expected = "status_line.context" },
-        .{ .path = "statusLine.contxt", .expected = "statusLine.contxt" },
-        .{ .path = "fast_mode", .expected = "fast_mode" },
-    };
-    for (cases) |case| try std.testing.expectEqualStrings(case.expected, currentPath(case.path));
-    // A mistyped child of an older name is reported under the current one.
-    try std.testing.expectEqualStrings("status_line", unknownPart("statusLine.contxt").?.parent.?);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"statusLine":{"context":true},"status_line":{"context":false},"notifications":{"max":true},
-        \\ "workspaces":{"/w":{"notifications":{},"sound":{}},"/x":{"sound":{}}}}
-    , .{});
-    defer parsed.deinit();
-    const twice = try findOlderNames(alloc, parsed.value, .profile);
-    defer alloc.free(twice);
-    // A top-level older name is reported alone too, so fx doctor can say when
-    // it stops working.
-    try std.testing.expectEqual(@as(usize, 3), twice.len);
-    try std.testing.expectEqualStrings("notifications", twice[0].older);
-    try std.testing.expect(!twice[0].both and twice[0].workspace == null);
-    try std.testing.expectEqualStrings("statusLine", twice[1].older);
-    try std.testing.expectEqualStrings("status_line", twice[1].current);
-    try std.testing.expect(twice[1].both and twice[1].workspace == null);
-    try std.testing.expectEqualStrings("notifications", twice[2].older);
-    try std.testing.expectEqualStrings("/w", twice[2].workspace.?);
 }
 
 test "project files ignore profile keys but not project-safe or retired ones" {
@@ -445,22 +317,23 @@ test "unknown keys are found at the top level, in fixed objects, and in workspac
 
     const unknown = try findUnknown(alloc, parsed.value, .profile);
     defer alloc.free(unknown);
-    try std.testing.expectEqual(@as(usize, 4), unknown.len);
+    try std.testing.expectEqual(@as(usize, 5), unknown.len);
 
     try std.testing.expectEqualStrings("fast_mdoe", unknown[0].name);
     try std.testing.expect(unknown[0].parent == null and unknown[0].workspace == null);
     try std.testing.expectEqual(@as(usize, keys.len), unknown[0].known.len);
 
-    try std.testing.expectEqualStrings("contxt", unknown[1].name);
-    try std.testing.expectEqualStrings("statusLine", unknown[1].parent.?);
-    try std.testing.expectEqual(@as(usize, 3), unknown[1].known.len);
+    // The old group names are unknown keys now, like any other.
+    try std.testing.expectEqualStrings("statusLine", unknown[1].name);
+    try std.testing.expect(unknown[1].parent == null and unknown[1].workspace == null);
+    try std.testing.expectEqualStrings("notifications", unknown[2].name);
+    try std.testing.expect(unknown[2].parent == null and unknown[2].workspace == null);
 
-    try std.testing.expectEqualStrings("efort", unknown[2].name);
-    try std.testing.expectEqualStrings("/w", unknown[2].workspace.?);
-
-    try std.testing.expectEqualStrings("sesion", unknown[3].name);
-    try std.testing.expectEqualStrings("statusLine", unknown[3].parent.?);
+    try std.testing.expectEqualStrings("efort", unknown[3].name);
     try std.testing.expectEqualStrings("/w", unknown[3].workspace.?);
+
+    try std.testing.expectEqualStrings("statusLine", unknown[4].name);
+    try std.testing.expectEqualStrings("/w", unknown[4].workspace.?);
 }
 
 test "a project file is checked at its top level only" {
@@ -481,9 +354,14 @@ test "a project file is checked at its top level only" {
 }
 
 test "dotted paths name listed keys, fixed children, and paths into maps" {
-    for ([_][]const u8{ "fast_mode", "status_line", "status_line.context", "statusLine.context", "models", "models.codex", "providers.local.base_url" }) |path| {
+    for ([_][]const u8{ "fast_mode", "status_line", "status_line.context", "models", "models.codex", "providers.local.base_url" }) |path| {
         try std.testing.expect(unknownPart(path) == null);
     }
+
+    // The old group name is an unknown top-level key, not a child of a setting.
+    const old_group = unknownPart("statusLine.context").?;
+    try std.testing.expectEqualStrings("statusLine", old_group.name);
+    try std.testing.expect(old_group.parent == null);
 
     const top = unknownPart("fast_mdoe").?;
     try std.testing.expectEqualStrings("fast_mdoe", top.name);

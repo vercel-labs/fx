@@ -134,6 +134,24 @@ const NAMES_ONLY: StoryStep[] = [
   { at: 2, text: "The notes are saved." },
 ];
 
+// Twelve commands one after the other, of nine different steps. The last one,
+// sh wait.sh, runs until the test lets it end.
+const TWELVE_COMMANDS: StoryStep[] = [
+  "ls desktop",
+  "cat desktop/src/main.ts",
+  "wc -l desktop/src/main.ts",
+  "grep -c export desktop/src/window.ts",
+  "ls desktop/src",
+  "sed -n 1p desktop/src/main.ts",
+  "head -1 desktop/src/window.ts",
+  "sh check.sh status",
+  "cat desktop/src/window.ts",
+  "tail -1 desktop/src/main.ts",
+  "sh check.sh remote",
+  "sh wait.sh",
+].map((command, at): StoryStep => ({ at, calls: [sh(command)] }));
+TWELVE_COMMANDS.push({ at: TWELVE_COMMANDS.length, text: "The desktop app has two source files." });
+
 // A command that nests `$( )` deeper than any stack, in a request the shell
 // refuses before it runs anything, so fx draws its row and nothing runs.
 const NESTED_WITHOUT_END: StoryStep[] = [
@@ -309,10 +327,10 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(await session.waitForText(/^ {2}1 file changed \+1 -1 · ran 4 commands · /m, TIMEOUT));
 
     const checks = group(lines, "● Ran commands ✗");
-    // The two passing checks share a row by their step; the failure keeps
-    // its own, with the error's line after it.
+    // The two passing checks share a row by their step, which counts them;
+    // the failure keeps its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh",
+      "├ Ran sh check.sh · 2 calls",
       expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
@@ -802,6 +820,55 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(resumed);
     await resumed.waitForText("The notes are saved.", TIMEOUT);
     expectNames(paneLines(await resumed.waitForComposer(TIMEOUT)));
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a row of several commands counts its calls while it runs, once it ran, at a narrow width, and after resume",
+  async () => {
+    const root = createStoryRoot();
+    roots.push(root);
+    writeFileSync(join(root.workspace, "wait.sh"), "while [ ! -f released ]; do sleep 0.1; done\n");
+    const gateway = startStoryGateway(TWELVE_COMMANDS);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+    sessions.push(session);
+    await session.waitForComposer();
+    await session.sendText("look around the desktop app");
+
+    // The row names each of its nine steps once, where it last ran, so only
+    // its count says it holds twelve calls, and the count stays as the row
+    // goes from running to ran.
+    const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
+    expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
+    writeFileSync(join(root.workspace, "released"), "");
+    await session.waitForText("The desktop app has two source files.", TIMEOUT);
+    const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
+    const expectRow = (pane: string, row: string) => {
+      expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
+    };
+    expectRow(await session.waitForComposer(TIMEOUT), ran);
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+
+    // After resume the row reads the same. A narrow terminal counts more of
+    // its older steps in front, and keeps its newest step and its count.
+    const resumedRows: Array<[number, string]> = [[110, ran], [40, "● Ran +8, sh wait.sh · 12 calls ✓"]];
+    for (const [width, row] of resumedRows) {
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The desktop app has two source files.", TIMEOUT);
+      expectRow(await resumed.waitForComposer(TIMEOUT), row);
+      await resumed.kill();
+      sessions.splice(sessions.indexOf(resumed), 1);
+    }
   },
   TIMEOUT * 3,
 );
@@ -1827,3 +1894,70 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+/** Sixty numbered lines; each edit below swaps seven of them for one, `+1/-7`. */
+const G_TSE = Array.from({ length: 60 }, (_, i) => `g line ${i}`).join("\n") + "\n";
+const TOOL_CALLS_FINISH = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+const gEdit = (id: string, start: number) => ({
+  type: "tool-call",
+  toolCallId: id,
+  toolName: "edit_file",
+  input: { path: "g.tse", old_string: Array.from({ length: 7 }, (_, i) => `g line ${start + i}`).join("\n"), new_string: `g joined ${start}` },
+});
+
+/** The tool call and tool result ids in a Gateway request's prompt, in order. */
+function promptCallIds(body: string): { calls: string[]; results: string[] } {
+  const parts = JSON.parse(body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+  const ids = (type: string) => parts.filter((part: { type: string }) => part.type === type).map((part: { toolCallId: string }) => part.toolCallId);
+  return { calls: ids("tool-call"), results: ids("tool-result") };
+}
+
+// Three edits of one file whose replies reuse one call id across replies (F),
+// repeat it in one reply (G), or leave it empty (H), and the ids fx keeps.
+const CALL_ID_CASES: Array<[string, object[][], string[]]> = [
+  ["one id in every reply", [[gEdit("dup", 1)], [gEdit("dup", 10)], [gEdit("dup", 20)]], ["dup", "fx_call_1", "fx_call_2"]],
+  ["one id three times in one reply", [[gEdit("same", 1), gEdit("same", 10), gEdit("same", 20)]], ["same", "fx_call_1", "fx_call_2"]],
+  ["empty ids", [[gEdit("", 1), gEdit("", 10), gEdit("", 20)]], ["fx_call_1", "fx_call_2", "fx_call_3"]],
+];
+
+for (const [label, replies, ids] of CALL_ID_CASES) {
+  test.skipIf(!tmuxAvailable())(
+    `edits whose calls have ${label} each run and count, live and after resume`,
+    async () => {
+      const root = createStoryRoot();
+      roots.push(root);
+      writeFileSync(join(root.workspace, "g.tse"), G_TSE);
+      const finalText = "Joined three blocks of g.tse.";
+      const gateway = startFakeGateway([
+        ...replies.map((calls, index) => fakeGatewaySse([
+          ...(index === 0 ? [{ type: "text-delta", id: "text_edit", delta: "Joining three blocks." }] : []),
+          ...calls,
+          TOOL_CALLS_FINISH,
+        ])),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({ cwd: root.workspace, env: storyEnv(root, gateway), width: 110, height: 60 });
+      sessions.push(session);
+      await session.waitForComposer();
+      await session.sendText("Join three blocks of g.tse.");
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      const live = paneLines(await session.waitForText(/^ {2}1 file changed /m, TIMEOUT));
+
+      expect(readFileSync(join(root.workspace, "g.tse"), "utf8").match(/g joined/g)).toHaveLength(3);
+      expect(live.join("\n")).not.toContain("malformed");
+      expect(live).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(live.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+      // The model gets each call back under the id fx keeps, with its result.
+      expect(promptCallIds(gateway.requests.at(-1)!.body)).toEqual({ calls: ids, results: ids });
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const { lines } = await resumeStory(root, gateway, finalText);
+      expect(lines).toContain("● Edited g.tse +3/-21 · 3 edits");
+      expect(lines.find((line) => line.startsWith("  1 file changed"))).toStartWith("  1 file changed +3 -21");
+    },
+    TIMEOUT,
+  );
+}

@@ -5101,6 +5101,49 @@ test "tool results are stamped as they enter the turn, and later requests and th
     try std.testing.expectEqual(write_stamp, steps[1].tool_results[0].created_at_ms);
 }
 
+test "every model request carries this turn's calls so far, which a reply may not reuse" {
+    const Seen = struct {
+        const ModelRequest = @import("../../stream_provider.zig").ModelRequest;
+        var turn_call_ids: [3]std.ArrayList(u8) = @splat(.empty);
+        var requests: usize = 0;
+
+        fn observe(request: ModelRequest) !void {
+            if (requests >= turn_call_ids.len) return error.TestUnexpectedRequest;
+            for (request.current_turn_messages) |message| {
+                if (message.role != .assistant) continue;
+                for (message.tool_calls) |call| try turn_call_ids[requests].print(std.testing.allocator, "{s};", .{call.id});
+            }
+            requests += 1;
+        }
+    };
+    Seen.requests = 0;
+    defer for (&Seen.turn_call_ids) |*ids| ids.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{toolCall("call_one", "read_file", "{\"path\":\"a.txt\"}")};
+    const second_calls = [_]ToolCall{toolCall("call_two", "read_file", "{\"path\":\"b.txt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    gateway.observe_request = Seen.observe;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "a" } },
+        .{ .result = .{ .model_output = "b" } },
+    };
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), Seen.requests);
+    try std.testing.expectEqualStrings("", Seen.turn_call_ids[0].items);
+    try std.testing.expectEqualStrings("call_one;", Seen.turn_call_ids[1].items);
+    try std.testing.expectEqualStrings("call_one;call_two;", Seen.turn_call_ids[2].items);
+}
+
 test "terminal publication failure deletes retained command replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

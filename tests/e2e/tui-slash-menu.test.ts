@@ -2025,7 +2025,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { workspace: false },
+          status_line: { workspace: false },
         })}\n`,
       );
 
@@ -2152,7 +2152,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { sandbox: false, context: false, workspace: false },
+          status_line: { sandbox: false, context: false, workspace: false },
         })}\n`,
       );
 

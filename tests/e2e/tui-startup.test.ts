@@ -205,7 +205,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
+        `${JSON.stringify({ status_line: { workspace: true }, fast_mode: false })}\n`,
       );
       writeFileSync(stderrPath, "");
 
@@ -1100,7 +1100,7 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the inline provider picker columns",
+    "/provider opens the inline provider picker columns",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -1115,7 +1115,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/setup");
+      await session.sendText("/provider");
       const picker = await session.waitForPane(
         (pane) =>
           pane.includes("/provider") &&
@@ -1126,10 +1126,6 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       );
       expect(picker).not.toContain("Connections");
       expect(picker).not.toContain("Credential source");
-      // `/setup` is the deprecated alias of `/provider`. The full notice wraps,
-      // so check the part that names the release.
-      expect(await session.captureFullScrollback()).toContain("/setup is deprecated and stops working in fx 0.0.18; use /login");
-
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) => pane.includes("oauth") && pane.includes("api-key"),

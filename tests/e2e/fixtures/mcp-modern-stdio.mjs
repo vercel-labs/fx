@@ -36,6 +36,9 @@ const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
 // FX_MCP_LIST_REPLY is raw JSON text that goes out as written after the id of every tools/list reply: `"result":{...}`
 // or `"error":{...}`. A test gives fx a list it refuses, with a repeated or escaped key that JSON.stringify cannot write.
 const rawListReply = process.env.FX_MCP_LIST_REPLY;
+// FX_MCP_LIST_LINE is a whole tools/list reply line as written, with `{id}` standing for the request's id: a test puts the
+// id after a part fx cannot read, so that the line names no request.
+const rawListLine = process.env.FX_MCP_LIST_LINE;
 const rawFormSchemaMark = "raw-form-schema-mark";
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 // FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
@@ -45,6 +48,10 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// In mode subscription_cache the tool is renamed 50 ms after fx listens, unless
+// FX_MCP_LIST_CHANGE_RELEASE_PATH is set: then the rename waits until that file
+// exists, so a test can change the list at a moment it picks.
+const listChangeReleasePath = process.env.FX_MCP_LIST_CHANGE_RELEASE_PATH;
 // FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
 // FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
 // test can act while a call is out and then let it end.
@@ -354,7 +361,7 @@ function handle(message) {
       },
     });
     if (mode === "subscription_cache") {
-      setTimeout(() => {
+      const changeList = () => {
         currentToolName = recoveredToolName;
         for (let index = 0; index < 10; index += 1) {
           send({
@@ -367,8 +374,21 @@ function handle(message) {
             },
           });
         }
-      }, 50);
+      };
+      if (listChangeReleasePath) {
+        const releasePoll = setInterval(() => {
+          if (!existsSync(listChangeReleasePath)) return;
+          clearInterval(releasePoll);
+          changeList();
+        }, 10);
+      } else {
+        setTimeout(changeList, 50);
+      }
     }
+    return;
+  }
+  if (message.method === "tools/list" && rawListLine !== undefined) {
+    process.stdout.write(`${rawListLine.replaceAll("{id}", JSON.stringify(message.id))}\n`);
     return;
   }
   if (message.method === "tools/list" && rawListReply !== undefined) {

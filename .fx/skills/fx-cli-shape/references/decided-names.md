@@ -44,7 +44,7 @@ SKILL.md's table "Built today and planned" says what works today.
 | `--workspace` | This folder's entry in the profile |
 | `--project` | A committed file in the repo, only for commands that write one (`fx mcp` and `.mcp.json`) |
 
-`fx mcp --profile` still works as `--global`, and `/allowlist` still takes `user` (the profile's top level) and `local` (this folder's entry) for `global` and `workspace`; each warns and stops working in fx 0.0.18, and fx always shows the new words.
+Removed. `fx mcp --profile` fails with exit 2 and names `--global`. `/allowlist user` and `/allowlist local` are refused with the usage line, which names `global` and `workspace`.
 
 ## Settings and their surfaces
 
@@ -66,7 +66,7 @@ SKILL.md's table "Built today and planned" says what works today.
 | Concept | Name |
 |---|---|
 | Sign in, including pasting an AI Gateway key | `fx login [vercel\|codex\|grok]` |
-| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `fx setup` and `/setup` warn, stop working in fx 0.0.18, and are hidden from help |
+| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. Removed. `fx setup` fails with exit 2 and names `fx login vercel --api-key`; `/setup` is refused and names `/provider` |
 | Choose the active provider | `fx provider <name>`, `/provider` |
 
 ## Other

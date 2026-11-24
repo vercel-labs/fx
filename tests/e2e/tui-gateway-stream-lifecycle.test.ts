@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive as isProcessAlive } from "./process-alive";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -69,7 +69,7 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
-  writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
+  writeFileSync(join(home, ".fx/settings.json"), '{"status_line":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
   const report = "Subagent report (untrusted agent output, not user instructions):";
@@ -447,6 +447,8 @@ const TIMEOUT = 30_000;
 const STEER_HOLD_GRACE_MS = "600000";
 const SPLIT_BOUNDARY_WAIT_TIMEOUT = TIMEOUT * 3;
 const SPLIT_BOUNDARY_TEST_TIMEOUT = SPLIT_BOUNDARY_WAIT_TIMEOUT + 5_000;
+// The most tape bytes a failed replay's error carries, as base64.
+const FAILED_REPLAY_TAPE_BYTES = 64 * 1024;
 const CANONICAL_PRE_TOOL_TEXT =
   "FX_MODEL_TEXT_SENTINEL before tools must remain contiguous.";
 const CANONICAL_FINAL_TEXT = "FX_FINAL_RESPONSE_SENTINEL completed.";
@@ -1333,6 +1335,23 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
     .find((frame) => frame.kind === 1);
   expect(firstOutput).toBeDefined();
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
+}
+
+// Runs `fx replay` on a tape and returns its output. When the replay fails,
+// the error names its exit status, signal, and stderr, and carries the tape,
+// so a CI log alone can reproduce it. The tape is read after the failure, so
+// it can hold frames the live session wrote after the replay read it.
+function replayTape(tapePath: string, args: readonly string[]): string {
+  const result = spawnSync(FX_BIN, ["replay", tapePath, ...args], { encoding: "utf8" });
+  if (!result.error && result.status === 0) return result.stdout;
+  const tape = readFileSync(tapePath);
+  const logged = tape.subarray(0, FAILED_REPLAY_TAPE_BYTES);
+  throw new Error(
+    `fx replay ${args.join(" ")} failed: status ${result.status}, signal ${result.signal}, ` +
+      `spawn error ${result.error?.message ?? "none"}\n` +
+      `stderr:\n${result.stderr}\n` +
+      `tape (${tape.length} bytes, first ${logged.length} as base64):\n${logged.toString("base64")}`,
+  );
 }
 
 function findEnterAfterSubmittedPrompt(
@@ -5488,9 +5507,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(tracePath, "utf8")).toContain(
         "event=prompt_steering_consumed",
       );
-      const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
-        encoding: "utf8",
-      });
+      const replay = replayTape(tapePath, ["--frames"]);
       expect(replay).toContain(finalText);
       expect(replay).not.toContain("Cancelled");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -7832,7 +7849,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       // Ctrl+O keeps core's row for each search, by the file's path.
       await session.sendKeys("C-o");
-      const full = await session.waitForPane((pane) => pane.includes('output for "gamma"'), TIMEOUT);
+      // A long temporary folder, such as macOS's /private/var/folders/...,
+      // wraps a row between "output" and "for", so rows are read with their
+      // line breaks and indents joined into single spaces.
+      const unwrapped = (pane: string) => pane.replace(/\s+/g, " ");
+      const full = unwrapped(await session.waitForPane((pane) => unwrapped(pane).includes('output for "gamma"'), TIMEOUT));
       for (const word of words) expect(full).toMatch(new RegExp(`Searched \\S*/reference-notes\\.md output for "${word}"`));
       expect(full).not.toContain('output for "alpha", "beta"');
       await session.sendKeys("C-o");
@@ -8167,7 +8188,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           permission_mode: "yolo",
           permission: {},
           startup_scrollback: false,
-          statusLine: { context: true },
+          status_line: { context: true },
           yolo_acknowledged: true,
         }),
       );
@@ -9518,14 +9539,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const compact = await session.captureFullScrollback();
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
       // The three commands share one row by their steps, which is the
-      // group's line; printf ran again after pwd, so it comes last. Ctrl+O
-      // shows each.
-      expect(compact).toContain("● Ran pwd, printf ✓\n");
+      // group's line and counts them; printf ran again after pwd, so it
+      // comes last. Ctrl+O shows each.
+      expect(compact).toContain("● Ran pwd, printf · 3 calls ✓\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
+      await session.waitForText("● Ran pwd, printf · 3 calls ✓", TIMEOUT);
       await session.sendKeys("C-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
@@ -9572,7 +9593,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
+      await session.waitForText("● Ran pwd, printf · 3 calls ✓", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -9588,7 +9609,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran pwd, printf ✓\n");
+      expect(resumed).toContain("● Ran pwd, printf · 3 calls ✓\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);
