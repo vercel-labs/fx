@@ -123,6 +123,16 @@
 # against it (MainMailTrace.tla) where turns commit as they finish, as in
 # fx ask and ACP.
 #
+# main-mail-handoff.cfg is the design where the host hands a subagent's mail
+# to its main loop before the worker's queue, as the app does
+# (postDelivery and deliverReports in src/core/app/app_agents_runtime.zig).
+# A reply that ends empty is followed by a check that first waits, at most a
+# bound, for mail in that hand-off (wait_for_handoff_mail), so the mail takes
+# the nudge's place. Two more planted defects:
+#
+#   nudge-blind          an empty reply's check ignores the hand-off        NoNudgeWithMail
+#   unbounded-wait       the worker waits for the hand-off with no bound    WaitBounded
+#
 # The WaitNudge configs:
 #
 # WaitNudge models main's wait against subagent works that end with nothing
@@ -191,6 +201,9 @@ MainMail main-mail-commit -
 MainMail main-mail-mutation-no-gate CommitBeforeNextTurn
 MainMail main-mail-mutation-stuck-gate GateNeverStuck
 MainMail main-mail-mutation-drop-unacknowledged GateNeverStuck
+MainMail main-mail-handoff -
+MainMail main-mail-mutation-nudge-blind NoNudgeWithMail
+MainMail main-mail-mutation-unbounded-wait WaitBounded
 QuietRelay quiet-relay -
 QuietRelay quiet-relay-deep -
 QuietRelay quiet-relay-mutation-relay-late-notice OnePerSpell

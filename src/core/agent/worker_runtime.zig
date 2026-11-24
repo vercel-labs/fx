@@ -1486,6 +1486,50 @@ pub const WorkerRuntime = struct {
         return .posted;
     }
 
+    /// What a `waitForJoinedMail` ended on.
+    pub const JoinedMailWake = enum {
+        /// A prompt that joins the turn is queued, so its next boundary takes it.
+        joined,
+        /// Something else woke the wait, such as mail that waits for the next turn.
+        woken,
+        /// The time ran out.
+        timed_out,
+        /// A stop, a shutdown, or a cancel was requested.
+        interrupted,
+        /// The turn takes no more mail, because a final boundary closed it or it
+        /// is not the running turn, so no mail can join it.
+        closed,
+    };
+
+    /// Waits on `worker_cond`, until `timeout`, for a prompt to join turn
+    /// `turn_id`. Every enqueue, stop, shutdown, and cancel signals that
+    /// condition, so the wait ends at once on each of them
+    /// (`tests/tla/subagent/MainMail.tla` WaitBounded). The state is read under
+    /// `worker_mutex` before the wait starts, so mail queued just before it is
+    /// not missed.
+    pub fn waitForJoinedMail(self: *WorkerRuntime, turn_id: u64, timeout: std.Io.Timeout) JoinedMailWake {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.joinedMailWakeLocked(turn_id)) |wake| return wake;
+        debug_trace.eventf("worker", "handoff_mail_wait", .{ .turn_id = turn_id }, "worker={x} state=begin", .{@intFromPtr(self)});
+        self.worker_cond.waitTimeout(io_mod.getIo(), &self.worker_mutex, timeout) catch |err| switch (err) {
+            error.Timeout => return .timed_out,
+            else => return .interrupted,
+        };
+        return self.joinedMailWakeLocked(turn_id) orelse .woken;
+    }
+
+    /// The reason a wait for mail to join `turn_id` need not block, or null when it should. The
+    /// caller holds `worker_mutex`.
+    fn joinedMailWakeLocked(self: *const WorkerRuntime, turn_id: u64) ?JoinedMailWake {
+        if (self.worker_stop_requested or self.worker_cancel_requested.load(.seq_cst)) return .interrupted;
+        if (!self.worker_processing or self.active_turn_id != turn_id or self.direct_steering_closed) return .closed;
+        for (self.queued_prompts.items) |prompt| {
+            if (self.joinsActiveTurnLocked(prompt)) return .joined;
+        }
+        return null;
+    }
+
     pub fn enqueueContextCompaction(
         self: *WorkerRuntime,
         task: ContextCompactionTask,
@@ -6879,6 +6923,84 @@ test "an agent's posted message joins the running turn, waits behind older work,
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("wakes", job.prompt);
     try std.testing.expect(job.delivery.isContinuation());
+}
+
+fn joinedMailBound(ms: i64) std.Io.Timeout {
+    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+}
+
+test "a wait for mail to join a turn does not block when the turn takes none or already has it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    const bound = joinedMailBound(5_000);
+
+    // No running turn, another turn, or a turn a final boundary closed.
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.closed, runtime.waitForJoinedMail(9, bound));
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 8;
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.closed, runtime.waitForJoinedMail(9, bound));
+    runtime.active_turn_id = 9;
+    runtime.direct_steering_closed = true;
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.closed, runtime.waitForJoinedMail(9, bound));
+    runtime.direct_steering_closed = false;
+
+    // Mail that waits for the next turn does not end the wait; mail that joins does.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "work", "model"));
+    try runtime.postMail(alloc, try makePrompt(alloc, "waits", "model"));
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.timed_out, runtime.waitForJoinedMail(9, joinedMailBound(20)));
+    var joins = WorkerRuntime{};
+    defer joins.deinit(alloc);
+    joins.worker_processing = true;
+    joins.active_turn_id = 9;
+    try joins.postMail(alloc, try makePrompt(alloc, "joins", "model"));
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.joined, joins.waitForJoinedMail(9, bound));
+
+    // A stop or a cancel already requested.
+    joins.requestStop();
+    try std.testing.expectEqual(WorkerRuntime.JoinedMailWake.interrupted, joins.waitForJoinedMail(9, bound));
+}
+
+test "a wait for mail to join a turn ends at once on the mail, a stop, a shutdown, and a cancel, and at its bound otherwise" {
+    const alloc = std.testing.allocator;
+    const Waiter = struct {
+        wake: std.atomic.Value(u8) = std.atomic.Value(u8).init(unset),
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        const unset: u8 = 255;
+
+        fn run(self: *@This(), runtime: *WorkerRuntime, bound: std.Io.Timeout) void {
+            self.started.store(true, .release);
+            self.wake.store(@backingInt(runtime.waitForJoinedMail(9, bound)), .release);
+        }
+    };
+    const Cause = enum { mail, stop, shutdown, cancel, nothing };
+    for ([_]Cause{ .mail, .stop, .shutdown, .cancel, .nothing }) |cause| {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.worker_processing = true;
+        runtime.active_turn_id = 9;
+        var waiter: Waiter = .{};
+        // Five seconds is far past the test's own limit below, so only the cause can end the wait early.
+        const bound = joinedMailBound(if (cause == .nothing) 50 else 5_000);
+        const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, &runtime, bound });
+        const started_at = io_mod.milliTimestamp();
+        while (!waiter.started.load(.acquire)) std.atomic.spinLoopHint();
+        switch (cause) {
+            .mail => try runtime.postMail(alloc, try makePrompt(alloc, "joins", "model")),
+            .stop => runtime.requestStop(),
+            .shutdown => runtime.requestShutdown(),
+            .cancel => runtime.requestCancel(),
+            .nothing => {},
+        }
+        thread.join();
+        const expected: WorkerRuntime.JoinedMailWake = switch (cause) {
+            .mail => .joined,
+            .stop, .shutdown, .cancel => .interrupted,
+            .nothing => .timed_out,
+        };
+        try std.testing.expectEqual(@backingInt(expected), waiter.wake.load(.acquire));
+        try std.testing.expect(io_mod.milliTimestamp() - started_at < 4_000);
+    }
 }
 
 test "wait names the senders whose prompts join the running turn, or else every sender" {

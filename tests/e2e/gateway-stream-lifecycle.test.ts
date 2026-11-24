@@ -13261,33 +13261,37 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  // A model reply that stays open until `hold.release` ends it with no text
+  // and the finish reason `other`.
+  const heldEmptyOtherReply = (hold: { started: boolean; release?: () => void }) => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        hold.started = true;
+        timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+        hold.release = () => {
+          clearInterval(timer);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: "finish",
+            finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
+          })}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        };
+      },
+      cancel() {
+        clearInterval(timer);
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+  };
+
   test.skipIf(!tmuxAvailable())("an empty reply that stops for another reason gives way to a subagent's report, with no Done.", async () => {
     const root = createFixtureRoot("other-empty-report");
     const child = heldFakeGatewayFinalText();
     const parentHold: { started: boolean; release?: () => void } = { started: false };
     // Holds the parent's reply open until the child's report is queued, then ends it empty.
-    const heldEmptyOther = () => {
-      const encoder = new TextEncoder();
-      let timer: ReturnType<typeof setInterval> | undefined;
-      return new Response(new ReadableStream<Uint8Array>({
-        start(controller) {
-          parentHold.started = true;
-          timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
-          parentHold.release = () => {
-            clearInterval(timer);
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-              type: "finish",
-              finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" },
-              usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
-            })}\n\ndata: [DONE]\n\n`));
-            controller.close();
-          };
-        },
-        cancel() {
-          clearInterval(timer);
-        },
-      }), { headers: { "content-type": "text/event-stream" } });
-    };
+    const heldEmptyOther = () => heldEmptyOtherReply(parentHold);
     const parentBodies: string[] = [];
     let childRequests = 0;
     const gateway = startDynamicFakeGateway(raw => {
@@ -13355,6 +13359,288 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(JSON.stringify(logLines(root.home, rootSessionIds(root.home)[0]!))).not.toContain("\"Done.\"");
     } finally {
       child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // The empty-reply hand-off tests. Main starts the subagent "reporter" by
+  // message, and the delivery hold keeps what the subagent sends back in the
+  // main loop's hand-off, where main's worker cannot see it, until the test
+  // writes the release file.
+  const handoffPaths = (root: { root: string }) => ({
+    trace: join(root.root, "trace.log"),
+    stderr: join(root.root, "stderr.log"),
+    held: join(root.root, "delivery-held"),
+    release: join(root.root, "delivery-release"),
+  });
+
+  const startHandoffGateway = (
+    task: string,
+    childReply: (request: number) => Response,
+    parentReply: (request: number) => Response,
+  ) => {
+    const parentBodies: string[] = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
+      if (latest.includes(task)) return childReply(++childRequests);
+      parentBodies.push(raw);
+      if (parentBodies.length === 1) {
+        return fakeGatewayToolCall(`${task}-delegation`, "subagent", { request: { action: "message", agent: "reporter", message: task } });
+      }
+      return parentReply(parentBodies.length);
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    return { gateway, parentBodies, childRequests: () => childRequests };
+  };
+
+  const startHandoffTui = (
+    root: ReturnType<typeof createFixtureRoot>,
+    gateway: { baseUrl: string; chatUrl: string },
+    paths: ReturnType<typeof handoffPaths>,
+  ) => TmuxSession.create({
+    cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true, stderrPath: paths.stderr,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+      AI_GATEWAY_API_KEY: "fake-empty-handoff-key", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_REPORT_DELIVERY_HELD: paths.held, FX_TEST_REPORT_DELIVERY_RELEASE: paths.release,
+      FX_TRACE_LOG: paths.trace, FX_TRACE_SCOPES: "subagent,mailbox,worker,agent,tool",
+    },
+  });
+
+  const quitHandoffTui = async (tui: TmuxSession, paths: ReturnType<typeof handoffPaths>) => {
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => tui.paneStatus().dead, 10000);
+    expect(tui.paneStatus().status).toBe(0);
+    expect(readFileSync(paths.stderr, "utf8")).toBe("");
+  };
+
+  // A reply with no text and the finish reason `other`, which ends at once.
+  const immediateEmptyOtherReply = () => {
+    const hold: { started: boolean; release?: () => void } = { started: false };
+    const reply = heldEmptyOtherReply(hold);
+    hold.release!();
+    return reply;
+  };
+
+  test.skipIf(!tmuxAvailable())("a report that waits in the main loop's hand-off as an empty reply ends takes the nudge's place", async () => {
+    const root = createFixtureRoot("other-empty-handoff");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies, childRequests } = startHandoffGateway(
+      "EMPTY_HANDOFF_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold) : fakeGatewayFinalText("EMPTY_HANDOFF_ALL_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_HANDOFF_START");
+      await tui.waitForPane(() => childRequests() === 1 && parentBodies.length === 2 && parentHold.started, 10000);
+      // The child finishes while the parent's reply is open. The host queues
+      // its report, and the main loop keeps it in the hand-off, so the
+      // parent's worker has not seen it.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      expect(trace()).toMatch(/event=report_queued /);
+      expect(trace()).not.toMatch(/event=mail_posted .*mail=report/);
+      // The reply ends empty. The worker finds the report on its way and
+      // waits for it. The loop then gives it the report.
+      const traced = trace().length;
+      parentHold.release!();
+      await tui.waitForPane(
+        () => /event=handoff_mail_wait .*state=begin|event=steering_boundary_check .*kind=finalizing/.test(trace().slice(traced)),
+        10000,
+      );
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_HANDOFF_ALL_DONE", 10000);
+
+      expect(childRequests()).toBe(1);
+      // The report takes the nudge's place, as one that waited in the
+      // worker's queue does: the next request carries it and not the nudge,
+      // and no request goes out for the nudge.
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_REPORT_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies).toHaveLength(3);
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=joined/);
+      expect(trace()).not.toMatch(/event=empty_reply_nudge /);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a subagent's message that waits in the main loop's hand-off as an empty reply ends takes the nudge's place", async () => {
+    const root = createFixtureRoot("other-empty-handoff-message");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    // The child messages its parent at once and then stays busy, so only
+    // the message waits in the hand-off.
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_MESSAGE_TASK",
+      request => request === 1
+        ? fakeGatewayToolCall("empty-message-child-up", "subagent", { request: { action: "message", agent: "parent", message: "CHILD_MESSAGE_TEXT" } })
+        : child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold) : fakeGatewayFinalText("EMPTY_MESSAGE_ALL_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_MESSAGE_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && parentHold.started && existsSync(`${paths.held}.1`), 10000);
+      expect(trace()).not.toMatch(/event=mail_posted .*mail=/);
+      const traced = trace().length;
+      parentHold.release!();
+      await tui.waitForPane(
+        () => /event=handoff_mail_wait .*state=begin|event=steering_boundary_check .*kind=finalizing/.test(trace().slice(traced)),
+        10000,
+      );
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_MESSAGE_ALL_DONE", 10000);
+
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_MESSAGE_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies).toHaveLength(3);
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=joined/);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply whose report stays in a stalled main loop's hand-off goes on to the nudge after a second, and the report follows", async () => {
+    const root = createFixtureRoot("other-empty-handoff-bound");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_BOUND_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold)
+        : fakeGatewayFinalText(request === 3 ? "EMPTY_BOUND_NUDGED_DONE" : "EMPTY_BOUND_REPORT_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_BOUND_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && parentHold.started, 10000);
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      // The loop stays stalled: the release file is not written. The worker
+      // waits its second and sends the nudge, with no hang.
+      const released = Date.now();
+      parentHold.release!();
+      await tui.waitForPane(() => parentBodies.length === 3, 10000);
+      expect(Date.now() - released).toBeGreaterThanOrEqual(900);
+      expect(parentBodies[2]).toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies[2]).not.toContain("CHILD_REPORT_TEXT");
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=timed_out/);
+      expect(trace()).toContain("did not land in the worker within 1000 ms");
+      await tui.waitForText("EMPTY_BOUND_NUDGED_DONE", 10000);
+      // The loop comes back: the report is still delivered, after the nudge.
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_BOUND_REPORT_DONE", 10000);
+      expect(parentBodies).toHaveLength(4);
+      expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a second empty reply waits for no report, so the turn ends and the report starts a later one", async () => {
+    const root = createFixtureRoot("other-empty-handoff-second");
+    const child = heldFakeGatewayFinalText();
+    const firstHold: { started: boolean; release?: () => void } = { started: false };
+    const secondHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_SECOND_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(firstHold)
+        : request === 3 ? heldEmptyOtherReply(secondHold)
+        : fakeGatewayFinalText("EMPTY_SECOND_REPORT_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_SECOND_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && firstHold.started, 10000);
+      // Nothing waits when the first empty reply ends, so the nudge goes out.
+      firstHold.release!();
+      await tui.waitForPane(() => parentBodies.length === 3 && secondHold.started, 10000);
+      expect(parentBodies[2]).toContain(EMPTY_REPLY_NUDGE);
+      // The report reaches the hand-off while the nudged reply is open, and
+      // that reply ends empty too.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      secondHold.release!();
+      await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_SECOND_REPORT_DONE", 10000);
+
+      expect(parentBodies).toHaveLength(4);
+      expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
+      expect(trace()).not.toMatch(/event=handoff_mail_wait /);
+      expect(trace()).not.toMatch(/event=empty_reply_mail_wait /);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply with no report waiting still nudges at once, with no wait", async () => {
+    const root = createFixtureRoot("other-empty-no-report");
+    const parentBodies: string[] = [];
+    const gateway = startDynamicFakeGateway(raw => {
+      parentBodies.push(raw);
+      return parentBodies.length === 1 ? immediateEmptyOtherReply() : fakeGatewayFinalText("EMPTY_PLAIN_ALL_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_PLAIN_START");
+      await tui.waitForText("EMPTY_PLAIN_ALL_DONE", 10000);
+
+      expect(parentBodies).toHaveLength(2);
+      expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);
+      expect(trace()).toMatch(/event=empty_reply_nudge /);
+      expect(trace()).not.toMatch(/event=handoff_mail_wait /);
+      expect(trace()).not.toMatch(/event=empty_reply_mail_wait /);
+      await quitHandoffTui(tui, paths);
+    } finally {
       await tui?.kill();
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

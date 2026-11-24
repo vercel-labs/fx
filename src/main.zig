@@ -8511,6 +8511,43 @@ fn postTestReport(app: *App, reporter: *subagent_tool_host.Runtime, output: []co
     } });
 }
 
+test "a report or message in the hand-off waits for its own agent until the main loop gives it to the worker" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    const bystander = try addTestChildAgent(&app, "child-2");
+    const Runtime = App.AgentsAppRuntime;
+
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &child.agent));
+    try postTestReport(&app, &reporter, "A_REPORT");
+    // It is the owner's, not the bystander's, and it stays in sight until the worker has it.
+    try std.testing.expect(Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &bystander.agent));
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    Runtime.takePosts(&app);
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+
+    // A subagent's message to its parent waits in the same list for the same agent.
+    // It is left undelivered: delivering one reads its sender's host, which this
+    // test does not run (`tests/e2e/gateway-stream-lifecycle.test.ts` covers it).
+    try app_agents_runtime.postDelivery(&app.child_handoffs, &reporter, .{ .message = .{
+        .to = .owner,
+        .agent = "worker",
+        .child_id = "c1",
+        .text = "A_MESSAGE",
+    } });
+    try std.testing.expect(Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &bystander.agent));
+}
+
 /// The lines of a saved session's log that hold `needle`.
 fn countLogLines(alloc: Allocator, tp: *@import("core/subagent/child_state.zig").TestParent, needle: []const u8) !usize {
     const log_path = try std.Io.Dir.path.join(alloc, &.{ ".fx", "sessions", "v2", tp.parent.id(), "log.jsonl" });
