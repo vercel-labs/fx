@@ -38,6 +38,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
@@ -2036,7 +2037,7 @@ test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access", FX_TRACE: "1", FX_TRACE_LOG: trace });
     await app.session.sendText("Fork busy prompt one.");
-    await app.session.waitForText("BUSY_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("BUSY_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork busy prompt two.");
     await scrollbackContains(app.session, "BUSY_PARENT_SENT");
@@ -2165,7 +2166,7 @@ test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell co
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork shell prompt one.");
-    await app.session.waitForText("SHELL_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("SHELL_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork shell prompt two.");
     await scrollbackContains(app.session, "SHELL_PARENT_SENT");
@@ -2226,7 +2227,7 @@ test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork stop prompt one.");
-    await app.session.waitForText("STOP_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("STOP_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork stop prompt two.");
     await scrollbackContains(app.session, "STOP_PARENT_SENT");
@@ -2800,10 +2801,10 @@ test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and
     const lastLine = lines.at(-1)!;
     longAnswer = ["```text", ...lines, "```"].join("\n");
     await app.session.sendText("Long fork prompt one.");
-    await app.session.waitForText(lastLine, TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes(lastLine) && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Long fork prompt two.");
-    await app.session.waitForText("LONG_FORK_TWO", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("LONG_FORK_TWO") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     const source = onlySessionId(fixture.home);
 
@@ -5790,7 +5791,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await tui.sendText("STEERING_START");
     await tui.waitForPane(() => childRequests === 1, 10000);
     // The parent's turn ends with the receipt while its child works.
-    await tui.waitForText("START_SENT", 10000);
+    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
     const parent = rootSessionIds(fixture.home)[0]!;
     await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
     const original = childWork(fixture.home, parent);

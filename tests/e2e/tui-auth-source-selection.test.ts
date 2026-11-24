@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
-import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER, turnSettled } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
 import { rotateFxLogin, startFakeIssuer, storedFxLoginToken, writeFxLogin } from "./fx-login-fakes";
@@ -5097,7 +5097,7 @@ tmuxTest(
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
-    await session.waitForText(RESTART_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(RESTART_RESPONSE) && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
@@ -7023,7 +7023,7 @@ tmuxTest(
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
-      await session.waitForText("GROK_LIMIT_RECOVERED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("GROK_LIMIT_RECOVERED") && turnSettled(pane), TIMEOUT);
       await session.sendText("Accept one more prompt after recovery.");
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
@@ -7956,7 +7956,7 @@ tmuxTest(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Read enough lines to complete the capacity loop.");
-      await session.waitForText("CODEX_CAPACITY_65_OK", 120_000);
+      await session.waitForPane((pane) => pane.includes("CODEX_CAPACITY_65_OK") && turnSettled(pane), 120_000);
       expect(codex.bodies).toHaveLength(65);
 
       await session.sendText("Confirm the same process remains usable.");
@@ -8547,7 +8547,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await selectFxLoginCredential(session);
     await session.sendText("prove fx login is active before logout");
-    await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(LOGIN_RESPONSE) && turnSettled(pane), TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/logout");
@@ -8908,9 +8908,9 @@ tmuxTest(
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_FIRST.");
-    await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_SECOND.");
-    await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
@@ -8978,9 +8978,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_FIRST.");
-    await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
-    await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
     const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
     const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");
@@ -9385,7 +9385,7 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("refresh login and answer");
-    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(REFRESH_RECOVERY_RESPONSE) && turnSettled(pane), TIMEOUT);
     await waitForModelRequestCount(gateway, 2);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",

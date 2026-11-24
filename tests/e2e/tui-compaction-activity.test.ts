@@ -13,6 +13,7 @@ const {
   FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall,
   fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
   hasEmptyComposer, tmuxAvailable,
+  turnSettled,
 } = await import("./tmux-helpers");
 const { HAS_API_KEY } = await import("../evals/eval-helpers");
 
@@ -345,14 +346,14 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
           await f.waitForResumeHandoff();
-          await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane), 10_000);
+          await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane) && turnSettled(pane), 10_000);
         }
         expect(f.counts().overflowSent).toBe(trigger === "overflow");
         expect(f.durable()).toBe(1);
         const before = f.counts();
         f.phase("followup");
         await terminal.sendText("Follow the latest request.");
-        await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
+        await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane) && turnSettled(pane), 10_000);
         expect(f.counts()).toEqual({ ...before, ordinary: before.ordinary + 1 });
         expect(f.lastRequest()).toContain("INTERNAL_HANDOFF_4e12");
         await assertCompactionQuiet(terminal, f.root, "completed", 1);
@@ -611,7 +612,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await assertCompactionQuiet(terminal, f.root, "failed");
         f.phase("followup");
         await terminal.sendText("Recover with another request.");
-        await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 10_000);
+        await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane) && turnSettled(pane), 10_000);
         expect(f.counts()).toEqual({ ...afterFailure, ordinary: f.seedTurns + 1 });
         expect(f.lastRequest()).toContain(HEAD);
         expect(f.lastRequest()).toContain(TAIL);

@@ -50,6 +50,7 @@ import {
   type FakeGatewayOptions,
   type FakeGatewayResponse,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { childLines, childWork, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 import { expectPermissionModeContext } from "./permission-mode-context";
@@ -171,12 +172,12 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
     await session.sendText("Start the child task.");
     await waitForPath(join(workspace, "starts"));
     // The parent's turn ends with the receipt while its subagent works.
-    await session.waitForText("CHILD_TASK_SENT", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_TASK_SENT") && turnSettled(pane), TIMEOUT);
     const original = childState();
     expect(original.outcome).toBeNull();
     if (variant === "late") {
       writeFileSync(release, "go");
-      await session.waitForText("ORIGINAL_REPORT_SEEN", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("ORIGINAL_REPORT_SEEN") && turnSettled(pane), TIMEOUT);
       expect(childState().outcome).toBe("ok");
     }
     await session.waitForStableComposer(TIMEOUT);
@@ -309,12 +310,12 @@ test.skipIf(!tmuxAvailable())("a parent's stop of a subagent turn stops the comm
     await session.sendText("Start the child task.");
     await waitForCondition(() => existsSync(pidPath) && readTrimmed(pidPath) !== "", "child command pid");
     commandPid = Number(readTrimmed(pidPath));
-    await session.waitForText("CHILD_TASK_SENT", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_TASK_SENT") && turnSettled(pane), TIMEOUT);
     expect(childWork(home, rootSessionIds(home)[0]!)?.outcome).toBeNull();
 
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Steer the child.");
-    await session.waitForText("CHILD_STEER_SENT", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_STEER_SENT") && turnSettled(pane), TIMEOUT);
     expect(receipts["child-stop-steer"]).toMatchObject({ ok: true, delivery: "queued" });
     // The child's next step carries the command's running result with the
     // steering notice, and the parent's message.
@@ -406,11 +407,11 @@ test.skipIf(!tmuxAvailable())("closing a subagent while its steered tty command 
     await session.sendText("Start the child task.");
     await waitForCondition(() => existsSync(pidPath) && readTrimmed(pidPath) !== "", "child command pid");
     commandPid = Number(readTrimmed(pidPath));
-    await session.waitForText("CHILD_TASK_SENT", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_TASK_SENT") && turnSettled(pane), TIMEOUT);
 
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Steer the child.");
-    await session.waitForText("CHILD_STEER_SENT", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_STEER_SENT") && turnSettled(pane), TIMEOUT);
     await waitForCondition(() => hold.started, "child step after the parent's steering");
     expect(isProcessAlive(commandPid)).toBe(true);
 
@@ -1797,7 +1798,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     );
     await session!.sendText("Read the notes and continue after a connection failure.");
     // No pause: the interrupted stream and the nine 503s recover on their own.
-    await session!.waitForText("AFTER_NETWORK_RECOVERY", TIMEOUT);
+    await session!.waitForPane((pane) => pane.includes("AFTER_NETWORK_RECOVERY") && turnSettled(pane), TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(11);
     const scrollback = await session!.captureFullScrollback();
@@ -2126,7 +2127,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // never answers. The prompt must not wait for it.
       await Bun.sleep(5_500);
       await session.sendText("First prompt.");
-      await session.waitForText("FIRST_PROMPT_OK", 10_000);
+      await session.waitForPane((pane) => pane.includes("FIRST_PROMPT_OK") && turnSettled(pane), 10_000);
       await waitForCondition(() => catalogGateway.modelRequests.length === 2, "background catalog retry");
 
       // A second prompt joins the retry already in flight instead of starting one.
@@ -4032,7 +4033,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length >= 11,
         "autonomous retries after the confirmed tool",
       );
-      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(13);
@@ -5491,7 +5492,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         writeFileSync(releasePath, "go");
         await waitForPath(effectPath);
         finalHold.release?.();
-        await session.waitForText(finalText, TIMEOUT);
+        await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
         await session.waitForComposer(TIMEOUT);
         const scrollback = await session.captureFullScrollback();
         for (const line of lines) expect(countOccurrences(scrollback, line)).toBe(1);
@@ -7866,7 +7867,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the fixture, then search and page its saved output.");
-      await session.waitForText("PARALLEL_READS_FINISHED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("PARALLEL_READS_FINISHED") && turnSettled(pane), TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
       // Both reads ran as one parallel group and still name their source.
@@ -7952,7 +7953,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Read both reference files, then read more of each.");
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
       const lines = (await session.captureFullScrollback()).split("\n").map((line) => line.trim());
 
       // One row names both files by name; it neither repeats the full path,
@@ -8066,7 +8067,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(rows.filter((row) => /Searching|Reading/.test(row))).toEqual([running]);
       }
       sendRest?.();
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
       const live = toolRows(await session.captureFullScrollback());
       expect(live).toContain(done);
       expect(live.filter((row) => row.includes("/reference-notes.md") || row.includes("result-") || row.includes("Searching"))).toEqual([]);
@@ -8164,7 +8165,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("List the tree, then search it.");
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
       // The search names the command by the short form its own row shows,
       // not by core's full command.
       const live = toolRows(await session.captureFullScrollback());
@@ -8907,7 +8908,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the supported call after the unknown call.");
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
       // The failed call is not a command, so the header keeps the command's
       // mark. The turn went on after it, so its row says only that it
       // failed, and the header does not count it.
@@ -9135,7 +9136,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("PARENT_HANDOFF_SEED");
-        await session.waitForText("PARENT_HANDOFF_SEED_DONE", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("PARENT_HANDOFF_SEED_DONE") && turnSettled(pane), TIMEOUT);
         expect(replies.get("SEED")).toContain(marker + "_SEED");
         const roots = rootSessionIds(home);
         expect(roots).toHaveLength(1);
@@ -9754,7 +9755,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the prepared command summary fixture.");
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
 
       const compact = await session.captureFullScrollback();
       // The no-op cd drops out of the short form; Ctrl-O keeps the full command.
@@ -9929,7 +9930,7 @@ test.skipIf(!tmuxAvailable())("long command rows show their steps while running 
     expect(runningRow).toBe("● Running printf, sleep, printf");
 
     // After settling, the completed row keeps the short form too.
-    await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE") && turnSettled(pane), TIMEOUT);
     const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
       .find((line) => line.includes("Ran printf"));
     expect(ranRow).toBe("● Ran printf, sleep, printf ✓");

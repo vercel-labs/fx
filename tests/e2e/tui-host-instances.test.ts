@@ -11,6 +11,7 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 // One fx process hosting several identical fx instances: each has its own
@@ -921,7 +922,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("HOST_B before new");
-        await session.waitForText("HOST_ANSWER_B", 30_000);
+        await session.waitForPane((pane) => pane.includes("HOST_ANSWER_B") && turnSettled(pane), 30_000);
 
         // A session command runs on any instance, as on the first.
         await session.sendText("/new");
@@ -1057,7 +1058,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(countLines(log)).toBe(5);
 
         // The grant shows in the session's permissions.
@@ -1088,7 +1089,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
         await session.waitForComposer(15_000);
         await session.sendText("GRANT_3 FILE[grant-main]");
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(existsSync(join(workspace, "grant-main.txt"))).toBe(true);
 
         await session.sendText("/permissions");
@@ -1151,7 +1152,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // So does main, which is in ask mode itself.
         await session.waitForComposer(15_000);
         await session.sendText(`GRANT_3 RUN[${command}]`);
-        await session.waitForText("GRANT_DONE_3", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_3") && turnSettled(pane), 30_000);
         expect(countLines(log)).toBe(5);
 
         await session.sendText("/permissions");
@@ -1216,7 +1217,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText(`GRANT_2 RUN[${command}]`);
         await waitShows(session, "main's command prompt", (pane) => asking(pane, "") && !pane.includes("Subagent"));
         await session.sendKeys("1");
-        await session.waitForText("GRANT_DONE_2", 30_000);
+        await session.waitForPane((pane) => pane.includes("GRANT_DONE_2") && turnSettled(pane), 30_000);
 
         await session.sendText("/permissions");
         await waitShows(session, "no session grants", (pane) => /^ {2}Session grants {2,}none/m.test(pane), 15_000);
@@ -1732,7 +1733,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       try {
         await withHost(answerByLetter, { remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("HOST_A alone");
-          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await session.waitForPane((pane) => pane.includes("HOST_ANSWER_A") && turnSettled(pane), 30_000);
           expect(hostRecords(home)).toEqual([]);
           await session.sendText("/launch");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
@@ -2092,7 +2093,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_PLAIN start a plain helper");
-        await session.waitForText("TREE_PLAIN_FINAL", 45_000);
+        await session.waitForPane((pane) => pane.includes("TREE_PLAIN_FINAL") && turnSettled(pane), 45_000);
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_BUILDER start a builder");
         await session.waitForText("TREE_BUILDER_FINAL", 45_000);

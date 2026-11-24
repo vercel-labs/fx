@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
-import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 import { copyV1Fixture, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 15_000;
@@ -3705,7 +3705,7 @@ describe("Vision route fake Gateway", () => {
         writeFileSync(firstImagePath, readFileSync(firstMutatedPath));
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux Vision completed", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("tmux Vision completed") && turnSettled(pane), TIMEOUT);
 
         await session.sendText(`/image ${secondImagePath}`);
         await session.waitForText("attached image: second.png", TIMEOUT);
@@ -3718,7 +3718,7 @@ describe("Vision route fake Gateway", () => {
         await session.sendKeys("1");
         await session.sendKeys("Enter");
         await session.waitForPane(
-          (pane) => pane.includes("tmux outage continued") && !pane.includes("Generating ("),
+          (pane) => pane.includes("tmux outage continued") && turnSettled(pane),
           TIMEOUT,
         );
 
@@ -3910,7 +3910,7 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.waitForStableComposer(TIMEOUT);
     // Nothing continues on its own (D54): a new prompt asks again.
     await session.sendText("Describe this image again.");
-    await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("TUI_RECOVERY_IMAGE_COMPLETE") && turnSettled(pane), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
     writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
