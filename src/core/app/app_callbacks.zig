@@ -315,6 +315,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering_boundary = if (comptime @hasDecl(@TypeOf(agent.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
+                .wait_for_handoff_mail = if (comptime @hasField(App, "child_handoffs") and @hasDecl(@TypeOf(agent.worker), "waitForJoinedMail")) agentWaitForHandoffMail else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -874,6 +875,31 @@ pub fn Bindings(comptime App: type) type {
                 .turn_id = turn_id,
                 .outcome = outcome,
             });
+        }
+
+        /// While the hand-off holds a report or message for this agent, waits on
+        /// the worker's condition until the main loop has given it to the
+        /// worker, at most `bound_ms` in all. Holds no lock between the peek
+        /// and the wait.
+        fn agentWaitForHandoffMail(ctx: *anyopaque, turn_id: u64, bound_ms: i64) agent_runtime.AgentRuntimeDeps.HandoffMailWait {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            const io = io_mod.getIo();
+            const until: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(bound_ms) });
+            var waited = false;
+            while (app_agents_runtime.Runtime(App).handoffMailWaiting(app, agent)) {
+                if (!std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, until)) return .timed_out;
+                waited = true;
+                switch (agent.worker.waitForJoinedMail(turn_id, .{ .deadline = until })) {
+                    .joined => return .joined,
+                    .behind => return .delivered,
+                    .closed => return .closed,
+                    .interrupted => return .interrupted,
+                    .timed_out => return .timed_out,
+                    .woken => {},
+                }
+            }
+            return if (waited) .delivered else .none;
         }
 
         fn agentTakeSteeringBoundary(

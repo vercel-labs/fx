@@ -763,6 +763,16 @@ test "a line refused after its id still names its request, whatever the bad part
     }
 }
 
+test "an id read before the bad part is kept when a method comes after it, because fx cannot know that one will" {
+    // The scan stops at the first thing that goes wrong, so the `method` after the bad `x` is never read. This line looks
+    // like a reply with a broken extra key, and fx cannot tell it from one: it keeps the id. A server's own request that
+    // is broken this way before its `method` can therefore end fx's request of the same number, and that is accepted.
+    try testing.expectEqual(@as(?RequestId, 3), responseId("{\"id\":3,\"x\":nope,\"method\":\"ping\"}"));
+    // A `method` read before the bad part shows a request or notification, whose id is the server's own.
+    try testing.expectEqual(@as(?RequestId, null), responseId("{\"id\":3,\"method\":\"ping\",\"x\":nope}"));
+    try testing.expectEqual(@as(?RequestId, null), responseId("{\"method\":\"ping\",\"id\":3,\"x\":nope}"));
+}
+
 test "guard: a refused line names no request unless its id is the top-level one read before the bad part" {
     for ([_][]const u8{
         // The id comes after the bad part, or no id was read.
