@@ -1860,17 +1860,6 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return false;
             }
-            if (comptime @hasField(App, "model_cache") and @hasDecl(@FieldType(App, "model_cache"), "adoptOwnedCatalog") and @hasDecl(@TypeOf(app.auth), "modelCatalogAccess")) {
-                if (prepared) |task| {
-                    if (task.catalog) |*fetched| switch (fetched.*) {
-                        .catalog => |*catalog| {
-                            app.model_cache.adoptOwnedCatalog(app.auth.modelCatalogAccess(), catalog);
-                            task.catalog = null;
-                        },
-                        .failure => {},
-                    };
-                }
-            }
             rememberCredentialSource(app, .fx_login);
             app.auth.closePicker(app.alloc);
             try app.writeDomainNotice(if (model_persistence_failed) .{
