@@ -35,6 +35,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 
 const HAS_TMUX = tmuxAvailable();
@@ -3046,7 +3047,12 @@ tmuxTest(
         headers: { "content-type": "application/json" },
       }),
       fakeGatewayFinalText("SIGNED_IN_RECOVERY_RESPONSE"),
-    ]);
+    ], {
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
     // The refresh token is rejected, so only a new sign-in can help.
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
       rejectRefreshGrant: true,
@@ -10815,3 +10821,254 @@ tmuxTest(
   },
   60_000,
 );
+
+tmuxTest(
+  "picking a Vercel team with Token Pass confirms active credit instead of asking to buy it",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-active-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: (request) => {
+        const teamId = new URL(request.url).searchParams.get("teamId");
+        return tokenPassCatalog(teamId === "team_tp");
+      },
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        if (url.searchParams.get("teamId") === "team_tp") {
+          return Response.json({
+            balance: "12.50",
+            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+          });
+        }
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("tp-team", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Vercel Token Pass is active ($79.93 remaining).");
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team with catalog Token Pass marks confirms active when credits fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-marks-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("tp-team", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Vercel Token Pass is active.");
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team omits the buy offer when credits fails and catalog has no marks",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-unknown-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(false),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_a", slug: "team-a", name: "Team A" },
+        { id: "team_b", slug: "team-b", name: "Team B" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_a");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("team-b", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team B (team-b).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(scrollback).not.toContain("Vercel Token Pass is active");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "switching from Codex to a Vercel Token Pass team confirms active credit instead of asking to buy it",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-to-token-pass-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_tp", slug: "tp-team", name: "Token Pass Team" }],
+    });
+    const chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_tp");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: FAKE_GATEWAY_MODEL } }),
+    );
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        ...chatgptOauth.env,
+        AI_GATEWAY_API_KEY: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
+        FX_MODEL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/login");
+      await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("tp-team", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Vercel Token Pass is active ($79.93 remaining).");
+      expect(scrollback).not.toContain("Get $150 of tokens");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      chatgptOauth.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team with a stalled credits endpoint does not hang and confirms active from catalog marks",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-slow-credits-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let releaseCredits = () => {};
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return new Promise<Response>((resolve) => {
+          releaseCredits = () =>
+            resolve(Response.json({
+              balance: "12.50",
+              token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            }));
+        });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        AI_GATEWAY_API_KEY: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/login");
+      await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("tp-team", TIMEOUT);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Vercel Token Pass is active.");
+      expect(scrollback).not.toContain("Get $150 of tokens");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      releaseCredits();
+    }
+  },
+  60_000,
+);
+
