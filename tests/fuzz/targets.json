@@ -103,6 +103,7 @@
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
     {"name": "response_language_expectation", "module": "fx", "test": "response language expectation stays conservative on fuzzed prompts", "iterations": 100000},
-    {"name": "command_environment_evidence", "module": "fx", "test": "command environment evidence keeps its lines on fuzzed shells", "iterations": 30000}
+    {"name": "command_environment_evidence", "module": "fx", "test": "command environment evidence keeps its lines on fuzzed shells", "iterations": 30000},
+    {"name": "acp_notice_title", "module": "fx", "test": "a notice title is trimmed text or none on fuzzed text", "iterations": 160000}
   ]
 }

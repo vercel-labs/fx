@@ -610,14 +610,14 @@ pub fn finishLengthLimitedToolCallCompletion(
         if (has_content) {
             try hooks.push_text(hooks.ctx, .{ .assistant_source = completion.content.? });
             try hooks.push_text(hooks.ctx, .{ .assistant_rendered = normalized });
-            try hooks.push_text(hooks.ctx, .{ .operational = "\n\n" });
+            try hooks.push_text(hooks.ctx, .{ .saved_reply = "\n\n" });
         }
-        try hooks.push_text(hooks.ctx, .{ .operational = blocker });
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
+        try hooks.push_text(hooks.ctx, .{ .saved_reply = blocker });
+        try hooks.push_text(hooks.ctx, .{ .saved_reply = "\n" });
     } else {
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
-        try hooks.push_text(hooks.ctx, .{ .operational = blocker });
-        try hooks.push_text(hooks.ctx, .{ .operational = "\n" });
+        try hooks.push_text(hooks.ctx, .{ .saved_reply = "\n" });
+        try hooks.push_text(hooks.ctx, .{ .saved_reply = blocker });
+        try hooks.push_text(hooks.ctx, .{ .saved_reply = "\n" });
     }
     return rendered;
 }
@@ -922,7 +922,7 @@ const StreamCapture = struct {
                 self.source_spans.appendAssumeCapacity(owned);
                 return;
             },
-            .assistant_rendered, .assistant_restarted, .operational => {},
+            .assistant_rendered, .assistant_restarted, .operational, .turn_failure, .saved_reply => {},
         }
 
         self.text_calls += 1;
@@ -933,7 +933,7 @@ const StreamCapture = struct {
             .assistant_source => unreachable,
             .assistant_rendered => |text| text,
             .assistant_restarted => |text| text,
-            .operational => |text| text,
+            .operational, .turn_failure, .saved_reply => |text| text,
         };
 
         try self.text_spans.ensureUnusedCapacity(self.capture_alloc, 1);

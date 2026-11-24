@@ -8,6 +8,7 @@ test {
     _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
+    _ = @import("acp/prompt.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/pending_revocation.zig");
