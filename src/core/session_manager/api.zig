@@ -16,6 +16,7 @@
 //! session data is already durable, and the failure is reported through
 //! the diagnostics callback (`index_stale`).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
@@ -67,7 +68,7 @@ const max_text_bytes = 4096;
 /// An I/O failure with its OS cause when known, `Io` otherwise (D29).
 pub const IoFault = storage.IoFault;
 pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, OutOfMemory } || storage.IoFault;
-pub const ForkError = OpenError || error{Cancelled};
+pub const ForkError = if (builtin.target.cpu.arch.isWasm()) OpenError else OpenError || error{Cancelled};
 pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
 pub const CloseError = error{OutOfMemory} || storage.IoFault;
 pub const ReadError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
@@ -324,7 +325,7 @@ pub const Manager = struct {
         const session: Session = .{ .manager = m, .inner = inner };
         // The repair may have moved the workspace or interrupted a turn, so
         // the whole entry is written, not only the open time (D42).
-        session.updateIndexAs(.{ .resumed = options.host });
+        session.updateIndexForHost(options.host);
         return session;
     }
 
@@ -353,7 +354,10 @@ pub const Manager = struct {
             .workspace = options.workspace,
             .host = options.host,
             .cancel = options.cancel,
-        }, options.children) catch |err| return switch (err) {
+        }, options.children) catch |err| return if (comptime builtin.target.cpu.arch.isWasm()) switch (err) {
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
+        } else switch (err) {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.Cancelled, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
@@ -362,7 +366,7 @@ pub const Manager = struct {
         // index lists it as its parent's child.
         for (forked.copies) |copy| (Session{ .manager = m, .inner = copy }).release();
         const session: Session = .{ .manager = m, .inner = forked.session };
-        session.updateIndexAs(.published);
+        session.updateIndexForHost(session.inner.identity.host);
         return session;
     }
 
@@ -584,7 +588,7 @@ pub const Session = struct {
         if (!s.import) return error.InvalidArgument;
         try s.manager.ready();
         try s.inner.publishImport();
-        s.updateIndexAs(.published);
+        s.updateIndexForHost(s.inner.identity.host);
     }
 
     fn appendChecked(s: Session, events: []const Event, ts_ms: ?u64) AppendError!u64 {
@@ -595,9 +599,9 @@ pub const Session = struct {
         if (!s.inner.staysHeld(events)) try s.manager.ready();
         const result = try s.inner.appendReport(events, ts_ms);
         if (result.published) {
-            s.updateIndexAs(.published);
+            s.updateIndexForHost(s.inner.identity.host);
         } else if (result.activity_changed) {
-            s.updateIndexAs(.{ .activity = s.inner.activeHost() });
+            s.updateIndexForHost(s.inner.active_host);
         } else if (result.listing_changed) {
             s.updateIndex();
         }
@@ -662,24 +666,19 @@ pub const Session = struct {
     }
 
     fn updateIndex(s: Session) void {
-        s.updateIndexAs(.changed);
+        s.updateIndexForHost(null);
     }
 
     /// A session's host timestamp tracks its last message or turn activity in
     /// that host so `-c` follows where the person was working. Resuming stamps
     /// the session's existing activity time so an untouched reopen does not
     /// overtake a session messaged more recently.
-    fn updateIndexAs(s: Session, why: union(enum) { published, activity: Host, changed, resumed: Host }) void {
+    fn updateIndexForHost(s: Session, host: ?Host) void {
         const m = s.manager;
         var arena = std.heap.ArenaAllocator.init(m.gpa);
         defer arena.deinit();
         var summary = s.indexSummary(arena.allocator()) catch return m.indexStale(s.id());
-        switch (why) {
-            .published => summary.opened_ms[@backingInt(summary.host)] = summary.updated_ms,
-            .activity => |host| summary.opened_ms[@backingInt(host)] = summary.updated_ms,
-            .resumed => |host| summary.opened_ms[@backingInt(host)] = summary.updated_ms,
-            .changed => {},
-        }
+        if (host) |h| summary.opened_ms[@backingInt(h)] = summary.updated_ms;
         m.catalog().put(summary) catch m.indexStale(s.id());
     }
 

@@ -252,10 +252,6 @@ pub const Session = struct {
         return session.identity.id;
     }
 
-    pub fn activeHost(session: *const Session) schema.Host {
-        return session.active_host;
-    }
-
     /// Whether this open session's log is on disk, so a resume finds it:
     /// from the publish of its first turn (D2), or from its open when it
     /// was resumed or forked (D58). A failed session keeps the log it had.
@@ -369,7 +365,7 @@ pub const Session = struct {
                 .last_seq = last,
                 .published = was_held and session.phase == .live,
                 // Only a published session is in the index.
-                .activity_changed = session.phase == .live and hasActivity(events),
+                .activity_changed = session.phase == .live and events.len > 0 and bodiesHaveActivity(session.bodies.items),
                 .listing_changed = session.phase == .live and changesListing(events),
             };
         };
@@ -463,6 +459,7 @@ pub const Session = struct {
             session.bounds.shrinkRetainingCapacity(first);
         }
         for (bodies, 0..) |body, i| try session.frameMarked(first + 1 + i, ts, body);
+        const prev_activity = session.state.last_activity_ms;
         for (bodies, 0..) |body, i| {
             try fold.apply(gpa, &session.state, 0, .{
                 .seq = first + 1 + i,
@@ -471,7 +468,7 @@ pub const Session = struct {
                 .body = body,
             });
         }
-        if (session.updated_ms == 0 or bodiesHaveActivity(bodies)) session.wrote(ts);
+        if (session.updated_ms == 0 or session.state.last_activity_ms > prev_activity) session.wrote(ts);
     }
 
     /// Import only (D59): writes every held line through the staged publish
@@ -758,11 +755,12 @@ pub const Session = struct {
             return fault;
         };
         const fork_seq = session.identity.forkSeq();
+        const prev_activity = session.state.last_activity_ms;
         for (bodies, 0..) |body, i| {
             const offset = base + if (i == 0) 0 else session.bounds.items[i - 1];
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = first_seq + i, .offset = offset, .ts_ms = ts, .body = body });
         }
-        if (cause == .host and (session.updated_ms == 0 or bodiesHaveActivity(bodies))) {
+        if (cause == .host and (session.updated_ms == 0 or session.state.last_activity_ms > prev_activity)) {
             session.wrote(ts);
         }
         session.written_seq.store(session.env.s.io, session.state.last_seq);
@@ -1107,13 +1105,6 @@ fn copyBlob(env: *const Env, source: storage.Dir, target: storage.Dir, name: []c
     defer s.closeFile(to);
     s.writeAt(to, bytes, 0) catch |io_err| return storage.ioFault(io_err);
     s.sync(to) catch |io_err| return storage.ioFault(io_err);
-}
-
-fn hasActivity(events: []const fold.Event) bool {
-    for (events) |event| {
-        if (fold.isActivityEvent(event)) return true;
-    }
-    return false;
 }
 
 fn bodiesHaveActivity(bodies: []const schema.Body) bool {
@@ -1791,7 +1782,12 @@ pub const Forked = struct {
     copies: []*Session,
 };
 
-pub const ForkError = OpenError || error{ InvalidForkPoint, Cancelled };
+pub const ForkError = if (builtin.target.cpu.arch.isWasm())
+    OpenError || error{InvalidForkPoint}
+else
+    OpenError || error{ InvalidForkPoint, Cancelled };
+
+const CopyFoldedError = if (builtin.target.cpu.arch.isWasm()) AppendError else AppendError || error{Cancelled};
 
 /// A new root session whose lines 2..S are the source's, unchanged, where
 /// S ends a turn (D5). The source is read without its lock and never
@@ -1885,15 +1881,21 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const created = env.nowMs();
     session.frameMarked(1, created, .{ .session_created = session.identity.created() }) catch |err| return forkError(err);
     session.created_ms = created;
-    if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    }
     const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, point.seq, options.cancel) catch |err| return switch (err) {
+    copyFolded(session, copied, point.seq, options.cancel) catch |err| return if (comptime builtin.target.cpu.arch.isWasm())
+        forkError(err)
+    else switch (err) {
         error.Cancelled => error.Cancelled,
         else => |append_err| forkError(append_err),
     };
-    if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (options.cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+    }
     // Then one finished work item per copy, after S, so the fork owns them.
     var seq = point.seq;
     for (children, copies) |child, copy| {
@@ -1980,7 +1982,9 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
     defer gpa.free(copied);
     if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, cut.seq, null) catch |err| return switch (err) {
+    copyFolded(session, copied, cut.seq, null) catch |err| return if (comptime builtin.target.cpu.arch.isWasm())
+        forkError(err)
+    else switch (err) {
         error.Cancelled => error.Cancelled,
         else => |append_err| forkError(append_err),
     };
@@ -2229,7 +2233,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
 /// crc holds, except snapshots: a snapshot records byte offsets, and the
 /// fork's line 1 has a different length, so each snapshot is encoded again
 /// from the fork's own fold at that point, with the same seq and time.
-fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64, cancel: ?*const std.atomic.Value(bool)) (AppendError || error{Cancelled})!void {
+fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64, cancel: ?*const std.atomic.Value(bool)) CopyFoldedError!void {
     const gpa = session.env.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2237,7 +2241,9 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64, cancel: ?*co
     defer encoded.deinit(gpa);
     var at: usize = 0;
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
-        if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+        }
         _ = arena.reset(.retain_capacity);
         const source_line = copied[at .. nl + 1];
         const source_header = log_mod.checkLine(source_line) catch |io_err| return storage.ioFault(io_err);

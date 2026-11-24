@@ -5672,10 +5672,12 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
             if (numbers) |n| n.trim.* = .{ .turn = n.list.items[1], .tool_steps = covered.tool_steps, .steering = covered.steering };
         }
     }
-    restored.transcript_matches_history = if (state.compaction_offset == null)
-        true
-    else
-        !compaction_in_turn and !compaction_kept_turn and covered.tool_steps == 0 and covered.steering == 0 and history.items.len > 1;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        restored.transcript_matches_history = if (state.compaction_offset == null)
+            true
+        else
+            !compaction_in_turn and !compaction_kept_turn and covered.tool_steps == 0 and covered.steering == 0 and history.items.len > 1;
+    }
     restored.history = try history.toOwnedSlice(alloc);
     return restored;
 }

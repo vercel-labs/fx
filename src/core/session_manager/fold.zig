@@ -210,41 +210,13 @@ fn isMessageItemType(item_type: []const u8) bool {
         std.mem.eql(u8, item_type, "assistant");
 }
 
-const ActivityCheck = union(enum) {
-    turn_started,
-    turn_committed,
-    turn_interrupted: schema.Reason,
-    item_type: []const u8,
-    other,
-};
-
-fn isActivity(check: ActivityCheck) bool {
-    return switch (check) {
-        .turn_started, .turn_committed => true,
-        .turn_interrupted => |reason| reason != .crash and reason != .closed,
-        .item_type => |item_type| isMessageItemType(item_type),
-        .other => false,
-    };
-}
-
 pub fn isActivityBody(body: schema.Body) bool {
-    return isActivity(switch (body) {
-        .turn_started => .turn_started,
-        .turn_committed => .turn_committed,
-        .turn_interrupted => |i| .{ .turn_interrupted = i.reason },
-        .item => |piece| .{ .item_type = piece.type },
-        else => .other,
-    });
-}
-
-pub fn isActivityEvent(event: Event) bool {
-    return isActivity(switch (event) {
-        .turn_started => .turn_started,
-        .turn_committed => .turn_committed,
-        .turn_interrupted => |reason| .{ .turn_interrupted = reason },
-        .item => |piece| .{ .item_type = piece.type },
-        else => .other,
-    });
+    return switch (body) {
+        .turn_started, .turn_committed => true,
+        .turn_interrupted => |i| i.reason != .crash and i.reason != .closed,
+        .item => |piece| isMessageItemType(piece.type),
+        else => false,
+    };
 }
 
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -271,11 +243,14 @@ pub const Line = struct {
 /// `last_seq`: they are a cache. In a forked session, child lines at or
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
+    var activity = false;
     switch (line.body) {
-        .session_created, .item, .snapshot, .closed => {},
+        .session_created, .snapshot, .closed => {},
+        .item => |piece| activity = isMessageItemType(piece.type),
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
+            activity = true;
         },
         .compacted => {
             state.last_compaction_seq = line.seq;
@@ -284,11 +259,13 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         .turn_committed => {
             state.open_turn = null;
             state.committed += 1;
+            activity = true;
         },
         .turn_interrupted => |i| {
             state.open_turn = null;
             state.interrupted += 1;
             state.last_interrupted = .{ .turn = i.turn, .reason = i.reason };
+            activity = i.reason != .crash and i.reason != .closed;
         },
         .set => |s| {
             const copy = try gpa.dupe(u8, s.value);
@@ -299,9 +276,7 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         .child_spawned => |c| if (line.seq > fork_seq) try state.spawnChild(gpa, line.seq, c),
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
     }
-    if (line.ts_ms != 0 and isActivityBody(line.body)) {
-        state.last_activity_ms = @max(state.last_activity_ms, line.ts_ms);
-    }
+    if (activity and line.ts_ms > state.last_activity_ms) state.last_activity_ms = line.ts_ms;
     state.last_seq = line.seq;
     state.clean_exit = line.body == .closed;
 }
@@ -433,7 +408,8 @@ pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *cons
     try out.appendSlice(gpa, ",\"compaction_offset\":");
     try printOptional(gpa, out, state.compaction_offset);
     if (state.last_activity_ms != 0) {
-        try out.print(gpa, ",\"activity\":{d}", .{state.last_activity_ms});
+        try out.appendSlice(gpa, ",\"activity\":");
+        try printOptional(gpa, out, state.last_activity_ms);
     }
     try out.append(gpa, '}');
 }
