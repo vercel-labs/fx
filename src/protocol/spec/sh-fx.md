@@ -1,6 +1,6 @@
 # sh.fx: fx extensions to the Agent Client Protocol
 
-Status: draft. fx implements the parts that a section describes as built. A section that says what it will define is not written yet.
+Status: draft. fx doesn't implement any part of this specification yet. A section that says what it will define is not written yet.
 
 `sh.fx` adds the session features that fx's own clients need to version 1 of the [Agent Client Protocol](https://agentclientprotocol.com) (ACP). It uses only ACP's [extension mechanisms](https://agentclientprotocol.com/protocol/v1/extensibility) and changes no standard message, so a client that knows only ACP works with fx and sees the standard part of each session. A client receives an extension's messages only after fx and the client both advertise the extension in `initialize`.
 
