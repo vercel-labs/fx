@@ -1829,8 +1829,11 @@ fn freeLeftovers(alloc: Allocator, slot: *Slot) void {
 
 fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
     const owner = slot.owner;
-    _ = owner.approvals.invalidateChild(slot.child_id) catch |err|
+    const dropped = owner.approvals.invalidateChild(slot.child_id) catch |err| blk: {
         debugFailure(slot.child_id, "approval_invalidate", err);
+        break :blk 0;
+    };
+    if (dropped > 0) debug_trace.logf("subagent", "approval requests dropped child={s} count={d} reason=worker_detached", .{ slot.child_id, dropped });
     owner.mutex.lockUncancelable(io_mod.getIo());
     while (slot.route_refs > 0) {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);

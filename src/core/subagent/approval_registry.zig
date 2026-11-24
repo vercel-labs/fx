@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const types = @import("../shared/types.zig");
@@ -428,12 +429,19 @@ pub const Registry = struct {
                 self.mutex.unlock(io_mod.getIo());
                 break;
             };
-            const owned_feedback = self.alloc.dupe(u8, feedback) catch {
+            const remaining = self.bindings.items.len;
+            const owned_feedback = self.alloc.dupe(u8, feedback) catch |err| {
                 self.mutex.unlock(io_mod.getIo());
+                // R3.8: say what was left unrefused and why, never the request's text.
+                debug_trace.logf("subagent", "approval refusals stopped root={s} refused={d} gone={d} left={d} err={s}", .{ root_id, counts.accepted, counts.gone, remaining, @errorName(err) });
                 break;
             };
             var feedback_owned = true;
-            const outcome = self.resolveIndexLocked(index, .deny, owned_feedback, &feedback_owned) catch break;
+            const outcome = self.resolveIndexLocked(index, .deny, owned_feedback, &feedback_owned) catch |err| {
+                // R3.8: the refusal stopped after `counts`; name the rest.
+                debug_trace.logf("subagent", "approval refusals stopped root={s} refused={d} gone={d} err={s}", .{ root_id, counts.accepted, counts.gone, @errorName(err) });
+                break;
+            };
             switch (outcome) {
                 .accepted => counts.accepted += 1,
                 .rejected => counts.gone += 1,
@@ -553,7 +561,11 @@ pub const Registry = struct {
             removed.deinit(self.alloc);
             changed += 1;
         }
-        if (changed > 0) self.pending_revision +|= 1;
+        if (changed > 0) {
+            self.pending_revision +|= 1;
+            // R3.8: the requests this call dropped, never their content.
+            debug_trace.logf("subagent", "approval requests dropped child={s} count={d} reason=child_invalidated", .{ child_id, changed });
+        }
         return changed;
     }
 
