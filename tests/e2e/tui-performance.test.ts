@@ -858,8 +858,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const slashOpen = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("/"),
-          () => session!.waitForText("Results ", TIMEOUT),
-          "Results ",
+          // The first command's description marks the menu's first rows.
+          () => session!.waitForText("show available slash commands", TIMEOUT),
+          "show available slash commands",
         );
         const slashQuery = await measureAction(
           fixture.tapePath,
@@ -871,7 +872,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           ),
           "┃ /he",
         );
-        await closeSurface(session, "Results ");
+        await closeSurface(session, "show available slash commands");
         if (cycle >= WARMUPS) {
           appendMeasured(samples.slashOpen, slashOpen);
           appendMeasured(samples.slashQuery, slashQuery);

@@ -1154,7 +1154,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // word, and no item holds it as typed.
       await session.sendLiteralText("/mdl");
       await session.waitForPane(
-        (pane) => /Commands 1\b/.test(pane) && /^\s*\/model\s{2,}/m.test(pane),
+        (pane) => /^commands\s*$/m.test(pane) && /^\s*\/model\s{2,}/m.test(pane),
         5_000,
       );
       await session.sendKeys("C-u");
@@ -1414,7 +1414,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForPane((pane) => /^commands\s*$/m.test(pane), 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1589,7 +1589,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("-l '/m'");
       await session.waitForPane(
-        (pane) => pane.includes("Commands ") && pane.includes("/model"),
+        (pane) => /^commands\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
 
@@ -1612,8 +1612,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         line.includes("manage MCP servers and their logins")
       );
       expect(mcpRow).toBeDefined();
+      // Columns fit the longest entry of the whole list, so the category
+      // column stays put as the list scrolls.
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
-      expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
       expect(modelRow).toContain("Model");
       expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
       expect(session.isAlive()).toBe(true);
@@ -1666,7 +1667,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendLiteralText("/m");
       await session.waitForPane(
-        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        (pane) => /^results\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
       grid = await session.capturePaneGrid();
@@ -1696,7 +1697,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendLiteralText("/m");
       await session.waitForPane(
-        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        (pane) => /^results\s*$/m.test(pane) && pane.includes("/model"),
         5_000,
       );
       grid = await session.capturePaneGrid();
@@ -4760,20 +4761,23 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForPane((pane) => /^commands\s*$/m.test(pane), 5_000);
 
-      for (let i = 0; i < 5; i += 1) {
+      // Five commands show above the "↓ N more" row: the highlight walks to
+      // the last of them before the list scrolls, then stays there.
+      for (let i = 0; i < 4; i += 1) {
         await session.sendKeys("Down");
       }
 
       const selectedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
-      expect(selectedRow).toBeGreaterThanOrEqual(5);
+      expect(selectedRow).toBe(4);
 
       await session.sendKeys("Down");
+      expect(selectedSlashRowIndex(await session.capturePaneEscapes())).toBe(4);
       await session.sendKeys("Up");
 
       const reversedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
-      expect(reversedRow).toBe(4);
+      expect(reversedRow).toBe(3);
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -4832,10 +4836,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const grid = await session.capturePaneGrid();
       const pane = grid.join("\n");
-      expect(pane).toContain("Commands 1");
+      expect(pane).toMatch(/^commands\s*$/m);
       expect(pane).toContain("/model");
       expect(pane).toContain("…");
-      expect(pane).not.toMatch(/\sModel\s*$/m);
+      // The description gives up width so the category stays.
+      expect(pane).toMatch(/\sModel\s*$/m);
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");

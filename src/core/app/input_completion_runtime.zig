@@ -176,7 +176,10 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn navigateSlashCompletion(app: *App, delta: i32, count: usize) void {
-            navigatePickerOptions(&app.input_runtime.picker.slash_completion_index, &app.input_runtime.picker.slash_completion_window_start, count, delta);
+            // The menu gives a row to "↓ N more" when the list overflows, so the
+            // window moves by the rows it shows.
+            const rows = list_window.visibleRowsWithMore(count, list_window.default_max_picker_rows);
+            list_window.advanceSelectionWithin(&app.input_runtime.picker.slash_completion_index, &app.input_runtime.picker.slash_completion_window_start, count, delta, rows);
         }
 
         pub fn routeSlashCompletionMove(app: *App, agent: *AppAgent, delta: i32) bool {
