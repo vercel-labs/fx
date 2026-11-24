@@ -152,7 +152,7 @@ fn signInLinkRow(alloc: Allocator, url: []const u8, width: u16) !Row {
 /// The paste hint's wordings, longest first; the first that fits after its
 /// indent is shown, and the shortest is cut to fit when none does.
 const paste_hints = [_][]const u8{
-    "Browser on another computer? Paste the address it ends on.",
+    menu.paste_hint,
     "Paste the address the browser ends on.",
     "Paste the address here.",
 };

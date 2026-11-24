@@ -64,8 +64,8 @@ pub const Listener = struct {
     /// Takes the sign-in's state from `authorize`, its authorization address.
     /// Safe while `accept` waits on another thread.
     pub fn expect(l: *Listener, io: std.Io, authorize: []const u8) void {
-        const query_at = std.mem.findScalar(u8, authorize, '?') orelse return;
-        const state = param(authorize[query_at + 1 ..], "state") orelse return;
+        const query = queryOf(authorize) orelse return;
+        const state = param(query, "state") orelse return;
         if (state.len > l.state.buf.len) return;
         l.state.mutex.lockUncancelable(io);
         defer l.state.mutex.unlock(io);
