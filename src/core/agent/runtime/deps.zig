@@ -207,7 +207,9 @@ pub const AgentRuntimeDeps = struct {
         none,
         /// The mail reached the worker's queue and joins the turn.
         joined,
-        /// The hand-off no longer holds the mail, and it does not join the turn.
+        /// The mail does not join the turn, either because older work waits
+        /// ahead of it or because the hand-off no longer holds it, so it goes to
+        /// a later turn.
         delivered,
         /// The turn takes no more mail, so the call did not wait.
         closed,

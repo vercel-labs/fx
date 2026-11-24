@@ -41,10 +41,18 @@ pub fn deferred(child_id: []const u8) bool {
         return hook(child_id);
     }
     const files = end_test_controls.holdFiles("FX_TEST_REPORT_DELIVERY_HELD", "FX_TEST_REPORT_DELIVERY_RELEASE") orelse return false;
+    return deferOnFiles(files, child_id);
+}
+
+/// The file controls' hold. A hold that cannot write its marker is not armed,
+/// as in every other seam in this folder (`holdOnFiles` in
+/// `end_test_controls.zig`): no test could see it, and it would hold every
+/// delivery for `max_hold_ms`.
+fn deferOnFiles(files: end_test_controls.HoldFiles, child_id: []const u8) bool {
     const hold = active orelse begin: {
-        holds += 1;
-        const started: Hold = .{ .n = holds, .deadline_ms = io_mod.milliTimestamp() + end_test_controls.max_hold_ms };
-        writeHeldMarker(files, started.n, child_id);
+        const started: Hold = .{ .n = holds + 1, .deadline_ms = io_mod.milliTimestamp() + end_test_controls.max_hold_ms };
+        writeHeldMarker(files, started.n, child_id) catch return false;
+        holds = started.n;
         active = started;
         break :begin started;
     };
@@ -56,12 +64,12 @@ pub fn deferred(child_id: []const u8) bool {
     return false;
 }
 
-fn writeHeldMarker(files: end_test_controls.HoldFiles, n: u32, child_id: []const u8) void {
+fn writeHeldMarker(files: end_test_controls.HoldFiles, n: u32, child_id: []const u8) !void {
     var marker_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const marker = std.mem.print(&marker_buf, "{s}.{d}", .{ files.held, n }) catch return;
+    const marker = try std.mem.print(&marker_buf, "{s}.{d}", .{ files.held, n });
     var contents_buf: [256]u8 = undefined;
-    const contents = std.mem.print(&contents_buf, "report_delivery child={s}", .{child_id}) catch return;
-    end_test_controls.writeMarker(marker, contents) catch return;
+    const contents = try std.mem.print(&contents_buf, "report_delivery child={s}", .{child_id});
+    try end_test_controls.writeMarker(marker, contents);
 }
 
 fn deferEveryReport(_: []const u8) bool {
@@ -76,4 +84,55 @@ test "a test build defers a report's delivery only through its hook" {
     defer test_defer = null;
     try std.testing.expect(deferred("child"));
     try std.testing.expectEqual(@as(u32, 0), holds);
+}
+
+fn resetState() void {
+    active = null;
+    holds = 0;
+}
+
+test "a delivery hold whose marker cannot be written does not hold" {
+    defer resetState();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    // Both paths are absolute, but their folder does not exist, so no marker can be written.
+    const held = try std.testing.allocator.print("{s}/missing/held", .{dir});
+    defer std.testing.allocator.free(held);
+    const release = try std.testing.allocator.print("{s}/missing/release", .{dir});
+    defer std.testing.allocator.free(release);
+    const files: end_test_controls.HoldFiles = .{ .held = held, .release = release };
+
+    // A delivery that nothing can see held, for up to `max_hold_ms`, is the failure.
+    try std.testing.expect(!deferOnFiles(files, "child-1"));
+    try std.testing.expect(active == null);
+    try std.testing.expectEqual(@as(u32, 0), holds);
+    try std.testing.expect(!deferOnFiles(files, "child-1"));
+}
+
+test "a delivery hold with a marker it can write holds until its release file exists" {
+    defer resetState();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(dir);
+    const held = try std.testing.allocator.print("{s}/held", .{dir});
+    defer std.testing.allocator.free(held);
+    const release = try std.testing.allocator.print("{s}/release", .{dir});
+    defer std.testing.allocator.free(release);
+    const marker = try std.testing.allocator.print("{s}.1", .{held});
+    defer std.testing.allocator.free(marker);
+    const files: end_test_controls.HoldFiles = .{ .held = held, .release = release };
+
+    // It writes its marker once, and defers pass after pass.
+    try std.testing.expect(deferOnFiles(files, "child-1"));
+    try std.testing.expect(end_test_controls.pathExists(marker));
+    try std.testing.expect(deferOnFiles(files, "child-1"));
+    try std.testing.expectEqual(@as(u32, 1), holds);
+
+    // The release file ends it.
+    try end_test_controls.writeMarker(release, "");
+    try std.testing.expect(!deferOnFiles(files, "child-1"));
+    try std.testing.expect(active == null);
 }

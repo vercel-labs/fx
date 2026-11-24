@@ -16108,7 +16108,8 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
 // absolute ones: a relative path is ignored, as if the hold were not set. Main
 // starts subagent `worker`, stops it, and closes it, so the run reaches the
 // start, stopped-end, settle, publish, and close holds, each set to a relative
-// path; the session-write hold is set too, though this run does not reach it.
+// path; the session-write hold and the report-delivery hold are set too, though
+// this run does not reach them (the delivery hold is in the TUI's main loop).
 // fx must neither crash nor write a marker file into the workspace.
 test("a test hold set to a relative path is ignored", async () => {
   const root = createFixtureRoot("relative-hold-paths");
@@ -16149,6 +16150,8 @@ test("a test hold set to a relative path is ignored", async () => {
         FX_TEST_SUBAGENT_CLOSE_RELEASE: "relative-close-release",
         FX_TEST_SESSION_WRITE_HELD: "relative-session-write-held",
         FX_TEST_SESSION_WRITE_RELEASE: "relative-session-write-release",
+        FX_TEST_REPORT_DELIVERY_HELD: "relative-delivery-held",
+        FX_TEST_REPORT_DELIVERY_RELEASE: "relative-delivery-release",
       },
       timeoutMs: 30_000,
     });

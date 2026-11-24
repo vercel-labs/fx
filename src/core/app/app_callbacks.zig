@@ -892,6 +892,7 @@ pub fn Bindings(comptime App: type) type {
                 waited = true;
                 switch (agent.worker.waitForJoinedMail(turn_id, .{ .deadline = until })) {
                     .joined => return .joined,
+                    .behind => return .delivered,
                     .closed => return .closed,
                     .interrupted => return .interrupted,
                     .timed_out => return .timed_out,

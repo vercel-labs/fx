@@ -66,11 +66,18 @@
 (* (`Decide`). The check first asks the host whether mail waits in the     *)
 (* hand-off (`wait_for_handoff_mail`), and if so waits on the worker's     *)
 (* condition for it, at most MaxWait ticks (`Tick`, `GiveUp`); a stop or   *)
-(* cancel ends the wait at once (`Abort`). A turn that a check closed      *)
-(* takes no more mail, so a second empty reply waits for nothing.          *)
+(* cancel ends the wait at once (`Abort`). So does older work that waits   *)
+(* ahead of any new mail (`olderMailWaitsLocked`): none can join the turn, *)
+(* so the wait is read from the worker's state and needs no signal that is *)
+(* still to come, even when the mail is posted just before the wait. A     *)
+(* turn that a check closed takes no more mail, so a second empty reply    *)
+(* waits for nothing.                                                      *)
 (*   NoNudgeWithMail  a nudge never goes out while mail waits in the       *)
-(*                  hand-off, unless the wait gave up on it                *)
+(*                  hand-off, unless the wait gave up on it or older work  *)
+(*                  keeps that mail out of the turn                        *)
 (*   WaitBounded    the worker never waits longer than MaxWait ticks       *)
+(*   NoPointlessWait  the worker never waits while older work keeps mail   *)
+(*                  out of the turn                                        *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -91,7 +98,8 @@ Bugs == {"none",
          "stuck_gate",         \* a commit leaves the gate's count as it was
          "drop_unacknowledged",\* a finish the loop drops unsaved leaves the gate's count as it was
          "nudge_blind",        \* an empty reply's check ignores mail in the hand-off (fx before the wait)
-         "unbounded_wait"}     \* the worker waits for mail in the hand-off with no bound
+         "unbounded_wait",     \* the worker waits for mail in the hand-off with no bound
+         "wait_behind"}        \* the worker keeps waiting for mail that older work keeps out of the turn
 
 ASSUME /\ Bug \in Bugs
        /\ Joins \in BOOLEAN
@@ -118,7 +126,9 @@ VARIABLES
   hand      \* the hand-off: [list |-> mail the host queued and the loop has not posted,
             \*   empty |-> an empty reply's step has ended and the worker decides,
             \*   waited |-> ticks the worker has waited for the list, gaveUp |-> the bound passed,
-            \*   nudges |-> the nudges sent: [t |-> turn, listed |-> mail then in the list, gaveUp |-> ...]]
+            \*   pointless |-> the worker waited while older work kept mail out of the turn,
+            \*   nudges |-> the nudges sent: [t |-> turn, listed |-> mail then in the list, gaveUp |-> ...,
+            \*   behind |-> older work kept that mail out of the turn]]
 
 vars == <<turn, turns, open, marked, queue, posted, readIn, order, due, aborted, waits, twice, uncommitted, owed, early, hand>>
 commitVars == <<uncommitted, owed, early>>
@@ -157,7 +167,7 @@ Init ==
   /\ uncommitted = 0
   /\ owed = 0
   /\ early = FALSE
-  /\ hand = [list |-> <<>>, empty |-> FALSE, waited |-> 0, gaveUp |-> FALSE, nudges |-> {}]
+  /\ hand = [list |-> <<>>, empty |-> FALSE, waited |-> 0, gaveUp |-> FALSE, pointless |-> FALSE, nudges |-> {}]
 
 \* The user's prompt starts main's first turn.
 UserTurn ==
@@ -313,15 +323,17 @@ EmptyReply ==
 
 \* The worker waits on its condition for the mail in the hand-off, and a tick
 \* of the bound passes. A wait ends when mail joins the turn, which signals
-\* that condition.
+\* that condition, and when older work keeps mail out of the turn, which the
+\* worker reads from its state.
 Tick ==
   /\ hand.empty
   /\ open
   /\ hand.list # <<>>
   /\ Joined = <<>>
+  /\ (NothingOlder \/ Bug = "wait_behind")
   /\ ~hand.gaveUp
   /\ (hand.waited < MaxWait \/ Bug = "unbounded_wait")
-  /\ hand' = [hand EXCEPT !.waited = @ + 1]
+  /\ hand' = [hand EXCEPT !.waited = @ + 1, !.pointless = @ \/ ~NothingOlder]
   /\ UNCHANGED <<turn, turns, open, marked, queue, posted, readIn, order, due, aborted, waits, twice, uncommitted, owed, early>>
 
 \* The bound passes with the mail still in the hand-off: the wait ends, and
@@ -332,6 +344,7 @@ GiveUp ==
   /\ open
   /\ hand.list # <<>>
   /\ Joined = <<>>
+  /\ (NothingOlder \/ Bug = "wait_behind")
   /\ ~hand.gaveUp
   /\ hand.waited = MaxWait
   /\ hand' = [hand EXCEPT !.gaveUp = TRUE]
@@ -340,7 +353,8 @@ GiveUp ==
 \* The worker's check as the empty reply's step ends, once it waits for
 \* nothing more (`takeSteeringBoundaryIntoInner`, finalizing): it takes the
 \* mail that joined, which replaces the nudge, or closes the turn and sends
-\* the nudge.
+\* the nudge. It waits for nothing more when the list is empty, mail joined,
+\* the bound passed, or older work keeps new mail out of the turn.
 Decide ==
   /\ hand.empty
   /\ turn # 0
@@ -348,6 +362,7 @@ Decide ==
   /\ \/ hand.list = <<>>
      \/ Joined # <<>>
      \/ hand.gaveUp
+     \/ (~NothingOlder /\ Bug # "wait_behind")
      \/ Bug = "nudge_blind"
   /\ \/ /\ Joined # <<>>
         /\ queue' = Rest
@@ -357,7 +372,7 @@ Decide ==
      \/ /\ Joined = <<>>
         /\ open' = FALSE
         /\ hand' = [hand EXCEPT !.empty = FALSE, !.waited = 0, !.gaveUp = FALSE,
-                     !.nudges = @ \cup {[t |-> turn, listed |-> Range(hand.list), gaveUp |-> hand.gaveUp]}]
+                     !.nudges = @ \cup {[t |-> turn, listed |-> Range(hand.list), gaveUp |-> hand.gaveUp, behind |-> ~NothingOlder]}]
         /\ UNCHANGED <<queue, readIn, order, twice>>
   /\ UNCHANGED <<turn, turns, marked, posted, due, aborted, waits, uncommitted, owed, early>>
 
@@ -399,7 +414,8 @@ TypeOK ==
   /\ hand.empty \in BOOLEAN
   /\ hand.waited \in 0..(MaxWait + 1)
   /\ hand.gaveUp \in BOOLEAN
-  /\ \A n \in hand.nudges : n.t \in 0..MaxTurns /\ n.listed \subseteq Mail /\ n.gaveUp \in BOOLEAN
+  /\ hand.pointless \in BOOLEAN
+  /\ \A n \in hand.nudges : n.t \in 0..MaxTurns /\ n.listed \subseteq Mail /\ n.gaveUp \in BOOLEAN /\ n.behind \in BOOLEAN
 
 JoinsOpenTurn ==
   \A m \in Mail :
@@ -425,8 +441,10 @@ CommitBeforeNextTurn == ~early
 
 GateNeverStuck == owed <= uncommitted
 
-NoNudgeWithMail == \A n \in hand.nudges : n.listed = {} \/ n.gaveUp
+NoNudgeWithMail == \A n \in hand.nudges : n.listed = {} \/ n.gaveUp \/ n.behind
 
 WaitBounded == hand.waited <= MaxWait
+
+NoPointlessWait == ~hand.pointless
 
 =============================================================================
