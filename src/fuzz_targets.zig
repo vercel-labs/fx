@@ -28,6 +28,7 @@ test {
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
     _ = @import("core/gateway/token_pass_memory.zig");
+    _ = @import("core/images/clipboard_read.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
