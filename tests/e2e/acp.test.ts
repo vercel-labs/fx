@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive } from "./process-alive";
@@ -672,6 +673,9 @@ class AcpClient {
   private proc: ChildProcess;
   private buffer: string = "";
   private queue = new LineQueue();
+  // A read can end inside a multi-byte character; the decoder keeps it.
+  private decoder = new TextDecoder();
+  private _stdoutChunks: Buffer[] = [];
   private _closed = false;
   private _stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
@@ -689,7 +693,8 @@ class AcpClient {
   constructor(proc: ChildProcess) {
     this.proc = proc;
     proc.stdout!.on("data", (chunk: Buffer) => {
-      this.buffer += chunk.toString();
+      this._stdoutChunks.push(chunk);
+      this.buffer += this.decoder.decode(chunk, { stream: true });
       const parts = this.buffer.split("\n");
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
@@ -868,6 +873,26 @@ class AcpClient {
       }
     }
     return resp as object;
+  }
+
+  /// The lines fx wrote to stdout that are not valid UTF-8.
+  get invalidUtf8Lines(): Buffer[] {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const bytes = Buffer.concat(this._stdoutChunks);
+    const invalid: Buffer[] = [];
+    let start = 0;
+    while (start < bytes.length) {
+      const newline = bytes.indexOf(0x0a, start);
+      const end = newline === -1 ? bytes.length : newline;
+      const line = bytes.subarray(start, end);
+      try {
+        decoder.decode(line);
+      } catch {
+        invalid.push(line);
+      }
+      start = end + 1;
+    }
+    return invalid;
   }
 
   /** False once the agent process has exited or been killed. */
@@ -15680,3 +15705,358 @@ test(
   },
   TIMEOUT * 2,
 );
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acpSkillLocations(body: string, name: string): string[] {
+  return acpTaggedBlock(body, "available_skills").split("\n")
+    .filter((line) => line.startsWith(`- ${name}: `))
+    .map((line) => {
+      const start = line.lastIndexOf(" (location: ");
+      if (start < 0 || !line.endsWith(")")) throw new Error("Malformed skill location");
+      return line.slice(start + " (location: ".length, -1);
+    });
+}
+
+function acpSkillPath(body: string, location: string): string {
+  const match = /^skill:[0-9a-f]{16}:(\d+)\/(.+)$/.exec(location);
+  if (!match) throw new Error(`Invalid scoped skill location: ${location}`);
+  const prefix = `Root ${match[1]}: `;
+  const root = acpTaggedBlock(body, "available_skills").split("\n")
+    .find((line) => line.startsWith(prefix));
+  if (!root) throw new Error(`Missing root for ${location}`);
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(acpTurnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+/// Named pipes that hold a shell command between writes. A step waits on
+/// `hold(index)` until the test calls `release(index)`, which it does once it
+/// has seen the progress the previous write produced. The next write then
+/// arrives as its own chunk at any speed, with no pause to tune.
+function shellGates(count: number) {
+  const dir = mkdtempSync(join(tmpdir(), "fx-acp-gates-"));
+  const paths = Array.from({ length: count }, (_, index) => join(dir, `gate-${index}`));
+  for (const path of paths) {
+    const made = Bun.spawnSync(["mkfifo", path]);
+    if (made.exitCode !== 0) throw new Error(`mkfifo ${path} failed: ${made.stderr.toString()}`);
+  }
+  return {
+    hold: (index: number) => `read _ < '${paths[index]}'`,
+    release: (index: number) => writeFile(paths[index]!, "go\n"),
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function shellProgressText(client: AcpClient, callId: string): string {
+  return client.rawLines
+    .map(line => JSON.parse(line))
+    .filter((message: any) =>
+      message.method === "session/update"
+      && message.params?.update?.toolCallId === callId
+      && (message.params.update.status === undefined || message.params.update.status === "in_progress"))
+    .flatMap((message: any) => message.params.update.content ?? [])
+    .map((item: any) => item.content?.text ?? "")
+    .join("");
+}
+
+/// Runs `command` through the shell tool. With `gate`, the command holds after
+/// each write until its progress, `after[index]` in full so far, has reached
+/// the client.
+async function runShellProgress(
+  command: string,
+  callId: string,
+  gate?: { after: string[]; release: (index: number) => Promise<void> },
+) {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", ...(gate ? { yield_time_ms: 30_000 } : {}), command } }, callId));
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    sendPrompt(client, 4, "Run the command.");
+    for (const [index, text] of (gate?.after ?? []).entries()) {
+      await waitForCondition(
+        `progress for write ${index + 1}`,
+        () => shellProgressText(client, callId).length >= text.length,
+        TIMEOUT,
+      );
+      await gate!.release(index);
+    }
+    const { responses } = await readUntilResponses(client, [4], TIMEOUT);
+    const updates = client.rawLines
+      .map(line => JSON.parse(line))
+      .map((message: any) => message.params?.update)
+      .filter((update: any) => update?.toolCallId === callId);
+    const progress = shellProgressText(client, callId);
+    const invalid = client.invalidUtf8Lines;
+    client.endStdin();
+    const exitCode = await client.waitForExit();
+    return {
+      stopReason: responses.get(4)!.result.stopReason,
+      progress,
+      statuses: updates.map((update: any) => update.status),
+      invalid,
+      exitCode,
+      stderr: client.stderr,
+    };
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}
+
+test("ACP shell progress frames stay valid UTF-8 for long multi-byte output", async () => {
+  // Shell output reaches ACP in chunks of a few KiB cut at raw byte counts,
+  // so 2-, 3- and 4-byte characters land on every chunk boundary.
+  const command = "awk 'BEGIN{printf \"x\"; for(i=0;i<50000;i++) printf \"\u044f\u20ac\u{1f600}\"}'";
+  const result = await runShellProgress(command, "call_utf8_long");
+  expect(result.invalid.map(line => line.subarray(0, 120).toString("latin1"))).toEqual([]);
+  expect(result.progress).toBe("x" + "\u044f\u20ac\u{1f600}".repeat(50000));
+  expect(result.statuses.at(-1)).toBe("completed");
+  expect(result.stopReason).toBe("end_turn");
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+}, 45000);
+
+test("ACP shell progress joins characters split across chunks per stream and escapes invalid bytes", async () => {
+  // The runner sends a line once it ends or reaches 4096 bytes. Each padded
+  // printf fills 4096 bytes that end inside a character. After each write the
+  // command holds until the test has seen that write's progress, so the rest
+  // arrives as the next chunk. stdout and stderr each hold a split character
+  // at the same time; a stray byte and a tail left unfinished at exit come
+  // out escaped.
+  const gates = shellGates(5);
+  try {
+    const command = [
+      "printf '%4095s\\320' ' '",
+      gates.hold(0),
+      "printf '%4094s\\360\\237' ' ' >&2",
+      gates.hold(1),
+      "printf '\\257\\n'",
+      gates.hold(2),
+      "printf '\\230\\200\\n' >&2",
+      gates.hold(3),
+      "printf '%4095s\\360' ' '",
+      gates.hold(4),
+      "printf '\\237\\230\\200\\n'",
+      "printf 'bad\\377byte\\n'",
+      "printf 'tail\\342\\202'",
+    ].join("; ");
+    const first = " ".repeat(4095);
+    const second = first + " ".repeat(4094);
+    const third = second + "\u042f\n";
+    const fourth = third + "\u{1f600}\n";
+    const fifth = fourth + " ".repeat(4095);
+    const result = await runShellProgress(command, "call_utf8_split", {
+      after: [first, second, third, fourth, fifth],
+      release: gates.release,
+    });
+    expect(result.invalid.map(line => line.subarray(0, 120).toString("latin1"))).toEqual([]);
+    expect(result.progress).toBe(fifth + "\u{1f600}\n" + "bad\\xffbyte\n" + "tail" + "\\xe2\\x82");
+    expect(result.statuses.at(-1)).toBe("completed");
+    expect(result.stopReason).toBe("end_turn");
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+  } finally {
+    gates.remove();
+  }
+}, 45000);
+
+/// Runs `prompts` in one `fx acp` session whose agent may take `steps` model
+/// requests per turn, against a gateway that serves `replies` in order. Returns
+/// each prompt's stop reason and every request body the gateway received.
+async function stepLimitedSession(steps: number | undefined, replies: Response[], prompts: string[]) {
+  const root = createIsolatedRoot("fx-acp-step-limit-");
+  const gateway = startFakeGateway(replies);
+  const env = { ...fakeGatewayEnv(root, gateway), ...(steps === undefined ? {} : { FX_MAX_AGENT_STEPS: String(steps) }) };
+  const client = await AcpClient.create({ cwd: root.workspace, env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const stopReasons: string[] = [];
+    for (const [index, text] of prompts.entries()) {
+      sendPrompt(client, 10 + index, text);
+      const { responses } = await readUntilResponses(client, [10 + index]);
+      stopReasons.push(responses.get(10 + index)!.result.stopReason);
+    }
+    expect(client.stderr).toBe("");
+    return { stopReasons, requests: gateway.requests.map(request => request.body) };
+  } finally {
+    await client.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}
+
+// ACP says `refusal` leaves the turn out of the next prompt and
+// `max_turn_requests` does not. A failed turn that fx keeps in its history ends
+// with `end_turn`, one it leaves out ends with `refusal`, and a step-limit stop
+// ends with `max_turn_requests` and keeps its turn
+// (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut, DroppedTurnRefuses,
+// TurnLimitKeepsTurn).
+test("ACP answers a step-limit stop with max_turn_requests and keeps the turn", async () => {
+  const run = await stepLimitedSession(
+    2,
+    [fakeShellRun("gate_step_1", "echo one"), fakeShellRun("gate_step_2", "echo two"), finalText("Picked up.")],
+    ["Keep running commands.", "Continue."],
+  );
+  expect(run.stopReasons).toEqual(["max_turn_requests", "end_turn"]);
+  expect(run.requests).toHaveLength(3);
+  for (const kept of ["Keep running commands.", "gate_step_1", "gate_step_2", "Continue."]) {
+    expect(run.requests[2]).toContain(kept);
+  }
+}, 45000);
+
+test("ACP answers a step limit of one with max_turn_requests, and a turn that ends on its last step with end_turn", async () => {
+  const one = await stepLimitedSession(
+    1,
+    [fakeShellRun("only_step", "echo one"), finalText("Picked up.")],
+    ["Run one command.", "Continue."],
+  );
+  expect(one.stopReasons).toEqual(["max_turn_requests", "end_turn"]);
+  expect(one.requests[1]).toContain("only_step");
+
+  const last = await stepLimitedSession(
+    2,
+    [fakeShellRun("last_step", "echo one"), finalText("Done.")],
+    ["Run one command."],
+  );
+  expect(last.stopReasons).toEqual(["end_turn"]);
+}, 90000);
+
+test("ACP answers a failed first request with refusal and leaves the prompt out of the next request", async () => {
+  const run = await stepLimitedSession(
+    2,
+    [
+      new Response(JSON.stringify({ error: { message: "bad request" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }),
+      finalText("Fresh start."),
+    ],
+    ["This prompt fails.", "Next question."],
+  );
+  expect(run.stopReasons).toEqual(["refusal", "end_turn"]);
+  expect(run.requests).toHaveLength(2);
+  expect(run.requests[1]).toContain("Next question.");
+  expect(run.requests[1]).not.toContain("This prompt fails.");
+}, 45000);
+
+test("ACP answers a rejected stream inside a tool call with a JSON-RPC error and leaves the prompt out of the next request", async () => {
+  // The provider starts a tool call, then rejects the request with a code a
+  // resend cannot fix. The turn ends on that error, and fx keeps no part of it.
+  const rejectedToolStart = () => fakeGatewaySse([
+    { type: "tool-input-start", id: "search_open", toolName: "provider_publish" },
+    { type: "tool-input-delta", id: "search_open", delta: "{\"query\":" },
+    { type: "error", error: { code: "invalid_request_error", message: "rejected mid tool call" } },
+    { type: "finish", finishReason: { unified: "error" } },
+  ]);
+  const root = createIsolatedRoot("fx-acp-rejected-tool-");
+  const gateway = startFakeGateway([rejectedToolStart(), finalText("Fresh start.")]);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+    sendPrompt(client, 10, "This prompt fails.");
+    const failed = await readUntilResponses(client, [10]);
+    expect(failed.responses.get(10)!.result).toBeUndefined();
+    expect(failed.responses.get(10)!.error).toBeDefined();
+    expect(gateway.requests).toHaveLength(1);
+
+    sendPrompt(client, 11, "Next question.");
+    const next = await readUntilResponses(client, [11]);
+    expect(next.responses.get(11)!.result.stopReason).toBe("end_turn");
+    expect(gateway.requests).toHaveLength(2);
+    const nextBody = gateway.requests[1]!.body;
+    expect(nextBody).toContain("Next question.");
+    expect(nextBody).not.toContain("This prompt fails.");
+    expect(nextBody).not.toContain("search_open");
+    expect(client.stderr).toBe("");
+  } finally {
+    if (client) await client.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45000);
+
+/// A kept failed turn: the turn ends as failed with a notice, fx saves it, and
+/// the next request holds the prompt and `kept`, so the turn ends with `end_turn`.
+async function expectKeptFailedTurn(replies: Response[], kept: string[], steps?: number) {
+  const run = await stepLimitedSession(steps, [...replies, finalText("Picked up.")], ["This prompt fails.", "Next question."]);
+  expect(run.stopReasons).toEqual(["end_turn", "end_turn"]);
+  expect(run.requests).toHaveLength(replies.length + 1);
+  const next = run.requests[replies.length]!;
+  expect(next).toContain("Next question.");
+  for (const text of ["This prompt fails.", ...kept]) expect(next).toContain(text);
+}
+
+const emptyReply = () => fakeGatewaySse([
+  { type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } } },
+]);
+
+test("ACP ends a kept failed turn, an empty reply twice, with end_turn and holds it in the next request", async () => {
+  await expectKeptFailedTurn([emptyReply(), emptyReply()], []);
+}, 45000);
+
+test("ACP ends a kept failed turn, malformed tool arguments three times, with end_turn and holds it in the next request", async () => {
+  await expectKeptFailedTurn(
+    [
+      fakeGatewaySerializedToolCall("malformed_1", "ask_user_question", '{"depth":1,"depth":2}'),
+      fakeGatewaySerializedToolCall("malformed_2", "ask_user_question", '{"depth":1,"depth":2}'),
+      fakeGatewaySerializedToolCall("malformed_3", "read_file", '{"path":"README.md",}'),
+    ],
+    ["malformed_1"],
+  );
+}, 45000);
+
+test("ACP ends a kept failed turn, a repeated terminal validation failure, with end_turn and holds it in the next request", async () => {
+  // The shell request names its executable in two key orders, and fx does not run it.
+  const invalid = (id: string, pathFirst: boolean) => fakeGatewaySse([
+    {
+      type: "tool-call",
+      toolCallId: id,
+      toolName: "shell",
+      input: {
+        request: {
+          command: "printf unexpected > must-not-run.txt",
+          tty: true,
+          shell: pathFirst ? { path: "/bin/bash", kind: "executable" } : { kind: "executable", path: "/bin/bash" },
+        },
+        yield_time_ms: "1000",
+      },
+    },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+  await expectKeptFailedTurn([invalid("invalid_1", false), invalid("invalid_2", true)], ["invalid_1"]);
+}, 45000);
+
+test("ACP ends a kept failed turn, three identical shell failures, with end_turn and holds it in the next request", async () => {
+  const failing = (id: string) => fakeShellRun(id, "echo bad >&2; exit 1");
+  await expectKeptFailedTurn([failing("fail_1"), failing("fail_2"), failing("fail_3")], ["fail_1"]);
+}, 45000);
+
+test("ACP ends a kept failed turn, a failed request after a tool step, with end_turn and holds its tool call in the next request", async () => {
+  const badRequest = new Response(JSON.stringify({ error: { message: "bad request" } }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  });
+  await expectKeptFailedTurn([fakeShellRun("tool_1", "echo one"), badRequest], ["tool_1"]);
+}, 45000);
