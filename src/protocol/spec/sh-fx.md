@@ -1,6 +1,6 @@
 # sh.fx: fx extensions to the Agent Client Protocol
 
-Status: draft. fx doesn't implement any part of this specification yet. A section that says what it will define is not written yet.
+Status: draft. fx implements the parts that a section describes as built. A section that says what it will define is not written yet.
 
 `sh.fx` adds the session features that fx's own clients need to version 1 of the [Agent Client Protocol](https://agentclientprotocol.com) (ACP). It uses only ACP's [extension mechanisms](https://agentclientprotocol.com/protocol/v1/extensibility) and changes no standard message, so a client that knows only ACP works with fx and sees the standard part of each session. A client receives an extension's messages only after fx and the client both advertise the extension in `initialize`.
 
@@ -186,7 +186,7 @@ A session can be open on several connections at once, which ACP v2's [session se
 - `session/load` replays the saved turns, then the session's saved title when it has one, then the updates that the running turn has sent so far, then its answer.
 - `session/resume` sends only its answer.
 
-fx does the joining and watching this section describes, and it takes input from every client. A joined client's `session/prompt`, `session/cancel`, steers and queued prompts take part in the session's one order (see "Steering and queued prompts"), and each answer goes to the connection that sent its request. A client that is not the main client (see "The main client") gets error `-32600` for `session/set_mode` and `session/set_config_option`, with the message `This session is open on another connection; only that connection can change it.` A `systemPrompt` in a joining request applies from the next turn, and fx ignores that request's hooks and traces them. A client leaves a session when it sends `session/close` for it or its input ends, as "Leaving a session" describes, and a client that has left gets `-32002` for requests to that session. fx doesn't yet send catch-up positions (`sh.fx/logPosition` and `sh.fx/replayFrom`), the sender's `sh.fx/client` in each chunk's `_meta`, permission requests to every client (they go only to the main client), a turn-end notice to the other clients (only the prompt's sender gets the stop reason), or the client list.
+fx does the joining and watching this section describes, and it takes input from every client. A joined client's `session/prompt`, `session/cancel`, steers and queued prompts take part in the session's one order (see "Steering and queued prompts"), and each answer goes to the connection that sent its request. A client that is not the main client (see "The main client") gets error `-32600` for `session/set_mode` and `session/set_config_option`, with the message `This session is open on another connection; only that connection can change it.` A `systemPrompt` in a joining request applies from the next turn, and fx ignores that request's hooks and traces them. A client leaves a session when it sends `session/close` for it or its input ends, as "Leaving a session" describes, and a client that has left gets `-32002` for requests to that session. fx doesn't yet send catch-up positions (`sh.fx/logPosition` and `sh.fx/replayFrom`), the sender's `sh.fx/client` in each chunk's `_meta`, a turn-end notice to the other clients (only the prompt's sender gets the stop reason), or the client list.
 
 A load's replay of the running turn holds the updates that its copy kept, in order. For a client that lists `sh.fx/turnProgress`, the turn's latest progress follows them. When fx kept only the start of the running turn's output, a notice comes before the answer: `fx kept only the start of this turn's output, so part of it isn't shown.` It is an ACP `info` notice for a client whose `clientCapabilities` lists `session.notices`, and an agent message for any other client. The copy keeps the running turn's updates up to 16 MiB; once it drops one, it keeps no later one.
 
@@ -214,9 +214,9 @@ fx acp exits when no client remains and no turn runs.
 
 #### The main client
 
-The main client is the first client in join order. The client that opened the session is the main client until it leaves; after that, the client that joined first among those that remain is. The main client gets a turn's permission requests and its host-tool calls, which run from the main client's own tools, and it is the only client that may send `session/set_mode` and `session/set_config_option`.
+The main client is the first client in join order. The client that opened the session is the main client until it leaves; after that, the client that joined first among those that remain is. The main client gets a turn's host-tool calls, which run from the main client's own tools, and it is the only client that may send `session/set_mode` and `session/set_config_option`.
 
-When the main client leaves while another client remains, a permission request that waits on it moves to the new main client, which gets the request again under a new request id. Each other request that the leaving client still owes gets an error result.
+When a client leaves while a permission request waits, the request stays with the other clients: the leaving client's copy goes away, and nobody is asked again. Each other request that the leaving client still owes gets an error result.
 
 #### Catching up
 
@@ -274,11 +274,15 @@ When a prompt starts a turn, or runs after the queue, fx sends its content as `u
 
 #### Permission requests
 
-Not built yet: a request to every client, the first answer deciding, and the client list in "Who is connected".
+fx sends a turn's `session/request_permission` to every client that has the session open. Each client gets its own copy of the request, under its own request id, and each copy has the same tool call and arguments. A client that joins while the request waits gets its copy after its replay and before its load or resume response. Only the copy for the client that sent the turn's prompt offers "allow for this session". The other copies offer "allow once" and "reject".
 
-fx sends a turn's `session/request_permission` to every client that has the session open, and to a client that opens the session while the request waits, after any replay and before the response to its load or resume, as ACP v2 reestablishes a pending request. While no client has the session open, the request waits for the next one.
+The first valid answer decides. An answer is valid when it uses the request id that fx gave the answering client and names an option that client was offered. fx ignores an answer that is not valid, and the request stays open for the other clients. fx also ignores every answer after the decision, including a `cancelled` outcome. When the answer decides, fx sends `$/cancel_request` with its own request id to each other client that received its copy, and the tool call's updates tell every client what happened, as for any permission request.
 
-The first answer decides. fx cancels the request on the other clients with `$/cancel_request`, as ACP lets an Agent cancel its own requests, and ignores a later answer, including their `cancelled` outcome. The tool call's updates then tell every client what happened, as for any permission request.
+A client that leaves takes its copy away, and nobody is asked again. The request stays open for the other clients. When no client is left, the request is denied at once. A `session/cancel` of the turn cancels every copy, and each client that received one is told with its own request id.
+
+Not built yet: a subagent's permission request to every client that has the parent session open, and the client list in "Who is connected".
+
+`tests/tla/acp/AcpApprovals.tla` models these rules, and TLC checks that every client gets the request, that the first valid answer decides, that the other clients are told, that only the sender's copy offers "allow for this session", and that a leaving client's copy goes with no re-ask. `tests/tla/drivers/acp/approvals/driver.ts` checks the same rules on the built fx.
 
 #### Stopping a turn
 
@@ -307,7 +311,7 @@ Each entry gives a client's id and the `clientInfo` that the client sent at `ini
 }
 ```
 
-`tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a permission is decided once, that every other client loses the request it can no longer answer, that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. Its `Today` configs show where fx breaks them now.
+`tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. Its `Today` configs show where fx breaks them now. The permission rules are in "Permission requests" and `tests/tla/acp/AcpApprovals.tla`.
 
 ### Session status and list changes
 
@@ -395,7 +399,7 @@ For a client that lists `subagents`:
 - fx sends a `subagent_update` in the parent session before any update of a child's work. It gives the child's own session id, its title and description, its `cwd`, and its state, as "Session status and list changes" defines states.
 - Every update of a child's work uses the child's session id, including its tool calls and its permission requests.
 - Each child's `capabilities` grants `cancel`. `session/cancel` with a child's id stops only that child's current work. The parent's tool call that waits for the child gets the child's cancelled result, and the parent's turn goes on. `session/cancel` of the parent stops its children's work as well.
-- A child's permission request goes to every client that has the parent session open, as "Permission requests" says. It stays with the child: when the child's work stops, fx cancels the request with `$/cancel_request`, and it never moves to the parent.
+- Sending a child's permission request to every client that has the parent session open is not built yet. The request stays with the child: when the child's work stops, fx cancels the request with `$/cancel_request`, and it never moves to the parent.
 - A child isn't in `session/list`, and a client doesn't load, resume, or close a child.
 
 When a client loads or resumes the parent, fx replays each child's `subagent_update` and history with the child's own session id, before the response. It doesn't send a recorded permission request again, but a request that still waits goes out as current, and fx sends each child's current state.
