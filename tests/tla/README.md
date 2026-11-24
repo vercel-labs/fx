@@ -72,7 +72,7 @@ npm ci --prefix sdk/durable
 
 ## MCP in CI
 
-CI runs MCP in two parallel jobs, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. `TLA+ MCP engine models and driver` runs each engine model's smoke config (`mcp/run.py check`) and the engine driver (`drivers/mcp/driver.ts`). `TLA+ MCP host models and drivers` runs the `mcp_host` drivers, and checks the host models through `models.test.ts` in them, which runs every host model's smoke and stress configs, planted bugs, findings, and repair witnesses: the catalog `mcp_host/check.sh` runs by hand, so CI doesn't run that script too. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+CI runs MCP in three parallel jobs, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. `TLA+ MCP engine models and driver` runs each engine model's smoke config (`mcp/run.py check`) and the engine driver (`drivers/mcp/driver.ts`). `TLA+ MCP host models` runs `models.test.ts`, which checks the host models and runs every host model's smoke and stress configs, planted bugs, findings, and repair witnesses: the catalog `mcp_host/check.sh` runs by hand, so CI doesn't run that script too. `TLA+ MCP host drivers` runs every other test file in `drivers/mcp_host/`. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
 
 `.github/workflows/tla-mcp-call.yml` runs `mcp_call/check.sh`, planted bugs included, on every push to `main` and on pull requests labeled `ci:tla-mcp-call`.
 
