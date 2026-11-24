@@ -29,6 +29,7 @@ pub const ProviderPickerStage = enum {
 pub const InlinePickerKind = enum {
     slash,
     model,
+    copy,
     provider,
     file,
     skill,
@@ -36,12 +37,11 @@ pub const InlinePickerKind = enum {
 
 const InlinePickerSuppression = union(enum) {
     dismissed_until_trigger_change: InlinePickerKind,
-    history_slash_recall_until_edit,
+    history_recall_until_edit: InlinePickerKind,
 
     fn kind(self: InlinePickerSuppression) InlinePickerKind {
         return switch (self) {
-            .dismissed_until_trigger_change => |suppressed_kind| suppressed_kind,
-            .history_slash_recall_until_edit => .slash,
+            .dismissed_until_trigger_change, .history_recall_until_edit => |suppressed_kind| suppressed_kind,
         };
     }
 };
@@ -144,6 +144,18 @@ pub const State = struct {
     slash_completion_index: usize = 0,
     slash_completion_window_start: usize = 0,
     inline_picker_suppression: ?InlinePickerSuppression = null,
+    copy_completion_index: usize = 0,
+    copy_completion_window_start: usize = 0,
+    copy_completion_moved: bool = false,
+    copy_completion_storage: std.ArrayList(u8) = .empty,
+    copy_completion_all_labels: std.ArrayList([]const u8) = .empty,
+    copy_completion_labels: std.ArrayList([]const u8) = .empty,
+    copy_completion_cached: bool = false,
+    copy_snapshot_storage: std.ArrayList(u8) = .empty,
+    copy_snapshot_lengths: [3]usize = @splat(0),
+    copy_snapshot_count: ?usize = null,
+    copy_snapshot_agent: usize = 0,
+    copy_snapshot_stale: bool = false,
     model_completion_index: usize = 0,
     model_completion_window_start: usize = 0,
     model_completion_anchor_current: bool = false,
@@ -182,6 +194,10 @@ pub const State = struct {
 
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
+        self.copy_completion_storage.deinit(alloc);
+        self.copy_completion_all_labels.deinit(alloc);
+        self.copy_completion_labels.deinit(alloc);
+        self.copy_snapshot_storage.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
         self.provider_picker_pending_provider.deinit(alloc);
         self.provider_picker_pending_method.deinit(alloc);
@@ -197,6 +213,12 @@ pub const State = struct {
         self.file_completion.invalidate();
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
+        self.copy_completion_index = 0;
+        self.copy_completion_window_start = 0;
+        self.copy_completion_moved = false;
+        self.copy_completion_cached = false;
+        self.copy_snapshot_count = null;
+        self.copy_snapshot_stale = false;
         self.inline_picker_suppression = null;
     }
 
@@ -216,7 +238,7 @@ pub const State = struct {
         const suppression = self.inline_picker_suppression orelse return false;
         return switch (suppression) {
             .dismissed_until_trigger_change => |dismissed| dismissed == kind,
-            .history_slash_recall_until_edit => false,
+            .history_recall_until_edit => false,
         };
     }
 
@@ -256,6 +278,59 @@ pub const State = struct {
         return self.rawFilePickerQuery(editor);
     }
 
+    pub fn activeCopyPickerQuery(self: *const State, editor: *const editor_state.State) ?ModelPickerQuery {
+        if (self.isInlinePickerSuppressed(.copy)) return null;
+        return self.rawCopyPickerQuery(editor);
+    }
+
+    pub fn rawCopyPickerQuery(_: *const State, editor: *const editor_state.State) ?ModelPickerQuery {
+        const items = editor.input.items;
+        const start = leadingWhitespaceLen(items);
+        const trimmed = items[start..];
+        if (trimmed.len < 5 or !std.ascii.eqlIgnoreCase(trimmed[0..5], "/copy")) return null;
+        if (trimmed.len > 5 and trimmed[5] != ' ') return null;
+        const token_start = start + @min(trimmed.len, 6);
+        return .{ .stage = .model, .query = items[token_start..], .token_start = token_start };
+    }
+
+    /// Bind the picker to exact replies until the composer is edited or cleared.
+    pub fn reconcileCopySnapshot(self: *State, alloc: Allocator, agent: usize, replies: []const []const u8) !bool {
+        std.debug.assert(replies.len <= self.copy_snapshot_lengths.len);
+        if (self.copy_snapshot_count == null) {
+            var bytes: usize = 0;
+            for (replies) |reply| bytes += reply.len;
+            self.copy_snapshot_storage.clearRetainingCapacity();
+            try self.copy_snapshot_storage.ensureTotalCapacity(alloc, bytes);
+            for (replies, 0..) |reply, i| {
+                self.copy_snapshot_lengths[i] = reply.len;
+                self.copy_snapshot_storage.appendSliceAssumeCapacity(reply);
+            }
+            self.copy_snapshot_count = replies.len;
+            self.copy_snapshot_agent = agent;
+            self.copy_snapshot_stale = false;
+            return true;
+        }
+        if (self.copy_snapshot_stale) return false;
+        if (self.copy_snapshot_agent != agent or self.copy_snapshot_count.? != replies.len) {
+            self.copy_snapshot_stale = true;
+            return false;
+        }
+        var start: usize = 0;
+        for (replies, 0..) |reply, i| {
+            const end = start + self.copy_snapshot_lengths[i];
+            if (!std.mem.eql(u8, reply, self.copy_snapshot_storage.items[start..end])) {
+                self.copy_snapshot_stale = true;
+                return false;
+            }
+            start = end;
+        }
+        return true;
+    }
+
+    pub fn revealStaleCopyPicker(self: *State) void {
+        if (self.isInlinePickerSuppressed(.copy)) self.inline_picker_suppression = null;
+    }
+
     pub fn activeModelPickerQuery(self: *const State, editor: *const editor_state.State) ?ModelPickerQuery {
         if (self.isInlinePickerSuppressed(.model)) return null;
         return self.rawModelPickerQuery(editor);
@@ -278,6 +353,7 @@ pub const State = struct {
 
     fn rawFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
         if (self.rawModelPickerQuery(editor) != null) return null;
+        if (self.rawCopyPickerQuery(editor) != null) return null;
         if (self.rawProviderPickerQuery(editor) != null) return null;
         const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
         if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
@@ -286,6 +362,7 @@ pub const State = struct {
 
     pub fn inlinePickerTriggerKind(self: *const State, editor: *const editor_state.State) ?InlinePickerKind {
         if (self.rawModelPickerQuery(editor) != null) return .model;
+        if (self.rawCopyPickerQuery(editor) != null) return .copy;
         if (self.rawProviderPickerQuery(editor) != null) return .provider;
         if (self.rawFilePickerQuery(editor) != null) return .file;
         if (findInlineSkillQuery(editor.input.items, editor.cursor) != null) return .skill;
@@ -368,6 +445,12 @@ pub const State = struct {
     /// The composer text changed, so whichever column is open no longer has a
     /// trustworthy highlighted row.
     pub fn resetActiveCompletionIndex(self: *State) void {
+        self.copy_completion_index = 0;
+        self.copy_completion_window_start = 0;
+        self.copy_completion_moved = false;
+        self.copy_completion_cached = false;
+        self.copy_snapshot_count = null;
+        self.copy_snapshot_stale = false;
         self.resetActiveModelPickerIndex();
         self.resetActiveProviderPickerIndex();
     }
@@ -513,8 +596,9 @@ pub const State = struct {
 };
 
 fn suppressionForHistoryRecall(trigger: ?InlinePickerKind) ?InlinePickerSuppression {
-    if (trigger != .slash) return null;
-    return .history_slash_recall_until_edit;
+    const kind = trigger orelse return null;
+    if (kind != .slash and kind != .copy) return null;
+    return .{ .history_recall_until_edit = kind };
 }
 
 fn suppressionAfterEdit(
@@ -527,7 +611,7 @@ fn suppressionAfterEdit(
             suppression
         else
             null,
-        .history_slash_recall_until_edit => null,
+        .history_recall_until_edit => null,
     };
 }
 
@@ -698,7 +782,7 @@ test "picker deinit releases owned text and restores declared defaults" {
     state.model_picker_stage = .fast;
     state.provider_picker_stage = .api_key;
     state.slash_completion_index = 7;
-    state.inline_picker_suppression = .history_slash_recall_until_edit;
+    state.inline_picker_suppression = .{ .history_recall_until_edit = .slash };
     state.file_completion.active = true;
     state.file_completion.episode = 51;
     state.deinit(alloc);
@@ -773,6 +857,46 @@ test "skill query binds the nearest dollar anywhere at the cursor" {
     try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
     _ = editor.setCursor("price$10".len);
     try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
+}
+
+test "copy history recall suppresses its picker until edit" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+    for ([_][]const u8{ "/copy", "/copy target" }) |text| {
+        try editor.setText(alloc, text);
+        state.resetInlinePickerForHistoryRecall(&editor);
+        try std.testing.expect(state.activeCopyPickerQuery(&editor) == null);
+        try std.testing.expect(!state.isInlinePickerDismissed(.copy));
+        state.reconcileInlinePickerAfterEdit(&editor);
+        try std.testing.expect(state.activeCopyPickerQuery(&editor) != null);
+    }
+}
+
+test "copy picker recognizes bare and filtered input and dismisses until trigger changes" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try editor.setText(alloc, "/copy");
+    try std.testing.expectEqualStrings("", state.activeCopyPickerQuery(&editor).?.query);
+    try std.testing.expectEqual(InlinePickerKind.copy, state.inlinePickerTriggerKind(&editor).?);
+    try editor.setText(alloc, "/copy code");
+    try std.testing.expectEqualStrings("code", state.activeCopyPickerQuery(&editor).?.query);
+    state.dismissInlinePicker(.copy);
+    try std.testing.expect(state.activeCopyPickerQuery(&editor) == null);
+    try editor.setText(alloc, "/cop");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try editor.setText(alloc, "/copy @file");
+    state.reconcileInlinePickerAfterEdit(&editor);
+    try std.testing.expect(state.activeCopyPickerQuery(&editor) != null);
+    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
+    try editor.setText(alloc, "/copying");
+    try std.testing.expect(state.activeCopyPickerQuery(&editor) == null);
 }
 
 test "model picker query takes precedence over file syntax" {

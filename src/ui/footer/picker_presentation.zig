@@ -833,7 +833,7 @@ pub noinline fn composePickerOptionRowAnnotated(
     // Model, provider, model-catalog, and effort pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
+        .model_stage, .copy_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .fork, .agents, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
@@ -923,6 +923,7 @@ pub fn composePickerStatusRowWithProvider(
             .effort => "no matching effort",
             .fast => "no matching mode",
         },
+        .copy_stage => if (failed) "copy targets changed or unavailable; edit to refresh" else "no matching copy targets",
         .provider_stage => switch (provider_stage) {
             .provider => "no matching providers",
             .method => "no matching sign-in methods",

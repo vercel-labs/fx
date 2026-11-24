@@ -31,7 +31,7 @@ pub const ParsedCommand = union(enum) {
     undo,
     mcp: []const u8,
     skills: []const u8,
-    copy,
+    copy: []const u8,
     feedback,
     trace,
     compact,
@@ -77,7 +77,7 @@ pub const CommandHandlers = struct {
     undo_last: *const fn (ctx: *anyopaque) anyerror!void,
     handle_mcp: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_skills: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    copy_last: *const fn (ctx: *anyopaque) anyerror!void,
+    copy_last: *const fn (ctx: *anyopaque, target: []const u8) anyerror!void,
     submit_feedback: *const fn (ctx: *anyopaque) anyerror!void,
     create_trace: *const fn (ctx: *anyopaque) anyerror!void,
     compact_history: *const fn (ctx: *anyopaque) anyerror!void,
@@ -127,7 +127,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .undo => .undo,
         .mcp => .{ .mcp = payload },
         .skills => .{ .skills = payload },
-        .copy => .copy,
+        .copy => .{ .copy = payload },
         .feedback => .feedback,
         .trace => .trace,
         .compact => .compact,
@@ -197,7 +197,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .undo => try handlers.undo_last(handlers.ctx),
         .mcp => |rest| try handlers.handle_mcp(handlers.ctx, rest),
         .skills => |rest| try handlers.handle_skills(handlers.ctx, rest),
-        .copy => try handlers.copy_last(handlers.ctx),
+        .copy => |target| try handlers.copy_last(handlers.ctx, target),
         .feedback => try handlers.submit_feedback(handlers.ctx),
         .trace => try handlers.create_trace(handlers.ctx),
         .compact => try handlers.compact_history(handlers.ctx),
@@ -316,7 +316,6 @@ test "parse extracts mcp command payload" {
 }
 
 test "parse recognizes exact no-payload commands" {
-    try std.testing.expectEqual(ParsedCommand.copy, parse(testSlashRegistry(), "/copy"));
     try std.testing.expectEqual(ParsedCommand.feedback, parse(testSlashRegistry(), "/feedback"));
     try std.testing.expectEqual(ParsedCommand.trace, parse(testSlashRegistry(), "/trace"));
     try std.testing.expectEqual(ParsedCommand.compact, parse(testSlashRegistry(), "/compact"));
@@ -371,7 +370,6 @@ test "parse treats unknown and malformed command inputs as unknown" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/tasks"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/subagents"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "hello"));
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/copy extra"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), " /model claude-opus"));
 }
 
@@ -380,7 +378,6 @@ test "parse tolerates trailing whitespace on exact-match commands" {
     try std.testing.expectEqual(ParsedCommand.quit, parse(testSlashRegistry(), "/quit  "));
     try std.testing.expectEqual(ParsedCommand.quit, parse(testSlashRegistry(), "/exit \t"));
     try std.testing.expectEqual(ParsedCommand.help, parse(testSlashRegistry(), "/help "));
-    try std.testing.expectEqual(ParsedCommand.copy, parse(testSlashRegistry(), "/copy "));
     try std.testing.expectEqual(ParsedCommand.clear_screen, parse(testSlashRegistry(), "/clear\t"));
 }
 
@@ -464,8 +461,9 @@ fn recordShell(ctx: *anyopaque, value: []const u8) anyerror!void {
     testContext(ctx).payload = value;
 }
 
-fn recordCopy(ctx: *anyopaque) anyerror!void {
+fn recordCopy(ctx: *anyopaque, value: []const u8) anyerror!void {
     testContext(ctx).called = "copy";
+    testContext(ctx).payload = value;
 }
 
 fn recordResumeSession(ctx: *anyopaque) anyerror!void {
@@ -540,7 +538,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .undo_last = unexpectedNoPayload,
         .handle_mcp = unexpectedPayload,
         .handle_skills = unexpectedPayload,
-        .copy_last = unexpectedNoPayload,
+        .copy_last = unexpectedPayload,
         .submit_feedback = unexpectedNoPayload,
         .create_trace = unexpectedNoPayload,
         .compact_history = unexpectedNoPayload,
@@ -592,15 +590,25 @@ test "/setup warns through its own handler and /provider does not" {
     }
 }
 
-test "route calls expected no-payload handler" {
-    var ctx: TestContext = .{};
-    var handlers = testHandlers(&ctx);
-    handlers.copy_last = recordCopy;
-
-    try route(testSlashRegistry(), &handlers, "/copy");
-
-    try std.testing.expectEqualStrings("copy", ctx.called);
-    try std.testing.expectEqualStrings("", ctx.payload);
+test "copy parses and routes its target" {
+    for ([_]struct { cmd: []const u8, target: []const u8 }{
+        .{ .cmd = "/copy", .target = "" },
+        .{ .cmd = "/copy \t", .target = "" },
+        .{ .cmd = "/copy all", .target = "all" },
+        .{ .cmd = "/copy  code_example \t", .target = "code_example" },
+    }) |case| {
+        switch (parse(testSlashRegistry(), case.cmd)) {
+            .copy => |target| try std.testing.expectEqualStrings(case.target, target),
+            else => return error.TestExpectedEqual,
+        }
+        var ctx: TestContext = .{};
+        var handlers = testHandlers(&ctx);
+        handlers.copy_last = recordCopy;
+        try route(testSlashRegistry(), &handlers, case.cmd);
+        try std.testing.expectEqualStrings("copy", ctx.called);
+        try std.testing.expectEqualStrings(case.target, ctx.payload);
+    }
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/copycat"));
 }
 
 test "route calls interactive resume handler" {
