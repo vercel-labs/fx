@@ -7849,7 +7849,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       // Ctrl+O keeps core's row for each search, by the file's path.
       await session.sendKeys("C-o");
-      const full = await session.waitForPane((pane) => pane.includes('output for "gamma"'), TIMEOUT);
+      // A long temporary folder, such as macOS's /private/var/folders/...,
+      // wraps a row between "output" and "for", so rows are read with their
+      // line breaks and indents joined into single spaces.
+      const unwrapped = (pane: string) => pane.replace(/\s+/g, " ");
+      const full = unwrapped(await session.waitForPane((pane) => unwrapped(pane).includes('output for "gamma"'), TIMEOUT));
       for (const word of words) expect(full).toMatch(new RegExp(`Searched \\S*/reference-notes\\.md output for "${word}"`));
       expect(full).not.toContain('output for "alpha", "beta"');
       await session.sendKeys("C-o");
