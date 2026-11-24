@@ -2721,17 +2721,17 @@ test "hook text a person reads is escaped where it is built, and the model's cop
 
     // The refusal the person reads shows the sequence as text, with no raw ESC byte.
     const refusal = configChange(lifecycle, arena, "settings", "sound.max", "false", "true").refusal orelse return error.MissingRefusal;
-    try std.testing.expect(std.mem.indexOfScalar(u8, refusal, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, refusal, 0x1b) == null);
     try std.testing.expectEqualStrings("A hook refused this setting change: \\x1b[31mred\\x1b[0m", refusal);
 
     // A notice from a hook escapes its id and its text where the notice is built.
     const notice = try noticeText(arena, .{ .kind = .message, .hook_id = @constCast("guard\x1b[2J"), .text = @constCast("\x1b[31mred\x1b[0m") });
-    try std.testing.expect(std.mem.indexOfScalar(u8, notice, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, notice, 0x1b) == null);
     try std.testing.expectEqualStrings("Hook guard\\x1b[2J: \\x1b[31mred\\x1b[0m", notice);
 
     // The model's copy keeps its bytes: the context a hook gives is framed, not escaped.
     const context = try frameContext(arena, "UserPromptSubmit", null, "\x1b[31mcontext");
-    try std.testing.expect(std.mem.indexOfScalar(u8, context, 0x1b) != null);
+    try std.testing.expect(std.mem.findScalar(u8, context, 0x1b) != null);
 }
 
 test "terminal-safe hook text does not change when it is escaped again" {

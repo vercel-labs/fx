@@ -42,7 +42,7 @@ pub const Signal = struct {
         const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + @as(i64, limit_ms);
         var filled: usize = 0;
         while (true) {
-            if (std.mem.indexOfScalar(u8, buf[0..filled], '\n')) |end| return buf[0..end];
+            if (std.mem.findScalar(u8, buf[0..filled], '\n')) |end| return buf[0..end];
             if (filled == buf.len) return error.LineTooLong;
             const left = deadline - std.Io.Clock.awake.now(io).toMilliseconds();
             if (left <= 0) return error.Timeout;
