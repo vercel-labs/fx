@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { processAlive as isProcessAlive } from "./process-alive";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -447,6 +447,8 @@ const TIMEOUT = 30_000;
 const STEER_HOLD_GRACE_MS = "600000";
 const SPLIT_BOUNDARY_WAIT_TIMEOUT = TIMEOUT * 3;
 const SPLIT_BOUNDARY_TEST_TIMEOUT = SPLIT_BOUNDARY_WAIT_TIMEOUT + 5_000;
+// The most tape bytes a failed replay's error carries, as base64.
+const FAILED_REPLAY_TAPE_BYTES = 64 * 1024;
 const CANONICAL_PRE_TOOL_TEXT =
   "FX_MODEL_TEXT_SENTINEL before tools must remain contiguous.";
 const CANONICAL_FINAL_TEXT = "FX_FINAL_RESPONSE_SENTINEL completed.";
@@ -1333,6 +1335,23 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
     .find((frame) => frame.kind === 1);
   expect(firstOutput).toBeDefined();
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
+}
+
+// Runs `fx replay` on a tape and returns its output. When the replay fails,
+// the error names its exit status, signal, and stderr, and carries the tape,
+// so a CI log alone can reproduce it. The tape is read after the failure, so
+// it can hold frames the live session wrote after the replay read it.
+function replayTape(tapePath: string, args: readonly string[]): string {
+  const result = spawnSync(FX_BIN, ["replay", tapePath, ...args], { encoding: "utf8" });
+  if (!result.error && result.status === 0) return result.stdout;
+  const tape = readFileSync(tapePath);
+  const logged = tape.subarray(0, FAILED_REPLAY_TAPE_BYTES);
+  throw new Error(
+    `fx replay ${args.join(" ")} failed: status ${result.status}, signal ${result.signal}, ` +
+      `spawn error ${result.error?.message ?? "none"}\n` +
+      `stderr:\n${result.stderr}\n` +
+      `tape (${tape.length} bytes, first ${logged.length} as base64):\n${logged.toString("base64")}`,
+  );
 }
 
 function findEnterAfterSubmittedPrompt(
@@ -5488,9 +5507,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(tracePath, "utf8")).toContain(
         "event=prompt_steering_consumed",
       );
-      const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
-        encoding: "utf8",
-      });
+      const replay = replayTape(tapePath, ["--frames"]);
       expect(replay).toContain(finalText);
       expect(replay).not.toContain("Cancelled");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
