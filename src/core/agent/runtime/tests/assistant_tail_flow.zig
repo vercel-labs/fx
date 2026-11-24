@@ -149,3 +149,40 @@ test "a tool boundary flush sends an empty tail" {
     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
     try std.testing.expectEqual(@as(usize, 0), capture_state.last_events);
 }
+
+test "a sink with no tail consumer gets no tail and builds no preview" {
+    const alloc = std.testing.allocator;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var deps = hooks.deps();
+    var capture_state = TailCapture{ .alloc = alloc };
+    defer capture_state.deinit();
+    var consuming_ctx = StreamChunkContext{
+        .hooks = &deps,
+        .turn_id = 1,
+        .alloc = alloc,
+        .semantic_presentation = capture_state.sink(),
+    };
+    defer consuming_ctx.deinit();
+    runtime_assistant_stream.onStreamContentChunk(&consuming_ctx, "Plain **bo");
+    try std.testing.expectEqual(@as(usize, 1), consuming_ctx.tail_previews_built);
+
+    var no_tail_owner: u8 = 0;
+    var silent_ctx = StreamChunkContext{
+        .hooks = &deps,
+        .turn_id = 1,
+        .alloc = alloc,
+        .semantic_presentation = .{
+            .ctx = &no_tail_owner,
+            .table = TailCapture.unexpectedTable,
+            .code_block = TailCapture.unexpectedCodeBlock,
+            .thematic_rule = TailCapture.unexpectedRule,
+            .assistant_tail = null,
+        },
+    };
+    defer silent_ctx.deinit();
+    runtime_assistant_stream.onStreamContentChunk(&silent_ctx, "Plain **bo");
+    try runtime_assistant_stream.finishAssistantTail(&silent_ctx);
+    try std.testing.expectEqual(@as(usize, 0), silent_ctx.tail_previews_built);
+    try std.testing.expectEqual(@as(usize, 0), silent_ctx.sent_tail.items.len);
+}

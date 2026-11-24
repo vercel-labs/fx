@@ -1018,7 +1018,7 @@ pub fn Runtime(comptime App: type) type {
             var deferred: usize = 0;
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
-                    approvalOutOfDate(&app.main_agent, false)))
+                    app.main_screen.pacer.hasTail() or approvalOutOfDate(&app.main_agent, false)))
             {
                 if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }

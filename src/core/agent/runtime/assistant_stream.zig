@@ -55,8 +55,9 @@ pub const SemanticPresentationSink = struct {
     code_block: *const fn (ctx: *anyopaque, block: CodeBlockPayload) anyerror!void,
     thematic_rule: *const fn (ctx: *anyopaque) anyerror!void,
     /// Takes ownership of `events` only when it returns successfully. `alloc`
-    /// is the allocator that made them.
-    assistant_tail: *const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
+    /// is the allocator that made them. Null when the sink shows no tail, so
+    /// the stream builds no preview for it.
+    assistant_tail: ?*const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
 };
 
 pub const StreamChunkContext = struct {
@@ -94,6 +95,8 @@ pub const StreamChunkContext = struct {
     response_language_next_probe_bytes: usize = 5,
     /// The tail last sent to the sink, to skip a send when nothing changed.
     sent_tail: std.ArrayList(assistant_presentation.Event) = .empty,
+    /// Tail previews this stream has rendered. A test reads it to see that a sink with no tail builds none.
+    tail_previews_built: usize = 0,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -540,17 +543,23 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
 
 /// Ends the tail of this stream. The empty tail replaces the last one sent.
 pub fn finishAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
     const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
     const empty = try stream_ctx.alloc.alloc(assistant_presentation.Event, 0);
     try deliverAssistantTail(sink, stream_ctx, empty);
 }
 
-/// Sends the rendered tail when it differs from the one sent last.
+/// Sends the rendered tail when it differs from the one sent last. A sink
+/// with no tail consumer gets no preview built.
 fn sendAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
     const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
     const alloc = stream_ctx.alloc;
     var tail: std.ArrayList(assistant_presentation.Event) = .empty;
     defer deinitEventList(alloc, &tail);
+    stream_ctx.tail_previews_built += 1;
     _ = try stream_ctx.markdown.renderProvisional(alloc, &tail);
     if (std.meta.eql(tail.items, stream_ctx.sent_tail.items)) return;
     try deliverAssistantTail(sink, stream_ctx, try tail.toOwnedSlice(alloc));
@@ -568,7 +577,7 @@ fn deliverAssistantTail(
     var sent: std.ArrayList(assistant_presentation.Event) = .empty;
     errdefer deinitEventList(alloc, &sent);
     try appendClonedEvents(alloc, &sent, events);
-    try sink.assistant_tail(sink.ctx, alloc, events);
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
     deinitEventList(alloc, &stream_ctx.sent_tail);
     stream_ctx.sent_tail = sent;
 }

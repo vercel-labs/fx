@@ -6,6 +6,8 @@ const tu = @import("text_util.zig");
 const unicode_classes = @import("unicode_classes.zig");
 const payload = @import("payload.zig");
 const shared_theme = @import("../../shared/theme.zig");
+const build_options = @import("build_options");
+const host_target = @import("../../hosts/target.zig");
 
 /// Renders heading content: emphasis is resolved normally, but bold tags are
 /// suppressed because the heading style already owns bold.
@@ -40,6 +42,9 @@ pub fn writeInline(
     }, footnotes, link_id);
 }
 
+/// The headless wasm core has no screen, so it never builds a provisional preview, and its open-end code compiles out.
+pub const builds_previews = !(host_target.is_wasm and build_options.wasm_surface == .core);
+
 /// open_end shows an unfinished line as if the stream ended now, so no raw mark shows (tests/tla/assistant_stream/StreamTail.tla NoRawMarkInTail).
 pub const Mode = union(enum) {
     committed,
@@ -47,6 +52,7 @@ pub const Mode = union(enum) {
     open_end: *bool,
 
     pub fn isOpenEnd(self: Mode) bool {
+        if (comptime !builds_previews) return false;
         return switch (self) {
             .committed => false,
             .open_end => true,

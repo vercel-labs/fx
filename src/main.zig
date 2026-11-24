@@ -5920,7 +5920,9 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
 
 test "a hidden main agent's assistant tail lands in its own transcript while a child is on screen" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer App.AgentsAppRuntime.deinitChildren(&app);
@@ -5942,7 +5944,9 @@ test "a hidden main agent's assistant tail lands in its own transcript while a c
 
 test "a hidden child with only a due tail is visited and its tail is applied" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer App.AgentsAppRuntime.deinitChildren(&app);
@@ -5964,9 +5968,39 @@ test "a hidden child with only a due tail is visited and its tail is applied" {
     );
 }
 
+test "a hidden main agent with only a due tail is visited and its tail lands in its own transcript" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    app.agent_on_screen = child;
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Main tail only") };
+    app.main_screen.transcript.staged_assistant_tail_id = 1;
+    app.main_screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
+    app.main_screen.pacer.setTail(1);
+    try std.testing.expect(!app.main_screen.pacer.hasPending());
+
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Main tail only",
+        app.main_screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), child.screen.transcript.assistant_tail.items.len);
+}
+
 test "the shown tail stays until the committed text replaces it in the same tick" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
 

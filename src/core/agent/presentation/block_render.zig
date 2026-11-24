@@ -255,6 +255,7 @@ fn parseAndRenderRows(
 }
 
 fn rowMode(open: OpenRows, line_idx: usize) inline_render.Mode {
+    if (comptime !inline_render.builds_previews) return .committed;
     const first = open.first orelse return .committed;
     return if (line_idx >= first) open.mode else .committed;
 }

@@ -603,7 +603,7 @@ test "ask presentation draws a provisional tail and drops it when committed text
     const events = try alloc.alloc(assistant_presentation.Event, 1);
     events[0] = .{ .text = try alloc.dupe(u8, "Streaming bold") };
     const sink = runtime.semanticSink();
-    try sink.assistant_tail(sink.ctx, alloc, events);
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
     try std.testing.expectEqual(@as(usize, 1), runtime.shell.assistant_tail.items.len);
     try std.testing.expectEqual(@as(usize, 1), try askGridRowsContaining(&runtime, "Streaming bold"));
 

@@ -2870,6 +2870,39 @@ test "nonzero command remains Ran in the current compact projection" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
 }
 
+test "a command process entry clears the shown assistant tail when it commits" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 20,
+        .divider_top_row = 21,
+        .input_row = 22,
+        .divider_bottom_row = 23,
+        .hint_row = 24,
+    } };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "exit-7" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"false\"}",
+    } });
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("streaming") }};
+    transcript_store.setAssistantTail(&runtime, alloc, try transcript_store.tailEntriesFromEvents(alloc, &events));
+    try std.testing.expectEqual(@as(usize, 1), runtime.assistant_tail.items.len);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran false" },
+        .result_memory = .{ .command_process_presentation = .{ .exit_code = 7 } },
+    } });
+    try std.testing.expectEqual(@as(usize, 0), runtime.assistant_tail.items.len);
+}
+
 test "terminal lifecycle records distinguish captured exec from durable actions" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -7245,7 +7278,7 @@ pub const TranscriptRuntime = struct {
         pending: *PendingToolDetailTerminal,
     ) void {
         if (pending.command_process_entry) |*entry| {
-            self.commitCommandProcessPresentationEntry(entry);
+            self.commitCommandProcessPresentationEntry(alloc, entry);
             pending.command_process_entry = null;
         }
         const detail = self.toolDetailPtr(entry_id).?;
@@ -7348,10 +7381,12 @@ pub const TranscriptRuntime = struct {
 
     fn commitCommandProcessPresentationEntry(
         self: *TranscriptRuntime,
+        alloc: Allocator,
         pending: *PendingCommandProcessEntry,
     ) void {
         std.debug.assert(self.notebook.next_entry_id == pending.entry_id);
         self.notebook.next_entry_id +%= 1;
+        self.clearAssistantTail(alloc);
         self.notebook.entries.appendAssumeCapacity(.{ .raw_bytes = .{
             .id = pending.entry_id,
             .created_at_ms = io_mod.milliTimestamp(),

@@ -9,6 +9,7 @@ const tu = @import("presentation/text_util.zig");
 const bp = @import("presentation/block_parse.zig");
 const payload = @import("presentation/payload.zig");
 const inline_render = @import("presentation/inline_render.zig");
+pub const builds_previews = inline_render.builds_previews;
 const block_render = @import("presentation/block_render.zig");
 
 /// Prevents OSC 8 hyperlinks from coalescing across wrapped terminal rows.
@@ -214,6 +215,8 @@ pub const MarkdownProcessor = struct {
     open_pipe_row: ?usize = null,
     /// Preview clone only: set when an open-end rule changes the open line.
     open_end_fired: bool = false,
+    /// Where new OSC 8 link ids come from. A preview points it at its own counter, so the shared counter never moves.
+    link_ids: *u32 = &link_id_counter,
     next_footnote_number: usize = 0,
     previous_line_was_blank: bool = true,
     /// Innermost last; each entry's shift already includes its parents'.
@@ -251,8 +254,9 @@ pub const MarkdownProcessor = struct {
     }
 
     /// A deep copy of the held state, so flushing the copy never touches this processor.
-    fn cloneForPreview(self: *const MarkdownProcessor, alloc: Allocator) !MarkdownProcessor {
+    fn cloneForPreview(self: *const MarkdownProcessor, alloc: Allocator, link_ids: *u32) !MarkdownProcessor {
         var copy = MarkdownProcessor{
+            .link_ids = link_ids,
             .in_code_block = self.in_code_block,
             .code_fence = self.code_fence,
             .in_pipe_block = self.in_pipe_block,
@@ -296,12 +300,10 @@ pub const MarkdownProcessor = struct {
         alloc: Allocator,
         tail: *std.ArrayList(Event),
     ) !ProvisionalResult {
-        // link_id_counter is a file global shared by every processor, so the preview restores it.
-        const saved_link_id = link_id_counter;
-        defer link_id_counter = saved_link_id;
         const first = tail.items.len;
         errdefer deinitEventsFrom(alloc, tail, first);
-        var preview = try self.cloneForPreview(alloc);
+        var preview_link_id = self.link_ids.*;
+        var preview = try self.cloneForPreview(alloc, &preview_link_id);
         defer preview.deinit(alloc);
         preview.open_line_mode = .{ .open_end = &preview.open_end_fired };
         var result = ProvisionalResult{};
@@ -510,14 +512,14 @@ pub const MarkdownProcessor = struct {
         if (completions.thematic_rule != null and self.pending_top_level_line.items.len > 0) {
             if (bp.parseSetextUnderline(line)) |level| {
                 self.active_definition = false;
-                try block_render.writeHeading(alloc, level, tu.withoutTerminalHardBreakMarker(self.pending_top_level_line.items, true), out, &fs, &link_id_counter, .committed);
+                try block_render.writeHeading(alloc, level, tu.withoutTerminalHardBreakMarker(self.pending_top_level_line.items, true), out, &fs, self.link_ids, .committed);
                 try out.append(alloc, '\n');
                 self.pending_top_level_line.clearRetainingCapacity();
                 return;
             }
             if (bp.definitionMarkerBody(line)) |body| {
                 try self.flushPendingTopLevelLine(alloc, out);
-                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 self.active_definition = true;
                 return;
             }
@@ -528,7 +530,7 @@ pub const MarkdownProcessor = struct {
         if (self.active_blockquote) |blockquote| {
             self.active_definition = false;
             if (bp.isLazyBlockquoteContinuation(line)) {
-                try block_render.writeBlockquoteLine(alloc, blockquote, line, line_has_lf, out, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+                try block_render.writeBlockquoteLine(alloc, blockquote, line, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 try out.append(alloc, '\n');
                 return;
             }
@@ -576,7 +578,7 @@ pub const MarkdownProcessor = struct {
 
         if (self.active_definition) {
             if (bp.definitionMarkerBody(line)) |body| {
-                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+                try block_render.writeDefinitionLine(alloc, body, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
                 return;
             }
         }
@@ -644,7 +646,7 @@ pub const MarkdownProcessor = struct {
         }
 
         if (bp.parseHeader(tu.withoutTerminalHardBreakMarker(line, line_has_lf))) |header| {
-            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+            try block_render.writeHeading(alloc, header.level, header.content, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
             return;
         }
 
@@ -654,12 +656,12 @@ pub const MarkdownProcessor = struct {
                 .depth = parsed.depth,
             };
             self.active_blockquote = if (bp.isBlockquoteParagraph(parsed.content)) blockquote else null;
-            try block_render.writeBlockquoteLine(alloc, blockquote, parsed.content, line_has_lf, out, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+            try block_render.writeBlockquoteLine(alloc, blockquote, parsed.content, line_has_lf, out, &fs, self.link_ids, self.inlineMode(line_has_lf));
             return;
         }
 
         try out.appendNTimes(alloc, ' ', shift);
-        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, &link_id_counter, self.inlineMode(line_has_lf))) {
+        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, self.link_ids, self.inlineMode(line_has_lf))) {
             if (bp.parseOrderedList(line)) |item| {
                 try self.open_ordered_items.append(alloc, .{
                     .content_column = item.indent.len + item.marker.len + 1,
@@ -669,7 +671,7 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter, self.inlineMode(line_has_lf));
+        try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, self.link_ids, self.inlineMode(line_has_lf));
     }
 
     /// Returns how far padded ordered markers move `line`, first closing the
@@ -699,14 +701,14 @@ pub const MarkdownProcessor = struct {
 
         if (bp.isValidTable(self.pipe_buf.items)) {
             if (completion) |sink| {
-                var table = try block_render.parseTablePayloadWithFootnotes(alloc, self.pipe_buf.items, &fs, &link_id_counter, self.openRows());
+                var table = try block_render.parseTablePayloadWithFootnotes(alloc, self.pipe_buf.items, &fs, self.link_ids, self.openRows());
                 var delivered = false;
                 errdefer if (!delivered) table.deinit(alloc);
                 try sink.deliver(sink.ctx, table, out);
                 delivered = true;
                 return;
             }
-            try block_render.renderTable(alloc, self.pipe_buf.items, out, &fs, &link_id_counter, self.openRows());
+            try block_render.renderTable(alloc, self.pipe_buf.items, out, &fs, self.link_ids, self.openRows());
             return;
         }
 
@@ -820,7 +822,7 @@ pub const MarkdownProcessor = struct {
                 if (note.number != number or !note.has_definition) continue;
                 try block_render.writeFootnoteDefinitionMarker(alloc, out, number);
                 const last_line_mode = if (self.open_body_note == index) self.open_line_mode else .committed;
-                try block_render.writeFootnoteBody(alloc, note.body.items, out, &fs, number, &link_id_counter, last_line_mode);
+                try block_render.writeFootnoteBody(alloc, note.body.items, out, &fs, number, self.link_ids, last_line_mode);
                 break;
             }
         }
@@ -952,10 +954,8 @@ fn completeOpenTableHeader(alloc: Allocator, preview: *MarkdownProcessor) !bool 
 /// delimiter row follows it. It runs the committed path on a copy, so the context
 /// the row sits in (a footnote, a quote, a list) decides, as it does for the commit.
 fn wouldFormTable(alloc: Allocator, preview: *const MarkdownProcessor, columns: usize) !bool {
-    // The copy's flush numbers links from the shared counter, so the counter is restored.
-    const saved_link_id = link_id_counter;
-    defer link_id_counter = saved_link_id;
-    var copy = try preview.cloneForPreview(alloc);
+    var copy_link_id = preview.link_ids.*;
+    var copy = try preview.cloneForPreview(alloc, &copy_link_id);
     defer copy.deinit(alloc);
     var found: std.ArrayList(Event) = .empty;
     defer deinitEvents(alloc, &found);
@@ -1071,6 +1071,25 @@ test "markdown link destination keeps balanced parentheses" {
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "a preview counts link ids in its own counter and never writes the shared one" {
+    const alloc = std.testing.allocator;
+    link_id_counter = 1;
+    const shared_before = link_id_counter;
+    var processor_link_id: u32 = 4242;
+    var processor = MarkdownProcessor{ .link_ids = &processor_link_id };
+    defer processor.deinit(alloc);
+    var committed: std.ArrayList(u8) = .empty;
+    defer committed.deinit(alloc);
+    try processor.push(alloc, "see [docs](https://example.com) please", &committed);
+
+    var preview: std.ArrayList(u8) = .empty;
+    defer preview.deinit(alloc);
+    try renderPreviewDisplay(alloc, &processor, &preview);
+    try std.testing.expect(std.mem.find(u8, preview.items, "id=fx-4242;https://example.com") != null);
+    try std.testing.expectEqual(@as(u32, 4242), processor_link_id);
+    try std.testing.expectEqual(shared_before, link_id_counter);
 }
 
 test "markdown link drops its title and unwraps angle destinations" {
@@ -4818,21 +4837,14 @@ fn stripEscapes(alloc: Allocator, bytes: []const u8) ![]u8 {
 /// backtick, no line that starts with a pipe, and no visible byte escape.
 fn expectNoRawMarks(plain: []const u8) !void {
     for ([_][]const u8{ "**", "~~", "](", "\\x" }) |needle| {
-        if (std.mem.find(u8, plain, needle) != null) {
-            std.debug.print("raw {s} in provisional text: {s}\n", .{ needle, plain });
-            return error.RawMarkShown;
-        }
+        if (std.mem.find(u8, plain, needle) != null) return error.RawMarkShown;
     }
     var ticks: usize = 0;
     for (plain) |byte| ticks += @intFromBool(byte == '`');
-    if (ticks % 2 == 1) {
-        std.debug.print("unpaired backtick in provisional text: {s}\n", .{plain});
-        return error.RawMarkShown;
-    }
+    if (ticks % 2 == 1) return error.RawMarkShown;
     var lines = std.mem.splitScalar(u8, plain, '\n');
     while (lines.next()) |line| {
         if (std.mem.trimStart(u8, line, " \t").len > 0 and std.mem.trimStart(u8, line, " \t")[0] == pipe_byte) {
-            std.debug.print("raw pipe row in provisional text: {s}\n", .{line});
             return error.RawPipeShown;
         }
     }
@@ -4870,10 +4882,7 @@ fn expectHeldWordsShown(p: *const MarkdownProcessor, plain: []const u8) !usize {
             while (i < held.len and std.ascii.isAlphanumeric(held[i])) i += 1;
             const word = held[start..i];
             checked += 1;
-            if (std.mem.find(u8, plain, word) == null) {
-                std.debug.print("word {s} not shown; provisional text: {s}\n", .{ word, plain });
-                return error.WordNotShown;
-            }
+            if (std.mem.find(u8, plain, word) == null) return error.WordNotShown;
         }
     }
     return checked;
@@ -4888,19 +4897,12 @@ test "provisional render never changes committed output" {
         for ([_]Chunking{ .byte1, .byte3, .word }) |chunking| {
             var plain = try runPreviewDocument(alloc, doc.source, chunking, .none, &tally);
             defer deinitEvents(alloc, &plain);
-            expectSameEvents(alloc, whole.items, plain.items) catch |err| {
-                std.debug.print("doc {s} chunking {s}: committed events differ from one push\n", .{ doc.name, @tagName(chunking) });
-                return err;
-            };
+            try expectSameEvents(alloc, whole.items, plain.items);
             var previewed = try runPreviewDocument(alloc, doc.source, chunking, .state, &tally);
             defer deinitEvents(alloc, &previewed);
-            expectSameEvents(alloc, whole.items, previewed.items) catch |err| {
-                std.debug.print("doc {s} chunking {s}: committed events with previews differ from one push\n", .{ doc.name, @tagName(chunking) });
-                return err;
-            };
+            try expectSameEvents(alloc, whole.items, previewed.items);
         }
     }
-    std.debug.print("T1 documents={d} chunkings=3 provisional_renders={d}\n", .{ preview_docs.len, tally.renders });
 }
 
 test "provisional text shows no raw marks" {
@@ -4912,7 +4914,6 @@ test "provisional text shows no raw marks" {
             deinitEvents(alloc, &events);
         }
     }
-    std.debug.print("T2 documents={d} renders={d} marks_checked={d}\n", .{ commit_documents.len, tally.renders, tally.marks_checked });
 }
 
 test "provisional text shows every received word" {
@@ -4922,20 +4923,6 @@ test "provisional text shows every received word" {
         var events = try runPreviewDocument(alloc, doc.source, .word, .words, &tally);
         deinitEvents(alloc, &events);
     }
-    std.debug.print("T3 documents={d} renders={d} held_words_checked={d}\n", .{ commit_documents.len, tally.renders, tally.words_checked });
-}
-
-fn printEventKinds(label: []const u8, events: []const Event) void {
-    std.debug.print("{s}:", .{label});
-    for (events) |event| switch (event) {
-        .text => |text| std.debug.print(" text({d})", .{text.len}),
-        .table => |table| std.debug.print(" table(rows={d},cols={d})", .{ table.rows.len, table.column_count }),
-        .code_block => |block| std.debug.print(" code({d})", .{block.code.len}),
-        .thematic_rule => std.debug.print(" rule", .{}),
-        .assistant_tail => std.debug.print(" tail", .{}),
-        else => std.debug.print(" other", .{}),
-    };
-    std.debug.print("\n", .{});
 }
 
 /// Counts what the cut-point check compared and skipped.
@@ -5002,12 +4989,7 @@ fn expectTailMatchesCommit(alloc: Allocator, source: []const u8, cut: usize, tal
     defer deinitEvents(alloc, &shown);
     try appendCopies(alloc, &shown, pushed.items);
     try appendCopies(alloc, &shown, tail.items);
-    expectSameEvents(alloc, committed.items, shown.items) catch |err| {
-        std.debug.print("cut {d}: header_completed={any} open_end={any}\n", .{ cut, result.table_header_completed, result.open_end_applied });
-        printEventKinds("shown", shown.items);
-        printEventKinds("commit", committed.items);
-        return err;
-    };
+    try expectSameEvents(alloc, committed.items, shown.items);
     tally.compared += 1;
     tally.compared_with_table += @intFromBool(countTag(tail.items, .table) > 0);
     tally.compared_with_code += @intFromBool(countTag(tail.items, .code_block) > 0);
@@ -5027,18 +5009,13 @@ test "preview equals commit at every cut point" {
     var tally = CutTally{};
     for (commit_documents) |doc| {
         for (1..doc.source.len + 1) |cut| {
-            expectTailMatchesCommit(alloc, doc.source, cut, &tally) catch |err| {
-                std.debug.print("doc {s} cut {d}: preview differs from commit\n", .{ doc.name, cut });
-                return err;
-            };
+            try expectTailMatchesCommit(alloc, doc.source, cut, &tally);
         }
     }
-    std.debug.print("T5 documents={d} cut_points={d} compared={d} compared_with_table={d} compared_with_code={d} compared_with_header_completion={d} skipped_open_end={d}\n", .{ commit_documents.len, tally.cuts, tally.compared, tally.compared_with_table, tally.compared_with_code, tally.compared_table_header, tally.skipped_open_end });
 }
 
 test "provisional preview of a one megabyte line completes" {
     const alloc = std.testing.allocator;
-    const io_mod = @import("../shared/io.zig");
     var collected: std.ArrayList(Event) = .empty;
     defer deinitEvents(alloc, &collected);
     var collector = EventCollector{ .alloc = alloc, .events = &collected };
@@ -5063,14 +5040,11 @@ test "provisional preview of a one megabyte line completes" {
 
     var preview: std.ArrayList(u8) = .empty;
     defer preview.deinit(alloc);
-    const started = io_mod.nanoTimestamp();
     try renderPreviewDisplay(alloc, &processor, &preview);
-    const elapsed = io_mod.nanoTimestamp() - started;
     const plain = try stripEscapes(alloc, preview.items);
     defer alloc.free(plain);
     try expectNoRawMarks(plain);
     try std.testing.expect(std.mem.find(u8, plain, "word") != null);
-    std.debug.print("one megabyte preview ns={d} provisional_bytes={d}\n", .{ elapsed, preview.items.len });
 }
 
 test "UTF-8 split across chunks never shows partial bytes" {
@@ -5265,10 +5239,8 @@ const open_cases = [_]OpenCase{
     .{ .input = "**bold \\", .visible = "bold ", .styled = ansi.bold_open ++ "bold", .source = "fuzz: a lone trailing backslash shows nothing" },
 };
 
-fn expectPreviewHas(bytes: []const u8, needle: []const u8, source: []const u8) !void {
-    if (std.mem.find(u8, bytes, needle) != null) return;
-    std.debug.print("open case ({s}): expected {d} bytes of styled text in the preview\n", .{ source, needle.len });
-    return error.OpenStyleMissing;
+fn expectPreviewHas(bytes: []const u8, needle: []const u8) !void {
+    if (std.mem.find(u8, bytes, needle) == null) return error.OpenStyleMissing;
 }
 
 // Each named open line previews as its visible text, and as styled text where
@@ -5288,15 +5260,12 @@ test "named open lines preview as open text" {
         try renderPreviewDisplay(alloc, &processor, &preview);
         const plain = try stripEscapes(alloc, preview.items);
         defer alloc.free(plain);
-        std.testing.expectEqualStrings(case.visible, plain) catch |err| {
-            std.debug.print("open case ({s}) input=[{s}] shown=[{s}]\n", .{ case.source, case.input, plain });
-            return err;
-        };
-        if (case.styled.len > 0) try expectPreviewHas(preview.items, case.styled, case.source);
+        try std.testing.expectEqualStrings(case.visible, plain);
+        if (case.styled.len > 0) try expectPreviewHas(preview.items, case.styled);
         if (case.code.len > 0) {
             const needle = try std.fmt.allocPrint(alloc, "{s}{s}", .{ ansi.inline_code_open, case.code });
             defer alloc.free(needle);
-            try expectPreviewHas(preview.items, needle, case.source);
+            try expectPreviewHas(preview.items, needle);
         }
     }
 }
@@ -5328,10 +5297,7 @@ test "an open marker-only line never previews as a rule" {
         defer deinitEvents(alloc, &tail);
         _ = try processor.renderProvisional(alloc, &tail);
         for (tail.items) |event| {
-            if (std.meta.activeTag(event) == .thematic_rule) {
-                std.debug.print("rule preview for open line: {s}\n", .{open_line});
-                return error.RulePreviewed;
-            }
+            if (std.meta.activeTag(event) == .thematic_rule) return error.RulePreviewed;
         }
         const shown = try displayOf(alloc, tail.items);
         defer alloc.free(shown);
@@ -5398,5 +5364,5 @@ test "open table row shows its open marks as styled text" {
     defer preview.deinit(alloc);
     try renderPreviewDisplay(alloc, &processor, &preview);
     try std.testing.expect(std.mem.find(u8, preview.items, "**") == null);
-    try expectPreviewHas(preview.items, ansi.bold_open ++ "d", "open table row");
+    try expectPreviewHas(preview.items, ansi.bold_open ++ "d");
 }
