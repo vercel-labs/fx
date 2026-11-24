@@ -365,7 +365,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("Sign in to a model provider");
       expect(stdout).toContain("Sign out of a model provider");
       expect(stdout).toContain("Choose the active model provider");
-      // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
+      // `fx login --api-key` replaced the removed `fx setup`.
       expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
       expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
@@ -1007,11 +1007,12 @@ describe("cli: status", () => {
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
+        // The old `statusLine` group is an unknown key now, so doctor names its
+        // current key. Its children are not checked, since the group is ignored.
         expect(warnings).toEqual([
           "unknown setting fast_mdoe in ~/.fx/settings.json (did you mean fast_mode?)",
-          "unknown setting statusLine.contxt in ~/.fx/settings.json (did you mean statusLine.context?)",
+          "unknown setting statusLine in ~/.fx/settings.json (did you mean status_line?)",
           `unknown setting efort in ~/.fx/settings.json for workspace ${cwd} (did you mean effort?)`,
-          "statusLine and status_line are both set in ~/.fx/settings.json; fx uses status_line where they differ, so remove statusLine",
           "unknown setting max_agent_step in .fx.json (did you mean max_agent_steps?)",
         ]);
 
@@ -1040,7 +1041,8 @@ describe("cli: status", () => {
         expect(schema.properties.fast_mode).toEqual({ description: "Use faster inference when the model supports it", type: "boolean" });
         expect(schema.properties.permission_mode.enum).toEqual(["ask", "auto", "full-access", "yolo"]);
         expect(schema.properties.auto_compact_percent).toMatchObject({ type: "integer", minimum: 10, maximum: 80 });
-        expect(schema.properties.statusLine.deprecated).toBe(true);
+        expect(schema.properties.statusLine).toBeUndefined();
+        expect(schema.properties.status_line).toMatchObject({ description: "What the footer shows" });
         expect(schema.properties.workspaces.additionalProperties).toEqual({ $ref: "#/$defs/workspace" });
         expect(schema.properties.additional_directories).toBeUndefined();
         expect(schema.$defs.workspace.properties.additional_directories.type).toBe("array");
@@ -1085,7 +1087,7 @@ describe("cli: status", () => {
           JSON.stringify({
             fast_mode: true,
             fast_mdoe: 1,
-            statusLine: { context: true },
+            status_line: { context: true },
             models: { codex: "gpt-5.5" },
             provider_order: ["a", "b"],
             workspaces: { [cwd]: { fast_mode: false } },
@@ -1170,7 +1172,7 @@ describe("cli: status", () => {
         mkdirSync(join(home, ".fx"), { recursive: true });
         mkdirSync(cwd);
         const settingsPath = join(home, ".fx", "settings.json");
-        writeFileSync(settingsPath, JSON.stringify({ statusLine: { session: true } }) + "\n", { mode: 0o600 });
+        writeFileSync(settingsPath, JSON.stringify({ status_line: { session: true } }) + "\n", { mode: 0o600 });
         const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
         const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
 
@@ -1188,7 +1190,7 @@ describe("cli: status", () => {
           changed: true,
           file: "~/.fx/settings.json",
         });
-        const unset = await runFx(["config", "unset", "statusLine.session"], { cwd, env });
+        const unset = await runFx(["config", "unset", "status_line.session"], { cwd, env });
         expect([unset.code, unset.stdout]).toEqual([0, "status_line.session removed from ~/.fx/settings.json.\n"]);
         expect(settings()).toEqual({ fast_mode: true, max_agent_steps: 40 });
         const get = await runFx(["config", "get", "max_agent_steps"], { cwd, env });
@@ -1962,7 +1964,7 @@ describe("cli: status", () => {
             model: 123,
             permission_mode: "danger",
             permission: { bash: true },
-            statusLine: 7,
+            status_line: 7,
             max_agent_steps: 7,
           }) + "\n",
         );
@@ -1987,7 +1989,7 @@ describe("cli: status", () => {
           "fx: config project: ignored_project_user_only_setting; key=permission",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=statusLine",
+          "fx: config project: ignored_project_user_only_setting; key=status_line",
         );
         expect(status.stderr).not.toContain("danger");
 
@@ -2961,23 +2963,20 @@ describe("cli: logout", () => {
 
 describe("cli: setup", () => {
   test(
-    "fx setup is a top-level command and fails cleanly when Keychain is disabled",
+    "fx setup is removed: it exits 2 and names fx login vercel --api-key",
     async () => {
-      const r = await runFx(["setup"], {
+      const r = await runFx(["setup", "--anything"], {
         env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
       });
-      expect(r.code).toBe(1);
+      expect(r.code).toBe(2);
       expect(r.stdout).toBe("");
-      expect(r.stderr).toBe(
-        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" +
-          "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
-      );
+      expect(r.stderr).toBe("fx: fx setup was removed; use fx login vercel --api-key\n");
     },
     TIMEOUT,
   );
 
   test(
-    "fx login --api-key replaces fx setup and is only for vercel",
+    "fx login --api-key pastes a key and is only for vercel",
     async () => {
       for (const args of [["login", "--api-key"], ["login", "vercel", "--api-key"]]) {
         const disabled = await runFx(args, { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" } });
@@ -3033,10 +3032,9 @@ exit 99
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(1);
+        expect(r.code).toBe(2);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n");
-        expect(r.stderr).toContain("interactive terminal is required");
+        expect(r.stderr).toBe("fx: fx setup was removed; use fx login vercel --api-key\n");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
         rmSync(fakeDir, { recursive: true, force: true });
