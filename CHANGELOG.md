@@ -163,6 +163,7 @@
 - `fx ask --verbose` and `FLASH_SYNC_UPDATES` are removed; use `FX_SYNC_UPDATES`.
 - Esc during a retry ends the turn, and the separate Esc-to-pause is gone.
 - `fx ask --json` and ACP report recovery as `state`, `attempt`, `need`, and `message`.
+- A libfx host tool now receives an argument whose `inputSchema` type is number, boolean, array, or object as that type, not as JSON text, so it must not `JSON.parse` it.
 
 <!-- release:end -->
 

@@ -3671,6 +3671,8 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     try std.testing.expectEqual(@as(usize, 2), FreshnessApplicableContext.new_target_selects);
     try expectBodyNotContains(&gateway, 0, FreshnessApplicableContext.content);
     try expectBodyNotContains(&gateway, 1, FreshnessApplicableContext.content);
+    try expectBodyContains(&gateway, 1, types.scoped_instructions_pending_tool_result_output);
+    try expectBodyNotContains(&gateway, 1, types.context_deferred_tool_result_output);
     try expectBodyContains(&gateway, 2, FreshnessApplicableContext.content);
     const expected_ids = [_][]const u8{ "resolve_scope", "scoped_reissue" };
     try std.testing.expectEqual(expected_ids.len, hooks.permission_call_ids.items.len);
@@ -3701,7 +3703,14 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
     try std.testing.expectEqualStrings("scope resolved", execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqualStrings(
+        types.scoped_instructions_pending_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
+    try std.testing.expectEqual(
+        types.PersistedToolStatus.failure,
+        execution.tool_steps[0].tool_results[1].status,
+    );
     try std.testing.expectEqualStrings("new scope access", execution.tool_steps[1].tool_results[0].output);
 }
 
@@ -3827,15 +3836,41 @@ test "same-batch read of a file an earlier call created stays deferred when scop
     for (expected_ids, hooks.executed_call_ids.items) |expected, execution_id| {
         try std.testing.expectEqualStrings(expected, execution_id);
     }
-    try expectBodyContains(&gateway, 1, "Not executed");
+    try std.testing.expectEqual(expected_ids.len, hooks.permission_call_ids.items.len);
+    for (expected_ids, hooks.permission_call_ids.items) |expected, permission_id| {
+        try std.testing.expectEqualStrings(expected, permission_id);
+    }
+    try expectBodyContains(&gateway, 1, types.scoped_instructions_pending_tool_result_output);
+    try expectBodyNotContains(&gateway, 1, types.context_deferred_tool_result_output);
     try expectBodyNotContains(&gateway, 1, CreatedFileScopedContext.content);
     try expectBodyContains(&gateway, 2, CreatedFileScopedContext.content);
+
+    var skipped_terminal: usize = 0;
+    var skipped_authoritative: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        const call_id = lifecycleCallId(event) orelse continue;
+        if (!std.mem.eql(u8, call_id, "read_made")) continue;
+        switch (event) {
+            .terminal => |terminal| {
+                skipped_terminal += 1;
+                try std.testing.expectEqual(.denied, terminal.outcome.kind);
+                try std.testing.expectEqualStrings("Not executed read_file", terminal.outcome.summary);
+            },
+            .authoritative_started => skipped_authoritative += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), skipped_terminal);
+    try std.testing.expectEqual(@as(usize, 0), skipped_authoritative);
 
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
     try std.testing.expectEqualStrings("made", execution.tool_steps[0].tool_results[0].output);
-    try std.testing.expectEqualStrings("Not executed", execution.tool_steps[0].tool_results[1].output);
+    try std.testing.expectEqualStrings(
+        types.scoped_instructions_pending_tool_result_output,
+        execution.tool_steps[0].tool_results[1].output,
+    );
     try std.testing.expectEqual(
         types.PersistedToolStatus.failure,
         execution.tool_steps[0].tool_results[1].status,

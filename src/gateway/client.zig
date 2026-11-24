@@ -592,7 +592,6 @@ fn fetchGatewayJsonAtUrlCore(
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
 
     var headers: std.http.Client.Request.Headers = .{};
-    headers.accept_encoding = .omit;
     headers.user_agent = .{ .override = user_agent };
     if (api_key) |key| {
         auth_header = try alloc.print("Bearer {s}", .{key});
@@ -647,9 +646,10 @@ fn fetchGatewayJsonAtUrlCore(
     if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
 
     var transfer_buffer: [64 * 1024]u8 = undefined;
-    const body = readGatewayJsonBody(alloc, response.reader(&transfer_buffer), max_gateway_json_bytes) catch |err| {
+    const raw_reader = response.reader(&transfer_buffer);
+    const body = decodeGatewayJsonBody(alloc, response.head.content_encoding, raw_reader, max_gateway_json_bytes) catch |err| {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        return err;
+        return if (err == error.ReadFailed) bodyReadError(&response) else err;
     };
     if (cancel_flag.load(.seq_cst)) {
         alloc.free(body);
@@ -661,6 +661,26 @@ fn fetchGatewayJsonAtUrlCore(
 /// About fifty times today's model catalog. A larger response fails rather
 /// than growing memory without bound.
 const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
+
+fn decodeGatewayJsonBody(
+    alloc: std.mem.Allocator,
+    encoding: std.http.ContentEncoding,
+    raw_reader: *std.Io.Reader,
+    max_bytes: usize,
+) ![]u8 {
+    if (encoding == .identity) return readGatewayJsonBody(alloc, raw_reader, max_bytes);
+    const decompress_buffer: []u8 = switch (encoding) {
+        .identity => unreachable,
+        .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
+        .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer alloc.free(decompress_buffer);
+
+    var decompress: std.http.Decompress = undefined;
+    const reader = std.http.Decompress.init(&decompress, raw_reader, decompress_buffer, encoding);
+    return readGatewayJsonBody(alloc, reader, max_bytes);
+}
 
 /// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
 /// it exceeds `max_bytes`.
@@ -682,6 +702,95 @@ test "gateway JSON bodies past the size cap fail instead of growing" {
         error.GatewayJsonResponseTooLarge,
         readGatewayJsonBody(std.testing.allocator, &over_cap, 8),
     );
+}
+
+test "gateway JSON body decode rejects malformed gzip and enforces size cap" {
+    const alloc = std.testing.allocator;
+    const sample = "{\"object\":\"list\",\"data\":[{\"id\":\"fx/test-model\"}]}";
+
+    var compressed_out = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer compressed_out.deinit();
+    var flate_scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed_out.writer, &flate_scratch, .gzip, .fastest);
+    try compressor.writer.writeAll(sample);
+    try compressor.finish();
+    const gzip_bytes = compressed_out.written();
+
+    var valid_reader = std.Io.Reader.fixed(gzip_bytes);
+    const decoded = try decodeGatewayJsonBody(alloc, .gzip, &valid_reader, max_gateway_json_bytes);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(sample, decoded);
+
+    var truncated_reader = std.Io.Reader.fixed(gzip_bytes[0 .. gzip_bytes.len - 4]);
+    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &truncated_reader, max_gateway_json_bytes));
+
+    var corrupt_reader = std.Io.Reader.fixed("\x1f\x8b\x08\x00bad-gzip");
+    try std.testing.expectError(error.ReadFailed, decodeGatewayJsonBody(alloc, .gzip, &corrupt_reader, max_gateway_json_bytes));
+
+    var compress_reader = std.Io.Reader.fixed(sample);
+    try std.testing.expectError(
+        error.UnsupportedCompressionMethod,
+        decodeGatewayJsonBody(alloc, .compress, &compress_reader, max_gateway_json_bytes),
+    );
+
+    var cap_reader = std.Io.Reader.fixed(gzip_bytes);
+    try std.testing.expectError(
+        error.GatewayJsonResponseTooLarge,
+        decodeGatewayJsonBody(alloc, .gzip, &cap_reader, sample.len - 1),
+    );
+}
+
+fn fuzzGatewayJsonDecode(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const raw = buf[0..smith.slice(&buf)];
+    const max_bytes: usize = 4096;
+
+    if (raw.len > 0) {
+        const encoding: std.http.ContentEncoding = switch (raw[0] % 5) {
+            0 => .identity,
+            1 => .gzip,
+            2 => .deflate,
+            3 => .zstd,
+            4 => .compress,
+            else => unreachable,
+        };
+        var reader = std.Io.Reader.fixed(raw[1..]);
+        if (decodeGatewayJsonBody(alloc, encoding, &reader, max_bytes)) |decoded| {
+            defer alloc.free(decoded);
+            try std.testing.expect(decoded.len <= max_bytes);
+            try std.testing.expect(encoding != .compress);
+        } else |err| {
+            if (encoding == .compress) try std.testing.expectEqual(error.UnsupportedCompressionMethod, err);
+            if (encoding == .identity) return err;
+        }
+    }
+
+    const plain = raw[0..@min(raw.len, max_bytes)];
+    var compressed_out = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer compressed_out.deinit();
+    var flate_scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed_out.writer, &flate_scratch, .gzip, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+
+    var gzip_reader = std.Io.Reader.fixed(compressed_out.written());
+    const round_tripped = try decodeGatewayJsonBody(alloc, .gzip, &gzip_reader, max_bytes);
+    defer alloc.free(round_tripped);
+    try std.testing.expectEqualSlices(u8, plain, round_tripped);
+}
+
+test "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzGatewayJsonDecode, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00{\"object\":\"list\",\"data\":[]}",
+            "\x01\x1f\x8b\x08\x00bad",
+            "\x02bad-zlib",
+            "\x03bad-zstd",
+            "\x04payload",
+        }) ++ @import("fuzz_corpus").gateway_json_decode.*),
+    });
 }
 
 fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {
@@ -10474,6 +10583,104 @@ test "cancellable gateway JSON request closes a stalled request send" {
 
 test "cancellable gateway JSON request interrupts a stalled TLS handshake" {
     try expectCancellableGatewayJsonCancellation(.tls_handshake_stall, "test-key", true, 20, 1200, 500);
+}
+
+test "gateway JSON fetch requests compression and decodes gzip responses" {
+    const zio = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    const plain = "{\"object\":\"list\",\"data\":[{\"id\":\"test/model\"}]}";
+    var compressed_out = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer compressed_out.deinit();
+    var flate_scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed_out.writer, &flate_scratch, .gzip, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+    const gzip_body = try compressed_out.toOwnedSlice();
+    defer alloc.free(gzip_body);
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    var server_closed = false;
+    defer if (!server_closed) server.deinit(zio);
+
+    const ServerState = struct {
+        server: *std.Io.net.Server,
+        gzip_body: []const u8,
+        accept_encoding_ok: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const inner_zio = io_mod.getIo();
+            const stream = self.server.accept(inner_zio) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(inner_zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(inner_zio, &read_buf);
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(inner_zio, &write_buf);
+
+            var header_buf: [16 * 1024]u8 = undefined;
+            var header_len: usize = 0;
+            while (header_len < header_buf.len) {
+                header_buf[header_len] = reader.interface.takeByte() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                header_len += 1;
+                if (std.mem.endsWith(u8, header_buf[0..header_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
+            }
+            const headers = header_buf[0 .. header_len - 4];
+            const enc = rawHeaderValue(headers, "accept-encoding") orelse "";
+            if (std.mem.find(u8, enc, "gzip") != null) {
+                self.accept_encoding_ok = true;
+            }
+
+            writer.interface.print(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{self.gzip_body.len},
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.writeAll(self.gzip_body) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    var state = ServerState{ .server = &server, .gzip_body = gzip_body };
+    const thread = try std.Thread.spawn(.{}, ServerState.run, .{&state});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
+    defer alloc.free(url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const response = try fetchGatewayJsonAtUrlCancellable(alloc, "test-key", null, url, &cancel_flag, gateway_json_fetch_timeout_ms, null);
+    defer switch (response) {
+        .success => |body| alloc.free(body),
+        .http_status => {},
+    };
+    try std.testing.expectEqualStrings(plain, response.success);
+
+    server.deinit(zio);
+    server_closed = true;
+    thread.join();
+    joined = true;
+    if (state.failure) |err| return err;
+    try std.testing.expect(state.accept_encoding_ok);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {

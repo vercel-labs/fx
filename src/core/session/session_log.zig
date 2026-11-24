@@ -1229,6 +1229,20 @@ pub const ConversationTurnBuilder = struct {
     /// The call a `cancelled_command` item names: the turn's command that
     /// was cancelled with no saved output (D100). Owned.
     cancelled_command_call_id: ?[]u8 = null,
+    /// The wait a `cancelled_wait` item names (D102).
+    cancelled_wait: ?CancelledWaitNote = null,
+
+    const CancelledWaitNote = struct {
+        /// Owned.
+        call_id: []u8,
+        /// Owned.
+        waited_for: ?[]u8,
+
+        fn deinit(self: CancelledWaitNote, alloc: Allocator) void {
+            alloc.free(self.call_id);
+            if (self.waited_for) |names| alloc.free(names);
+        }
+    };
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1262,6 +1276,7 @@ pub const ConversationTurnBuilder = struct {
         for (self.bridge_calls.items) |record| types.freeBridgeCallRecordStrings(self.alloc, record);
         self.bridge_calls.deinit(self.alloc);
         if (self.cancelled_command_call_id) |id| self.alloc.free(id);
+        if (self.cancelled_wait) |note| note.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1279,6 +1294,25 @@ pub const ConversationTurnBuilder = struct {
     fn takeCancelledCommandNote(self: *ConversationTurnBuilder) ?[]u8 {
         const noted = self.cancelled_command_call_id;
         self.cancelled_command_call_id = null;
+        return noted;
+    }
+
+    /// Notes that the turn's `subagent` wait `call_id` was cancelled while
+    /// it waited for `waited_for`, so its interruption keeps the wait's row
+    /// (D102). One before the turn's user message is left out.
+    pub fn noteCancelledWait(self: *ConversationTurnBuilder, call_id: []const u8, waited_for: ?[]const u8) !void {
+        if (self.user == null) return;
+        const owned_id = try self.alloc.dupe(u8, call_id);
+        errdefer self.alloc.free(owned_id);
+        const owned_names = if (waited_for) |names| try self.alloc.dupe(u8, names) else null;
+        if (self.cancelled_wait) |previous| previous.deinit(self.alloc);
+        self.cancelled_wait = .{ .call_id = owned_id, .waited_for = owned_names };
+    }
+
+    /// Takes the noted cancelled wait; the caller owns it.
+    fn takeCancelledWaitNote(self: *ConversationTurnBuilder) ?CancelledWaitNote {
+        const noted = self.cancelled_wait;
+        self.cancelled_wait = null;
         return noted;
     }
 
@@ -1532,8 +1566,9 @@ pub const ConversationTurnBuilder = struct {
             text
         else
             try self.alloc.dupe(u8, "");
-        // Only an interrupted turn keeps a cancelled command's row.
+        // Only an interrupted turn keeps a cancelled command's or wait's row.
         if (self.takeCancelledCommandNote()) |id| self.alloc.free(id);
+        if (self.takeCancelledWaitNote()) |note| note.deinit(self.alloc);
         const execution = try self.takeExecution(
             completed.files,
             completed.turn_summary,
@@ -1610,6 +1645,16 @@ pub const ConversationTurnBuilder = struct {
             debug_trace.logf("session", "cancelled command note unmatched call_id={s} dropped=cancelled_command_row", .{id});
             break :blk null;
         } else null;
+        const cancelled_wait: ?types.CancelledWaitPresentation = if (self.takeCancelledWaitNote()) |note| blk: {
+            if (tool_call) |call| if (std.mem.eql(u8, call.id, note.call_id) and std.mem.eql(u8, call.name, "subagent")) {
+                self.alloc.free(note.call_id);
+                break :blk .{ .waited_for = note.waited_for };
+            };
+            debug_trace.logf("session", "cancelled wait note unmatched call_id={s} dropped=cancelled_wait_row", .{note.call_id});
+            note.deinit(self.alloc);
+            break :blk null;
+        } else null;
+        errdefer if (cancelled_wait) |presentation| types.freeCancelledWaitPresentation(self.alloc, presentation);
         const execution = try self.takeExecution(
             value.files,
             value.turn_summary,
@@ -1622,6 +1667,7 @@ pub const ConversationTurnBuilder = struct {
             .tool_call = tool_call,
             .execution = execution,
             .cancelled_command = cancelled_command,
+            .cancelled_wait = cancelled_wait,
             .terminal_reason = value.reason,
             .cancellation_origin = value.cancellation_origin,
         } };
@@ -1671,6 +1717,63 @@ test "conversation replay keeps reasoning-only assistant units before the final 
     try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "a cancelled wait note keeps the row only for the interrupted turn's own subagent call (D102)" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const wait: session_event.ConversationToolCall = .{
+        .call_id = "call-wait",
+        .tool_name = "subagent",
+        .arguments_json = "{\"action\":\"wait\"}",
+    };
+    // A note before the turn's user message is left out.
+    try builder.noteCancelledWait("call-wait", "lander");
+    try std.testing.expect(builder.cancelled_wait == null);
+
+    // The note of the turn's own wait keeps the names its row showed.
+    try builder.begin(.{ .text = "wait" });
+    try builder.appendToolCall(wait);
+    try builder.noteCancelledWait("call-wait", "lander, scout");
+    const kept = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, kept);
+    try std.testing.expectEqualStrings("lander, scout", kept.interrupted.cancelled_wait.?.waited_for.?);
+
+    // A wait whose host named no subagents keeps its row with no names.
+    try builder.begin(.{ .text = "wait unnamed" });
+    try builder.appendToolCall(wait);
+    try builder.noteCancelledWait("call-wait", null);
+    const unnamed = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, unnamed);
+    try std.testing.expect(unnamed.interrupted.cancelled_wait.?.waited_for == null);
+
+    // A note of another call, or of a call that is no subagent call, is dropped.
+    try builder.begin(.{ .text = "wait again" });
+    try builder.appendToolCall(wait);
+    try builder.noteCancelledWait("call-other", "lander");
+    const unmatched = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, unmatched);
+    try std.testing.expect(unmatched.interrupted.cancelled_wait == null);
+    try builder.begin(.{ .text = "read" });
+    try builder.appendToolCall(.{ .call_id = "call-read", .tool_name = "read_file", .arguments_json = "{}" });
+    try builder.noteCancelledWait("call-read", "lander");
+    const not_wait = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, not_wait);
+    try std.testing.expect(not_wait.interrupted.cancelled_wait == null);
+
+    // A turn that finished keeps no note for the next one.
+    try builder.begin(.{ .text = "finish" });
+    try builder.noteCancelledWait("call-wait", "lander");
+    try builder.appendAssistant(.{ .text = "done" });
+    const finished = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, finished);
+    try std.testing.expect(builder.cancelled_wait == null);
+    try builder.begin(.{ .text = "then stop" });
+    try builder.appendToolCall(wait);
+    const plain = try builder.finishInterrupted(.{ .reason = .cancelled });
+    defer types.freeHistoryTurn(alloc, plain);
+    try std.testing.expect(plain.interrupted.cancelled_wait == null);
 }
 
 test "a cancelled command note keeps the row only for the interrupted turn's own call (D100)" {

@@ -5461,6 +5461,101 @@ describe("cli: ask success", () => {
     60_000,
   );
 
+  test(
+    "fx ask requests compressed model catalog and decodes gzip responses",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-gzip-catalog-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/compressed-catalog-model";
+      let modelsAcceptEncoding: string | null = null;
+      let chatBody = "";
+      const catalogJson = JSON.stringify({
+        object: "list",
+        data: [
+          {
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 500_000,
+            max_tokens: 32_000,
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+          },
+        ],
+      });
+      const gzippedCatalog = Bun.gzipSync(Buffer.from(catalogJson));
+      const sseBody =
+        `data: ${JSON.stringify({ type: "text-delta", id: "a1", delta: "compressed catalog ok\n" })}\n\n` +
+        `data: ${JSON.stringify({
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 4 }, outputTokens: { total: 3 } },
+        })}\n\ndata: [DONE]\n\n`;
+
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/coding-agent/v1/models") {
+            modelsAcceptEncoding = request.headers.get("accept-encoding");
+            return new Response(gzippedCatalog, {
+              headers: {
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+              },
+            });
+          }
+          if (url.pathname === "/ai/v1/chat/completions") {
+            chatBody = await request.text();
+            return new Response(sseBody, {
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          `${JSON.stringify({ model, effort: "high" })}\n`,
+        );
+
+        const baseUrl = `http://127.0.0.1:${server.port}`;
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Check compressed catalog."],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              ...NO_GATEWAY_AUTH,
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-gzip-catalog-key",
+              FX_GATEWAY_BASE_URL: baseUrl,
+              FX_GATEWAY_CHAT_URL: `${baseUrl}/ai/v1/chat/completions`,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(modelsAcceptEncoding ?? "").toContain("gzip");
+        expect(JSON.parse(result.stdout).output.trim()).toBe("compressed catalog ok");
+        expect(JSON.parse(chatBody)).toMatchObject({
+          reasoning: "high",
+          maxOutputTokens: 32_000,
+        });
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "live Gateway accepts catalog-backed portable reasoning",
     async () => {
