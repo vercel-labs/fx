@@ -735,21 +735,29 @@ jobs:
           bun tests/tla/drivers/mcp/driver.ts
 
   # The MCP host models, which models.test.ts checks with TLC, and the drivers
-  # that run fx along them. It runs beside the engine job above, in two parts
-  # that run in parallel: models.test.ts alone takes about 19 minutes, and
-  # every other test file in tests/tla/drivers/mcp_host/ takes about 14. The
-  # drivers part takes the files by listing the folder, so a new driver runs
-  # without a change here. Planted bugs stay local
+  # that run fx along them. It runs beside the engine job above, in three
+  # parts that run in parallel. The model checks take about 20 minutes and the
+  # SignIn model is half of them, so SignIn has a part and the other models
+  # have one (models.test.ts, which also holds the bridge controls). Every
+  # other test file in tests/tla/drivers/mcp_host/ takes about 10 minutes in
+  # the drivers part, which takes the files by listing the folder, so a new
+  # driver runs without a change here. Planted bugs stay local
   # (tests/tla/mcp_host/check.sh).
   tla-mcp-host:
-    name: TLA+ MCP host ${{ matrix.part }}
+    name: TLA+ MCP host ${{ matrix.label }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        part: [models, drivers]
+        include:
+          - part: signin
+            label: SignIn model
+          - part: models
+            label: other models
+          - part: drivers
+            label: drivers
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
@@ -788,8 +796,17 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
           dir=./tests/tla/drivers/mcp_host
+          args=()
           case "$PART" in
-            models) files=("$dir/models.test.ts") ;;
+            signin)
+              export FX_MCP_HOST_MODELS=SignIn
+              files=("$dir/models.test.ts")
+              args=(-t 'TLC: ')
+              ;;
+            models)
+              export FX_MCP_HOST_MODELS=-SignIn
+              files=("$dir/models.test.ts")
+              ;;
             drivers)
               mapfile -t files < <(find "$dir" -maxdepth 1 -type f \( -name '*.test.*' -o -name '*_test.*' -o -name '*.spec.*' -o -name '*_spec.*' \) ! -name models.test.ts | sort)
               ;;
@@ -797,7 +814,7 @@ jobs:
           esac
           printf 'MCP host %s part runs:\n' "$PART"
           printf '  %s\n' "${files[@]}"
-          bun test "${files[@]}"
+          bun test "${files[@]}" "${args[@]}"
 
   # The transcript window model and the window's core driven along it both
   # ways. Its planted bugs and the run of a built fx along the model stay local

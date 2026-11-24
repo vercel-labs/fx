@@ -239,7 +239,7 @@ When the detector can't read the change, the `macOS arm64` check fails instead o
 - The Node-API or WebAssembly core entry point
 - `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
 
-The `TLA+ MCP engine models and driver`, `TLA+ MCP host models` and `TLA+ MCP host drivers` jobs run in parallel, take about 20 minutes each, and run their checks when the change touches:
+The `TLA+ MCP engine models and driver`, `TLA+ MCP host SignIn model`, `TLA+ MCP host other models` and `TLA+ MCP host drivers` jobs run in parallel, take about 20 minutes each, and run their checks when the change touches:
 
 - `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
 - The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`

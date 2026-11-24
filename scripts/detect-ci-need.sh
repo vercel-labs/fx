@@ -11,9 +11,10 @@
 # src/acp/, src/core/hosts/, or src/core/session_manager/.
 #
 # mcp: the TLA+ MCP jobs, the engine models and driver and the host models and
-# the host drivers (two parts of one job), model-check tests/tla/mcp/ and
-# tests/tla/mcp_host/ and drive the MCP engine and fx along them. They run in
-# parallel and take about 20 minutes each. A pull request runs them only when it touches src/mcp/,
+# drivers (three parts of one job: the SignIn model, the other models, and the
+# drivers), model-check tests/tla/mcp/ and tests/tla/mcp_host/ and drive the
+# MCP engine and fx along them. They run in parallel and take about 20 minutes
+# each. A pull request runs them only when it touches src/mcp/,
 # src/core/mcp_host/, src/core/mcp/, src/core/shared/net_connect.zig (the
 # connect its model Connect.tla checks), those models, their drivers in
 # tests/tla/drivers/mcp/, tests/tla/drivers/mcp_host/, and
