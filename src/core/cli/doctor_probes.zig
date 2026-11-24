@@ -1635,8 +1635,9 @@ test "stopping a check that keeps starting processes in groups of their own leav
         // process the forker started. The read end is open, and never blocks,
         // before the forker opens the write end.
         var moved_path_buf: [std.posix.PATH_MAX]u8 = undefined;
-        const moved_path = try std.fmt.bufPrintSentinel(&moved_path_buf, "{s}/moved-{d}", .{ dir, round }, 0);
+        const moved_path = try std.mem.printSentinel(&moved_path_buf, "{s}/moved-{d}", .{ dir, round }, 0);
         if (fifo_c.mkfifo(moved_path, 0o600) != 0) return error.PipeFailed;
+        defer _ = std.c.unlink(moved_path);
         const moved_read = std.c.open(moved_path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         if (moved_read < 0) return error.PipeFailed;
         defer _ = std.c.close(moved_read);
