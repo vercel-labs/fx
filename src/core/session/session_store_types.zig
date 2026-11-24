@@ -194,6 +194,23 @@ pub const SessionRecoveryResult = struct {
     }
 };
 
+pub const SessionForkResult = struct {
+    source_session_id: []u8,
+    fork_session_id: []u8,
+    workspace_root: []u8,
+    history_len: usize,
+    copied_agents: usize = 0,
+    /// False when a side file could not be copied.
+    files_complete: bool = true,
+
+    pub fn deinit(self: *SessionForkResult, alloc: Allocator) void {
+        alloc.free(self.source_session_id);
+        alloc.free(self.fork_session_id);
+        alloc.free(self.workspace_root);
+        self.* = undefined;
+    }
+};
+
 /// Copyable store state shared with discovery and migration without introducing
 /// a dependency on the `Store` facade. `canonical_root` retains value semantics.
 pub const StoreContext = struct {
