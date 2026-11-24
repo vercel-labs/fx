@@ -13891,28 +13891,22 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test.each(["empty-name", "missing-name", "null-name", "long-name", "long-id", "long-provisional"])(
+  test.each(["empty-name", "missing-name", "null-name", "long-name"])(
     "unstorable tool identities reject the batch and preserve earlier saved work (%s)",
     async (kind) => {
       const root = createFixtureRoot(`identity-${kind}`);
       const tracePath = join(root.root, "trace.log");
       const invalid: Record<string, unknown> = {
-        type: "tool-call", toolCallId: kind === "long-id" ? "i".repeat(257) : "bad",
+        type: "tool-call", toolCallId: "bad",
         toolName: "unknown_tool", input: {},
       };
       if (kind === "empty-name") invalid.toolName = "";
       if (kind === "missing-name") delete invalid.toolName;
       if (kind === "null-name") invalid.toolName = null;
       if (kind === "long-name") invalid.toolName = "n".repeat(257);
-      const streamed = kind === "long-provisional" ? [
-        { type: "tool-input-start", id: "p".repeat(257), toolName: "unknown_tool" },
-        { type: "tool-input-delta", id: "p".repeat(257), delta: "{}" },
-        { type: "tool-input-end", id: "p".repeat(257) },
-      ] : [];
       const responses = [
         fakeGatewayToolCall("prior", "write_file", { path: "prior.txt", content: "settled" }),
         fakeGatewaySse([
-          ...streamed,
           { type: "tool-call", toolCallId: "sibling", toolName: "write_file", input: { path: "must-not-exist.txt", content: "unexpected effect" } },
           invalid,
           { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" } },
@@ -13938,8 +13932,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(history).toHaveLength(1);
         expect(history[0].execution.tool_steps).toHaveLength(1);
         expect(history[0].execution.tool_steps[0].tool_calls.map((call: { id: string }) => call.id)).toEqual(["prior"]);
-        const field = kind === "long-id" ? "id" : kind === "long-provisional" ? "provisional_id" : "name";
-        expect(readFileSync(tracePath, "utf8")).toContain(`field=${field} failure=${kind.startsWith("long-") ? "too_long" : "empty"}`);
+        expect(readFileSync(tracePath, "utf8")).toContain(`field=name failure=${kind === "long-name" ? "too_long" : "empty"}`);
 
         responses.push(fakeGatewayFinalText("The prior write is retained."));
         const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What was completed?"], {
@@ -13958,21 +13951,66 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
   );
 
-  test("blank current tool id is rejected before file execution", async () => {
+  test.each(["long-id", "long-provisional"])(
+    "an oversized tool id runs under an fx id beside its sibling (%s)",
+    async (kind) => {
+      const root = createFixtureRoot(`fx-id-${kind}`);
+      const tracePath = join(root.root, "trace.log");
+      const longId = (letter: string) => letter.repeat(257);
+      const streamed = kind === "long-provisional" ? [
+        { type: "tool-input-start", id: longId("p"), toolName: "unknown_tool" },
+        { type: "tool-input-delta", id: longId("p"), delta: "{}" },
+        { type: "tool-input-end", id: longId("p") },
+      ] : [];
+      const responses = [
+        fakeGatewayToolCall("prior", "write_file", { path: "prior.txt", content: "settled" }),
+        fakeGatewaySse([
+          ...streamed,
+          { type: "tool-call", toolCallId: "sibling", toolName: "write_file", input: { path: "sibling.txt", content: "ran" } },
+          { type: "tool-call", toolCallId: kind === "long-id" ? longId("i") : "bad", toolName: "unknown_tool", input: {} },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" } },
+        ]),
+        fakeGatewayFinalText("Both calls answered."),
+      ];
+      const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 400 }));
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "Create prior.txt, then sibling.txt."], {
+          cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+        });
+        expect(result.code, result.stdout).toBe(0);
+        expect(readFileSync(join(root.workspace, "sibling.txt"), "utf8")).toBe("ran");
+        expect(gateway.requests).toHaveLength(3);
+        const parts = JSON.parse(gateway.requests[2]!.body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+        const ids = (type: string) => parts.filter((part: { type: string }) => part.type === type).map((part: { toolCallId: string }) => part.toolCallId);
+        // An oversized final id gets an fx id; an oversized streamed id never names the call.
+        const expected = ["prior", "sibling", kind === "long-id" ? "fx_call_1" : "bad"];
+        expect(ids("tool-call")).toEqual(expected);
+        expect(ids("tool-result")).toEqual(expected);
+        expect(gateway.requests[2]!.body).not.toContain(longId(kind === "long-id" ? "i" : "p"));
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("a blank tool id runs under an fx id", async () => {
     const root = createFixtureRoot("blank-call-id");
     const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => fakeGatewayToolCall(" \t", "write_file", {
-      path: "must-not-exist.txt", content: "unexpected effect",
-    }));
+    const responses = [
+      fakeGatewayToolCall(" \t", "write_file", { path: "written.txt", content: "written" }),
+      fakeGatewayFinalText("Wrote the fixture file."),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 400 }));
     try {
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Write the fixture file."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
-      expect(result.code).toBe(1);
-      expect(result.stdout).toContain("MalformedAuthoritativeToolIdentity");
-      expect(parseAskJson(result.stdout).tool_calls).toEqual([]);
-      expect(gateway.requests).toHaveLength(1);
-      expect(existsSync(join(root.workspace, "must-not-exist.txt"))).toBe(false);
+      expect(result.code, result.stdout).toBe(0);
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([{ name: "write_file", status: "success" }]);
+      expect(readFileSync(join(root.workspace, "written.txt"), "utf8")).toBe("written");
+      expect(gateway.requests).toHaveLength(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, "fx_call_1")).toContain("written.txt");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

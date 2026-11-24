@@ -40,7 +40,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
-import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
+import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -3884,6 +3884,52 @@ function askIn(fixture: Fixture, gateway: any, cwd: string, args: string[]) {
 
 /// The tools a request offered the model, by name.
 const offeredTools = (body: string): string[] => (JSON.parse(body).tools ?? []).map((tool: { name: string }) => tool.name);
+
+/// Writes session `id`'s log again with `edit` applied to each line's text
+/// before its CRC, each line sealed with its CRC32C again.
+function rewriteLogLines(fixture: Fixture, id: string, edit: (head: string) => string) {
+  const path = join(storeRoot(fixture.home), id, "log.jsonl");
+  const marker = ',"crc":"';
+  const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  const sealed = lines.map((text) => {
+    const head = edit(text.slice(0, text.lastIndexOf(marker)));
+    return `${head}${marker}${crc32c(Buffer.from(head)).toString(16).padStart(8, "0")}"}\n`;
+  });
+  writeFileSync(path, sealed.join(""));
+}
+
+test("a session saved with one call id in several steps resumes as before, and a new reuse gets an fx id", async () => {
+  const fixture = createFixture("fx-session-reused-call-id-");
+  const write = (id: string, name: string) => fakeGatewayToolCall(id, "write_file", { path: name, content: name });
+  const gateway = startFakeGateway([
+    write("call_a", "a.txt"), write("call_b", "b.txt"), write("call_c", "c.txt"), fakeGatewayFinalText("Saved three files."),
+    write("call_a", "d.txt"), fakeGatewayFinalText("Saved a fourth file."),
+  ]);
+  try {
+    const first = await ask(fixture, gateway, ["Write a, b, and c."]);
+    expect(first.code).toBe(0);
+    const id = JSON.parse(first.stdout).session_id;
+    expect(gateway.requests).toHaveLength(4);
+    // Saved the way fx did before each call got its own id: one id in all three steps.
+    rewriteLogLines(fixture, id, (head) => head.replaceAll('"call_b"', '"call_a"').replaceAll('"call_c"', '"call_a"'));
+    expect(savedText(fixture.home, id)).not.toMatch(/call_[bc]/);
+
+    const second = await ask(fixture, gateway, ["--resume", id, "Write d."]);
+    expect(second.code, second.stdout + second.stderr).toBe(0);
+    expect(readFileSync(join(fixture.workspace, "d.txt"), "utf8")).toBe("d.txt");
+    // The resumed request sends the saved calls as they were, each with its result.
+    const resumed = promptToolParts(gateway.requests[4]!.body);
+    expect(resumed.calls.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a"]);
+    expect(resumed.results.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a"]);
+    // The new call that reuses the saved id runs under an fx id.
+    const next = promptToolParts(gateway.requests[5]!.body);
+    expect(next.calls.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a", "fx_call_1"]);
+    expect(next.results.map((part) => part.toolCallId)).toEqual(["call_a", "call_a", "call_a", "fx_call_1"]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 /// Writes parent session `id`'s log again with `edit` applied to the data of each
 /// of its `child_spawned` lines, each line sealed with its CRC32C again. A

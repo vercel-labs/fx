@@ -1680,6 +1680,39 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "each ACP tool call has its own toolCallId when the model reuses, repeats, or leaves out ids",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-call-ids-");
+      const write = (id: string, name: string) => ({ type: "tool-call", toolCallId: id, toolName: "write_file", input: { path: name, content: name } });
+      const finish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+      const gateway = startFakeGateway([
+        fakeGatewaySse([write("dup", "a.txt"), finish]),
+        fakeGatewaySse([write("dup", "b.txt"), write("dup", "c.txt"), write("", "d.txt"), finish]),
+        finalText("ACP_CALL_IDS_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Write a, b, c, and d.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        for (const name of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
+          expect(readFileSync(join(root.workspace, name), "utf8")).toBe(name);
+        }
+        const updates = result.messages.map((message) => message.params?.update).filter(Boolean);
+        const started = updates.filter((update) => update.sessionUpdate === "tool_call").map((update) => update.toolCallId);
+        expect(started).toEqual(["dup", "fx_call_1", "fx_call_2", "fx_call_3"]);
+        for (const update of updates.filter((update) => update.sessionUpdate === "tool_call_update")) {
+          expect(started).toContain(update.toolCallId);
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "host-managed ACP sessions stream without local credentials",
     async () => {
       const root = createIsolatedRoot("fx-acp-host-managed-");

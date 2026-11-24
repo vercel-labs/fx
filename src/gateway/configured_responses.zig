@@ -169,7 +169,7 @@ fn selectTools(alloc: Allocator, request: stream_provider.RequestData) !Selected
 /// Reads a successful streamed reply. The result owns the completion.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: stream_provider.ModelRequest, progress: ?sse.Progress) !stream_provider.Result {
     var events = request.events;
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages });
     defer reducer.deinit(alloc);
     var lines: sse.Reader = .{ .max_event_bytes = max_event_bytes, .max_total_bytes = max_stream_bytes, .progress = progress };
     defer lines.deinit(alloc);
@@ -327,6 +327,10 @@ const RecordedEvents = struct {
 };
 
 fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) !stream_provider.Result {
+    return test_consume_in(alloc, bytes, recorded, &.{});
+}
+
+fn test_consume_in(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents, messages: []const types.ChatMessage) !stream_provider.Result {
     var reader = std.Io.Reader.fixed(bytes);
     var cancel = std.atomic.Value(bool).init(false);
     var delivery = stream_provider.DeliveryCertainty.init();
@@ -335,7 +339,7 @@ fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) 
         .credential = .{ .direct = .{ .source = .configured } },
         .model = "qwen2.5:0.5b",
         .retry_count = 0,
-        .messages = &.{},
+        .messages = messages,
         .tool_choice = .auto,
         .provider_options = .{},
         .trace_ctx = .{},
@@ -370,6 +374,77 @@ test "configured responses reads a real server's text reply with its cached and 
     try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
     try std.testing.expectEqual(@as(?u64, 12), completion.usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 1), completion.usage.reasoning_tokens);
+}
+
+fn test_function_call(comptime index: []const u8, comptime call_id_field: []const u8) []const u8 {
+    const item = "{\"type\":\"function_call\"" ++ call_id_field ++ ",\"name\":\"read_file\",\"arguments\":\"{}\"}";
+    return "data: {\"type\":\"response.output_item.added\",\"output_index\":" ++ index ++ ",\"item\":" ++ item ++ "}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":" ++ index ++ ",\"item\":" ++ item ++ "}\n\n";
+}
+
+const test_completed = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+
+fn test_call_ids(alloc: Allocator, completion: types.ModelCompletion) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (completion.tool_calls) |call| try out.print(alloc, "{s};", .{call.id});
+    return out.toOwnedSlice(alloc);
+}
+
+test "configured responses gives a call the id an earlier step used an fx id" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{\"path\":\"old\"}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    var result = try test_consume_in(alloc, comptime test_function_call("0", ",\"call_id\":\"dup\"") ++ test_completed, &recorded, &messages);
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("fx_call_1;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
+}
+
+test "configured responses keeps the id of a call sent again with an earlier call's id, tool, and arguments" {
+    const alloc = std.testing.allocator;
+    const earlier = [_]types.ToolCall{.{ .id = "dup", .name = "read_file", .arguments_json = "{ }" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &earlier },
+        .{ .role = .tool, .tool_call_id = "dup", .tool_name = "read_file", .content = "read" },
+    };
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    const wire = comptime test_function_call("0", ",\"call_id\":\"dup\"") ++ test_function_call("1", ",\"call_id\":\"dup\"") ++ test_completed;
+    var result = try test_consume_in(alloc, wire, &recorded, &messages);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    const ids = try test_call_ids(alloc, completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("dup;fx_call_2;", ids);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].provisional_id.?);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(completion));
+}
+
+test "configured responses gives repeated, missing, and empty call ids fx ids" {
+    const alloc = std.testing.allocator;
+    const wire = comptime test_function_call("0", ",\"call_id\":\"same\"") ++
+        test_function_call("1", ",\"call_id\":\"same\"") ++
+        test_function_call("2", "") ++
+        test_function_call("3", ",\"call_id\":\"\"") ++
+        test_completed;
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(alloc);
+    var result = try test_consume_in(alloc, wire, &recorded, &.{});
+    defer result.deinit(alloc);
+    const ids = try test_call_ids(alloc, result.completed.completion);
+    defer alloc.free(ids);
+    try std.testing.expectEqualStrings("same;fx_call_1;fx_call_2;fx_call_3;", ids);
+    try std.testing.expectEqual(types.AuthoritativeToolAdmission.admitted, types.authoritativeToolAdmission(result.completed.completion));
 }
 
 test "configured responses fails a reply that never finishes" {
