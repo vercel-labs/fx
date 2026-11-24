@@ -320,6 +320,13 @@ pub const TurnContext = struct {
         []const u8,
         child_state.Phase,
     ) anyerror!void = null,
+    /// Asked when a hosted turn is about to begin, by the host that runs it
+    /// (the app's main loop, as it starts the run): whether it may begin.
+    /// False when the work's cancel is already set, so the turn must not
+    /// begin and the stop that set it has counted the work's unread messages.
+    /// Null where no slot owns the turn.
+    begin_context: ?*anyopaque = null,
+    begin_fn: ?*const fn (*anyopaque) bool = null,
     /// Called once a child's approval request is registered, so its parent
     /// hears that the child waits on it. Null when nothing listens.
     approval_note_context: ?*anyopaque = null,
@@ -391,10 +398,12 @@ pub const TurnContext = struct {
     /// The child's turn starts: its start capture (D98).
     pub fn startWorkspaceCapture(self: *TurnContext, fresh: bool, step: runtime_deps.AgentRuntimeDeps.WorkspaceCaptureStep) void {
         if (comptime !turn_capture.supported) return;
+        if (step == .settle) return self.turn_capture.settle();
         const context = self.workspaceCaptureContext() orelse return;
         switch (step) {
             .begin => self.turn_capture.begin(context, fresh),
             .capture => self.turn_capture.start(context, &self.capture_lock),
+            .settle => unreachable,
         }
     }
 
@@ -408,6 +417,12 @@ pub const TurnContext = struct {
     /// True when the child's own agent holds the session.
     pub fn isHosted(self: *const TurnContext) bool {
         return self.child == null;
+    }
+
+    /// Whether a hosted turn may begin now (`begin_fn`). True when nothing asks.
+    pub fn hostedTurnBegins(self: *TurnContext) bool {
+        const begin = self.begin_fn orelse return true;
+        return begin(self.begin_context orelse return true);
     }
 
     pub fn deinit(self: *TurnContext) void {

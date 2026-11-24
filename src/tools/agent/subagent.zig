@@ -327,6 +327,7 @@ pub fn call(
         request,
         ctx.tool_call_id,
     );
+    if (result.started) tool_dispatch.reportToolResultMemory(ctx, .{ .subagent_started = true });
     return switch (result.status) {
         .success => .{ .success = result.body },
         .failure => .{ .failure = result.body },
@@ -436,6 +437,48 @@ test "call executes a validated managed request through the provider" {
         },
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "a message that made its subagent marks the call's row, not what the model reads" {
+    const Fixture = struct {
+        started: bool,
+
+        fn execute(
+            raw_context: ?*anyopaque,
+            alloc: Allocator,
+            _: *model_contract.Request,
+            _: []const u8,
+        ) Allocator.Error!tool_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+            return .{ .status = .success, .body = try alloc.dupe(u8, "{\"ok\":true}"), .started = self.started };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |started| {
+        const decoded = try decode(
+            .{ .allocator = alloc, .tool_call_id = "call-1" },
+            "{\"request\":{\"action\":\"message\",\"agent\":\"scout\",\"message\":\"map it\"}}",
+        );
+        const input = switch (decoded) {
+            .failure => |reason| {
+                alloc.free(reason);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| input,
+        };
+        defer input.deinit(alloc);
+        var fixture = Fixture{ .started = started };
+        var memory: ?@import("../../core/shared/types.zig").ToolResultMemory = null;
+        const result = try call(.{
+            .allocator = alloc,
+            .tool_call_id = "call-1",
+            .tool_result_memory_sink = &memory,
+            .subagent_provider = .{ .context = &fixture, .execute_fn = Fixture.execute },
+        }, input);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("{\"ok\":true}", result.success);
+        try std.testing.expectEqual(started, if (memory) |value| value.subagent_started else false);
+    }
 }
 
 test "decode accepts the seven actions and nothing else" {

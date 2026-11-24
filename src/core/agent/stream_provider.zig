@@ -225,6 +225,10 @@ pub const RequestData = struct {
     model: []const u8,
     instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
+    /// This turn's messages so far, borrowed. Compaction can take some of
+    /// them out of `messages`; a reply's calls still may not take their ids
+    /// (`src/gateway/tool_call_ids.zig` ReplyIds).
+    current_turn_messages: []const types.ChatMessage = &.{},
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
     vision_mode: VisionMode = .unavailable,
@@ -436,6 +440,10 @@ pub const ModelRequest = struct {
     retry_count: usize,
     instructions: []const types.ChatMessage = &.{},
     messages: []const types.ChatMessage,
+    /// This turn's messages so far, borrowed. Compaction can take some of
+    /// them out of `messages`; a reply's calls still may not take their ids
+    /// (`src/gateway/tool_call_ids.zig` ReplyIds).
+    current_turn_messages: []const types.ChatMessage = &.{},
     tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
     vision_mode: VisionMode = .unavailable,
@@ -465,6 +473,7 @@ pub const ModelRequest = struct {
             .model = self.model,
             .instructions = self.instructions,
             .messages = self.messages,
+            .current_turn_messages = self.current_turn_messages,
             .tools = self.tools,
             .tool_choice = self.tool_choice,
             .vision_mode = self.vision_mode,

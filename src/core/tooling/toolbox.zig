@@ -156,6 +156,35 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
     return .{ .name = target.string, .arguments_json = arguments.written(), .arguments_from_text = from_text };
 }
 
+/// The alias of the MCP tool a call runs: its own name for a direct call,
+/// and the one a `toolbox {run}` carries. Null for any other call, an open
+/// or a search of an MCP tool included. Borrows `name` or `arena`.
+pub fn mcpToolAlias(arena: Allocator, name: []const u8, arguments_json: ?[]const u8) Allocator.Error!?[]const u8 {
+    if (core_types.isMcpToolName(name)) return name;
+    const run = (try carriedCall(arena, name, arguments_json orelse return null)) orelse return null;
+    return if (core_types.isMcpToolName(run.name)) run.name else null;
+}
+
+test "the MCP tool a call runs is its own name or the one its toolbox run carries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { name: []const u8, arguments: ?[]const u8, alias: ?[]const u8 }{
+        .{ .name = "mcp_slack_read_thread", .arguments = null, .alias = "mcp_slack_read_thread" },
+        .{ .name = tool_name, .arguments = "{\"run\":\"mcp_slack_read_thread\",\"arguments\":{\"ts\":\"1\"}}", .alias = "mcp_slack_read_thread" },
+        .{ .name = tool_name, .arguments = "{\"open\":\"mcp_slack_read_thread\"}", .alias = null },
+        .{ .name = tool_name, .arguments = "{\"run\":\"read_file\",\"arguments\":{\"path\":\"a\"}}", .alias = null },
+        .{ .name = tool_name, .arguments = null, .alias = null },
+        .{ .name = "read_file", .arguments = "{\"path\":\"a\"}", .alias = null },
+    };
+    for (cases) |case| {
+        const alias = try mcpToolAlias(a, case.name, case.arguments);
+        if (case.alias) |expected| {
+            try std.testing.expectEqualStrings(expected, alias orelse return error.TestExpectedAlias);
+        } else try std.testing.expect(alias == null);
+    }
+}
+
 /// The call a `toolbox {run}` of a built-in tool shows as on its rows: the
 /// call fx runs for it, of that tool with that tool's arguments under the
 /// toolbox call's id, so the rows read as a direct call of the tool from

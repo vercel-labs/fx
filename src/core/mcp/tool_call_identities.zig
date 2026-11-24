@@ -1,15 +1,18 @@
-//! Remembers the MCP identity each exposed tool name had when an ACP session
-//! called it, so `session/load` replays those calls with their server,
-//! original tool, and title. Replay otherwise resolves identity from the live
-//! catalog, which stays empty for servers served over the ACP connection
-//! until the next turn connects them. The record is display metadata stored
-//! beside the client system prompt; an unreadable record is dropped.
+//! Remembers the MCP identity each exposed tool name had when a session
+//! called it, so a replay shows those calls with their server, original tool,
+//! and title: ACP's `session/load`, and the terminal's resume. Replay
+//! otherwise resolves identity from the live catalog, which stays empty until
+//! the servers connect, after the replay: those served over the ACP
+//! connection until the next turn connects them, and the terminal's until
+//! they start in the background. The record is display metadata stored beside
+//! the client system prompt; an unreadable record is dropped.
 
 const std = @import("std");
-const io_mod = @import("../core/shared/io.zig");
-const catalog_state = @import("../core/mcp/catalog_state.zig");
-const session_child_store = @import("../core/session/session_child_store.zig");
-const session_adapter = @import("../core/session/session_adapter.zig");
+const io_mod = @import("../shared/io.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const catalog_state = @import("catalog_state.zig");
+const session_child_store = @import("../session/session_child_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 
 const Allocator = std.mem.Allocator;
 const Identity = catalog_state.ToolIdentity;
@@ -138,6 +141,126 @@ pub fn load(alloc: Allocator, capability: *session_child_store.SessionChildCapab
     return parse(alloc, bytes);
 }
 
+/// The record a v2 session keeps in its `tool_identities` setting (D46). A
+/// record that cannot be read is reported in the trace and replaced by an
+/// empty one.
+pub fn restore(alloc: Allocator, session: *session_adapter.Session) Allocator.Error!Record {
+    const record = blk: {
+        const stored = session.toolIdentities(alloc) catch |err| break :blk err;
+        const bytes = stored orelse return .{};
+        defer alloc.free(bytes);
+        break :blk parse(alloc, bytes);
+    };
+    return record catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "session",
+                "dropped unreadable tool identity record session={s} err={s}",
+                .{ session.id(), @errorName(err) },
+            );
+            return .{};
+        },
+    };
+}
+
+/// The record of whichever v2 session fx has open, read from its setting the
+/// first time that session is asked about, so a switch to another session,
+/// a fork, or `/new` needs no step of its own. The worker thread records a
+/// call as it starts while a resume on the UI thread reads, so one mutex
+/// guards both.
+pub const SessionRecord = struct {
+    mutex: std.Io.Mutex = .init,
+    /// The session `record` belongs to; owned.
+    session_id: ?[]u8 = null,
+    record: Record = .{},
+
+    pub fn deinit(self: *SessionRecord, alloc: Allocator) void {
+        if (self.session_id) |id| alloc.free(id);
+        self.record.deinit(alloc);
+        self.* = .{};
+    }
+
+    /// The identity `session` recorded for `name`, copied into `arena`.
+    pub fn lookup(self: *SessionRecord, alloc: Allocator, arena: Allocator, session: *session_adapter.Session, name: []const u8) Allocator.Error!?Identity {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.follow(alloc, session);
+        return self.record.lookup(arena, name);
+    }
+
+    /// Records `identity` for `name` in `session`'s setting.
+    pub fn remember(self: *SessionRecord, alloc: Allocator, session: *session_adapter.Session, name: []const u8, identity: Identity) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.follow(alloc, session);
+        try self.record.remember(alloc, .{ .v2 = session }, name, identity);
+    }
+
+    /// Reads `session`'s record when the one held is another session's.
+    fn follow(self: *SessionRecord, alloc: Allocator, session: *session_adapter.Session) Allocator.Error!void {
+        if (self.session_id) |id| if (std.mem.eql(u8, id, session.id())) return;
+        const id = try alloc.dupe(u8, session.id());
+        errdefer alloc.free(id);
+        const record = try restore(alloc, session);
+        if (self.session_id) |old| alloc.free(old);
+        self.record.deinit(alloc);
+        self.session_id = id;
+        self.record = record;
+    }
+};
+
+test "a session record names the calls of the session fx has open, after a resume too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    // fx keeps `.fx` private, and resuming a session checks that.
+    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".fx" });
+    defer alloc.free(fx_dir);
+    if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+    var store = try session_adapter.Store.openFromEnv(alloc);
+    defer store.deinit(alloc);
+    var model = "m".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
+    };
+
+    var record: SessionRecord = .{};
+    defer record.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try session_adapter.Session.create(alloc, &store, "/w", .app, seed);
+    try record.remember(alloc, first, "mcp_my_srv_echo", .{ .server = @constCast("my_srv"), .tool = @constCast("echo") });
+    try first.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("q") }, .assistant = @constCast("a") } }, .default());
+    const first_id = try alloc.dupe(u8, first.id());
+    defer alloc.free(first_id);
+
+    // Another session has its own record, and a switch back reads it again.
+    const second = try session_adapter.Session.create(alloc, &store, "/w", .app, seed);
+    try std.testing.expect(try record.lookup(alloc, arena, second, "mcp_my_srv_echo") == null);
+    second.close();
+    first.close();
+
+    const resumed = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = first_id }, "/w", .app);
+    defer resumed.close();
+    const identity = (try record.lookup(alloc, arena, resumed, "mcp_my_srv_echo")).?;
+    try std.testing.expectEqualStrings("my_srv", identity.server);
+    try std.testing.expectEqualStrings("echo", identity.tool);
+    try std.testing.expect(try record.lookup(alloc, arena, resumed, "mcp_other_echo") == null);
+}
+
 /// A record from its stored JSON; `load` reads a v1 side file through it, and
 /// a v2 session hands it its setting.
 pub fn parse(alloc: Allocator, bytes: []const u8) !Record {
@@ -234,6 +357,27 @@ test "tool identity record rejects malformed entries and control-character title
     defer arena_state.deinit();
     const identity = (try record.lookup(arena_state.allocator(), "mcp_a_b")).?;
     try std.testing.expectEqual(@as(?[]u8, null), identity.title);
+}
+
+test "a tool identity record keeps at most 1,024 names, and the names it has" {
+    const alloc = std.testing.allocator;
+    var record: Record = .{};
+    defer record.deinit(alloc);
+    var name_buf: [32]u8 = undefined;
+    for (0..max_entries) |index| {
+        const name = try std.mem.print(&name_buf, "mcp_s_tool_{d}", .{index});
+        try record.remember(alloc, .none, name, .{ .server = @constCast("s"), .tool = @constCast("tool") });
+    }
+    try std.testing.expectEqual(max_entries, record.entries.count());
+    // One more name is not kept, and costs nothing.
+    try record.remember(alloc, .none, "mcp_s_one_more", .{ .server = @constCast("s"), .tool = @constCast("one_more") });
+    try std.testing.expectEqual(max_entries, record.entries.count());
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expect(try record.lookup(arena_state.allocator(), "mcp_s_one_more") == null);
+    // A name it has still changes.
+    try record.remember(alloc, .none, "mcp_s_tool_0", .{ .server = @constCast("s"), .tool = @constCast("renamed") });
+    try std.testing.expectEqualStrings("renamed", (try record.lookup(arena_state.allocator(), "mcp_s_tool_0")).?.tool);
 }
 
 test "tool identity record refuses names that would outgrow the stored record" {

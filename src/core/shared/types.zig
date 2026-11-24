@@ -239,12 +239,28 @@ pub const ToolOutcome = struct {
     summary: []const u8,
 };
 
+/// The MCP server a call's tool is on, by its configured name, and the tool's
+/// own name on it, before fx gives it an alias such as `mcp_slack_read`.
+pub const McpToolName = struct {
+    server: []const u8,
+    tool: []const u8,
+};
+
 pub const ToolLifecycleEvent = union(enum) {
     provisional: struct {
         id: ToolLifecycleId,
         presentation_group_id: ?ToolPresentationGroupId = null,
         tool_name: ?[]const u8,
         activity_kind: ToolActivityKind,
+        /// The call's arguments once the provider has sent all of them, while
+        /// the call waits to start; null while they still stream in.
+        /// Borrowed for this push only.
+        arguments_json: ?[]const u8 = null,
+        /// The MCP tool the call runs, from the session's MCP catalog or its
+        /// record of the tools it called (src/core/mcp/tool_call_identities.zig);
+        /// null for any other call, or one neither knows. Borrowed for this
+        /// push only. Only the transcript's compact rows read it.
+        mcp_tool: ?McpToolName = null,
     },
     authoritative_started: struct {
         id: ToolLifecycleId,
@@ -258,6 +274,8 @@ pub const ToolLifecycleEvent = union(enum) {
         /// title a call when it starts. Borrowed for this push only; copies
         /// omit it.
         resolved_display_target: ?[]const u8 = null,
+        /// As `provisional.mcp_tool`.
+        mcp_tool: ?McpToolName = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -269,6 +287,21 @@ pub const ToolLifecycleEvent = union(enum) {
         result: ?[]const u8 = null,
         result_memory: ?ToolResultMemory = null,
         command_artifact_handle: ?[]const u8 = null,
+        /// Whether the call, a shell check, found its session's command
+        /// ended, which its status does not say when the command passed
+        /// (`checkFoundCommandEnded` in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        check_found_command_ended: bool = false,
+        /// The file a read, edit, or write read or changed, as core resolved
+        /// it with symlinks followed, the same for every way the call named
+        /// the file: an edit's or write's absolute path
+        /// (`finishCommittedFileStatus`), or the path a read's result names,
+        /// relative to the workspace for a file in it
+        /// (`finishExecutedToolStatus`, both in
+        /// src/core/agent/runtime/tool_presentation.zig). Only the
+        /// transcript's compact rows read it.
+        resolved_path: ?[]const u8 = null,
     },
     turn_finished: TurnFinished,
 };
@@ -1236,6 +1269,9 @@ pub const PersistedToolResult = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
+    /// A `subagent` message that made a new subagent, which a v2 session
+    /// saves as an item of its own beside the result (D101).
+    subagent_started: bool = false,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -1251,6 +1287,14 @@ pub const CommandOutputReplay = union(enum) {
 pub const CancelledCommandPresentation = struct {
     output_replay: ?CommandOutputReplay = null,
     command_artifact_handle: ?[]const u8 = null,
+};
+
+/// A `subagent` wait the turn cancelled while it waited, so a resume shows
+/// its row again (D102).
+pub const CancelledWaitPresentation = struct {
+    /// The subagents its row named, such as "lander, scout", or null when
+    /// its host named none.
+    waited_for: ?[]const u8 = null,
 };
 
 pub const CommandProcessPresentation = union(enum) {
@@ -1336,6 +1380,7 @@ pub const TerminalActionPresentation = union(enum) {
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
 pub const context_deferred_tool_status_label = "Reading project instructions before continuing:";
+pub const scoped_instructions_pending_tool_result_output = "Not executed: new scoped project instructions apply to this path. Reissue this tool call so fx can load them before execution.";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -1345,7 +1390,8 @@ pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
 pub fn isDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
         (std.mem.eql(u8, result.output, deferred_tool_result_output) or
-            std.mem.eql(u8, result.output, context_deferred_tool_result_output));
+            std.mem.eql(u8, result.output, context_deferred_tool_result_output) or
+            std.mem.eql(u8, result.output, scoped_instructions_pending_tool_result_output));
 }
 
 test "persisted deferred tool result classifier is exact" {
@@ -1378,6 +1424,17 @@ test "persisted deferred tool result classifier is exact" {
     result.output = @constCast(context_deferred_tool_result_output);
     try std.testing.expect(isDeferredToolResult(result));
     try std.testing.expect(isContextDeferredToolResult(result));
+
+    result.output = @constCast(scoped_instructions_pending_tool_result_output);
+    try std.testing.expect(isDeferredToolResult(result));
+    try std.testing.expect(!isContextDeferredToolResult(result));
+
+    result.output = @constCast(scoped_instructions_pending_tool_result_output ++ "\n");
+    try std.testing.expect(!isDeferredToolResult(result));
+
+    result.status = .success;
+    result.output = @constCast(scoped_instructions_pending_tool_result_output);
+    try std.testing.expect(!isDeferredToolResult(result));
 }
 
 pub const ToolResultMemory = struct {
@@ -1400,6 +1457,9 @@ pub const ToolResultMemory = struct {
     /// the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
+    /// A `subagent` message that made a new subagent, so its row reads
+    /// "Started" rather than "Messaged". The model never sees it.
+    subagent_started: bool = false,
 };
 
 /// A shell command that crossed the quiet limit during a wait: its command
@@ -1755,6 +1815,7 @@ pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
         .command_process_presentation = memory.command_process_presentation,
         .terminal_action_presentation = memory.terminal_action_presentation,
         .quiet_crossing = quiet_crossing,
+        .subagent_started = memory.subagent_started,
     };
 }
 
@@ -2484,6 +2545,11 @@ pub const ConversationIdentity = struct {
         if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
         return null;
     }
+
+    /// A call id of only spaces, tabs, and line ends names no call.
+    pub fn isBlank(value: []const u8) bool {
+        return std.mem.trim(u8, value, " \t\r\n").len == 0;
+    }
 };
 
 pub const AuthoritativeToolAdmission = union(enum) {
@@ -2504,7 +2570,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
+        const final_identity = if (call.final_identity == .valid and ConversationIdentity.isBlank(call.id))
             FinalToolIdentity.empty
         else
             call.final_identity;
@@ -2770,6 +2836,8 @@ pub const InterruptedHistoryTurn = struct {
     completed_tool_names: [][]u8 = &.{},
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
+    /// Set only when `tool_call` is that wait.
+    cancelled_wait: ?CancelledWaitPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
     cancellation_origin: CancellationOrigin = .turn,
     /// fx stopped before the turn ended, by a crash or a closed window,
@@ -3117,6 +3185,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             if (entry.cancelled_command) |presentation| {
                 freeCancelledCommandPresentation(alloc, presentation);
             }
+            if (entry.cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
         },
     }
 }
@@ -3196,6 +3265,12 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 freeCancelledCommandPresentation(alloc, presentation);
             };
 
+            const cancelled_wait = if (entry.cancelled_wait) |presentation|
+                try dupeCancelledWaitPresentation(alloc, presentation)
+            else
+                null;
+            errdefer if (cancelled_wait) |presentation| freeCancelledWaitPresentation(alloc, presentation);
+
             const execution = try dupeExecutionMemory(alloc, entry.execution);
 
             break :blk .{ .interrupted = .{
@@ -3205,6 +3280,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .completed_tool_names = completed_tool_names,
                 .execution = execution,
                 .cancelled_command = cancelled_command,
+                .cancelled_wait = cancelled_wait,
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
@@ -3237,6 +3313,20 @@ pub fn freeCancelledCommandPresentation(
 ) void {
     if (presentation.output_replay) |replay| freeCommandOutputReplay(alloc, replay);
     if (presentation.command_artifact_handle) |handle| alloc.free(@constCast(handle));
+}
+
+pub fn dupeCancelledWaitPresentation(
+    alloc: std.mem.Allocator,
+    presentation: CancelledWaitPresentation,
+) !CancelledWaitPresentation {
+    return .{ .waited_for = if (presentation.waited_for) |names| try alloc.dupe(u8, names) else null };
+}
+
+pub fn freeCancelledWaitPresentation(
+    alloc: std.mem.Allocator,
+    presentation: CancelledWaitPresentation,
+) void {
+    if (presentation.waited_for) |names| alloc.free(@constCast(names));
 }
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
@@ -3661,6 +3751,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
         .terminal_action_presentation = result.terminal_action_presentation,
+        .subagent_started = result.subagent_started,
     };
 }
 
@@ -4309,6 +4400,17 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     );
     freeHistoryTurn(alloc, interrupted_copy);
     freeHistoryTurn(alloc, interrupted_original);
+
+    const wait_original: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = try alloc.dupe(u8, "wait") },
+        .cancelled_wait = .{ .waited_for = try alloc.dupe(u8, "lander, scout") },
+    } };
+    const wait_copy = try dupeHistoryTurn(alloc, wait_original);
+    const copied_names = wait_copy.interrupted.cancelled_wait.?.waited_for.?;
+    try std.testing.expectEqualStrings("lander, scout", copied_names);
+    try std.testing.expect(copied_names.ptr != wait_original.interrupted.cancelled_wait.?.waited_for.?.ptr);
+    freeHistoryTurn(alloc, wait_copy);
+    freeHistoryTurn(alloc, wait_original);
 
     const finished_original = FinishedPrompt{
         .turn = .{ .interrupted = .{

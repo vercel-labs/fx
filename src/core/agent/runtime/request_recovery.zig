@@ -126,6 +126,8 @@ pub const RequestRecovery = struct {
     host_showing: bool = false,
     /// The kind of this request's last failed send (`failed`), reported with every status after it.
     last_failure: ?Failure.Kind = null,
+    /// The kind and attempt of the last status saved in the session log.
+    saved: ?struct { kind: types.RouteRecoveryStatus.Kind, attempt: usize } = null,
     ticker: ?std.Thread = null,
     ticker_stop: bool = false,
     ticker_wake: std.Io.Condition = .init,
@@ -347,11 +349,13 @@ pub const RequestRecovery = struct {
         if (!self.recovery_shown) return;
         self.recovery_shown = false;
         self.host_showing = false;
-        try self.deps.push_route_recovery_status(self.deps.ctx, .{
+        const recovered: types.RouteRecoveryStatus = .{
             .kind = .recovered,
             .attempt = self.attempts,
             .failure = self.last_failure,
-        });
+        };
+        defer self.saveStatusLocked(recovered);
+        try self.deps.push_route_recovery_status(self.deps.ctx, recovered);
     }
 
     /// Esc or quitting: ends the request and clears its status.
@@ -370,6 +374,7 @@ pub const RequestRecovery = struct {
         self.recovery_shown = false;
         var shown = status;
         if (shown.failure == null) shown.failure = self.last_failure;
+        defer self.saveStatusLocked(shown);
         try self.deps.push_route_recovery_status(self.deps.ctx, shown);
     }
 
@@ -385,12 +390,26 @@ pub const RequestRecovery = struct {
         if (!self.recovery_shown) return self.clearShownLocked();
         self.recovery_shown = false;
         self.host_showing = false;
-        self.deps.push_route_recovery_status(self.deps.ctx, .{
+        const failed_status: types.RouteRecoveryStatus = .{
             .kind = .failed,
             .attempt = self.attempts,
             .failure = self.last_failure,
-        }) catch |err| {
+        };
+        self.deps.push_route_recovery_status(self.deps.ctx, failed_status) catch |err| {
             debug_trace.logf("recovery", "failed status publication failed err={s}", .{@errorName(err)});
+        };
+        self.saveStatusLocked(failed_status);
+    }
+
+    /// Saves `status` in the session log when its kind or attempt differs
+    /// from the last one saved, so a countdown's updates add nothing. A
+    /// failed save is traced and never fails the request.
+    fn saveStatusLocked(self: *RequestRecovery, status: types.RouteRecoveryStatus) void {
+        const save = self.deps.save_route_recovery_status orelse return;
+        if (self.saved) |last| if (last.kind == status.kind and last.attempt == status.attempt) return;
+        self.saved = .{ .kind = status.kind, .attempt = status.attempt };
+        save(self.deps.ctx, status) catch |err| {
+            debug_trace.logf("recovery", "status save failed err={s} kind={s}", .{ @errorName(err), @tagName(status.kind) });
         };
     }
 
@@ -617,6 +636,7 @@ pub const RequestRecovery = struct {
             shown.failure = self.last_failure;
             self.recovery_shown = true;
             self.host_showing = true;
+            defer self.saveStatusLocked(shown);
             try self.deps.push_route_recovery_status(self.deps.ctx, shown);
         } else {
             self.host_showing = false;
@@ -784,6 +804,39 @@ test "the recovered status names the failure its last send had, and a healthy re
     try std.testing.expectEqual(pushed, fake.route_recovery_statuses.items.len);
     for (fake.route_recovery_statuses.items[pushed..]) |status| {
         try std.testing.expectEqual(@as(?Failure.Kind, null), status.failure);
+    }
+}
+
+test "the session log gets each status once per kind and attempt, and the outcome" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    // The countdown: three `waiting` updates in one wait, then a retry, then success.
+    _ = try request.start(false, null);
+    _ = try request.failed(.{ .kind = .rate_limited, .retry_after_ms = 3_000 });
+    _ = (try request.waitForSend()).?;
+    request.responding();
+    try request.succeeded();
+
+    const pushed = fake.route_recovery_statuses.items;
+    const saved = fake.saved_route_recovery_statuses.items;
+    try std.testing.expect(pushed.len > saved.len);
+    try std.testing.expectEqual(@as(usize, 3), saved.len);
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, saved[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), saved[0].attempt);
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, saved[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), saved[1].attempt);
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.recovered, saved[2].kind);
+    try std.testing.expectEqual(@as(usize, 2), saved[2].attempt);
+    for (saved, 0..) |status, i| {
+        try std.testing.expectEqual(@as(?Failure.Kind, .rate_limited), status.failure);
+        if (i == 0) continue;
+        const before = saved[i - 1];
+        try std.testing.expect(before.kind != status.kind or before.attempt != status.attempt);
     }
 }
 

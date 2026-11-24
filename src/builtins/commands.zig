@@ -104,12 +104,18 @@ const config_options = [_]command_specs.OptionDoc{
 const session_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "last", .description = "Inspect the current workspace session" },
     .{ .usage = "resume [last|<id>]", .description = "Resume the latest workspace session or a session by id" },
+    .{ .usage = "fork <last|id>", .description = "Copy a saved or live session into a new session", .options = &session_fork_options },
     .{ .usage = "recover <id>", .description = "Copy a recoverable corrupt session into a new session" },
 };
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
     .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
+    json_option,
+};
+
+pub const session_fork_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--id <id>", .description = "Fork a saved session by exact id" },
     json_option,
 };
 
@@ -373,8 +379,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
-        .summary = "Inspect, resume, or recover saved sessions",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session fork <last|id>|--id <id> [--json] | session recover <id>|--id <id> [--json]",
+        .summary = "Inspect, resume, fork, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
         .details = &.{
@@ -504,6 +510,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .sessions, .usage = "sessions" },
         .{ .kind = .session, .usage = "session <last|id>" },
         .{ .usage = "session resume [last|id]", .summary = "Resume the latest workspace session or a session by id" },
+        .{ .usage = "session fork <last|id>", .summary = "Copy a saved or live session into a new session" },
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{

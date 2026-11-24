@@ -46,6 +46,13 @@ const WIDE_TABLE =
   "| 1 | **Change:** on reopen, an unfinished turn gets `turn_interrupted{reason: crash}`; it's never cut | " +
   "`recovery.json` and `recovery.asked` go away. The adapter handles a turn that ends in a tool call with no result |\n" +
   "| 8 | **Keep:** forks start only at turn boundaries (or turn 0) | Mid-turn forks deferred |\n";
+const TOKEN_BREAKS_TABLE =
+  "| Check | Status | Notes |\n" +
+  "|---|---|---|\n" +
+  "| node tsec/scripts/seed.ts update && node tsec/scripts/seed.ts check | Pass (exit 0) | 63 .js files, byte-for-byte stage1 == stage2 == seed fixpoint |\n" +
+  "| TSE_BUILD_JOBS=4 node tsec/scripts/native.ts | Pass (exit 0) | 58 C units compiled and linked cleanly into native tsec (8.0 MB) |\n" +
+  "| TSE_BUILD_JOBS=4 node tsec/test/run.ts --only native-const-prim-arrays,native-cow-clone,native-export-inline,cache-gc,native-stats-line,native-fast-split,build-run305,d307 | Pass (exit 0) | All 8 sections passed (O2 -Werror, ASan+UBSan live 0, 8-thread TSan 0 races, --c-dir, nm -u inline proof, cache-gc 28/28, native-stats-line 213 checks) |\n" +
+  "| node tsec/test/run.ts --only query | Pass (exit 0) | All query and query layout checks passed (nullable own + --cow-reachable) |\n";
 
 const roots: string[] = [];
 const gateways: Array<{ stop(): void }> = [];
@@ -540,7 +547,10 @@ describe("fx ask presentation", () => {
       const pane = await session.capturePane();
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
-      expect(scrollback).toContain("Inspect fixture.txt and render the response.");
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain(FAKE_GATEWAY_MODEL);
+      expect(scrollback).not.toContain("Run /help for commands");
+      expect(scrollback).not.toContain("Inspect fixture.txt and render the response.");
       // Each group's only call is its header, and the failed read is marked.
       expect(pane).toContain("● Reading fixture.txt");
       expect(pane).toContain("Between groups.");
@@ -623,7 +633,10 @@ describe("fx ask presentation", () => {
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const pane = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
-      expect(pane).toContain("Render the no-color fixture.");
+      expect(pane).toContain("𝒇x v");
+      expect(pane).toContain(FAKE_GATEWAY_MODEL);
+      expect(pane).not.toContain("Run /help for commands");
+      expect(pane).not.toContain("Render the no-color fixture.");
       expect(pane).toContain("Ask presentation");
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("const answer: u8 = 42;");
@@ -736,6 +749,42 @@ describe("fx ask presentation", () => {
       expect(grid.some((line) => /^\s*│   │ \S/.test(line))).toBe(true);
       expect(scrollback).not.toContain("Choice: ");
       expect(scrollback).not.toContain("Direct consequences: ");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY tables break a long token instead of widening its column",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText(TOKEN_BREAKS_TABLE)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Render the check table fixture."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      const grid = lines.filter((line) => /^\s*[┌│├└]/.test(line));
+      const top = lines.find((line) => line.includes("┌")) ?? "";
+      const segments = top.trim().replace(/^┌/, "").replace(/┐$/, "").split("┬").map((segment) => segment.length);
+      expect(segments).toEqual([42, 15, 37]);
+      expect(new Set(grid.map((line) => line.length)).size).toBe(1);
+      expect(Math.max(...grid.map((line) => line.length))).toBeLessThanOrEqual(100);
+      expect(scrollback.split("Pass (exit 0)").length - 1).toBe(4);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -881,17 +930,18 @@ describe("fx ask presentation", () => {
         while (Date.now() < headerDeadline) {
           initialScrollback = await session.captureFullScrollback();
           if (
-            initialScrollback.includes("Run /help for commands") &&
-            initialScrollback.includes("Stream every answer line.")
+            initialScrollback.includes("𝒇x v") &&
+            initialScrollback.includes(`${FAKE_GATEWAY_MODEL} · fx ask --help`) &&
+            initialScrollback.includes("• Thinking")
           ) break;
           await Bun.sleep(25);
         }
-        expect(initialScrollback).toContain("Run /help for commands");
-        expect(initialScrollback).toContain("Stream every answer line.");
+        expect(initialScrollback).toContain("𝒇x v");
+        expect(initialScrollback).toContain(`${FAKE_GATEWAY_MODEL} · fx ask --help`);
+        expect(initialScrollback).toContain("• Thinking");
+        expect(initialScrollback).not.toContain("Run /help for commands");
+        expect(initialScrollback).not.toContain("Stream every answer line.");
         expect(initialScrollback).not.toContain(answerLines[0]!);
-        expect(initialScrollback.indexOf("Run /help for commands")).toBeLessThan(
-          initialScrollback.indexOf("Stream every answer line."),
-        );
 
         releaseOutput();
         const releaseDeadline = Date.now() + 5_000;
@@ -909,7 +959,10 @@ describe("fx ask presentation", () => {
 
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const finalScrollback = await session.captureFullScrollback();
-      expect(finalScrollback.split("Run /help for commands")).toHaveLength(2);
+      expect(finalScrollback.split(FAKE_GATEWAY_MODEL)).toHaveLength(2);
+      expect(finalScrollback).not.toContain("• Thinking");
+      expect(finalScrollback).not.toContain("Run /help for commands");
+      expect(finalScrollback).not.toContain("Stream every answer line.");
       for (const line of answerLines) {
         expect(finalScrollback.split(line)).toHaveLength(2);
       }
@@ -1003,12 +1056,189 @@ describe("fx ask presentation", () => {
 
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("Run the notice filtering fixture.");
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain(FAKE_GATEWAY_MODEL);
+      expect(scrollback).not.toContain("Run /help for commands");
+      expect(scrollback).not.toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
       expect(scrollback).toContain("● Running printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY header shows plain white version and resolved CLI model, effort, and fast settings without echoing the prompt",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText("Header verified.\n")], {
+        models: [
+          {
+            id: "anthropic/claude-sonnet-5.5",
+            type: "language",
+            tags: ["tool-use", "reasoning"],
+            reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+            speed: { fast: true },
+          },
+        ],
+      });
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand([
+          "ask",
+          "--no-save",
+          "--model",
+          "anthropic/claude-sonnet-5.5",
+          "--effort",
+          "high",
+          "--fast",
+          "Secret prompt text that must not echo.",
+        ]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 30,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain("· anthropic/claude-sonnet-5.5 · high · fast · fx ask --help");
+      expect(scrollback).toContain("Header verified.");
+      expect(scrollback).not.toContain("Run /help for commands");
+      expect(scrollback).not.toContain("Secret prompt text that must not echo.");
+      // Version carries bright/white hint style and model metadata carries dim style.
+      expect(escaped).toMatch(
+        /\x1b\[1m\x1b\[38;5;255m𝒇x\x1b\[0m \x1b\[38;5;255mv[^\x1b]+\x1b\[38;5;245m · anthropic\/claude-sonnet-5\.5 · high · fast · fx ask --help/,
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY resize mid-stream preserves prior scrollback without clearing the screen",
+    async () => {
+      const root = createRoot();
+      writeFileSync(join(root.workspace, "resize-fixture.txt"), "ok\n");
+      let releaseFinal: (() => void) | undefined;
+      const finalGate = new Promise<void>((resolve) => {
+        releaseFinal = resolve;
+      });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("read_resize", "read_file", { path: "resize-fixture.txt" }),
+        async () => {
+          await finalGate;
+          return fakeGatewayFinalText("FINAL_AFTER_RESIZE\n");
+        },
+      ]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const fxCmd = [FX_BIN, "ask", "--auto", "--no-save", "Read resize-fixture.txt."]
+        .map(shellQuote)
+        .join(" ");
+      const script = `printf 'PRIOR_SCROLLBACK_SENTINEL\\n'; ${fxCmd}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: `/bin/sh -c ${shellQuote(script)}`,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 100,
+        height: 24,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      try {
+        await session.waitForText("● Reading resize-fixture.txt", TIMEOUT);
+        await session.resizeWindow(76, 20);
+        releaseFinal!();
+        await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      } finally {
+        releaseFinal!();
+      }
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("PRIOR_SCROLLBACK_SENTINEL");
+      expect(scrollback.split(FAKE_GATEWAY_MODEL)).toHaveLength(2);
+      expect(scrollback).toContain("● Reading resize-fixture.txt");
+      expect(scrollback).toContain("FINAL_AFTER_RESIZE");
+      expect(scrollback).not.toContain("• Thinking");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY clears Thinking indicator before printing HTTP error to stderr",
+    async () => {
+      const root = createRoot();
+      let releaseError: () => void;
+      const errorGate = new Promise<void>((resolve) => {
+        releaseError = resolve;
+      });
+      const gateway = startDynamicFakeGateway(async () => {
+        await errorGate;
+        return new Response(
+          JSON.stringify({ error: { message: "bad request test" } }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      });
+      gateways.push(gateway);
+
+      const fxCmd = [
+        FX_BIN,
+        "ask",
+        "--auto",
+        "--no-save",
+        "Trigger an HTTP error.",
+      ]
+        .map(shellQuote)
+        .join(" ");
+      const script = `${fxCmd}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: `/bin/sh -c ${shellQuote(script)}`,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 96,
+        height: 24,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      try {
+        await session.waitForText("• Thinking", TIMEOUT);
+        releaseError!();
+        await session.waitForText("__FX_EXIT_1__", TIMEOUT);
+      } finally {
+        releaseError!();
+      }
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain(
+        "\nfx ask: API request failed · HTTP 400 · bad request test\n",
+      );
+      expect(scrollback).not.toContain("• Thinking");
     },
     TIMEOUT,
   );

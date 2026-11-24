@@ -66,8 +66,12 @@ function send(message) {
 // array of { bad, then, slowMs, progressEveryMs }. `bad` first writes a line fx refuses and cannot
 // attach to a call: "utf8_last" (bytes that are not UTF-8, the id after them), "deep_last" (JSON
 // nested past the engine's limit, the id last), "garbage" (a line with no JSON, as a notification
-// the server mangled would be), "cut" (a reply cut in the middle) or "duplicate_escaped" (the id first,
-// then `result` twice, the second time written `r\u0065sult`, which JSON reads as the same name). `then` is "silent" (nothing
+// the server mangled would be), "cut_no_id" (a reply cut in the middle, with no id), "duplicate_id" (the
+// id twice, which names no call) or, with the id first, so that fx can still tell which call the line
+// answers and ends it at once: "utf8_first" (bytes that are not UTF-8 after it), "deep_first" (JSON nested
+// past the engine's limit after it), "cut" (the reply cut in the middle after it), "duplicate_escaped"
+// (`result` twice, the second time written `r\u0065sult`, which JSON reads as the same name) or "other_id"
+// (the id of a call that is not in flight, then bytes that are not UTF-8). `then` is "silent" (nothing
 // more), "exit" (the server exits), or by default the valid reply, `slowMs` later, with progress
 // for the call's own token every `progressEveryMs` until then.
 const refused = JSON.parse(process.env.FX_MCP_REFUSED ?? "{}");
@@ -87,12 +91,22 @@ function refusedLine(id, bad) {
       ];
     case "deep_last":
       return [`{"jsonrpc":"2.0","result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}},"id":${id}}\n`];
+    case "utf8_first":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"text","text":"x`, Buffer.from([0xff, 0xfe]), '"}]}}\n'];
+    case "deep_first":
+      return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[],"structuredContent":${'{"a":'.repeat(3000)}1${"}".repeat(3000)}}}\n`];
+    case "duplicate_id":
+      return [`{"jsonrpc":"2.0","id":${id},"id":${id},"result":{"content":[]}}\n`];
+    case "other_id":
+      return [`{"jsonrpc":"2.0","id":${id + 1000},"result":{"content":[{"type":"text","text":"x`, Buffer.from([0xff, 0xfe]), '"}]}}\n'];
     case "garbage":
       return [`${"x".repeat(80)}\n`];
     case "duplicate_escaped":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[]},"r\\u0065sult":{"content":[]}}\n`];
     case "cut":
       return [`{"jsonrpc":"2.0","id":${id},"result":{"content":[{"type":"te\n`];
+    case "cut_no_id":
+      return [`{"jsonrpc":"2.0","result":{"content":[{"type":"te\n`];
     default:
       return [];
   }
@@ -654,7 +668,7 @@ process.stdin.on("data", (chunk) => {
 
 // FX_MCP_DEEP_SITE nests JSON at one place, for the depth limit on a server's JSON. FX_MCP_DEEP_DEPTH is the
 // nesting depth of the root value fx checks (the result for the result sites, the tool object for the tool
-// sites), FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
+// sites), FX_MCP_DEEP_ID_LAST (any value) writes a result's id after the result, FX_MCP_DEEP_SHAPE is object (the default), array or mixed. Sites: structured, content_meta,
 // content_annotations, error_data, tool_meta, tool_annotations, tool_icons.
 function deepSite() {
   return process.env.FX_MCP_DEEP_SITE ?? "";
@@ -728,5 +742,7 @@ function sendDeepResult(message) {
     result.content[0].annotations = { x: "@@DEEP@@" };
     inner = depth - 4;
   }
-  sendDeepText({ jsonrpc: "2.0", id: message.id, result }, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
+  // FX_MCP_DEEP_ID_LAST writes the id after the result, so a line fx cannot read names no call.
+  const reply = process.env.FX_MCP_DEEP_ID_LAST ? { jsonrpc: "2.0", result, id: message.id } : { jsonrpc: "2.0", id: message.id, result };
+  sendDeepText(reply, { "@@DEEP@@": deepValue(inner, site === "structured" || site === "content_meta") });
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const execution_observation = @import("../agent/runtime/observation.zig");
+const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const reports = @import("reports.zig");
@@ -43,6 +44,226 @@ const types = @import("../shared/types.zig");
 const usage_ledger = @import("usage_ledger.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Who wrote the mail that ended a `wait`.
+const MailSenders = std.EnumSet(types.MessageAuthor);
+
+/// When the model reads the mail that ended a `wait`: right after the result,
+/// when it joined the running turn, or in the next turn.
+const MailRead = enum { this_turn, next_turn };
+
+const sender_sentences = std.EnumArray(types.MessageAuthor, []const u8).init(.{
+    .user = "The user sent a message.",
+    .parent = "The agent that started you sent a message.",
+    .child = "A report or message arrived.",
+});
+const reads_now_one = "It follows this result.";
+const reads_now_several = "They follow this result.";
+const reads_next_one = "It starts your next turn once this one ends, so end your turn to read it.";
+const reads_next_several = "They start your next turn once this one ends, so end your turn to read them.";
+const answer_user_first = "Answer the user in text first, then call wait again if you still need a report.";
+const answer_owed = "You have not answered the user's message yet, so wait returned at once. " ++ answer_user_first;
+/// How the result of a `wait` held back for the user's answer starts, as
+/// `encodeManaged` writes it.
+const held_wait_prefix = "{\"ok\":true,\"result\":\"" ++ answer_owed ++ "\"";
+
+/// What `wait` says about the mail that ended it: who sent it, when the
+/// model reads it, that a user's message needs an answer before the next
+/// wait, and when no subagent sent any. The user's words must not read as a
+/// subagent's report, or the model looks for a report that never came instead
+/// of answering the user. The caller owns the result.
+fn mailArrivedText(alloc: Allocator, senders: MailSenders, read: MailRead) ![]u8 {
+    // The queue can empty between the wake and this read, when a stop drops
+    // what waited; then say what `wait` said before it named senders.
+    const named: MailSenders = if (senders.count() == 0) .initOne(.child) else senders;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(alloc);
+    var authors = named.iterator();
+    while (authors.next()) |author| {
+        try text.appendSlice(alloc, sender_sentences.get(author));
+        try text.append(alloc, ' ');
+    }
+    const several = named.count() > 1;
+    try text.appendSlice(alloc, switch (read) {
+        .this_turn => if (several) reads_now_several else reads_now_one,
+        .next_turn => if (several) reads_next_several else reads_next_one,
+    });
+    if (read == .this_turn and named.contains(.user)) {
+        try text.append(alloc, ' ');
+        try text.appendSlice(alloc, answer_user_first);
+    }
+    if (!named.contains(.child)) try text.appendSlice(alloc, " No subagent report arrived.");
+    return text.toOwnedSlice(alloc);
+}
+
+/// Whether the user's latest steering in `turn_messages` has no answer yet:
+/// no reply with visible text came after it, and no model step has followed
+/// the result of a `wait` fx held back for it. fx knows that result by its
+/// own record, `held_wait_id`, since a tool result's words alone are data
+/// (R4.4). So every `wait` is held back until the model writes visible text
+/// or a model step follows a held result, whether a step's calls run one by
+/// one or together. After fx resumes an interrupted session it has no
+/// record, so it can hold back once more.
+fn userAnswerOwed(turn_messages: []const types.ChatMessage, held_wait_id: ?[]const u8) bool {
+    var replied_since = false;
+    var index = turn_messages.len;
+    while (index > 0) {
+        index -= 1;
+        const message = turn_messages[index];
+        switch (message.role) {
+            .assistant => {
+                if (std.mem.trim(u8, message.content orelse "", " \t\r\n").len > 0) return false;
+                replied_since = true;
+            },
+            .tool => if (replied_since and isHeldWait(message, held_wait_id)) return false,
+            .user => if (runtime_execution_memory.isUserSteering(message)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether a tool result is the `wait` fx held back: the call fx recorded,
+/// `subagent`'s own or one toolbox carried, which keeps the call's id, and
+/// the held result itself, since a provider can reuse an id in a later step.
+fn isHeldWait(message: types.ChatMessage, held_wait_id: ?[]const u8) bool {
+    const held = held_wait_id orelse return false;
+    const id = message.tool_call_id orelse return false;
+    if (!std.mem.eql(u8, id, held)) return false;
+    return std.mem.startsWith(u8, message.content orelse "", held_wait_prefix);
+}
+
+test "wait holds back only while the user's latest message has no answer" {
+    const alloc = std.testing.allocator;
+    const steer = try runtime_execution_memory.steeringMessage(alloc, "whats going on ?");
+    defer alloc.free(steer);
+    const later = try runtime_execution_memory.steeringMessage(alloc, "and now?");
+    defer alloc.free(later);
+    const parent = try runtime_execution_memory.parentSteeringMessage(alloc, "check again");
+    defer alloc.free(parent);
+    const wait_call = [_]types.ToolCall{.{ .id = "w", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const toolbox_wait_call = [_]types.ToolCall{.{ .id = "t", .name = "toolbox", .arguments_json = "{\"run\":\"subagent\",\"arguments\":{\"action\":\"wait\"}}" }};
+    const read_call = [_]types.ToolCall{.{ .id = "r", .name = "read_file", .arguments_json = "{\"path\":\"src/core/subagent/tool_host.zig\"}" }};
+    const owed_result = "{\"ok\":true,\"result\":\"" ++ answer_owed ++ "\",\"error_code\":null}";
+    const second_wait_call = [_]types.ToolCall{.{ .id = "x", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const two_waits = [_]types.ToolCall{ wait_call[0], second_wait_call[0] };
+    const batch_calls = [_]types.ToolCall{ wait_call[0], read_call[0], second_wait_call[0] };
+    const Case = struct { name: []const u8, messages: []const types.ChatMessage, held: ?[]const u8 = null, owed: bool };
+    const cases = [_]Case{
+        .{ .name = "no steer", .messages = &.{.{ .role = .assistant, .tool_calls = &wait_call }}, .owed = false },
+        .{ .name = "steer, then a wait with no text", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "steer, then a wait with only spaces", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = " \n", .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "steer, then a wait with an answer", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "sleeper is still running.", .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "steer, an answer in an earlier step, then a wait", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "Checking.", .tool_calls = &wait_call },
+            .{ .role = .tool, .content = "{\"ok\":true}", .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "steer, already held back once", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = false },
+        .{ .name = "steer, held back once through toolbox", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &toolbox_wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "t", .tool_name = "toolbox" },
+            .{ .role = .assistant, .tool_calls = &toolbox_wait_call },
+        }, .held = "t", .owed = false },
+        .{ .name = "steer, then a result in the hold's words that fx did not hold", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &read_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "r", .tool_name = "read_file" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then a reused id on another tool's result", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .content = "Still running.", .tool_calls = &second_wait_call },
+            .{ .role = .tool, .content = "{\"ok\":true}", .tool_call_id = "x", .tool_name = "subagent" },
+            .{ .role = .user, .content = later },
+            .{ .role = .assistant, .tool_calls = &.{.{ .id = "w", .name = "read_file", .arguments_json = "{}" }} },
+            .{ .role = .tool, .content = "file text", .tool_call_id = "w", .tool_name = "read_file" },
+            .{ .role = .assistant, .tool_calls = &second_wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then wait, read, wait run one by one, the first wait held", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &batch_calls },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .tool, .content = "file text", .tool_call_id = "r", .tool_name = "read_file" },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, then two waits in one step, the first held", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &two_waits },
+        }, .held = "w", .owed = true },
+        .{ .name = "steer, held back before a resume, so fx has no record", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .assistant, .tool_calls = &second_wait_call },
+        }, .owed = true },
+        .{ .name = "an answered steer, then a new one", .messages = &.{
+            .{ .role = .user, .content = steer },
+            .{ .role = .assistant, .content = "Still running.", .tool_calls = &wait_call },
+            .{ .role = .tool, .content = owed_result, .tool_call_id = "w", .tool_name = "subagent" },
+            .{ .role = .user, .content = later },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .held = "w", .owed = true },
+        .{ .name = "a steer restored from a saved turn, then a wait with no text", .messages = &.{
+            .{ .role = .user, .content = "whats going on ?", .restored_steering = true },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = true },
+        .{ .name = "a parent's steering", .messages = &.{
+            .{ .role = .user, .content = parent },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+        .{ .name = "a subagent's report", .messages = &.{
+            .{ .role = .user, .content = agent_frame.report_header ++ "{}" },
+            .{ .role = .assistant, .tool_calls = &wait_call },
+        }, .owed = false },
+    };
+    for (cases) |case| {
+        std.testing.expectEqual(case.owed, userAnswerOwed(case.messages, case.held)) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "wait names who sent the mail that ended it" {
+    const alloc = std.testing.allocator;
+    const Case = struct { senders: []const types.MessageAuthor, read: MailRead, text: []const u8 };
+    const cases = [_]Case{
+        .{ .senders = &.{.child}, .read = .this_turn, .text = "A report or message arrived. It follows this result." },
+        .{ .senders = &.{.child}, .read = .next_turn, .text = "A report or message arrived. It starts your next turn once this one ends, so end your turn to read it." },
+        .{ .senders = &.{.user}, .read = .this_turn, .text = "The user sent a message. It follows this result. Answer the user in text first, then call wait again if you still need a report. No subagent report arrived." },
+        // Read in the next turn, the message starts that turn, which answers it.
+        .{ .senders = &.{.user}, .read = .next_turn, .text = "The user sent a message. It starts your next turn once this one ends, so end your turn to read it. No subagent report arrived." },
+        .{ .senders = &.{.parent}, .read = .this_turn, .text = "The agent that started you sent a message. It follows this result. No subagent report arrived." },
+        .{ .senders = &.{ .child, .user }, .read = .this_turn, .text = "The user sent a message. A report or message arrived. They follow this result. Answer the user in text first, then call wait again if you still need a report." },
+        .{ .senders = &.{ .user, .parent }, .read = .next_turn, .text = "The user sent a message. The agent that started you sent a message. They start your next turn once this one ends, so end your turn to read them. No subagent report arrived." },
+        // Nothing left in the queue to name.
+        .{ .senders = &.{}, .read = .this_turn, .text = "A report or message arrived. It follows this result." },
+    };
+    for (cases) |case| {
+        const text = try mailArrivedText(alloc, .initMany(case.senders), case.read);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(case.text, text);
+    }
+}
+
 /// Bounds how long a parent wait takes to observe cancellation or steering,
 /// and how long the polling loops take to see a child change. The terminal
 /// result wait also wakes on child state changes. Status publishing is rate
@@ -197,6 +418,9 @@ pub const ExecuteOptions = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     /// The caller's own worker, which `wait` blocks on.
     caller_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// The caller's turn so far, oldest first, ending with the reply that
+    /// made this call. `wait` reads it for a user message with no answer.
+    turn_messages: []const types.ChatMessage = &.{},
     /// Checks a subagent's waiting call as the caller's own, for `approve`.
     approval_check: ?ApprovalCheck = null,
     progress: ?ProgressSink = null,
@@ -210,6 +434,9 @@ pub const ManagedExecutionResult = struct {
     body: []u8,
     /// The final status model is owned by the result allocator.
     final_status: ?types.SubagentStatus = null,
+    /// The message made a new subagent, for its row (D101). The model's
+    /// `body` does not change with it.
+    started: bool = false,
 };
 
 pub const Runtime = struct {
@@ -267,6 +494,9 @@ pub const Runtime = struct {
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
+    /// The id of the last `wait` call held back for the user's answer
+    /// (`holdForUserAnswer`). Owned; guarded by `waiter_mutex`.
+    held_wait_id: ?[]u8 = null,
     /// Whether this host's owner is itself a subagent, so a message to its
     /// parent has somewhere to go. Set by its runtime.
     owner_has_parent: bool = false,
@@ -351,6 +581,7 @@ pub const Runtime = struct {
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
         self.start_waits.deinit(self.alloc);
+        if (self.held_wait_id) |id| self.alloc.free(id);
         self.usage_ledger.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
@@ -801,8 +1032,15 @@ pub const Runtime = struct {
                         // The work ended while this message waited for the lock,
                         // and nothing keeps the child busy any more: admit the
                         // message again, so it starts a work rather than waiting
-                        // for a turn no end will start.
-                        if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
+                        // for a turn no end will start. When the second pass
+                        // finds the same, the registry shows a work that nothing
+                        // runs, so no end will start what waits for this child:
+                        // the message is refused, not queued.
+                        if (turned_away and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
+                            if (pass == 0) continue :admit;
+                            debug_trace.eventf("mailbox", "message_refused_unstartable", .{}, "child={s} work_id={s}", .{ target.child_id, target.work_id });
+                            return self.refuse(alloc, .state_unavailable);
+                        }
                         // It waits, and starts the child's next turn.
                         self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
                             if (err == error.QueueFull) return self.refuse(alloc, .{ .queue_full = .subagent });
@@ -841,7 +1079,9 @@ pub const Runtime = struct {
                         debug_trace.eventf("mailbox", "idle_list_unavailable", .{}, "child={s} err={s}", .{ ready.child_id, @errorName(err) });
                         break :unread &.{};
                     };
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = try startedResult(scratch.allocator(), sent, agent, ready.user_closed, idle) });
+                    var answer = try self.encodeManaged(alloc, .{ .ok = true, .result = try startedResult(scratch.allocator(), sent, agent, ready.user_closed, idle) });
+                    answer.started = true;
+                    return answer;
                 },
                 .start_failed => |failed| {
                     var buf: [start_failed_result_bytes]u8 = undefined;
@@ -1087,6 +1327,19 @@ pub const Runtime = struct {
         return if (self.owner_has_parent) self.root_id else "main";
     }
 
+    /// Whether this `wait` must return at once for the user's answer
+    /// (`userAnswerOwed`). Records its call when it does, so the next `wait`
+    /// finds the hold by its id.
+    fn holdForUserAnswer(self: *Runtime, options: ExecuteOptions) Allocator.Error!bool {
+        self.waiter_mutex.lockUncancelable(io_mod.getIo());
+        defer self.waiter_mutex.unlock(io_mod.getIo());
+        if (!userAnswerOwed(options.turn_messages, self.held_wait_id)) return false;
+        const id = try self.alloc.dupe(u8, options.invocation_id);
+        if (self.held_wait_id) |old| self.alloc.free(old);
+        self.held_wait_id = id;
+        return true;
+    }
+
     fn setWaiter(self: *Runtime, worker: ?*worker_runtime.WorkerRuntime) void {
         self.waiter_mutex.lockUncancelable(io_mod.getIo());
         defer self.waiter_mutex.unlock(io_mod.getIo());
@@ -1122,54 +1375,161 @@ pub const Runtime = struct {
 
     /// `workEnded` after the owner was told of `end`: settles the child and
     /// returns whether its slot has a next work. `posted` is set when a turn
-    /// work finished here posts to the owner too.
-    fn settleEnd(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool) bool {
-        if (self.endClosingWork(end)) {
-            _ = self.settleClose(end.child_id);
-            return false;
+    /// work finished here posts to the owner too. A waiting message that could
+    /// not be saved as a work, and a leftover of `end` that could not be queued
+    /// again, are reported here too, and the child is settled again. A turn
+    /// that ended before its work opened is finished here too, with the lock
+    /// released, and the child is settled again by the next pass.
+    fn settleEnd(self: *Runtime, first: managed_owner.WorkEnd, posted: *bool) bool {
+        var end = first;
+        while (true) {
+            var drops: LeftoverDrops = .{};
+            const dropped = switch (self.settleEndOnce(end, posted, &drops)) {
+                .idle => return false,
+                .next => return true,
+                .leftovers_dropped => {
+                    if (self.reportDroppedLeftovers(end, drops)) posted.* = true;
+                    end.leftovers = &.{};
+                    continue;
+                },
+                .again => {
+                    // The first pass queued the leftovers; the turn was finished with
+                    // the lock released, so the child is settled again by the one hold,
+                    // which sees a close or a turn that came meanwhile.
+                    end.leftovers = &.{};
+                    continue;
+                },
+                .dropped => |failed| failed,
+            };
+            // The owner was told this message waits, so it hears that it
+            // could not start. The report goes with the lock released, and
+            // the child is settled again: a close, a turn, or another message
+            // may have come meanwhile.
+            defer dropped.deinit(self.alloc);
+            if (self.reportFailedStart(end.child_id, dropped)) posted.* = true;
+            // The first pass queued the leftovers.
+            end.leftovers = &.{};
         }
-        var ended = blk: {
+    }
+
+    /// One pass of `settleEnd`: settles the child once for `end`. A leftover of
+    /// `end` that could not be queued again is noted in `drops`, and the pass
+    /// returns before it settles the child, so the caller reports it first. A
+    /// closing child takes no next work; its close is written here once its
+    /// work is settled. A turn that ended before its work opened is finished
+    /// with the lock released, and the pass returns `.again`, so `settleEnd`
+    /// settles the child again under one hold of the lock.
+    fn settleEndOnce(self: *Runtime, end: managed_owner.WorkEnd, posted: *bool, drops: *LeftoverDrops) SlotNext {
+        var ended = (blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
+            // The closing check and the settle are one hold of the lock. A close
+            // that finds the child busy leaves its write to this end, so it has
+            // to land before this hold or after it, never between the check and
+            // the busy clear.
+            if (self.endClosingWorkLocked(end)) break :blk null;
             self.forgetCallLocked(end.work_id);
-            self.queueLeftoversLocked(end);
+            self.queueLeftoversLocked(end, drops);
+            if (drops.any()) return .leftovers_dropped;
             switch (self.openWaitingTurnWorkLocked(end.child_id)) {
                 .none => return self.nextOrIdleLocked(end.child_id),
                 // The turn that began meanwhile keeps the child busy; the
                 // parent's next message waits for it.
                 .opened => {
                     self.managed.markEnding(end.child_id);
-                    return false;
+                    return .idle;
                 },
                 .ended => |work| break :blk work,
             }
-        };
-        // Its turn ended before the work could open: finish it now, and let
-        // this slot take the parent's next message.
+        }) orelse return self.settleClosing(end.child_id, posted);
+        // Its turn ended before the work could open: finish it now, with the
+        // lock released. The next pass settles the child again, and then the
+        // slot takes the parent's next message.
         defer ended.deinit(self.alloc);
         const reply = ended.ended.?.reply;
         if (self.finishTurnWork(ended, ended.ended.?.outcome, reply)) posted.* = true;
-        self.admission_mutex.lockUncancelable(io_mod.getIo());
-        defer self.admission_mutex.unlock(io_mod.getIo());
-        return self.nextOrIdleLocked(end.child_id);
+        if (end_test_controls.inSettleArmed()) end_test_controls.holdInSettle(end.child_id);
+        return .again;
     }
 
-    /// Makes the parent's next message waiting for `child_id` the slot's
-    /// next work, or else marks the child idle.
-    fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) bool {
-        const messages = self.startNextPendingLocked(child_id);
-        if (messages > 0) {
-            self.managed.markNext(child_id, messages);
-            return true;
+    /// A closing child's work has ended (`endClosingWorkLocked`): what a user's
+    /// close noted goes to the owner, then the close is written. Call with no
+    /// lock held.
+    fn settleClosing(self: *Runtime, child_id: []const u8, posted: *bool) SlotNext {
+        if (self.deliverClosingDrop(child_id)) posted.* = true;
+        _ = self.settleClose(child_id);
+        return .idle;
+    }
+
+    /// What one pass of `settleEnd` did for a child whose work ended.
+    const SlotNext = union(enum) {
+        /// Nothing waits: the child is idle and its slot ends.
+        idle,
+        /// The slot has a next work.
+        next,
+        /// The next waiting message could not be saved as a work. The child
+        /// stays busy: the caller reports it with the lock released, then
+        /// settles the child again.
+        dropped: FailedStart,
+        /// Some leftovers of the ended work could not be queued again, as
+        /// `LeftoverDrops` records. The child stays busy: the caller reports
+        /// them with the lock released, then settles the child again.
+        leftovers_dropped,
+        /// A turn that ended before its work opened was finished with the lock
+        /// released. The caller settles the child again.
+        again,
+    };
+
+    /// The leftovers of an ended work that could not be queued again, by
+    /// their index in `WorkEnd.leftovers`. Filled under the lock with no
+    /// allocation: the drop is an out-of-memory one.
+    const LeftoverDrops = struct {
+        mask: u64 = 0,
+        /// Drops at an index the mask cannot hold. They are logged, not reported.
+        beyond: usize = 0,
+        /// Messages lost for memory before the slot kept them: a count only, as
+        /// they have no index.
+        lost: usize = 0,
+
+        const mask_bits = @bitSizeOf(u64);
+        comptime {
+            if (managed_owner.max_unread_feedback > mask_bits) @compileError("the leftover mask cannot hold every unread message the owner allows");
         }
-        self.clearBusyLocked(child_id);
-        self.managed.markEnding(child_id);
-        return false;
+
+        fn note(self: *LeftoverDrops, index: usize) void {
+            if (index < mask_bits) self.mask |= @as(u64, 1) << @intCast(index) else self.beyond += 1;
+        }
+        fn any(self: LeftoverDrops) bool {
+            return self.mask != 0 or self.beyond != 0 or self.lost != 0;
+        }
+        fn has(self: LeftoverDrops, index: usize) bool {
+            return index < mask_bits and (self.mask >> @intCast(index)) & 1 == 1;
+        }
+    };
+
+    /// Makes the parent's next message waiting for `child_id` the slot's
+    /// next work, or else marks the child idle. A message that could not be
+    /// saved as a work is returned for the caller to report.
+    fn nextOrIdleLocked(self: *Runtime, child_id: []const u8) SlotNext {
+        switch (self.startNextPendingLocked(child_id)) {
+            .saved => |messages| {
+                self.managed.markNext(child_id, messages);
+                return .next;
+            },
+            .dropped => |dropped| return .{ .dropped = dropped },
+            .none => {
+                self.clearBusyLocked(child_id);
+                self.managed.markEnding(child_id);
+                return .idle;
+            },
+        }
     }
 
     /// Queues the parent's messages the ended turn never took ahead of the
-    /// others waiting, so the child's next work takes them.
-    fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd) void {
+    /// others waiting, so the child's next work takes them. It also takes the
+    /// count of messages lost before the slot kept them, into `drops`.
+    fn queueLeftoversLocked(self: *Runtime, end: managed_owner.WorkEnd, drops: *LeftoverDrops) void {
+        drops.lost = self.managed.takeLostLeftovers(end.child_id);
         if (end.leftovers.len == 0) return;
         // A stop or close that came after the slot kept them counted them as
         // dropped, so none may start a work.
@@ -1187,13 +1547,15 @@ pub const Runtime = struct {
             at = index;
             break;
         };
-        for (end.leftovers) |work| {
+        for (end.leftovers, 0..) |work, index| {
             const queued = for (self.pending.items) |item| {
                 if (std.mem.eql(u8, item.work.id, work.id)) break true;
             } else false;
             if (queued) continue;
-            self.insertPendingLocked(at, end.child_id, name, work) catch |err| {
+            const inserted: anyerror!void = if (start_test_controls.leftoverInsertFails(index)) error.OutOfMemory else self.insertPendingLocked(at, end.child_id, name, work);
+            inserted catch |err| {
                 debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ end.child_id, work.id, @errorName(err) });
+                drops.note(index);
                 continue;
             };
             at += 1;
@@ -1304,11 +1666,39 @@ pub const Runtime = struct {
     /// clear (`nudgeWaiter`).
     fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) bool {
         debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
-        const dropped = self.takeUserDropped(end.child_id);
+        var dropped = self.takeUserDropped(end.child_id);
+        // The slot's end counted the messages a user's stop or close dropped
+        // from the turn, which no stop or close had counted.
+        dropped.count += end.dropped_by_user;
+        if (end.dropped_by_user > 0 and end.closed_by_user) dropped.closed = true;
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
-        if (dropped.count > 0) return self.postReportWith(.{ .child_id = end.child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
+        if (dropped.count > 0) return self.postDropNotice(end.child_id, dropped);
         return false;
+    }
+
+    /// Posts the notice that the user's stop or close of `child_id` dropped
+    /// `dropped` messages. True when the sink took it. A notice nothing took is
+    /// gone, since no log entry posts it again, so a log line says so.
+    fn postDropNotice(self: *Runtime, child_id: []const u8, dropped: Dropped) bool {
+        const posted = self.postReportWith(.{ .child_id = child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
+        if (!posted) debug_trace.logf("mailbox", "drop notice not delivered child={s} dropped={d} closed={}: nothing took it", .{ child_id, dropped.count, dropped.closed });
+        return posted;
+    }
+
+    /// A closing child takes no next work, so no later end delivers what a
+    /// user's close noted after the child's last end was told to the owner:
+    /// the note goes now, as the notice. Call with no lock held, before the
+    /// close is written. True when the sink took it.
+    fn deliverClosingDrop(self: *Runtime, child_id: []const u8) bool {
+        {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            if (self.closingIndexLocked(child_id) == null) return false;
+        }
+        const dropped = self.takeUserDropped(child_id);
+        if (dropped.count == 0) return false;
+        return self.postDropNotice(child_id, dropped);
     }
 
     /// Posts the reports `session`'s log still owes its owner, oldest first,
@@ -1339,8 +1729,10 @@ pub const Runtime = struct {
         _ = self.postReportWith(end, .{});
     }
 
-    /// Posts `end`'s report, or with no `work_id` the notice that the user's
-    /// stop or close dropped `dropped` messages. True when the sink took it.
+    /// Posts `end`'s report. With no `work_id` and no start failure it is the
+    /// notice that the user's stop or close dropped `dropped` messages. With a
+    /// start failure and no `work_id` it is the report of messages fx lost and
+    /// cannot name. True when the sink took it.
     fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: Dropped) bool {
         const sink = self.report_sink orelse {
             // Nothing here can take it; it stays owed in the log.
@@ -1350,16 +1742,22 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const notice = end.work_id.len == 0;
+        const notice = end.work_id.len == 0 and end.start_failure == null;
+        // A report reads the child's facts once, before its text. A work whose
+        // start failed says to call status while the registry still holds a
+        // work for the child: the same read that decides `idle`.
+        const facts: IdleFacts = if (notice) .{} else self.idleFactsAfterEnd(a, end);
+        var reported = end;
+        reported.start_held = end.start_held or facts.holds_work;
         const output = if (notice)
             (a.print("The user {s} it, and {d} of your messages waiting for it were dropped.", .{
                 if (dropped.closed) "closed" else "stopped",
                 dropped.count,
             }) catch "")
         else
-            self.reportOutput(a, end) catch "";
+            self.reportOutput(a, reported) catch (if (end.start_failure != null) start_failed_report_fallback else "");
         const agent = self.childName(a, end.child_id) catch end.child_id;
-        const idle = !notice and self.idleAfterEnd(a, end);
+        const idle = !notice and facts.idle();
         sink.post(self, .{ .report = .{
             .agent = agent,
             .child_id = end.child_id,
@@ -1391,11 +1789,12 @@ pub const Runtime = struct {
         return true;
     }
 
-    /// Whether `end`'s child is idle once its report goes. Read before the
-    /// slot starts the next message waiting for the child (`workEnded`), so
-    /// a waiting message counts (`tests/tla/subagent/StopMessage.tla`
-    /// IdleNoteHonest).
-    fn idleAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) bool {
+    /// The facts that decide whether the child is idle once `end`'s report
+    /// goes, read in one pass before the report's text, so the text and the
+    /// idle flag come from one read. The read comes before the slot starts the
+    /// next message waiting for the child (`workEnded`), so a waiting message
+    /// counts (`tests/tla/subagent/StopMessage.tla` IdleNoteHonest).
+    fn idleFactsAfterEnd(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) IdleFacts {
         const facts: IdleFacts = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1411,21 +1810,23 @@ pub const Runtime = struct {
             defer lock.release();
             facts.open = if (self.managed.state_store.load(a)) |loaded| open: {
                 var registry = loaded;
-                break :open registry.findById(end.child_id) != null;
+                const child = registry.findById(end.child_id) orelse break :open false;
+                facts.holds_work = end.start_failure != null and child.active != null;
+                break :open true;
             } else |err| unread: {
                 debug_trace.eventf("mailbox", "idle_unknown", .{}, "child={s} work_id={s} err={s}", .{ end.child_id, end.work_id, @errorName(err) });
                 break :unread false;
             };
             break :blk facts;
         };
-        return facts.idle();
+        return facts;
     }
 
     /// What a report says about the work: the child's reply, or how it
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
         // A work that never began has no reply, and nothing it changed.
-        if (end.start_failure) |cause| return startFailedReport(a, cause, end.start_messages);
+        if (end.start_failure) |cause| return startFailedReport(a, cause, end.start_messages, end.start_held);
         const saved = if (end.reply) |reply|
             reply
         else
@@ -1470,25 +1871,46 @@ pub const Runtime = struct {
         return (try self.managed.state_store.closedName(a, child_id)) orelse child_id;
     }
 
+    /// What became of the next message waiting for a child.
+    const NextStart = union(enum) {
+        /// Nothing waits for the child.
+        none,
+        /// It is saved as the child's next work, which carries this many of
+        /// the parent's messages.
+        saved: usize,
+        /// It could not be saved as a work, so it never ran. The caller
+        /// reports it to the owner as a failed start, with the lock released.
+        dropped: FailedStart,
+    };
+
     /// Makes the next message waiting for `child_id` its next work, which
-    /// the child's slot runs at once. Returns how many of the parent's
-    /// messages the work carries, or 0 when none waits or it could not be
-    /// started, which drops it.
-    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) usize {
+    /// the child's slot runs at once. Returns `.saved` with how many of the
+    /// parent's messages the work carries, `.none` when none waits, or
+    /// `.dropped` when it could not be saved as a work (`dropStart`).
+    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) NextStart {
         const index = for (self.pending.items, 0..) |item, i| {
             if (std.mem.eql(u8, item.child_id, child_id)) break i;
-        } else return 0;
+        } else return .none;
         var item = self.pending.orderedRemove(index);
         defer item.deinit(self.alloc);
         const messages = 1 + self.absorbPendingLocked(&item, index);
+        if (start_test_controls.nextWorkFails()) return self.dropStart(&item, error.OutOfMemory, messages);
+        self.saveNextWorkLocked(&item) catch |err| return self.dropStart(&item, err, messages);
+        debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
+        return .{ .saved = messages };
+    }
+
+    /// Saves `item` as its child's next work. The registry lock is taken and
+    /// released here, so the caller handles a failure with that lock free:
+    /// `dropStart` asks the owner whether its tree is closed, and the owner's
+    /// lock comes before the registry's (`managed_owner.zig`, the slot's end).
+    fn saveNextWorkLocked(self: *Runtime, item: *const Pending) !void {
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
-        var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(item, err);
+        var registry = try self.managed.state_store.load(self.alloc);
         defer registry.deinit(self.alloc);
-        _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(item, err);
-        self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(item, err);
-        debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
-        return messages;
+        _ = try registry.startPersistentWork(self.alloc, item.agent, null, item.work);
+        try self.managed.state_store.save(self.alloc, registry);
     }
 
     /// The messages waiting for `head`'s child behind it join the turn it
@@ -1688,73 +2110,138 @@ pub const Runtime = struct {
             break :blk self.turn_works.swapRemove(index);
         };
         defer work.deinit(self.alloc);
-        const posted = self.finishTurnWork(work, outcome, reply);
+        var posted = self.finishTurnWork(work, outcome, reply);
         if (end_test_controls.settleArmed()) end_test_controls.holdBeforeSettle(child_id);
-        // Defers run last-declared first: the lock below is released, then a
-        // closing child's close is written, then the owner's `wait` is nudged,
-        // so the child's busy flag is clear and its close is written by then
-        // (`nudgeWaiter`).
-        defer if (!posted) self.nudgeWaiter();
-        defer _ = self.settleClose(child_id);
+        // Runs after the lock below is released: a closing child's close is
+        // written, then the owner's `wait` is nudged, so the child's busy
+        // flag is clear and its close is written by then (`nudgeWaiter`).
+        defer self.settleCloseThenNudge(child_id, !posted);
         // A message the slot could not start is ended and reported with the
         // lock released, and the next one waiting is tried.
         while (self.startPendingAfterTurn(child_id)) |failed| {
             defer failed.deinit(self.alloc);
             start_test_controls.failedStartEnded(child_id);
-            _ = self.deliverEnd(.{
-                .child_id = child_id,
-                .work_id = failed.work_id,
-                .outcome = .failed,
-                .failure = execution.failureDiagnosticValue("start_failed", @errorName(failed.err)),
-                .report_owed = failed.report_owed,
-                .end = failed.end,
-                .start_failure = startCauseText(failed.err),
-                .start_messages = failed.messages,
-            });
-            self.admission_mutex.lockUncancelable(io_mod.getIo());
-            defer self.admission_mutex.unlock(io_mod.getIo());
-            self.forgetCallLocked(failed.work_id);
+            _ = self.reportFailedStart(child_id, failed);
         }
+        // A user's close after this turn's report left a note that nothing else delivers.
+        if (self.deliverClosingDrop(child_id)) posted = true;
     }
 
-    /// A message waiting for the child whose slot could not start, now ended
-    /// as a failed work. `work_id` is owned by the caller.
+    /// The last step of a user's turn's end: writes the child's close when
+    /// it is closing, then nudges the owner's `wait` when `nudge` is set.
+    /// When another thread is writing that close, the nudge is left to it,
+    /// and it sends it once its write returns (`settleCloseFor`), so the
+    /// wait is never nudged ahead of the write.
+    fn settleCloseThenNudge(self: *Runtime, child_id: []const u8, nudge: bool) void {
+        end_test_controls.holdBeforeCloseSettle(child_id);
+        if (self.settleCloseFor(child_id, nudge) == .left) return;
+        if (nudge) self.nudgeWaiter();
+    }
+
+    /// A waiting message for the child that never ran: a work that was saved
+    /// and ended as failed, a message that could not be saved as a work at
+    /// all, or messages lost before the slot kept them, with no work. `work_id`
+    /// is owned by the caller.
     const FailedStart = struct {
         work_id: []u8,
         report_owed: bool,
         end: child_state.EndFacts,
         err: anyerror,
         /// How many of the parent's messages the work carried: the count the
-        /// slot was started with.
+        /// slot was started with, or the count lost before the slot kept them.
         messages: usize,
+        /// Whether the work was saved in the registry, and so in the log: a
+        /// message that could not be saved has no log entry to post it again.
+        saved: bool,
 
         fn deinit(self: FailedStart, alloc: Allocator) void {
             alloc.free(self.work_id);
         }
     };
 
+    /// Tells the owner of `failed` as a failed work whose messages never ran,
+    /// and forgets the call that sent it. Call with no lock held. True when
+    /// the sink took the report.
+    fn reportFailedStart(self: *Runtime, child_id: []const u8, failed: FailedStart) bool {
+        const posted = self.deliverEnd(.{
+            .child_id = child_id,
+            .work_id = failed.work_id,
+            .outcome = .failed,
+            .failure = execution.failureDiagnosticValue("start_failed", @errorName(failed.err)),
+            .report_owed = failed.report_owed,
+            .end = failed.end,
+            .start_failure = startCauseText(failed.err),
+            .start_messages = failed.messages,
+            .start_held = failed.err == error.ChildBusy,
+        });
+        // No report of it went out: nothing took one, or none was owed. A
+        // work that was saved keeps an owed report in the log; a message that
+        // was never saved is gone with this line.
+        if (!posted or !failed.report_owed) debug_trace.logf("mailbox", "failed start not reported child={s} work_id={s} messages={d} error={s} owed={} saved={}: its messages never ran", .{ child_id, failed.work_id, failed.messages, @errorName(failed.err), failed.report_owed, failed.saved });
+        self.forgetCall(failed.work_id);
+        return posted;
+    }
+
+    /// Tells the owner of each leftover of `end` that could not be queued
+    /// again, as a failed start: the owner was told the message joined the
+    /// turn, and it never ran. Also tells it, as one failed start with no
+    /// work, how many messages were lost before the slot kept them. Call with
+    /// no lock held. True when the sink took a report.
+    fn reportDroppedLeftovers(self: *Runtime, end: managed_owner.WorkEnd, drops: LeftoverDrops) bool {
+        var posted = false;
+        const owed = !self.managed.treeClosed();
+        for (end.leftovers, 0..) |work, index| {
+            if (!drops.has(index)) continue;
+            // The id is the slot's, borrowed for the hook: nothing is freed here.
+            if (self.reportFailedStart(end.child_id, .{
+                .work_id = work.id,
+                .report_owed = owed,
+                .end = .{ .started_by = .parent },
+                .err = error.OutOfMemory,
+                .messages = 1,
+                .saved = false,
+            })) posted = true;
+        }
+        if (drops.lost > 0 and self.reportFailedStart(end.child_id, .{
+            .work_id = &.{},
+            .report_owed = owed,
+            .end = .{ .started_by = .parent },
+            .err = error.OutOfMemory,
+            .messages = drops.lost,
+            .saved = false,
+        })) posted = true;
+        if (drops.beyond > 0) debug_trace.logf("mailbox", "leftovers dropped unreported child={s} count={d}: they could not be queued again and never ran", .{ end.child_id, drops.beyond });
+        return posted;
+    }
+
     /// Starts the next message waiting for `child_id` as a slot's work, after
     /// the turn the user or a child's report started has ended. Null when
     /// that is done, or nothing waits, which leaves the child idle. One that
-    /// could not start is ended as failed, which the caller reports: the
-    /// parent was told it was queued, so it must not vanish.
+    /// could not start is ended as failed, and one that could not be saved as
+    /// a work is returned as failed without a work. The caller reports either:
+    /// the parent was told it was queued, so it must not vanish.
     fn startPendingAfterTurn(self: *Runtime, child_id: []const u8) ?FailedStart {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         if (self.closingIndexLocked(child_id) != null) {
             // A closing child takes no next work, as when a slot's work ends
-            // (`endClosingWork`): what waits for it is dropped and it stops
+            // (`endClosingWorkLocked`): what waits for it is dropped and it stops
             // counting as working. The close is written below, once nothing
             // of it runs, and the owner's `wait` is nudged after that.
             _ = self.dropPendingLocked(child_id, "closed");
             self.clearBusyLocked(child_id);
             return null;
         }
-        const messages = self.startNextPendingLocked(child_id);
-        if (messages == 0) {
-            self.clearBusyLocked(child_id);
-            return null;
-        }
+        const messages = switch (self.startNextPendingLocked(child_id)) {
+            .none => {
+                self.clearBusyLocked(child_id);
+                return null;
+            },
+            // It was never saved, so there is no work to end. Busy stays set:
+            // the next waiting message, if any, starts now.
+            .dropped => |dropped| return dropped,
+            .saved => |count| count,
+        };
         _ = self.managed.start(child_id, messages) catch |err| {
             debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s} messages={d}", .{ child_id, @errorName(err), messages });
             const ended = self.managed.endUnstarted(child_id, null, err, true) orelse {
@@ -1765,7 +2252,7 @@ pub const Runtime = struct {
                 return null;
             };
             // Busy stays set: the next waiting message, if any, starts now.
-            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err, .messages = messages };
+            return .{ .work_id = ended.work_id, .report_owed = ended.report_owed, .end = ended.end, .err = err, .messages = messages, .saved = true };
         };
         return null;
     }
@@ -1788,11 +2275,23 @@ pub const Runtime = struct {
         });
     }
 
-    /// Drops a message that could not be made a work: it carries no messages.
-    fn dropStart(self: *Runtime, item: Pending, err: anyerror) usize {
-        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ item.child_id, item.work.id, @errorName(err) });
-        self.forgetCallLocked(item.work.id);
-        return 0;
+    /// A waiting message that could not be made a work. It is not dropped in
+    /// silence: its facts go to the caller, which reports it as a failed
+    /// start. The call that sent it stays remembered until then, so the
+    /// report names it.
+    fn dropStart(self: *Runtime, item: *Pending, err: anyerror, messages: usize) NextStart {
+        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s} messages={d}", .{ item.child_id, item.work.id, @errorName(err), messages });
+        // The id moves to the caller, so nothing is allocated here.
+        const work_id = item.work.id;
+        item.work.id = &.{};
+        return .{ .dropped = .{
+            .work_id = work_id,
+            .report_owed = !self.managed.treeClosed(),
+            .end = .{ .started_by = item.work.started_by },
+            .err = err,
+            .messages = messages,
+            .saved = false,
+        } };
     }
 
     /// `wait`: blocks on the caller's own worker until a report or message
@@ -1800,13 +2299,17 @@ pub const Runtime = struct {
     /// caller is stopped. Returns at once when nothing can still arrive.
     fn waitForMail(self: *Runtime, alloc: Allocator, options: ExecuteOptions) !ManagedExecutionResult {
         const worker = options.caller_worker orelse return self.refuse(alloc, .wait_unavailable);
+        if (try self.holdForUserAnswer(options)) {
+            debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=user_answer_owed", .{self.ownerName()});
+            return self.encodeManaged(alloc, .{ .ok = true, .result = answer_owed });
+        }
         // Registered first, so a child that ends before the wait starts
         // still ends it.
         self.setWaiter(worker);
         defer self.setWaiter(null);
         if (worker.queuedPromptCount() == 0 and !self.anyWorking()) {
             debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=quiet", .{self.ownerName()});
-            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so nothing more will arrive. Continue, or end your turn." });
+            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so no report or message will arrive. If shell returned running, call shell with action interact and the session_id from that result. Otherwise continue, or end your turn." });
         }
         // The ones it waits for, named in its result for its row.
         var roster_arena = std.heap.ArenaAllocator.init(alloc);
@@ -1818,15 +2321,20 @@ pub const Runtime = struct {
         // turns; elsewhere, as in ACP, it starts the next one, and the owner
         // must end this turn to read it (`tests/tla/subagent/MainMail.tla`
         // WaitHonest).
-        const follows = wake == .posted and worker.queuedMailJoinsTurn();
-        debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s} said={s}", .{ self.ownerName(), @tagName(wake), if (follows) "follows" else "next" });
+        const read: MailRead = if (wake == .posted and worker.queuedMailJoinsTurn()) .this_turn else .next_turn;
+        const senders: MailSenders = if (wake == .posted) worker.queuedAuthors() else .empty;
+        debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s} said={s} user={} parent={} child={}", .{
+            self.ownerName(),
+            @tagName(wake),
+            if (read == .this_turn) "follows" else "next",
+            senders.contains(.user),
+            senders.contains(.parent),
+            senders.contains(.child),
+        });
         return switch (wake) {
             .posted => self.encodeManaged(alloc, .{
                 .ok = true,
-                .result = if (follows)
-                    "A report or message arrived. It follows this result."
-                else
-                    "A report or message arrived. It starts your next turn once this one ends, so end your turn to read it.",
+                .result = try mailArrivedText(roster_arena.allocator(), senders, read),
                 .subagents = waited_for,
             }),
             .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
@@ -1893,6 +2401,10 @@ pub const Runtime = struct {
         interrupted,
         finished,
         idle,
+        /// The registry holds a work for the child that nothing runs, because
+        /// an end could not be recorded. Messages to it are refused until a
+        /// restart clears it.
+        refusing,
 
         fn label(self: ChildState) []const u8 {
             return switch (self) {
@@ -1902,6 +2414,7 @@ pub const Runtime = struct {
                 .interrupted => "interrupted",
                 .finished => "finished",
                 .idle => "idle",
+                .refusing => "refuses messages until fx restarts",
             };
         }
 
@@ -1917,7 +2430,7 @@ pub const Runtime = struct {
                 .fresh => self.label(),
                 .kept => switch (self) {
                     inline .awaiting_approval, .awaiting_answer => |state| comptime state.label() ++ " when this turn started",
-                    .working, .interrupted, .finished, .idle => self.label(),
+                    .working, .interrupted, .finished, .idle, .refusing => self.label(),
                 },
             };
         }
@@ -1947,6 +2460,11 @@ pub const Runtime = struct {
     /// Under `admission_mutex`. `waits` is what `userWaitsLocked` returned
     /// while the lock was held.
     fn childStateLocked(self: *const Runtime, child: child_state.Child, waits: []const managed_owner.Owner.UserWaiting) ChildState {
+        // The registry holds a work that nothing runs: an end could not be
+        // recorded. Nothing starts or ends it, and its messages are refused,
+        // until a restart clears it.
+        const open = child.phase == .running or child.phase == .awaiting_approval;
+        if (open and !self.isBusyLocked(child.id) and !self.inTurnWorkLocked(child.id)) return .refusing;
         if (child.phase == .awaiting_approval) return .awaiting_approval;
         if (self.isBusyLocked(child.id)) {
             // A wait counts only while the child works, so one a turn's end
@@ -2343,16 +2861,12 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
-            // A user's close tells the parent what it dropped, as a stop does,
-            // and keeps the name for main's status and its next message to it.
-            if (by == .user) {
-                self.noteUserDropLocked(child_id, dropped, true);
-                if (name) |value| self.noteUserClosedLocked(value);
-            }
             // The parent's close drops the closed turn's unread messages and
             // the ones its slot keeps or carries into the next work, and counts
-            // them in the owner's one step, as its stop does. The user's close
-            // counts none of them.
+            // them in the owner's one step, as its stop does. A user's close that
+            // ends a running work counts none of them here: the slot's end counts
+            // them for the work's report (`WorkEnd.dropped_by_user`). A close that
+            // finds the work ended counts what the slot keeps (`takeDropped`).
             var unread: usize = 0;
             var ended_turn = false;
             const stopped = switch (by) {
@@ -2361,11 +2875,18 @@ pub const Runtime = struct {
                     ended_turn = true;
                     break :ended true;
                 } else false,
-                .user => self.managed.closeByUser(child_id),
+                .user => user: {
+                    ended_turn = self.managed.closeByUser(child_id);
+                    break :user ended_turn;
+                },
             } or self.stopTurnWorkLocked(child_id);
-            if (by == .parent) {
-                end_test_controls.holdInStop(child_id);
-                if (!ended_turn) unread += self.managed.takeDropped(child_id);
+            if (by == .parent) end_test_controls.holdInStop(child_id);
+            if (!ended_turn) unread += self.managed.takeDropped(child_id);
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped + unread, true);
+                if (name) |value| self.noteUserClosedLocked(value);
             }
             self.closing.appendAssumeCapacity(.{ .id = owned });
             self.closed_unseen.appendAssumeCapacity(unseen);
@@ -2452,10 +2973,9 @@ pub const Runtime = struct {
     }
 
     /// A closing child's work ended: it takes no next work, and what waits
-    /// for it is dropped. False for a child that isn't closing.
-    fn endClosingWork(self: *Runtime, end: managed_owner.WorkEnd) bool {
-        self.admission_mutex.lockUncancelable(io_mod.getIo());
-        defer self.admission_mutex.unlock(io_mod.getIo());
+    /// for it is dropped. False for a child that isn't closing. Hold the
+    /// admission mutex.
+    fn endClosingWorkLocked(self: *Runtime, end: managed_owner.WorkEnd) bool {
         if (self.closingIndexLocked(end.child_id) == null) return false;
         self.forgetCallLocked(end.work_id);
         _ = self.dropPendingLocked(end.child_id, "closed");
@@ -2480,16 +3000,37 @@ pub const Runtime = struct {
     /// failed, which leaves the child listed again, as before its close, and
     /// is traced.
     fn settleClose(self: *Runtime, child_id: []const u8) bool {
+        return self.settleCloseFor(child_id, false) != .failed;
+    }
+
+    /// How `settleCloseFor` left a child's close.
+    const Settled = enum {
+        /// Nothing was left to write, or this thread wrote the close.
+        settled,
+        /// This thread's write failed.
+        failed,
+        /// Another thread is writing it.
+        left,
+    };
+
+    /// `settleClose`, for a caller that owes the owner's `wait` a nudge
+    /// (`nudge_owed`): when another thread is writing the close, that
+    /// thread is told to send the nudge after its write returns
+    /// (`Closing.nudge_after`), under the same lock that reads the mark.
+    fn settleCloseFor(self: *Runtime, child_id: []const u8, nudge_owed: bool) Settled {
         const work_id = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
-            const index = self.closingIndexLocked(child_id) orelse return true;
+            const index = self.closingIndexLocked(child_id) orelse return .settled;
             const entry = &self.closing.items[index];
-            if (entry.settling) return true;
-            if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return true;
+            if (entry.settling) {
+                if (nudge_owed) entry.nudge_after = true;
+                return .left;
+            }
+            if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return .settled;
             const id = self.alloc.print(close_work_prefix ++ "{s}", .{entry.id}) catch |err| {
-                self.finishCloseLocked(child_id, err);
-                return false;
+                _ = self.finishCloseLocked(child_id, err);
+                return .failed;
             };
             entry.settling = true;
             break :blk id;
@@ -2506,31 +3047,42 @@ pub const Runtime = struct {
             break :blk null;
         };
         self.finishClose(owned, failure);
-        if (failure != null) return false;
+        if (failure != null) return .failed;
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
         self.managed.forgetFeedback(owned);
-        return true;
+        return .settled;
     }
 
     /// The end of a close, written or not: the child stops being closing. A
     /// close that couldn't be written leaves the child, so the app, if it
     /// hasn't yet, keeps its agent too.
     fn finishClose(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
-        self.admission_mutex.lockUncancelable(io_mod.getIo());
-        defer self.admission_mutex.unlock(io_mod.getIo());
-        self.finishCloseLocked(child_id, failure);
+        const nudge_after = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            break :blk self.finishCloseLocked(child_id, failure);
+        };
+        // A user's turn that ended meanwhile left its nudge to this write.
+        if (nudge_after) self.nudgeWaiter();
     }
 
-    fn finishCloseLocked(self: *Runtime, child_id: []const u8, failure: ?anyerror) void {
+    /// Returns whether a turn's end left its nudge to this write.
+    fn finishCloseLocked(self: *Runtime, child_id: []const u8, failure: ?anyerror) bool {
         if (failure) |err| debug_trace.logf("mailbox", "close not written child={s} err={s}", .{ child_id, @errorName(err) });
-        if (self.closingIndexLocked(child_id)) |index| self.alloc.free(self.closing.swapRemove(index).id);
-        if (failure == null) return;
+        var nudge_after = false;
+        if (self.closingIndexLocked(child_id)) |index| {
+            const removed = self.closing.swapRemove(index);
+            nudge_after = removed.nudge_after;
+            self.alloc.free(removed.id);
+        }
+        if (failure == null) return nudge_after;
         for (self.closed_unseen.items, 0..) |id, index| {
             if (!std.mem.eql(u8, id, child_id)) continue;
             self.alloc.free(self.closed_unseen.orderedRemove(index));
             break;
         }
         if (self.closed_unseen.items.len == 0) self.closed_waiting.store(false, .release);
+        return nudge_after;
     }
 
     /// `message{agent: "parent"}`: a child of this host writes to the
@@ -2839,7 +3391,10 @@ pub const Runtime = struct {
             debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=busy", .{ child_id, work_id, @errorName(err) });
             return err;
         };
-        _ = self.managed.start(child_id, 0) catch |err| {
+        // Where the app hosts the turn, the work carries the call's one message
+        // until that turn begins. Elsewhere the turn takes its own message when
+        // it starts, as `tests/tla/subagent/StopMessage.tla` models the first send.
+        _ = self.managed.start(child_id, if (self.managed.hostsTurns()) 1 else 0) catch |err| {
             debug_trace.eventf("mailbox", "start_blocked", .{}, "child={s} work_id={s} error={s} stage=spawn", .{ child_id, work_id, @errorName(err) });
             self.clearBusyLocked(child_id);
             return err;
@@ -3281,10 +3836,10 @@ const MailboxFixture = struct {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         if (fixture_run_hook) |hook| hook();
         if (cancel.load(.seq_cst)) _ = self.cancelled_at_start.fetchAdd(1, .seq_cst);
-        // The app hands a hosted turn to the child's agent through `postAndWait`
-        // (`src/core/app/app_agents_runtime.zig`), which withdraws a post whose
-        // cancel is set before the main loop takes it, so no turn begins.
-        if (turn.isHosted() and cancel.load(.seq_cst)) return error.Cancelled;
+        // The app's main loop asks `hostedTurnBegins` as it starts a hosted run
+        // (`startPost`, `src/core/app/app_agents_runtime.zig`): a cancel that is
+        // already set answers no, so no turn begins.
+        if (turn.isHosted() and !turn.hostedTurnBegins()) return error.Cancelled;
         const worker = turn.workerRuntime();
         // Counted once its turn has begun, so a test that waits for the run
         // can message it. A run that takes no steering is a turn past its
@@ -3385,9 +3940,13 @@ fn mailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_sta
 
 /// One call of the subagent tool from the root, as its model would make it.
 fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestInput, invocation_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) ![]const u8 {
+    return (try callToolResult(runtime, arena, input, invocation_id, worker)).body;
+}
+
+fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.RequestInput, invocation_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) !ManagedExecutionResult {
     var request = try model_contract.validateRequest(std.testing.allocator, input);
     defer request.deinit(std.testing.allocator);
-    const result = try runtime.executeManaged(arena, &request, .{
+    return runtime.executeManaged(arena, &request, .{
         .caller_id = runtime.root_id,
         .invocation_id = invocation_id,
         .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
@@ -3395,7 +3954,6 @@ fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestIn
         .timestamp_ms = 1,
         .caller_worker = worker,
     });
-    return result.body;
 }
 
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
@@ -3434,6 +3992,34 @@ test "a message returns at once, and the subagent's report reaches its parent on
 
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
     try std.testing.expect(std.mem.find(u8, status, "reviewer: idle, last work completed, reports final") != null);
+}
+
+test "only a message that makes its subagent marks the start, and the model's answer stays the same" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const first = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-1", null);
+    try std.testing.expect(first.started);
+    try waitUntilQuiet(runtime);
+    const second = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-2", null);
+    try std.testing.expect(!second.started);
+    try std.testing.expectEqualStrings(first.body, second.body);
+    try waitUntilQuiet(runtime);
+    const closed = try callToolResult(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(!closed.started);
+    // Once closed, the name starts a new one.
+    const again = try callToolResult(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-4", null);
+    try std.testing.expect(again.started);
+    try waitUntilQuiet(runtime);
 }
 
 test "a work that saves an empty reply reports that it ended without one" {
@@ -3484,6 +4070,145 @@ test "a message to a busy subagent waits and runs as its next work, in order" {
     try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[1], "reviewer call-2 "));
     // Nothing is left remembered once both works ended.
     try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+}
+
+// Main was told that its message waits for the subagent's work. When the
+// message cannot become the subagent's next work, main must hear that it
+// failed: it never ran, and the subagent is idle.
+test "a message that waited for a subagent's work and could not be saved as its next work is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    start_test_controls.test_fail_next_work = false;
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], "DONE first"));
+    try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[1], "reviewer call-2 "));
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "failed") != null);
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[1], "could not start the work your message made: fx ran out of memory. It never ran.") != null);
+    try std.testing.expect(fixture.idles.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: idle") != null);
+    const third = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "third" } }, "call-4", null);
+    try expectBodyHas(third, "Sent to reviewer");
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
+// A closed tree has nobody to take a report of a message that never ran, so
+// the dropped message is left to a log line.
+test "a message that could not be saved as a closed tree's next work is not reported, and a log line says so" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    runtime.closeTree();
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    start_test_controls.test_fail_next_work = false;
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    for (fixture.reports.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "could not start the work") == null);
+    }
+    try std.testing.expect(trace.has("failed start not reported"));
+    try std.testing.expect(trace.has("owed=false"));
+    try std.testing.expect(trace.has("saved=false"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+}
+
+const UserDropHook = struct {
+    var runtime: ?*Runtime = null;
+    var calls: usize = 0;
+
+    // The user's stop lands where the failed start is ended, before its report is built.
+    fn hook(child_id: []const u8) void {
+        calls += 1;
+        runtime.?.userStopped(child_id, 1);
+    }
+};
+
+// A user's stop left a drop for the closed tree's child, so the notice is the only
+// report that goes out, and no report names the failed start: the log line says so.
+test "a message that could not be saved is logged when only the notice of a user's drop goes out" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2", null);
+    try expectBodyHas(queued, "is busy");
+    const before = fixture.reportCount();
+    runtime.closeTree();
+    UserDropHook.runtime = runtime;
+    defer UserDropHook.runtime = null;
+    UserDropHook.calls = 0;
+    start_test_controls.test_failed_start_ended = UserDropHook.hook;
+    defer start_test_controls.test_failed_start_ended = null;
+    start_test_controls.test_fail_next_work = true;
+    defer start_test_controls.test_fail_next_work = false;
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    start_test_controls.test_fail_next_work = false;
+    try waitUntilQuiet(runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), UserDropHook.calls);
+    var notice = false;
+    for (fixture.reports.items[before..]) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "could not start the work") == null);
+        if (std.mem.find(u8, line, "dropped=") != null) notice = true;
+    }
+    try std.testing.expect(notice);
+    try std.testing.expect(trace.has("failed start not reported"));
+    try std.testing.expect(trace.has("owed=false"));
 }
 
 test "the roster names the open subagents, and the working ones while they work" {
@@ -3656,6 +4381,77 @@ test "a user's stop of a work that owes no report tells the parent of its droppe
     );
 }
 
+test "a user's close of a turn that had returned tells the parent it was closed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    RunHeld.arm();
+    defer end_test_controls.test_hold_run = null;
+    defer RunHeld.release();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first", .report = "never" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    fixture.release.set(io_mod.getIo());
+    try RunHeld.first.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    RunHeld.release();
+    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[0], "The user closed it, and 1 of your messages waiting for it were dropped.");
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user stopped it") == null);
+}
+
+test "a user's close of a turn that had returned names the close in the report it owes" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    RunHeld.arm();
+    defer end_test_controls.test_hold_run = null;
+    defer RunHeld.release();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    fixture.release.set(io_mod.getIo());
+    try RunHeld.first.waitHeld();
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    RunHeld.release();
+    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try expectBodyHas(fixture.reports.items[0], " completed ");
+    try expectBodyHas(fixture.reports.items[0], "dropped=1");
+    try std.testing.expectEqual(@as(usize, 1), fixture.ends.items.len);
+    try std.testing.expectEqual(@as(?child_state.Cause, .user_close), fixture.ends.items[0].cause);
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user stopped it") == null);
+}
+
 test "a turn the user starts on an idle subagent is a work, and reports its reply under every_turn" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3726,6 +4522,120 @@ test "a parent's message that joined a turn that failed runs as the child's next
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], " failed ") != null);
     try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], " completed DONE also this"));
+}
+
+// Main was told the message joined the turn. When the host cannot queue it
+// again, main must hear that it never ran, as a failed start does.
+test "a message that joined a turn and could not be queued again is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    start_test_controls.test_fail_leftover_at = 0;
+    defer start_test_controls.test_fail_leftover_at = null;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    // The turn failed without reading the message, and the message could not
+    // be queued again: it never ran, and the report says so.
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    var failed_report = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work your message made: fx ran out of memory. It never ran. Send the message again if it is still needed.") != null and std.mem.find(u8, line, " failed ") != null) failed_report = true;
+    }
+    try std.testing.expect(failed_report);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try expectBodyHas(status, "reviewer: idle");
+    const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-4", null);
+    try expectBodyHas(again, "Sent to reviewer");
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+}
+
+// The worker lost a message that joined the turn before the host got it. Main was
+// told it joined, so it hears that it never ran, as a failed start does; the
+// message that did reach the host still runs.
+test "a message that joined a turn and was lost before the host got it is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted_worker = worker_runtime.WorkerRuntime{};
+    defer hosted_worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true, .hosted = &hosted_worker };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const joined = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "also this" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, joined, "Sent into the subagent's running turn") != null);
+    // A second message that the worker lost before the host got it.
+    hosted_worker.lost_parent_steering = 1;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    var lost_report = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work your message made: fx ran out of memory. It never ran. Send the message again if it is still needed.") != null) lost_report = true;
+    }
+    try std.testing.expect(lost_report);
+    // Three reports: the first run's failed end, the lost message's failed start,
+    // and the second run's completion, which runs the message that did reach the host.
+    try std.testing.expectEqual(@as(usize, 3), fixture.reportCount());
+}
+
+// Two messages joined the turn and only the second cannot be queued again: the
+// first runs as the next work, and only the second is reported as failed.
+test "only the leftover that could not be queued again is reported as failed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true, .steerable = true, .fail_first = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const first = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first steer" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, first, "Sent into the subagent's running turn") != null);
+    const second = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second steer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, second, "Sent into the subagent's running turn") != null);
+    start_test_controls.test_fail_leftover_at = 1;
+    defer start_test_controls.test_fail_leftover_at = null;
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+
+    var failed_reports: usize = 0;
+    var ran_first = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "could not start the work") != null) failed_reports += 1;
+        if (std.mem.endsWith(u8, line, " completed DONE first steer")) ran_first = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), failed_reports);
+    try std.testing.expect(ran_first);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
 }
 
 test "the parent's stop drops a message that joined the turn it stops" {
@@ -4444,6 +5354,36 @@ test "the user's close of a working subagent reports that the user closed it" {
     try std.testing.expectEqual(@as(usize, 1), taken.len);
 }
 
+test "the user's close of a working subagent counts a message its worker lost" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var hosted_worker = worker_runtime.WorkerRuntime{};
+    defer hosted_worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .hosted = &hosted_worker };
+    defer fixture.deinit();
+    const runtime = try hostedMailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    hosted_worker.lost_parent_steering = 1;
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    try waitUntilQuiet(runtime);
+    try waitForSlotEnd(runtime, child_id);
+    var counted = false;
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, "The user closed it before it finished.") != null and std.mem.find(u8, line, "dropped=1") != null) counted = true;
+    }
+    try std.testing.expect(counted);
+}
+
 test "the user's close tells main how many of its messages waiting for the subagent it dropped" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -4470,6 +5410,206 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expect(std.mem.find(u8, report, "The user closed it before it finished.") != null);
     try std.testing.expect(std.mem.endsWith(u8, report, " dropped=1"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+/// Whether a report the fixture took says `needle`.
+fn reportSays(fixture: *MailboxFixture, needle: []const u8) bool {
+    for (fixture.reports.items) |line| {
+        if (std.mem.find(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
+test "a user's close that lands after a subagent's report still tells main what it dropped" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+
+    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
+    try waitForRuns(&gap.fixture, 1);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    const child_id = try reviewerId(gap.runtime, gap.arena());
+
+    // The hold sits after the work's report is posted and before the child
+    // settles, so the user's close lands in that window.
+    gap.arm();
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[0], "DONE first") != null);
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
+
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.runs.load(.seq_cst));
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 0), gap.runtime.user_dropped.items.len);
+}
+
+// The hold sits after the host finishes a turn that ended before its work
+// opened, with the lock released, and before it settles the child again. A
+// close that lands there sees the child busy. The next pass checks for a
+// closing child under the same hold that clears the flag, and writes the close
+// then, so the close must still be written once the work has settled.
+test "a close that lands while a subagent's ended work is settled is still written" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+    SettleGap.armInSettle();
+    defer SettleGap.disarmInSettle();
+
+    // A user's turn the child took while its work runs. It waits for that work
+    // and ends before the work opens, so the host finishes it at the hold.
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    // Two reports are out at the hold: the message's own, and the failed turn's,
+    // which the host posted when it finished the turn.
+    try std.testing.expectEqual(@as(usize, 2), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[1], " failed ") != null);
+
+    _ = (try gap.runtime.closeChild(child_id, .parent)).?;
+    SettleGap.go.set(io_mod.getIo());
+    try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
+
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        try std.testing.expect(gap.runtime.closingIndexLocked(child_id) == null);
+    }
+    try std.testing.expect(!registryLists(gap.runtime, child_id));
+
+    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2");
+    try waitUntilQuiet(gap.runtime);
+    const new_id = try reviewerId(gap.runtime, gap.arena());
+    try std.testing.expect(!std.mem.eql(u8, child_id, new_id));
+}
+
+// The same window for a user's close. The parent's message that waits for the
+// child is dropped by the close, which leaves a note the host must still
+// deliver as the notice that main hears.
+test "a close that lands while a subagent's ended work is settled is still written for the user's close too" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+    SettleGap.armInSettle();
+    defer SettleGap.disarmInSettle();
+
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 2), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[1], " failed ") != null);
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    try waitUntilQuiet(gap.runtime);
+    try waitForSlotEnd(gap.runtime, child_id);
+
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        try std.testing.expect(gap.runtime.closingIndexLocked(child_id) == null);
+    }
+    try std.testing.expect(!registryLists(gap.runtime, child_id));
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 0), gap.runtime.user_dropped.items.len);
+
+    _ = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-3");
+    try waitUntilQuiet(gap.runtime);
+    const new_id = try reviewerId(gap.runtime, gap.arena());
+    try std.testing.expect(!std.mem.eql(u8, child_id, new_id));
+}
+
+// The hold sits after the host finishes a turn that ended before its work
+// opened. A second user's turn that begins there waits, as the child is busy,
+// and the host must open it before it lets the child go idle.
+test "a user's turn that begins while the host finishes an earlier one is opened" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .hold = true, .armed = false });
+    defer gap.deinit();
+    SettleGap.armInSettle();
+    defer SettleGap.disarmInSettle();
+
+    const began = try gap.beginTurnWhileFirstWorkRuns();
+    const child_id = began.child_id;
+    defer std.testing.allocator.free(began.turn);
+    gap.runtime.endUserWork(child_id, began.turn, .failed, "");
+    gap.fixture.release.set(io_mod.getIo());
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+
+    // The child is busy while the host settles, so this turn waits, unopened.
+    const second = gap.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
+    defer std.testing.allocator.free(second);
+    SettleGap.go.set(io_mod.getIo());
+    try waitForSlotEnd(gap.runtime, child_id);
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        const index = gap.runtime.findTurnWorkLocked(child_id) orelse return error.SecondTurnGone;
+        try std.testing.expect(gap.runtime.turn_works.items[index].opened);
+    }
+
+    // Its end posts its own report, after the two the first pass made.
+    gap.runtime.endUserWork(child_id, second, .failed, "");
+    try waitUntilQuiet(gap.runtime);
+    try std.testing.expectEqual(@as(usize, 3), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[2], " failed ") != null);
+    {
+        gap.runtime.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer gap.runtime.admission_mutex.unlock(io_mod.getIo());
+        try std.testing.expect(gap.runtime.findTurnWorkLocked(child_id) == null);
+    }
+}
+
+test "a user's close that lands after a user's turn's report still tells main what it dropped" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .armed = false });
+    defer gap.deinit();
+
+    const child_id = try gap.finishFirstWork();
+    // The user's turn ends failed, which owes a report, so the report is out
+    // before the hold.
+    const work_id = gap.runtime.beginUserWork(std.testing.allocator, child_id, null).?;
+    defer std.testing.allocator.free(work_id);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+
+    gap.arm();
+    const ender = try std.Thread.spawn(.{}, endUserWorkOnThread, .{ gap.runtime, child_id, work_id, child_state.Outcome.failed });
+    var ender_joined = false;
+    defer if (!ender_joined) {
+        SettleGap.go.set(io_mod.getIo());
+        ender.join();
+    };
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 2), gap.fixture.reportCount());
+    try std.testing.expect(std.mem.find(u8, gap.fixture.reports.items[1], "failed") != null);
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    ender.join();
+    ender_joined = true;
+    try waitUntilQuiet(gap.runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.runs.load(.seq_cst));
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 0), gap.runtime.user_dropped.items.len);
 }
 
 /// `body` must hold `needle`; a miss shows the needle beside the body, since a
@@ -4596,6 +5736,46 @@ fn reviewerPhase(runtime: *Runtime, arena: Allocator) !struct { phase: child_sta
         .report_owed = child.last_report_owed,
         .has_work = child.active != null,
     };
+}
+
+// A user's turn that ends cancelled owes no report, so the notice that the
+// user's close leaves at the end of the turn is the only post. The post reaches
+// main's worker, which wakes main's wait, so the host must not nudge it too.
+test "a notice at the end of a user's turn wakes main's wait without a nudge" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .armed = false });
+    defer gap.deinit();
+
+    const child_id = try gap.finishFirstWork();
+    const work_id = gap.runtime.beginUserWork(std.testing.allocator, child_id, null).?;
+    defer std.testing.allocator.free(work_id);
+    const queued = try gap.call(.{ .message = .{ .agent = "reviewer", .message = "after the user" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    // Main's wait is registered, as `waitForMail` registers it first.
+    gap.runtime.setWaiter(&gap.worker);
+    defer gap.runtime.setWaiter(null);
+
+    gap.arm();
+    const ender = try std.Thread.spawn(.{}, endUserWorkOnThread, .{ gap.runtime, child_id, work_id, child_state.Outcome.cancelled });
+    var ender_joined = false;
+    defer if (!ender_joined) {
+        SettleGap.go.set(io_mod.getIo());
+        ender.join();
+    };
+    SettleGap.entered.waitTimeout(io_mod.getIo(), gap_wait_limit) catch return error.HostNeverReachedTheGap;
+    try std.testing.expectEqual(@as(usize, 1), gap.fixture.reportCount());
+
+    const closed = (try gap.runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    SettleGap.go.set(io_mod.getIo());
+    ender.join();
+    ender_joined = true;
+    try waitUntilQuiet(gap.runtime);
+
+    try std.testing.expect(reportSays(&gap.fixture, "The user closed it, and 1 of your messages waiting for it were dropped."));
+    try std.testing.expectEqual(@as(usize, 1), gap.worker.queuedPromptCount());
+    try std.testing.expect(!nudgeSet(&gap.worker));
+    try std.testing.expect(!registryLists(gap.runtime, child_id));
 }
 
 test "a start that fails after its work is saved answers that it failed, and ends the work" {
@@ -5077,7 +6257,7 @@ test "a message whose start failed says its subagent is idle only while nothing 
         }
         try std.testing.expect(!runtime.anyWorking());
         // The host's own test for an idle child, as a report applies it.
-        try std.testing.expect(runtime.idleAfterEnd(arena, .{ .child_id = child_id, .work_id = call, .outcome = .failed, .report_owed = false }));
+        try std.testing.expect(runtime.idleFactsAfterEnd(arena, .{ .child_id = child_id, .work_id = call, .outcome = .failed, .report_owed = false }).idle());
     }
 }
 
@@ -5163,11 +6343,16 @@ fn sweepStart(create: bool, seed: bool, fail_at: usize) !bool {
         try expectAt(where, "reviewer is idle or working", stuck);
     }
     const again = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
-    const taken = std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
+    // The faulted call may have started the work. While that turn still runs
+    // the next message joins it, and the turn's own report is then the last.
+    const joined = std.mem.find(u8, again, "Sent into the subagent's running turn") != null;
+    const taken = joined or std.mem.find(u8, again, "Sent to reviewer") != null or std.mem.find(u8, again, "is busy") != null;
     try expectAt(where, "the next message is taken", if (taken) "the next message is taken" else again);
     try waitUntilQuiet(runtime);
     try std.testing.expect(fixture.reportCount() > reports_before);
-    try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], " completed DONE again");
+    try expectBodyHas(fixture.reports.items[fixture.reports.items.len - 1], if (joined) " completed DONE second" else " completed DONE again");
+    // A message that joined the turn never runs as a work of its own.
+    if (joined) try std.testing.expect(!reportSays(&fixture, " completed DONE again"));
     return failed;
 }
 
@@ -5250,13 +6435,20 @@ fn sweepUnrecorded(fail_at: usize, stuck: *usize) !bool {
     try expectBodyHas(closed_again, "\"error_code\":\"close_not_saved\"");
     const after_close = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "after the close" } }, "call-3c", null);
     try expectBodyHas(after_close, "\"error_code\":\"state_unavailable\"");
+    const where = try alloc.print("allocation {d} of a start whose end was not recorded", .{fail_at});
+    defer alloc.free(where);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3f", null);
+    try expectAt(where, "reviewer: refuses messages until fx restarts", if (std.mem.find(u8, status, "reviewer: refuses messages until fx restarts") != null) "reviewer: refuses messages until fx restarts" else status);
+    const note = (try runtime.teamNote(alloc, 0)).?;
+    defer alloc.free(note);
+    try expectAt(where, "\n- reviewer: refuses messages until fx restarts", if (std.mem.find(u8, note, "\n- reviewer: refuses messages until fx restarts") != null) "\n- reviewer: refuses messages until fx restarts" else note);
     // The answer tells main to send the work to a subagent with another name.
     // That works with the stuck child present: the new subagent starts, runs
-    // and reports, and status lists both. What status calls `reviewer` is not
-    // checked here: `childStateLocked` reads a child that the registry holds
-    // as running, with no slot, as idle.
+    // and reports, and status lists both. The status row of `reviewer` is
+    // checked above, while it is still stuck.
     const other = try callTool(runtime, arena, .{ .message = .{ .agent = "helper", .message = "do it instead" } }, "call-3d", null);
     try expectBodyHas(other, "Sent to helper");
+    try expectAt(where, "the started answer does not list reviewer as idle", if (std.mem.find(u8, other, "\n- reviewer") == null) "the started answer does not list reviewer as idle" else other);
     try waitUntilQuiet(runtime);
     var helper_reports: usize = 0;
     for (fixture.reports.items) |line| {
@@ -5372,6 +6564,149 @@ test "a user's turn whose work fails to open at any allocation leaves its subage
     // The call allocates in more places than the few that matter; a sweep that
     // ended at once would prove nothing.
     try std.testing.expect(at > 3);
+}
+
+/// One try of the sweep below: a user's turn is open on `reviewer`, one message
+/// of main waits for it, and that message's start fails (with `fail_save`, its
+/// save to the registry fails instead). The `fail_at`-th
+/// allocation of the turn's end fails. Once the turn has ended, the waiting
+/// message's account must be there: main was told it could not start, or its
+/// work is still recorded as the subagent's active work. Where main was told,
+/// a subagent that still holds a work is not reported idle. Main then sends
+/// one more message, which must run or be refused, and never be answered as
+/// waiting. Returns whether the allocation failed; counts in `sent` and
+/// `refused` the tries of each kind, in `reported` the tries where main was
+/// told the waiting message could not start, and in `plain` the tries where
+/// that report had the fallback text. Where the subagent still holds a work,
+/// that report says to call `status`; where it holds none, it does not.
+fn sweepUserTurnEnd(fail_at: usize, fail_save: bool, sent: *usize, refused: *usize, reported: *usize, plain: *usize) !bool {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    var faulted: FaultedHost = undefined;
+    faulted.install(runtime);
+    defer faulted.deinit();
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-0", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "waiting" } }, "call-1", null);
+    try expectBodyHas(queued, "is busy");
+
+    start_test_controls.test_fail_spawn = true;
+    start_test_controls.test_fail_next_work = fail_save;
+    faulted.arm(fail_at);
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    faulted.disarm();
+    start_test_controls.test_fail_spawn = false;
+    start_test_controls.test_fail_next_work = false;
+    try waitUntilQuiet(runtime);
+    if (!faulted.fault.fired) return false;
+
+    const where = try alloc.print("allocation {d} of the end of a user's turn", .{fail_at});
+    defer alloc.free(where);
+    // The waiting message's account, now that the turn has ended: main was
+    // told it could not start, or its work is still recorded as the
+    // subagent's active work. A message's work id starts `fxop:` and a user's
+    // turn's `fxuser:`, so a user's turn recorded in its place is no account.
+    var told_failed = false;
+    var told_index: usize = 0;
+    for (fixture.reports.items, 0..) |line, index| {
+        if (std.mem.find(u8, line, "could not start the work") != null) {
+            told_failed = true;
+            told_index = index;
+            if (std.mem.find(u8, line, "could not start the work you sent it") != null) plain.* += 1;
+        }
+    }
+    if (told_failed) reported.* += 1;
+    const active_prefix: []const u8 = blk: {
+        var lock = runtime.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try runtime.managed.state_store.load(arena);
+        const child = registry.findPersistent("reviewer") orelse break :blk "gone";
+        const active = child.active orelse break :blk "none";
+        if (std.mem.startsWith(u8, active.id, "fxop:")) break :blk "fxop:";
+        if (std.mem.startsWith(u8, active.id, "fxuser:")) break :blk "fxuser:";
+        break :blk "other";
+    };
+    if (!told_failed) try expectAt(where, "the waiting message is reported, or its work is still recorded", if (std.mem.eql(u8, active_prefix, "fxop:")) "the waiting message is reported, or its work is still recorded" else active_prefix);
+    if (told_failed and !std.mem.eql(u8, active_prefix, "none")) {
+        const idle = fixture.idles.items[told_index];
+        try expectAt(where, "the report does not call a subagent that still holds a work idle", if (idle) "the report calls it idle" else "the report does not call a subagent that still holds a work idle");
+        const line = fixture.reports.items[told_index];
+        if (std.mem.find(u8, line, "could not start the work you sent it") == null) {
+            const says_status = std.mem.find(u8, line, "Call status before you send the message again.") != null;
+            try expectAt(where, "the report says to call status before the message is sent again", if (says_status) "the report says to call status before the message is sent again" else line);
+        }
+    }
+    if (told_failed and std.mem.eql(u8, active_prefix, "none")) {
+        const line = fixture.reports.items[told_index];
+        if (std.mem.find(u8, line, "could not start the work you sent it") == null) {
+            const says_status = std.mem.find(u8, line, "Call status before you send") != null;
+            try expectAt(where, "the report does not say to call status", if (says_status) line else "the report does not say to call status");
+        }
+    }
+    const runs_before = fixture.runs.load(.seq_cst);
+    const next = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "next" } }, "call-2", null);
+    try expectAt(where, "not answered as waiting", if (std.mem.find(u8, next, "is busy") == null) "not answered as waiting" else next);
+    if (std.mem.find(u8, next, "Sent to reviewer") != null) {
+        sent.* += 1;
+        try waitUntilQuiet(runtime);
+        const ran = fixture.runs.load(.seq_cst) - runs_before;
+        try expectAt(where, "the message ran once", if (ran == 1) "the message ran once" else "the message did not run");
+    } else {
+        refused.* += 1;
+        try expectAt(where, "refused as state_unavailable", if (std.mem.find(u8, next, "\"error_code\":\"state_unavailable\"") != null) "refused as state_unavailable" else next);
+        const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+        try expectAt(where, "reviewer: refuses messages until fx restarts", if (std.mem.find(u8, status, "reviewer: refuses messages until fx restarts") != null) "reviewer: refuses messages until fx restarts" else status);
+    }
+    return true;
+}
+
+test "a message sent after the user's turn could not be ended runs or is refused, at any allocation" {
+    var trace: GapTrace = undefined;
+    try trace.init(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    var at: usize = 0;
+    var sent: usize = 0;
+    var refused: usize = 0;
+    var reported: usize = 0;
+    var plain: usize = 0;
+    while (try sweepUserTurnEnd(at, false, &sent, &refused, &reported, &plain)) : (at += 1) {}
+    // The end allocates in more places than the few that matter, and each
+    // kind of answer must occur, so the sweep is not vacuous.
+    try std.testing.expect(at > 0);
+    try std.testing.expect(refused > 0);
+    try std.testing.expect(sent > 0);
+    try std.testing.expect(reported > 0);
+    // The fallback text is what main reads where the report's text cannot be
+    // built, so the sweep reaches it: an allocation of that report fails.
+    try std.testing.expect(plain > 0);
+    // The refusal of a message that nothing can start writes its trace line.
+    // The older unavailable answer writes none, so one line over the sweep
+    // shows the new refusal ran.
+    try std.testing.expect(trace.has("event=message_refused_unstartable"));
+}
+
+test "a failed start's report points to status whenever the subagent's record still holds a work" {
+    var at: usize = 0;
+    var sent: usize = 0;
+    var refused: usize = 0;
+    var reported: usize = 0;
+    var plain: usize = 0;
+    while (try sweepUserTurnEnd(at, true, &sent, &refused, &reported, &plain)) : (at += 1) {}
+    // The sweep must reach an allocation that holds a work, and a report that
+    // main reads, or its checks are vacuous.
+    try std.testing.expect(at > 0);
+    try std.testing.expect(reported > 0);
 }
 
 test "an early-ended work names each file it changed once, without reads or failed changes" {
@@ -5834,8 +7169,13 @@ test "wait returns at once when nothing works, and when a report arrives" {
     defer runtime.deinit();
 
     const quiet = try callTool(runtime, arena, .wait, "call-1", &worker);
-    try std.testing.expect(std.mem.find(u8, quiet, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "no report or message will arrive") != null);
     try std.testing.expect(std.mem.find(u8, quiet, "\"subagents\"") == null);
+    // A model often waits here for a shell command that returned running,
+    // so the reply points it at that command's own session_id.
+    try std.testing.expect(std.mem.find(u8, quiet, "call shell with action interact and the session_id from that result") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "shell-") == null);
 
     _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-2", &worker);
     try waitForRuns(&fixture, 1);
@@ -5853,10 +7193,179 @@ test "wait returns at once when nothing works, and when a report arrives" {
     try std.testing.expect(std.mem.find(u8, woken, "It starts your next turn once this one ends, so end your turn to read it.") != null);
     // It names the subagent that was working when it began.
     try std.testing.expect(std.mem.find(u8, woken, "\"subagents\":[\"reviewer\"]") != null);
+    try std.testing.expect(std.mem.find(u8, woken, "shell") == null);
     try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
     const queued = worker.takeQueuedPrompt(alloc).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);
     try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+}
+
+test "wait asks the model to answer the user's message first, once, before it waits" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const steer = try runtime_execution_memory.steeringMessage(arena, "whats going on ?");
+    const first_wait = [_]types.ToolCall{.{ .id = "w1", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const second_wait = [_]types.ToolCall{.{ .id = "w2", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const unanswered = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+    };
+    const held = try waitWithTurn(runtime, arena, "w1", &worker, &unanswered);
+    try std.testing.expect(std.mem.startsWith(u8, held, held_wait_prefix));
+
+    // Told once, the next wait waits as usual: here nothing works, so it returns.
+    const told = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+        .{ .role = .tool, .content = held, .tool_call_id = "w1", .tool_name = "subagent" },
+        .{ .role = .assistant, .tool_calls = &second_wait },
+    };
+    const next = try waitWithTurn(runtime, arena, "w2", &worker, &told);
+    try std.testing.expect(std.mem.find(u8, next, answer_owed) == null);
+    try std.testing.expect(std.mem.find(u8, next, "no report or message will arrive") != null);
+
+    // A wait toolbox ran keeps its call's id, under toolbox's name.
+    const told_through_toolbox = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &first_wait },
+        .{ .role = .tool, .content = held, .tool_call_id = "w1", .tool_name = "toolbox" },
+        .{ .role = .assistant, .tool_calls = &second_wait },
+    };
+    const after_toolbox = try waitWithTurn(runtime, arena, "w2", &worker, &told_through_toolbox);
+    try std.testing.expect(std.mem.find(u8, after_toolbox, answer_owed) == null);
+
+    // Another result in the hold's very words is not fx's record of a hold.
+    const read_call = [_]types.ToolCall{.{ .id = "r1", .name = "read_file", .arguments_json = "{}" }};
+    const third_wait = [_]types.ToolCall{.{ .id = "w3", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const look_alike = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &read_call },
+        .{ .role = .tool, .content = held, .tool_call_id = "r1", .tool_name = "read_file" },
+        .{ .role = .assistant, .tool_calls = &third_wait },
+    };
+    const after_look_alike = try waitWithTurn(runtime, arena, "w3", &worker, &look_alike);
+    try std.testing.expect(std.mem.find(u8, after_look_alike, answer_owed) != null);
+
+    // Each wait in the step right after the steer is held back.
+    const pair = [_]types.ToolCall{
+        .{ .id = "w4", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+        .{ .id = "w5", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+    };
+    const one_step = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &pair },
+    };
+    const first_of_pair = try waitWithTurn(runtime, arena, "w4", &worker, &one_step);
+    try std.testing.expect(std.mem.find(u8, first_of_pair, answer_owed) != null);
+    const second_of_pair = try waitWithTurn(runtime, arena, "w5", &worker, &one_step);
+    try std.testing.expect(std.mem.find(u8, second_of_pair, answer_owed) != null);
+
+    // Run one by one, wait, read, wait: the first held result is in the turn
+    // before the second wait runs, which is still held back.
+    const batch = [_]types.ToolCall{
+        .{ .id = "w6", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+        .{ .id = "r2", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "w7", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" },
+    };
+    const batch_start = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+    };
+    const held_first = try waitWithTurn(runtime, arena, "w6", &worker, &batch_start);
+    try std.testing.expect(std.mem.find(u8, held_first, answer_owed) != null);
+    const batch_middle = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+        .{ .role = .tool, .content = held_first, .tool_call_id = "w6", .tool_name = "subagent" },
+        .{ .role = .tool, .content = "file text", .tool_call_id = "r2", .tool_name = "read_file" },
+    };
+    const held_second = try waitWithTurn(runtime, arena, "w7", &worker, &batch_middle);
+    try std.testing.expect(std.mem.find(u8, held_second, answer_owed) != null);
+    // Once the model replies after the held results, its next wait waits.
+    const after_batch_wait = [_]types.ToolCall{.{ .id = "w8", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" }};
+    const after_batch = [_]types.ChatMessage{
+        .{ .role = .user, .content = steer },
+        .{ .role = .assistant, .tool_calls = &batch },
+        .{ .role = .tool, .content = held_first, .tool_call_id = "w6", .tool_name = "subagent" },
+        .{ .role = .tool, .content = "file text", .tool_call_id = "r2", .tool_name = "read_file" },
+        .{ .role = .tool, .content = held_second, .tool_call_id = "w7", .tool_name = "subagent" },
+        .{ .role = .assistant, .tool_calls = &after_batch_wait },
+    };
+    const after_batch_result = try waitWithTurn(runtime, arena, "w8", &worker, &after_batch);
+    try std.testing.expect(std.mem.find(u8, after_batch_result, answer_owed) == null);
+}
+
+fn waitWithTurn(runtime: *Runtime, arena: Allocator, invocation_id: []const u8, worker: *worker_runtime.WorkerRuntime, turn: []const types.ChatMessage) ![]const u8 {
+    var request = try model_contract.validateRequest(std.testing.allocator, .wait);
+    defer request.deinit(std.testing.allocator);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = runtime.root_id,
+        .invocation_id = invocation_id,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = worker,
+        .turn_messages = turn,
+    });
+    return result.body;
+}
+
+test "a user's message that ends a wait reads as the user's, not as a subagent's report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", &worker);
+    try waitForRuns(&fixture, 1);
+    try worker.enqueuePrompt(alloc, .{
+        .prompt = try alloc.dupe(u8, "whats going on ?"),
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    });
+    const steered = try callTool(runtime, arena, .wait, "call-2", &worker);
+    try std.testing.expect(std.mem.find(u8, steered, "The user sent a message.") != null);
+    try std.testing.expect(std.mem.find(u8, steered, "No subagent report arrived.") != null);
+    // No turn runs here, so the message waits for the next turn, which answers it.
+    try std.testing.expect(std.mem.find(u8, steered, "Answer the user") == null);
+    try std.testing.expect(std.mem.find(u8, steered, "A report or message arrived") == null);
+    const typed = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, typed);
+    try std.testing.expectEqual(types.MessageAuthor.user, typed.author);
+
+    // The reviewer's report, once it comes, still reads as a report.
+    fixture.release.set(io_mod.getIo());
+    const reported = try callTool(runtime, arena, .wait, "call-3", &worker);
+    try std.testing.expect(std.mem.find(u8, reported, "A report or message arrived.") != null);
+    try std.testing.expect(std.mem.find(u8, reported, "The user sent a message") == null);
+    const report = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, report);
+    try std.testing.expectEqual(types.MessageAuthor.child, report.author);
 }
 
 test "a subagent that reports never stays quiet when its work completes" {
@@ -5893,6 +7402,19 @@ const SettleGap = struct {
 
     fn disarm() void {
         end_test_controls.test_settle_hold = null;
+    }
+
+    /// The hold after the host finishes a turn that ended before its work
+    /// opened, with the lock released and before it settles the child again,
+    /// with the same two events as `arm`.
+    fn armInSettle() void {
+        entered = .unset;
+        go = .unset;
+        end_test_controls.test_in_settle_hold = hold;
+    }
+
+    fn disarmInSettle() void {
+        end_test_controls.test_in_settle_hold = null;
     }
 
     fn hold(_: []const u8) void {
@@ -6023,6 +7545,18 @@ const GapFixture = struct {
         const first = self.worker.takeQueuedPrompt(std.testing.allocator).?;
         worker_runtime.freeQueuedPrompt(std.testing.allocator, first);
         return reviewerId(self.runtime, self.arena());
+    }
+
+    const BeganTurn = struct { child_id: []const u8, turn: []u8 };
+
+    /// Sends "first" as "call-1", waits for its run, and begins a user's turn
+    /// on the child while that work runs. The caller frees `turn`.
+    fn beginTurnWhileFirstWorkRuns(self: *GapFixture) !BeganTurn {
+        _ = try self.call(.{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1");
+        try waitForRuns(&self.fixture, 1);
+        const child_id = try reviewerId(self.runtime, self.arena());
+        const turn = self.runtime.beginTurnWork(std.testing.allocator, child_id, .user, null).?;
+        return .{ .child_id = child_id, .turn = turn };
     }
 };
 
@@ -6219,7 +7753,7 @@ test "a wait that starts before and after the user's turn on a closing subagent 
 
     const said = try boundedWait(&gap);
     defer std.testing.allocator.free(said);
-    try std.testing.expect(std.mem.find(u8, said, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, said, "no report or message will arrive") != null);
     try std.testing.expect(!registryLists(gap.runtime, child_id));
 }
 
@@ -6282,6 +7816,76 @@ test "a user's turn on a closing subagent writes the close before it nudges main
     try std.testing.expect(!nudged_before_close);
     try std.testing.expect(nudgeSet(&gap.worker));
     try std.testing.expect(!registryLists(gap.runtime, child_id));
+}
+
+/// A hold at `end_test_controls.test_hold_close_settle`: the end of a user's
+/// turn, once it has cleared the child's busy flag, waits here before it
+/// settles the close.
+const HeldCloseSettle = HeldAt(end_test_controls, "test_hold_close_settle");
+
+/// A hold at the write of a close, after the close marks the child as being
+/// written (`close_test_controls.test_hold`).
+const HeldCloseWrite = HeldAt(close_test_controls, "test_hold");
+
+/// Closes `child_id` as its parent on the calling thread, for a test that lands
+/// a close from another thread. A thread cannot return an error, so a failed
+/// close leaves `closed` false, and the test asserts it.
+fn closeChildOnThread(runtime: *Runtime, child_id: []const u8, closed: *bool) void {
+    closed.* = (runtime.closeChild(child_id, .parent) catch return) != null;
+}
+
+test "a close that lands as a user's turn ends is written before main's wait is nudged" {
+    var gap: GapFixture = undefined;
+    try gap.init(.{ .armed = false });
+    defer gap.deinit();
+
+    const child_id = try gap.finishFirstWork();
+    const work_id = gap.runtime.beginUserWork(std.testing.allocator, child_id, null).?;
+    defer std.testing.allocator.free(work_id);
+    // Main's wait is registered, as `waitForMail` registers it first, so a
+    // nudge sets the worker's flag and stays set.
+    gap.runtime.setWaiter(&gap.worker);
+    defer gap.runtime.setWaiter(null);
+    HeldCloseSettle.arm();
+    defer HeldCloseSettle.clear();
+    HeldCloseWrite.arm();
+    defer HeldCloseWrite.clear();
+
+    const ender = try std.Thread.spawn(.{}, endUserWorkOnThread, .{ gap.runtime, child_id, work_id, child_state.Outcome.cancelled });
+    var ender_joined = false;
+    defer if (!ender_joined) {
+        HeldCloseSettle.release();
+        ender.join();
+    };
+    // The end has cleared the child's busy flag and is held before it settles.
+    try HeldCloseSettle.waitHeld();
+
+    // A close that lands now finds the child idle, so it settles the close
+    // itself, and that thread is held in the write.
+    var closed = false;
+    const closer = try std.Thread.spawn(.{}, closeChildOnThread, .{ gap.runtime, child_id, &closed });
+    var closer_joined = false;
+    defer if (!closer_joined) {
+        HeldCloseWrite.release();
+        closer.join();
+    };
+    try HeldCloseWrite.waitHeld();
+
+    // The end goes on while the close is still held in its write.
+    HeldCloseSettle.release();
+    ender.join();
+    ender_joined = true;
+    const nudged_while_write_held = nudgeSet(&gap.worker);
+    try std.testing.expect(!nudged_while_write_held);
+    try std.testing.expect(registryLists(gap.runtime, child_id));
+
+    // The write goes on: the close is written, and then main's wait is nudged.
+    HeldCloseWrite.release();
+    closer.join();
+    closer_joined = true;
+    try std.testing.expect(closed);
+    try std.testing.expect(!registryLists(gap.runtime, child_id));
+    try std.testing.expect(nudgeSet(&gap.worker));
 }
 
 test "rebinding a moved host context moves its report sink too" {
@@ -7027,7 +8631,7 @@ test "a turn the user typed on a hosted subagent's screen shows its wait too" {
     try expectHas(ended, "reviewer: idle");
 }
 
-/// The team note for rows in every state `Runtime.ChildState` has, as a note
+/// The team note for rows in every state `Runtime.ChildState` has but `refusing`, as a note
 /// of `kind` says them: a waiting row with no last outcome, one with an
 /// outcome, then rows that do not wait, with the fourth past the limit.
 fn teamNoteForEveryState(alloc: Allocator, kind: Runtime.NoteKind) ![]u8 {
@@ -7430,6 +9034,10 @@ const Closing = struct {
     id: []u8,
     /// Whether a thread is writing its close, so no other writes it too.
     settling: bool = false,
+    /// Whether the thread writing the close nudges the owner's `wait`
+    /// once its write returns: a user's turn that ended meanwhile found
+    /// the close being written and left its own nudge to that thread.
+    nudge_after: bool = false,
 };
 
 /// What names a close's work in the log; the child's id follows.
@@ -7472,6 +9080,7 @@ fn startCauseText(err: anyerror) []const u8 {
         error.ThreadSpawnFailed => "fx could not start a thread for it",
         error.OutOfMemory => "fx ran out of memory",
         error.OwnerClosed => "fx is closing",
+        error.ChildBusy => "its record still holds an earlier work",
         else => @errorName(err),
     };
 }
@@ -7498,14 +9107,24 @@ fn startFailedStuckResult(buf: []u8, agent: []const u8, cause: []const u8) []con
 /// A report's text for a work whose slot could not start: its messages never
 /// ran, one or the `messages` that joined it. It does not say whether the
 /// subagent is idle, which the host reads after it builds this text, and the
-/// report's `next` says when it is. Allocated in `a`.
-fn startFailedReport(a: Allocator, cause: []const u8, messages: usize) ![]const u8 {
-    if (messages > 1) return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Send them again if they are still needed.", .{ messages, cause });
+/// report's `next` says when it is. When `held`, the last sentence says to call
+/// `status` before the message is sent again, because the subagent's record
+/// still holds an earlier work. Allocated in `a`.
+fn startFailedReport(a: Allocator, cause: []const u8, messages: usize, held: bool) ![]const u8 {
+    if (messages > 1) {
+        if (held) return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Call status before you send them again.", .{ messages, cause });
+        return a.print("The subagent could not start the work your {d} messages made: {s}. They never ran. Send them again if they are still needed.", .{ messages, cause });
+    }
+    if (held) return a.print("The subagent could not start the work your message made: {s}. It never ran. Call status before you send the message again.", .{cause});
     return a.print("The subagent could not start the work your message made: {s}. It never ran. Send the message again if it is still needed.", .{cause});
 }
 
+/// A failed start's report when fx cannot build `startFailedReport`'s text: it
+/// names no cause and no count, and is true for any of them.
+const start_failed_report_fallback = "The subagent could not start the work you sent it. It never ran. Call status before you send it again.";
+
 /// What decides whether a child is idle once its work's report goes
-/// (`Runtime.idleAfterEnd`).
+/// (`Runtime.idleFactsAfterEnd`).
 const IdleFacts = struct {
     /// The parent's messages the ended turn never took, which become its
     /// next work.
@@ -7523,9 +9142,12 @@ const IdleFacts = struct {
     /// Every later message to the child fails the same way, as when its
     /// profile cannot be loaded, so there is nothing to keep it for.
     unusable: bool = false,
+    /// The report says a message could not start, and the registry still
+    /// holds an earlier work for the child, so messages to it are refused.
+    holds_work: bool = false,
 
     fn idle(self: IdleFacts) bool {
-        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting and !self.unusable;
+        return self.open and !self.leftovers and !self.user_closed and !self.closing and !self.waiting and !self.turn_waiting and !self.unusable and !self.holds_work;
     }
 };
 
@@ -7538,6 +9160,7 @@ test "a child is idle after its report only when nothing starts its next turn or
     try std.testing.expect(!(IdleFacts{ .open = true, .waiting = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .turn_waiting = true }).idle());
     try std.testing.expect(!(IdleFacts{ .open = true, .unusable = true }).idle());
+    try std.testing.expect(!(IdleFacts{ .open = true, .holds_work = true }).idle());
 }
 
 /// An idle subagent a new subagent's start names, with what it is for.
@@ -8203,7 +9826,7 @@ const HeldRecorded = HeldRun(true);
 /// `done` event: the slot sets it after its end hook returned, so every write
 /// that end makes is in by then, the close of a closing child included.
 /// `waitUntilQuiet` is not enough for a test that reads that state: the host
-/// stops counting a closing child as working (`endClosingWork`) before it
+/// stops counting a closing child as working (`endClosingWorkLocked`) before it
 /// writes the close (`settleClose`).
 fn waitForSlotEnd(runtime: *Runtime, child_id: []const u8) !void {
     _ = runtime.managed.wait(child_id, .{ .clock = .awake, .raw = .fromSeconds(30) }) catch |err| {
@@ -9267,8 +10890,8 @@ test "a stop after the next work began does not count its message" {
 // The rule, for each message `m` that main sent to a subagent
 // (`tests/tla/subagent/StopMessage.tla` NoSilentLoss and CountedNeverRead).
 // An account of `m` is one of: (i) `m`'s turn began; (ii) a count includes `m`,
-// the N of a stop's or close's answer or of a user's note; (iii) the report of
-// `m`'s own work says the work failed or was cancelled.
+// the N of a stop's or close's answer or of a user's note the host delivered;
+// (iii) the report of `m`'s own work says the work failed or was cancelled.
 //
 //   R1, never false: if (ii) or (iii) holds for `m`, its turn never begins.
 //   R2, never silent: if `m`'s turn never begins, (ii) or (iii) holds.
@@ -9307,9 +10930,12 @@ const Plan = struct {
     }
 };
 
-/// The pairs that end in a user's stop are not run: the app calls
-/// `Runtime.userStopped` only while a turn runs, and no turn runs after a stop
-/// or close.
+/// The pairs that end in a user's stop: the two that follow a parent's stop or
+/// close of the same turn are run, since a cancelled turn is still in flight
+/// until it is saved and the user's stop can reach it. The fixture's user stop
+/// calls the worker's drop directly, as the app does once its Esc check has
+/// passed. The two that follow a user's stop or close are not run: the app's Esc
+/// and approval paths skip a turn whose cancel is already requested.
 const table_plans = [_]Plan{
     .{ .first = .parent_stop },
     .{ .first = .parent_close },
@@ -9327,6 +10953,8 @@ const table_plans = [_]Plan{
     .{ .first = .parent_close, .second = .parent_close },
     .{ .first = .user_close, .second = .user_close },
     .{ .first = .user_stop, .second = .user_close },
+    .{ .first = .parent_stop, .second = .user_stop },
+    .{ .first = .parent_close, .second = .user_stop },
 };
 
 const Scenario = enum {
@@ -9943,7 +11571,8 @@ const AccountCell = struct {
         }
         for (self.answers.items) |answer| ledger.counted += accountAnswerDropped(answer);
         for (fixture.reports.items) |line| ledger.counted += accountReportDropped(line);
-        for (self.runtime.user_dropped.items) |drop| ledger.counted += drop.count;
+        // A note the host still holds at the cell's end never reached the owner,
+        // so it accounts for nothing; the printout names it.
         return ledger;
     }
 
@@ -9983,16 +11612,14 @@ const AccountVerdict = enum {
     over_counted,
     /// R3: a count beside the report of a work that failed.
     count_beside_failed_report,
-    /// The case says it breaks R2 as `main` does, and it does not.
-    wrongly_marked,
 };
 
-fn accountVerdict(ledger: AccountLedger, as_on_main: bool) AccountVerdict {
+fn accountVerdict(ledger: AccountLedger) AccountVerdict {
     if (ledger.count_beside_failed_report) return .count_beside_failed_report;
     const accounted = ledger.by_report + ledger.counted;
     if (accounted > ledger.never_began) return .over_counted;
-    if (accounted < ledger.never_began) return if (as_on_main) .ok else .silent;
-    return if (as_on_main) .wrongly_marked else .ok;
+    if (accounted < ledger.never_began) return .silent;
+    return .ok;
 }
 
 const AccountReportFields = struct { call: []const u8, outcome: []const u8 };
@@ -10023,48 +11650,14 @@ fn accountAnswerDropped(answer: []const u8) usize {
     return std.fmt.parseInt(usize, answer[start..at], 10) catch 0;
 }
 
-/// Cells that break R2 as `main` does: no count names a message that was dropped.
-/// A user's close of a turn with a message unread or kept, and the user's stop
-/// before the end is recorded with one kept, drop it silently; so do a second
-/// close, the parent's or the user's, after them, and the user's close after a
-/// user's stop that left a message. A parent's stop that follows counts what
-/// the user's left. On the hosted path, a parent's stop or close after the
-/// work's worker attached and before its turn begins withdraws the turn (the
-/// app's `postAndWait`) and counts nothing: `Slot.unstarted` is zeroed at the
-/// attach. A change that counts these takes this list as its failing tests.
-/// Every other cell holds R2.
-fn accountAsOnMain(plan: Plan, scenario: Scenario, hosted_path: bool) bool {
-    const attached = scenario == .attached_not_begun or scenario == .next_attached_not_begun;
-    if (attached and (hosted_path or scenario.hosted())) {
-        // The parent's stop owes no report, and nor does its close, unless the
-        // user's close came first: its report stays and accounts.
-        const parent_first = plan.first == .parent_stop or plan.first == .parent_close;
-        return parent_first or plan.second == .parent_stop or (plan.second == .parent_close and plan.first != .user_close);
-    }
-    const user_close_silent = switch (scenario) {
-        .running_unread, .returned_kept, .recorded_kept, .two_works_unread, .recorded_kept_failed_first => true,
-        else => false,
-    };
-    return switch (plan.first) {
-        .user_close => user_close_silent and (plan.second == null or plan.second == .parent_close or plan.second == .user_close),
-        .user_stop => if (plan.second) |second| switch (second) {
-            // The app's Esc on a running turn counts the unread message.
-            .user_close => user_close_silent and scenario != .running_unread,
-            else => false,
-        } else scenario == .returned_kept,
-        else => false,
-    };
-}
-
-fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan, as_on_main: bool) []const u8 {
-    return std.mem.print(buf, "{s}{s}{s} / {s}{s}{s}{s}", .{
+fn accountCellName(buf: []u8, scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Plan) []const u8 {
+    return std.mem.print(buf, "{s}{s}{s} / {s}{s}{s}", .{
         @tagName(scenario),
         if (hosted_path and !scenario.hosted()) " (hosted)" else "",
         if (in_stop) " (the slot let go inside the stop)" else "",
         @tagName(plan.first),
         if (plan.second != null) " then " else "",
         if (plan.second) |second| @tagName(second) else "",
-        if (as_on_main) " (as on main: R2)" else "",
     }) catch "?";
 }
 
@@ -10081,11 +11674,10 @@ fn runAccountCell(scenario: Scenario, hosted_path: bool, in_stop: bool, plan: Pl
     // Every other cell of the window would wait as long, so the table stops
     // there, as it does for a cell it cannot drive.
     if (cell.fixture.linger_timed_out.load(.seq_cst)) return error.LingerNotReleasedWithin10s;
-    const as_on_main = accountAsOnMain(plan, scenario, hosted_path);
     const ledger = cell.tally();
-    const verdict = accountVerdict(ledger, as_on_main);
+    const verdict = accountVerdict(ledger);
     var buf: [160]u8 = undefined;
-    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan, as_on_main);
+    const name = accountCellName(&buf, scenario, hosted_path, in_stop, plan);
     // A stop that read on before the slot went on proves nothing about the
     // order the cell is there for, whatever the verdict says.
     const slot_went_on = !in_stop or cell.stopHeld(plan);
@@ -10108,7 +11700,7 @@ test "every message main sends has one account in every window of a subagent's s
         // Some windows run again with the slot let go inside the parent's stop or
         // close, right after the owner stopped the work, for the plans that have
         // one: the owner's count and the flag it sets are one step, so the slot's
-        // end or attach runs before it or after it, and never between.
+        // end or begin runs before it or after it, and never between.
         for ([_]bool{ false, true }) |in_stop| {
             if (in_stop and !scenario.holdsInStop()) continue;
             const paths: []const bool = if (in_stop) scenario.inStopPaths() else if (scenario.hosted()) &.{true} else &.{ false, true };
@@ -10118,7 +11710,7 @@ test "every message main sends has one account in every window of a subagent's s
                     cells += 1;
                     const held = runAccountCell(scenario, hosted_path, in_stop, plan) catch |err| {
                         var buf: [160]u8 = undefined;
-                        std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, in_stop, plan, false), @errorName(err) });
+                        std.debug.print("\nTABLE {s}: the cell could not be driven ({s}); the rest of its window is skipped\n", .{ accountCellName(&buf, scenario, hosted_path, in_stop, plan), @errorName(err) });
                         broken += 1;
                         break;
                     };

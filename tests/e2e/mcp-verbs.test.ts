@@ -4,6 +4,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
 import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
@@ -239,6 +240,106 @@ describe("fx mcp", () => {
     expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
   });
 
+  // What fx refuses in a server's answer to tools/list, and the words it gives for each. The reply is raw text after the
+  // request id, so a repeated key reaches fx as written.
+  const refusedLists: [string, string, string][] = [
+    ["`tools` is no list", '"result":{"resultType":"complete","tools":7}', '"tools" is not a list'],
+    ["`tools` is written twice", '"result":{"resultType":"complete","tools":[],"tools":[]}', "a field is written twice"],
+    ["`tools` is written twice, once with an escape", '"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}', "a field is written twice"],
+    ["the server answers with an error", '"error":{"code":-32603,"message":"Internal error"}', "the server answered the list with an error"],
+    ["the answer is no finished list", '"result":{"resultType":"input_required","inputRequests":{}}', "the server's answer was not a finished list"],
+    // The reply is matched to the list by its id, which comes first, and then fx cannot read the rest. It says so, not that the server
+    // answered with an error, and it does not wait 30 seconds for the list.
+    ["the reply goes wrong after its id: not JSON", '"result":{"resultType":"complete","tools":[]},"extra":nope', "the answer is not a readable tool list"],
+    [
+      "the reply goes wrong after its id: nested past the engine's limit",
+      `"result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)}`,
+      "the answer is not a readable tool list",
+    ],
+    ["the reply goes wrong after its id: `result` is written twice", '"result":{"resultType":"complete","tools":[]},"result":{"resultType":"complete","tools":[]}', "a field is written twice"],
+  ];
+
+  for (const [what, reply, why] of refusedLists) {
+    test(`show says when fx refused the tool list, as the server's answer: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      // The server works, so the exit stays 0.
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${why}\n  version    2026-07-28\n  transport  stdio\n`);
+      expect(text.stdout).not.toContain("0 tools");
+
+      const json = await mcp(root, "show", "fixture", "--json");
+      expect(json.code).toBe(0);
+      const shown = JSON.parse(json.stdout);
+      // `error` is what says a server is down, and this one is not; `status` and `tools` keep their meaning.
+      expect(shown).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: why, tools: [] });
+    }, 30_000);
+  }
+
+  test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
+    const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    const text = await mcp(good, "show", "fixture");
+    expect(text.stdout).toMatch(/^fixture\n  status     ready, 1 tool\n  version/);
+    expect(text.stdout).not.toContain("tool list");
+    expect(JSON.parse((await mcp(good, "show", "fixture", "--json")).stdout)).toMatchObject({ status: "ready", error: null, tools_error: null });
+
+    // A tool whose `name` is written twice is dropped and the list is still the server's answer: nothing is refused.
+    const dropped = createRoot({
+      mcpServers: {
+        fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":[{"name":"a","name":"b","inputSchema":{"type":"object"}}]}' } }),
+      },
+    });
+    const shown = JSON.parse((await mcp(dropped, "show", "fixture", "--json")).stdout);
+    expect(shown).toMatchObject({ status: "ready", tools_error: null, tools: [] });
+  }, 30_000);
+
+  test("show says when fx refused the tool list of an HTTP server too", async () => {
+    const upstream = startModernMcpHttpFixture("list_refused");
+    try {
+      const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+      const text = await mcp(root, "show", "web");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toStartWith("web\n  status     ready, tool list refused\n  tool list  refused: a field is written twice\n");
+      const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", error: null, tools_error: "a field is written twice", tools: [] });
+    } finally {
+      upstream.stop();
+    }
+  }, 30_000);
+
+  // The server answered `tools/list`, but not with a JSON-RPC message: a status that no other flow reads, or a page
+  // that is no JSON. That is an answer fx refuses, not a server that gave none.
+  const httpAnswers = [
+    ["list_http_500", "the server answered the list with HTTP 500"],
+    ["list_http_429", "the server answered the list with HTTP 429"],
+    ["list_html_200", "the list is not valid JSON"],
+  ] as const;
+  for (const [mode, why] of httpAnswers) {
+    test(`show says when an HTTP server answered the tool list with ${mode.replace("list_", "").replaceAll("_", " ")}`, async () => {
+      const upstream = startModernMcpHttpFixture(mode);
+      try {
+        const root = createRoot({ mcpServers: { web: { type: "http", url: upstream.url } } });
+        const text = await mcp(root, "show", "web");
+        expect(text.stderr).toBe("");
+        expect(text.code).toBe(0);
+        expect(text.stdout).toStartWith(`web\n  status     ready, tool list refused\n  tool list  refused: ${why}\n`);
+        const shown = JSON.parse((await mcp(root, "show", "web", "--json")).stdout);
+        expect(shown).toMatchObject({ status: "ready", error: null, tools_error: why, tools: [] });
+      } finally {
+        upstream.stop();
+      }
+    }, 30_000);
+  }
+
+  test("list --json carries tools_error, null for a server fx has not asked for its tools", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: refusedLists[0][1] } }), off: { command: "never-run", enabled: false } } });
+    const listed = await mcp(root, "list", "--json");
+    expect(listed.code).toBe(0);
+    for (const server of JSON.parse(listed.stdout).servers) expect(server).toHaveProperty("tools_error", null);
+  });
+
   test("a variable a header can't carry holds its server back instead of aborting fx", async () => {
     // Nothing listens on port 1, and nothing should be sent there.
     const root = createRoot({
@@ -398,6 +499,29 @@ describe("fx mcp", () => {
 });
 
 describe("/mcp in the shell", () => {
+  test.skipIf(!tmuxAvailable())("/mcp list and /mcp show say when fx refused a server's tool list", async () => {
+    // The shell can ask questions, so it says so to servers, and the fixture expects that.
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_LIST_REPLY: '"result":{"resultType":"complete","tools":7}' } }) } });
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    // Servers start on their own once the first frame is up; ask until the status says what happened to the list.
+    const listed = "fixture  ~/.fx/mcp.json  stdio      ready, tool list refused";
+    for (let i = 0; i < 20 && !(await tui.capturePane()).includes(listed); i++) {
+      await tui.sendText("/mcp list");
+      await tui.waitForText(listed, 500).catch(() => {});
+    }
+    await tui.waitForText(listed, 1_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText('tool list  refused: "tools" is not a list', 15_000);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });
@@ -732,7 +856,7 @@ describe("/mcp in the shell", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
     await tui.waitForComposer(15_000);
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -834,7 +958,7 @@ describe("/mcp in the shell", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp show slow");
-    const pidPath = join(root.workspace, "slow.pid");
+    const pidPath = join(root.home, "slow.pid");
     for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
     const pid = Number(readFileSync(pidPath, "utf8").trim());
     try {
@@ -846,7 +970,10 @@ describe("/mcp in the shell", () => {
       while (tui.isAlive() && Date.now() - start < 5_000) await Bun.sleep(20);
       // A graceful stop would wait 1.5 s on the closed stdin before SIGTERM.
       expect(Date.now() - start).toBeLessThan(1_000);
-      for (let i = 0; i < 50 && isRunning(pid); i++) await Bun.sleep(20);
+      // The owner stops the server, which ignores its closed stdin, with
+      // SIGTERM within its grace; the session itself does not wait for it.
+      // Polls that process's exit, bounded at 5 s.
+      for (let i = 0; i < 250 && isRunning(pid); i++) await Bun.sleep(20);
       expect(isRunning(pid)).toBe(false);
     } finally {
       if (isRunning(pid)) process.kill(pid, "SIGKILL");
@@ -1456,6 +1583,62 @@ describe("fx mcp add and remove refuse what fx would skip", () => {
     // The shell still answers.
     await tui.sendText("/mcp list");
     await tui.waitForText("~/.fx/mcp.json", 10_000);
+    await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
+    await tui.waitForText("Added web to .mcp.json.", 10_000);
+  }, 90_000);
+
+  // A file nested past the limit (src/core/shared/json_depth.zig) is not rewritten: the writer aborts the whole
+  // process from 257 levels. The reader still loads such a file.
+  const nested = (levels: number, server = "old") => `{"mcpServers":{"${server}":{"command":"true"}},"notes":${"[".repeat(levels)}${"]".repeat(levels)}}`;
+  const TOO_DEEP = "the file is nested more than 64 levels deep; flatten it by hand first";
+
+  test("add and remove refuse a file nested past the limit, however deep, and leave it as it was", async () => {
+    for (const levels of [64, 256, 300, 400_000]) {
+      const root = fresh(nested(levels));
+      writeFileSync(root.projectPath, nested(levels, "proj"));
+      for (const [flag, file, path, server] of [["--global", "~/.fx/mcp.json", root.profilePath, "old"], ["--project", ".mcp.json", root.projectPath, "proj"]] as const) {
+        await refused(root, ["--no-login", flag, "web", "https://mcp.example/mcp"], TOO_DEEP, file, "add", "web", path);
+        await refused(root, [flag, server], TOO_DEEP, file, "remove", server, path);
+      }
+      expect((await loaded(root)).sort()).toEqual(["old", "proj"]);
+    }
+  }, 120_000);
+
+  test("guard: a file at the limit is edited, and a deep file beside the one being edited does not stop it", async () => {
+    const root = fresh(nested(63));
+    const added = await mcp(root, "add", "--no-login", "web", "https://mcp.example/mcp");
+    expect(added.stderr).toBe("");
+    expect(added.stdout).toBe("Added web to ~/.fx/mcp.json.\n");
+    expect(Object.keys(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers)).toEqual(["old", "web"]);
+    const removed = await mcp(root, "remove", "--global", "old");
+    expect(removed.stdout).toBe("Removed old from ~/.fx/mcp.json.\n");
+
+    writeFileSync(root.profilePath, nested(400_000));
+    const profile = bytesOf(root.profilePath);
+    const project = await mcp(root, "add", "--no-login", "--project", "web", "https://mcp.example/mcp");
+    expect(project.stderr).toBe("");
+    expect(project.code).toBe(0);
+    expect(project.stdout).toStartWith("Added web to .mcp.json.\n");
+    expect(bytesOf(root.profilePath)).toBe(profile);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add and /mcp remove refuse a file nested past the limit and the shell keeps running", async () => {
+    const root = fresh(nested(300));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 220,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const before = readFileSync(root.profilePath, "utf8");
+    await tui.sendText("/mcp add web https://x.example/mcp");
+    await tui.waitForText(`Couldn't add web to ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    await tui.sendText("/mcp remove old");
+    await tui.waitForText(`Couldn't remove old from ~/.fx/mcp.json: ${TOO_DEEP}.`, 10_000);
+    expect(readFileSync(root.profilePath, "utf8")).toBe(before);
     await tui.sendText("/mcp add --no-login --project web https://x.example/mcp");
     await tui.waitForText("Added web to .mcp.json.", 10_000);
   }, 90_000);

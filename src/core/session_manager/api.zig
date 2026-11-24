@@ -48,6 +48,7 @@ pub const ForkPoint = session_mod.ForkPoint;
 pub const Verified = session_mod.Verified;
 pub const VerifyOptions = session_mod.VerifyOptions;
 pub const Stop = session_mod.Stop;
+pub const LockStatus = session_mod.LockStatus;
 pub const Summary = catalog_mod.Summary;
 pub const ListPage = catalog_mod.Page;
 pub const ListCursor = catalog_mod.Cursor;
@@ -468,6 +469,14 @@ pub const Manager = struct {
         return session_mod.isBusy(&m.env, id);
     }
 
+    /// Whether another process has session `id` open for writing, and its PID
+    /// when recorded (`session.zig` `lockStatus`).
+    pub fn lockStatus(m: *Manager, id: []const u8) OpenError!LockStatus {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.lockStatus(&m.env, id);
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
@@ -613,6 +622,17 @@ pub const Session = struct {
     /// An owned copy of the folded state; free with `State.deinit`.
     pub fn state(s: Session, gpa: std.mem.Allocator) error{OutOfMemory}!State {
         return s.inner.stateCopy(gpa);
+    }
+
+    /// Whether every turn of the session ran in `workspace`: the session was
+    /// made there and never resumed from another folder, which a `set
+    /// workspace` line records. A saved path relative to a turn's workspace
+    /// then names a file in `workspace`.
+    pub fn ranOnlyIn(s: Session, gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory}!bool {
+        if (!std.mem.eql(u8, s.inner.identity.workspace, workspace)) return false;
+        var copy = try s.state(gpa);
+        defer copy.deinit(gpa);
+        return copy.workspace == null;
     }
 
     /// Interrupts an open turn, appends `closed`, syncs, updates the index
@@ -1169,6 +1189,32 @@ const api_tests = struct {
         const c = try m.openResume(.{ .target = .{ .last_opened = .app }, .workspace = "/x", .host = .app });
         try testing.expectEqualStrings(id, c.id());
         c.release();
+    }
+
+    test "a session ran only in its workspace until it is resumed from another" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, .turn_committed });
+        try testing.expect(try s.ranOnlyIn(gpa, "/w"));
+        try testing.expect(!try s.ranOnlyIn(gpa, "/x"));
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+        const same = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expect(try same.ranOnlyIn(gpa, "/w"));
+        same.release();
+        // Once resumed from /x, its turns may have run there, even after it
+        // comes back to /w.
+        const moved = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/x", .host = .app });
+        try testing.expect(!try moved.ranOnlyIn(gpa, "/x"));
+        try testing.expect(!try moved.ranOnlyIn(gpa, "/w"));
+        moved.release();
+        const back = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expect(!try back.ranOnlyIn(gpa, "/w"));
+        back.release();
     }
 
     test "lastOpened names the app's session from the index, and isBusy sees its writer" {

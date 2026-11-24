@@ -3853,7 +3853,7 @@ fn maybeDelayForTest(name: []const u8) void {
 }
 
 fn signalTestBarrier(name: []const u8) void {
-    const path = io_mod.getenv(name) orelse return;
+    const path = io_mod.getenvAbsolutePath(name) orelse return;
     var file = std.Io.Dir.createFileAbsolute(
         io_mod.getIo(),
         path,
