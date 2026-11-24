@@ -224,7 +224,7 @@ fn classify_codepoint(counts: *Counts, codepoint: u21) void {
     }
 }
 
-fn is_latin_codepoint(codepoint: u21) bool {
+pub fn is_latin_codepoint(codepoint: u21) bool {
     return (codepoint >= 'A' and codepoint <= 'Z') or
         (codepoint >= 'a' and codepoint <= 'z') or
         (codepoint >= 0x00C0 and codepoint <= 0x024F) or
