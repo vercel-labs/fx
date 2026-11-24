@@ -73,7 +73,7 @@ class FindsDeprecatedApis(unittest.TestCase):
 
 class SameLineRules(unittest.TestCase):
     def test_debug_tag_needs_an_optimize_word_after_it(self):
-        code, out = scan("const strip = b.option(bool, \"s\", \"\") orelse (mode == .Debug); // optimize\n")
+        code, out = scan("const strip = b.option(bool, \"s\", \"\") orelse (.Debug == optimize);\n")
         self.assertEqual(code, 1, out)
         self.assertIn("Debug/ReleaseSafe", out)
         code, out = scan("const optimize = 1;\nconst e = .Debug;\n")
@@ -84,6 +84,77 @@ class SameLineRules(unittest.TestCase):
         self.assertEqual(code, 0, out)
         code, out = scan("comptime { @export(&f, .{ .name = \"f\", .visibility = .internal, .x = linkage }); }\nfn f() void {}\n")
         self.assertEqual(code, 1, out)
+
+
+    def test_the_word_after_the_tag_must_be_code(self):
+        # Observed: a local `.Debug` was reported because `mode` followed it in a comment or string.
+        code, out = scan("const e = if (x) .Debug else .Info; // optimize\nconst f = .Debug; const s = \"mode\";\n")
+        self.assertEqual(code, 0, out)
+
+
+def scan_tree(files, only=None):
+    """Scan a folder holding `files` (name -> source), or just the file `only`."""
+    with tempfile.TemporaryDirectory() as root:
+        for name, source in files.items():
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write(source)
+        r = run_on(os.path.join(root, only) if only else root)
+        return r.returncode, r.stdout
+
+
+class OwnDeclarationsAreNotStd(unittest.TestCase):
+    # Observed: valid code that declares these names itself failed the scan,
+    # which `Build & Test` runs on every pull request.
+    RING = (
+        "pub const Ring = struct {\n"
+        "    items: [4]u8 = @splat(0),\n"
+        "    read: *const fn (n: usize) usize,\n"
+        "    readAlloc: *const fn (n: usize) usize,\n"
+        "    pub fn getLast(self: *const Ring) u8 { return self.items[3]; }\n"
+        "    pub fn initEmpty() Ring { return .{ .read = undefined, .readAlloc = undefined }; }\n"
+        "};\n"
+    )
+    USE = (
+        "const Ring = @import(\"ring.zig\").Ring;\n"
+        "test \"own methods\" {\n"
+        "    var r: Ring = .initEmpty();\n"
+        "    _ = r.getLast();\n"
+        "    _ = r.readAlloc(1);\n"
+        "}\n"
+    )
+
+    def test_methods_the_project_declares_in_another_file(self):
+        code, out = scan_tree({"ring.zig": self.RING, "use.zig": self.USE})
+        self.assertEqual(code, 0, out)
+        code, out = scan_tree({"ring.zig": self.RING, "use.zig": self.USE}, only="use.zig")
+        self.assertEqual(code, 1, out)
+        for name in ("getLast", "readAlloc", "initEmpty"):
+            self.assertIn(name, out)
+
+    def test_enum_tags_the_project_declares(self):
+        source = (
+            "const Level = enum { Debug, Info };\n"
+            "fn pick(level: Level, mode: u8) bool {\n"
+            "    return level == .Debug and mode == 0;\n"
+            "}\n"
+            "const Build = enum {\n    ReleaseSafe,\n    Other,\n};\n"
+            "const b: Build = .ReleaseSafe;\n"
+        )
+        code, out = scan(source)
+        self.assertEqual(code, 0, out)
+
+    def test_a_variable_named_i0(self):
+        code, out = scan("fn scale(x: u32, i0: u32) u32 {\n    return x * i0;\n}\nfn neg(i0: bool) bool {\n    return !i0;\n}\n")
+        self.assertEqual(code, 0, out)
+        code, out = scan("fn f(x: i0) void {\n    _ = x;\n}\nconst T = []i0;\n")
+        self.assertEqual(code, 1, out)
+
+    def test_std_uses_are_still_reported(self):
+        source = "const x = list.getLast();\nconst b = .ReleaseSafe;\nconst s = std.bit_set.Integer(8).initEmpty();\n"
+        code, out = scan(source)
+        self.assertEqual(code, 1, out)
+        for name in ("getLast", "ReleaseSafe", "initEmpty"):
+            self.assertIn(name, out)
 
 
 class ValidCodeIsNotFlagged(unittest.TestCase):
@@ -152,7 +223,7 @@ class InputItCannotTrust(unittest.TestCase):
         tags = ", ".join([".Debug"] * 80000)
         code, out = scan(f"const a = .{{ {tags} }};\n", timeout=20)
         self.assertEqual(code, 0, out)
-        code, out = scan(f"const a = .{{ {tags} }}; // optimize\n", timeout=20)
+        code, out = scan(f"const a = .{{ {tags} }}; _ = optimize;\n", timeout=20)
         self.assertEqual(code, 1, out)
         self.assertIn("80000 deprecated", out)
 

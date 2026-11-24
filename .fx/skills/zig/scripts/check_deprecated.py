@@ -12,7 +12,10 @@ Exit status is 1 when any deprecated or removed finding exists, or any
 finding at all with --strict, and 2 when a given path could not be read.
 Directories are searched for .zig files; symbolic links and files that are
 not regular files are skipped there. Comments and string literals are ignored.
-File-level aliases such as `const mem = std.mem;` are resolved.
+File-level aliases such as `const mem = std.mem;` are resolved. A rule that
+matches a method or tag on any receiver, such as `.getLast()` or `.Debug`, is
+skipped when a scanned file declares that name itself, as a function, field,
+enum tag, parameter, variable, or capture.
 Reads files only; no network access and no code execution.
 """
 import os
@@ -98,6 +101,17 @@ SAME_LINE_RULES = [
     (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "removed"),
     (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
 ]
+# The names SYNTAX_RULES and SAME_LINE_RULES match without knowing the
+# receiver's type. std never asks user code to declare them, so a project that
+# declares one means its own declaration, not std's.
+OWN_NAMES = r"getLast(?:OrNull)?|readAlloc|sendMany|init(?:Empty|Full)|Debug|Release(?:Safe|Fast|Small)|i0"
+OWN_NAME = re.compile(rf"\b(?:{OWN_NAMES})\b")
+DECLARATION = re.compile(
+    rf"\b(?:fn|const|var)\s+(?P<keyword>{OWN_NAMES})\b"  # fn getLast, const i0
+    rf"|(?<![\w.@])(?P<field>{OWN_NAMES})\s*:"  # a field, parameter, or label: readAlloc: Fn, i0: u32
+    rf"|(?:^|[{{,|])[ \t]*\*?(?P<tag>{OWN_NAMES})[ \t]*(?=[,}}|]|=(?!=)|$)",  # enum { Debug, Info }, |i0|
+    re.M,
+)
 REVIEW_RULES = [
     (r"containsAtLeastScalar\s*\(", "containsAtLeastScalar", "0.17 order is (T, list, element, minimum); 0.16 was (T, list, minimum, element)"),
     (r"@hasDecl\s*\(", "@hasDecl", "0.17 only sees pub declarations, even in the same file"),
@@ -106,23 +120,46 @@ REVIEW_RULES = [
 ]
 
 
-def findings(text):
-    mask = code_mask(text)
+def declared_names(text, mask):
+    """The OWN_NAMES that this source declares in code."""
+    names = set()
+    for m in DECLARATION.finditer(text):
+        if mask[m.start(m.lastgroup)]:
+            names.add(m.group(m.lastgroup))
+    return names
+
+
+def findings(text, own_names=frozenset()):
+    """Findings as (line, kind, old, new), without those a name in
+    `own_names` explains."""
+    return [f[:4] for f in tagged_findings(text, code_mask(text)) if f[4] not in own_names]
+
+
+def tagged_findings(text, mask):
+    """Findings as (line, kind, old, new, name): `name` is the OWN_NAMES entry
+    the match depends on, or None when the match names std itself."""
     lines = Lines(text)
     seen = set()
+    module_aliases = {}
 
-    def emit(m, old, new, kind, start=None):
+    def aliases_of(module):
+        if module not in module_aliases:
+            module_aliases[module] = aliases(text, module)
+        return module_aliases[module]
+
+    def emit(m, old, new, kind, start=None, receiver_agnostic=False):
         s = m.start() if start is None else start
         if not mask[s] or (s, kind) in seen:
             return None
         seen.add((s, kind))
-        return (lines.number(s), kind, old, new)
+        own = OWN_NAME.search(m.group(0)) if receiver_agnostic else None
+        return (lines.number(s), kind, old, new, own.group(0) if own else None)
 
     out = []
     for module, member, new, kind in MODULE_RULES:
-        prefixes = [re.escape(module)] + [re.escape(a) for a in aliases(text, module)]
+        prefixes = [re.escape(module)] + [re.escape(a) for a in aliases_of(module)]
         if module == "std.fs":
-            prefixes += [re.escape(a) + r"(?=\.(?:resolve|relative)\s*\()" for a in aliases(text, "std.fs.path")]
+            prefixes += [re.escape(a) + r"(?=\.(?:resolve|relative)\s*\()" for a in aliases_of("std.fs.path")]
         for p in prefixes:
             pat = START + p + (r"\." + member if "(?=" not in p else r"\.(?:resolve|relative)") + r"\b"
             for m in re.finditer(pat, text):
@@ -150,17 +187,18 @@ def findings(text):
             start = m.start()
             if old == "** array repetition":
                 start = text.index("**", m.start())
-            f = emit(m, old, new, kind, start)
+            f = emit(m, old, new, kind, start, receiver_agnostic=True)
             if f:
                 out.append(f)
     for pat, after, old, new, kind in SAME_LINE_RULES:
         # The last start of `after` on each line, found in one pass.
         last_after = {}
         for m in re.finditer(after, text):
-            last_after[lines.number(m.start())] = m.start()
+            if mask[m.start()]:
+                last_after[lines.number(m.start())] = m.start()
         for m in re.finditer(pat, text):
             if last_after.get(lines.number(m.start()), -1) >= m.end():
-                f = emit(m, old, new, kind)
+                f = emit(m, old, new, kind, receiver_agnostic=True)
                 if f:
                     out.append(f)
     for pat, old, note in REVIEW_RULES:
@@ -177,6 +215,7 @@ def main(argv):
     paths = [a for a in argv if a not in ("--strict", "--review")] or ["."]
     counts = {"deprecated": 0, "removed": 0, "review": 0}
     errors, warnings = [], []
+    scanned, own_names = [], set()
     for path in sorted(zig_files(paths, errors, warnings)):
         try:
             text = read_source(path)
@@ -186,7 +225,14 @@ def main(argv):
         except ValueError as e:
             errors.append(f"{display(path)}: {e}")
             continue
-        for line, kind, old, new in findings(text):
+        mask = code_mask(text)
+        # A type declared in one file is often used in another.
+        own_names |= declared_names(text, mask)
+        scanned.append((path, tagged_findings(text, mask)))
+    for path, found in scanned:
+        for line, kind, old, new, name in found:
+            if name in own_names:
+                continue
             counts[kind] += 1
             if kind != "review" or show_review:
                 print(f"{display(path)}:{line}: [{kind}] {old} -> {new}")

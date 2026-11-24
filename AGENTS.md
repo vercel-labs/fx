@@ -237,25 +237,13 @@ Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgra
 
 ### Zig 0.17 Standard Library
 
-fx does not use declarations that Zig 0.17 deprecates. They still compile, so `Build & Test` runs `.fx/skills/zig/scripts/check_deprecated.py src`, which fails on any of them. Check new code against this list:
+fx does not use declarations that Zig 0.17 deprecates or removed. They can still compile, so `Build & Test` runs `python3 .fx/skills/zig/scripts/check_deprecated.py src`, which fails on any of them. Its rule tables are the only list, and each finding names the replacement, so run it on the files you change. It does not check these:
 
-* Format with `alloc.print(fmt, args)` and `std.mem.print(buf, fmt, args)`, not `std.fmt.allocPrint` or `std.fmt.bufPrint`.
-
-* Search with the `std.mem.find` family (`find`, `findScalar`, `findAny`, `findLast`, `findScalarLast`, and their `Pos` variants), not `indexOf` or `lastIndexOf`. Trim with `trimStart` and `trimEnd`.
-
-* Copy overlapping slices with `@memmove(dest, src)`, not `std.mem.copyForwards` or `copyBackwards`. Both slices must have the same length.
-
-* Resolve paths with `std.Io.Dir.path.resolveAlloc` and `relativeAlloc`.
-
-* Read the target from `builtin.target.os`, `builtin.target.cpu`, and `builtin.target.abi`, and the optimization mode from `builtin.optimize` (`.debug`, `.safe`, `.fast`, `.small`). Gate safety-only work on `builtin.optimize.runtimeSafety()`. Language types live in `std.lang`, not `std.builtin`.
-
-* Use `std.ArrayList`, `std.array_hash_map.String` and `.Auto`, and `std.bit_set.Dynamic` and `.Static`, not the `Unmanaged` or `BitSet` aliases. Read the last list item with `last()`.
-
-* Convert enums with `@backingInt` and `@fromBackingInt`. Divide rounding up with `@divCeil`.
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
 
 * `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
 
-* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
+* Divide rounding up with `@divCeil`.
 
 ### Testing
 
