@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.17";
+pub const version = "0.0.18";
 
 /// Panics save a crash record for `/trace`, except in tests, which keep the
 /// default handler.
