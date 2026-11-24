@@ -237,9 +237,9 @@ Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgra
 
 ### Zig 0.17 Standard Library
 
-fx does not use declarations that Zig 0.17 deprecates or removed. They can still compile, so `Build & Test` runs `python3 .fx/skills/zig/scripts/check_deprecated.py src`, which fails on any of them. Its rule tables are the only list, and each finding names the replacement, so run it on the files you change. It does not check these:
+fx does not use declarations that Zig 0.17 deprecates or removed. They can still compile, so `Build & Test` runs `python3 .fx/skills/zig/scripts/check_deprecated.py src build.zig benchmarks tests`. It fails on a std declaration it can name, such as `std.fmt.bufPrint`, and lists a match that depends on the receiver's type, such as `.getLast()`, only with `--review`. Its rule tables are the only list, and each finding names the replacement, so run it with `--review` on the files you change. fx also has its own rules:
 
-* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`.
 
 * `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
 

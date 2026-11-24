@@ -6,16 +6,16 @@ usage: check_deprecated.py [--review] [--strict] [PATH ...]   (default PATH: .)
 Each finding prints `path:line: [kind] old -> replacement`.
   deprecated  still compiles on 0.17, scheduled for removal
   removed     does not compile on 0.17
-  review      compiles, but 0.17 changed its meaning; read the call site.
+  review      read the call site: 0.17 changed its meaning, or the name is
+              deprecated or removed only on a std type, and a scan of text
+              cannot see the receiver's type (such as `.getLast()` or `.Debug`).
               Counted always, listed only with --review (use it when migrating).
 Exit status is 1 when any deprecated or removed finding exists, or any
 finding at all with --strict, and 2 when a given path could not be read.
 Directories are searched for .zig files; symbolic links and files that are
 not regular files are skipped there. Comments and string literals are ignored.
-File-level aliases such as `const mem = std.mem;` are resolved. A rule that
-matches a method or tag on any receiver, such as `.getLast()` or `.Debug`, is
-skipped when a scanned file declares that name itself, as a function, field,
-enum tag, parameter, variable, or capture.
+Top-level aliases such as `const mem = std.mem;` are resolved, unless the file
+declares the same name again.
 Reads files only; no network access and no code execution.
 """
 import os
@@ -88,30 +88,22 @@ SYNTAX_RULES = [
     (r"\berrdefer\s*\|", "errdefer capture", "split into an inner function and handle the error in the caller", "removed"),
     # zig fmt writes the removed value syntax as `void{}` and a void function body as `void {}`.
     (r"(?<![\w.!])void\{\s*\}", "void{}", "{}", "removed"),
+    # From here on, review: the match names no std declaration, so code that
+    # declares its own i0, enum tag, or method of that name also matches.
     # Only in type positions, so a variable named i0 is not reported.
-    (r"(?:(?<=[:\]*?!])\s*|@as\(\s*)i0\b", "i0", "u0", "removed"),
-    (r"\.Release(?:Safe|Fast|Small)\b", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
-    (r"\.getLast(?:OrNull)?\s*\(\s*\)", "ArrayList.getLast/getLastOrNull", "last() (optional) or last().?", "deprecated"),
-    (r"\.readAlloc\s*\(", "Io.Reader.readAlloc", "readAllocAll", "deprecated"),
-    (r"\.sendMany\s*\(", "Io.net sendMany", "sendManyTimeout(..., .none)", "deprecated"),
-    (r"\.(?:initEmpty|initFull)\s*\(\s*\)", "bit set / EnumSet initEmpty()/initFull()", ".empty / .full", "removed"),
+    (r"(?:(?<=[:\]*?!])\s*|@as\(\s*)i0\b", "i0", "u0", "review"),
+    (r"\.Release(?:Safe|Fast|Small)\b", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "review"),
+    (r"\.getLast(?:OrNull)?\s*\(\s*\)", "ArrayList.getLast/getLastOrNull", "last() (optional) or last().?", "review"),
+    (r"\.readAlloc\s*\(", "Io.Reader.readAlloc", "readAllocAll", "review"),
+    (r"\.sendMany\s*\(", "Io.net sendMany", "sendManyTimeout(..., .none)", "review"),
+    (r"\.(?:initEmpty|initFull)\s*\(\s*\)", "bit set / EnumSet initEmpty()/initFull()", ".empty / .full", "review"),
 ]
-# Reported only when the second pattern follows on the same line.
+# Reported only when the second pattern follows in code on the same line.
+# Review: the tag may belong to the code's own enum.
 SAME_LINE_RULES = [
-    (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "removed"),
-    (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "deprecated"),
+    (r"\.(?:internal|link_once)\b", r"linkage", "internal/link_once linkage", "do not @export, or use .weak", "review"),
+    (r"\.Debug\b", r"optimize|mode|Optimize", "Debug/ReleaseSafe/ReleaseFast/ReleaseSmall tag", ".debug / .safe / .fast / .small", "review"),
 ]
-# The names SYNTAX_RULES and SAME_LINE_RULES match without knowing the
-# receiver's type. std never asks user code to declare them, so a project that
-# declares one means its own declaration, not std's.
-OWN_NAMES = r"getLast(?:OrNull)?|readAlloc|sendMany|init(?:Empty|Full)|Debug|Release(?:Safe|Fast|Small)|i0"
-OWN_NAME = re.compile(rf"\b(?:{OWN_NAMES})\b")
-DECLARATION = re.compile(
-    rf"\b(?:fn|const|var)\s+(?P<keyword>{OWN_NAMES})\b"  # fn getLast, const i0
-    rf"|(?<![\w.@])(?P<field>{OWN_NAMES})\s*:"  # a field, parameter, or label: readAlloc: Fn, i0: u32
-    rf"|(?:^|[{{,|])[ \t]*\*?(?P<tag>{OWN_NAMES})[ \t]*(?=[,}}|]|=(?!=)|$)",  # enum { Debug, Info }, |i0|
-    re.M,
-)
 REVIEW_RULES = [
     (r"containsAtLeastScalar\s*\(", "containsAtLeastScalar", "0.17 order is (T, list, element, minimum); 0.16 was (T, list, minimum, element)"),
     (r"@hasDecl\s*\(", "@hasDecl", "0.17 only sees pub declarations, even in the same file"),
@@ -120,24 +112,8 @@ REVIEW_RULES = [
 ]
 
 
-def declared_names(text, mask):
-    """The OWN_NAMES that this source declares in code."""
-    names = set()
-    for m in DECLARATION.finditer(text):
-        if mask[m.start(m.lastgroup)]:
-            names.add(m.group(m.lastgroup))
-    return names
-
-
-def findings(text, own_names=frozenset()):
-    """Findings as (line, kind, old, new), without those a name in
-    `own_names` explains."""
-    return [f[:4] for f in tagged_findings(text, code_mask(text)) if f[4] not in own_names]
-
-
-def tagged_findings(text, mask):
-    """Findings as (line, kind, old, new, name): `name` is the OWN_NAMES entry
-    the match depends on, or None when the match names std itself."""
+def findings(text):
+    mask = code_mask(text)
     lines = Lines(text)
     seen = set()
     module_aliases = {}
@@ -147,13 +123,12 @@ def tagged_findings(text, mask):
             module_aliases[module] = aliases(text, module)
         return module_aliases[module]
 
-    def emit(m, old, new, kind, start=None, receiver_agnostic=False):
+    def emit(m, old, new, kind, start=None):
         s = m.start() if start is None else start
         if not mask[s] or (s, kind) in seen:
             return None
         seen.add((s, kind))
-        own = OWN_NAME.search(m.group(0)) if receiver_agnostic else None
-        return (lines.number(s), kind, old, new, own.group(0) if own else None)
+        return (lines.number(s), kind, old, new)
 
     out = []
     for module, member, new, kind in MODULE_RULES:
@@ -187,7 +162,7 @@ def tagged_findings(text, mask):
             start = m.start()
             if old == "** array repetition":
                 start = text.index("**", m.start())
-            f = emit(m, old, new, kind, start, receiver_agnostic=True)
+            f = emit(m, old, new, kind, start)
             if f:
                 out.append(f)
     for pat, after, old, new, kind in SAME_LINE_RULES:
@@ -198,7 +173,7 @@ def tagged_findings(text, mask):
                 last_after[lines.number(m.start())] = m.start()
         for m in re.finditer(pat, text):
             if last_after.get(lines.number(m.start()), -1) >= m.end():
-                f = emit(m, old, new, kind, receiver_agnostic=True)
+                f = emit(m, old, new, kind)
                 if f:
                     out.append(f)
     for pat, old, note in REVIEW_RULES:
@@ -215,7 +190,6 @@ def main(argv):
     paths = [a for a in argv if a not in ("--strict", "--review")] or ["."]
     counts = {"deprecated": 0, "removed": 0, "review": 0}
     errors, warnings = [], []
-    scanned, own_names = [], set()
     for path in sorted(zig_files(paths, errors, warnings)):
         try:
             text = read_source(path)
@@ -225,14 +199,7 @@ def main(argv):
         except ValueError as e:
             errors.append(f"{display(path)}: {e}")
             continue
-        mask = code_mask(text)
-        # A type declared in one file is often used in another.
-        own_names |= declared_names(text, mask)
-        scanned.append((path, tagged_findings(text, mask)))
-    for path, found in scanned:
-        for line, kind, old, new, name in found:
-            if name in own_names:
-                continue
+        for line, kind, old, new in findings(text):
             counts[kind] += 1
             if kind != "review" or show_review:
                 print(f"{display(path)}:{line}: [{kind}] {old} -> {new}")

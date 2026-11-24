@@ -18,6 +18,11 @@ def scan(source, *extra, timeout=60):
         return r.returncode, r.stdout
 
 
+def review(source):
+    """Scan with --review, which lists review findings without failing."""
+    return scan(source, "--review")
+
+
 def run_on(*paths):
     return subprocess.run([sys.executable, SCRIPT, *paths], capture_output=True, text=True, timeout=60)
 
@@ -46,7 +51,6 @@ class FindsDeprecatedApis(unittest.TestCase):
     def test_builtins_and_containers(self):
         self.assertFlags("const E = enum(u8) { a };\nconst x = @intFromEnum(E.a);\n", "@backingInt")
         self.assertFlags('const std = @import("std");\nvar l: std.ArrayListUnmanaged(u8) = .empty;\n', "std.ArrayList")
-        self.assertFlags('const std = @import("std");\nfn f(l: std.ArrayList(u8)) u8 { return l.getLast(); }\n', "last()")
         self.assertFlags('const std = @import("std");\nconst c = std.unicode.utf8Decode("a");\n', "utf8Decode")
 
     def test_removed_syntax(self):
@@ -61,9 +65,11 @@ class FindsDeprecatedApis(unittest.TestCase):
         self.assertFlags('const std = @import("std");\nfn f(s: []const u8) []const u8 { return s[0..std.mem.lastIndexOfScalar(u8, s, 47).?]; }\n', "findScalarLast")
 
     def test_i0_only_as_a_type(self):
-        self.assertFlags("const x: i0 = 0;\n", "u0")
-        code, out = scan("const i0: u8 = 1;\nconst j = i0 + 1;\n")
+        code, out = review("const x: i0 = 0;\n")
         self.assertEqual(code, 0, out)
+        self.assertIn("[review] i0 -> u0", out)
+        code, out = review("const i0: u8 = 1;\nconst j = i0 + 1;\n")
+        self.assertNotIn("i0 -> u0", out)
 
     def test_aliases(self):
         self.assertFlags('const std = @import("std");\nconst mem = std.mem;\nconst i = mem.indexOf(u8, "ab", "b");\n', "find")
@@ -73,46 +79,50 @@ class FindsDeprecatedApis(unittest.TestCase):
 
 class SameLineRules(unittest.TestCase):
     def test_debug_tag_needs_an_optimize_word_after_it(self):
-        code, out = scan("const strip = b.option(bool, \"s\", \"\") orelse (.Debug == optimize);\n")
-        self.assertEqual(code, 1, out)
-        self.assertIn("Debug/ReleaseSafe", out)
-        code, out = scan("const optimize = 1;\nconst e = .Debug;\n")
+        code, out = review("const strip = b.option(bool, \"s\", \"\") orelse (.Debug == optimize);\n")
         self.assertEqual(code, 0, out)
+        self.assertIn("[review] Debug/ReleaseSafe", out)
+        code, out = review("const optimize = 1;\nconst e = .Debug;\n")
+        self.assertNotIn("Debug/ReleaseSafe", out)
 
     def test_linkage_word_after_the_tag(self):
-        code, out = scan("comptime { @export(&f, .{ .name = \"f\", .linkage = .internal }); }\nfn f() void {}\n")
-        self.assertEqual(code, 0, out)
-        code, out = scan("comptime { @export(&f, .{ .name = \"f\", .visibility = .internal, .x = linkage }); }\nfn f() void {}\n")
-        self.assertEqual(code, 1, out)
-
+        code, out = review("comptime { @export(&f, .{ .name = \"f\", .linkage = .internal }); }\nfn f() void {}\n")
+        self.assertNotIn("internal/link_once", out)
+        code, out = review("comptime { @export(&f, .{ .name = \"f\", .visibility = .internal, .x = linkage }); }\nfn f() void {}\n")
+        self.assertIn("[review] internal/link_once linkage", out)
 
     def test_the_word_after_the_tag_must_be_code(self):
         # Observed: a local `.Debug` was reported because `mode` followed it in a comment or string.
-        code, out = scan("const e = if (x) .Debug else .Info; // optimize\nconst f = .Debug; const s = \"mode\";\n")
-        self.assertEqual(code, 0, out)
+        code, out = review("const e = if (x) .Debug else .Info; // optimize\nconst f = .Debug; const s = \"mode\";\n")
+        self.assertNotIn("Debug/ReleaseSafe", out)
 
 
-def scan_tree(files, only=None):
-    """Scan a folder holding `files` (name -> source), or just the file `only`."""
+def scan_tree(files, *extra):
+    """Scan a folder holding `files` (name -> source)."""
     with tempfile.TemporaryDirectory() as root:
         for name, source in files.items():
             with open(os.path.join(root, name), "w", encoding="utf-8") as f:
                 f.write(source)
-        r = run_on(os.path.join(root, only) if only else root)
+        r = subprocess.run([sys.executable, SCRIPT, *extra, root], capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout
 
 
-class OwnDeclarationsAreNotStd(unittest.TestCase):
+class RulesThatCannotSeeTheReceiver(unittest.TestCase):
     # Observed: valid code that declares these names itself failed the scan,
-    # which `Build & Test` runs on every pull request.
+    # which `Build & Test` runs on every pull request. Without the receiver's
+    # type, a match is something to read, not a failure.
     RING = (
         "pub const Ring = struct {\n"
         "    items: [4]u8 = @splat(0),\n"
-        "    read: *const fn (n: usize) usize,\n"
         "    readAlloc: *const fn (n: usize) usize,\n"
         "    pub fn getLast(self: *const Ring) u8 { return self.items[3]; }\n"
-        "    pub fn initEmpty() Ring { return .{ .read = undefined, .readAlloc = undefined }; }\n"
+        "    pub fn initEmpty() Ring { return .{ .readAlloc = undefined }; }\n"
         "};\n"
+        "const Level = enum { Debug, Info };\n"
+        "fn pick(level: Level, mode: u8) bool {\n    return level == .Debug and mode == 0;\n}\n"
+        "const Build = enum {\n    ReleaseSafe,\n    Other,\n};\n"
+        "const b: Build = .ReleaseSafe;\n"
+        "fn scale(x: u32, i0: u32) u32 {\n    return x * i0;\n}\n"
     )
     USE = (
         "const Ring = @import(\"ring.zig\").Ring;\n"
@@ -122,39 +132,49 @@ class OwnDeclarationsAreNotStd(unittest.TestCase):
         "    _ = r.readAlloc(1);\n"
         "}\n"
     )
+    STD = (
+        "const std = @import(\"std\");\n"
+        "fn f(l: std.ArrayList(u8)) u8 { return l.getLast(); }\n"
+        "const b = .ReleaseSafe;\n"
+        "const s = std.bit_set.Integer(8).initEmpty();\n"
+    )
 
-    def test_methods_the_project_declares_in_another_file(self):
+    def test_valid_code_with_the_same_names_passes(self):
         code, out = scan_tree({"ring.zig": self.RING, "use.zig": self.USE})
         self.assertEqual(code, 0, out)
-        code, out = scan_tree({"ring.zig": self.RING, "use.zig": self.USE}, only="use.zig")
-        self.assertEqual(code, 1, out)
-        for name in ("getLast", "readAlloc", "initEmpty"):
-            self.assertIn(name, out)
 
-    def test_enum_tags_the_project_declares(self):
+    def test_std_uses_are_listed_and_fail_only_with_strict(self):
+        code, out = scan_tree({"std.zig": self.STD}, "--review")
+        self.assertEqual(code, 0, out)
+        for name in ("getLast", "ReleaseSafe", "initEmpty"):
+            self.assertRegex(out, rf"\[review\] [^\n]*{name}")
+        code, out = scan_tree({"std.zig": self.STD}, "--strict")
+        self.assertEqual(code, 1, out)
+
+
+class Aliases(unittest.TestCase):
+    def test_a_local_alias_does_not_name_a_parameter_in_another_function(self):
+        # Observed: valid code. `mem` in b() is a parameter with its own indexOf.
         source = (
-            "const Level = enum { Debug, Info };\n"
-            "fn pick(level: Level, mode: u8) bool {\n"
-            "    return level == .Debug and mode == 0;\n"
-            "}\n"
-            "const Build = enum {\n    ReleaseSafe,\n    Other,\n};\n"
-            "const b: Build = .ReleaseSafe;\n"
+            "const std = @import(\"std\");\n"
+            "const Finder = struct {\n    pub fn indexOf(_: Finder, _: []const u8) ?usize { return null; }\n};\n"
+            "fn a(x: []const u8) ?usize {\n    const mem = std.mem;\n    return mem.find(u8, x, \"a\");\n}\n"
+            "fn b(mem: Finder) ?usize {\n    return mem.indexOf(\"x\");\n}\n"
         )
         code, out = scan(source)
         self.assertEqual(code, 0, out)
 
-    def test_a_variable_named_i0(self):
-        code, out = scan("fn scale(x: u32, i0: u32) u32 {\n    return x * i0;\n}\nfn neg(i0: bool) bool {\n    return !i0;\n}\n")
-        self.assertEqual(code, 0, out)
-        code, out = scan("fn f(x: i0) void {\n    _ = x;\n}\nconst T = []i0;\n")
-        self.assertEqual(code, 1, out)
-
-    def test_std_uses_are_still_reported(self):
-        source = "const x = list.getLast();\nconst b = .ReleaseSafe;\nconst s = std.bit_set.Integer(8).initEmpty();\n"
+    def test_a_top_level_alias_declared_again_is_not_resolved(self):
+        source = (
+            "const std = @import(\"std\");\n"
+            "const mem = std.mem;\n"
+            "const Inner = struct {\n"
+            "    const mem = struct { fn indexOf() void {} };\n"
+            "    fn f() void { mem.indexOf(); }\n"
+            "};\n"
+        )
         code, out = scan(source)
-        self.assertEqual(code, 1, out)
-        for name in ("getLast", "ReleaseSafe", "initEmpty"):
-            self.assertIn(name, out)
+        self.assertEqual(code, 0, out)
 
 
 class ValidCodeIsNotFlagged(unittest.TestCase):
@@ -223,9 +243,9 @@ class InputItCannotTrust(unittest.TestCase):
         tags = ", ".join([".Debug"] * 80000)
         code, out = scan(f"const a = .{{ {tags} }};\n", timeout=20)
         self.assertEqual(code, 0, out)
-        code, out = scan(f"const a = .{{ {tags} }}; _ = optimize;\n", timeout=20)
+        code, out = scan(f"const a = .{{ {tags} }}; _ = optimize;\n", "--strict", timeout=20)
         self.assertEqual(code, 1, out)
-        self.assertIn("80000 deprecated", out)
+        self.assertIn("80000 to review", out)
 
 
 class IgnoresNonCode(unittest.TestCase):
