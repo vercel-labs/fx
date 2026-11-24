@@ -234,6 +234,13 @@ pub const Table = struct {
         return count;
     }
 
+    /// How many normal requests are in flight: the ones a refused line gives a grace. A listen and initialize get none.
+    pub fn normalInFlightCount(table: *const Table) usize {
+        var count: usize = 0;
+        for (table.slots) |slot| count += @intFromBool(slot.used and slot.kind == .normal);
+        return count;
+    }
+
     /// Applies one event. Resets `out` first. Errors leave the table unchanged.
     pub fn step(table: *Table, event: Event, out: *Output) StepError!void {
         out.* = .{};
@@ -540,6 +547,19 @@ test "ids are allocated from 1 and never reused" {
     try table.step(.{ .response_received = .{ .id = 1, .response = .result } }, &out);
     try testing.expectEqual(@as(usize, 0), out.effect_count);
     try testing.expectEqual(Status.done, table.status(1));
+}
+
+test "a listen and initialize are in flight but are not normal requests, the ones a refused line gives a grace" {
+    var slots: [4]Slot = undefined;
+    var table: Table = .init(&slots, .{});
+    var out: Output = .{};
+    try table.step(.{ .send = .initialize }, &out);
+    try table.step(.{ .send = .listen }, &out);
+    try testing.expectEqual(@as(usize, 2), table.inFlightCount());
+    try testing.expectEqual(@as(usize, 0), table.normalInFlightCount());
+    try table.step(.{ .send = .normal }, &out);
+    try testing.expectEqual(@as(usize, 3), table.inFlightCount());
+    try testing.expectEqual(@as(usize, 1), table.normalInFlightCount());
 }
 
 test "late and duplicate responses deliver nothing" {

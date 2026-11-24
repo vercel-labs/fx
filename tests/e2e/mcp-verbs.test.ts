@@ -277,6 +277,33 @@ describe("fx mcp", () => {
     }, 30_000);
   }
 
+  // The reply's id comes after what fx cannot read, so the line names no request. Nothing tells which list it answers: the
+  // list waits out the 30-second grace, as every request in flight does, and then fx says it could not read the list.
+  const unnamedLists: [string, string, "text" | "json"][] = [
+    ["not JSON before the id", '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}', "text"],
+    ["nested past the engine's limit before the id", `{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)},"id":{id}}`, "json"],
+  ];
+  const UNREADABLE = "the answer is not a readable tool list";
+
+  for (const [what, line, form] of unnamedLists) {
+    test(`show says the list was unreadable when no id could be read, after the grace: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_LINE: line } }) } });
+      const started = Date.now();
+      const shown = await runFx(["mcp", "show", "fixture", ...(form === "json" ? ["--json"] : [])], { cwd: root.workspace, env: root.env, timeoutMs: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      if (form === "json") {
+        expect(JSON.parse(shown.stdout)).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: UNREADABLE, tools: [] });
+      } else {
+        expect(shown.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${UNREADABLE}\n`);
+        expect(shown.stdout).not.toContain("0 tools");
+      }
+      // The wait is the grace: not at once, as a line with an id would, and far short of the 5 minutes an operation waits.
+      expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    }, 90_000);
+  }
+
   test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
     const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
     const text = await mcp(good, "show", "fixture");
