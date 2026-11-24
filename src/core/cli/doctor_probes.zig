@@ -1527,11 +1527,14 @@ fn killForkerLeftovers(dir: std.Io.Dir, forkers: []const ?*ProcessProbe) void {
 }
 
 /// What `holdUntilForkerMovesMore` waits on: the forker of the round that is
-/// stopping, and the read end of the pipe it writes a byte to for each process
-/// it has moved to a group of its own. Doctor's own thread only, like
+/// stopping, and the read end of the named pipe it writes a byte to for each
+/// process it has moved to a group of its own. Doctor's own thread only, like
 /// `ProcessProbe.stop_landed`.
 var holding_forker: ?*ProcessProbe = null;
 var moved_fd: std.posix.fd_t = -1;
+const fifo_c = struct {
+    extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+};
 /// A byte written after the listing ended says a process was started after it
 /// and has moved; the forker starts the next one only after writing it, so the
 /// second byte proves the first of those.
@@ -1583,21 +1586,28 @@ test "stopping a check that keeps starting processes in groups of their own leav
     defer holding_forker = null;
     // The forker starts a process about every millisecond, records its pid,
     // moves it to a group of its own, like a stdio server an `fx mcp show`
-    // child starts, and writes a byte to a pipe. It does all of that itself,
-    // right after the fork, so that a byte says the process is out of the
-    // group, and the pid is written first, so a process that is out of the
-    // group is always one the test knows. The pause bounds the storm: started
-    // as fast as the machine allows, a stop that is slow to land lets
-    // thousands start, and the load they add slows the stop and the exit of
-    // what it killed further, until the processes fill the machine's memory.
-    // A longer pause leaves too few starting at the stop to fail a stop path
-    // that lists them before it stops the forker. Each ignores SIGHUP from its
-    // birth: the kernel hangs up a stopped process in a group that its
-    // parent's death orphans, which would end them without fx's own kill of
-    // what a check started outside its group, and this test must prove that
-    // kill. The forker starts no more than `$ARGV[1]` and then waits for them,
-    // so a stop path that never ends it cannot start thousands, and a stop
-    // that lands late still finds a check to stop.
+    // child starts, and writes a byte to a named pipe. It does all of that
+    // itself, right after the fork, so that a byte says the process is out of
+    // the group, and the pid is written first, so a process that is out of the
+    // group is always one the test knows.
+    //
+    // The pipe is named, and the forker opens it by its path, because a child
+    // cannot be handed an open descriptor: on macOS `std.process.spawn` leaves
+    // it only stdin, stdout and stderr, even for a descriptor that is not
+    // close-on-exec.
+    //
+    // The pause bounds the storm: started as fast as the machine allows, a
+    // stop that is slow to land lets thousands start, and the load they add
+    // slows the stop and the exit of what it killed further, until the
+    // processes fill the machine's memory. A longer pause leaves too few
+    // starting at the stop to fail a stop path that lists them before it
+    // stops the forker. Each ignores SIGHUP from its birth: the kernel hangs
+    // up a stopped process in a group that its parent's death orphans, which
+    // would end them without fx's own kill of what a check started outside
+    // its group, and this test must prove that kill. The forker starts no
+    // more than `$ARGV[1]` and then waits for them, so a stop path that never
+    // ends it cannot start thousands, and a stop that lands late still finds a
+    // check to stop.
     //
     // A stop path that does not stop the forker first loses only what the
     // forker starts between the listing and the forker's own stop, a few
@@ -1606,7 +1616,7 @@ test "stopping a check that keeps starting processes in groups of their own leav
     // moved two more processes.
     const script =
         \\$SIG{HUP} = "IGNORE";
-        \\open(W, ">&=", $ARGV[2]) or exit 1;
+        \\open(W, ">", $ARGV[2]) or exit 1;
         \\for (1 .. $ARGV[1]) {
         \\    my $pid = fork();
         \\    exit 1 unless defined $pid;
@@ -1621,18 +1631,19 @@ test "stopping a check that keeps starting processes in groups of their own leav
     ;
     for (&forkers, 0..) |*forker, round| {
         var waiters: std.Io.Group = .init;
+        // Made before `before` is read, so its entry is not counted as a
+        // process the forker started. The read end is open, and never blocks,
+        // before the forker opens the write end.
+        var moved_path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const moved_path = try std.fmt.bufPrintSentinel(&moved_path_buf, "{s}/moved-{d}", .{ dir, round }, 0);
+        if (fifo_c.mkfifo(moved_path, 0o600) != 0) return error.PipeFailed;
+        const moved_read = std.c.open(moved_path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (moved_read < 0) return error.PipeFailed;
+        defer _ = std.c.close(moved_read);
         const before = try entryCount(tmp.dir);
-        // The write end is the forker's, which inherits it; the read end is not.
-        var moved_pipe: [2]std.c.fd_t = undefined;
-        if (std.c.pipe(&moved_pipe) != 0) return error.PipeFailed;
-        defer _ = std.c.close(moved_pipe[0]);
-        _ = std.posix.system.fcntl(moved_pipe[0], std.posix.F.SETFD, @as(usize, std.posix.FD_CLOEXEC));
-        var write_fd_buf: [16]u8 = undefined;
-        const write_fd_arg = try std.fmt.bufPrint(&write_fd_buf, "{d}", .{moved_pipe[1]});
-        const argv = [_][]const u8{ "/usr/bin/perl", "-e", script, dir, forker_start_cap_arg, write_fd_arg };
+        const argv = [_][]const u8{ "/usr/bin/perl", "-e", script, dir, forker_start_cap_arg, moved_path };
         const probe = try ProcessProbe.create(alloc, "forker", &argv, null);
         probe.spawn(&waiters, null);
-        _ = std.c.close(moved_pipe[1]);
         forker.* = probe;
         // Once it has started one, so the stop meets it while it starts more.
         // On a loaded machine that takes longer than any fixed wait.
@@ -1643,7 +1654,7 @@ test "stopping a check that keeps starting processes in groups of their own leav
         io_mod.sleep((5 * round) * std.time.ns_per_ms);
         probe.stopped.store(true, .release);
         holding_forker = probe;
-        moved_fd = moved_pipe[0];
+        moved_fd = moved_read;
         // Under load the stop can take longer than `stop_land_ms` to land,
         // which `stopTrees` allows; what it started must be gone either way.
         stopTrees(&.{probe});
