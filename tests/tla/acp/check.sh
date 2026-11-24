@@ -17,7 +17,8 @@
 # connections and catching up by log position, which hasn't landed in
 # src/acp/ yet. AcpSessionState: session state, session/status, and list
 # change hints, likewise not landed. AcpSharedSession: what the clients of
-# one session see of each other's prompts, approvals, cancels, and presence,
+# one session see of each other's prompts, approvals, cancels, presence, and the
+# list of connected clients,
 # likewise not landed. AcpSubagents: child sessions in the shape of ACP's
 # Subagent Sessions, likewise not landed. AcpForkRewind: forking a session
 # before a prompt and rewinding one, likewise not landed. Their Before configs show fx before
@@ -184,6 +185,11 @@ MCAcpSharedSession AcpSharedSessionToday-request RequestReachesAll
 MCAcpSharedSession AcpSharedSessionToday-prompts EchoComplete
 MCAcpSharedSession AcpSharedSessionToday-clients RosterCurrent
 MCAcpSharedSession AcpSharedSessionToday-cancel CancelStops
+MCAcpSharedSession AcpSharedSessionOptIn -
+MCAcpSharedSession AcpSharedSessionWitness-optin NoUnlistedOpen
+MCAcpSharedSession AcpSharedSessionWitness-steer NoSteerSent
+MCAcpSharedSession AcpSharedSessionToday-joiner JoinerListedBeforeAnswer
+MCAcpSharedSession AcpSharedSessionToday-sender ChunkSenderGate
 MCAcpSubagents MCAcpSubagents -
 MCAcpSubagents AcpSubagentsToday-ids ChildIdUsed
 MCAcpSubagents AcpSubagentsToday-replay ReplayComplete
