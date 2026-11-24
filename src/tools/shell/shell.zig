@@ -8,6 +8,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
+const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -786,8 +787,13 @@ fn callRun(
     };
     defer prepared.deinit(ctx.allocator);
     const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
-    return attachSnapshotNotice(ctx.allocator, result) catch |err| {
+    const noticed = attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
+        return err;
+    };
+    if (!mcpCallNoticeDue(prepared.snapshot.state, commandCalledBridge(bridge_registration))) return noticed;
+    return attachMcpCallNotice(ctx.allocator, noticed) catch |err| {
+        noticed.deinit(ctx.allocator);
         return err;
     };
 }
@@ -814,6 +820,36 @@ fn attachSnapshotNotice(
     };
 }
 
+/// Adds `mcp_call_notice` to a JSON run result of a command that still runs
+/// after its `fx mcp call` calls, so the model learns that later calls exit 3.
+fn attachMcpCallNotice(
+    alloc: Allocator,
+    result: tool_dispatch.ToolResult,
+) Allocator.Error!tool_dispatch.ToolResult {
+    const body = switch (result) {
+        .success, .failure => |value| value,
+        .rich => return result,
+    };
+    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    const updated = (try withJsonStringField(alloc, body, "mcp_call_notice", mcp_call_notice)).?;
+    alloc.free(body);
+    return switch (result) {
+        .success => .{ .success = updated },
+        .failure => .{ .failure = updated },
+        .rich => unreachable,
+    };
+}
+
+fn commandCalledBridge(registration: ?*mcp_call_bridge.Registration) bool {
+    if (comptime !mcp_call_bridge.supported) return false;
+    const live = registration orelse return false;
+    return mcp_call_bridge.commandCalled(live);
+}
+
+fn mcpCallNoticeDue(state: managed_execution.SnapshotState, command_called: bool) bool {
+    return state == .running and command_called;
+}
+
 /// Returns a copy of the JSON object `body` with the string field `name`,
 /// a plain key, set to `value` at its end, or null when `body` does not end
 /// in `}`. The caller owns the copy; `body` is left as it is.
@@ -835,6 +871,9 @@ fn withJsonStringField(
 
 const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
     "Read the steering first. The session stays yours: use interact with this session_id to follow it, or stop to end it.";
+
+const mcp_call_notice = "This command used fx mcp call, and this call returned while it still runs, so its later fx mcp call commands exit 3. If it still needs them, stop it. " ++
+    mcp_call_capability.short_checks_advice;
 
 fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
     const flag = ctx.tool_yield_flag orelse return false;
@@ -3349,6 +3388,36 @@ test "a command returned for steering tells the model it still runs" {
     try std.testing.expect(!steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
     flag.store(true, .seq_cst);
     try std.testing.expect(steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
+}
+
+test "a run result tells the model a running command's fx mcp calls stop" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-2\"}");
+    const updated = try attachMcpCallNotice(alloc, .{ .success = body });
+    defer updated.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.success, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("shell-2", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings(mcp_call_notice, parsed.value.object.get("mcp_call_notice").?.string);
+}
+
+test "only a running command that used fx mcp call gets the notice" {
+    const State = managed_execution.SnapshotState;
+    try std.testing.expect(mcpCallNoticeDue(.running, true));
+    try std.testing.expect(!mcpCallNoticeDue(.running, false));
+    var others: usize = 0;
+    for (std.enums.values(std.meta.Tag(State))) |tag| {
+        const state: State = switch (tag) {
+            .running => .running,
+            .completed => .{ .completed = .finished },
+            .stopped => .{ .stopped = null },
+            .lost => .lost,
+        };
+        if (tag == .running) continue;
+        others += 1;
+        try std.testing.expect(!mcpCallNoticeDue(state, true));
+    }
+    try std.testing.expect(others > 0);
 }
 
 test "shell interaction wait bounds empty observations without delaying writes" {

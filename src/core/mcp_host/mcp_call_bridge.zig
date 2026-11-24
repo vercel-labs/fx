@@ -50,6 +50,9 @@ pub const Registration = struct {
     hold: std.atomic.Value(u32) = .init(0),
     /// Requests whose work borrows `capability`. Guarded by the bridge mutex.
     in_use: u32 = 0,
+    /// The command sent a request that the bridge admitted. Guarded by the
+    /// bridge mutex.
+    called: bool = false,
     token_hex: [wire.token_hex_len]u8,
     variables: [2]command_runner.EnvironmentVariable = undefined,
 
@@ -161,6 +164,15 @@ pub fn unregister(registration: *Registration) void {
     bridge.stop.store(false, .release);
     bridge.phase = .idle;
     bridge.changed.broadcast(io);
+}
+
+/// Whether the command of `registration` has sent a request that the
+/// bridge admitted. Valid until `unregister`.
+pub fn commandCalled(registration: *Registration) bool {
+    const io = io_mod.getIo();
+    bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    return registration.called;
 }
 
 fn nextOwnerLocked() mcp_call.OwnerId {
@@ -379,7 +391,7 @@ fn writeReply(stream: std.Io.net.Stream, status: wire.Status, reason: ?wire.Reas
 fn refusalMessage(reason: wire.Reason) []const u8 {
     return switch (reason) {
         .closed => "The fx session's shell call that started this command has ended. Run fx mcp call from a command in a new shell call.",
-        .unauthorized => "This command was not started by a running fx shell call, or that call has ended. Run fx mcp call from a command fx's shell tool runs, not from one left running in the background.",
+        .unauthorized => "This command was not started by a running fx shell call, or that call has ended. " ++ capability_mod.short_checks_advice,
         .unsupported_version => "This fx mcp call is from another fx version than the running session. Run the fx that started the session, or restart the session with this one.",
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
@@ -489,6 +501,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     live = .{ .id = work.id };
     bridge.live.appendAssumeCapacity(&live);
     registration.in_use += 1;
+    registration.called = true;
     _ = registration.hold.fetchAdd(1, .acq_rel);
     bridge.mutex.unlock(io);
     defer {
@@ -709,6 +722,40 @@ test "a lookup answers without a permission check, and a forged token gets none"
     }
     try std.testing.expect(!tool.authorizing.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a registration records once its command has called the bridge" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    try std.testing.expect(!commandCalled(registration));
+    const reply = try client.call(arena, std.testing.io, variables[0].value, wire.parseToken(variables[1].value).?, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
+    try std.testing.expectEqual(wire.Status.ok, reply.header.status);
+    try std.testing.expect(commandCalled(registration));
+}
+
+test "a call after its shell call returned says why and how to check a slow job" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{};
+    const first = try register(tool.capability());
+    const second = try register(tool.capability());
+    defer unregister(second);
+    const socket_path = try arena.dupe(u8, first.environment()[0].value);
+    const token = wire.parseToken(first.environment()[1].value).?;
+    unregister(first);
+    const reply = try client.call(arena, std.testing.io, socket_path, token, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
+    try std.testing.expectEqual(wire.Status.refused, reply.header.status);
+    try std.testing.expectEqual(wire.Reason.unauthorized, reply.header.reason.?);
+    try std.testing.expect(std.mem.indexOf(u8, reply.bytes, "that call has ended") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply.bytes, capability_mod.short_checks_advice) != null);
 }
 
 test "a command that leaves while its call waits for permission runs nothing, and holds the yield meanwhile" {
