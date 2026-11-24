@@ -21,6 +21,19 @@ const captured_stop_settle_timeout_ms: i64 = if (builtin.is_test)
     100
 else
     command_runner.termination_settle_timeout_ms + 1_000;
+/// The longest a captured wait blocks between its checks. The worker wakes
+/// the wait when it settles the entry; the poll still drives the cancel,
+/// yield, steering and quiet checks, which have no wake signal.
+const captured_wait_poll_ms: i64 = 10;
+/// Tests set a long poll, so a run that misses its wake-up shows as slow.
+var test_captured_wait_poll_ms: ?i64 = null;
+
+fn capturedWaitPollMs() i64 {
+    if (builtin.is_test) {
+        if (test_captured_wait_poll_ms) |ms| return ms;
+    }
+    return captured_wait_poll_ms;
+}
 
 /// The quiet limit (`quiet_notice.zig`), or the shorter one the end-to-end
 /// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
@@ -272,6 +285,8 @@ const Entry = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     force_cancel: std.atomic.Value(bool) = .init(false),
     start_gate: std.Io.Event = .unset,
+    /// Set by `workerMain` once it has settled the entry, to wake `startCaptured`.
+    worker_done: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     /// Serializes joins of `thread`; see `Runtime.joinEntry`.
     join_mutex: std.Io.Mutex = .init,
@@ -621,6 +636,7 @@ const Entry = struct {
             self.state = state_for_worker_error(err);
             self.barrier.output_drained = true;
             self.mutex.unlock(zio);
+            self.worker_done.set(zio);
             return;
         };
 
@@ -638,6 +654,7 @@ const Entry = struct {
         self.state = next.state;
         self.barrier = next.barrier;
         self.mutex.unlock(zio);
+        self.worker_done.set(zio);
     }
 
     fn finalizeReplayLocked(self: *Entry) void {
@@ -753,6 +770,7 @@ pub const Runtime = struct {
 
         const started_ms = io_mod.milliTimestamp();
         const yield_grace_ms = if (input.tool_yield_flag != null) steerYieldGraceMs() else 0;
+        const poll_ms = capturedWaitPollMs();
         const zio = io_mod.getIo();
         // The wait ends at its yield, or when the command reaches the quiet
         // limit after the wait saw it under it, as an `interact` wait does
@@ -796,7 +814,14 @@ pub const Runtime = struct {
                     break;
                 }
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            entry.worker_done.waitTimeout(zio, .{ .duration = .{
+                .raw = .fromMilliseconds(poll_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                // Canceled is ignored, as io_mod.sleep ignored it before. Every
+                // pass re-runs the checks above, so both errors fall through.
+                error.Timeout, error.Canceled => {},
+            };
         }
 
         var prepared = try self.prepareSnapshot(alloc, entry.execution_id);
@@ -2321,6 +2346,37 @@ test "a command that ends inside the steering grace returns its result" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "captured run returns when its command ends without waiting out the poll" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    test_captured_wait_poll_ms = 5_000;
+    defer test_captured_wait_poll_ms = null;
+    var input = StartCapturedInput{
+        .execution_id = "managed-wake-on-end",
+        .command = "sleep 0.05",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 30_000,
+    };
+    input.authority = testAuthority(input);
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+    switch (started.snapshot.state) {
+        .completed => |status| try std.testing.expectEqual(command_contract.CommandStatus{ .exit_code = 0 }, status),
+        else => return error.TestUnexpectedResult,
+    }
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 }
 
