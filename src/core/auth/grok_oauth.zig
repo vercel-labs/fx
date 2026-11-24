@@ -1008,7 +1008,7 @@ test "a Grok Team account is named by the principal in its access token, not use
         const token = try testAccessToken(alloc, payload);
         defer alloc.free(token);
         var userinfo: TestUserInfo = .{ .refuse_all = true };
-        const account_id = try fetchAccountId(alloc, userinfo.transport(), token);
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
         defer alloc.free(account_id);
         try std.testing.expectEqualStrings(id, account_id);
         try std.testing.expectEqual(@as(usize, 0), userinfo.requests);
@@ -1030,7 +1030,7 @@ test "a Grok Team token without a usable principal_id is refused" {
         const token = try testAccessToken(alloc, payload);
         defer alloc.free(token);
         var userinfo: TestUserInfo = .{ .refuse_all = true };
-        try std.testing.expectError(error.InvalidGrokAccessToken, fetchAccountId(alloc, userinfo.transport(), token));
+        try std.testing.expectError(error.InvalidGrokAccessToken, fetchAccountId(alloc, userinfo.transport(), token, false));
         try std.testing.expectEqual(@as(usize, 0), userinfo.requests);
     }
 }
@@ -1048,7 +1048,7 @@ test "Grok personal and claimless tokens keep the userinfo path" {
         const token = try testAccessToken(alloc, payload);
         defer alloc.free(token);
         var userinfo: TestUserInfo = .{ .refuse_all = false };
-        const account_id = try fetchAccountId(alloc, userinfo.transport(), token);
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
         defer alloc.free(account_id);
         try std.testing.expectEqualStrings("user_from_userinfo", account_id);
         try std.testing.expectEqual(@as(usize, 1), userinfo.requests);
@@ -1056,7 +1056,7 @@ test "Grok personal and claimless tokens keep the userinfo path" {
     // Tokens that are not a three-part JWT, or whose payload is not base64url.
     for ([_][]const u8{ "access-token", "header.payload", "a.b.c.d", "header.!!!.signature", "header..signature" }) |token| {
         var userinfo: TestUserInfo = .{ .refuse_all = false };
-        const account_id = try fetchAccountId(alloc, userinfo.transport(), token);
+        const account_id = try fetchAccountId(alloc, userinfo.transport(), token, false);
         defer alloc.free(account_id);
         try std.testing.expectEqualStrings("user_from_userinfo", account_id);
         try std.testing.expectEqual(@as(usize, 1), userinfo.requests);
