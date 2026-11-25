@@ -2142,6 +2142,48 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(shown).toContain("edited app.py +1 -1");
   }, TIMEOUT);
 
+  test("exported edit and write work inside a bash -c child process and do not leak into saved state", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-child-edit", "bash", {
+        command: [
+          "bash -c \"edit app.py <<'EOF'",
+          "<<<<<<< SEARCH",
+          "print('a')",
+          "=======",
+          "print('child')",
+          ">>>>>>> REPLACE",
+          "EOF\"",
+          "bash -c \"write child.txt <<'EOF'",
+          "from-child",
+          "EOF\"",
+          "saved_ok=1",
+        ].join("\n"),
+      }),
+      fakeGatewayToolCall("bash-after-child", "bash", {
+        command: "echo \"saved_ok=$saved_ok\"; declare -f edit write >/dev/null && echo funcs=yes || echo funcs=no",
+      }),
+      fakeGatewayFinalText("Child bash done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Run edit and write in bash -c."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('child')\n");
+    expect(readFileSync(join(root.workspace, "child.txt"), "utf8")).toBe("from-child\n");
+    const childResult = toolResultText(gateway.requests[1]!.body, "bash-child-edit");
+    expect(childResult).toContain("edited app.py +1 -1");
+    expect(childResult).toContain("wrote child.txt +1");
+    const nextResult = toolResultText(gateway.requests[2]!.body, "bash-after-child");
+    expect(nextResult).toContain("saved_ok=1");
+    expect(nextResult).toContain("funcs=yes");
+  }, TIMEOUT);
+
   test("2h: a CRLF file with LF search text is not found with closest-lines hint and writes nothing", async () => {
     const root = createRoot();
     const target = join(root.workspace, "crlf.txt");

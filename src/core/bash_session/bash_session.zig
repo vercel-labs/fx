@@ -693,7 +693,8 @@ fn sessionEnvScript(alloc: std.mem.Allocator, dir: []const u8, fx_variables: []c
 }
 
 /// Appends the two functions a program calls to change files: `edit PATH` and
-/// `write PATH`, each run as `'<fx>' tool <verb> "$@"`. They come after the saved
+/// `write PATH`, each run as `'<fx>' tool <verb> "$@"`, and exports them to
+/// child bash processes (`export -f edit write`). They come after the saved
 /// state loads, so they win over a saved definition with the same name, and the
 /// save skips them (`body_after_skip`), so they never reach the state.
 fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binary: []const u8) !void {
@@ -705,6 +706,7 @@ fn appendFxFunctions(alloc: std.mem.Allocator, out: *std.ArrayList(u8), fx_binar
         try out.appendSlice(alloc, verb);
         try out.appendSlice(alloc, " \"$@\"; }\n");
     }
+    try out.appendSlice(alloc, "builtin export -f edit write\n");
 }
 
 /// The kind of the entry `name` in `folder`, without following a link, or null
@@ -1042,7 +1044,7 @@ test "the bash script keeps the reviewed bytes" {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(script, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    try std.testing.expectEqualStrings("a32d85136ebfaccf5690adfc3e397becfed42423f771bf2624dd2bd4553b299d", &hex);
+    try std.testing.expectEqualStrings("09e1fa033a8c892e174c9af3b1580d4f7e91976e3807d4a9f3ebca893beafaaf", &hex);
 }
 
 /// Writes an executable shell script at `path` that prints its arguments, standing
@@ -1132,6 +1134,63 @@ test "the edit and write functions are never saved into the state" {
     try std.testing.expect(std.mem.find(u8, state, "edit () ") == null);
     try std.testing.expect(std.mem.find(u8, state, "write () ") == null);
     try std.testing.expect(std.mem.find(u8, state, "x=\"kept\"") != null);
+}
+
+test "exported edit and write work in a bash -c child process, and stay out of the saved state" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+
+    const result = try runProgram(alloc, io, &session, root, "t1", "bash -c 'edit app.py && write new.txt' && x=kept");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+    try std.testing.expectEqualStrings("tool edit app.py\ntool write new.txt\n", result.stdout);
+
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    const state = try folder.readFileAlloc(io, state_file, alloc, .limited(1 << 20));
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "edit () ") == null);
+    try std.testing.expect(std.mem.find(u8, state, "write () ") == null);
+    try std.testing.expect(std.mem.find(u8, state, "BASH_FUNC_") == null);
+    try std.testing.expect(std.mem.find(u8, state, "export -f") == null);
+    try std.testing.expect(std.mem.find(u8, state, "x=\"kept\"") != null);
+}
+
+test "a saved state that defines and exports edit does not win in a bash -c child" {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/bin/bash", .{}) catch return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const fx_path = try alloc.print("{s}/fx bin", .{root});
+    defer alloc.free(fx_path);
+    try makeFakeFx(io, fx_path);
+
+    var session = Session.init(alloc);
+    defer _ = session.deinit(io);
+    _ = try session.prepare(io, root, &test_fx_variables, fx_path);
+    var folder = try std.Io.Dir.cwd().openDir(io, session.dir.?, .{});
+    defer folder.close(io);
+    try writePrivateFile(io, folder, state_file, "edit() { echo saved; }\nexport -f edit\n");
+
+    const result = try runProgram(alloc, io, &session, root, "t1", "bash -c 'edit app.py'");
+    defer freeRun(alloc, result);
+    try expectExit(result, 0);
+    try std.testing.expectEqualStrings("tool edit app.py\n", result.stdout);
 }
 
 test "prepare refuses a relative fx path and leaves no session" {

@@ -1783,7 +1783,10 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("KILLED_PROMPT_DONE"),
     ]);
     gateways.push(gateway);
-    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+    const active = await launch(fixture, gateway, FX_BIN, {
+      FX_PERMISSION_MODE: "ask",
+      FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent,mcp-call",
+    });
 
     await active.sendText("Edit app.py.");
     await active.waitForText("1. Yes", TIMEOUT);
@@ -1802,7 +1805,13 @@ test.skipIf(!tmuxAvailable())(
     }
     try { process.kill(bashPid, "SIGKILL"); } catch {}
 
-    await Bun.sleep(400);
+    await waitUntilGone([bashPid, ...childPids], TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        pane.includes("Apply this change?") &&
+        readFileSync(fixture.tracePath, "utf8").includes("client or owner gone"),
+      TIMEOUT,
+    );
     const stillPrompting = await waitForEditApproval(active, ["app.py"]);
     expect(stillPrompting).toContain("Apply this change?");
     expect(readFileSync(target, "utf8")).toBe("print('a')\n");
