@@ -7,7 +7,10 @@ import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewaySse, startFakeGateway, tmuxAvailable } = await import("./tmux-helpers");
+const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewaySse, startFakeGateway, tmuxAvailable,
+  turnSettled,
+  hasEmptyComposer,
+} = await import("./tmux-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const TIMEOUT = 30_000;
@@ -127,8 +130,7 @@ async function start(cmd: string, workspace: string, env: Record<string, string 
 
 async function ask(session: Session, prompt: string, answer: string) {
   await session.sendText(prompt);
-  await session.waitForText(answer, TIMEOUT);
-  await session.waitForComposer(TIMEOUT);
+  await session.waitForPane((pane) => pane.includes(answer) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
 }
 
 /// Opens Ctrl+O and returns its rows; the hint is the last one.

@@ -13,6 +13,8 @@ import {
   composerContains,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
+  hasEmptyComposer,
 } from "./tmux-helpers";
 
 // Switching between main and its subagents through the agent list, in one fx
@@ -32,8 +34,12 @@ function mainRow(state = ""): RegExp {
   return new RegExp(`^ {2}main {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
 }
 
+// The time a working subagent's row shows after its state, such as "3s" or "1h2m3s".
+const ROW_ELAPSED = String.raw`\d+(?:h\d+m\d+s|m\d+s|s)`;
+
 function subagentRow(name: string, state = ""): RegExp {
-  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
+  const shown = state === "working" ? `working(?: ${ROW_ELAPSED})?` : state;
+  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${shown}(?: {2,}|$)` : ""}`, "m");
 }
 
 // Expects the agent list in `pane` to show `rows` in this order, top to bottom.
@@ -318,6 +324,14 @@ function held() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => (release = resolve));
   return { promise, release };
+}
+
+// The seconds a "worker" row in the agent list shows after "working", or -1
+// when no such row shows a time.
+function workerTurnSeconds(pane: string): number {
+  const match = /^ {2}[\u251c\u2514] worker .*working (?:(\d+)h)?(?:(\d+)m)?(\d+)s\b/m.exec(pane);
+  if (!match) return -1;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3]);
 }
 
 // What main's report request has to carry, because the report missed main's
@@ -716,8 +730,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_final", "SWITCH_MAIN_FINAL");
       }, async (session, { workspace, tape }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
 
         // Main's unsent draft holds an image and text.
         const image = join(workspace, "switch-draft.png");
@@ -774,8 +787,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_final", "SWITCH_MAIN_FINAL");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
         // Shutdown is main's own: quitting here used to stop the subagent in
@@ -822,7 +834,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && turnSettled(pane), 30_000);
         expect(childCalls).toBe(1);
         await showAgent(session, "worker");
         await session.waitForPane((pane) => pane.includes("SWITCH_STOP_TASK") && pane.includes("worker \u2193"), 15_000);
@@ -881,7 +893,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && turnSettled(pane), 30_000);
         expect(childCalls).toBe(1);
         // The close keys of the test above: Down opens the list on main's row,
         // Down selects the subagent, Delete arms, Up keeps it, then Down, the
@@ -1071,7 +1083,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_done", "SWITCH_MAIN_DONE");
         }, async (session) => {
           await session.sendText("SWITCH_USER");
-          await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+          await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && turnSettled(pane), 30_000);
           await until("the subagent's turn", () => childCalls >= 1);
           await showAgent(session, "worker");
           await session.waitForPane((pane) => pane.includes("SWITCH_HALTED_TASK") && pane.includes("worker \u2193"), 15_000);
@@ -1180,7 +1192,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_wait", "CLOSEGAP_MAIN_WAITING");
         }, async (session) => {
           await session.sendText("SWITCH_USER");
-          await session.waitForText("CLOSEGAP_MAIN_WAITING", 60_000);
+          await session.waitForPane((pane) => pane.includes("CLOSEGAP_MAIN_WAITING") && turnSettled(pane), 60_000);
           expect(moreResult).toContain("is busy");
           // Down opens the agent list on main's row, and the next Down selects worker.
           await session.sendKeys("Down");
@@ -1403,7 +1415,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE") && turnSettled(pane), 30_000);
         const deadline = Date.now() + 15_000;
         while (childCalls === 0 && Date.now() < deadline) await Bun.sleep(50);
         expect(childCalls).toBe(1);
@@ -1453,8 +1465,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
@@ -1506,8 +1517,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
@@ -1617,8 +1627,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
@@ -1672,8 +1681,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { tape }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         const pane = await session.waitForPane((value) => value.includes("SWITCH_CHILD_FIRST"), 15_000);
         // The subagent's screen shows the task with its escapes as text.
@@ -1704,8 +1712,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         // The subagent's title arrived after main's, and main is still on screen.
         const mainTitle = await stablePaneTitle(session);
         expect(mainTitle).not.toBe("");
@@ -1737,8 +1744,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session, { home }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
@@ -1782,8 +1788,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_done", "SWITCH_MAIN_DONE");
         }, async (session, { home, launch }) => {
           await session.sendText("SWITCH_USER");
-          await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-          await session.waitForComposer(15_000);
+          await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
           await showAgent(session, "reviewer");
           await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
           await session.waitForComposer(15_000);
@@ -1955,7 +1960,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER");
           // Lead's turn has ended and main has read its report, so neither
           // works; only lead's helper does, held until the checks are done.
-          await session.waitForText("WAIT_MAIN_IDLE", 30_000);
+          await session.waitForPane((pane) => pane.includes("WAIT_MAIN_IDLE") && turnSettled(pane), 30_000);
           await until("the helper's request", () => helperAsked);
           // Main waits on nothing of its own. The footer note and the wait
           // row come from the same frame, so a frame that counts the helper
@@ -2011,8 +2016,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
@@ -2586,8 +2590,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_final", "SWITCH_MAIN_FINAL");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(15_000)).toBe(true);
 
@@ -2651,8 +2654,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), marker));
 
         await session.sendText("SWITCH_USER");
-        await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
-        await session.waitForComposer(15_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL") && hasEmptyComposer(pane) && turnSettled(pane), 30_000);
         await showAgent(session, "reader");
         await session.waitForPane((pane) => pane.includes("reader \u00b7 "), 15_000);
         await session.sendText("/compact");
@@ -2660,7 +2662,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         while (holding("SWITCH_COMPACT_SUMMARY").length === 0 && Date.now() < deadline) await Bun.sleep(100);
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_AFTER_COMPACT");
-        await session.waitForText("SWITCH_CHILD_AFTER", 30_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_AFTER") && turnSettled(pane), 30_000);
         await session.waitForComposer(15_000);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(15_000)).toBe(true);
@@ -2724,7 +2726,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       return text("main_final", "EDGE_MAIN_FINAL");
     }, async (session) => {
       await session.sendText("SWITCH_USER_EDGE");
-      await session.waitForText("EDGE_MAIN_FINAL", 30_000);
+      await session.waitForPane((pane) => pane.includes("EDGE_MAIN_FINAL") && turnSettled(pane), 30_000);
       await session.waitForComposer(15_000);
       await run(session);
     });
@@ -2981,7 +2983,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
           // Only busy runs in a profile other than main, and its row names it
           // after its model.
-          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
+          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+ {2,}notes\s*$/m);
           expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
           expect(list).not.toMatch(/ {2}main\s*$/m);
           await session.sendKeys("Escape");
@@ -3015,7 +3017,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "LIST_MAIN_WAITING");
       }, async (session) => {
         await session.sendText("SWITCH_USER plan it");
-        await session.waitForText("LIST_MAIN_WAITING", 30_000);
+        await session.waitForPane((pane) => pane.includes("LIST_MAIN_WAITING") && turnSettled(pane), 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
         // Idle main says it waits on its subagent above the composer, with
         // a running clock and the list's key, and the footer still counts
@@ -3032,7 +3034,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         // The model follows the state; the main profile goes unnamed.
-        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
+        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+\s*$/m.test(pane), 15_000);
         expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
@@ -3072,7 +3074,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "PURPOSE_MAIN_WAITING");
       }, async (session) => {
         await session.sendText("SWITCH_USER plan it");
-        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_WAITING") && turnSettled(pane), 30_000);
         await until("the auditor's turn", () => childCalls >= 1);
         await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
         // Down opens the list only once main's turn is over and its composer is empty.
@@ -3144,7 +3146,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "PURPOSE_MAIN_WAITING");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER plan it");
-        await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+        await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_WAITING") && turnSettled(pane), 30_000);
         await until("the auditor's turn", () => childCalls >= 1);
         await session.waitForComposer(15_000);
         await session.sendText("/quit");
@@ -3206,7 +3208,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_done", "PURPOSE_MAIN_DONE");
         }, async (session) => {
           await session.sendText("SWITCH_USER");
-          await session.waitForText("PURPOSE_MAIN_IDLE", 30_000);
+          await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_IDLE") && turnSettled(pane), 30_000);
           await until("the helper's request", () => helperAsked);
           await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
           await session.waitForComposer(15_000);
@@ -3255,7 +3257,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "TITLE_MAIN_WAITING");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER plan it");
-        await session.waitForText("TITLE_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => pane.includes("TITLE_MAIN_DONE") && turnSettled(pane), 30_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Down");
         await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}/m.test(pane), 15_000);
@@ -3294,7 +3296,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const again = await launch(`--resume ${mains[0]}`);
         await again.waitForComposer(15_000);
         await again.sendText("SWITCH_USER again");
-        await again.waitForText("TITLE_MAIN_AGAIN_DONE", 30_000);
+        await again.waitForPane((pane) => pane.includes("TITLE_MAIN_AGAIN_DONE") && turnSettled(pane), 30_000);
         await again.waitForComposer(15_000);
         await again.sendKeys("Down");
         await again.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}/m.test(pane), 15_000);
@@ -3331,7 +3333,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("order_main_idle", "ORDER_MAIN_IDLE");
         }, async (session, { home, launch }) => {
           await session.sendText("SWITCH_USER start both workers");
-          await session.waitForText("ORDER_MAIN_IDLE", 30_000);
+          await session.waitForPane((pane) => pane.includes("ORDER_MAIN_IDLE") && turnSettled(pane), 30_000);
           await until("both workers' requests", () => started.reviewer && started.tester);
           await session.waitForPane((pane) => /\u2022 waiting on 2 subagents \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
           await session.sendKeys("Down");
@@ -3472,7 +3474,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, async (session, { home, launch, workspace }) => {
         gateFile = join(workspace, "reviewer-slow-gate");
         await session.sendText("SWITCH_USER ROW_START start the reviewer");
-        await session.waitForText("SWITCH_MAIN_ONE", 60_000);
+        await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_ONE") && turnSettled(pane), 60_000);
         // The resume must see the whole first turn, so wait until its last row is saved.
         await until("the reviewer's first turn to be saved", () => sessionsHolding(home, "ROW-0300").length > 0, 60_000);
         await session.sendText("/quit");
@@ -3524,7 +3526,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "CLOSE_MAIN_WAITING");
       }, async (session, { home, launch }) => {
         await session.sendText("SWITCH_USER review it");
-        await session.waitForText("CLOSE_MAIN_WAITING", 30_000);
+        await session.waitForPane((pane) => pane.includes("CLOSE_MAIN_WAITING") && turnSettled(pane), 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
         await session.sendKeys("Down");
         await session.waitForText("esc back", 10_000);
@@ -3821,7 +3823,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_wait", "PURPOSE_MAIN_WAITING");
         }, async (session) => {
           await session.sendText("SWITCH_USER plan it");
-          await session.waitForText("PURPOSE_MAIN_WAITING", 30_000);
+          await session.waitForPane((pane) => pane.includes("PURPOSE_MAIN_WAITING") && turnSettled(pane), 30_000);
           await until("the auditor's turn", () => childCalls >= 1);
           await session.waitForPane((pane) => pane.includes("1 subagent working"), 15_000);
           await session.waitForComposer(15_000);
@@ -3896,7 +3898,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "NOTE_MAIN_WAITING");
       }, async (session) => {
         await session.sendText("SWITCH_USER review it");
-        await session.waitForText("NOTE_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => pane.includes("NOTE_MAIN_DONE") && turnSettled(pane), 30_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Down");
         await session.waitForText("esc back", 10_000);
@@ -4020,7 +4022,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_idle", "BRANCH_MAIN_IDLE");
         }, async (session) => {
           await session.sendText("SWITCH_USER start them");
-          await session.waitForText("BRANCH_MAIN_IDLE", 30_000);
+          await session.waitForPane((pane) => pane.includes("BRANCH_MAIN_IDLE") && turnSettled(pane), 30_000);
           await until("first's and the helper's requests", () => asked.first && asked.helper);
           // First works, so its row is above lead's, and lead's helper sits
           // under lead.
@@ -4192,7 +4194,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         return text("main_wait", "MAIN_CLOSE_WAITING");
       }, async (session) => {
         await session.sendText("SWITCH_USER run them");
-        const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
+        const pane = await session.waitForPane((pane) => pane.includes("MAIN_CLOSE_DONE") && turnSettled(pane), 60_000);
         // The close is its group's only row, so it is the group's header.
         expect(pane).toContain("\u25cf Closed tester");
         // Main alone again: no agent indicator, and ↓ opens no list, which
@@ -4662,7 +4664,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // The lane's answer comes once it has taken the steers, so its
           // turn is saved with them. Then main ends and starts again on the
           // same session, and the lane's restored screen shows the steers.
-          await session.waitForText("LANE_DONE", 30_000);
+          await session.waitForPane((pane) => pane.includes("LANE_DONE") && turnSettled(pane), 30_000);
           await showAgent(session, "main");
           await session.waitForComposer(15_000);
           await session.sendText("/quit");
@@ -4777,7 +4779,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // Give the screen time to draw what main's queue holds.
         await Bun.sleep(1_000);
         releaseMain();
-        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && turnSettled(pane), 60_000);
         await session.waitForComposer(30_000);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(15_000)).toBe(true);
@@ -4843,7 +4845,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-u");
         // Main still gets the report once its command ends.
         writeFileSync(gate, "");
-        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && turnSettled(pane), 60_000);
         await session.waitForComposer(30_000);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(15_000)).toBe(true);
@@ -4914,12 +4916,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a working subagent's row keeps its title and shows its call's time, and its quiet command wakes main's wait",
+    "a working subagent's row keeps its title and shows how long its turn has run, and its quiet command wakes main's wait",
     async () => {
       const command = "sh -c 'printf TUI-QUIET-READY; exec sleep 600'";
       // The shell session the child's run started, from its result.
       const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
       let childWaiting = false;
+      let childAsked = false;
+      const firstChildRequest = held();
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           // The latest call comes first: every earlier call stays in the turn.
@@ -4938,6 +4942,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
               request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
             });
           }
+          // The child's first request waits until the list has shown its turn's time.
+          childAsked = true;
+          await firstChildRequest.promise;
           return toolCall("child_run", "shell", { request: { action: "run", command, yield_time_ms: 300 } });
         }
         if (body.includes('"main_wait"')) {
@@ -4952,13 +4959,23 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         });
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await until("the child's first wait", () => childWaiting);
-        // The row of the working subagent keeps its title, not its current
-        // call, and shows how long that call has run.
+        await until("the child's first request", () => childAsked);
+        // While its first request waits on the model, no call is open, and the
+        // row shows how long its turn has run.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
-        const list = await session.waitForPane((pane) =>
-          /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
+        const thinking = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 3, 15_000);
+        const before = workerTurnSeconds(thinking);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        firstChildRequest.release();
+        await until("the child's first wait", () => childWaiting);
+        // The row keeps its title, not its current call, and a new call does
+        // not start its clock again.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        const list = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 0, 15_000);
+        expect(workerTurnSeconds(list)).toBeGreaterThanOrEqual(before);
         const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
         expect(workerRow).not.toContain("Waiting for");
         expect(workerRow).not.toContain("TUI-QUIET-READY");

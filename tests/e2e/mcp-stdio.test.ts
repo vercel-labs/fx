@@ -22,6 +22,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
@@ -1294,7 +1295,7 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Load the fixture echo tool and call it.");
-      await tui.waitForText("FIRST_TURN_DONE", 20_000);
+      await tui.waitForPane((pane) => pane.includes("FIRST_TURN_DONE") && turnSettled(pane), 20_000);
       await tui.waitForComposer(10_000);
       expect(toolResultText(activeGateway.requests[2]!.body, "first_call")).toContain(`${MODERN_RESULT}:first`);
       await tui.sendText("Call the echo tool again.");
@@ -2815,7 +2816,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture.");
     await options.answer?.(tui);
-    await tui.waitForText(finalText, 20_000);
+    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(`└ ${row}`);
     expect(live.filter((line) => line.includes(alias))).toEqual([`├ Opened ${alias}`]);
@@ -2915,7 +2916,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
         await tui.waitForComposer(15_000);
         await tui.sendText("Call the MCP fixture.");
-        await tui.waitForText(finalText, 20_000);
+        await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 20_000);
         await tui.waitForStableComposer(10_000);
         const live = compactRows(await tui.captureFullScrollback());
         expect(live).toContain(`└ Used ${serverName} to echo`);
@@ -3049,7 +3050,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 32, stderrPath, env });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP tool.");
-    await tui.waitForText(finalText, 25_000);
+    await tui.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), 25_000);
     await tui.waitForStableComposer(10_000);
     const live = compactRows(await tui.captureFullScrollback());
     expect(live).toContain(row);
@@ -3162,7 +3163,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const cause = "arguments rejected: limit is a string, the schema wants a number";
       // The row names the failed call, and the cause follows it on its line.
       await tui.waitForText(cause, 20_000);
-      await tui.waitForText("Rejected arguments complete.", 20_000);
+      await tui.waitForPane((pane) => pane.includes("Rejected arguments complete.") && turnSettled(pane), 20_000);
       expect(await tui.captureFullScrollback()).toContain(`Couldn't use ${TOOL_ROW} · ${cause}`);
       // The model still gets the server's own words, which say how to fix the call.
       expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
@@ -5632,6 +5633,47 @@ describe("fx mcp call", () => {
     expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
   }, 90_000);
 
+  test("a command still running after its run call returns is told its fx mcp calls stop, and a later call says why", async () => {
+    const root = bridgeRoot("bridge-run-returned");
+    const call = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}'`;
+    // The command waits for the file go, which the test creates only after
+    // the run call has returned, so the second call runs after that return.
+    const command = `${call} > first.json; while [ ! -f go ]; do sleep 0.1; done; ${call} > second.json 2> second.err; echo "second_exit=$?"`;
+    let runResult: Record<string, unknown> = {};
+    let interactOutput = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+      (body: string) => {
+        runResult = JSON.parse(toolResultText(body, "run_call"));
+        writeFileSync(join(root.workspace, "go"), "");
+        return fakeGatewayToolCall("interact_call", "shell", {
+          action: "interact",
+          session_id: runResult.session_id,
+          yield_time_ms: 30_000,
+        });
+      },
+      (body: string) => {
+        interactOutput = shellOutput(toolResultText(body, "interact_call"));
+        return fakeGatewayFinalText("DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 60_000,
+    });
+    expect(typeof runResult.mcp_call_notice).toBe("string");
+    expect(String(runResult.mcp_call_notice)).toContain("exit 3");
+    expect(interactOutput).toContain("second_exit=3");
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("DONE");
+    // The first call ran while the run call was still running.
+    expect(readFileSync(join(root.workspace, "first.json"), "utf8").length).toBeGreaterThan(0);
+    expect(readFileSync(join(root.workspace, "second.err"), "utf8")).toContain("has returned");
+  }, 90_000);
+
   test("a structured result that is only one result string saves as that text", async () => {
     const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
     const seen = await runBridgeCommand(root, `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"docs"}' > docs.md; echo "exit=$?"`);
@@ -5661,6 +5703,33 @@ describe("fx mcp call", () => {
     expect(seen).toContain("missing=1");
     expect(seen).toContain("No MCP server by that name is available to this agent.");
     expect(seen).toContain("server=1");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  // A server held back for an unset ${VAR} needs no login. A command's `list` and `search` say what `toolbox search`
+  // and `toolbox open` say for it (`Catalog.unavailableText`, src/core/mcp_host/model.zig).
+  const heldRoot = (label: string, variable: string) => {
+    const root = bridgeRoot(label);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.keyed = { type: "http", url: "https://keyed.example/mcp", bearer_token_env: variable };
+    writeFileSync(profilePath, JSON.stringify(profile));
+    return root;
+  };
+
+  test("list and search name the variable a server needs, not a login", async () => {
+    const root = heldRoot("bridge-held-variable", "FX_BRIDGE_NOT_SET_ANYWHERE");
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list keyed 2>&1; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search keyed 2>&1; echo "search=$?"`,
+      `"${FX_BIN}" mcp call list fixture 2>&1; echo "other=$?"`,
+    ].join("\n")));
+    const words = "fx mcp call: MCP server 'keyed' needs FX_BRIDGE_NOT_SET_ANYWHERE set before fx starts.";
+    expect(seen).toContain(`${words}\nlist=1`);
+    expect(seen).toContain(`${words}\nsearch=1`);
+    expect(seen).not.toContain("needs a login");
+    // The server that loads is listed as before.
+    expect(seen).toContain(`${TOOL_NAME}\tEcho text through the modern MCP fixture\nother=0`);
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
@@ -5734,7 +5803,7 @@ describe("fx mcp call", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_DONE") && turnSettled(pane), 30_000);
       const scrollback = await tui.captureFullScrollback();
       // The calls of one tool share a row that counts them, in the
       // command's group.

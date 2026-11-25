@@ -28,6 +28,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -230,8 +231,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         session = await TmuxSession.create({ cmd: `${JSON.stringify(FX_BIN)} --resume ${JSON.stringify(id)}`, cwd: fixture.workspace, env: { ...env, FX_PROVIDER: override } });
         await session.waitForComposer(TIMEOUT);
         await session.sendText(`resume check ${index}`);
-        await session.waitForText("local reply", TIMEOUT);
-        await session.waitForComposer(TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("local reply") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
         const until = Date.now() + TIMEOUT;
         while (fixture.requests.length < index + 2 && Date.now() < until) await Bun.sleep(20);
         expect(fixture.requests).toHaveLength(index + 2);
@@ -296,8 +296,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       await session.waitForComposer(TIMEOUT);
       for (let turn = 1; turn <= 5; turn++) {
         await session.sendText("remember context " + "detail ".repeat(500));
-        await session.waitForText(`local reply ${turn}`, TIMEOUT);
-        await session.waitForComposer(TIMEOUT);
+        await session.waitForPane((pane) => pane.includes(`local reply ${turn}`) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       expect(fixture.requests).toHaveLength(6);
       const status = await readStatusPanel(session, TIMEOUT);
@@ -1544,7 +1543,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.fast_mode_model_bound).toBe(true);
 
         await session.sendText("Use portable auto.");
-        await session.waitForText("portable auto complete", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("portable auto complete") && turnSettled(pane), TIMEOUT);
         const footer = await session.waitForText("0k/750k 0%", TIMEOUT);
         expect(footer).toContain("new-reasoning-model");
         expect(footer).not.toMatch(/[*✓!✗⊘i] context:/);

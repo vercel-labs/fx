@@ -26,11 +26,13 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   fakeShellRun,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -565,6 +567,160 @@ describe("fx ask presentation", () => {
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal stream error after a partial line keeps the committed text once",
+    async () => {
+      const root = createRoot();
+      const finalText = "A complete replacement response.";
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "Streaming **bold" },
+          { type: "finish", finishReason: { unified: "error", raw: "provider_error" } },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Fail mid line."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback.split("Streaming **bold").length - 1).toBe(1);
+      expect(scrollback).not.toContain("Streaming bold");
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal Ctrl+C on a partial line commits the held text once and leaves no tail",
+    async () => {
+      const root = createRoot();
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([() => held.response]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Cancel mid line."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+      held.send("Streaming **bold");
+      await session.waitForText("Streaming bold", TIMEOUT);
+      await session.sendKeys("C-c");
+      await session.waitForText("Streaming **bold", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      held.dispose();
+
+      expect(scrollback.split("Streaming **bold").length - 1).toBe(1);
+      expect(scrollback).not.toContain("Streaming bold");
+    },
+    TIMEOUT * 2,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal shows streamed words formatted before their line ends",
+    async () => {
+      const root = createRoot();
+      const prompt = "Stream the formatted reply.";
+      const calibration = "Calibration **bold** line.\n\n";
+      const streamedLine = "Streaming **bold";
+      const streamedRest = " words** and `code` here.\n\n| a | b |";
+      const ending = "\n|---|---|\n| 1 | 2 |\n\nDone.\n";
+      const fullReply = `${calibration}${streamedLine}${streamedRest}${ending}`;
+      const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
+      const sgrBeforeBold = (row: string) =>
+        row.slice(0, row.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
+      const rowsOf = (text: string) =>
+        text
+          .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
+          .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
+          .replace(/Pane is dead \(status \d+, [^)]*\)/g, "Pane is dead")
+          .split("\n")
+          .map((row) => row.trimEnd());
+      const startAsk = async (
+        gateway: ReturnType<typeof startFakeGateway>,
+        label: string,
+      ) => {
+        const stderrPath = join(root.root, `${label}-stderr.log`);
+        writeFileSync(stderrPath, "");
+        const session = await TmuxSession.create({
+          isolated: true,
+          cmd: terminalCommand(["ask", "--auto", "--no-save", prompt]),
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+          width: 120,
+          height: 40,
+          remainOnExit: true,
+          stderrPath,
+        });
+        sessions.push(session);
+        return { session, stderrPath };
+      };
+
+      const held = heldFakeGatewayFinalText();
+      const heldGateway = startFakeGateway([() => held.response]);
+      gateways.push(heldGateway);
+      const { session, stderrPath } = await startAsk(heldGateway, "streamed");
+      held.send(calibration);
+      await session.waitForText("Calibration bold line.", TIMEOUT);
+      held.send(streamedLine);
+      await session.waitForText("Streaming bold", 5_000);
+
+      const escapedMid = await session.captureFullScrollbackEscapes();
+      const plainMid = await session.captureFullScrollback();
+      expect(plainMid).not.toContain("**");
+      const calibrationRow =
+        escapedMid.split("\n").find((row) => row.includes("Calibration")) ?? "";
+      const streamedRow =
+        escapedMid.split("\n").find((row) => row.includes("Streaming")) ?? "";
+      expect(sgrBeforeBold(calibrationRow)).toMatch(boldSgr);
+      expect(sgrBeforeBold(streamedRow)).toBe(sgrBeforeBold(calibrationRow));
+
+      held.send(streamedRest);
+      await session.waitForText("words", TIMEOUT);
+      await session.waitForText("code", TIMEOUT);
+      const plainPartial = await session.captureFullScrollback();
+      expect(plainPartial).not.toContain("**");
+      expect(plainPartial).not.toContain("`");
+      expect(
+        plainPartial.split("\n").some((row) => row.trimStart().startsWith("| a")),
+      ).toBe(false);
+
+      held.send(ending);
+      held.release("");
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      // tmux marks the pane dead a moment after the command's last line, so
+      // each capture waits for that mark and both show it.
+      await session.waitForPane(() => session.paneStatus().dead, TIMEOUT);
+      const streamed = await session.captureFullScrollback();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const onePieceGateway = startFakeGateway([fakeGatewayFinalText(fullReply)]);
+      gateways.push(onePieceGateway);
+      const onePiece = await startAsk(onePieceGateway, "one-piece");
+      await onePiece.session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      await onePiece.session.waitForPane(() => onePiece.session.paneStatus().dead, TIMEOUT);
+      expect(rowsOf(streamed)).toEqual(
+        rowsOf(await onePiece.session.captureFullScrollback()),
+      );
     },
     TIMEOUT,
   );
@@ -1590,7 +1746,7 @@ describe("fx ask shell startup files", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Check the secret.");
-        await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("SECRET_CHECK_DONE") && turnSettled(pane), TIMEOUT);
         await session.sendText("/trace");
         await session.waitForText("Trace saved at", TIMEOUT);
       } finally {

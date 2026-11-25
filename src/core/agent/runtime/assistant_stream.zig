@@ -54,6 +54,10 @@ pub const SemanticPresentationSink = struct {
     /// Takes ownership of `block` only when it returns successfully.
     code_block: *const fn (ctx: *anyopaque, block: CodeBlockPayload) anyerror!void,
     thematic_rule: *const fn (ctx: *anyopaque) anyerror!void,
+    /// Takes ownership of `events` only when it returns successfully. `alloc`
+    /// is the allocator that made them. Null when the sink shows no tail, so
+    /// the stream builds no preview for it.
+    assistant_tail: ?*const fn (ctx: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) anyerror!void,
 };
 
 pub const StreamChunkContext = struct {
@@ -89,6 +93,10 @@ pub const StreamChunkContext = struct {
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
     response_language_next_probe_bytes: usize = 5,
+    /// The tail last sent to the sink, to skip a send when nothing changed.
+    sent_tail: std.ArrayList(assistant_presentation.Event) = .empty,
+    /// Tail previews this stream has rendered. A test reads it to see that a sink with no tail builds none.
+    tail_previews_built: usize = 0,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -128,6 +136,7 @@ pub const StreamChunkContext = struct {
         self.interrupted_source.deinit(self.alloc);
         self.initial_line_prefix.deinit(self.alloc);
         self.provisional_statuses.deinit(self.alloc);
+        deinitEventList(self.alloc, &self.sent_tail);
     }
 
     pub fn start_response(self: *StreamChunkContext) !void {
@@ -168,6 +177,7 @@ pub const StreamChunkContext = struct {
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
         self.published_phase = null;
+        try sendAssistantTail(self);
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
@@ -476,9 +486,11 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
         .code = semantic_code_completion,
         .thematic_rule = semantic_thematic_rule_completion,
     });
-    if (out.items.len == 0) return;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
-    stream_ctx.recordTextOutput(out.items);
+    if (out.items.len > 0) {
+        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = out.items });
+        stream_ctx.recordTextOutput(out.items);
+    }
+    try sendAssistantTail(stream_ctx);
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
@@ -518,13 +530,73 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         .code = semantic_code_completion,
         .thematic_rule = semantic_thematic_rule_completion,
     });
-    if (out.items.len == 0) return;
-    const text = if (stream_ctx.trailing_newline_count >= 2 and beginsFootnoteProjection(out.items))
-        out.items[1..]
-    else
-        out.items;
-    try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
-    stream_ctx.recordTextOutput(text);
+    if (out.items.len > 0) {
+        const text = if (stream_ctx.trailing_newline_count >= 2 and beginsFootnoteProjection(out.items))
+            out.items[1..]
+        else
+            out.items;
+        try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
+        stream_ctx.recordTextOutput(text);
+    }
+    try sendAssistantTail(stream_ctx);
+}
+
+/// Ends the tail of this stream. The empty tail replaces the last one sent.
+pub fn finishAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
+    const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
+    const empty = try stream_ctx.alloc.alloc(assistant_presentation.Event, 0);
+    try deliverAssistantTail(sink, stream_ctx, empty);
+}
+
+/// Sends the rendered tail when it differs from the one sent last. A sink
+/// with no tail consumer gets no preview built.
+fn sendAssistantTail(stream_ctx: *StreamChunkContext) !void {
+    if (comptime !assistant_presentation.builds_previews) return;
+    const sink = stream_ctx.semantic_presentation orelse return;
+    if (sink.assistant_tail == null) return;
+    const alloc = stream_ctx.alloc;
+    var tail: std.ArrayList(assistant_presentation.Event) = .empty;
+    defer deinitEventList(alloc, &tail);
+    stream_ctx.tail_previews_built += 1;
+    _ = try stream_ctx.markdown.renderProvisional(alloc, &tail);
+    if (std.meta.eql(tail.items, stream_ctx.sent_tail.items)) return;
+    try deliverAssistantTail(sink, stream_ctx, try tail.toOwnedSlice(alloc));
+}
+
+/// Hands `events` to the sink and keeps a copy to compare the next tail with.
+/// A failed send keeps the last tail sent, and the sink never gets the events.
+fn deliverAssistantTail(
+    sink: SemanticPresentationSink,
+    stream_ctx: *StreamChunkContext,
+    events: []assistant_presentation.Event,
+) !void {
+    const alloc = stream_ctx.alloc;
+    errdefer assistant_presentation.freeEventSlice(alloc, events);
+    var sent: std.ArrayList(assistant_presentation.Event) = .empty;
+    errdefer deinitEventList(alloc, &sent);
+    try appendClonedEvents(alloc, &sent, events);
+    try sink.assistant_tail.?(sink.ctx, alloc, events);
+    deinitEventList(alloc, &stream_ctx.sent_tail);
+    stream_ctx.sent_tail = sent;
+}
+
+fn appendClonedEvents(
+    alloc: Allocator,
+    list: *std.ArrayList(assistant_presentation.Event),
+    source: []const assistant_presentation.Event,
+) !void {
+    for (source) |event| {
+        var cloned = try event.clone(alloc);
+        errdefer cloned.deinit(alloc);
+        try list.append(alloc, cloned);
+    }
+}
+
+fn deinitEventList(alloc: Allocator, list: *std.ArrayList(assistant_presentation.Event)) void {
+    for (list.items) |*event| event.deinit(alloc);
+    list.deinit(alloc);
 }
 
 fn beginsFootnoteProjection(text: []const u8) bool {
@@ -843,12 +915,17 @@ const StreamCapture = struct {
         };
     }
 
+    fn captureAssistantTail(_: *anyopaque, alloc: Allocator, events: []assistant_presentation.Event) !void {
+        assistant_presentation.freeEventSlice(alloc, events);
+    }
+
     fn semanticPresentationSink(self: *@This()) SemanticPresentationSink {
         return .{
             .ctx = self,
             .table = captureTable,
             .code_block = captureCodeBlock,
             .thematic_rule = captureThematicRule,
+            .assistant_tail = captureAssistantTail,
         };
     }
 

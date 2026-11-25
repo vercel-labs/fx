@@ -22,6 +22,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { holdChildAnswer } from "./saved-sessions";
 
@@ -1177,7 +1178,7 @@ describe("ultrafast fake Gateway", () => {
             .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
           expect(gateway.requests).toEqual([]);
           await session.sendText("Return the model picker marker.");
-          await session.waitForText("marker selection response", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("marker selection response") && turnSettled(pane), TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);
           await session.sendText("/ultrafast off");
@@ -1309,7 +1310,7 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendText("Return the downgrade sentinel.");
-          await session.waitForText("downgraded answer", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("downgraded answer") && turnSettled(pane), TIMEOUT);
           const scrollback = normalizeTerminalWhitespace(
             await session.captureFullScrollback(),
           );

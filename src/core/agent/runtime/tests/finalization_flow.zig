@@ -1765,7 +1765,7 @@ test "an empty reply gives way to mail that lands while it waits, so no nudge go
     try std.testing.expectEqual(@as(i64, 1000), deps.handoff_wait_bound_ms);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContainsInOrder(&gateway, 1, &.{"CHILD_REPORT"});
-    try std.testing.expect(std.mem.indexOf(u8, gateway.request_bodies.items[1], empty_reply_nudge_text) == null);
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[1], empty_reply_nudge_text) == null);
 }
 
 test "an empty reply whose mail does not land within the bound goes on to the nudge as before" {

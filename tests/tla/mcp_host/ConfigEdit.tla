@@ -17,6 +17,16 @@
 \*     The scan the reader runs at load gives up on a big file (more than 64
 \*     top-level keys, or 64 entries under one key); the scan an edit runs
 \*     reads every key.
+\*   - src/builtins/mcp.zig inspectLocalConfig, which `fx status` and `fx doctor` read the files with: the reader
+\*     `fx mcp list` and the runtime use, so an entry it skips is left out and noted, and never hides another
+\*     entry or the other file's (`InspectShown`, `InspectNoted`). A profile that is not JSON fails the whole inspection,
+\*     as it stops the runtime. The inspection only reads, so it adds no state: its invariants hold in every state.
+\*   - src/builtins/mcp.zig composeHostConfigs, and src/acp/sessions.zig appendMcpConfigs: the terminal app's host and an
+\*     ACP session that sets `_meta.fx.profileMcpServers` read the files with that reader and compose them with this
+\*     one function, so an entry the reader skips never hides a good one from either (`AcpKeepsGood`,
+\*     `AcpRunsWhatTheTerminalRuns`). A profile that is not JSON stops the terminal app's host, and costs an ACP
+\*     session only the profile's servers. `${VAR}` and names a terminal can't print are not classes here: they are
+\*     steps of the same function, which its unit tests and the ACP e2e tests check.
 \*   - src/core/mcp_host/verbs.zig add, remove: print the refusal and exit 1. A remove that
 \*     finds no entry exits 1 with "No MCP server named ..." and leaves the file as it was; when
 \*     the profile's misspelled servers key holds a server by that name, it adds one line that
@@ -88,6 +98,25 @@ Loads(f, c) == c = "ok" \/ (c = "auth" /\ f = "project")
 \* What `fx mcp list` shows from file f: nothing from a file the reader can't read.
 LoadedNames(f) ==
     IF st[f] \in {"ok", "deep"} THEN {n \in Names : ent[f][n] # NoEntry /\ Loads(f, ent[f][n])} ELSE {}
+
+\* The entries of file f that the reader skips: the file is readable, and the entry's class is one it does not load.
+SkippedNames(f) ==
+    IF st[f] \in {"ok", "deep"} THEN {n \in Names : ent[f][n] # NoEntry /\ ~Loads(f, ent[f][n])} ELSE {}
+
+\* A profile that is not JSON fails the inspection, whole: no server of either file shows.
+InspectFailed == st["profile"] = "broken"
+
+\* The servers `fx status` and `fx doctor` list from file f, and the entries they note as skipped.
+InspectShown(f) == IF InspectFailed THEN {} ELSE LoadedNames(f)
+InspectNoted(f) == IF InspectFailed THEN {} ELSE SkippedNames(f)
+
+\* The servers a host loads from file f: the reader's, which the terminal app's host (`loadHost`) and an ACP session that
+\* asks for the profile's servers (`_meta.fx.profileMcpServers`, sessions.zig appendMcpConfigs) both read the files with,
+\* and both compose with the same `composeHostConfigs`. So one operator says what each runs. A profile that is not JSON
+\* stops the terminal app's host load, whole; an ACP session goes on without the profile's servers.
+HostLoads(f) == LoadedNames(f)
+TuiRuns(f) == IF InspectFailed THEN {} ELSE HostLoads(f)
+AcpRuns(f) == HostLoads(f)
 
 \* The edit finds the misspelled key.
 KeyBlocks == typo /\ (KeyScan = "complete" \/ (KeyScan = "bounded" /\ ~big))
@@ -332,4 +361,23 @@ HintMatchesHeldName == last \in {"missing", "hinted"} => ((last = "hinted") <=> 
 
 \* An add or remove changes only the entry it names.
 OthersKept == last \in {"added", "removed"} => others
+
+\* Whatever else a file holds, every entry the reader loads shows in `fx status` and `fx doctor`, and no skipped
+\* entry does: one bad entry of the profile never hides a good one, or a server of the project.
+InspectKeepsGood ==
+    ~InspectFailed =>
+        \A f \in Files, n \in Names :
+            (st[f] \in {"ok", "deep"} /\ ent[f][n] # NoEntry /\ Loads(f, ent[f][n])) <=> n \in InspectShown(f)
+
+\* Every entry the reader skips is noted, and nothing else is: the note is how a person learns of it.
+InspectNotesSkipped ==
+    ~InspectFailed =>
+        \A f \in Files, n \in Names :
+            (st[f] \in {"ok", "deep"} /\ ent[f][n] # NoEntry /\ ~Loads(f, ent[f][n])) <=> n \in InspectNoted(f)
+
+\* An entry the reader skips never hides one it loads from an ACP session that asks for the profile's servers.
+AcpKeepsGood == \A f \in Files : LoadedNames(f) \subseteq AcpRuns(f)
+
+\* The terminal app and an ACP session run the same servers from a file both can read.
+AcpRunsWhatTheTerminalRuns == ~InspectFailed => \A f \in Files : AcpRuns(f) = TuiRuns(f)
 ====
