@@ -1733,8 +1733,21 @@ pub fn Runtime(comptime App: type) type {
             try agent.session_persistence.pending_input_restore.queue(v2.id(), reader);
         }
 
+        fn resumeHandoffPending(app: *const App) bool {
+            if (comptime !@hasField(App, "shell")) return false;
+            const Shell = @TypeOf(app.shell);
+            if (comptime @hasDecl(Shell, "pendingResumeFlow")) {
+                if (app.shell.pendingResumeFlow().len > 0) return true;
+            }
+            if (comptime @hasDecl(Shell, "transcriptCommitDiagnostic")) {
+                if (app.shell.transcriptCommitDiagnostic().state == .recovering) return true;
+            }
+            return false;
+        }
+
         /// Starts a queued pending-input restore once the first frame is on
-        /// screen, and applies its finished result on the main loop.
+        /// screen, holds a finished result until the resume handoff commits,
+        /// and applies it on the main loop.
         pub fn pollPendingInputRestore(app: *App, agent: *AppAgent) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const restore = &agent.session_persistence.pending_input_restore;
@@ -1748,6 +1761,15 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 };
             }
+            const ready_session_id = restore.readySessionId() orelse return;
+            const active_id = activeSessionId(agent);
+            if (active_id == null or !std.mem.eql(u8, active_id.?, ready_session_id)) {
+                const stale = restore.takeCompleted() orelse return;
+                defer stale.deinit();
+                try applyPendingInputRestore(app, agent, stale);
+                return;
+            }
+            if (resumeHandoffPending(app)) return;
             const task = restore.takeCompleted() orelse return;
             defer task.deinit();
             try applyPendingInputRestore(app, agent, task);
@@ -14074,4 +14096,64 @@ test "eb03: restore with FIFO at snapshot path does not block and counts image n
         }
     }
     try std.testing.expect(saw_notice);
+}
+
+test "eb03: restore result is held while recovering and applied on first poll after handoff" {
+    const alloc = std.testing.allocator;
+    const restore_test_controls = @import("restore_test_controls.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("held until handoff");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+
+    // Install a tall resume projection so `pendingResumeFlow()` is active until handoff completes.
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &app.shell, 0, 1);
+    errdefer projection.deinit();
+    _ = try projection.appendRawClassified("resumed line\n", .unknown_raw);
+    try projection.finalize();
+    projection.install(&app.shell);
+
+    try app.agent().session_persistence.pending_input_restore.startQueued();
+    restore_test_controls.awaitRunning(&app.agent().session_persistence.pending_input_restore);
+
+    // Poll while handoff is still pending: result must be held, composer empty, no restore notice.
+    const notices_before = app.notices.items.len;
+    try Runtime(TestApp).pollPendingInputRestore(&app, (&app).agent());
+    try std.testing.expect(app.agent().session_persistence.pending_input_restore.isActive());
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before, app.notices.items.len);
+
+    // Clear the pending resume source to simulate handoff completion; next poll applies it at once.
+    _ = app.shell.releaseUnpaintedResumeSource(alloc);
+    try Runtime(TestApp).pollPendingInputRestore(&app, (&app).agent());
+    try std.testing.expect(!app.agent().session_persistence.pending_input_restore.isActive());
+    try std.testing.expectEqualStrings("held until handoff", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(notices_before + 1, app.notices.items.len);
 }

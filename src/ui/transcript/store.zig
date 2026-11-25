@@ -1807,9 +1807,6 @@ fn commitMutationStateWithReconciliationSource(
             requestTranscriptPaint(self);
         }
     }
-    if (comptime @hasDecl(Runtime, "releaseSupersededResumeSource")) {
-        self.releaseSupersededResumeSource(alloc);
-    }
     reconcileTranscriptAnchorAfterSourceChangeUsingSource(
         self,
         reconciliation_source,

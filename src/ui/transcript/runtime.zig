@@ -2281,47 +2281,6 @@ test "an unpainted resume flow is released, and a painted transcript keeps its f
     try std.testing.expect(unpainted.unpainted_resume_hold);
 }
 
-test "releaseSupersededResumeSource transfers borrowed recovering flow before freeing source" {
-    const alloc = std.testing.allocator;
-    const flow = "one line\n";
-    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
-    runtime.layout.cols = 40;
-    defer runtime.deinit(alloc);
-
-    const source = try source_preparation.prepareFullTranscriptViewportSource(
-        &runtime,
-        alloc,
-        try alloc.dupe(u8, flow),
-    );
-    runtime.notebook.pending_resume_source = source;
-    runtime.transcript_commit_state = .{ .recovering = .{
-        .accepted_visual_offset = 0,
-        .accepted_history_visual_offset = 0,
-        .attempt_visual_offset = 0,
-        .attempt_total_visual_rows = 1,
-        .materialized_visual_offset = 0,
-        .materialized_visual_rows = 1,
-        .materialized_flow_len = flow.len,
-        .remaining_resize_reflow_rows = 0,
-        .remaining_semantic_rows = 1,
-        .remaining_semantic_progress_rows = 1,
-        .remaining_unplanned_scroll_rows = 0,
-        .attempt_cols = 40,
-        .attempt_resize_history_row_delta = null,
-        .attempt_resize_history_committed = true,
-        .flow = source.bytes,
-        .flow_owned = false,
-        .cursor_row = 2,
-        .cursor_col = 1,
-        .document_append_committed = false,
-    } };
-
-    runtime.releaseSupersededResumeSource(alloc);
-    try std.testing.expect(runtime.notebook.pending_resume_source == null);
-    try std.testing.expect(runtime.transcript_commit_state.recovering.flow_owned);
-    try std.testing.expectEqualStrings(flow, runtime.transcript_commit_state.recovering.flow);
-}
-
 const PendingBuildProbe = struct {
     polls: usize = 0,
     pending_after: ?usize = null,
@@ -5618,28 +5577,6 @@ pub const TranscriptRuntime = struct {
         const released = self.releasePendingResumeSource(alloc);
         if (released > 0) self.unpainted_resume_hold = true;
         return released;
-    }
-
-    /// Drops `pending_resume_source` once at least one frame has painted
-    /// (`recovering` or `stable`) and a committed transcript mutation updates
-    /// `notebook.entries`, transferring `bytes` ownership if the `.recovering`
-    /// receipt still borrows them. Before the first paint (`.invalid`), the
-    /// resume flow stays until `releaseUnpaintedResumeSource` or the first frame.
-    pub fn releaseSupersededResumeSource(self: *TranscriptRuntime, alloc: Allocator) void {
-        const pending = if (self.notebook.pending_resume_source) |*source| source else return;
-        switch (self.transcript_commit_state) {
-            .invalid => return,
-            .recovering => |*receipt| {
-                if (!receipt.flow_owned and receipt.flow.ptr == pending.bytes.ptr) {
-                    pending.bytes = &.{};
-                    receipt.flow_owned = true;
-                }
-                _ = self.releasePendingResumeSource(alloc);
-            },
-            .stable => {
-                _ = self.releasePendingResumeSource(alloc);
-            },
-        }
     }
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {

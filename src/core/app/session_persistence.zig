@@ -1094,6 +1094,23 @@ pub const PendingInputRestore = struct {
         return self.state != .idle;
     }
 
+    pub fn needsFastPoll(self: *const PendingInputRestore) bool {
+        return switch (self.state) {
+            .idle => false,
+            .queued => true,
+            .running => |task| !task.done.load(.acquire),
+        };
+    }
+
+    pub fn readySessionId(self: *const PendingInputRestore) ?[]const u8 {
+        const task = switch (self.state) {
+            .running => |t| t,
+            .idle, .queued => return null,
+        };
+        if (!task.done.load(.acquire)) return null;
+        return task.session_id;
+    }
+
     /// Takes ownership of `reader`, freeing it even on allocation error.
     pub fn queue(
         self: *PendingInputRestore,

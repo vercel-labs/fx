@@ -1331,7 +1331,7 @@ const App = struct {
 
     fn pendingInputRestoreActive(self: *App) bool {
         if (comptime !host_profile.durable_sessions) return false;
-        return self.screenAgent().session_persistence.pending_input_restore.isActive();
+        return self.screenAgent().session_persistence.pending_input_restore.needsFastPoll();
     }
 
     fn processNextCooperativePrompt(self: *App, agent: *agents.Agent) !void {
@@ -4568,6 +4568,43 @@ test "focused UI workers retain a bounded native poll timeout" {
     try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, false));
     try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false, true));
     try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true, true));
+}
+
+test "poll timeout is not 1 ms while only a held restore result waits" {
+    const test_session_adapter = @import("core/session/session_adapter.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(home);
+    const ws = try std.testing.allocator.dupe(u8, home);
+    defer std.testing.allocator.free(ws);
+
+    var store = try test_session_adapter.Store.open(std.testing.allocator, home);
+    defer store.deinit(std.testing.allocator);
+    var model = "test-model".*;
+    const sess = try test_session_adapter.Session.create(std.testing.allocator, &store, ws, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+
+    var app = App{ .alloc = std.testing.allocator };
+    defer {
+        app.main_agent.session_persistence.pending_input_restore.deinit();
+        sess.close();
+        app.lifecycle_runtime.deinit();
+    }
+    try app.main_agent.session_persistence.pending_input_restore.queue(
+        sess.id(),
+        sess.pendingInputsReader(),
+    );
+    try app.main_agent.session_persistence.pending_input_restore.startQueued();
+    @import("core/app/restore_test_controls.zig").awaitRunning(&app.main_agent.session_persistence.pending_input_restore);
+
+    // The background task finished and is waiting for handoff (`isActive()` is still true).
+    try std.testing.expect(app.main_agent.session_persistence.pending_input_restore.isActive());
+    try std.testing.expect(!app.pendingInputRestoreActive());
+    try std.testing.expectEqual(@as(i32, 8), App.loopPollTimeoutMs(&app, 8));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
