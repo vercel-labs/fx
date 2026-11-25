@@ -242,7 +242,7 @@ pub const AgentsMenu = struct {
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
     names: std.ArrayList(u8) = .empty,
-    /// Backs each subagent row's state with its current call's time, such
+    /// Backs each subagent row's state with the time its turn has run, such
     /// as "working 12s". Owned.
     activities: std.ArrayList(u8) = .empty,
 
@@ -267,8 +267,8 @@ pub const AgentsMenu = struct {
 
 /// Room for an instance's name in the agent list, such as "fx 12".
 const instance_name_bytes = 24;
-/// Room for a subagent row's state with its call's time, such as
-/// "working 59m59s".
+/// Room for a subagent row's state with the time its turn has run, such
+/// as "working 59m59s".
 const activity_bytes = 32;
 
 /// What an instance is doing, as the instance list shows it, most urgent
@@ -563,8 +563,11 @@ pub const ReportPost = struct {
     idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
+    /// Who started the turn that sent a message, read while that turn ran
+    /// (`messageStartedBy`).
+    started_by: ?subagent_reports.StartedBy = null,
 
-    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
+    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
         errdefer handoff_alloc.destroy(post);
         const agent, const child_id, const work_id, const text = switch (delivery) {
@@ -589,6 +592,7 @@ pub const ReportPost = struct {
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
             .idle = delivery == .report and delivery.report.idle,
+            .started_by = if (delivery == .message) started_by else null,
         };
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
@@ -620,12 +624,12 @@ pub const ReportPost = struct {
     }
 };
 
-test "a message's hand-off keeps its own copy of what the user typed" {
+test "a message's hand-off keeps its own copy of what the user typed, and who started its turn" {
     var host: subagent_tool_host.Runtime = undefined;
     var first = "tell main hi".*;
     var second = "and bye".*;
     const lines = [_][]const u8{ &first, &second };
-    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
+    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } }, .user);
     defer post.destroy();
     // The sender's buffers change once the post is made.
     @memset(&first, 'x');
@@ -633,27 +637,32 @@ test "a message's hand-off keeps its own copy of what the user typed" {
     try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
     try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
     try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
+    try std.testing.expectEqual(@as(?subagent_reports.StartedBy, .user), post.started_by);
 }
 
 test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
     // Only the host's address is kept, so any will do.
     var host: subagent_tool_host.Runtime = undefined;
     const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
-    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } }, .user);
     defer post.destroy();
     try std.testing.expectEqual(@as(usize, 2), post.dropped);
     try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
     try std.testing.expectEqual(end, post.end);
     try std.testing.expect(!post.idle);
-    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } });
+    // Only a message carries who started its turn; a report has `end` for that.
+    try std.testing.expect(post.started_by == null);
+    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } }, null);
     defer idle.destroy();
     try std.testing.expect(idle.idle);
 }
 
 /// Queues a host's delivery for the main loop, without waiting.
-/// `AgentGone` once the app is shutting down; a report then stays owed.
-pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {
-    const post = try ReportPost.create(host, delivery);
+/// `started_by` is who started the turn that sends a message, from
+/// `messageStartedBy`; a report ignores it. `AgentGone` once the app is
+/// shutting down; a report then stays owed.
+pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) subagent_tool_host.PostReportError!void {
+    const post = try ReportPost.create(host, delivery, started_by);
     handoffs.mutex.lockUncancelable(io_mod.getIo());
     defer handoffs.mutex.unlock(io_mod.getIo());
     if (handoffs.closed) {
@@ -1975,7 +1984,7 @@ pub fn Runtime(comptime App: type) type {
                 const model = provider_runtime.modelOf(app, agent);
                 const state = stateOf(app, target);
                 const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
-                const activity_state = rowActivityState(app, subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
+                const activity_state = rowActivityState(subagent, state, now_ms, menu.activities.addManyAsArrayAssumeCapacity(activity_bytes));
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
@@ -2572,17 +2581,17 @@ pub fn Runtime(comptime App: type) type {
             return if (child) |value| &value.screen else &app.main_screen;
         }
 
-        /// A working subagent's state with its current call's time, such as
-        /// "working 12s", from its host, written into `buf`; null for any
-        /// other row.
-        fn rowActivityState(app: *App, subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
+        /// A working subagent's state with the time its turn has run, such as
+        /// "working 12m3s", written into `buf`. It reads the clock the
+        /// subagent's own status row shows, which holds while the turn waits
+        /// on the user. Null for any other row, and for a turn not timed yet.
+        fn rowActivityState(subagent: ?*ChildAgent, state: InstanceState, now_ms: i64, buf: *[activity_bytes]u8) ?[]const u8 {
             if (state != .working) return null;
             const child = subagent orelse return null;
-            const host = hostOf(app, child) orelse return null;
-            const call = host.childCall(child.id) orelse return null;
+            const seconds = activity_status.turnSeconds(child.agent.stream, now_ms) orelse return null;
             var writer = std.Io.Writer.fixed(buf);
             writer.print("{s} ", .{state.label()}) catch return null;
-            activity_status.writeElapsed(&writer, @intCast(call.runningMs(now_ms) / std.time.ms_per_s)) catch return null;
+            activity_status.writeElapsed(&writer, seconds) catch return null;
             return writer.buffered();
         }
 
@@ -2788,6 +2797,18 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// Whether the hand-off holds mail for the agent that owns `host`
+        /// (`handoffMailWaiting`), so that agent's `wait` waits for it: the
+        /// host's `ReportSink.mail_waiting_fn`, on that agent's thread.
+        pub fn hostMailWaiting(app: *App, host: *subagent_tool_host.Runtime) bool {
+            const owner = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk ownerOf(app, host) orelse return false;
+            };
+            return handoffMailWaiting(app, owner);
+        }
+
         /// The agent a subagent's delivery from `host` goes to: the host's
         /// owner, or with `from_owner` that owner's own parent. Call with
         /// `authority_mutex` held, or on the main loop.
@@ -2822,6 +2843,29 @@ pub fn Runtime(comptime App: type) type {
             receiver.worker.releaseAgentMessage();
         }
 
+        /// Who started the turn that sends a message from child `child_id`
+        /// of `host`, or from `host`'s owner when `from_owner`, as the host
+        /// that runs the sender knows it. Read on the sender's thread while
+        /// that turn runs: once the main loop takes the post, the turn may
+        /// have ended. A post made after a pass took its posts waits for the
+        /// next pass, and the same pass can handle the turn's end first
+        /// (`tests/e2e/tui-host-switch.test.ts` "a subagent's message says
+        /// the user started its turn when that turn ends before the main loop
+        /// delivers the message").
+        pub fn messageStartedBy(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool, child_id: []const u8) ?subagent_reports.StartedBy {
+            if (!from_owner) return host.turnStartedBy(child_id);
+            const sender_host, const sender = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                const owner = ownerOf(app, host) orelse return null;
+                const child = hostedOf(app, owner) orelse return null;
+                break :blk .{ hostOf(app, child) orelse return null, child };
+            };
+            // The sender is mid-call, so its agent and the host that runs it
+            // outlive this read.
+            return sender_host.turnStartedBy(sender.id);
+        }
+
         fn deliverReport(app: *App, post: *ReportPost) !void {
             const message = post.kind == .message;
             const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
@@ -2831,15 +2875,6 @@ pub fn Runtime(comptime App: type) type {
                 break :blk hostedOf(app, owner) orelse return error.AgentGone;
             } else null;
             const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
-            // Who started the turn that sent a message, from the host that
-            // runs the sender. That turn is still going: posts are taken
-            // each pass before the children's events, its end among them.
-            const started_by: ?subagent_reports.StartedBy = if (!message)
-                null
-            else if (owner_child) |child|
-                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
-            else
-                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -2852,7 +2887,7 @@ pub fn Runtime(comptime App: type) type {
                     .end = post.end,
                     .idle = post.idle,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, post.started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },
@@ -3444,9 +3479,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// A hosted subagent's tool events reach the app instead of its
-        /// turn: its current call goes to its host, for status and the agent
-        /// list, and a shell command that crossed the quiet limit is relayed
-        /// to its parent (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
+        /// turn: its current call goes to its host, for status, and a shell
+        /// command that crossed the quiet limit is relayed to its parent
+        /// (`noteChildQuiet`, `tests/tla/subagent/QuietRelay.tla`).
         pub fn noteChildToolLifecycle(app: *App, agent: *AppAgent, lifecycle: types.ToolLifecycleEvent) void {
             if (agent.role != .subagent) return;
             const child = hostedOf(app, agent) orelse return;

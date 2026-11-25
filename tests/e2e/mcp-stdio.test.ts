@@ -5839,7 +5839,7 @@ describe("fx mcp call", () => {
       tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_SAVED") && turnSettled(pane), 30_000);
       await tui.waitForComposer(10_000);
       expect(await tui.captureFullScrollback()).toContain(`└ Used ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
@@ -5939,7 +5939,7 @@ describe("fx mcp call", () => {
 
       // The session goes on.
       await tui.sendText("Go on.");
-      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_AFTER_CANCEL") && turnSettled(pane), 10_000);
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);

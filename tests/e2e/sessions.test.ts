@@ -1711,6 +1711,7 @@ test.skipIf(!tmuxAvailable())("the interactive app resumes a session with a shel
     const first = await startApp(fixture, gateway, []);
     await first.session.sendText("Run the shell command.");
     await scrollbackContains(first.session, "APP_SHELL_DONE");
+    await first.session.waitForPane(turnSettled, TIMEOUT);
     await first.session.waitForComposer(TIMEOUT);
     await quitApp(first);
     const id = onlySessionId(fixture.home);
@@ -2042,6 +2043,7 @@ test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork busy prompt two.");
     await scrollbackContains(app.session, "BUSY_PARENT_SENT");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => childHeld, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
@@ -2095,6 +2097,7 @@ async function switchAwayFromBusyChild(prefix: string, setup: string[], switchAw
     }
     await app.session.sendText("Busy sibling prompt delegate.");
     await scrollbackContains(app.session, "BUSY_SIBLING_SENT");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => childHeld, TIMEOUT);
     await app.session.waitForStableComposer();
     await switchAway(app.session);
@@ -2171,6 +2174,7 @@ test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell co
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork shell prompt two.");
     await scrollbackContains(app.session, "SHELL_PARENT_SENT");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => interactSent && processRunning(command), TIMEOUT);
     // Paces the switch so the interact call is inside its wait.
     await Bun.sleep(1000);
@@ -2232,6 +2236,7 @@ test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork stop prompt two.");
     await scrollbackContains(app.session, "STOP_PARENT_SENT");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => childHeld, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
@@ -2260,6 +2265,7 @@ test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its
     expect(await scrollbackContains(app.session, "STOP_PARENT_SENT")).toContain("STOP_PARENT_SENT");
     await app.session.sendText("Back in the stopped source.");
     await scrollbackContains(app.session, "STOP_SOURCE_ANSWER");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     await quitApp(app);
     app = undefined;
@@ -2389,6 +2395,7 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Keep prompt one.");
     await scrollbackContains(app.session, "KEEP_REPORT_1");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Keep prompt two.");
     await scrollbackContains(app.session, "KEEP_PARENT_TWO");
@@ -2406,6 +2413,7 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
       console.log(`<timeout> /new never finished while the subagent worked; screen:\n${await app.session.capturePane()}`);
       throw error;
     }
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     await quitApp(app);
     app = undefined;
@@ -2427,6 +2435,7 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     expect(childBodies.find((body) => body.includes("KEEPER_THIRD"))).toContain("KEEPER_FIRST_DONE");
     expect(new Set(childLines(fixture.home, source).map((line) => line.child)).size).toBe(1);
     await scrollbackContains(app.session, `KEEP_REPORT_${before + 1}`);
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     await quitApp(app);
     app = undefined;
@@ -2485,22 +2494,27 @@ async function startChatWithSubagents(prefix: string) {
   const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
   await app.session.sendText("Copy prompt one.");
   await scrollbackContains(app.session, "COPY_REPORT_1");
+  await app.session.waitForPane(turnSettled, TIMEOUT);
   await app.session.waitForStableComposer();
   await app.session.sendText("Copy prompt two.");
   await scrollbackContains(app.session, "COPY_PARENT_TWO");
+  await app.session.waitForPane(turnSettled, TIMEOUT);
   await app.session.waitForStableComposer();
   await app.session.sendText("Copy prompt three.");
   await scrollbackContains(app.session, "COPY_PARENT_THREE");
+  await app.session.waitForPane(turnSettled, TIMEOUT);
   const source = rootSessionIds(fixture.home)[0]!;
   // Reports of work that ends together share one turn, so wait for the work.
   await app.session.waitForPane(() => childLines(fixture.home, source).filter((line) => line.kind === "child_finished").length >= 3, TIMEOUT);
   for (let seen = -1; seen !== reports; ) {
     seen = reports;
     await scrollbackContains(app.session, `COPY_REPORT_${seen}`);
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
   }
   await app.session.sendText("Copy prompt four.");
   await scrollbackContains(app.session, "COPY_PARENT_FOUR");
+  await app.session.waitForPane(turnSettled, TIMEOUT);
   await app.session.waitForStableComposer();
   return { fixture, gateway, app, source, childBodies };
 }
@@ -2545,6 +2559,7 @@ test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made bef
     await app.session.sendKeys("C-u");
     await app.session.sendText("Use the helper in the fork.");
     await scrollbackContains(app.session, "COPY_PARENT_FORK");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     // The copy's request can come after the parent's reply.
     await app.session.waitForPane(() => childBodies.some((body) => body.includes("HELPER_FORK")), TIMEOUT);
     const forkBody = childBodies.find((body) => body.includes("HELPER_FORK"))!;
@@ -2648,10 +2663,12 @@ test.skipIf(!tmuxAvailable())("a copy of a subagent whose turn runs across the f
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Long prompt one.");
     await scrollbackContains(app.session, "LONG_PARENT_ONE");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => held, TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Long prompt two.");
     await scrollbackContains(app.session, "LONG_PARENT_TWO");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
     const runner = childLines(fixture.home, source)[0].child;
@@ -2751,6 +2768,7 @@ test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first p
     await app.session.sendKeys("C-u");
     await app.session.sendText("Twice prompt three.");
     await scrollbackContains(app.session, "TWICE_PARENT_THREE");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
 
     // Forking the fork before its first own prompt falls in the history it
@@ -4242,6 +4260,7 @@ test.skipIf(!tmuxAvailable())("the app records a subagent's repository in its ow
     const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
     await app.session.sendText("Delegate with captures from the app.");
     await scrollbackContains(app.session, "APP_PARENT_DONE");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     await quitApp(app);
     const roots = rootSessionIds(fixture.home);
@@ -4292,6 +4311,7 @@ test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and rec
     const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
     await app.session.sendText("Delegate from the app.");
     await scrollbackContains(app.session, "APP_PARENT_DONE");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     await quitApp(app);
 
@@ -4498,6 +4518,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
       await session.waitForComposer(TIMEOUT);
       await session.sendText("After detail request");
       await scrollbackContains(session, "DETAIL_AFTER");
+      await session.waitForPane(turnSettled, TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd()).toBe(true);
@@ -5635,7 +5656,7 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     await until(() => hold.started, "the held reply");
     await app.session.sendText(steering);
     await until(() => hold.cancelled, "steering to stop the held reply");
-    await app.session.waitForText("STEERED_ANSWER", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("STEERED_ANSWER") && turnSettled(pane), TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     const steered = gateway.requests[1]!.body;
     expect(steered).toContain("<user_steering>");
@@ -5693,7 +5714,7 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     await until(() => hold.cancelled, "the cancel to reach the gateway");
     await app.session.waitForComposer(TIMEOUT);
     await app.session.sendText("Confirm the next prompt still works.");
-    await app.session.waitForText("AFTER_CANCEL_ANSWER", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("AFTER_CANCEL_ANSWER") && turnSettled(pane), TIMEOUT);
     const followUp = gateway.requests[1]!.body;
     expect(countIn(followUp, "<turn_aborted>")).toBe(1);
     expect(followUp).toContain("PARTIAL_BEFORE_CANCEL");
@@ -5854,7 +5875,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     expect(childWork(fixture.home, parent)).toEqual(original);
 
     held.release("HELD_CHILD_RESULT");
-    const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
+    const reported = await tui.waitForPane((pane) => pane.includes("CHILD_COMPLETE") && turnSettled(pane), 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
     expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
@@ -5863,7 +5884,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForText("LATER_OK", 10000);
+    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
     expect(childRequests).toBe(1);
     await tui.sendText("/quit");
     await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
@@ -6662,7 +6683,7 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
         await app.session.waitForStableComposer(TIMEOUT, 300);
         await app.session.sendText("Grid second.");
         if (exit === "committed") {
-          await app.session.waitForText("GRID_SECOND_ANSWER", TIMEOUT);
+          await app.session.waitForPane((pane) => pane.includes("GRID_SECOND_ANSWER") && turnSettled(pane), TIMEOUT);
           await app.session.waitForComposer(TIMEOUT);
           await quitApp(app);
         } else if (exit === "cancelled") {

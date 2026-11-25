@@ -976,6 +976,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       HISTORY_DONE,
       config.historyTimeoutMs ?? TIMEOUT * 4,
     );
+    await session.waitForPane(turnSettled, TIMEOUT);
     // Held transcript rows settle into native scrollback on the frames
     // right after the answer completes; wait for the settled markers
     // instead of asserting one racy snapshot.
@@ -1138,6 +1139,8 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     writeMetrics();
     const finalScrollback = await waitForScrollback(session, LIVE_DONE, TIMEOUT * 2);
     expect(finalScrollback).toContain(LIVE_DONE);
+    // The reply's words show before its turn is saved.
+    await session.waitForPane(() => committedAssistantOccurrences(paths.home, LIVE_DONE) > 0, TIMEOUT * 2);
     // Terminal reset may duplicate a visible line in tmux; durable state must not.
     expect(committedAssistantOccurrences(paths.home, LIVE_DONE)).toBe(1);
     if ((config.settledCycles ?? 0) > 0) {

@@ -1472,7 +1472,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.sendKeys("Escape");
       await session.sendKeys("C-u");
       await session.sendText("Use the remaining provider.");
-      await session.waitForText("LOGOUT_GATEWAY_RESPONSE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("LOGOUT_GATEWAY_RESPONSE") && turnSettled(pane), TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForSessionEnd(TIMEOUT);
@@ -8956,7 +8956,7 @@ tmuxTest(
     expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
-    await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_CONTINUED") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(5);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
@@ -9020,7 +9020,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     await selectEnvKeyCredential(session);
     expect(gateway.requests).toHaveLength(2);
     await session.sendText("Continue the original conversation without tools.");
-    await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_RECOVERED") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
     expect(readFileSync(historyPath, "utf8")).not.toContain('"kind":"compacted"');
@@ -10501,7 +10501,7 @@ for (const outcome of ["cancel", "failure"] as const) {
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
       await session.sendText("Use the validated team.");
-      await session.waitForText("TEAM_PREPARATION_OK", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("TEAM_PREPARATION_OK") && turnSettled(pane), TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

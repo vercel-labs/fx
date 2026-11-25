@@ -2153,10 +2153,18 @@ const App = struct {
         // A message needs room where it goes; a report never does.
         const from_owner = delivery == .message and delivery.message.to == .owners_parent;
         if (delivery == .message) try AgentsAppRuntime.reserveMessagePlace(self, reporting_host, from_owner);
-        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery) catch |err| {
+        const started_by = if (delivery == .message) AgentsAppRuntime.messageStartedBy(self, reporting_host, from_owner, delivery.message.child_id) else null;
+        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery, started_by) catch |err| {
             if (delivery == .message) AgentsAppRuntime.releaseMessagePlace(self, reporting_host, from_owner);
             return err;
         };
+    }
+
+    /// The subagent host's `ReportSink.mail_waiting_fn`: whether mail that
+    /// `postSubagentReport` queued has yet to reach the owner's worker.
+    pub fn subagentMailWaiting(raw: ?*anyopaque, waiting_host: *subagent_tool_host.Runtime) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.hostMailWaiting(self, waiting_host);
     }
 
     /// The user stopped `agent`'s turn on its own screen.
@@ -3497,10 +3505,14 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
+        // Posts go first, before any agent's events, the shown one's too. A
+        // message carries who started the turn that sent it
+        // (`messageStartedBy`), so it stays right when that turn's end is
+        // handled first.
+        AgentsAppRuntime.takePosts(self);
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.
-        AgentsAppRuntime.takePosts(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);
@@ -7057,6 +7069,28 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
+test "a working subagent's row shows how long its turn has run, with no call open" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const timed = try addTestChildAgent(&app, "timed");
+    defer timed.agent.session.agent.history.deinit(alloc);
+    timed.agent.worker.worker_processing = true;
+    defer timed.agent.worker.worker_processing = false;
+    // The turn began 2m5s ago and waits on the model, so no tool call is open.
+    timed.agent.stream = .{ .active = true, .turn_started_ms = io_mod.milliTimestamp() - 125 * std.time.ms_per_s };
+    try runtime.openMenu(&app);
+    const state = try menuRowState(runtime.menuProjection(&app), "timed");
+    try std.testing.expect(std.mem.startsWith(u8, state, "working 2m"));
+}
+
 /// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
 /// through the decoder and the open list's key routing.
 fn sendTerminalBytes(app: *App, bytes: []const u8) !void {
@@ -8628,7 +8662,7 @@ fn postTestReport(app: *App, reporter: *subagent_tool_host.Runtime, output: []co
         .work_id = "w1",
         .outcome = .completed,
         .output = output,
-    } });
+    } }, null);
 }
 
 test "a report or message in the hand-off waits for its own agent until the main loop gives it to the worker" {
@@ -8656,16 +8690,106 @@ test "a report or message in the hand-off waits for its own agent until the main
     try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
 
     // A subagent's message to its parent waits in the same list for the same agent.
-    // It is left undelivered: delivering one reads its sender's host, which this
-    // test does not run (`tests/e2e/gateway-stream-lifecycle.test.ts` covers it).
+    // It is left undelivered here; "a subagent's message keeps who started its turn
+    // when the turn ends before the main loop delivers it" delivers one.
     try app_agents_runtime.postDelivery(&app.child_handoffs, &reporter, .{ .message = .{
         .to = .owner,
         .agent = "worker",
         .child_id = "c1",
         .text = "A_MESSAGE",
-    } });
+    } }, null);
     try std.testing.expect(Runtime.handoffMailWaiting(&app, &child.agent));
     try std.testing.expect(!Runtime.handoffMailWaiting(&app, &bystander.agent));
+}
+
+test "a subagent's message keeps who started its turn when the turn ends before the main loop delivers it" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    const authority = @import("core/subagent/authority.zig");
+    const model_contract = @import("core/subagent/model_contract.zig");
+    const session_language = @import("core/session/session.zig").ConversationLanguage;
+    // A subagent that answers each message at once.
+    const Child = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(a, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(_: ?*anyopaque, turn: *subagent_execution.TurnContext, message: subagent_domain.QueuedMessage, _: subagent_domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) subagent_execution.ServiceError!subagent_execution.RunOutcome {
+            if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
+            turn.commit(turn.active_work_id.?, .{ .assistant = .{
+                .user = .{ .text = message.content },
+                .assistant = @constCast("CHILD_OK"),
+            } }) catch return error.ProviderFailed;
+            return .completed;
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    // The host the subagent runs on. Its owner messages the subagent once, so
+    // the subagent exists and is idle.
+    const parent_host = try subagent_tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Child.resolve }, .{ .run_fn = Child.run });
+    defer parent_host.deinit();
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "look" } });
+    defer request.deinit(alloc);
+    _ = try parent_host.executeManaged(arena, &request, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "main-sub",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session_language.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    for (0..5000) |_| {
+        if (parent_host.quiet()) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else return error.Timeout;
+    const child_id = blk: {
+        var lock = parent_host.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try parent_host.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, registry.findPersistent("reviewer").?.id);
+    };
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // The agent that owns `parent_host` and gets the message.
+    var resolver: authority.Resolver = undefined;
+    const receiver = try addReportTarget(&app, "receiver", parent_host, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer receiver.agent.session_persistence.subagent_host = null;
+    // The subagent, run on `parent_host`, with a host of its own whose owner
+    // it is. Only that host's address is read.
+    const child = try addTestChildAgent(&app, child_id);
+    child.parent_host = parent_host;
+    var own_host: subagent_tool_host.Runtime = undefined;
+    child.agent.session_persistence.subagent_host = &own_host;
+    defer child.agent.session_persistence.subagent_host = null;
+
+    // The user types a turn on the subagent's screen, and that turn messages
+    // its parent.
+    const work_id = parent_host.beginUserWork(alloc, child_id, null) orelse return error.TestUnexpectedResult;
+    defer alloc.free(work_id);
+    try App.postSubagentReport(&app, &own_host, .{ .message = .{
+        .to = .owners_parent,
+        .agent = "",
+        .child_id = child_id,
+        .text = "HI_FROM_CHILD",
+    } });
+    // The turn ends before the main loop takes the message, as it does when
+    // the message comes after the pass took its posts and the same pass
+    // handles the turn's end.
+    parent_host.endUserWork(child_id, work_id, .completed, "");
+    App.AgentsAppRuntime.takePosts(&app);
+
+    const queued = receiver.agent.worker.queued_prompts.items;
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    try std.testing.expect(std.mem.find(u8, queued[0].prompt, "HI_FROM_CHILD") != null);
+    try std.testing.expect(std.mem.find(u8, queued[0].prompt, "\"started_by\":\"user\"") != null);
 }
 
 test "the hand-off wait waits for a report that can still join the turn, up to its bound" {
