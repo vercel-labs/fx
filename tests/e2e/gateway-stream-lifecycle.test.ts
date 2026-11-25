@@ -12320,17 +12320,28 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
   ]);
 
+  type SavedModelCall = {
+    outcome?: string;
+    effort?: string | null;
+    generation_id?: string | null;
+    failure?: string | null;
+  };
+
+  /** Every saved model_call record in a session's log, in log order. */
+  function savedModelCalls(home: string, sessionId: string): SavedModelCall[] {
+    const calls: SavedModelCall[] = [];
+    for (const line of logLines(home, sessionId) as Array<{ kind: string; type?: string; data?: SavedModelCall }>) {
+      if (line.kind === "item" && line.type === "model_call" && line.data) calls.push(line.data);
+    }
+    return calls;
+  }
+
   /** Each saved model call's record, keyed by its gateway generation id. */
   function savedCallsByGeneration(home: string, sessionId: string) {
-    const calls = new Map<string, { effort?: string | null }>();
-    const lines = logLines(home, sessionId) as Array<{
-      kind: string;
-      type?: string;
-      data?: { generation_id?: string; effort?: string | null };
-    }>;
-    for (const line of lines) {
-      if (line.kind !== "item" || line.type !== "model_call" || !line.data?.generation_id) continue;
-      calls.set(line.data.generation_id, line.data);
+    const calls = new Map<string, SavedModelCall>();
+    for (const call of savedModelCalls(home, sessionId)) {
+      if (!call.generation_id) continue;
+      calls.set(call.generation_id, call);
     }
     return calls;
   }
@@ -12485,6 +12496,54 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(calls.get(EFFORT_GEN_A)?.effort).toBe(bodies[0]!.reasoning);
     expect(calls.get(EFFORT_GEN_B)?.effort).toBe(bodies[1]!.reasoning);
   }, 40_000);
+
+  test("a refused connect before any byte is sent logs null effort and null generation id", async () => {
+    const root = createFixtureRoot("effort-logged-refused");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(() => new Response("unexpected request", { status: 500 }), {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"], reasoning_options: [{ type: "effort", values: ["low", "high"] }] }],
+    });
+    let proc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const refusedChatUrl = await refusedLoopbackUrl("/v4/ai/language-model");
+      proc = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "--effort", "high", "Answer briefly."], {
+        cwd: root.workspace,
+        env: {
+          ...envWithoutFxHome(),
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_SOUND: "0",
+          FX_GATEWAY_CHAT_URL: refusedChatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: refusedChatUrl,
+        },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const readCalls = () => {
+        try {
+          return savedSessionIds(root.home).flatMap((id) => savedModelCalls(root.home, id));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return [];
+          throw error;
+        }
+      };
+      const recorded = await waitUntil(
+        () => proc!.exitCode !== null || readCalls().some((call) => call.outcome === "failed" && call.failure === "ConnectionRefused"),
+        15_000,
+      );
+      expect(recorded).toBe(true);
+      expect(readCalls()[0]).toMatchObject({ outcome: "failed", failure: "ConnectionRefused", generation_id: null, effort: null });
+      expect(gateway.requests).toHaveLength(0);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("event=provider_admitted");
+      expect(trace).not.toContain("event=before_request_send");
+    } finally {
+      if (proc && proc.exitCode === null) proc.kill("SIGKILL");
+      await proc?.exited;
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {
     const { result, json, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-resend", [

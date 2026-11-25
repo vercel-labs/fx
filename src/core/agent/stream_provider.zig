@@ -180,8 +180,8 @@ pub const AttemptEvidence = struct {
     network_failure: ?NetworkFailureEvidence = null,
     effort: RequestEffort = .{},
 
-    pub fn sentEffort(self: *const AttemptEvidence) ?[]const u8 {
-        if (!self.provider_admitted) return null;
+    pub fn sentEffort(self: *const AttemptEvidence, delivery: DeliveryCertainty.State) ?[]const u8 {
+        if (!self.provider_admitted or delivery == .definitely_unsent) return null;
         return self.effort.slice();
     }
 };
@@ -1134,15 +1134,16 @@ test "stream provider rejects non-system instructions before serialization" {
     try std.testing.expectEqual(@as(usize, 0), builder.calls);
 }
 
-test "AttemptEvidence.sentEffort requires admission and rejects unsafe or oversized effort" {
+test "AttemptEvidence.sentEffort requires admission and possible delivery and rejects unsafe or oversized effort" {
     var evidence: AttemptEvidence = .{};
     evidence.effort.set("high");
-    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort());
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
     evidence.provider_admitted = true;
-    try std.testing.expectEqualStrings("high", evidence.sentEffort().?);
+    try std.testing.expect(evidence.sentEffort(.definitely_unsent) == null);
+    try std.testing.expectEqualStrings("high", evidence.sentEffort(.possibly_sent).?);
     const too_long: [RequestEffort.max_bytes + 1]u8 = @splat('a');
     evidence.effort.set(&too_long);
-    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort());
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
     evidence.effort.set("bad\x1b[0m");
-    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort());
+    try std.testing.expectEqual(@as(?[]const u8, null), evidence.sentEffort(.possibly_sent));
 }
