@@ -161,14 +161,6 @@ pub fn snapshot(out: []Stop) usize {
     return ring.snapshot(out);
 }
 
-/// Stops recorded this session, including any the ring no longer holds.
-pub fn total() u64 {
-    const io = io_mod.getIo();
-    mutex.lockUncancelable(io);
-    defer mutex.unlock(io);
-    return ring.total;
-}
-
 pub fn reset() void {
     const io = io_mod.getIo();
     mutex.lockUncancelable(io);
@@ -197,7 +189,6 @@ test "output limit stops keep the newest in order, cut long names, and reset" {
     }
     var stops: [ring_capacity]Stop = undefined;
     try std.testing.expectEqual(ring_capacity, snapshot(&stops));
-    try std.testing.expectEqual(@as(u64, ring_capacity + 2), total());
     try std.testing.expectEqual(@as(u64, 2), stops[0].step_id);
     try std.testing.expectEqual(@as(u64, ring_capacity + 2), stops[ring_capacity - 1].sequence);
     try std.testing.expectEqualStrings("google/gemini-4-neon", stops[0].model());
@@ -228,5 +219,4 @@ test "output limit stops keep the newest in order, cut long names, and reset" {
 
     reset();
     try std.testing.expectEqual(@as(usize, 0), snapshot(&stops));
-    try std.testing.expectEqual(@as(u64, 0), total());
 }

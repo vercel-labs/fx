@@ -343,6 +343,14 @@ const ContinuedAnswer = struct {
         self.suffix_end = 0;
     }
 
+    /// Ends the answer at tool activity: its parts stay in the turn as
+    /// replies of their own, and fx stops joining them into the final text.
+    fn endAtToolActivity(self: *ContinuedAnswer, reason: []const u8) void {
+        if (self.suffix_start == null) return;
+        debug_trace.logf("agent", "continued answer not joined: {s} ended it, so its {d} bytes stay replies of their own", .{ reason, self.text.items.len });
+        self.forget();
+    }
+
     /// The whole answer, ending with `last`, the reply that finishes it. The
     /// parts' messages and fx's notes leave `suffix` when nothing came after
     /// them, so the saved turn holds the answer once.
@@ -10866,7 +10874,7 @@ fn processQueuedPromptLoop(
             try deps.push_text(deps.ctx, .{ .operational = "\n" });
             // Tool activity ends an answer the model was continuing: its text
             // stays a reply of its own.
-            if (tool_cut) continued_answer.forget();
+            if (tool_cut) continued_answer.endAtToolActivity("a cut tool call");
             switch (action) {
                 .run_complete_calls => {
                     // The cut calls' rows settle as calls that never ran, and
@@ -10904,7 +10912,7 @@ fn processQueuedPromptLoop(
         if (output_limit_action == .end_turn) try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
         // Tool calls run in this step: an answer the model was continuing
         // ends here, and its text stays a reply of its own.
-        if (completion.tool_calls.len > 0) continued_answer.forget();
+        if (completion.tool_calls.len > 0) continued_answer.endAtToolActivity("tool calls");
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
         const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
             try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)
@@ -10930,13 +10938,10 @@ fn processQueuedPromptLoop(
             const tool_calls = calls.complete.len + calls.cut > 0;
             const blocker = try outputLimitEndNotice(arena, sent_output_limit, output_limit_cuts, tool_calls);
             // A reply cut before any tool call ends the answer it continued:
-            // the turn keeps every part, then says why it stopped.
-            var ended = completion;
-            if (!tool_calls) {
-                const answer = try continued_answer.finish(arena, partial_assistant, &within_turn_suffix);
-                if (answer.len > 0) ended.content = answer;
-            }
-            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, ended, stream_ctx.raw_text.items.len, blocker);
+            // the turn keeps every part, then says why it stopped. Only this
+            // reply's text is shown, since the earlier parts already were.
+            const earlier = if (tool_calls) "" else try continued_answer.finish(arena, "", &within_turn_suffix);
+            const assistant_text = try runtime_assistant_stream.finishLengthLimitedToolCallCompletion(deps, arena, completion, stream_ctx.raw_text.items.len, earlier, blocker);
             debug_trace.eventf("agent", "provider_completion_blocked", step_ctx, "finish_reason={s} tool_calls={d}", .{
                 finish_reason.label(),
                 completion.tool_calls.len,

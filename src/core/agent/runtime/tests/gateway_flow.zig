@@ -11476,6 +11476,35 @@ test "processQueuedPrompt ends the turn on the third reply in a row cut before a
     try std.testing.expect(std.mem.find(u8, text, "The reply reached the output limit of 32768 tokens 3 times in a row before it was complete, so fx stopped the turn.") != null);
 }
 
+test "processQueuedPrompt shows a continued answer's text once when the turn ends on cut replies with no text" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        // The part streams, as a provider's text does.
+        .{ .chunks = &.{"Alpha. "}, .content = "Alpha. ", .finish_reason = .length },
+        .{ .finish_reason = .length },
+        .{ .finish_reason = .length },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    // The part was shown when its reply streamed; the end of the turn shows
+    // only the last reply's text, which is none.
+    var shown: usize = 0;
+    for (hooks.texts.items) |text| shown += std.mem.count(u8, text, "Alpha.");
+    try std.testing.expectEqual(@as(usize, 1), shown);
+    // The saved text holds the part once, then why the turn stopped.
+    const saved = hooks.finish_assistant_text.?;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved, "Alpha."));
+    try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
+}
+
 test "processQueuedPrompt keeps a cut reply's text as its own reply once tools run after it" {
     const alloc = std.testing.allocator;
     const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};

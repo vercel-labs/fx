@@ -762,19 +762,26 @@ pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator
     try hooks.push_system_notice(hooks.ctx, line);
 }
 
-/// Shows a cut reply's text, then `blocker`, which says why its tool calls did
-/// not run, and returns the two as the turn's final text.
+/// Shows a cut reply's text, then `blocker`, which says why the turn stopped,
+/// and returns the turn's final text: `earlier`, the parts of an answer that
+/// earlier cut replies wrote and that were already shown, then the reply's
+/// text, then `blocker`.
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
     completion: types.ModelCompletion,
     streamed_content_len: usize,
+    earlier: []const u8,
     blocker: []const u8,
 ) ![]const u8 {
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
-    const rendered = if (normalized.len > 0)
-        try arena.print("{s}\n\n{s}", .{ normalized, blocker })
+    const whole = if (earlier.len == 0)
+        normalized
+    else
+        try normalizeAssistantTextForDisplay(arena, try std.mem.concat(arena, u8, &.{ earlier, completion.content orelse "" }));
+    const rendered = if (whole.len > 0)
+        try arena.print("{s}\n\n{s}", .{ whole, blocker })
     else
         blocker;
 

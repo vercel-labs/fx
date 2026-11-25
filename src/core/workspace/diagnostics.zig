@@ -63,11 +63,6 @@ pub fn snapshotOutputLimitStops(out: []OutputLimitStop) usize {
     return output_limit_metrics.snapshot(out);
 }
 
-/// Output-limit stops this session, including ones no longer kept.
-pub fn outputLimitStopTotal() u64 {
-    return output_limit_metrics.total();
-}
-
 pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
 }
