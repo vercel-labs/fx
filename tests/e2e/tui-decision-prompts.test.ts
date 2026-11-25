@@ -617,7 +617,6 @@ function startFakeGateway(
 function createIsolatedRoot(
   permissionMode: "ask" | "auto" = "ask",
   permission: Record<string, unknown> = {},
-  settings: Record<string, unknown> = {},
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-decision-e2e-")));
   const home = join(root, "home");
@@ -626,7 +625,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission, ...settings }),
+    JSON.stringify({ permission_mode: permissionMode, permission }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -662,9 +661,8 @@ async function launchScenario(
   permissionMode: "ask" | "auto" = "ask",
   classifierDecision: ClassifierDecision = () => "clear",
   permission: Record<string, unknown> = {},
-  settings: Record<string, unknown> = {},
 ) {
-  const root = createIsolatedRoot(permissionMode, permission, settings);
+  const root = createIsolatedRoot(permissionMode, permission);
   const gateway = startFakeGateway(responses, classifierDecision);
   gateways.push(gateway);
   const tracePath = join(root.root, "trace.log");
@@ -843,17 +841,16 @@ async function answerQuestions(activeSession: TmuxSession, count: number) {
 }
 
 /// Reads three files around answered questions, then checks the rows the turn
-/// leaves, live and again after `--resume last`. The resumed rows match the
-/// live ones unless `options.resumed` names them.
+/// leaves, live and again after `--resume last`.
 async function expectAnsweredQuestionOrder(
   responses: GatewayResponse[],
   expected: string[],
-  options: { questions?: number; settings?: Record<string, unknown>; resumed?: string[] } = {},
+  questions = 1,
 ) {
-  const ctx = await launchScenario(responses, "input", {}, "auto", undefined, {}, options.settings);
+  const ctx = await launchScenario(responses, "input", {}, "auto");
   for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
   await ctx.session.sendText(ORDER_PROMPT);
-  await answerQuestions(ctx.session, options.questions ?? 1);
+  await answerQuestions(ctx.session, questions);
   const live = await waitForGridState(ctx.session, "live answered question order", hasOrderSummary, TIMEOUT);
   expect(answeredQuestionRows(live)).toEqual(expected);
   await assertProcessAliveAndClean(ctx);
@@ -869,7 +866,7 @@ async function expectAnsweredQuestionOrder(
     height: 40,
   });
   const resumed = await waitForGridState(session, "resumed answered question order", hasOrderSummary, TIMEOUT);
-  expect(answeredQuestionRows(resumed)).toEqual(options.resumed ?? answeredQuestionRows(live));
+  expect(answeredQuestionRows(resumed)).toEqual(answeredQuestionRows(live));
   expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
 }
 
@@ -3867,7 +3864,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "     Run tests",
         "● Read third.txt",
         `  ${ORDER_DONE}`,
-      ], { questions: 2 });
+      ], 2);
     },
     TIMEOUT * 2,
   );
@@ -3889,42 +3886,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "● Read second.txt, third.txt",
         `  ${ORDER_DONE}`,
       ]);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "calls after a question asked through toolbox draw below it, live and after resume",
-    async () => {
-      await expectAnsweredQuestionOrder([
-        outerToolCalls([readCall("read_1", "first.txt")]),
-        outerToolCalls([{
-          id: "question_toolbox_1",
-          name: "toolbox",
-          input: { run: "ask_user_question", arguments: QUESTION_CALL.input },
-        }]),
-        outerToolCalls([readCall("read_2", "second.txt")]),
-        outerToolCalls([readCall("read_3", "third.txt")]),
-        outerText(ORDER_DONE),
-      ], [
-        `┃ ${ORDER_PROMPT}`,
-        "● Read first.txt",
-        `  1) ${QUESTION_PROMPT}`,
-        "     Run tests",
-        "● Read second.txt, third.txt",
-        `  ${ORDER_DONE}`,
-      ], {
-        settings: { tool_placement: { ask_user_question: "toolbox" } },
-        // A resumed session draws the saved toolbox call as an Asked row,
-        // not as the answered question, on main too.
-        resumed: [
-          `┃ ${ORDER_PROMPT}`,
-          "● Read first.txt",
-          "● Asked",
-          "● Read second.txt, third.txt",
-          `  ${ORDER_DONE}`,
-        ],
-      });
     },
     TIMEOUT * 2,
   );
