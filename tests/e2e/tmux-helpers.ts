@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
 
@@ -735,7 +735,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
+    const env = localCreditsEnv(requestedEnv);
 
     if (
       minimumHistoryLines !== undefined &&

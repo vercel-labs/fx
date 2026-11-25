@@ -56,6 +56,10 @@ jobs:
             echo "Tag ${TAG} missing, release needed"
           fi
 
+      - name: Check pinned provider client versions
+        if: steps.check.outputs.publish == 'true'
+        run: scripts/check-provider-versions.sh
+
   build-linux-aarch64:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'

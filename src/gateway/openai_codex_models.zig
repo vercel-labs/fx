@@ -8,7 +8,6 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
-const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
 const max_model_id_bytes: usize = 1024;
@@ -82,16 +81,7 @@ fn fetchCatalogForProvider(
         .clock = .awake,
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
-    const version = if (request_auth.credential != null)
-        version_lookup.resolve(alloc, .codex, cancel_flag, deadline) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .{ .failure = .{
-                .category = if (err == error.Cancelled) .cancellation else .transport,
-                .retryable = err != error.Cancelled,
-            } };
-        }
-    else
-        null;
+    const version: ?[]const u8 = if (request_auth.credential != null) versions.codex_client_version else null;
     const request_url = modelsUrl(alloc, version) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -224,8 +214,8 @@ const FetchOperation = struct {
     }
 };
 
-/// The models endpoint, with the Codex client version when known. Caller owns it.
-pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
+/// The models endpoint, with the Codex client version when given. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator, version: ?[]const u8) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2ECodexModelsEndpoint;
@@ -234,7 +224,7 @@ pub fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     const separator: u8 = if (std.mem.findScalar(u8, base, '?') == null) '?' else '&';
     return alloc.print(
         "{s}{c}client_version={s}",
-        .{ base, separator, compatible.slice() },
+        .{ base, separator, compatible },
     );
 }
 
@@ -371,11 +361,10 @@ test "Codex catalog parser keeps visible API models and live capabilities" {
     try std.testing.expectEqual(@as(u32, 272_000), model.context_window);
 }
 
-test "Codex catalog URL uses the resolved compatibility version" {
-    const url = try modelsUrl(std.testing.allocator, versions.Version.parse("0.999.1").?);
+test "Codex catalog URL carries the pinned client version" {
+    const url = try modelsUrl(std.testing.allocator, versions.codex_client_version);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.999.1") != null);
-    try std.testing.expect(std.mem.find(u8, url, "client_version=0.148.0") == null);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=" ++ versions.codex_client_version, url);
 }
 
 test "host-managed Codex catalog auth carries no local headers" {

@@ -44,7 +44,7 @@ const replySse =
   'data: {"type":"response.output_text.delta","output_index":0,"delta":"libfx ok"}\n\n' +
   'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":23,"output_tokens":7}}}\n\n';
 
-/** A host fetch that plays npm, Codex and OpenAI's token endpoint. */
+/** A host fetch that plays Codex and OpenAI's token endpoint. */
 function codexWorld({ rejectFirstReply = false, refreshedToken, reply = replySse }) {
   const log = [];
   let replies = 0;
@@ -54,8 +54,7 @@ function codexWorld({ rejectFirstReply = false, refreshedToken, reply = replySse
     const headers = new Headers(init.headers);
     const body = init.body === undefined ? undefined : typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body);
     log.push({ method, url, headers, body });
-    if (url === "https://registry.npmjs.org/@openai/codex/latest") return Response.json({ version: "0.162.1", name: "@openai/codex" });
-    if (url === "https://chatgpt.com/backend-api/codex/models?client_version=0.162.1") return Response.json(models);
+    if (/^https:\/\/chatgpt\.com\/backend-api\/codex\/models\?client_version=\d+\.\d+\.\d+$/.test(url)) return Response.json(models);
     if (url === "https://auth.openai.com/oauth/token" && method === "POST") {
       return Response.json({ access_token: refreshedToken, refresh_token: "rt-2", expires_in: tenDays });
     }
@@ -100,6 +99,7 @@ const assertNoSecrets = (value, secrets) => {
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "libfx ok");
   assert.equal(world.log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false, "a Codex agent must not call AI Gateway");
+  assert.equal(world.log.some((entry) => entry.url.startsWith("https://registry.npmjs.org/")), false, "the Codex client version is pinned, not looked up");
   assert.equal(world.log.some((entry) => entry.url.startsWith("https://auth.openai.com/")), false, "fresh credentials need no refresh");
   const [reply] = replyRequests(world.log);
   assert.ok(reply, "the turn must reach Codex");
