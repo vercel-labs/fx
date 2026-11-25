@@ -31,7 +31,7 @@ pub const max_slots = 16;
 pub const default_capacity: u8 = 8;
 
 /// The bridge's own registration and the shell calls it serves at once. The
-/// bridge refuses a shell call past it (`mcp_call_bridge.zig` `register`).
+/// bridge refuses a shell call past it (`bridge.zig` `register`).
 pub const max_owners = 1 + 256;
 
 /// A bearer secret the shell makes for one owner: 32 random bytes.

@@ -12,7 +12,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
-const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
+const tool_bridge = @import("../../core/tool_bridge/tool_bridge.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
@@ -68,7 +68,7 @@ const send_without_action_text = "send " ++ bash_session.wait_word ++ " without 
 
 /// The variables fx adds to every bash program. The saved state never holds
 /// them, so the session skips them by these names.
-const fx_variables = [_][]const u8{managed_execution.agent_variable} ++ mcp_call_bridge.variable_names;
+const fx_variables = [_][]const u8{managed_execution.agent_variable} ++ tool_bridge.variable_names;
 
 /// How long a call waits before it reports that the program is still running.
 pub const program_yield_ms: u32 = managed_contract.default_yield_time_ms;
@@ -264,15 +264,15 @@ fn callRun(
     // Set before the start, so a failed start never leaves an untracked program.
     session.setProgram(execution_id) catch |err| return runtimeFailure(ctx, err);
     // While this call runs, its program can reach this agent's MCP tools with
-    // `fx mcp call` (`mcp_call_bridge.zig`).
-    const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
+    // `fx mcp call` (`tool_bridge.zig`).
+    const bridge_registration: ?*tool_bridge.Registration = if (comptime tool_bridge.supported) registration: {
         const capability = ctx.mcp_call_capability orelse break :registration null;
-        break :registration mcp_call_bridge.register(capability) catch |err| {
+        break :registration tool_bridge.register(capability) catch |err| {
             traceError("bash call not registered with the bridge", err);
             break :registration null;
         };
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
+    defer if (comptime tool_bridge.supported) if (bridge_registration) |registration| tool_bridge.unregister(registration);
     const extra_environment: []const managed_execution.EnvironmentVariable = if (bridge_registration) |registration| registration.environment() else &.{};
     // A save record that a program left after it ended, with its end never
     // delivered, is this program's to report. It is taken here, just before this

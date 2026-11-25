@@ -11,7 +11,7 @@
 const std = @import("std");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const mcp_call_capability = @import("mcp_call_capability.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const core_types = @import("../shared/types.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -483,9 +483,9 @@ pub fn render(alloc: Allocator, entries: []const Entry, limits: Limits) Allocato
 
 /// How to keep a large MCP result out of the conversation, for a menu that
 /// lists MCP servers. Empty where the `fx mcp call` bridge does not exist
-/// (`mcp_call_capability.supported`), so the model is never told to use it
+/// (`tool_bridge.supported`), so the model is never told to use it
 /// there.
-pub const mcp_call_hint = if (mcp_call_capability.supported)
+pub const mcp_call_hint = if (tool_bridge.supported)
     "When an MCP tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you.\n"
 else
     "";

@@ -5229,7 +5229,7 @@ describe("MCP stdio servers", () => {
 
 // `fx mcp call` lets a command fx's shell tool runs call the session's MCP
 // tools, so a big result can go to a file and only what the command prints
-// reaches the model (`src/core/mcp_host/mcp_call_bridge.zig`).
+// reaches the model (`src/core/tool_bridge/bridge.zig`).
 describe("fx mcp call", () => {
   const bridgeRoot = (label: string, settings: Record<string, unknown> = {}, options: RootOptions = {}) => {
     const root = createRoot(label, MODERN_FIXTURE, options);

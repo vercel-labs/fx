@@ -1,11 +1,11 @@
 //! The `fx mcp call` bridge: the shell around the pure core in
-//! `mcp_call.zig`. A command that fx's shell tool runs can call the
+//! `core.zig`. A command that fx's shell tool runs can call the
 //! session's MCP tools through it, so a large result can go to a file
 //! instead of into the model's context.
 //!
 //! Each running shell call registers as an owner with its own token and
 //! lends the bridge its permission check and MCP call
-//! (`../tooling/mcp_call_capability.zig`), so a call meets the same rules,
+//! (`capability.zig`), so a call meets the same rules,
 //! prompt, review, and access as a direct one by the same agent. The bridge
 //! listens on one Unix socket in a private directory while any shell call is
 //! registered, and closes it after the last one ends.
@@ -21,9 +21,9 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const command_runner = @import("../execution/command_runner.zig");
-const capability_mod = @import("../tooling/mcp_call_capability.zig");
-const mcp_call = @import("mcp_call.zig");
-const wire = @import("mcp_call_wire.zig");
+const capability_mod = @import("capability.zig");
+const mcp_call = @import("core.zig");
+const wire = @import("wire.zig");
 
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -663,7 +663,7 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
     }
 }
 
-const client = @import("mcp_call_client.zig");
+const client = @import("../mcp_host/mcp_call_client.zig");
 
 test "a shell call's command reaches its MCP tool, and a forged token reaches nothing" {
     if (!supported) return error.SkipZigTest;

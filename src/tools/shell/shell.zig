@@ -8,7 +8,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
-const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
+const tool_bridge = @import("../../core/tool_bridge/tool_bridge.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -746,15 +746,15 @@ fn callRun(
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
     // While this call runs, its command can reach the session's MCP tools
-    // with `fx mcp call`, as this agent (`mcp_call_bridge.zig`).
-    const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
+    // with `fx mcp call`, as this agent (`tool_bridge.zig`).
+    const bridge_registration: ?*tool_bridge.Registration = if (comptime tool_bridge.supported) registration: {
         const capability = ctx.mcp_call_capability orelse break :registration null;
-        break :registration mcp_call_bridge.register(capability) catch |err| {
+        break :registration tool_bridge.register(capability) catch |err| {
             debug_trace.logf("mcp-call", "shell call not registered with the bridge err={s}", .{@errorName(err)});
             break :registration null;
         };
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
+    defer if (comptime tool_bridge.supported) if (bridge_registration) |registration| tool_bridge.unregister(registration);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,

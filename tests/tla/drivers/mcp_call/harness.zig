@@ -1,7 +1,7 @@
 //! A JSON-lines shell around the real `fx mcp call` bridge core, for the Bun
 //! drivers.
 //!
-//! Built from `src/core/mcp_host/mcp_call.zig` (or a planted-bug copy of it)
+//! Built from `src/core/tool_bridge/core.zig` (or a planted-bug copy of it)
 //! as the `mcp_call` module. `--capacity N` sets the requests the bridge holds
 //! at once (the model uses 2). On start it prints the core's zero state. Then
 //! it reads one event per line and prints one line per event:

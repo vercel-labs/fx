@@ -5458,9 +5458,7 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
-    _ = @import("core/mcp_host/mcp_call.zig");
-    _ = @import("core/mcp_host/mcp_call_wire.zig");
-    _ = @import("core/mcp_host/mcp_call_bridge.zig");
+    _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/bash_session/bash_session.zig");
     _ = @import("tools/bash/bash.zig");

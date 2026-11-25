@@ -28,7 +28,7 @@ const host = @import("../hosts/host.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
-const mcp_call_capability = @import("mcp_call_capability.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -341,8 +341,8 @@ pub const DispatchContext = struct {
     mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
     /// Lent to `fx mcp call` while this tool call runs; see
-    /// `mcp_call_capability.zig`. Only the shell tool uses it.
-    mcp_call_capability: ?mcp_call_capability.Capability = null,
+    /// `../tool_bridge/capability.zig`. Only the shell tool uses it.
+    mcp_call_capability: ?tool_bridge.Capability = null,
     /// What `toolbox {run}` runs through: the permission check and execution
     /// a direct call of the named tool gets. Valid while this call runs.
     toolbox_run: ?ToolboxRun = null,

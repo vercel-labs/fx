@@ -1,5 +1,5 @@
 //! What a running tool call lends the `fx mcp call` bridge
-//! (`src/core/mcp_host/mcp_call_bridge.zig`): the permission check and the
+//! (`bridge.zig`): the permission check and the
 //! MCP call of that tool call's own context. A shell command's `fx mcp call`
 //! therefore meets the same rules, prompt, automatic review, and MCP access
 //! as a direct call by the agent that ran the command, a subagent included.

@@ -60,7 +60,8 @@ const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
-const mcp_call_capability = @import("mcp_call_capability.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
+const mcp_call_capability = tool_bridge.capability;
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
@@ -1044,7 +1045,7 @@ fn executeRegisteredTool(
 }
 
 /// Lends this tool call's permission check and MCP call to the `fx mcp call`
-/// bridge while the call runs (`mcp_call_capability.zig`).
+/// bridge while the call runs (`../tool_bridge/capability.zig`).
 const McpCallBridgeState = struct {
     runtime: Context,
 
@@ -9087,9 +9088,9 @@ fn echoMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.Permis
     return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"description\":\"Echoes its text.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}") } };
 }
 
-const mcp_call = @import("../mcp_host/mcp_call.zig");
+const mcp_call = tool_bridge.core;
 const mcp_call_client = @import("../mcp_host/mcp_call_client.zig");
-const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
+const mcp_call_wire = tool_bridge.wire;
 
 test "a command's fx mcp call is checked against the approvals its tool call began with" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
