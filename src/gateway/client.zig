@@ -2958,8 +2958,9 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
         },
         else => |e| return e,
     };
-    // The std reader ends a short body quietly; an error status keeps its own category.
-    if (require_whole_body and response.head.status == .ok and response.head.content_encoding == .identity) {
+    // The std reader ends a short body quietly. Chunked framing wins over
+    // Content-Length (RFC 9112 6.3), and an error status keeps its own category.
+    if (require_whole_body and response.head.status == .ok and response.head.transfer_encoding == .none and response.head.content_encoding == .identity) {
         if (response.head.content_length) |expected| {
             if (body_len < expected) return error.HttpBodyCutOff;
         }
@@ -11386,6 +11387,11 @@ test "fetchWholeBodyOnOpenJob returns a plain body that matches its Content-Leng
 test "fetchWholeBodyOnOpenJob keeps the status of an error answer whose body is short" {
     const result = try fetchOneLoopbackAnswer("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"error\":", true);
     try std.testing.expectEqual(std.http.Status.service_unavailable, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob accepts a complete chunked answer whose Content-Length is wrong" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nb\r\n{\"data\":[]}\r\n0\r\n\r\n", true);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
