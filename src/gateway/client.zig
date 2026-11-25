@@ -2877,7 +2877,15 @@ pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.Fe
     std.debug.assert(options.redirect_behavior == .unhandled);
     var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
     defer opened.deinit();
-    return fetchOnRequest(&opened.request, options);
+    return fetchOnRequest(&opened.request, options, false);
+}
+
+/// Like `fetchOnOpenJob`, but a plain body shorter than its Content-Length is `error.HttpBodyCutOff`.
+pub fn fetchWholeBodyOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    var opened = try openRequestOnJob(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
+    defer opened.deinit();
+    return fetchOnRequest(&opened.request, options, true);
 }
 
 /// `std.http.Client.fetch` on a client the caller owns, without its panic on
@@ -2886,7 +2894,7 @@ pub fn fetchWithClient(client: *std.http.Client, options: std.http.Client.FetchO
     std.debug.assert(options.redirect_behavior == .unhandled);
     var req = try client.request(fetchMethod(options), try fetchUri(options), fetchRequestOptions(options));
     defer req.deinit();
-    return fetchOnRequest(&req, options);
+    return fetchOnRequest(&req, options, false);
 }
 
 fn fetchMethod(options: std.http.Client.FetchOptions) std.http.Method {
@@ -2912,7 +2920,7 @@ fn fetchRequestOptions(options: std.http.Client.FetchOptions) std.http.Client.Re
 
 /// Sends an opened request and reads its answer as `std.http.Client.fetch`
 /// does, except that a failed body read returns `bodyReadError`.
-fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchOptions, require_whole_body: bool) !std.http.Client.FetchResult {
     if (options.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = try req.sendBodyUnflushed(&.{});
@@ -2943,13 +2951,19 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+    const body_len = reader.streamRemaining(response_writer) catch |err| switch (err) {
         error.ReadFailed => {
             if (decompressError(response.head.content_encoding, &decompress)) |decoded| return decoded;
             return bodyReadError(&response);
         },
         else => |e| return e,
     };
+    // The std reader ends a short body quietly; an error status keeps its own category.
+    if (require_whole_body and response.head.status == .ok and response.head.content_encoding == .identity) {
+        if (response.head.content_length) |expected| {
+            if (body_len < expected) return error.HttpBodyCutOff;
+        }
+    }
     return .{ .status = response.head.status };
 }
 
@@ -11282,6 +11296,96 @@ test "fetchOnOpenJob returns the gzip decoder's error for a body it cannot decod
     thread.join();
     if (serve.failure) |err| return err;
     try std.testing.expectError(error.BadGzipHeader, result);
+}
+
+const short_plain_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}";
+
+/// Serves one loopback answer, then fetches it with `fetchWholeBodyOnOpenJob`
+/// when `whole_body` is set, and with `fetchOnOpenJob` otherwise.
+fn fetchOneLoopbackAnswer(answer: []const u8, whole_body: bool) !std.http.Client.FetchResult {
+    const zio = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+
+    const ServeOnce = struct {
+        server: *std.Io.net.Server,
+        answer: []const u8,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const inner_zio = io_mod.getIo();
+            const stream = self.server.accept(inner_zio) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(inner_zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(inner_zio, &read_buf);
+            var request: [16 * 1024]u8 = undefined;
+            var request_len: usize = 0;
+            while (request_len < request.len) {
+                request[request_len] = reader.interface.takeByte() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                request_len += 1;
+                if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
+            }
+
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(inner_zio, &write_buf);
+            writer.interface.writeAll(self.answer) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var serve = ServeOnce{ .server = &server, .answer = answer };
+    const thread = try std.Thread.spawn(.{}, ServeOnce.run, .{&serve});
+
+    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const options: std.http.Client.FetchOptions = .{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    };
+    const result = if (whole_body) fetchWholeBodyOnOpenJob(options) else fetchOnOpenJob(options);
+    thread.join();
+    if (serve.failure) |err| return err;
+    return result;
+}
+
+test "fetchWholeBodyOnOpenJob reports a plain body shorter than its Content-Length as cut off" {
+    try std.testing.expectError(error.HttpBodyCutOff, fetchOneLoopbackAnswer(short_plain_answer, true));
+}
+
+test "fetchOnOpenJob still returns a plain body shorter than its Content-Length" {
+    const result = try fetchOneLoopbackAnswer(short_plain_answer, false);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob returns a plain body that matches its Content-Length" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}", true);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+}
+
+test "fetchWholeBodyOnOpenJob keeps the status of an error answer whose body is short" {
+    const result = try fetchOneLoopbackAnswer("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"error\":", true);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, result.status);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
