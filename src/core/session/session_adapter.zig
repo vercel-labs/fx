@@ -15485,7 +15485,7 @@ test "eb03: recordInputAccepted assigns ids across reopen without reading old re
     try testing.expectEqualSlices(u64, &.{ id1, id3 }, pending.ids);
 }
 
-test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and has empty pendingAcceptedInputs" {
+test "eb03: fork copies lines 2..S byte-for-byte and appends input_withdrawn for pending inputs" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -15494,7 +15494,7 @@ test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and 
     defer s.close();
 
     // Turn 1: pending input_accepted before turn + delivered prompt inside turn 1.
-    _ = try s.recordInputAccepted("pending before turn 1");
+    const pending1 = try s.recordInputAccepted("pending before turn 1");
     const delivered_id = try s.recordInputAccepted("delivered turn 1");
     const user1: types.UserTurn = .{ .text = @constCast("delivered turn 1"), .input_id = delivered_id };
     try s.commitTurn(.{ .assistant = .{
@@ -15502,16 +15502,45 @@ test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and 
         .assistant = @constCast("answer 1"),
     } }, types.ConversationLanguage.default());
 
-    // Turn 2: withdrawn input before turn 2.
+    // Turn 2: withdrawn input and another pending input before turn 2.
     const withdrawn_id = try s.recordInputAccepted("withdrawn turn 2");
     try s.recordInputWithdrawn(withdrawn_id);
+    const pending2 = try s.recordInputAccepted("pending before turn 2");
     try s.commitTurn(.{ .assistant = .{
         .user = .{ .text = @constCast("turn two") },
         .assistant = @constCast("answer 2"),
     } }, types.ConversationLanguage.default());
 
     const io = io_mod.getIo();
-    for ([_]u64{ 1, 2 }) |before_turn| {
+    const src_log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", s.id(), "log.jsonl" });
+    defer testing.allocator.free(src_log_path);
+    const src_bytes = try t.tmp.dir.readFileAlloc(io, src_log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(src_bytes);
+
+    // Slice source lines 2..S up to the `before_turn`-th `turn_started`.
+    const src_line1_end = std.mem.findScalar(u8, src_bytes, '\n').? + 1;
+
+    for ([_]u64{ 1, 2, 3 }) |before_turn| {
+        var cut_end: usize = src_line1_end;
+        if (before_turn == 1) {
+            while (std.mem.findScalarPos(u8, src_bytes, cut_end, '\n')) |nl| {
+                const line = src_bytes[cut_end .. nl + 1];
+                if (std.mem.find(u8, line, "\"kind\":\"turn_started\"") != null) break;
+                cut_end = nl + 1;
+            }
+        } else {
+            var seen_commits: u64 = 0;
+            while (std.mem.findScalarPos(u8, src_bytes, cut_end, '\n')) |nl| {
+                const line = src_bytes[cut_end .. nl + 1];
+                cut_end = nl + 1;
+                if (std.mem.find(u8, line, "\"kind\":\"turn_committed\"") != null) {
+                    seen_commits += 1;
+                    if (seen_commits == before_turn - 1) break;
+                }
+            }
+        }
+        const expected_copied = src_bytes[src_line1_end..cut_end];
+
         const forked = try s.fork(testing.allocator, .{
             .before_turn = before_turn,
             .workspace = "/w",
@@ -15527,10 +15556,30 @@ test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and 
 
         const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", fork_id, "log.jsonl" });
         defer testing.allocator.free(log_path);
-        const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
-        defer testing.allocator.free(bytes);
-        try testing.expect(std.mem.find(u8, bytes, "\"input_accepted\"") == null);
-        try testing.expect(std.mem.find(u8, bytes, "\"input_delivered\"") == null);
-        try testing.expect(std.mem.find(u8, bytes, "\"input_withdrawn\"") == null);
+        const fork_bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(fork_bytes);
+
+        const fork_line1_end = std.mem.findScalar(u8, fork_bytes, '\n').? + 1;
+        try testing.expect(fork_bytes.len >= fork_line1_end + expected_copied.len);
+        try testing.expectEqualSlices(u8, expected_copied, fork_bytes[fork_line1_end .. fork_line1_end + expected_copied.len]);
+
+        const tail = fork_bytes[fork_line1_end + expected_copied.len ..];
+        var tail_withdrawn: std.ArrayList(u64) = .empty;
+        defer tail_withdrawn.deinit(testing.allocator);
+        var at: usize = 0;
+        while (std.mem.findScalarPos(u8, tail, at, '\n')) |nl| : (at = nl + 1) {
+            const line = tail[at .. nl + 1];
+            const parsed = try std.json.parseFromSlice(struct { kind: []const u8, id: ?u64 = null }, testing.allocator, line, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            try testing.expectEqualStrings("input_withdrawn", parsed.value.kind);
+            try tail_withdrawn.append(testing.allocator, parsed.value.id.?);
+        }
+        if (before_turn == 1) {
+            try testing.expectEqualSlices(u64, &.{ pending1, delivered_id }, tail_withdrawn.items);
+        } else if (before_turn == 2) {
+            try testing.expectEqualSlices(u64, &.{pending1}, tail_withdrawn.items);
+        } else {
+            try testing.expectEqualSlices(u64, &.{ pending1, pending2 }, tail_withdrawn.items);
+        }
     }
 }
