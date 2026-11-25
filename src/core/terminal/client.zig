@@ -1447,6 +1447,48 @@ fn processGoneWithin(pid: std.posix.pid_t, timeout_ms: i64) bool {
     return processGone(pid);
 }
 
+/// A named pipe that a terminal's command writes one byte to when it starts,
+/// so a test can wait on the command itself. The test holds both ends open:
+/// the command's open never blocks, and a hang-up cannot pass for the byte on
+/// either OS.
+const LaunchSignal = struct {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+
+    /// The pipe's name in its folder. The command runs in that folder, so it
+    /// names the pipe relative to its working directory, and no path, which
+    /// may hold any character, goes into a shell command.
+    const name = "launched";
+
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+
+    fn init(signal: *LaunchSignal, dir: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/" ++ name, .{dir}, 0);
+        if (fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestLaunchSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestLaunchSignalFailed;
+        errdefer _ = std.c.close(signal.read_fd);
+        signal.write_fd = std.c.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        if (signal.write_fd < 0) return error.TestLaunchSignalFailed;
+    }
+
+    fn deinit(signal: *LaunchSignal) void {
+        _ = std.c.close(signal.write_fd);
+        _ = std.c.close(signal.read_fd);
+    }
+
+    /// Blocks until the command's byte arrives, for at most `timeout_ms`.
+    fn wait(signal: *LaunchSignal, timeout_ms: i32) !void {
+        var fds = [_]std.posix.pollfd{.{ .fd = signal.read_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&fds, timeout_ms)) == 0) return error.TestLaunchSignalTimedOut;
+        var byte: [1]u8 = undefined;
+        if ((try std.posix.read(signal.read_fd, &byte)) != 1) return error.TestLaunchSignalFailed;
+    }
+};
+
 test "in-process registry starts writes to and stops a real terminal" {
     var fixture: LiveTerminalFixture = undefined;
     try fixture.init();
@@ -1520,19 +1562,29 @@ test "cancelling a start after its terminal launched closes that terminal" {
     defer fixture.deinit();
     const alloc = std.testing.allocator;
 
+    // The record file appears before the session can be found, so waiting on
+    // the session as soon as the record exists can miss it. The command's own
+    // byte comes after the session is registered, launched and its pid is
+    // recorded.
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    const command = "printf 'HELD%s\\n' START; printf x > ./" ++ LaunchSignal.name ++ "; sleep 30";
+
     try fixture.preparePersistence();
     const correlation_id = fixture.runtime.nextCorrelationId();
     // The start waits for an exit that never comes on its own, so the
     // cancel lands after the terminal launched and before the result.
     try fixture.runtime.admit(alloc, correlation_id, .{ .start = .{
         .cwd = fixture.home,
-        .command = "printf 'HELD%s\\n' START; sleep 30",
+        .command = command,
         .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
         .backend = .native,
         .return_when = .exit,
         .wait_ceiling_ms = 15_000,
         .persistence = fixture.persistence.?.view(),
     } });
+    try launched.wait(15_000);
     const session_id = try fixture.waitForOnlyRecordedSession(15_000);
     defer alloc.free(session_id);
     try fixture.waitForMatch(session_id, "HELDSTART");
