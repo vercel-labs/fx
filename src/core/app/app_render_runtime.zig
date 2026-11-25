@@ -1492,7 +1492,8 @@ pub fn Runtime(comptime App: type) type {
                     .attempt_invalidations = attempt_invalidations,
                     .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
-                const fixed_point = try render_engine.frame_fixed_point.solve(
+                const fixed_point = try presentation_shell.solveFrameWithFooterCloseReset(
+                    &app.metrics,
                     FixedPointTranscriptContext(App),
                     &fixed_point_ctx,
                     .{
@@ -1507,6 +1508,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
                     FixedPointTranscriptContext(App).resolveCandidate,
+                    footer_reservation_changed,
+                    replay_displaced_footer_history,
+                    &prepared_transcript,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
