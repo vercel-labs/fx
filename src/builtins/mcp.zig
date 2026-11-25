@@ -121,7 +121,7 @@ pub fn composeHostConfigs(
 ) Allocator.Error!void {
     var i: usize = 0;
     while (i < loaded.configs.items.len) {
-        if (!nameIn(first, loaded.configs.items[i].name)) {
+        if (!project_config.configNamePresent(first, loaded.configs.items[i].name)) {
             i += 1;
             continue;
         }
@@ -130,11 +130,6 @@ pub fn composeHostConfigs(
     }
     try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, inherited);
     try skipUnprintableNames(alloc, loaded);
-}
-
-fn nameIn(configs: []const McpServerConfig, name: []const u8) bool {
-    for (configs) |config| if (std.mem.eql(u8, config.name, name)) return true;
-    return false;
 }
 
 /// A server name a terminal can't show as is, such as one with an escape
