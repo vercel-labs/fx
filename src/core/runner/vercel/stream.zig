@@ -595,6 +595,11 @@ const CountingAllocator = struct {
 const linux_holds = builtin.os.tag == .linux;
 /// How long past its limit a real-socket connect may end, in milliseconds (V11).
 const v11_slack_ms: i64 = 2_000;
+/// Off Linux, one filler connect gets this long before it is cancelled (V11). Zig 0.17's POSIX connect
+/// panics on a timeout, so the bound is a timer that races the connect.
+const filler_bound_ns: u64 = 500 * std.time.ns_per_ms;
+/// Off Linux, a real-socket test connects at most this many fillers before it stops filling (V11).
+const max_fillers = 8;
 
 /// Holds a connect until the connect limit cancels the wait, so only the limit can end it (V11).
 fn holdUntilLimit(connect: *Connect) anyerror!Connected {
@@ -610,16 +615,67 @@ fn refuseAtOnce(connect: *Connect) anyerror!Connected {
     return error.ConnectionRefused;
 }
 
-/// Connects one filler to a listener whose accept queue is filling (V11). Linux must accept each filler. Elsewhere
-/// the kernel may refuse or reset one, and that means the queue is full already: null tells the caller to stop.
-fn connectFiller(io: std.Io, address: *const std.Io.net.IpAddress) !?std.Io.net.Stream {
-    return address.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
-        error.ConnectionRefused, error.ConnectionResetByPeer => {
-            if (linux_holds) return err;
-            return null;
-        },
-        else => return err,
+/// Runs one fallible setup step of a real-socket test (V11). A failure prints one line with the step, the error,
+/// the elapsed time and the round, then returns the error. A passing step prints nothing.
+fn setupStep(value: anytype, step: []const u8, started_ms: i64, round: ?usize) @TypeOf(value) {
+    return value catch |err| {
+        std.debug.print("V11 setup failed: step={s} error={s} elapsed_ms={d} round={?d}\n", .{ step, @errorName(err), io_mod.milliTimestamp() - started_ms, round });
+        return err;
     };
+}
+
+const FillerEvent = union(enum) {
+    connected: std.Io.net.IpAddress.ConnectError!std.Io.net.Stream,
+    bound: void,
+};
+
+fn connectTask(io: std.Io, address: *const std.Io.net.IpAddress) std.Io.net.IpAddress.ConnectError!std.Io.net.Stream {
+    return address.connect(io, .{ .mode = .stream });
+}
+
+fn boundTask(ns: u64) void {
+    io_mod.sleep(ns);
+}
+
+/// Connects one filler off Linux, within `filler_bound_ns` (V11). The connect races a timer, and the loser is
+/// cancelled. Null means the filler failed or hit its bound, so the queue is full and the caller stops.
+fn boundedFiller(io: std.Io, address: *const std.Io.net.IpAddress) !?std.Io.net.Stream {
+    var buffer: [2]FillerEvent = undefined;
+    var select: std.Io.Select(FillerEvent) = .init(io, &buffer);
+    try select.concurrent(.connected, connectTask, .{ io, address });
+    try select.concurrent(.bound, boundTask, .{filler_bound_ns});
+    const first = try select.await();
+    var filler: ?std.Io.net.Stream = switch (first) {
+        .connected => |result| result catch null,
+        .bound => null,
+    };
+    while (select.cancel()) |item| switch (item) {
+        .connected => |late| {
+            if (filler == null) filler = late catch null;
+        },
+        .bound => {},
+    };
+    return filler;
+}
+
+/// Fills the accept queue of `address` for a V11 test. Linux connects two fillers strictly, so a failure fails
+/// the test. Elsewhere it connects up to `max_fillers` bounded fillers and stops at the first one that fails or
+/// hits its bound, because then the queue is full. The caller closes what is left in `fillers`.
+fn fillAcceptQueue(io: std.Io, address: *const std.Io.net.IpAddress, fillers: *[max_fillers]?std.Io.net.Stream, t0: i64) !void {
+    if (linux_holds) {
+        fillers[0] = try setupStep(address.connect(io, .{ .mode = .stream }), "filler 1", t0, null);
+        fillers[1] = try setupStep(address.connect(io, .{ .mode = .stream }), "filler 2", t0, null);
+        return;
+    }
+    for (fillers) |*slot| {
+        slot.* = (try setupStep(boundedFiller(io, address), "bounded filler", t0, null)) orelse return;
+    }
+}
+
+fn closeFillers(io: std.Io, fillers: *[max_fillers]?std.Io.net.Stream) void {
+    for (fillers) |*slot| {
+        if (slot.*) |*stream| stream.close(io);
+    }
 }
 
 /// The V11 bound for a connect that a real kernel answers: it ends as ConnectTimeout or TransportFailed,
@@ -763,18 +819,17 @@ test "real sockets: a connect to a full accept queue ends by its limit (V11)" {
     // Linux holds the connect until its limit ends it, and the test checks that exactly. Elsewhere the
     // kernel may answer differently, so the test checks only the bound.
     const io = std.testing.io;
-    const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true });
+    const t0 = io_mod.milliTimestamp();
+    const any = try setupStep(std.Io.net.IpAddress.parse("127.0.0.1", 0), "parse address", t0, null);
+    var listener = try setupStep(any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true }), "listen", t0, null);
     defer listener.deinit(io);
     const target = listener.socket.address;
-    var first = try connectFiller(io, &target);
-    defer if (first) |*stream| stream.close(io);
-    // A refused first filler means the queue is full already, so no second filler is needed.
-    var second = if (first != null) try connectFiller(io, &target) else null;
-    defer if (second) |*stream| stream.close(io);
+    var fillers: [max_fillers]?std.Io.net.Stream = @splat(null);
+    defer closeFillers(io, &fillers);
+    try fillAcceptQueue(io, &target, &fillers, t0);
 
     var buffer: [64]u8 = undefined;
-    const base = try loopbackBase(&buffer, target.getPort());
+    const base = try setupStep(loopbackBase(&buffer, target.getPort()), "base url", t0, null);
     var cancel = std.atomic.Value(bool).init(false);
     var capture: credentials.CaptureTrace = .{};
     const started = io_mod.milliTimestamp();
@@ -1030,24 +1085,23 @@ test "real sockets: a connect to a full accept queue ends by its limit, 50 times
     // Two connections fill the accept queue. Linux holds each later connect until its limit ends it, and the
     // test checks that exactly. Elsewhere each connect only has to end by its limit.
     const io = std.testing.io;
-    const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true });
+    const t0 = io_mod.milliTimestamp();
+    const any = try setupStep(std.Io.net.IpAddress.parse("127.0.0.1", 0), "parse address", t0, null);
+    var listener = try setupStep(any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true }), "listen", t0, null);
     defer listener.deinit(io);
     const held = listener.socket.address;
-    var filler_a = try connectFiller(io, &held);
-    defer if (filler_a) |*stream| stream.close(io);
-    // A refused first filler means the queue is full already, so no second filler is needed.
-    var filler_b = if (filler_a != null) try connectFiller(io, &held) else null;
-    defer if (filler_b) |*stream| stream.close(io);
+    var fillers: [max_fillers]?std.Io.net.Stream = @splat(null);
+    defer closeFillers(io, &fillers);
+    try fillAcceptQueue(io, &held, &fillers, t0);
     var held_buffer: [64]u8 = undefined;
-    const held_base = try loopbackBase(&held_buffer, held.getPort());
+    const held_base = try setupStep(loopbackBase(&held_buffer, held.getPort()), "held base url", t0, null);
 
     var server: test_server.Server = .{ .replies = &.{.{ .body = "{\"ok\":true}" }} };
-    try server.listen();
-    try server.start();
+    try setupStep(server.listen(), "test server listen", t0, null);
+    try setupStep(server.start(), "test server start", t0, null);
     defer server.close();
     var buffer: [64]u8 = undefined;
-    const base = try loopbackBase(&buffer, server.port());
+    const base = try setupStep(loopbackBase(&buffer, server.port()), "server base url", t0, null);
     var cancel = std.atomic.Value(bool).init(false);
     var capture: credentials.CaptureTrace = .{};
 
@@ -1068,11 +1122,11 @@ test "real sockets: a connect to a full accept queue ends by its limit, 50 times
         } else {
             try expectEndedByLimit(result, round_elapsed, 50, capture.captured(), round);
         }
-        const response = try callBuffered(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
+        const response = try setupStep(callBuffered(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
             .step = "user",
             .method = .GET,
             .path = "/v2/user",
-        });
+        }), "between-round call", t0, round);
         response.deinit(std.testing.allocator);
     }
     try expectOpenJobsDone();
