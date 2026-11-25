@@ -464,7 +464,7 @@ test "approval wheel keeps scrolling a committed command review after review syn
         .document_scrollable = true,
     });
 
-    try std.testing.expect(!try app.agent().approval_prompt.syncReview(alloc, null));
+    try std.testing.expect(!app.agent().approval_prompt.adoptReview(alloc, null, null, null));
     try ApprovalRuntime(WheelApp).handleApprovalWheel(&app, (&app).agent(), .up);
     try std.testing.expectEqual(@as(usize, 3), app.approval_screen.document_scroll_rows);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));

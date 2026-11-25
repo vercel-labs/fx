@@ -63,23 +63,22 @@ async function waitForSelected(session: TmuxSession, name: string, ms = 10_000):
 // moment after the parent's turn shows it did.
 async function showNamedAgent(session: TmuxSession, name: string) {
   const deadline = Date.now() + 30_000;
-  for (;;) {
-    await session.sendKeys("C-x");
-    await session.waitForText(LIST_HINT, 10_000);
-    const rows = agentRows(await session.capturePaneEscapes());
-    const from = rows.findIndex((row) => row.selected);
-    const to = rows.findIndex((row) => row.name === name);
-    if (to >= 0) {
-      for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
-      await session.sendKeys("Enter");
-      await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
-      return;
-    }
-    await session.sendKeys("Escape");
-    await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
-    if (Date.now() > deadline) throw new Error(`no ${name} row in the agent list`);
-    await Bun.sleep(100);
-  }
+  await session.sendKeys("C-x");
+  await session.waitForText(LIST_HINT, 10_000);
+  // The list redraws as agents come, so its pane is the signal that a row a
+  // parent started a moment ago is drawn.
+  await session.waitForPane(
+    (value) => agentRows(value).some((row) => row.name === name),
+    Math.max(1, deadline - Date.now()),
+  );
+  const pane = await session.capturePaneEscapes();
+  const rows = agentRows(pane);
+  const from = rows.findIndex((row) => row.selected);
+  const to = rows.findIndex((row) => row.name === name);
+  if (from < 0 || to < 0) throw new Error(`no ${name} row in the agent list:\n${pane}`);
+  for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
+  await session.sendKeys("Enter");
+  await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
 }
 
 // Opens the agent list and selects the row `name` that follows `anchor`, for a

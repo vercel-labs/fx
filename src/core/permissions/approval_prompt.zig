@@ -148,32 +148,48 @@ pub const ApprovalPrompt = struct {
         self.decision.setConfirmationOnly(true);
     }
 
-    /// Copies the review once per request, because the call that built it frees
-    /// it as soon as its tool call ends (`tests/tla/subagent/TuiParentApproval.tla`
+    /// Whether the prompt already holds a copy of `source` as the review for
+    /// `request_id`, so the caller needs no new copy for it.
+    pub fn reviewCopyMatches(
+        self: *const ApprovalPrompt,
+        request_id: u64,
+        source: ?*const diff_mod.FileReview,
+    ) bool {
+        return self.review_request_id == request_id and self.review_source == source;
+    }
+
+    /// Takes `review` as the prompt's own copy of the file review for
+    /// `request_id`, which it frees when it clears; `source` only tells one
+    /// review from another. The caller hands the copy over even when the
+    /// prompt cannot keep it, which happens once the request is gone or names
+    /// no file. Pass no request id and no review to clear what it holds.
+    /// Returns whether the prompt's review changed. The copy comes from the
+    /// worker, made under its lock (`WorkerRuntime.copyPendingReview`),
+    /// because the tool call that built the review frees it as soon as its
+    /// request is answered (`tests/tla/subagent/TuiParentApproval.tla`
     /// NoStalePrompt).
-    pub fn syncReview(
+    pub fn adoptReview(
         self: *ApprovalPrompt,
         alloc: Allocator,
-        review: ?*const diff_mod.FileReview,
-    ) Allocator.Error!bool {
-        const request = self.request orelse {
-            const changed = self.review != null or self.review_request_id != 0;
-            self.clearReview(alloc);
-            return changed;
-        };
-        if (request.file == null) {
+        request_id: ?u64,
+        source: ?*const diff_mod.FileReview,
+        review: ?diff_mod.OwnedReview,
+    ) bool {
+        var incoming = review;
+        const keeps = if (request_id) |id|
+            if (self.request) |request| request.file != null and request.id == id else false
+        else
+            false;
+        if (!keeps) {
+            if (incoming) |*owned| owned.deinit(alloc);
             const changed = self.review != null or self.review_request_id != 0;
             self.clearReview(alloc);
             return changed;
         }
-
-        if (self.review_source == review and self.review_request_id == request.id) return false;
         self.clearReview(alloc);
-        if (review) |source| {
-            self.review = try diff_mod.OwnedReview.init(alloc, source);
-            self.review_source = source;
-            self.review_request_id = request.id;
-        }
+        self.review = incoming;
+        self.review_source = source;
+        self.review_request_id = if (incoming == null) 0 else request_id.?;
         return true;
     }
 
@@ -317,7 +333,7 @@ test "approval prompt keeps full review request-bound" {
         .file = approvalFileRequest(approvalPreview()),
     };
     try std.testing.expect(try prompt.syncRequest(alloc, request_a));
-    try std.testing.expect(try prompt.syncReview(alloc, &review));
+    try std.testing.expect(prompt.adoptReview(alloc, request_a.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     // The prompt keeps its own copy, so the review can go with the tool call
     // that built it and the prompt still reads the same rows.
     try std.testing.expect(prompt.currentReview() != &review);
@@ -352,7 +368,7 @@ test "approval projection borrows immutable active state" {
         .label = "edit_file note.txt",
         .file = approvalFileRequest(approvalPreview()),
     }));
-    try std.testing.expect(try prompt.syncReview(alloc, &review));
+    try std.testing.expect(prompt.adoptReview(alloc, 41, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     const kept_rows = prompt.currentReview().?.rowCount();
     // The projection reads the prompt's own copy, so it outlives the review the
     // tool call built.
@@ -386,7 +402,7 @@ test "command approval ignores absent file review" {
         .label = "shell.run printf '%s' command-review",
     }));
 
-    try std.testing.expect(!try prompt.syncReview(alloc, null));
+    try std.testing.expect(!prompt.adoptReview(alloc, null, null, null));
     try std.testing.expect(prompt.review == null);
     try std.testing.expectEqual(@as(u64, 0), prompt.review_request_id);
 }

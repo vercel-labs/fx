@@ -2605,6 +2605,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     async () => {
       const approved = held();
       let noteSeen = false;
+      let waitingRow = "";
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           if (!body.includes('"child_write"')) {
@@ -2619,6 +2620,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         if (body.includes("I wait for your approval to run") && !body.includes('"main_approve"')) {
           noteSeen = true;
+          // Main's team row for the writer, whose turn main started, while
+          // main answers its request.
+          waitingRow = teamRow(body, "writer");
           await approved.promise;
           return toolCall("main_approve", "subagent", { action: "approve", agent: "writer" });
         }
@@ -2639,6 +2643,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(pane).not.toContain("needs approval");
         expect(pane).not.toContain("needs permission");
       }, writeSpikeWriter);
+      // The registry still says the writer waits for the approval, since main
+      // started its turn and answers it.
+      expect(waitingRow).toContain("- writer: waiting for an approval when this turn started.");
     },
     TIMEOUT,
   );

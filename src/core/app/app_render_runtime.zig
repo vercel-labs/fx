@@ -6104,7 +6104,7 @@ test "core.app_render_runtime file approval returns to the preserved inline skil
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6197,7 +6197,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_a,
     ));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6233,7 +6233,7 @@ test "core.app_render_runtime file approvals commit the alternate screen for eac
         alloc,
         request_b,
     ));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try std.testing.expect(!approval_screen.fileApprovalAffirmativeReady(
         &app.shell,
@@ -6325,7 +6325,7 @@ test "core.app_render_runtime restores file review before rendering a generic ap
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, file_request));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.first_frame);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6543,7 +6543,7 @@ test "core.app_render_runtime file approval takes over the full transcript alter
     try app.shell.writeTranscript(alloc, &app.metrics, "prior transcript\n", true);
     try app_lifecycle.openFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
 
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
@@ -6667,7 +6667,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     var review = try diff_mod.FileReview.init(alloc, "", "pending\n");
     defer review.deinit(alloc);
     try std.testing.expect(try app.agent().approval_prompt.syncRequest(alloc, request));
-    try std.testing.expect(try app.agent().approval_prompt.syncReview(alloc, &review));
+    try std.testing.expect(app.agent().approval_prompt.adoptReview(alloc, app.agent().approval_prompt.request.?.id, &review, try diff_mod.OwnedReview.init(alloc, &review)));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app, (&app).agent());
     try std.testing.expect(app.terminal.fileApprovalScreenActive());

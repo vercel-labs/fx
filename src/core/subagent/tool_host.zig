@@ -12247,6 +12247,6 @@ test "a stop or close with nothing waiting refuses nothing" {
     _ = try t.runtime.stopChild(t.arena(), "reviewer");
     try std.testing.expect(t.worker.decision == null);
     // The close's own result is not what this test reads.
-    _ = t.runtime.closeChild("child-1", .parent) catch {};
+    _ = try t.runtime.closeChild("child-1", .parent);
     try std.testing.expect(t.worker.decision == null);
 }
