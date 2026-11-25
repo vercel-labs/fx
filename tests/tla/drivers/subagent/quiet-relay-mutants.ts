@@ -81,7 +81,7 @@ const mutants: Mutant[] = [
     to: "const masked = searched;",
   },
   {
-    name: "row-hides-call-time",
+    name: "row-hides-turn-time",
     file: "src/core/app/app_agents_runtime.zig",
     from: "            return writer.buffered();\n",
     to: "            return null;\n",
@@ -104,7 +104,7 @@ const unitFilters = [
 const commands: Array<{ name: string; argv: string[]; cwd: string }> = [
   { name: "unit", argv: ["zig", "build", "quiet-relay-unit", ...unitFilters.map((f) => `-Dquiet-relay-filter=${f}`)], cwd: REPO_ROOT },
   { name: "fx ask E2E", argv: ["bun", "test", "./gateway-stream-lifecycle.test.ts", "-t", "quiet subagent command wakes|relayed again"], cwd: join(REPO_ROOT, "tests", "e2e") },
-  { name: "agent list tmux", argv: ["bun", "test", "./tui-host-switch.test.ts", "-t", "row keeps its title and shows its call's time"], cwd: join(REPO_ROOT, "tests", "e2e") },
+  { name: "agent list tmux", argv: ["bun", "test", "./tui-host-switch.test.ts", "-t", "row keeps its title and shows how long its turn has run"], cwd: join(REPO_ROOT, "tests", "e2e") },
 ];
 
 const buildFile = join(REPO_ROOT, "build.zig");

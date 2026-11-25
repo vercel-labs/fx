@@ -5618,7 +5618,7 @@ pub fn Runtime(comptime App: type) type {
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
-                host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
+                host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport, .mail_waiting_fn = App.subagentMailWaiting };
                 // A subagent's own host can message the subagent's parent,
                 // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
