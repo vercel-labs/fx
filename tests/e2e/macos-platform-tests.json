@@ -4,6 +4,8 @@
   "gateway-stream-lifecycle.test.ts",
   "mcp-auth.test.ts",
   "oauth-keychain-migration.test.ts",
+  "runner.test.ts",
+  "sandbox-provider.test.ts",
   "sessions.test.ts",
   "tui-auth-source-selection.test.ts",
   "tui-command-permissions.test.ts",

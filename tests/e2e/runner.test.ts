@@ -1935,7 +1935,8 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
   let runRoot: string;
   let runner: RemoteSetupFixture;
   beforeAll(() => {
-    runRoot = mkdtempSync(join(tmpdir(), "fx-runner-e2e-"));
+    // macOS keeps $TMPDIR under the /var symlink, and the runner refuses a state path with a symlink in it.
+    runRoot = realpathSync(mkdtempSync(join(tmpdir(), "fx-runner-e2e-")));
     runner = startRemoteSetupFixture({ macRoots: [runRoot] });
   });
   afterAll(() => {
@@ -2363,7 +2364,7 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     writeFileSync(join(repo, ".gitignore"), "zig-out/\n");
     const result = await spawnRemote(
       repo,
-      "mkdir -p zig-out/bin zig-out/other && echo app > zig-out/bin/fx && touch -d @1000000000 zig-out/bin/fx && echo x > zig-out/other/x",
+      "mkdir -p zig-out/bin zig-out/other && echo app > zig-out/bin/fx && TZ=UTC touch -t 200109090146.40 zig-out/bin/fx && echo x > zig-out/other/x",
       [],
       ["zig-out/bin"],
     ).result;
@@ -2459,11 +2460,16 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     const before = runner.api.log.length;
     const run = spawnRemote(repo, "mkdir -p zig-out/bin && echo app > zig-out/bin/fx && sleep 2", [], ["zig-out/bin"]);
     await waitFor(() => execsSince(before) >= 1);
-    // Another process holds the state folder's lock while the command ends. The bring-back waits 60 s, then gives up.
+    // Another process holds the state folder's lock (flock(2), the lock the product takes) while the command ends.
+    // The bring-back waits 60 s, then gives up. The holder prints once it holds the lock, and the test waits for that.
     const lockPath = join(stateOf(repo), "lock");
     writeFileSync(lockPath, "", { mode: 0o600 });
-    const holder = spawn("flock", ["-x", lockPath, "-c", "sleep 75"], { stdio: "ignore" });
+    const holder = spawn("perl", ["-MFcntl=:flock", "-e", '$| = 1; open my $fh, ">>", $ARGV[0] or die; flock($fh, LOCK_EX) or die; print "locked\\n"; sleep 75;', lockPath], { stdio: ["ignore", "pipe", "ignore"] });
     children.push(holder);
+    await new Promise<void>((resolve) => {
+      holder.stdout?.once("data", () => resolve());
+      holder.once("exit", () => resolve());
+    });
     const timedOut = await run.result;
     expect(timedOut.stderr).not.toContain(ranLine(1));
     expect(existsSync(join(repo, "zig-out", "bin", "fx"))).toBe(false);

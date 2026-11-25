@@ -166,6 +166,13 @@ jobs:
         run: bun install --frozen-lockfile
         working-directory: tests/e2e
 
+      # The fake Vercel API runs the sandbox scripts with GNU find, GNU coreutils and bash 4.4, as the Linux sandbox has them.
+      # Each of the two shards runs one of runner.test.ts and sandbox-provider.test.ts, so both need them.
+      - name: Install the GNU tools the runner E2E files need
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install --quiet bash coreutils findutils
+
       - name: Run this shard of the macOS platform E2E files
         working-directory: tests/e2e
         shell: bash

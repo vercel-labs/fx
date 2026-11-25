@@ -282,6 +282,14 @@ jobs:
         run: bun install --frozen-lockfile
         working-directory: tests/e2e
 
+      # The fake Vercel API runs the sandbox scripts with GNU find, GNU coreutils and bash 4.4, as the Linux sandbox has them.
+      # Only the jobs that run verify-runner or verify-sandbox-provider need them.
+      - name: Install the GNU tools the runner E2E files need
+        if: contains(matrix.scenarios, 'verify-runner') || contains(matrix.scenarios, 'verify-sandbox-provider')
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install --quiet bash coreutils findutils
+
       - name: Download candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

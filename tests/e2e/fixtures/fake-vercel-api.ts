@@ -44,6 +44,43 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, 
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 
+// The sandbox's scripts need GNU find, xargs, dirname and realpath, and bash 4 or later, as the Linux sandbox has them.
+// On a Mac the fake puts Homebrew's copies first, for its own commands only, when Homebrew has them.
+const homebrewSandboxTools = [
+  "/opt/homebrew/opt/findutils/libexec/gnubin",
+  "/opt/homebrew/opt/coreutils/libexec/gnubin",
+  "/opt/homebrew/bin",
+];
+
+function sandboxPath(): string {
+  return [...homebrewSandboxTools.filter((dir) => existsSync(dir)), process.env.PATH ?? "/usr/bin:/bin"].join(":");
+}
+
+const sandboxToolsMessage =
+  "the fake sandbox needs GNU findutils, GNU coreutils and bash 4.4 or later on this host: brew install bash coreutils findutils";
+// The calls the sandbox scripts make, with the flags they use.
+const sandboxToolsProbe =
+  "find . -maxdepth 0 -printf '' >/dev/null && find -files0-from /dev/null -maxdepth 0 >/dev/null && " +
+  "dirname -z -- / >/dev/null && realpath -m -z --relative-to=/ / >/dev/null && " +
+  "declare -A seen=() && mapfile -d '' -t list < /dev/null";
+let sandboxToolsChecked = false;
+
+function sandboxToolsReady(): boolean {
+  try {
+    return Bun.spawnSync(["bash", "-c", sandboxToolsProbe], { env: { PATH: sandboxPath() }, stdin: "ignore" }).exitCode === 0;
+  } catch {
+    // bash itself is missing from the sandbox PATH, so the tools are missing too.
+    return false;
+  }
+}
+
+// On a host that is not Linux, stop at once when the sandbox scripts' tools are missing, not later in a bring-back.
+function requireSandboxTools(): void {
+  if (process.platform === "linux" || sandboxToolsChecked) return;
+  if (!sandboxToolsReady()) throw new Error(sandboxToolsMessage);
+  sandboxToolsChecked = true;
+}
+
 export type FakeVercelUser = { id: string; username: string; email: string };
 export type FakeVercelTeam = { id: string; slug: string; name: string };
 export type FakeVercelProject = { id: string; name: string; createdAt: number };
@@ -399,6 +436,7 @@ function classify(body: CommandBody, args: string[]): FakeVercelCommandKind {
 }
 
 export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
+  requireSandboxTools();
   const privateRoot = resolve(options.privateRoot);
   const macRoots = [...(options.macRoots ?? [])].map((root) => resolve(root)).sort((a, b) => b.length - a.length);
   for (const root of macRoots) {
@@ -560,7 +598,8 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
       end(0);
       return state;
     }
-    const env: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, LANG: "C.UTF-8" };
+    // bsdtar on macOS adds AppleDouble ._ entries for files with extended attributes; the Linux sandbox has none.
+    const env: Record<string, string> = { PATH: sandboxPath(), HOME: home, LANG: "C.UTF-8", COPYFILE_DISABLE: "1" };
     if (body.env && typeof body.env === "object") {
       for (const [name, value] of Object.entries(body.env as Record<string, unknown>)) {
         if (typeof value === "string") env[name] = value;
@@ -1313,7 +1352,8 @@ async function selfTest(): Promise<number> {
     check("the new session runs commands", (await readLines(await exec(session, "exit 0"))).at(-1)?.command?.exitCode === 0);
 
     // Bring back: real, then hostile.
-    const bringBack = "touch -d '2000-01-01' .git/fx-stamp-r1 && touch back.txt && " +
+    // touch -t is the form BSD and GNU touch both accept; touch -d is GNU only.
+    const bringBack = "touch -t 200001010000 .git/fx-stamp-r1 && touch back.txt && " +
       "find . -newer .git/fx-stamp-r1 ! -path './.git/*' -type f -print0 | tar -cz --null -T - | base64 -w0";
     const real = await readLines(await exec(session, bringBack));
     const realNames = tarEntries(Buffer.from(output(real, "stdout"), "base64")).map((item) => item.name).sort();
