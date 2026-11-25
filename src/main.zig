@@ -1912,6 +1912,11 @@ const App = struct {
         try self.mcp.runVerbs(io_mod.homeDir() orelse "", self.workspace_root, rest);
     }
 
+    /// From any thread: a warning for the notice row, such as a question fx declined.
+    pub fn addMcpHostNotice(self: *App, text: []const u8) void {
+        self.mcp.addHostWarning(text);
+    }
+
     pub fn takeMcpHostNotices(self: *App) []app_mcp_runtime.State.HostNotice {
         return self.mcp.takeHostNotices();
     }
