@@ -9556,13 +9556,14 @@ async function launchFx(
   gateway: ReturnType<typeof startFakeGateway>,
   args: string,
   name: string,
+  env: Record<string, string> = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   writeFileSync(stderrPath, "");
   const session = await TmuxSession.create({
     cmd: `${FX_BIN} ${args}`.trim(),
     cwd: fixture.workspace,
-    env: gatewayEnv(fixture.home, gateway),
+    env: { ...gatewayEnv(fixture.home, gateway), ...env },
     stderrPath,
     width: 100,
     height: 32,
@@ -9629,8 +9630,8 @@ test.skipIf(!tmuxAvailable())(
 );
 
 /// A gateway that holds every request for `prompt` and its resumes, so each
-/// launch dies with a send in flight, and answers other requests.
-function holdingGateway(prompt: string) {
+/// launch dies with a send in flight, and answers other requests with `other`.
+function holdingGateway(prompt: string, other: (body: string) => Response = () => fakeGatewayFinalText("UNRELATED")) {
   let notify: () => void = () => {};
   let held = 0;
   const gateway = startDynamicFakeGateway(async (body) => {
@@ -9639,7 +9640,7 @@ function holdingGateway(prompt: string) {
       notify();
       return new Promise<Response>(() => {});
     }
-    return fakeGatewayFinalText("UNRELATED");
+    return other(body);
   });
   const heldAtLeast = async (count: number) => {
     const deadline = Date.now() + TIMEOUT;
@@ -9767,6 +9768,72 @@ test.skipIf(!tmuxAvailable())(
       expect(replayed).toContain("Resuming the interrupted request");
       expect(replayed).not.toContain(RESUME_NOTE);
       expect(readFileSync(last.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+/// The gateway's answer to a request that has no credit left to run on.
+function outOfCredits(): Response {
+  return new Response(JSON.stringify({
+    error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+}
+
+test.skipIf(!tmuxAvailable())(
+  "an Enter that reaches no waiting request does not answer a later request's question",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-early-enter-");
+    let payments = 0;
+    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.", (body) => {
+      if (!body.includes("Pay me.")) return fakeGatewayFinalText("UNRELATED");
+      payments += 1;
+      return payments === 1 ? outOfCredits() : fakeGatewayFinalText("PAID_ANSWER_5521");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      // Two crashes with the send in flight, so the next resume asks first.
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Crash me.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGKILL");
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGKILL");
+
+      // "1" picks the picker's retry, and the Enter right after it reaches
+      // the composer while the status still says the request waits.
+      const tracePath = join(fixture.root, "third-trace.log");
+      const third = await launchFx(fixture, gateway, "", "third", { FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "recovery" });
+      active = third.session;
+      await active.sendText("Pay me.");
+      await active.waitForPane(
+        (pane) => pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"),
+        TIMEOUT,
+      );
+      await active.sendKeys("1 Enter");
+      await active.waitForText("PAID_ANSWER_5521", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(payments).toBe(2);
+
+      // The crashed request, resumed in the same fx, still asks first.
+      await active.sendText("/resume");
+      await waitForSessionPicker(active);
+      await active.sendKeys("Enter");
+      await active.waitForText("This request crashed fx twice · Enter to retry, Esc to cancel", TIMEOUT);
+      expect(held()).toBe(2);
+      // The user's own Enter answers it.
+      await active.sendKeys("Enter");
+      await heldAtLeast(3);
+      await active.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
+      // The early Enter did reach the request's continue, and the resumed
+      // request dropped it.
+      expect(readFileSync(tracePath, "utf8")).toMatch(/event=answer_dropped .*event=user_continue origin=start/);
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
       gateway.stop();
