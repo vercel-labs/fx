@@ -106,6 +106,7 @@
 #   bun ../drivers/acp/leader/check-spec.ts
 #   bun ../drivers/acp/leader/driver.ts   # the real fx acp against AcpLeader
 #   bun ../drivers/acp/takeover/check-spec.ts   # AcpTakeover: the design, today, planted bugs, witnesses
+#   bun ../drivers/acp/takeover/driver.ts   # the real fx acp through the takeover plans, against AcpTakeoverTrace
 #   bun ../drivers/acp/join/check-spec.ts
 #   bun ../drivers/acp/join/driver.ts   # the real fx acp with followers, against AcpJoinTrace
 #   bun ../drivers/acp/session_state/check-spec.ts
