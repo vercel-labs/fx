@@ -294,6 +294,15 @@ function outerQuestionCall() {
   return outerToolCalls([QUESTION_CALL]);
 }
 
+// The same question asked through toolbox, as the model asks it when
+// `tool_placement.ask_user_question` is `toolbox`.
+const TOOLBOX_QUESTION_SETTINGS = { tool_placement: { ask_user_question: "toolbox" } };
+const TOOLBOX_QUESTION_CALL = {
+  id: QUESTION_CALL.id,
+  name: "toolbox",
+  input: { run: QUESTION_CALL.name, arguments: QUESTION_CALL.input },
+};
+
 const TALL_QUESTION_PROMPT = "Who should relay events to the chat panes?";
 const TALL_QUESTION_DESCRIPTION =
   "The relay follows each session and passes its events on, so every pane keeps updating " +
@@ -618,6 +627,7 @@ function startFakeGateway(
 function createIsolatedRoot(
   permissionMode: "ask" | "auto" = "ask",
   permission: Record<string, unknown> = {},
+  settings: Record<string, unknown> = {},
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-decision-e2e-")));
   const home = join(root, "home");
@@ -626,7 +636,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission }),
+    JSON.stringify({ permission_mode: permissionMode, permission, ...settings }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -662,8 +672,9 @@ async function launchScenario(
   permissionMode: "ask" | "auto" = "ask",
   classifierDecision: ClassifierDecision = () => "clear",
   permission: Record<string, unknown> = {},
+  settings: Record<string, unknown> = {},
 ) {
-  const root = createIsolatedRoot(permissionMode, permission);
+  const root = createIsolatedRoot(permissionMode, permission, settings);
   const gateway = startFakeGateway(responses, classifierDecision);
   gateways.push(gateway);
   const tracePath = join(root.root, "trace.log");
@@ -841,14 +852,94 @@ async function answerQuestions(activeSession: TmuxSession, count: number) {
   }
 }
 
+// Quits fx and starts it again on the same profile with `--resume last`.
+async function resumeLastSession(ctx: Awaited<ReturnType<typeof launchScenario>>) {
+  await ctx.session.sendText("/quit");
+  expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  await ctx.session.kill();
+  return TmuxSession.create({
+    cmd: `env -u VERCEL_OIDC_TOKEN ${FX_BIN} --resume last 2>${ctx.stderrPath}`,
+    cwd: ctx.root.workspace,
+    env: definedStringEnv(fakeGatewayEnv(ctx.root, ctx.gateway)),
+    width: 120,
+    height: 40,
+  });
+}
+
+const CANCELLED_NOTICE = "▪ Cancelled";
+
+// The rows from the prompt to the cancelled turn's notice, without blank rows.
+function cancelledQuestionRows(grid: string[]) {
+  const rows = grid.map((row) => row.trimEnd()).filter((row) => row !== "");
+  const start = rows.indexOf(`┃ ${ORDER_PROMPT}`);
+  const end = rows.findIndex((row) => row.includes(CANCELLED_NOTICE));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start, end + 1);
+}
+
+function hasCancelledNotice(grid: string[]) {
+  return grid.some((row) => row.includes(CANCELLED_NOTICE));
+}
+
+/// Reads a file, cancels the question that follows with Esc at its prompt,
+/// then checks the rows the turn leaves, live and again after `--resume last`.
+async function expectCancelledQuestionRows(
+  responses: GatewayResponse[],
+  expected: { live: string[]; resumed: string[] },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario(responses, "input", {}, "auto", undefined, {}, settings);
+  for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
+  await ctx.session.sendText(ORDER_PROMPT);
+  await waitForGridState(
+    ctx.session,
+    "question open",
+    (grid) => grid.some((row) => row.includes(QUESTION_PROMPT)) && grid.some((row) => row.includes("Inspect repo state")),
+    TIMEOUT,
+  );
+  await ctx.session.sendKeys("Escape");
+  const live = await waitForGridState(ctx.session, "live cancelled question", hasCancelledNotice, TIMEOUT);
+  expect(cancelledQuestionRows(live)).toEqual(expected.live);
+  await assertProcessAliveAndClean(ctx);
+
+  session = await resumeLastSession(ctx);
+  const resumed = await waitForGridState(session, "resumed cancelled question", hasCancelledNotice, TIMEOUT);
+  expect(cancelledQuestionRows(resumed)).toEqual(expected.resumed);
+  expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+}
+
+// The full transcript's rows without blank rows, read once it shows `until`.
+async function fullTranscriptRows(active: TmuxSession, until: string) {
+  await active.sendKeys("C-o");
+  const full = await waitForGridState(
+    active,
+    "full transcript",
+    (grid) => grid.some((row) => row.includes("esc close")) && grid.some((row) => row.includes(until)),
+    TIMEOUT,
+  );
+  return full.map((row) => row.trimEnd()).filter((row) => row !== "");
+}
+
+// After resume, the full transcript shows the answered question as a direct
+// one does, not an "Asked" row.
+async function expectResumedFullTranscriptQuestion() {
+  const full = await fullTranscriptRows(session!, ORDER_DONE);
+  const prompt = full.indexOf(`  1) ${QUESTION_PROMPT}`);
+  expect(prompt).toBeGreaterThan(full.indexOf("● Read first.txt"));
+  expect(full[prompt + 1]).toBe("     Run tests");
+  expect(full.some((row) => row.startsWith("● Asked"))).toBe(false);
+}
+
 /// Reads three files around answered questions, then checks the rows the turn
 /// leaves, live and again after `--resume last`.
 async function expectAnsweredQuestionOrder(
   responses: GatewayResponse[],
   expected: string[],
   questions = 1,
+  settings: Record<string, unknown> = {},
 ) {
-  const ctx = await launchScenario(responses, "input", {}, "auto");
+  const ctx = await launchScenario(responses, "input", {}, "auto", undefined, {}, settings);
   for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
   await ctx.session.sendText(ORDER_PROMPT);
   await answerQuestions(ctx.session, questions);
@@ -856,16 +947,7 @@ async function expectAnsweredQuestionOrder(
   expect(answeredQuestionRows(live)).toEqual(expected);
   await assertProcessAliveAndClean(ctx);
 
-  await ctx.session.sendText("/quit");
-  expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
-  await ctx.session.kill();
-  session = await TmuxSession.create({
-    cmd: `env -u VERCEL_OIDC_TOKEN ${FX_BIN} --resume last 2>${ctx.stderrPath}`,
-    cwd: ctx.root.workspace,
-    env: definedStringEnv(fakeGatewayEnv(ctx.root, ctx.gateway)),
-    width: 120,
-    height: 40,
-  });
+  session = await resumeLastSession(ctx);
   const resumed = await waitForGridState(session, "resumed answered question order", hasOrderSummary, TIMEOUT);
   expect(answeredQuestionRows(resumed)).toEqual(answeredQuestionRows(live));
   expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
@@ -3815,6 +3897,68 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "● Read second.txt, third.txt",
         `  ${ORDER_DONE}`,
       ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question asked through toolbox draws as a direct one, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([TOOLBOX_QUESTION_CALL]),
+        outerToolCalls([readCall("read_2", "second.txt")]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ], 1, TOOLBOX_QUESTION_SETTINGS);
+      await expectResumedFullTranscriptQuestion();
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question streamed through toolbox draws as a direct one, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        streamedToolCalls([readCall("read_1", "first.txt")]),
+        streamedToolCalls([TOOLBOX_QUESTION_CALL]),
+        streamedToolCalls([readCall("read_2", "second.txt")]),
+        streamedToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ], 1, TOOLBOX_QUESTION_SETTINGS);
+      await expectResumedFullTranscriptQuestion();
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question asked through toolbox and cancelled at its prompt leaves the rows of a direct one, live and after resume",
+    async () => {
+      await expectCancelledQuestionRows([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([TOOLBOX_QUESTION_CALL]),
+      ], {
+        live: [`┃ ${ORDER_PROMPT}`, "● Read first.txt", CANCELLED_NOTICE],
+        resumed: [`┃ ${ORDER_PROMPT}`, "● Read first.txt", `${CANCELLED_NOTICE} · What can fx do differently?`],
+      }, TOOLBOX_QUESTION_SETTINGS);
+      // The full transcript ends the turn with its notice, as a direct
+      // question's does, not with a row for the question's call.
+      const full = await fullTranscriptRows(session!, CANCELLED_NOTICE);
+      expect(full.at(-2)).toBe(`${CANCELLED_NOTICE} · What can fx do differently?`);
     },
     TIMEOUT * 2,
   );

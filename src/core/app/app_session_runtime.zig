@@ -4175,7 +4175,7 @@ pub fn Runtime(comptime App: type) type {
                         var wrote_cancelled_call = false;
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
-                        } else if (cancelledCallOf(app, agent, entry)) |call| {
+                        } else if (try cancelledCallOf(app, agent, entry)) |call| {
                             wrote_cancelled_call = try writeCancelledCallPresentation(app, agent, sink, call, entry.cancelled_wait, labels);
                         }
                         if (entry.tool_call) |call| {
@@ -4326,12 +4326,16 @@ pub fn Runtime(comptime App: type) type {
         /// shows as live did: "Cancelled" and its call. A command's row comes
         /// from its `cancelled_command` presentation (D100), or not at all,
         /// and a question shows its prompt live and never a row
-        /// (`startToolVisibleLifecycle`). Null when the turn has no such call.
-        fn cancelledCallOf(app: *App, agent: *AppAgent, entry: types.InterruptedHistoryTurn) ?types.ToolCall {
+        /// (`startToolVisibleLifecycle`), through toolbox too. Null when the
+        /// turn has no such call.
+        fn cancelledCallOf(app: *App, agent: *AppAgent, entry: types.InterruptedHistoryTurn) !?types.ToolCall {
             if (entry.cancelled_command != null) return null;
             if (entry.terminal_reason != .cancelled or entry.cancellation_origin != .turn) return null;
             const call = entry.tool_call orelse return null;
-            return switch (app.historicalToolActivityKind(agent, call)) {
+            var shown_arena = std.heap.ArenaAllocator.init(app.alloc);
+            defer shown_arena.deinit();
+            const shown = try shownHistoricalCall(app, agent, shown_arena.allocator(), call);
+            return switch (app.historicalToolActivityKind(agent, shown)) {
                 .command, .ask => null,
                 else => call,
             };
@@ -4939,6 +4943,8 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// `call` is the call the saved one shows as (`shownHistoricalCall`):
+        /// a question asked through toolbox keeps toolbox's name on its result.
         fn writeAnsweredQuestionResult(
             app: *App,
             sink: anytype,
@@ -4946,7 +4952,7 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) !bool {
             if (result.status != .success or
-                !std.mem.eql(u8, result.tool_name, "ask_user_question") or
+                !std.mem.eql(u8, call.name, "ask_user_question") or
                 !@hasDecl(App, "writeHistoricalQuestionResolution")) return false;
 
             var answer_arena = std.heap.ArenaAllocator.init(app.alloc);
@@ -9024,6 +9030,41 @@ test "execution replay projects answered questions as a semantic card and retain
     );
 }
 
+test "execution replay projects a question answered through toolbox as a direct one" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var calls = [_]types.ToolCall{.{
+        .id = "call_question",
+        .name = "toolbox",
+        .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}",
+    }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_question"),
+        .tool_name = @constCast("toolbox"),
+        .status = .success,
+        .output = @constCast("[{\"question\":\"Which verification depth should I use?\",\"answer\":\"Thorough\"}]"),
+        .output_bytes = 82,
+        .stored_output_bytes = 82,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqual(@as(usize, 0), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.historical_question_entry_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.historical_question_answer_count);
+    try std.testing.expectEqual(@as(usize, 1), app.historical_tool_detail_entry_ids.items.len);
+    try std.testing.expectEqual(
+        app.historical_question_entry_ids.items[0],
+        app.historical_tool_detail_entry_ids.items[0],
+    );
+}
+
 test "execution replay keeps invalid question results on the generic path" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -10328,6 +10369,8 @@ test "a cancelled call that is no command keeps its row on replay, in place of t
     const wait: types.ToolCall = .{ .id = "wait", .name = "subagent", .arguments_json = "{\"action\":\"wait\"}" };
     const command: types.ToolCall = .{ .id = "cmd", .name = "shell", .arguments_json = "{\"command\":\"sleep 20\"}" };
     const question: types.ToolCall = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{\"questions\":[{\"question\":\"Which one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}" };
+    const toolbox_question: types.ToolCall = .{ .id = "ask", .name = "toolbox", .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[{\"question\":\"Which one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}}" };
+    const toolbox_command: types.ToolCall = .{ .id = "cmd", .name = "toolbox", .arguments_json = "{\"run\":\"shell\",\"arguments\":{\"command\":\"sleep 20\"}}" };
     const cases = [_]Case{
         .{ .name = "read", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = true },
         .{ .name = "wait with names (D102)", .turn = .{ .user = .{ .text = @constCast("wait") }, .tool_call = wait, .cancelled_wait = .{ .waited_for = "lander" } }, .row = true, .target = "lander" },
@@ -10338,6 +10381,9 @@ test "a cancelled call that is no command keeps its row on replay, in place of t
         // A question shows its prompt live, never a row, and a call that names
         // nothing after "Cancelled" gets none either; the turn's notice stays.
         .{ .name = "question", .turn = .{ .user = .{ .text = @constCast("ask") }, .tool_call = question }, .row = false, .notice = true },
+        // A toolbox run reads as the call fx ran for it.
+        .{ .name = "question through toolbox", .turn = .{ .user = .{ .text = @constCast("ask") }, .tool_call = toolbox_question }, .row = false, .notice = true },
+        .{ .name = "command through toolbox", .turn = .{ .user = .{ .text = @constCast("run") }, .tool_call = toolbox_command }, .row = false, .notice = true },
         .{ .name = "names nothing", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read }, .row = false, .notice = true, .bare = true },
         .{ .name = "failed", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .terminal_reason = .failed }, .row = false },
         .{ .name = "compaction", .turn = .{ .user = .{ .text = @constCast("read") }, .tool_call = read, .cancellation_origin = .compaction }, .row = false },
