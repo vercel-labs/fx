@@ -1,10 +1,9 @@
 // Runs the built fx along tests/tla/sandbox/SandboxProvider.tla, code to spec:
 // each scenario is one `fx ask` whose scripted model makes one shell call that
-// a rule in the private sandbox config places locally, in the workspace
-// sandbox, or in an isolated one. fx runs the real default provider,
-// src/core/sandbox/providers/vercel.sh, against the fake sandbox CLI in
-// tests/e2e/fixtures/fake-sandbox-cli.ts, which logs every sandbox step. The
-// driver adds its own steps to that log (a local edit, a stop, a provider
+// a rule in the private sandbox config places locally, with a third-party
+// provider (spec L2), or isolated. The provider is provider-fixture.sh in this
+// folder: a small shell program that records each step in a JSON log and ends
+// with the spec's notes. The driver adds its own steps to that log (a stop or a
 // crash), reads what fx told the model, and has TLC check that the model has a
 // behavior that gives the whole run (SandboxProviderTrace.tla).
 //
@@ -18,8 +17,8 @@
 //
 // Exit codes: 0 every run accepted, 1 a rejected run (or a tampered run that
 // was accepted), 2 a toolchain or harness failure.
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { binary, targetHelpers, testEnvironment, worktree } from "../lib/context";
@@ -31,10 +30,14 @@ const { fakeGatewayFinalText, fakeGatewayToolCall, fakeShellRun, startFakeGatewa
 const evals = await import(pathToFileURL(join(worktree, "tests", "evals", "eval-helpers.ts")).href);
 const { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } = evals;
 
-const FAKE_CLI = join(worktree, "tests", "e2e", "fixtures", "fake-sandbox-cli.ts");
+const FIXTURE = join(worktree, "tests", "tla", "drivers", "sandbox", "provider-fixture.sh");
+// The stand-in for a remote sandbox: it runs each command outside fx's process tree.
+const DAEMON = join(worktree, "tests", "tla", "drivers", "sandbox", "sandbox-daemon.sh");
 const SPEC_DIR = join(TLA_ROOT, "sandbox");
 const ALL_PLACEMENTS = ["local", "workspace", "isolated"] as const;
 type Placement = (typeof ALL_PLACEMENTS)[number];
+// The model calls a remote run `workspace`; the config word for it is `remote`.
+const configRunner = (placement: Placement): string => (placement === "workspace" ? "remote" : placement);
 // One model tick is about 250 ms of real time (SandboxProvider.tla).
 const TICK_MS = 250;
 
@@ -59,31 +62,30 @@ type Scenario = {
   command: string;
   gated?: boolean;
   then?: "stop" | "crash";
-  edit?: boolean;
   env?: boolean;
-  failCreate?: boolean;
-  createDelayMs?: number;
+  // The provider refuses to create the sandbox (fixture act create-fails).
+  act?: "create-fails";
+  // The provider waits this long before it starts the command.
+  holdMs?: number;
   killDelayMs?: number;
   graceMs?: number;
+  // The call's own timeout, which makes fx stop the run.
   timeoutMs?: number;
-  sweepAfter?: boolean;
 };
 
 const scenarios: Scenario[] = [
   { name: "local", placement: "local", command: "echo ran-here" },
   { name: "workspace-exit-0", placement: "workspace", command: "cat a.txt; echo made > made.txt" },
   { name: "workspace-exit-1", placement: "workspace", command: "echo failing; exit 1" },
-  { name: "workspace-edit-kept", placement: "workspace", gated: true, edit: true, command: "echo remote > a.txt; echo new > b.txt" },
   { name: "workspace-timeout", placement: "workspace", timeoutMs: 2000, command: "sleep 10" },
-  { name: "workspace-create-fails", placement: "workspace", failCreate: true, command: "echo never" },
+  { name: "workspace-create-fails", placement: "workspace", act: "create-fails", command: "echo never" },
   { name: "workspace-stop", placement: "workspace", gated: true, then: "stop", command: "echo late > late.txt" },
   { name: "workspace-stop-slow-kill", placement: "workspace", gated: true, then: "stop", killDelayMs: 1500, command: "echo late > late.txt" },
   { name: "workspace-stop-grace-too-short", placement: "workspace", gated: true, then: "stop", graceMs: 1000, killDelayMs: 3000, command: "echo late > late.txt" },
-  { name: "workspace-stop-before-start", placement: "workspace", then: "stop", createDelayMs: 4000, command: "echo never" },
+  { name: "workspace-stop-before-start", placement: "workspace", then: "stop", holdMs: 4000, command: "echo never" },
   { name: "workspace-crash", placement: "workspace", gated: true, then: "crash", command: "echo late > late.txt" },
-  { name: "isolated-no-keys", placement: "isolated", env: true, command: "echo \"secret=[${SECRET:-}]\"; echo out > result.txt" },
+  { name: "isolated-no-keys", placement: "isolated", env: true, command: 'echo "secret=[${SECRET:-}]"; echo out > result.txt' },
   { name: "isolated-stop", placement: "isolated", gated: true, then: "stop", command: "echo late" },
-  { name: "isolated-crash-then-sweep", placement: "isolated", gated: true, then: "crash", sweepAfter: true, command: "echo late" },
   { name: "tty-placed", placement: "workspace", tty: true, command: "echo never" },
   { name: "provider-missing", placement: "workspace", ready: false, command: "echo never" },
 ];
@@ -113,32 +115,29 @@ function git(cwd: string, args: string[]) {
   });
 }
 
-// The fake's daemon runs the detached commands outside fx's process tree, as a
-// real sandbox does.
-async function startFakeDaemon(fakeHome: string): Promise<ChildProcess> {
-  const daemon = spawn(FAKE_CLI, ["__daemon"], { env: { ...process.env, FAKE_SANDBOX_HOME: fakeHome }, stdio: "ignore" });
-  const deadline = Date.now() + 10_000;
-  while (!existsSync(join(fakeHome, "daemon.pid"))) {
-    if (Date.now() > deadline) throw new Error("the fake sandbox daemon did not start");
-    await Bun.sleep(10);
-  }
-  return daemon;
+function appendEvent(providerHome: string, ev: string) {
+  writeFileSync(join(providerHome, "events.jsonl"), `${JSON.stringify({ ev, t: Date.now(), driver: true })}\n`, { flag: "a" });
 }
 
-function appendEvent(fakeHome: string, ev: string) {
-  writeFileSync(join(fakeHome, "events.jsonl"), `${JSON.stringify({ ev, t: Date.now(), driver: true })}\n`, { flag: "a" });
-}
-
-function readEvents(fakeHome: string): Array<Record<string, unknown>> {
-  const file = join(fakeHome, "events.jsonl");
+function readEvents(providerHome: string): Array<Record<string, unknown>> {
+  const file = join(providerHome, "events.jsonl");
   if (!existsSync(file)) return [];
   return readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-async function waitForEvent(fakeHome: string, ev: string, timeoutMs = 30_000) {
+async function waitForFile(file: string, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (readEvents(fakeHome).some((e) => e.ev === ev)) return;
+    if (existsSync(file)) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`no ${file} within ${timeoutMs} ms`);
+}
+
+async function waitForEvent(providerHome: string, ev: string, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (readEvents(providerHome).some((e) => e.ev === ev)) return;
     await Bun.sleep(25);
   }
   throw new Error(`no ${ev} event within ${timeoutMs} ms`);
@@ -155,39 +154,41 @@ function providerPid(stateDir: string): number | null {
   }
 }
 
-// The fake's commands that still run, with their process groups.
-function runningCommands(fakeHome: string): number[] {
-  const dir = join(fakeHome, "commands");
-  if (!existsSync(dir)) return [];
-  const pids: number[] = [];
-  for (const id of readdirSync(dir)) {
-    if (existsSync(join(dir, id, "exit")) || !existsSync(join(dir, id, "pid"))) continue;
-    const pid = Number(readFileSync(join(dir, id, "pid"), "utf8"));
-    try {
-      process.kill(pid, 0);
-      pids.push(pid);
-    } catch {}
-  }
-  return pids;
+// The commands this run's provider started, from its log.
+function commandPids(events: Array<Record<string, unknown>>): number[] {
+  return events.filter((e) => e.ev === "start" && typeof e.child === "number").map((e) => e.child as number);
 }
 
-// The fake log and the driver's steps as model events. Exits that a kill or a
-// removal caused are part of those steps. fx sweeps at every start, so an ls
-// is hidden; an rm after the driver's next-start marker is that start's sweep.
-function modelEvents(raw: Array<Record<string, unknown>>): string[] {
+// Whether the process runs. A zombie has ended, but kill -0 still finds it, so
+// the process state is read instead.
+function alive(pid: number): boolean {
+  try {
+    const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return state !== "" && !state.startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+// The provider's log and the driver's steps as model events. The trace hides the
+// steps fx cannot see (a refused create, a stop before the start, a SIGKILL that
+// left no line, the sends and bring-backs), so they are not listed: an observed
+// event the model hides could never match. A timeout is a stop by fx, so a stop
+// comes before the first kill when fx says it timed out.
+function modelEvents(raw: Array<Record<string, unknown>>, timedOut: boolean): string[] {
   const events: string[] = [];
-  let sweeping = false;
   for (const e of raw) {
     switch (e.ev) {
-      case "next-start": sweeping = true; break;
-      case "rm": events.push(sweeping ? "sweep" : "rm"); break;
-      case "exit": if (!e.by) events.push("exit"); break;
-      case "createfail": case "start": case "timeout": case "killsent": case "killed":
-      case "edit": case "stop": case "crash":
+      case "exit": events.push("exit"); break;
+      case "start": case "killsent": case "killed": case "stop": case "crash":
         events.push(String(e.ev));
         break;
-      default: break; // create and foreground exec calls (sends, bring-backs) are hidden steps
+      default: break; // provider, createfail, termexit: hidden in the model
     }
+  }
+  if (timedOut && !events.includes("stop")) {
+    const at = events.indexOf("killsent");
+    events.splice(at >= 0 ? at : events.length, 0, "stop");
   }
   return events;
 }
@@ -215,13 +216,14 @@ function sessionId(body: string): string {
 }
 
 // fx's own refusals start with "fx did not run this command:"; the provider's
-// notes start with "fx: ".
+// notes start with "fx: " and use the spec's wording (N1, N5, N7, N24, N3, N4, N6).
 function classify(text: string, events: string[], ranLocal: boolean): string {
   if (ranLocal) return "local";
   if (/fx did not run this command:/.test(text) && events.length === 0) return "refused";
-  if (/fx: the command did not run|fx: stopped before the command started/.test(text)) return "didnotrun";
-  if (/fx: stopped the command in the sandbox/.test(text)) return "stopped";
-  if (/fx: ran in /.test(text)) return "exit";
+  if (/fx: did not run:|fx: stopped before the command was sent/.test(text)) return "didnotrun";
+  if (/fx: result unknown|fx: lost contact|fx: force stop/.test(text)) return "mayhaveran";
+  if (/fx: stopped;|fx: timed out after|TimeoutExpired/.test(text)) return "stopped";
+  if (events.includes("exit")) return "exit";
   if (events.length === 0) return "refused";
   return "mayhaveran";
 }
@@ -231,50 +233,60 @@ async function runScenario(s: Scenario, dir: string): Promise<Run> {
   const home = join(root, "home");
   const fxHome = join(home, ".fx");
   const repo = join(root, "repo");
-  const fakeHome = join(root, "fake");
+  const providerHome = join(root, "provider");
   const gate = join(root, "gate");
   const stateDir = join(fxHome, "sandbox", "state");
   mkdirSync(join(fxHome, "sandbox"), { recursive: true });
   mkdirSync(repo);
-  mkdirSync(fakeHome);
+  mkdirSync(providerHome);
+  const spool = join(root, "spool");
+  mkdirSync(spool);
+  // Started in its own session, outside fx's process tree, before fx runs.
+  const daemon = spawn("sh", [DAEMON, spool], { stdio: "ignore", detached: true });
+  daemon.unref();
+  try {
+    await waitForFile(join(spool, "daemon.pid"));
+  } catch (error) {
+    if (daemon.pid !== undefined) process.kill(daemon.pid, "SIGKILL");
+    throw error;
+  }
   writeFileSync(join(repo, "a.txt"), "hello\n");
   writeFileSync(join(repo, ".gitignore"), "out/\n");
   git(repo, ["init", "-q"]);
   git(repo, ["add", "-A"]);
   git(repo, ["commit", "-q", "-m", "initial"]);
-  chmodSync(FAKE_CLI, 0o755);
 
   const remote = s.gated ? `while [ ! -e ${gate} ]; do sleep 0.05; done; ${s.command}` : s.command;
   writeFileSync(join(fxHome, "settings.json"), JSON.stringify({ experimental: { sandbox_execution: true } }));
-  const timeoutMs = s.timeoutMs ?? 30_000;
   const config: Record<string, unknown> = {
-    provider_args: ["--cli", FAKE_CLI, "--remote-base", join(fakeHome, "fs"), "--command-timeout", `${timeoutMs}ms`],
+    provider: ["/bin/sh"],
+    provider_args: [FIXTURE],
     grace_ms: s.graceMs ?? 5000,
     env: s.env ? ["SECRET"] : [],
-    rules: s.placement === "local" ? [] : [{ command: remote, placement: s.placement }],
+    rules: s.placement === "local" ? [] : [{ command: remote, runner: configRunner(s.placement) }],
   };
   if (s.ready === false) config.provider = ["/nonexistent/fx-sandbox-provider"];
   writeFileSync(join(fxHome, "sandbox", "config.json"), JSON.stringify(config));
 
-  const responses: unknown[] = [fakeShellRun("run_1", remote, s.then ? { yield_time_ms: 500 } : s.tty ? { tty: true } : {})];
+  const callArgs = s.then ? { yield_time_ms: 500 } : s.tty ? { tty: true } : {};
+  const responses: unknown[] = [fakeShellRun("run_1", remote, { ...callArgs, ...(s.timeoutMs ? { timeout_ms: s.timeoutMs } : {}) })];
   if (s.then === "stop") {
     responses.push((body: string) => {
-      appendEvent(fakeHome, "stop");
+      appendEvent(providerHome, "stop");
       return fakeGatewayToolCall("stop_1", "shell", { request: { action: "stop", session_id: sessionId(body) } });
     });
   } else if (s.then === "crash") {
     responses.push(async (body: string) => {
-      await waitForEvent(fakeHome, "start");
+      await waitForEvent(providerHome, "start");
       const pid = providerPid(stateDir);
       if (!pid) throw new Error("no provider process to crash");
-      appendEvent(fakeHome, "crash");
+      appendEvent(providerHome, "crash");
       process.kill(pid, "SIGKILL");
       return fakeGatewayToolCall("wait_1", "shell", { request: { action: "interact", session_id: sessionId(body), yield_time_ms: 6000 } });
     });
   }
   responses.push(fakeGatewayFinalText("Done."));
   const gateway = startFakeGateway(responses);
-  const daemon = await startFakeDaemon(fakeHome);
 
   const env: Record<string, string | undefined> = testEnvironment({
     HOME: home,
@@ -283,31 +295,23 @@ async function runScenario(s: Scenario, dir: string): Promise<Run> {
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
-    FAKE_SANDBOX_HOME: fakeHome,
+    L2_PROVIDER_LOG: join(providerHome, "events.jsonl"),
+    L2_SPOOL: spool,
+    L2_ACT: s.act ?? "",
+    L2_HOLD_S: s.holdMs ? String(s.holdMs / 1000) : "0",
+    L2_KILL_DELAY_S: s.killDelayMs ? String(s.killDelayMs / 1000) : "0",
     SECRET: "s3cret",
-    ...(s.failCreate ? { FAKE_SANDBOX_FAIL_CREATE: "1" } : {}),
-    ...(s.createDelayMs ? { FAKE_SANDBOX_CREATE_DELAY_MS: String(s.createDelayMs) } : {}),
-    ...(s.killDelayMs ? { FAKE_SANDBOX_KILL_DELAY_MS: String(s.killDelayMs) } : {}),
   });
   // runFx passes this process's environment through; no real login reaches fx.
   env.VERCEL_TOKEN = undefined;
   env.VERCEL_OIDC_TOKEN = undefined;
 
-  let edited = false;
-  const editor = s.edit
+  const editor = s.gated && !s.then
     ? (async () => {
-        await waitForEvent(fakeHome, "start");
-        writeFileSync(join(repo, "a.txt"), "local edit\n");
-        edited = true;
-        appendEvent(fakeHome, "edit");
+        await waitForEvent(providerHome, "start");
         writeFileSync(gate, "");
       })()
-    : s.gated && !s.then
-      ? (async () => {
-          await waitForEvent(fakeHome, "start");
-          writeFileSync(gate, "");
-        })()
-      : Promise.resolve();
+    : Promise.resolve();
 
   try {
     const saving = s.tty ? [] : ["--no-save"];
@@ -317,24 +321,11 @@ async function runScenario(s: Scenario, dir: string): Promise<Run> {
     await editor;
     if (result.code !== 0 && !s.tty) throw new Error(`fx exited ${result.code}: ${result.stderr}`);
     const text = toolTexts(gateway.requests);
-    const orphan = runningCommands(fakeHome).length > 0;
-
-    if (s.sweepAfter) {
-      // The next fx start sweeps what the crashed provider left.
-      appendEvent(fakeHome, "next-start");
-      const next = startFakeGateway([fakeGatewayFinalText("Nothing to do.")]);
-      await runFx(["ask", "--json", "--no-save", "--permission-mode", "full-access", "Nothing."], {
-        cwd: repo, env: { ...env, FX_GATEWAY_BASE_URL: next.baseUrl, FX_GATEWAY_CHAT_URL: next.chatUrl, FX_TEST_GATEWAY_CHAT_URL: next.chatUrl }, timeoutMs: 60_000,
-      });
-      const deadline = Date.now() + 20_000;
-      while (Date.now() < deadline && !readEvents(fakeHome).some((e) => e.ev === "rm")) await Bun.sleep(50);
-      next.stop();
-    }
-
-    const events = modelEvents(readEvents(fakeHome));
+    const raw = readEvents(providerHome);
+    const orphan = commandPids(raw).some(alive);
+    const events = modelEvents(raw, /TimeoutExpired/.test(text));
     const marker = s.placement === "local" && /ran-here/.test(text);
-    const startEnv = readEvents(fakeHome).filter((e) => e.ev === "start").flatMap((e) => (e.env as string[]) ?? []);
-    const aText = readFileSync(join(repo, "a.txt"), "utf8");
+    const startEnv = raw.filter((e) => e.ev === "provider").flatMap((e) => (e.env as string[]) ?? []);
     const observation: Observation = {
       placement: s.placement,
       tty: Boolean(s.tty),
@@ -346,24 +337,31 @@ async function runScenario(s: Scenario, dir: string): Promise<Run> {
       ranLocal: marker,
       env: [...new Set(startEnv)].map(() => "KEY"),
       conflict: /fx: kept your version of/.test(text),
-      lost: edited && aText.startsWith("remote"),
+      lost: false,
       orphan,
     };
     const killTicks = Math.max(1, Math.ceil(((s.killDelayMs ?? 0) + 400) / TICK_MS));
     const constants = {
       Grace: Math.max(1, Math.floor((s.graceMs ?? 5000) / TICK_MS)),
       KillTicks: killTicks,
-      Timeout: Math.max(1, Math.ceil(timeoutMs / TICK_MS)),
+      Timeout: Math.max(1, Math.ceil((s.timeoutMs ?? 30_000) / TICK_MS)),
       MaxEdits: 1,
     };
     writeFileSync(join(dir, "observation.json"), JSON.stringify({ observation, constants, text }, null, 2));
     return { observation, constants, text };
   } finally {
     gateway.stop();
-    daemon.kill("SIGKILL");
-    // Stop only the fake commands this run started, by their process groups.
-    for (const pid of runningCommands(fakeHome)) {
-      try { process.kill(-pid, "SIGKILL"); } catch {}
+    // Stop only the commands this run's provider started: each one leads its own
+    // session, so its process group is the command and its children.
+    for (const pid of commandPids(readEvents(providerHome))) {
+      if (alive(pid)) {
+        try { process.kill(-pid, "SIGKILL"); } catch {}
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }
+    // The daemon is the process this run started; stop it by its pid.
+    if (daemon.pid !== undefined) {
+      try { process.kill(daemon.pid, "SIGKILL"); } catch {}
     }
     cleanupIsolatedTestHome(root);
   }

@@ -1,0 +1,42 @@
+{
+  "covers": [
+    "AC-6"
+  ],
+  "title": "The user declines setup; the model repeats the call in the same turn and it is refused without a prompt.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [
+      "decline"
+    ],
+    "cancels": {},
+    "retries": {
+      "c1": 1
+    },
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused",
+        "refused"
+      ]
+    },
+    "prompts": 1,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "prompt-after-decline"
+  },
+  "drive": {}
+}

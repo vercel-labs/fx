@@ -361,6 +361,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_VERCEL_API_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_XAI_GROK_MODALITIES_URL": {
       "job": "test",
       "stability": "internal"
@@ -443,8 +447,10 @@
     "TYPESAFE_BASE_URL",
     "USER",
     "USERPROFILE",
+    "VERCEL_TOKEN",
     "WAYLAND_DISPLAY",
     "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
     "ZDOTDIR"
   ],
   "hand_parsed_flags": {

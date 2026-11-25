@@ -12,6 +12,8 @@ const layout = @import("layout.zig");
 const scan_mod = @import("scan.zig");
 const snapshot_mod = @import("snapshot.zig");
 const tree_mod = @import("tree.zig");
+const bounded_read = @import("bounded_read.zig");
+const ignore = @import("ignore.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -63,6 +65,48 @@ pub const RepoFilters = struct {
         alloc.free(self.names);
     }
 };
+
+/// The two ignore sources outside the tree that a remote run copies into the sandbox (V5),
+/// as bytes. `excludes_file` is what `core.excludesFile` names, and `info_exclude` is the
+/// common git directory's `info/exclude`. A source that cannot be read, or config the
+/// indexer cannot load, sets `unavailable`.
+pub const IgnoreFiles = struct {
+    excludes_file: ?[]const u8 = null,
+    info_exclude: ?[]const u8 = null,
+    unavailable: bool = false,
+};
+
+/// Reads the excludes sources the way the scan reads them: through the same layout, config
+/// and settings, with the same follow rule for `core.excludesFile`. Read only. The bytes
+/// belong to `arena`.
+pub fn ignoreFiles(arena: Allocator, workspace_root: []const u8) Allocator.Error!IgnoreFiles {
+    const found = (layout.discover(arena, workspace_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidGitFile => return .{ .unavailable = true },
+    }) orelse return .{};
+    const context = try git_config.Context.fromEnvironment(arena, found);
+    const loaded = try git_config.loadAll(arena, &context);
+    const settings = try git_config.ignoreSettings(arena, loaded, &context);
+    var result: IgnoreFiles = .{ .unavailable = loaded.unavailable.len > 0 or settings.invalid.len > 0 };
+    if (settings.excludes_file) |path| {
+        const outcome = if (settings.excludes_file_follows_symlinks)
+            try bounded_read.readUserAbsolute(arena, path, ignore.max_pattern_file_bytes)
+        else
+            try bounded_read.readAbsolute(arena, path, ignore.max_pattern_file_bytes);
+        switch (outcome) {
+            .content => |content| result.excludes_file = content,
+            .missing => {},
+            .unavailable => result.unavailable = true,
+        }
+    }
+    const info_exclude = try scan_mod.infoExcludePath(arena, found.common_dir);
+    switch (try bounded_read.readAbsolute(arena, info_exclude, ignore.max_pattern_file_bytes)) {
+        .content => |content| result.info_exclude = content,
+        .missing => {},
+        .unavailable => result.unavailable = true,
+    }
+    return result;
+}
 
 pub const RepoFiltersError = error{ OutOfMemory, RepoConfigUnavailable };
 

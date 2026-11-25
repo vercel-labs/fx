@@ -6,7 +6,7 @@ const command_effect = @import("../shell_command/command_effect.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_executor = @import("local_executor.zig");
 const command_runner = @import("../execution/command_runner.zig");
-const launch = @import("../sandbox/launch.zig");
+const launch = @import("../runner/runner.zig");
 
 pub const RouteKind = local_executor.RouteKind;
 pub const PreparedCommandRoute = local_executor.PreparedCommand;
@@ -121,6 +121,7 @@ fn placedRoute(
         command_ctx.resolved_cwd,
         command_ctx.placement,
         command_ctx.placement_profile,
+        command_ctx.timeout_ms,
     );
     debug_trace.logf(
         "core",
@@ -331,14 +332,14 @@ test "router sends a placed command to its provider invocation for either author
         .grace_ms = 2500,
     };
     var ctx = context("pwd", false);
-    ctx.placement = .workspace;
+    ctx.placement = .remote;
     ctx.sandbox = &sandbox;
 
     var direct = try prepareAuthorizedRoute(std.testing.allocator, ctx, directAuthority(ctx));
     defer direct.deinit(std.testing.allocator);
     try std.testing.expect(direct == .approved_shell);
     try std.testing.expectEqualStrings(
-        "exec /opt/fx/vercel.sh run --mode workspace --root /tmp --cwd /tmp --state /tmp/state -- pwd",
+        "exec /opt/fx/vercel.sh run --mode remote --root /tmp --cwd /tmp --state /tmp/state -- pwd",
         direct.approved_shell.run_command.?,
     );
     try std.testing.expectEqual(@as(?i64, 2500), direct.approved_shell.termination_grace_ms);

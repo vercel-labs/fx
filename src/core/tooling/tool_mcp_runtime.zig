@@ -130,8 +130,14 @@ pub const LegacyUrlCompletionSignal = struct {
     status: std.atomic.Value(LegacyUrlCompletionStatus) = .init(.pending),
 };
 
+/// Who asked. An MCP server asks through its tool call, and its prompts name it.
+/// The host (fx itself) asks for its own setup and names no server. Only fx code
+/// that builds an origin sets the kind; a server's request data never does.
+pub const OriginKind = enum { mcp_server, host };
+
 pub const InputOrigin = struct {
     wire: elicitation.Wire,
+    kind: OriginKind = .mcp_server,
     server_name: []const u8,
     operation: elicitation.Operation,
     runtime_generation: u64 = 0,

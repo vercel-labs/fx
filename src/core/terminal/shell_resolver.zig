@@ -202,6 +202,18 @@ const bash_unshadow_builtin = "\\unset -f builtin; ";
 /// snapshot replay have run.
 const zsh_command_prelude = zsh_unshadow_builtin ++ "\\builtin unsetopt equals; ";
 
+const runner_launch_shell = "/bin/sh";
+
+/// The runner launch kind (spec L3): `/bin/sh -c` without `-l`. A non-interactive
+/// POSIX shell reads no startup file, and the runner keeps fx's own environment, so
+/// there is no clean start, no zsh prelude and no snapshot replay.
+pub fn runnerLaunch(command: []const u8) Invocation {
+    var invocation = Invocation{ .path = runner_launch_shell };
+    invocation.append(runner_launch_shell);
+    invocation.setCommand(command);
+    return invocation;
+}
+
 pub fn capturedInvocation(
     alloc: Allocator,
     environment_value: Environment,
@@ -866,4 +878,18 @@ test "bootstrap construction cleans every allocation failure" {
         checkBootstrapAllocationFailures,
         .{},
     );
+}
+
+test "the runner launch is /bin/sh -c with the exec text unchanged, without a login flag" {
+    // The text `launch.invocation` writes for a runner whose root has a space, a single
+    // quote and a dollar, and whose command has a quote and a dollar.
+    const text = "exec /opt/fx/fx __fx_runner__ run --root '/Users/example/my repo'\\''s $x' -- 'echo '\\''a b'\\'' $HOME'";
+    const invocation = runnerLaunch(text);
+    try std.testing.expectEqualStrings("/bin/sh", invocation.path);
+    const argv = invocation.argv();
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("/bin/sh", argv[0]);
+    try std.testing.expectEqualStrings("-c", argv[1]);
+    try std.testing.expectEqualStrings(text, argv[2]);
+    for (argv) |word| try std.testing.expect(!std.mem.eql(u8, word, "-l"));
 }

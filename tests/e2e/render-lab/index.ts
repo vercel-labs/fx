@@ -2112,6 +2112,8 @@ class RenderLabTmux {
       "AI_GATEWAY_API_KEY",
       "-u",
       "VERCEL_OIDC_TOKEN",
+      "-u",
+      "VERCEL_TOKEN",
       "FX_DISABLE_KEYCHAIN=1",
       "FX_TEST_SKIP_ONBOARDING=1",
       `HOME=${shQuote(opts.fixture.home)}`,

@@ -495,6 +495,59 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
+/// Which `shell` schema a surface advertises: the process-only form, and
+/// whether the `runner` field is on. The default is the plain `shell` schema.
+pub const ShellVariant = struct {
+    process_only: bool = false,
+    runner: bool = false,
+};
+
+const runner_property = model_tool_schema.Property{
+    .name = "runner",
+    .json_type = .string,
+    .shape = &.{ .enum_values = &.{ "local", "remote" } },
+    .description = "For run: local (this machine, default) or remote (the user's sandbox).",
+};
+
+const shell_runner_properties = shell_properties ++ [_]model_tool_schema.Property{runner_property};
+const shell_process_runner_properties = shell_process_properties ++ [_]model_tool_schema.Property{runner_property};
+
+const shell_runner = blk: {
+    var spec = shell;
+    spec.model_schema = .{
+        .name = "shell",
+        .description = shell_description,
+        .input_schema = .{
+            .properties = &shell_runner_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    break :blk spec;
+};
+
+const shell_process_only_runner = blk: {
+    var spec = shell_process_only;
+    spec.model_schema = .{
+        .name = "shell",
+        .description = shell_process_description,
+        .input_schema = .{
+            .properties = &shell_process_runner_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    break :blk spec;
+};
+
+/// The `shell` spec for `variant`. Each of the four is built at compile time.
+pub fn shellSpecFor(variant: ShellVariant) ToolSpec {
+    if (variant.process_only) {
+        return if (variant.runner) shell_process_only_runner else shell_process_only;
+    }
+    return if (variant.runner) shell_runner else shell;
+}
+
 pub const install_skill = ToolSpec{
     .name = "install_skill",
     .description = install_skill_description,
@@ -852,6 +905,62 @@ test "built-in model-facing tool contract stays byte exact" {
             "4d81e7b55d64ef239ea329049dcb05c9f76d453cdc04518ce482613ee2be55d6",
         &actual_hex,
     );
+}
+
+test "shell runner variants add exactly the runner property to their off variant" {
+    const alloc = std.testing.allocator;
+    const member = "\"runner\":{\"type\":\"string\",\"enum\":[\"local\",\"remote\"],\"description\":\"For run: local (this machine, default) or remote (the user's sandbox).\"}";
+    inline for (.{
+        .{ .off = shell, .on = shellSpecFor(.{ .runner = true }) },
+        .{ .off = shellProcessOnlySpec(), .on = shellSpecFor(.{ .process_only = true, .runner = true }) },
+    }) |case| {
+        const off_json = try tool_specs.toolGatewaySchemaJson(alloc, case.off);
+        defer alloc.free(off_json);
+        const on_json = try tool_specs.toolGatewaySchemaJson(alloc, case.on);
+        defer alloc.free(on_json);
+
+        const at = std.mem.find(u8, on_json, ",\"runner\":") orelse return error.TestUnexpectedResult;
+        const end = at + 1 + member.len;
+        try std.testing.expect(end <= on_json.len);
+        try std.testing.expectEqualStrings(member, on_json[at + 1 .. end]);
+        const without_runner = try std.mem.concat(alloc, u8, &.{ on_json[0..at], on_json[end..] });
+        defer alloc.free(without_runner);
+        try std.testing.expectEqualStrings(off_json, without_runner);
+    }
+}
+
+test "shell runner variants list the runner field in the run contract only" {
+    const runner_contract = shell_impl.actionFieldContractFor(.run, true).allowed;
+    try std.testing.expect(nameInSet(runner_contract, "runner"));
+    try std.testing.expectEqual(
+        shell_impl.actionFieldContract(.run).allowed.len + 1,
+        runner_contract.len,
+    );
+    for ([_]shell_impl.Action{ .interact, .stop }) |action| {
+        try std.testing.expect(!nameInSet(shell_impl.actionFieldContractFor(action, true).allowed, "runner"));
+    }
+
+    const actions = std.enums.values(shell_impl.Action);
+    const full = model_tool_schema.ObjectSchema{ .properties = &shell_runner_properties };
+    for (actions) |action| {
+        for (shell_impl.actionFieldContractFor(action, true).allowed) |name| {
+            try std.testing.expect(schemaProperty(full, name) != null);
+        }
+    }
+    // The process-only form has a subset of the fields, and none of the terminal ones.
+    const process = model_tool_schema.ObjectSchema{ .properties = &shell_process_runner_properties };
+    for (shell_process_runner_properties) |property| {
+        var named = false;
+        for (actions) |action| named = named or nameInSet(shell_impl.actionFieldContractFor(action, true).allowed, property.name);
+        try std.testing.expect(named);
+    }
+    for ([_][]const u8{ "shell", "tty", "reload", "chars" }) |name| {
+        try std.testing.expect(schemaProperty(process, name) == null);
+    }
+    for ([_]model_tool_schema.ObjectSchema{ full, process }) |schema| {
+        const runner = schemaProperty(schema, "runner") orelse return error.TestExpectedEqual;
+        try std.testing.expect(std.mem.startsWith(u8, runner.description, "For run:"));
+    }
 }
 
 test "built-in tool descriptions fit the model-facing description cap" {

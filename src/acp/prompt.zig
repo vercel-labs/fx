@@ -90,6 +90,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const command_output_content = @import("../core/tooling/command_output_content.zig");
 const builtin_tools = @import("../builtins/tools.zig");
+const shell_projection = @import("../builtins/shell_projection.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -337,10 +338,22 @@ const ModelRoute = struct {
     }
 };
 
+/// Gives each `session/prompt` its own id for remote setup's decline marks.
+/// It is not the trace's turn counter, which the worker uses, so tracing is unchanged.
+var prompt_turn_ids = std.atomic.Value(u64).init(0);
+
+fn nextPromptTurnId() u64 {
+    // WASM has no 64-bit atomics. A WASM host never runs remote setup (A4), so one id is enough.
+    if (comptime std_builtin.target.os.tag == .wasi) return 1;
+    return prompt_turn_ids.fetchAdd(1, .seq_cst) + 1;
+}
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
+    /// The turn of this `session/prompt` request (spec U4 decline marks).
+    user_turn_id: u64 = 0,
     /// Tool-call IDs already announced with a pending update, and where each
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
@@ -703,6 +716,7 @@ const AcpContext = struct {
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
+            .user_turn_id = self.user_turn_id,
             .worker = &self.state.worker,
             .permission_prompter = if (self.state.initialized) .{
                 .observer = self.observer,
@@ -1258,6 +1272,7 @@ pub fn handlePrompt(
         .alloc = alloc,
         .state = state,
         .session_id = session.session_id,
+        .user_turn_id = nextPromptTurnId(),
         .captured_mode = captured_mode,
         .captured_permission_mode = captured_permission_mode,
         .current_prompt_input = &prompt_input,
@@ -1359,12 +1374,12 @@ pub fn handlePrompt(
         try v2.beginTurn();
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try shell_projection.buildModelToolProjection(alloc, state.cfg.mode_registry, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
         .behind_toolbox = state.toolbox_behind.slice(),
-    });
+    }, .{ .runner = if (comptime host_target.is_wasm) false else state.sandbox_policy != null });
     defer tool_projection.deinit(alloc);
 
     const owned_prompt = try alloc.dupe(
@@ -1654,8 +1669,9 @@ pub fn runSubagentChild(
         child_bridge.work_id = child_bridge.turn_id;
         if (child_bridge.enabled) ctx.observer = &child_bridge.observer;
     }
-    var child_projection = state.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = shell_projection.buildModelToolProjection(
         alloc,
+        state.cfg.mode_registry,
         builtin_tools.advertisement_set,
         captured_mode,
         .{
@@ -1664,6 +1680,7 @@ pub fn runSubagentChild(
             .subagent_available = true,
             .behind_toolbox = state.toolbox_behind.slice(),
         },
+        .{ .runner = if (comptime host_target.is_wasm) false else state.sandbox_policy != null },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
     var skill_catalog = state.skills.acquireCatalog();
@@ -3971,7 +3988,7 @@ fn requestAcpElicitation(
     defer if (legacy_source_id != null and !legacy_url_retained) {
         server.removeLegacyUrl(state, url_id.?);
     };
-    const display_message = try formatAcpElicitationMessage(alloc, origin.server_name, input_request);
+    const display_message = try formatAcpElicitationMessage(alloc, origin, input_request);
     defer alloc.free(display_message);
     const params = try mcp_elicitation.projectToAcpCreateParams(
         alloc,
@@ -3991,7 +4008,7 @@ fn requestAcpElicitation(
         .external_id = outbound_id,
         .prompt = display_message,
         .schema_json = input_request.requested_schema_json,
-        .server_name = origin.server_name,
+        .server_name = waitServerName(origin),
     }) else null;
     var wait_finished = false;
     var wait_outcome: observation.WaitOutcome = .failed;
@@ -4047,13 +4064,13 @@ fn requestAcpElicitation(
     var transition_state: mcp_elicitation.RequestState = .pending;
     // The MCP engine ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
-    const host_session = responder.acp.mcpHost() != null;
+    const server_live = serverLive(origin, responder.acp.mcpHost() != null);
     const transition = mcp_elicitation.decideTransition(
         transition_state,
-        bindingForAcpInput(responder, origin),
-        answerBindingForAcpInput(responder, origin, null),
+        bindingForAcpInput(responder, origin, outbound_id),
+        answerBindingForAcpInput(responder, origin, null, outbound_id),
         acpAwakeMillis(),
-        host_session,
+        server_live,
     );
     switch (transition) {
         .consume => transition_state = .consumed,
@@ -4066,7 +4083,7 @@ fn requestAcpElicitation(
             const sink = server.legacyUrlCompletionSink(state);
             // The MCP host has no generations to check: the sink takes the
             // consent itself.
-            if (!host_session) return error.McpInputRequired;
+            if (!server_live) return error.McpInputRequired;
             const accept_result = sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired;
             if (accept_result == .awaiting_completion) {
                 const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
@@ -4089,9 +4106,11 @@ fn requestAcpElicitation(
 
 fn formatAcpElicitationMessage(
     alloc: Allocator,
-    server_name: []const u8,
+    origin: tool_mcp_runtime.InputOrigin,
     request: mcp_elicitation.Request,
 ) ![]u8 {
+    if (origin.kind == .host) return alloc.print("fx asks: {s}", .{request.message});
+    const server_name = origin.server_name;
     return switch (request.mode) {
         .form => alloc.print(
             "fx received a form request from MCP server {s}. {s}",
@@ -4105,16 +4124,37 @@ fn formatAcpElicitationMessage(
     };
 }
 
+/// A host prompt names no server, so its wait record names none either.
+fn waitServerName(origin: tool_mcp_runtime.InputOrigin) ?[]const u8 {
+    return if (origin.kind == .mcp_server) origin.server_name else null;
+}
+
+/// Whether the server that asked is still live, so an answer may be taken. A
+/// host prompt names no server, so no server can be removed under it.
+fn serverLive(origin: tool_mcp_runtime.InputOrigin, mcp_host_present: bool) bool {
+    return origin.kind == .host or mcp_host_present;
+}
+
+/// The scope an answer must match. A host prompt is bound to its own ACP
+/// request id, and an MCP prompt keeps its session and tool call.
+fn acpInputScope(
+    kind: tool_mcp_runtime.OriginKind,
+    session_id: []const u8,
+    tool_call_id: []const u8,
+    request_id: u64,
+) mcp_elicitation.Scope {
+    if (kind == .host) return .{ .acp_request = .{ .integer = @intCast(request_id) } };
+    return .{ .acp_session = .{ .session_id = session_id, .tool_call_id = tool_call_id } };
+}
+
 fn bindingForAcpInput(
     responder: *AcpElicitationResponderContext,
     origin: tool_mcp_runtime.InputOrigin,
+    request_id: u64,
 ) mcp_elicitation.Binding {
     return .{
         .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
+        .scope = acpInputScope(origin.kind, responder.acp.session_id, responder.tool_call_id, request_id),
         .runtime_generation = origin.runtime_generation,
         .connection_generation = origin.connection_generation,
         .client_generation = origin.client_generation,
@@ -4129,6 +4169,7 @@ fn answerBindingForAcpInput(
     responder: *AcpElicitationResponderContext,
     origin: tool_mcp_runtime.InputOrigin,
     witness: ?tool_mcp_runtime.InputIdentityWitness,
+    request_id: u64,
 ) mcp_elicitation.AnswerBinding {
     const current: tool_mcp_runtime.InputIdentityWitness = witness orelse .{
         .runtime_generation = origin.runtime_generation,
@@ -4139,10 +4180,7 @@ fn answerBindingForAcpInput(
     };
     return .{
         .server_name = origin.server_name,
-        .scope = .{ .acp_session = .{
-            .session_id = responder.acp.session_id,
-            .tool_call_id = responder.tool_call_id,
-        } },
+        .scope = acpInputScope(origin.kind, responder.acp.session_id, responder.tool_call_id, request_id),
         .runtime_generation = current.runtime_generation,
         .connection_generation = current.connection_generation,
         .client_generation = current.client_generation,
@@ -4300,6 +4338,159 @@ test "ACP shell title uses the call-aware action label" {
     });
     defer alloc.free(title);
     try std.testing.expectEqualStrings("Stopping", title);
+}
+
+fn testInputOrigin(kind: tool_mcp_runtime.OriginKind, server_name: []const u8) tool_mcp_runtime.InputOrigin {
+    return .{
+        .wire = .modern_mcp,
+        .kind = kind,
+        .server_name = server_name,
+        .operation = .{ .tools_call = "" },
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = 1000,
+    };
+}
+
+fn testInputBinding(scope: mcp_elicitation.Scope) mcp_elicitation.Binding {
+    return .{
+        .server_name = "",
+        .scope = scope,
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = 1000,
+    };
+}
+
+fn testInputAnswer(scope: mcp_elicitation.Scope) mcp_elicitation.AnswerBinding {
+    return .{
+        .server_name = "",
+        .scope = scope,
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+    };
+}
+
+fn transitionName(transition: mcp_elicitation.Transition) []const u8 {
+    return switch (transition) {
+        .consume => "consume",
+        .reject => |reason| @tagName(reason),
+    };
+}
+
+test "ACP input binding: a host answer and an MCP answer never satisfy each other, even with the same server name" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "");
+    const host_request_7 = acpInputScope(host_origin.kind, "session-1", "call-1", 7);
+    const host_request_8 = acpInputScope(host_origin.kind, "session-1", "call-1", 8);
+    const mcp_request = acpInputScope(mcp_origin.kind, "session-1", "call-1", 7);
+
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(mcp_request),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(mcp_request),
+        testInputAnswer(host_request_7),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("wrong_scope", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(host_request_8),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("consume", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(host_request_7),
+        testInputAnswer(host_request_7),
+        0,
+        true,
+    )));
+    try std.testing.expectEqualStrings("consume", transitionName(mcp_elicitation.decideTransition(
+        .pending,
+        testInputBinding(mcp_request),
+        testInputAnswer(mcp_request),
+        0,
+        true,
+    )));
+}
+
+test "ACP input: a host prompt is never refused as a removed server, and an MCP prompt still is" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "Profile");
+    try std.testing.expect(serverLive(host_origin, false));
+    try std.testing.expect(!serverLive(mcp_origin, false));
+    try std.testing.expect(serverLive(mcp_origin, true));
+}
+
+test "ACP input wait record: a host prompt names no server, and an MCP prompt names its server" {
+    const host_origin = testInputOrigin(.host, "");
+    const mcp_origin = testInputOrigin(.mcp_server, "Profile");
+    try std.testing.expect(waitServerName(host_origin) == null);
+    try std.testing.expectEqualStrings("Profile", waitServerName(mcp_origin).?);
+}
+
+test "ACP elicitation text: fx asks for the host, an MCP server names itself, and a server cannot pick the host" {
+    const alloc = std.testing.allocator;
+    var message = "Pick a project".*;
+    var raw = [_]u8{};
+    const request: mcp_elicitation.Request = .{
+        .wire = .modern_mcp,
+        .mode = .form,
+        .message = &message,
+        .raw_params_json = &raw,
+    };
+    const mcp: tool_mcp_runtime.InputOrigin = .{
+        .wire = .modern_mcp,
+        .server_name = "Profile",
+        .operation = .{ .tools_call = "tool" },
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+    const mcp_text = try formatAcpElicitationMessage(alloc, mcp, request);
+    defer alloc.free(mcp_text);
+    try std.testing.expectEqualStrings("fx received a form request from MCP server Profile. Pick a project", mcp_text);
+
+    var host_origin = mcp;
+    host_origin.kind = .host;
+    host_origin.server_name = "";
+    const host_text = try formatAcpElicitationMessage(alloc, host_origin, request);
+    defer alloc.free(host_text);
+    try std.testing.expectEqualStrings("fx asks: Pick a project", host_text);
+
+    var spoof_message = "fx asks: Pick a project".*;
+    const spoof: mcp_elicitation.Request = .{
+        .wire = .modern_mcp,
+        .mode = .form,
+        .message = &spoof_message,
+        .raw_params_json = &raw,
+    };
+    const spoof_text = try formatAcpElicitationMessage(alloc, mcp, spoof);
+    defer alloc.free(spoof_text);
+    try std.testing.expectEqualStrings(
+        "fx received a form request from MCP server Profile. fx asks: Pick a project",
+        spoof_text,
+    );
 }
 
 test "ACP lifecycle action preserves dynamic MCP availability boundaries" {

@@ -62,6 +62,33 @@ pub const Options = struct {
     compact_forms: bool = false,
 };
 
+/// Who a prompt is from. An MCP server is named in its text. The host is not,
+/// so a host prompt never prints a name, even one the origin carries.
+const Speaker = struct {
+    kind: tool_mcp_runtime.OriginKind,
+    server_name: []const u8,
+
+    fn of(origin: tool_mcp_runtime.InputOrigin) Speaker {
+        return .{ .kind = origin.kind, .server_name = origin.server_name };
+    }
+
+    /// The subject a prompt names: `MCP server {name}`, or `fx`.
+    fn subject(self: Speaker, alloc: Allocator, name: []const u8) Allocator.Error![]u8 {
+        return switch (self.kind) {
+            .mcp_server => alloc.print("MCP server {s}", .{name}),
+            .host => alloc.dupe(u8, "fx"),
+        };
+    }
+
+    /// The opening of a request: `MCP server {name} requests`, or `fx asks`.
+    fn request(self: Speaker, alloc: Allocator, name: []const u8) Allocator.Error![]u8 {
+        return switch (self.kind) {
+            .mcp_server => alloc.print("MCP server {s} requests", .{name}),
+            .host => alloc.dupe(u8, "fx asks"),
+        };
+    }
+};
+
 pub fn respond(
     alloc: Allocator,
     origin: tool_mcp_runtime.InputOrigin,
@@ -82,7 +109,7 @@ pub fn respond(
     if (required.legacy_url_phase == .await_completion) {
         return answerLegacyUrlCompletion(
             alloc,
-            origin.server_name,
+            Speaker.of(origin),
             requests,
             required.legacy_url_completion_signal orelse return error.InvalidAnswer,
             origin.deadline_ms,
@@ -107,7 +134,7 @@ pub fn respond(
                 const result = switch (elicitation_request.mode) {
                     .form => try answerForm(
                         alloc,
-                        origin.server_name,
+                        Speaker.of(origin),
                         elicitation_request,
                         origin.deadline_ms,
                         origin.lifecycle_cancel_flag,
@@ -115,7 +142,7 @@ pub fn respond(
                     ),
                     .url => try answerUrl(
                         alloc,
-                        origin.server_name,
+                        Speaker.of(origin),
                         elicitation_request,
                         origin.deadline_ms,
                         origin.lifecycle_cancel_flag,
@@ -195,14 +222,15 @@ const SingleAnswer = union(enum) {
 
 fn answerForm(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     request: elicitation.Request,
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
     options: Options,
 ) Error![]u8 {
-    const display_server_name = try terminalSafeAlloc(alloc, server_name);
-    defer alloc.free(display_server_name);
+    const display_name = try terminalSafeAlloc(alloc, speaker.server_name);
+    defer alloc.free(display_name);
+    const display_speaker: Speaker = .{ .kind = speaker.kind, .server_name = display_name };
     const display_message = try terminalSafeAlloc(alloc, request.message);
     defer alloc.free(display_message);
     var form = try elicitation.parseFormSchema(
@@ -231,7 +259,7 @@ fn answerForm(
         for (form.fields, values) |field, *current| {
             const answer = answerField(
                 alloc,
-                display_server_name,
+                display_speaker,
                 display_message,
                 field,
                 current.*,
@@ -262,7 +290,7 @@ fn answerForm(
         if (invalid or !allFieldsAnswered(values)) {
             if (!try retryInvalidForm(
                 alloc,
-                display_server_name,
+                display_speaker,
                 deadline_ms,
                 cancel_flag,
                 options.questioner,
@@ -278,7 +306,7 @@ fn answerForm(
             else => {
                 if (!try retryInvalidForm(
                     alloc,
-                    display_server_name,
+                    display_speaker,
                     deadline_ms,
                     cancel_flag,
                     options.questioner,
@@ -294,7 +322,7 @@ fn answerForm(
 
         const review_question = try buildReviewQuestion(
             alloc,
-            display_server_name,
+            display_speaker,
             display_message,
             form,
             values,
@@ -337,7 +365,7 @@ fn answerForm(
 
 fn answerField(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     request_message: []const u8,
     field: elicitation.Field,
     current: FieldValue,
@@ -347,12 +375,12 @@ fn answerField(
     compact: bool,
 ) Error!FieldAnswer {
     if (compact and !current.answered) {
-        return answerCompactField(alloc, server_name, request_message, field, deadline_ms, cancel_flag, questioner);
+        return answerCompactField(alloc, speaker, request_message, field, deadline_ms, cancel_flag, questioner);
     }
     if (current.answered) {
         const keep = try askToKeepCurrentValue(
             alloc,
-            server_name,
+            speaker,
             field,
             current.json,
             deadline_ms,
@@ -371,7 +399,7 @@ fn answerField(
     if (field.kind == .multi_select) {
         return answerMultiSelect(
             alloc,
-            server_name,
+            speaker,
             request_message,
             field,
             deadline_ms,
@@ -387,11 +415,13 @@ fn answerField(
     else
         null;
     defer if (display_description) |description| alloc.free(description);
+    const opening = try speaker.request(alloc, speaker.server_name);
+    defer alloc.free(opening);
     const question = if (display_description) |description|
         try alloc.print(
-            "MCP server {s} requests {s}{s} — {s}\nReason: {s}",
+            "{s} {s}{s} — {s}\nReason: {s}",
             .{
-                server_name,
+                opening,
                 display_name,
                 if (field.required) " (required)" else " (optional)",
                 description,
@@ -400,9 +430,9 @@ fn answerField(
         )
     else
         try alloc.print(
-            "MCP server {s} requests {s}{s}\nReason: {s}",
+            "{s} {s}{s}\nReason: {s}",
             .{
-                server_name,
+                opening,
                 display_name,
                 if (field.required) " (required)" else " (optional)",
                 request_message,
@@ -413,7 +443,7 @@ fn answerField(
         const fill_kind: FillKind = if (field.kind == .single_select) .single_select else .scalar;
         switch (try choose_fill_action(
             alloc,
-            server_name,
+            speaker,
             request_message,
             display_name,
             field,
@@ -507,7 +537,7 @@ const CompactAction = union(enum) {
 
 fn answerCompactField(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     message: []const u8,
     field: elicitation.Field,
     deadline_ms: i64,
@@ -519,9 +549,10 @@ fn answerCompactField(
     const temp = arena.allocator();
     const display_name = try terminalSafeAlloc(temp, field.displayName());
     const description = try terminalSafeAlloc(temp, field.description orelse "");
+    const opening = try speaker.request(temp, speaker.server_name);
     const question = try temp.print(
-        "MCP server {s} requests {s}{s}\n{s}\nReason: {s}\nChoose an option to submit.",
-        .{ server_name, display_name, if (field.required) " (required)" else " (optional)", description, message },
+        "{s} {s}{s}\n{s}\nReason: {s}\nChoose an option to submit.",
+        .{ opening, display_name, if (field.required) " (required)" else " (optional)", description, message },
     );
     var choices: std.ArrayList(types.QuestionOption) = .empty;
     var actions: std.ArrayList(CompactAction) = .empty;
@@ -580,7 +611,7 @@ const KeepCurrentDecision = enum { keep, edit, cancelled };
 
 fn askToKeepCurrentValue(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     field: elicitation.Field,
     current_json: ?[]const u8,
     deadline_ms: i64,
@@ -594,9 +625,11 @@ fn askToKeepCurrentValue(
     else
         try alloc.dupe(u8, "(skipped)");
     defer alloc.free(display_value);
+    const who = try speaker.subject(alloc, speaker.server_name);
+    defer alloc.free(who);
     const question = try alloc.print(
-        "MCP server {s}: current value for {s} is {s}. Keep it or edit it?",
-        .{ server_name, display_name, display_value },
+        "{s}: current value for {s} is {s}. Keep it or edit it?",
+        .{ who, display_name, display_value },
     );
     defer alloc.free(question);
     const options = [_]types.QuestionOption{
@@ -626,7 +659,7 @@ fn allFieldsAnswered(values: []const FieldValue) bool {
 
 fn answerMultiSelect(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     request_message: []const u8,
     field: elicitation.Field,
     deadline_ms: i64,
@@ -638,7 +671,7 @@ fn answerMultiSelect(
     if (field.default_json != null or !field.required) {
         switch (try choose_fill_action(
             alloc,
-            server_name,
+            speaker,
             request_message,
             display_name,
             field,
@@ -654,14 +687,16 @@ fn answerMultiSelect(
         }
     }
 
+    const who = try speaker.subject(alloc, speaker.server_name);
+    defer alloc.free(who);
     var selected: std.ArrayList([]const u8) = .empty;
     defer selected.deinit(alloc);
     for (field.choices) |choice| {
         const display_title = try terminalSafeAlloc(alloc, choice.title);
         defer alloc.free(display_title);
         const question = try alloc.print(
-            "MCP server {s}: include {s} in {s}?\nReason: {s}",
-            .{ server_name, display_title, display_name, request_message },
+            "{s}: include {s} in {s}?\nReason: {s}",
+            .{ who, display_title, display_name, request_message },
         );
         defer alloc.free(question);
         const choice_options = [_]types.QuestionOption{
@@ -698,7 +733,7 @@ fn answerMultiSelect(
 
 fn choose_fill_action(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     request_message: []const u8,
     display_name: []const u8,
     field: elicitation.Field,
@@ -707,10 +742,12 @@ fn choose_fill_action(
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
 ) Error!FillAction {
+    const who = try speaker.subject(alloc, speaker.server_name);
+    defer alloc.free(who);
     const question = try alloc.print(
-        "MCP server {s}: choose how to fill {s}{s}.\nReason: {s}",
+        "{s}: choose how to fill {s}{s}.\nReason: {s}",
         .{
-            server_name,
+            who,
             display_name,
             if (field.required) " (required)" else " (optional)",
             request_message,
@@ -754,15 +791,20 @@ fn choose_fill_action(
 
 fn retryInvalidForm(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
 ) Error!bool {
-    const question = try alloc.print(
-        "A response for MCP server {s} did not satisfy the requested form constraints. Edit the form or cancel?",
-        .{server_name},
-    );
+    const who = try speaker.subject(alloc, speaker.server_name);
+    defer alloc.free(who);
+    const question = switch (speaker.kind) {
+        .host => try alloc.dupe(u8, "Your answer did not fit the question. Edit the form or cancel?"),
+        .mcp_server => try alloc.print(
+            "A response for {s} did not satisfy the requested form constraints. Edit the form or cancel?",
+            .{who},
+        ),
+    };
     defer alloc.free(question);
     const options = [_]types.QuestionOption{
         .{ .label = "Edit" },
@@ -808,16 +850,18 @@ fn buildAcceptedFormResponse(alloc: Allocator, values: []const FieldValue) Error
 /// the decision; it is never retained in runtime, status, or model state.
 fn buildReviewQuestion(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     message: []const u8,
     form: elicitation.FormSchema,
     values: []const FieldValue,
 ) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
+    const who = try speaker.subject(alloc, speaker.server_name);
+    defer alloc.free(who);
     try out.writer.print(
-        "Review the completed form requested by MCP server {s}.\nReason: {s}\nCurrent values:\n",
-        .{ server_name, message },
+        "Review the completed form requested by {s}.\nReason: {s}\nCurrent values:\n",
+        .{ who, message },
     );
     for (values, 0..) |value, index| {
         const label = if (index < form.fields.len) form.fields[index].displayName() else value.name;
@@ -898,7 +942,7 @@ fn choiceLabelAlloc(
 
 fn answerUrl(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     request: elicitation.Request,
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
@@ -906,8 +950,10 @@ fn answerUrl(
 ) Error![]u8 {
     const url = request.url orelse return error.InvalidAnswer;
     const host = request.url_host orelse return error.InvalidAnswer;
-    const display_server_name = try terminalSafeAlloc(alloc, server_name);
-    defer alloc.free(display_server_name);
+    const display_name = try terminalSafeAlloc(alloc, speaker.server_name);
+    defer alloc.free(display_name);
+    const opening = try speaker.request(alloc, display_name);
+    defer alloc.free(opening);
     const display_host = try terminalSafeAlloc(alloc, host);
     defer alloc.free(display_host);
     const display_url = try terminalSafeAlloc(alloc, url);
@@ -918,8 +964,8 @@ fn answerUrl(
         .non_ascii => "\nWarning: This host contains non-ASCII characters and may be visually ambiguous.",
     };
     const question = try alloc.print(
-        "MCP server {s} requests an external browser action. Target host: {s}\nComplete URL: {s}{s}\nOpen it? fx will not fetch this URL or see browser contents.",
-        .{ display_server_name, display_host, display_url, warning },
+        "{s} an external browser action. Target host: {s}\nComplete URL: {s}{s}\nOpen it? fx will not fetch this URL or see browser contents.",
+        .{ opening, display_host, display_url, warning },
     );
     defer alloc.free(question);
     const consent_options = [_]types.QuestionOption{
@@ -989,7 +1035,7 @@ fn answerUrl(
 
 fn answerLegacyUrlCompletion(
     alloc: Allocator,
-    server_name: []const u8,
+    speaker: Speaker,
     requests: []const mrtr.InputRequest,
     signal: *const tool_mcp_runtime.LegacyUrlCompletionSignal,
     deadline_ms: i64,
@@ -1009,11 +1055,13 @@ fn answerLegacyUrlCompletion(
         return renderUniformResponses(alloc, requests, .cancel);
     }
 
-    const display_server_name = try terminalSafeAlloc(alloc, server_name);
-    defer alloc.free(display_server_name);
+    const display_name = try terminalSafeAlloc(alloc, speaker.server_name);
+    defer alloc.free(display_name);
+    const who = try speaker.subject(alloc, display_name);
+    defer alloc.free(who);
     const question = try alloc.print(
-        "Complete the browser flow requested by MCP server {s}. fx will continue automatically if the server confirms every URL request. Otherwise choose I completed it / Retry, or Cancel.",
-        .{display_server_name},
+        "Complete the browser flow requested by {s}. fx will continue automatically if the server confirms every URL request. Otherwise choose I completed it / Retry, or Cancel.",
+        .{who},
     );
     defer alloc.free(question);
     const completion_options = [_]types.QuestionOption{
@@ -1124,6 +1172,23 @@ fn ask_single(
     const answer = answers[0];
     alloc.free(answers);
     return .{ .answer = answer };
+}
+
+test "an answer that does not fit a form is worded for the host, and an MCP server's keeps its text" {
+    const alloc = std.testing.allocator;
+    var host = Fixture{
+        .answers = &.{"Cancel"},
+        .expected_question = "Your answer did not fit the question. Edit the form or cancel?",
+    };
+    try std.testing.expect(!try retryInvalidForm(alloc, .{ .kind = .host, .server_name = "" }, std.math.maxInt(i64), null, host.questioner()));
+    try std.testing.expect(host.saw_expected_question);
+
+    var mcp = Fixture{
+        .answers = &.{"Cancel"},
+        .expected_question = "A response for MCP server Profile did not satisfy the requested form constraints. Edit the form or cancel?",
+    };
+    try std.testing.expect(!try retryInvalidForm(alloc, .{ .kind = .mcp_server, .server_name = "Profile" }, std.math.maxInt(i64), null, mcp.questioner()));
+    try std.testing.expect(mcp.saw_expected_question);
 }
 
 test "interaction review shows every validated current value before submission" {
@@ -1403,6 +1468,138 @@ test "legacy URL completion is separate from consent and supports bounded manual
     try std.testing.expectEqual(@as(usize, 0), automatic.answer_index);
 }
 
+fn originFor(kind: tool_mcp_runtime.OriginKind, server_name: []const u8) tool_mcp_runtime.InputOrigin {
+    return .{
+        .wire = .modern_mcp,
+        .kind = kind,
+        .server_name = server_name,
+        .operation = .{ .tools_call = "fixture" },
+        .connection_generation = 1,
+        .client_generation = 1,
+        .catalog_generation = 1,
+        .request_generation = 1,
+        .auth_generation = 1,
+        .deadline_ms = std.math.maxInt(i64),
+    };
+}
+
+/// Records the first question a prompt asks, then cancels, so a test reads its text.
+const FirstQuestion = struct {
+    text: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn questioner(self: *FirstQuestion) Questioner {
+        return .{ .context = self, .ask_fn = ask };
+    }
+
+    fn ask(
+        raw: *anyopaque,
+        _: Allocator,
+        entries: []const types.QuestionBatchEntry,
+        _: i64,
+        _: ?*const std.atomic.Value(bool),
+    ) anyerror!?[][]u8 {
+        const self: *FirstQuestion = @ptrCast(@alignCast(raw));
+        if (self.len == 0) {
+            self.len = entries[0].question.len;
+            @memcpy(self.text[0..self.len], entries[0].question);
+        }
+        return null;
+    }
+
+    fn slice(self: *const FirstQuestion) []const u8 {
+        return self.text[0..self.len];
+    }
+};
+
+fn refuseOpen(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+    return false;
+}
+
+fn firstQuestion(
+    alloc: Allocator,
+    origin: tool_mcp_runtime.InputOrigin,
+    input_json: []const u8,
+    compact: bool,
+) !FirstQuestion {
+    var capture: FirstQuestion = .{};
+    const response = try respond(alloc, origin, .{ .input_requests_json = input_json }, .{
+        .questioner = capture.questioner(),
+        .browser = .{ .open_fn = refuseOpen },
+        .capabilities = .{ .form = true },
+        .compact_forms = compact,
+    });
+    alloc.free(response);
+    return capture;
+}
+
+const text_form_json =
+    \\{"form":{"method":"elicitation/create","params":{"message":"Pick a name","requestedSchema":{"type":"object","properties":{"name":{"type":"string","title":"Project name"}},"required":["name"]}}}}
+;
+
+const choice_form_json =
+    \\{"form":{"method":"elicitation/create","params":{"message":"Choose one","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Pick one","oneOf":[{"const":"a","title":"Alpha"},{"const":"b","title":"Beta"}]}},"required":["choice"]}}}}
+;
+
+test "Speaker words: an MCP server names itself, and the host never prints a name" {
+    const alloc = std.testing.allocator;
+    const server: Speaker = .{ .kind = .mcp_server, .server_name = "Profile" };
+    const host: Speaker = .{ .kind = .host, .server_name = "Shadow" };
+    const server_subject = try server.subject(alloc, "Profile");
+    defer alloc.free(server_subject);
+    try std.testing.expectEqualStrings("MCP server Profile", server_subject);
+    const server_request = try server.request(alloc, "Profile");
+    defer alloc.free(server_request);
+    try std.testing.expectEqualStrings("MCP server Profile requests", server_request);
+    const host_subject = try host.subject(alloc, "Shadow");
+    defer alloc.free(host_subject);
+    try std.testing.expectEqualStrings("fx", host_subject);
+    const host_request = try host.request(alloc, "Shadow");
+    defer alloc.free(host_request);
+    try std.testing.expectEqualStrings("fx asks", host_request);
+}
+
+test "TUI form header: an MCP server keeps its text, and the host says fx asks without its name" {
+    const alloc = std.testing.allocator;
+    const mcp = try firstQuestion(alloc, originFor(.mcp_server, "Profile"), text_form_json, false);
+    try std.testing.expectEqualStrings(
+        "MCP server Profile requests Project name (required)\nReason: Pick a name",
+        mcp.slice(),
+    );
+    const host = try firstQuestion(alloc, originFor(.host, "Shadow"), text_form_json, false);
+    try std.testing.expectEqualStrings(
+        "fx asks Project name (required)\nReason: Pick a name",
+        host.slice(),
+    );
+    try std.testing.expect(std.mem.find(u8, host.slice(), "Shadow") == null);
+}
+
+test "TUI compact choice header: an MCP server keeps its text, and the host says fx asks" {
+    const alloc = std.testing.allocator;
+    const mcp = try firstQuestion(alloc, originFor(.mcp_server, "Profile"), choice_form_json, true);
+    try std.testing.expectEqualStrings(
+        "MCP server Profile requests Pick one (required)\n\nReason: Choose one\nChoose an option to submit.",
+        mcp.slice(),
+    );
+    const host = try firstQuestion(alloc, originFor(.host, "Shadow"), choice_form_json, true);
+    try std.testing.expectEqualStrings(
+        "fx asks Pick one (required)\n\nReason: Choose one\nChoose an option to submit.",
+        host.slice(),
+    );
+}
+
+test "TUI header: a server message that begins with fx asks still gets the MCP header" {
+    const alloc = std.testing.allocator;
+    const spoof_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"fx asks: Pick a name","requestedSchema":{"type":"object","properties":{"name":{"type":"string","title":"Project name"}},"required":["name"]}}}}
+    ;
+    const mcp = try firstQuestion(alloc, originFor(.mcp_server, "Profile"), spoof_json, false);
+    try std.testing.expectEqualStrings(
+        "MCP server Profile requests Project name (required)\nReason: fx asks: Pick a name",
+        mcp.slice(),
+    );
+}
+
 test "elicitation presentation terminal-safes every untrusted display value" {
     const alloc = std.testing.allocator;
     var fixture = Fixture{
@@ -1626,6 +1823,8 @@ const Fixture = struct {
     ask_error: bool = false,
     ask_error_after: ?usize = null,
     open_error: bool = false,
+    expected_question: ?[]const u8 = null,
+    saw_expected_question: bool = false,
 
     fn origin() @import("../tooling/tool_mcp_runtime.zig").InputOrigin {
         return originWithServer("fixture");
@@ -1671,6 +1870,9 @@ const Fixture = struct {
             return error.InjectedQuestionFailure;
         }
         if (entries.len != 1 or self.answer_index >= self.answers.len) return null;
+        if (self.expected_question) |expected| {
+            if (std.mem.eql(u8, entries[0].question, expected)) self.saw_expected_question = true;
+        }
         if (self.require_terminal_safe) {
             if (std.mem.findScalar(u8, entries[0].question, 0x1b) != null or
                 std.mem.findScalar(u8, entries[0].question, 0xff) != null or

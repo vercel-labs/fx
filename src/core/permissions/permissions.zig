@@ -2604,6 +2604,27 @@ test "web_fetch exact matcher never calls generic url wildcard matcher" {
     try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", target, .none));
 }
 
+// #2153 and spec A2: a configured rule matches the command with its placement stripped
+// (patternForRuleMatch), so a configured allow or deny applies to local and remote runs alike.
+// A remote run therefore never escapes a configured deny.
+test "a configured allow or deny for make matches a remote make as well as a local one" {
+    const alloc = std.testing.allocator;
+    const local_target = "/tmp/workspace::make";
+    const remote_target = "/tmp/workspace::@fx-placement:remote:prj_1:make";
+    var allow_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("make"), .action = .allow },
+    };
+    const allow: types.PermissionRuleSet = .{ .rules = &allow_buf };
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, allow, "/tmp/workspace", "run_command", local_target, .command_cwd));
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, allow, "/tmp/workspace", "run_command", remote_target, .command_cwd));
+    var deny_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("make"), .action = .deny },
+    };
+    const deny: types.PermissionRuleSet = .{ .rules = &deny_buf };
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, deny, "/tmp/workspace", "run_command", local_target, .command_cwd));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, deny, "/tmp/workspace", "run_command", remote_target, .command_cwd));
+}
+
 test "web_fetch grants do not authorize other tools" {
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com") },

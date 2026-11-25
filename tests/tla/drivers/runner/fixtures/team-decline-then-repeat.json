@@ -1,0 +1,44 @@
+{
+  "covers": [
+    "U7-team-decline"
+  ],
+  "title": "A decline at the team prompt sets the decline mark: the repeat in the same turn gets no prompt.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "many",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [
+      "decline"
+    ],
+    "cancels": {},
+    "retries": {
+      "c1": 1
+    },
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused",
+        "refused"
+      ]
+    },
+    "prompts": 1,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "prompt-after-decline"
+  },
+  "drive": {
+    "teams": 2
+  }
+}

@@ -1,8 +1,8 @@
 --------------------------- MODULE SandboxProvider ---------------------------
 (***************************************************************************)
 (* One shell call that fx may place in a sandbox, run through a provider   *)
-(* program that does all sandbox work (src/core/sandbox/, and the default  *)
-(* provider src/core/sandbox/providers/vercel.sh over the `sandbox` CLI).  *)
+(* program that does all sandbox work: the built-in runner, or a          *)
+(* third-party provider that follows spec L2 (tests/tla/drivers/sandbox/). *)
 (* This models code that has not landed yet; the drivers in                *)
 (* tests/tla/drivers/sandbox/ that need it run only with --next.           *)
 (*                                                                         *)
@@ -41,8 +41,8 @@ ProvLive == {"setup", "created", "pushed", "started", "pulled"}
 ProvGone == {"exited", "killed"}
 Events == {"none", "decide", "local", "provider", "create", "createfail", "push",
            "start", "exit", "timeout", "edit", "copy", "keep", "nochange", "final",
-           "rm", "stop", "termexit", "killsent", "killed", "sigkill", "crash",
-           "result", "sweep", "tick"}
+           "rm", "stop", "termexit", "killsent", "killed", "sigkill", "crash", "hostcrash", "cleanup",
+           "result", "tick"}
 
 VARIABLES
     placement,      \* where the rules put the call
@@ -69,6 +69,7 @@ VARIABLES
     lost,           \* a local edit was overwritten
     conflict,       \* the provider kept a local edit and did not bring the file back
     sandbox,        \* none, up, removed
+    leftover,       \* an isolated sandbox a crashed earlier run left is still up
     ev              \* what the last step did, for trace validation
 
 inputs == <<placement, tty, ready, configured, grants>>
@@ -76,7 +77,7 @@ fxv == <<runAt, phase, result, ranLocal>>
 provv == <<prov, term, killWait, crashed, report>>
 remv == <<remote, code, age, remoteChanged>>
 filev == <<env, localVer, pushedVer, lost, conflict>>
-vars == <<inputs, fxv, provv, remv, filev, sandbox, ev>>
+vars == <<inputs, fxv, provv, remv, filev, sandbox, leftover, ev>>
 
 TypeOK ==
     /\ placement \in Placements
@@ -103,6 +104,7 @@ TypeOK ==
     /\ lost \in BOOLEAN
     /\ conflict \in BOOLEAN
     /\ sandbox \in {"none", "up", "removed"}
+    /\ leftover \in BOOLEAN
     /\ ev \in Events
 
 Init ==
@@ -130,6 +132,7 @@ Init ==
     /\ lost = FALSE
     /\ conflict = FALSE
     /\ sandbox = "none"
+    /\ leftover \in BOOLEAN
     /\ ev = "none"
 
 \* Admission: a grant for this command at this placement.
@@ -159,7 +162,7 @@ Decide ==
                       /\ result' = "refused"
                       /\ UNCHANGED runAt
     /\ ev' = "decide"
-    /\ UNCHANGED <<inputs, ranLocal, provv, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, ranLocal, provv, remv, filev, sandbox, leftover>>
 
 RunLocal ==
     /\ phase = "admitted"
@@ -168,7 +171,7 @@ RunLocal ==
     /\ phase' = "done"
     /\ result' = "local"
     /\ ev' = "local"
-    /\ UNCHANGED <<inputs, runAt, provv, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, runAt, provv, remv, filev, sandbox, leftover>>
 
 \* fx starts the provider; only a workspace run gets the configured env.
 StartProvider ==
@@ -179,7 +182,7 @@ StartProvider ==
     /\ env' = IF configured /\ (placement = "workspace" \/ Bug = "isolated_keys") THEN {"KEY"} ELSE {}
     /\ ev' = "provider"
     /\ UNCHANGED <<inputs, runAt, result, ranLocal, term, killWait, crashed, report,
-                   remv, localVer, pushedVer, lost, conflict, sandbox>>
+                   remv, localVer, pushedVer, lost, conflict, sandbox, leftover>>
 
 \* fx reads the report once the provider is gone.
 Collect ==
@@ -191,7 +194,7 @@ Collect ==
                    [] report = "notstarted" -> "didnotrun"
                    [] OTHER -> IF Bug = "trust_missing" THEN "didnotrun" ELSE "mayhaveran"
     /\ ev' = "result"
-    /\ UNCHANGED <<inputs, runAt, ranLocal, provv, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, runAt, ranLocal, provv, remv, filev, sandbox, leftover>>
 
 \* The user or the model stops the call: fx sends SIGTERM.
 Stop ==
@@ -200,7 +203,7 @@ Stop ==
     /\ term = -1
     /\ term' = 0
     /\ ev' = "stop"
-    /\ UNCHANGED <<inputs, fxv, prov, killWait, crashed, report, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, prov, killWait, crashed, report, remv, filev, sandbox, leftover>>
 
 \* The grace ended: fx sends SIGKILL to the provider.
 GraceOver ==
@@ -208,18 +211,7 @@ GraceOver ==
     /\ prov \in ProvLive
     /\ prov' = "killed"
     /\ ev' = "sigkill"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv, filev, sandbox>>
-
-\* The next fx start removes isolated sandboxes whose owner is gone.
-Sweep ==
-    /\ phase = "done"
-    /\ placement = "isolated"
-    /\ sandbox = "up"
-    /\ prov \in ProvGone
-    /\ Bug # "no_sweep"
-    /\ sandbox' = "removed"
-    /\ ev' = "sweep"
-    /\ UNCHANGED <<inputs, fxv, provv, remv, filev>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv, filev, sandbox, leftover>>
 
 -----------------------------------------------------------------------------
 (* The provider *)
@@ -228,10 +220,11 @@ Sweep ==
 Create ==
     /\ prov = "setup"
     /\ term = -1
+    /\ (placement # "isolated" \/ ~leftover \/ Bug = "skip_cleanup")
     /\ prov' = "created"
     /\ sandbox' = "up"
     /\ ev' = "create"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv, filev>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv, filev, leftover>>
 
 CreateFail ==
     /\ prov = "setup"
@@ -239,7 +232,7 @@ CreateFail ==
     /\ prov' = "exited"
     /\ report' = "notstarted"
     /\ ev' = "createfail"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, remv, filev, sandbox, leftover>>
 
 Push ==
     /\ prov = "created"
@@ -248,7 +241,7 @@ Push ==
     /\ pushedVer' = localVer
     /\ ev' = "push"
     /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv,
-                   env, localVer, lost, conflict, sandbox>>
+                   env, localVer, lost, conflict, sandbox, leftover>>
 
 \* sandbox exec --detach --timeout; the report now says it started.
 Start ==
@@ -259,7 +252,7 @@ Start ==
     /\ remote' = "running"
     /\ age' = 0
     /\ ev' = "start"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, code, remoteChanged, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, code, remoteChanged, filev, sandbox, leftover>>
 
 \* Bring back a changed file, unless it changed here since it was sent.
 Pull ==
@@ -277,7 +270,7 @@ Pull ==
        ELSE /\ UNCHANGED <<lost, conflict>>
             /\ ev' = "nochange"
     /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, report, remv,
-                   env, localVer, pushedVer, sandbox>>
+                   env, localVer, pushedVer, sandbox, leftover>>
 
 \* Write the final report; an isolated sandbox is removed.
 Finish ==
@@ -287,7 +280,8 @@ Finish ==
     /\ IF placement = "isolated" /\ sandbox = "up"
        THEN /\ sandbox' = "removed"
             /\ ev' = "rm"
-       ELSE /\ UNCHANGED sandbox
+            /\ UNCHANGED leftover
+       ELSE /\ UNCHANGED <<sandbox, leftover>>
             /\ ev' = "final"
     /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, remv, filev>>
 
@@ -303,14 +297,15 @@ OnTerm ==
           /\ IF placement = "isolated" /\ sandbox = "up"
              THEN /\ sandbox' = "removed"
                   /\ ev' = "rm"
-             ELSE /\ UNCHANGED sandbox
+                  /\ UNCHANGED leftover
+             ELSE /\ UNCHANGED <<sandbox, leftover>>
                   /\ ev' = "termexit"
           /\ UNCHANGED killWait
        \/ /\ prov = "started"
           /\ remote = "running"
           /\ killWait' = 0
           /\ ev' = "killsent"
-          /\ UNCHANGED <<prov, report, sandbox>>
+          /\ UNCHANGED <<prov, report, sandbox, leftover>>
     /\ UNCHANGED <<inputs, fxv, term, crashed, remv, filev>>
 
 \* The remote kill landed; Finish writes the report and cleans up.
@@ -321,7 +316,7 @@ KillLands ==
     /\ report' = IF remote = "running" THEN "stopped" ELSE report
     /\ prov' = "pulled"
     /\ ev' = "killed"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, code, age, remoteChanged, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, crashed, code, age, remoteChanged, filev, sandbox, leftover>>
 
 Crash ==
     /\ prov \in ProvLive
@@ -329,7 +324,31 @@ Crash ==
     /\ prov' = "killed"
     /\ crashed' = TRUE
     /\ ev' = "crash"
-    /\ UNCHANGED <<inputs, fxv, term, killWait, report, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, term, killWait, report, remv, filev, sandbox, leftover>>
+
+\* The provider removes what a crashed earlier isolated run left, before it
+\* creates a sandbox (spec L2: a third-party runner cleans up its own leftovers).
+CleanUp ==
+    /\ prov = "setup"
+    /\ term = -1
+    /\ placement = "isolated"
+    /\ leftover
+    /\ Bug # "skip_cleanup"
+    /\ leftover' = FALSE
+    /\ ev' = "cleanup"
+    /\ UNCHANGED <<inputs, fxv, provv, remv, filev, sandbox>>
+
+\* fx itself dies. Its provider goes with it, the sandbox it made stays up, as
+\* after Crash, and the call reports nothing more.
+HostCrash ==
+    /\ prov \in ProvLive
+    /\ ~crashed
+    /\ phase # "done"
+    /\ phase' = "done"
+    /\ prov' = "killed"
+    /\ crashed' = TRUE
+    /\ ev' = "hostcrash"
+    /\ UNCHANGED <<inputs, runAt, result, ranLocal, term, killWait, report, remv, filev, sandbox, leftover>>
 
 -----------------------------------------------------------------------------
 (* The sandbox and this machine *)
@@ -341,7 +360,7 @@ RemoteEnds ==
           /\ remoteChanged' = ch
     /\ remote' = "exited"
     /\ ev' = "exit"
-    /\ UNCHANGED <<inputs, fxv, provv, age, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, provv, age, filev, sandbox, leftover>>
 
 TimeOut ==
     /\ remote = "running"
@@ -351,7 +370,7 @@ TimeOut ==
     /\ remote' = "timedout"
     /\ code' = 137
     /\ ev' = "timeout"
-    /\ UNCHANGED <<inputs, fxv, provv, age, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, provv, age, filev, sandbox, leftover>>
 
 \* Someone edits the file here while the call runs.
 LocalEdit ==
@@ -360,7 +379,7 @@ LocalEdit ==
     /\ localVer < MaxEdits
     /\ localVer' = localVer + 1
     /\ ev' = "edit"
-    /\ UNCHANGED <<inputs, fxv, provv, remv, env, pushedVer, lost, conflict, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, provv, remv, env, pushedVer, lost, conflict, sandbox, leftover>>
 
 \* Time passes. The provider handles a signal at once, and a timer that is
 \* due fires before more time passes.
@@ -377,24 +396,25 @@ Tick ==
     /\ killWait' = IF killWait >= 0 /\ killWait < KillTicks /\ prov \in ProvLive
                    THEN killWait + 1 ELSE killWait
     /\ ev' = "tick"
-    /\ UNCHANGED <<inputs, fxv, prov, crashed, report, remote, code, remoteChanged, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, prov, crashed, report, remote, code, remoteChanged, filev, sandbox, leftover>>
 
 \* The call is over; time and cleanup may still move.
 Done ==
     /\ phase = "done"
     /\ ev' = "none"
-    /\ UNCHANGED <<inputs, fxv, provv, remv, filev, sandbox>>
+    /\ UNCHANGED <<inputs, fxv, provv, remv, filev, sandbox, leftover>>
 
 Next ==
-    \/ Decide \/ RunLocal \/ StartProvider \/ Collect \/ Stop \/ GraceOver \/ Sweep
+    \/ Decide \/ RunLocal \/ StartProvider \/ Collect \/ Stop \/ GraceOver
     \/ Create \/ CreateFail \/ Push \/ Start \/ Pull \/ Finish \/ OnTerm \/ KillLands \/ Crash
+    \/ CleanUp \/ HostCrash
     \/ RemoteEnds \/ TimeOut \/ LocalEdit \/ Tick \/ Done
 
 Fairness ==
     /\ WF_vars(Decide) /\ WF_vars(RunLocal) /\ WF_vars(StartProvider) /\ WF_vars(Collect)
-    /\ WF_vars(GraceOver) /\ WF_vars(Sweep) /\ WF_vars(Create) /\ WF_vars(Push)
+    /\ WF_vars(GraceOver) /\ WF_vars(Create) /\ WF_vars(Push)
     /\ WF_vars(Start) /\ WF_vars(Pull) /\ WF_vars(Finish) /\ WF_vars(OnTerm)
-    /\ WF_vars(KillLands) /\ WF_vars(TimeOut) /\ WF_vars(Tick)
+    /\ WF_vars(KillLands) /\ WF_vars(TimeOut) /\ WF_vars(Tick) /\ WF_vars(CleanUp)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -432,6 +452,8 @@ OrphanBounded == remote = "running" => age <= Timeout
 \* Every call ends.
 CallEnds == <>(phase = "done")
 
-\* No isolated sandbox stays up for good.
-IsolatedCleanedUp == <>[](placement = "isolated" => sandbox # "up")
+\* An isolated sandbox that a crashed earlier run left stays only until the next
+\* isolated run: this run's sandbox never comes up while such a leftover remains.
+\* A state predicate, checked as an invariant in every reachable state.
+IsolatedCleanedUp == placement = "isolated" /\ sandbox = "up" => ~leftover
 =============================================================================

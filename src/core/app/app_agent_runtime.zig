@@ -238,6 +238,7 @@ pub fn Runtime(comptime App: type) type {
         /// not stop a call to it; `childLiveToolAuthority` refuses any tool
         /// outside the admission.
         fn applyChildToolContext(app: *App, ctx: *tool_runtime.Context, run: *agents.ChildRun) void {
+            ctx.remote_setup_allowed = false;
             ctx.session_grants = run.admission.grants;
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
@@ -499,6 +500,7 @@ pub fn Runtime(comptime App: type) type {
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,
+                .user_turn_id = agent.worker.activeTurnId(),
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;

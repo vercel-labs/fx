@@ -1,0 +1,42 @@
+{
+  "covers": [
+    "U7-team-accept"
+  ],
+  "title": "A team accept at P1 is not consent: the project prompt follows, and a dismissed project form refuses with nothing written.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "many",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [
+      "team_accept",
+      "cancel"
+    ],
+    "cancels": {},
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 2,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "p2-skipped"
+  },
+  "drive": {
+    "teams": 2
+  }
+}

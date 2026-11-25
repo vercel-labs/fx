@@ -3,7 +3,7 @@ const auto_classifier = @import("auto_classifier.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
-const launch = @import("../sandbox/launch.zig");
+const launch = @import("../runner/runner.zig");
 const types = @import("../shared/types.zig");
 
 pub const CommandExecutionMode = enum {
@@ -24,6 +24,10 @@ pub const CommandContext = struct {
     /// The provider launch for a placed command. It is configuration, not
     /// identity, so `AdmissionFingerprint` leaves it out.
     sandbox: ?*const launch.Launch = null,
+    /// The call's timeout, passed to a built-in run (spec L1). Null when the call
+    /// sets none. Like `sandbox`, it is configuration, so `AdmissionFingerprint`
+    /// leaves it out.
+    timeout_ms: ?usize = null,
 };
 
 pub const AdmissionFingerprint = struct {
@@ -248,16 +252,16 @@ test "explicit clean environment is direct only in automatic mode" {
 
 test "admission fingerprint binds the placement" {
     const local: CommandContext = .{ .command = "zig build test", .resolved_cwd = "/repo", .target_os = .linux };
-    var workspace = local;
-    workspace.placement = .workspace;
+    var remote = local;
+    remote.placement = .remote;
     var isolated = local;
     isolated.placement = .isolated;
 
     const fingerprint = AdmissionFingerprint.init(local);
     try std.testing.expect(fingerprint.matches(local));
-    try std.testing.expect(!fingerprint.matches(workspace));
+    try std.testing.expect(!fingerprint.matches(remote));
     try std.testing.expect(!fingerprint.matches(isolated));
-    try std.testing.expect(!AdmissionFingerprint.init(workspace).eql(AdmissionFingerprint.init(isolated)));
+    try std.testing.expect(!AdmissionFingerprint.init(remote).eql(AdmissionFingerprint.init(isolated)));
 
     var media = isolated;
     media.placement_profile = "media";

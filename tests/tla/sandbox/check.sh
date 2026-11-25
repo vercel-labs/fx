@@ -14,7 +14,7 @@
 #   overwrite-local      a changed file comes back over a local edit             NoLostLocalEdit
 #   trust-missing        a missing report reads as did not run                   HonestResult
 #   no-timeout           the remote command has no timeout                       OrphanBounded
-#   no-sweep             startup does not sweep isolated sandboxes               IsolatedCleanedUp
+#   skip-cleanup         an isolated create skips the cleanup of a crashed run   IsolatedCleanedUp
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -29,6 +29,7 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'VERDICTS'
 SandboxProvider sandbox-provider -
+SandboxProvider sandbox-isolated -
 SandboxProvider grace-today NoOrphanAfterStop
 SandboxProvider mutation-local-fallback NoLocalFallback
 SandboxProvider mutation-grant-any-placement GrantPerPlacement
@@ -37,5 +38,5 @@ SandboxProvider mutation-isolated-keys IsolatedNoKeys
 SandboxProvider mutation-overwrite-local NoLostLocalEdit
 SandboxProvider mutation-trust-missing HonestResult
 SandboxProvider mutation-no-timeout OrphanBounded
-SandboxProvider mutation-no-sweep temporal
+SandboxProvider mutation-skip-cleanup IsolatedCleanedUp
 VERDICTS

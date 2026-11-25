@@ -1,0 +1,28 @@
+{
+  "covers": [
+    "V3"
+  ],
+  "title": "The session ends before the command line: the exec answers 410, the one resume runs, and the exec goes out once more and exits 0.",
+  "run": {
+    "events": [
+      "push_ok",
+      "send_gone",
+      "resumed",
+      "send_ran",
+      "id_arrives",
+      "cmd_exits",
+      "stream_end",
+      "bring_back_nothing",
+      "exit_cmd"
+    ]
+  },
+  "tamper": {
+    "run": "resend-without-resume"
+  },
+  "drive": {
+    "command": "true",
+    "faults": {
+      "goneOnce": true
+    }
+  }
+}

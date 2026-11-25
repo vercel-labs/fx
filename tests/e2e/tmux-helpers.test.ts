@@ -36,6 +36,7 @@ const tmuxTest = test.skipIf(!tmuxAvailable());
 const ISOLATED_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",

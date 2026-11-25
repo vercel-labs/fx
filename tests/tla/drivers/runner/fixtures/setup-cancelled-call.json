@@ -1,0 +1,39 @@
+{
+  "covers": [
+    "U7-cancel"
+  ],
+  "title": "The user cancels the turn while the setup prompt is open: refused, nothing written.",
+  "setup": {
+    "calls": {
+      "c1": {
+        "req": "remote",
+        "rule": "none",
+        "floor": "none",
+        "sub": false
+      }
+    },
+    "teams": "one",
+    "surface": "interactive",
+    "login": "valid",
+    "configured": false,
+    "configValid": true,
+    "answers": [],
+    "cancels": {
+      "c1": 1
+    },
+    "retries": {},
+    "newTurns": 0,
+    "loginChange": null,
+    "outcomes": {
+      "c1": [
+        "refused"
+      ]
+    },
+    "prompts": 1,
+    "writes": 0
+  },
+  "tamper": {
+    "setup": "write-without-accept"
+  },
+  "drive": {}
+}

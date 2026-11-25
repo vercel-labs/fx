@@ -741,6 +741,8 @@ function startShellCommand(
     "AI_GATEWAY_API_KEY",
     "-u",
     "VERCEL_OIDC_TOKEN",
+    "-u",
+    "VERCEL_TOKEN",
     `HOME=${shQuote(fixture.home)}`,
     `ZDOTDIR=${shQuote(fixture.zdotdir)}`,
     `HISTFILE=${shQuote(fixture.histfile)}`,

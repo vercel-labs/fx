@@ -22,6 +22,7 @@ const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
 const AUTH_ENV_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
+  "VERCEL_TOKEN",
 ] as const;
 const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
@@ -29,6 +30,7 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_MODELS_URL",
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
+  "FX_TEST_VERCEL_API_URL",
   "FX_PERMISSION_MODE",
   "FX_HOME",
   // A pane inherits the tmux server's environment, which a developer's shell

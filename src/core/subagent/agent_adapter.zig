@@ -115,6 +115,7 @@ const Context = struct {
         result.subagent_caller_id = self.turn.child_id;
         result.session_child_capability = self.turn.childCapability() catch null;
         result.interactive = false;
+        result.remote_setup_allowed = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
         // A child's tool calls are no rows of the parent's, so neither are
@@ -654,6 +655,8 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
         .subagent_id = 1,
     };
     const deps = runtimeDeps(&context);
+    // A child's tool context never starts remote setup (spec U2).
+    try std.testing.expect(!context.toolContext().remote_setup_allowed);
     const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
     try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
     try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));

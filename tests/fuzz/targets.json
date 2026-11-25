@@ -97,6 +97,16 @@
     {"name": "mcp_request_grace", "module": "fx", "test": "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed", "iterations": 1000000},
     {"name": "turn_clock", "module": "fx", "test": "the turn clock keeps its laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "compaction_progress", "module": "fx", "test": "the notes count keeps its laws on fuzzed replies", "iterations": 2000000},
-    {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000}
+    {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
+    {"name": "vercel_auth_json", "module": "fx", "test": "auth.json parses to one of three results, and a token equals its JSON string, on fuzzed bytes", "iterations": 300000},
+    {"name": "vercel_setup_reply", "module": "fx", "test": "a setup API reply parses or is refused, and a parsed id is non-empty and bounded, on fuzzed bytes", "iterations": 300000},
+    {"name": "vercel_sandbox_answer", "module": "fx", "test": "a sandbox answer parses or is refused, and a parsed size and session id are bounded, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_state_files", "module": "fx", "test": "sandbox.json, manifest.json and a pending record parse or are refused, and a parsed manifest writes back to the same records, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_list_page", "module": "fx", "test": "a sandbox list page parses or is refused, and a parsed page has bounded names and a non-empty cursor, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_exec_line", "module": "fx", "test": "a command stream line parses or is refused, and a parsed line has a known stream or a non-empty id, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_back_archive", "module": "fx", "test": "the bring-back archive decodes and writes only files whose names pass the path rules, on fuzzed bytes", "iterations": 100000},
+    {"name": "vercel_back_text", "module": "fx", "test": "a stderr note and a deferred path parse or are ignored, a deferred path survives its escaping, and an accepted name is clean, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_config_remote", "module": "fx", "test": "a remote section parses or is refused on fuzzed bytes, and a parsed remote keeps the strings its JSON gave", "iterations": 200000},
+    {"name": "vercel_wait_answer", "module": "fx", "test": "a wait answer parses or is refused, and a parsed exit code holds when it is written back, on fuzzed bytes", "iterations": 200000}
   ]
 }

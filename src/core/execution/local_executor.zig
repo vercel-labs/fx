@@ -1,10 +1,11 @@
 const std = @import("std");
+const self_exe = @import("../shared/self_exe.zig");
 
 const command_admission = @import("../permissions/command_admission.zig");
 const direct_command = @import("../permissions/direct_command.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
-const launch = @import("../sandbox/launch.zig");
+const launch = @import("../runner/runner.zig");
 
 pub const RouteKind = enum {
     direct_read_only,
@@ -82,15 +83,24 @@ pub fn executePreparedCommand(
             .result = try direct_command.executeDirectReadOnly(cfg, alloc, plan),
         },
         .approved_shell => |shell| blk: {
-            var result = try command_runner.executeCommandInEnvironment(
-                shellConfig(cfg, shell.grant_epoch, shell.termination_grace_ms),
-                alloc,
-                shell.run_command orelse shell.command_ctx.command,
-                shell.command_ctx.resolved_cwd,
-                shell.command_ctx.environment,
-            );
+            var result = if (shell.run_command) |launch_text|
+                // A placed command starts its runner as a local command (spec L3).
+                try command_runner.executeRunnerLaunch(
+                    shellConfig(cfg, shell.grant_epoch, shell.termination_grace_ms),
+                    alloc,
+                    launch_text,
+                    shell.command_ctx.resolved_cwd,
+                )
+            else
+                try command_runner.executeCommandInEnvironment(
+                    shellConfig(cfg, shell.grant_epoch, shell.termination_grace_ms),
+                    alloc,
+                    shell.command_ctx.command,
+                    shell.command_ctx.resolved_cwd,
+                    shell.command_ctx.environment,
+                );
             // The runner records the text it executed. A placed command reports
-            // the command the user asked for, not its provider invocation.
+            // the command the user asked for, not its launch text.
             if (shell.run_command != null) {
                 if (result.command_result) |*foreground| foreground.command = shell.command_ctx.command;
             }
@@ -156,6 +166,7 @@ test "local executor runs an approved shell command with its admitted context" {
 }
 
 test "local executor runs a placed command through its provider and names the user command" {
+    try self_exe.requireInstalledForTest();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -170,14 +181,14 @@ test "local executor runs a placed command through its provider and names the us
     };
     const user_command = "printf local-executor";
     // The test allocator fails the test if the invocation leaks.
-    const run_command = try launch.invocation(std.testing.allocator, &sandbox, user_command, "/tmp", .workspace, null);
+    const run_command = try launch.invocation(std.testing.allocator, &sandbox, user_command, "/tmp", .remote, null, null);
     defer std.testing.allocator.free(run_command);
     const command = PreparedCommand{ .approved_shell = .{
         .command_ctx = .{
             .command = user_command,
             .resolved_cwd = "/tmp",
             .target_os = @import("builtin").target.os.tag,
-            .placement = .workspace,
+            .placement = .remote,
             .sandbox = &sandbox,
         },
         .reason = .dynamic_shell,
@@ -192,7 +203,7 @@ test "local executor runs a placed command through its provider and names the us
     try std.testing.expect(std.mem.find(
         u8,
         executed.result.output,
-        "run --mode workspace --root /tmp --cwd /tmp --state /tmp/fx-state -- printf local-executor",
+        "run --mode remote --root /tmp --cwd /tmp --state /tmp/fx-state -- printf local-executor",
     ) != null);
     const foreground = executed.result.command_result.?;
     try std.testing.expectEqualStrings(user_command, foreground.command);

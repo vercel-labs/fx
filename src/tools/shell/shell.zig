@@ -9,6 +9,7 @@ const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const self_exe = @import("../../core/shared/self_exe.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
@@ -23,6 +24,7 @@ const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_admission = @import("../../core/tooling/tool_admission.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
@@ -30,6 +32,7 @@ const result_commit = @import("../../core/tooling/result_commit.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
+const sandbox_runner = @import("../../core/runner/runner.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -75,10 +78,23 @@ pub const ActionFieldContract = struct {
     conflicts: []const tool_result_errors.TerminalActionFieldConflict = &.{},
 };
 
+const run_fields = [_][]const u8{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" };
+const run_fields_with_runner = run_fields ++ [_][]const u8{runner_key};
+
+fn runFields(runner_field: bool) []const []const u8 {
+    return if (runner_field) &run_fields_with_runner else &run_fields;
+}
+
 pub fn actionFieldContract(action: Action) ActionFieldContract {
+    return actionFieldContractFor(action, false);
+}
+
+/// The contract of `action`. `runner_field` is true exactly when the surface
+/// holds a sandbox policy. Then `run` also takes `runner`, and no other action does.
+pub fn actionFieldContractFor(action: Action, runner_field: bool) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" },
+            .allowed = runFields(runner_field),
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
@@ -131,9 +147,13 @@ fn fittingAction(object: std.json.ObjectMap, empty_fields: EmptyFields) Fit {
     return if (found) |action| .{ .one = action } else .none;
 }
 
+/// Whether a call's fields fit `contract`. The runner key is skipped, as if it
+/// were absent, so the action a call fits is the same with the runner field on
+/// or off. Decode still checks the key through the contract.
 fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract, empty_fields: EmptyFields) bool {
     var fields = object.iterator();
     while (fields.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, runner_key)) continue;
         if (isAbsentValue(entry.value_ptr.*)) continue;
         if (containsFieldName(contract.allowed, entry.key_ptr.*)) continue;
         if (empty_fields == .ignored_outside_action and isDroppableOutsideAction(entry.key_ptr.*, entry.value_ptr.*)) continue;
@@ -258,6 +278,8 @@ test "inferAction names the one action a call's fields fit" {
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,
+    /// The `runner` of a run, when the runner field is on.
+    runner: ?sandbox_runner.Request = null,
 
     fn deinit(self: *OwnedInput, alloc: Allocator) void {
         self.arena_state.promote(alloc).deinit();
@@ -272,8 +294,45 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    if (try runnerValueProblem(ctx, args_json)) |reason| return .{ .failure = reason };
     if (try decode_input(ctx, args_json)) |input| return .{ .input = input };
-    return .{ .failure = try request_correction(ctx.allocator, args_json, ctx.session_child_capability != null) };
+    return .{ .failure = try requestCorrectionFor(
+        ctx.allocator,
+        args_json,
+        ctx.session_child_capability != null,
+        ctx.sandbox_policy != null,
+    ) };
+}
+
+/// The field that asks for a sandbox placement. Decode reads it through the run
+/// contract, and inference skips it, so the key is named here once.
+const runner_key = "runner";
+
+const runner_value_message = "runner must be \"local\" or \"remote\"";
+
+fn isRunnerWord(value: std.json.Value) bool {
+    return value == .string and (std.mem.eql(u8, value.string, "local") or std.mem.eql(u8, value.string, "remote"));
+}
+
+/// E1: with the runner field on, a `run` whose `runner` is neither `local` nor
+/// `remote` is refused before anything else is read. Other actions are left to
+/// the field check, which refuses `runner` on them.
+fn runnerValueProblem(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!?[]u8 {
+    if (ctx.sandbox_policy == null) return null;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer mem_utils.deinit_arena(arena_state);
+    const arena = arena_state.allocator();
+    const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (raw != .object) return null;
+    const action = raw.object.get("action") orelse return null;
+    if (action != .string or !std.mem.eql(u8, action.string, "run")) return null;
+    const value = raw.object.get(runner_key) orelse return null;
+    if (value == .null) return null;
+    if (isRunnerWord(value)) return null;
+    return try ctx.allocator.dupe(u8, runner_value_message);
 }
 
 fn decode_input(
@@ -304,12 +363,15 @@ fn decode_input(
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
+    const runner_field = ctx.sandbox_policy != null;
     if (try actionFieldCorrection(
         ctx.allocator,
         action,
         raw.object,
         &correction_scratch,
+        runner_field,
     ) != null) return null;
+    const runner = takeRunner(&raw.object, action, runner_field);
     normalizeCompositeArgument(arena, &raw, "shell") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -327,12 +389,26 @@ fn decode_input(
     owned.* = .{
         .arena_state = arena_state.state,
         .value = input,
+        .runner = runner,
     };
     arena_state.state = .init;
     return .{
         .ptr = owned,
         .deinit_fn = inputDeinit,
     };
+}
+
+/// Removes `runner` from a run's arguments, which `Input` does not read, and
+/// returns its request. Without the runner field, the field check has already
+/// refused `runner`, so nothing is removed.
+fn takeRunner(object: *std.json.ObjectMap, action: Action, runner_field: bool) ?sandbox_runner.Request {
+    if (!runner_field or action != .run) return null;
+    const value = object.get(runner_key) orelse return null;
+    _ = object.orderedRemove(runner_key);
+    if (value != .string) return null;
+    if (std.mem.eql(u8, value.string, "local")) return .local;
+    if (std.mem.eql(u8, value.string, "remote")) return .remote;
+    return null;
 }
 
 fn defaultYieldTime(action: Action) u32 {
@@ -366,6 +442,10 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
 
 // Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
+    return requestCorrectionFor(alloc, args_json, supports_tty, false);
+}
+
+fn requestCorrectionFor(alloc: Allocator, args_json: []const u8, supports_tty: bool, runner_field: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
@@ -432,7 +512,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     elideLoginShellOnPlainRun(&object, action, shell_resolver.configuredLoginShellInto(&login_shell_buffer));
 
     var scratch: ActionFieldCorrectionScratch = .{};
-    if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
+    if (try actionFieldCorrection(arena, action, object, &scratch, runner_field)) |correction| {
         for (correction.invalid_fields) |name| {
             try problems.append(arena, try arena.print(
                 "{s} is not accepted for {s}.",
@@ -513,6 +593,18 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     }
     if (problems.items.len == 0) {
         try problems.append(arena, "Submit one Shell action.");
+    }
+    // A suggested retry keeps a valid runner, so the retry is placed the same
+    // way. An invalid one is refused with the E1 text instead.
+    if (runner_field and action == .run) {
+        if (object.get(runner_key)) |value| {
+            if (isRunnerWord(value)) {
+                try canonical.put(arena, runner_key, value);
+            } else {
+                try problems.append(arena, runner_value_message);
+                repairable = false;
+            }
+        }
     }
     return correction_json(alloc, problems.items, if (repairable) canonical else null);
 }
@@ -595,8 +687,9 @@ fn actionFieldCorrection(
     action: Action,
     object: std.json.ObjectMap,
     scratch: *ActionFieldCorrectionScratch,
+    runner_field: bool,
 ) Allocator.Error!?tool_result_errors.TerminalActionFieldCorrection {
-    const field_contract = actionFieldContract(action);
+    const field_contract = actionFieldContractFor(action, runner_field);
     try scratch.invalid_fields.ensureTotalCapacity(alloc, object.count());
     var fields = object.iterator();
     while (fields.next()) |entry| {
@@ -696,9 +789,10 @@ pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = erased.as(OwnedInput).value;
+    const owned = erased.as(OwnedInput);
+    const input = owned.value;
     return switch (input.action) {
-        .run => callRun(ctx, runInputFor(ctx, input)),
+        .run => callRun(ctx, runInputFor(ctx, input), owned.runner),
         .interact => callInteract(ctx, input),
         .stop => callStop(ctx, input),
     };
@@ -707,9 +801,10 @@ pub fn call(
 fn callRun(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
+    runner: ?sandbox_runner.Request,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (input.tty) {
-        return callTtyRun(ctx, input);
+        return callTtyRun(ctx, input, runner);
     }
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const execution_authority = ctx.execution_authority orelse return unavailable(ctx);
@@ -742,11 +837,11 @@ fn callRun(
         ) };
     };
     // The run keeps the placement that admission approved. A placement the
-    // policy now gives differently refuses the run before anything starts.
-    const placed_ctx = (tool_admission.placementAsApproved(
-        ctx.sandbox_policy,
+    // policy now gives differently refuses the run before anything starts. A
+    // built-in remote run sets up remote first (R4 to R5).
+    const approved_run = switch (try placeRunStart(
+        ctx,
         request_arena,
-        ctx.workspace_root,
         managed_execution.admittedFingerprint(authority),
         .{
             .command = command,
@@ -754,10 +849,13 @@ fn callRun(
             .target_os = builtin.target.os.tag,
             .environment = environment,
         },
-        true,
-    ) catch |err| return placementFailure(ctx, err)) orelse return .{
-        .failure = try ctx.allocator.dupe(u8, tool_admission.placement_changed_refusal),
+        runner,
+    )) {
+        .placed => |placed| placed,
+        .refused => |result| return result,
     };
+    const placed_ctx = approved_run.ctx;
+    const reason_line = try sandbox_runner.reasonLine(request_arena, approved_run.reason, @tagName(placed_ctx.placement));
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
@@ -803,11 +901,42 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
+    // The host's note for a placed run (N7, N6) goes in the notice of the call that reports its
+    // end, with the reason line. `finishPrepared` leaves a run's note to this call.
+    const host_line: ?[]const u8 = if (runtime.takeHostNote(execution_id)) |note|
+        try hostNoteLine(request_arena, note)
+    else
+        null;
     const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
-    return attachSnapshotNotice(ctx.allocator, result) catch |err| {
+    return attachSnapshotNotice(ctx.allocator, result, reason_line, host_line) catch |err| {
         result.deinit(ctx.allocator);
         return err;
     };
+}
+
+/// Whether fx's own timeout ended the command (the snapshot's error is `TimeoutExpired`).
+fn timedOutByHost(snapshot: managed_execution.Snapshot) bool {
+    const name = snapshot.error_name orelse return false;
+    return std.mem.eql(u8, name, "TimeoutExpired");
+}
+
+/// The host's line for a placed command's own end: N7 for its timeout, N6 for a force stop.
+fn hostNoteLine(alloc: Allocator, note: managed_execution.HostNote) Allocator.Error![]u8 {
+    return switch (note) {
+        .timed_out => |ms| sandbox_runner.timeoutLine(alloc, ms),
+        .force_stopped => sandbox_runner.forceStopLine(alloc),
+    };
+}
+
+/// Adds the host's N6 or N7 line to a result body, when the placed command has one to report
+/// (`Runtime.takeHostNote`). Frees `body` only when it returns the new one.
+fn withHostNote(alloc: Allocator, runtime: *managed_execution.Runtime, execution_id: []const u8, body: []u8) Allocator.Error![]u8 {
+    const note = runtime.takeHostNote(execution_id) orelse return body;
+    const line = try hostNoteLine(alloc, note);
+    defer alloc.free(line);
+    const updated = (try withJsonStringField(alloc, body, "notice", line)) orelse return body;
+    alloc.free(body);
+    return updated;
 }
 
 /// Adds the pending shell snapshot fallback notice to a JSON run result, so
@@ -815,13 +944,17 @@ fn callRun(
 fn attachSnapshotNotice(
     alloc: Allocator,
     result: tool_dispatch.ToolResult,
+    reason_line: ?[]const u8,
+    host_line: ?[]const u8,
 ) Allocator.Error!tool_dispatch.ToolResult {
     const body = switch (result) {
         .success, .failure => |value| value,
         .rich => return result,
     };
     if (body.len == 0 or body[body.len - 1] != '}') return result;
-    const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
+    const process_notice = try shell_snapshot.processOwner().takeResultNotice(alloc);
+    defer if (process_notice) |text| alloc.free(text);
+    const notice = (try joinedNotice(alloc, &.{ process_notice, reason_line, host_line })) orelse return result;
     defer alloc.free(notice);
     const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
     alloc.free(body);
@@ -830,6 +963,25 @@ fn attachSnapshotNotice(
         .failure => .{ .failure = updated },
         .rich => unreachable,
     };
+}
+
+/// The one notice a shell result carries: each present line, in order, joined by
+/// a newline. Null when no line exists.
+fn joinedNotice(alloc: Allocator, lines: []const ?[]const u8) Allocator.Error!?[]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var any = false;
+    for (lines) |maybe_line| {
+        const line = maybe_line orelse continue;
+        if (any) out.writer.writeByte('\n') catch return error.OutOfMemory;
+        out.writer.writeAll(line) catch return error.OutOfMemory;
+        any = true;
+    }
+    if (!any) {
+        out.deinit();
+        return null;
+    }
+    return try out.toOwnedSlice();
 }
 
 /// Returns a copy of the JSON object `body` with the string field `name`,
@@ -1286,12 +1438,81 @@ const ParsedTerminalExecution = struct {
 fn placementFailure(
     ctx: tool_dispatch.DispatchContext,
     err: tool_admission.PlaceError,
+    refusal: sandbox_runner.Refusal,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const sandbox = ctx.sandbox_policy orelse return unavailable(ctx);
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
-    const text = try tool_admission.placeErrorText(arena_state.allocator(), sandbox, err, false);
+    const text = try tool_admission.placeErrorText(arena_state.allocator(), sandbox, err, refusal, false);
     return .{ .failure = try ctx.allocator.dupe(u8, text) };
+}
+
+/// Where a shell run starts. `placed` is the only way to start one: a refusal
+/// starts nothing.
+const RunStart = union(enum) {
+    placed: tool_admission.ApprovedPlacement,
+    refused: tool_dispatch.ToolResult,
+};
+
+/// Decides where a shell run starts. A built-in remote run first sets up remote
+/// (R4 to R5, U1 to U11). Then the placement that admission approved is checked
+/// against the policy now. A remote run with no launch never starts (spec R1).
+fn placeRunStart(
+    ctx: tool_dispatch.DispatchContext,
+    arena: std.mem.Allocator,
+    fingerprint: command_admission.AdmissionFingerprint,
+    command_ctx: command_admission.CommandContext,
+    runner: ?sandbox_runner.Request,
+) tool_dispatch.DispatchError!RunStart {
+    if (try remoteSetupRefusal(ctx, arena, command_ctx.command, runner)) |text| {
+        return .{ .refused = .{ .failure = try ctx.allocator.dupe(u8, text) } };
+    }
+    var refusal: sandbox_runner.Refusal = .{};
+    const approved = tool_admission.placementAsApprovedWithReason(
+        ctx.sandbox_policy,
+        arena,
+        ctx.workspace_root,
+        fingerprint,
+        command_ctx,
+        true,
+        runner,
+        &refusal,
+    ) catch |err| return .{ .refused = try placementFailure(ctx, err, refusal) };
+    const placed = approved orelse return .{
+        .refused = .{ .failure = try ctx.allocator.dupe(u8, tool_admission.placement_changed_refusal) },
+    };
+    if (tool_admission.launchlessRemote(placed.ctx)) {
+        return .{ .refused = try placementFailure(ctx, error.SandboxRunnerNotPrepared, refusal) };
+    }
+    return .{ .placed = placed };
+}
+
+/// Runs remote setup for a built-in remote run (R4 to R5, U1 to U11). Returns
+/// the refusal text, or null when the run may go on. A canceled setup gives
+/// error.Cancelled. The session, turn and responder come from the tool context,
+/// and a sub-agent call has no session key and no setup (U2).
+fn remoteSetupRefusal(
+    ctx: tool_dispatch.DispatchContext,
+    arena: std.mem.Allocator,
+    command: []const u8,
+    runner: ?sandbox_runner.Request,
+) tool_dispatch.DispatchError!?[]const u8 {
+    const policy = ctx.sandbox_policy orelse return null;
+    if (!policy.needsVercelDestination(ctx.workspace_root, command, runner)) return null;
+    var no_cancel = std.atomic.Value(bool).init(false);
+    const setup_call = sandbox_runner.remoteCall(
+        arena,
+        ctx.remote_setup.allowed,
+        ctx.remote_setup.session_key,
+        ctx.remote_setup.turn_id,
+        ctx.mcp_input_responder,
+        ctx.cancel_flag orelse &no_cancel,
+    );
+    return switch (try policy.ensureRemote(setup_call)) {
+        .ready => null,
+        .canceled => error.Cancelled,
+        .refused => |text| text,
+    };
 }
 
 /// Refuses a tty run that the sandbox rules place in a sandbox, and every run
@@ -1308,7 +1529,7 @@ fn sandboxRefusal(
         sandbox,
         ctx.workspace_root,
         command,
-        true,
+        .{ .tty = true },
         true,
     )) orelse return null;
     return .{ .failure = try ctx.allocator.dupe(u8, text) };
@@ -1317,6 +1538,7 @@ fn sandboxRefusal(
 fn callTtyRun(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
+    runner: ?sandbox_runner.Request,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (input.command) |command| {
         if (try sandboxRefusal(ctx, command)) |refusal| return refusal;
@@ -1332,6 +1554,19 @@ fn callTtyRun(
     defer ctx.allocator.free(@constCast(cwd));
     var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(shell_arena_state);
+    // Admission refused every non-local tty run before this point, so the
+    // placement that gives the reason is local.
+    var refusal: sandbox_runner.Refusal = .{};
+    const placed = tool_admission.placeShellCommand(
+        ctx.sandbox_policy,
+        shell_arena_state.allocator(),
+        ctx.workspace_root,
+        command,
+        true,
+        runner,
+        &refusal,
+    ) catch |err| return placementFailure(ctx, err, refusal);
+    const reason_line = try sandbox_runner.reasonLine(shell_arena_state.allocator(), placed.reason, @tagName(placed.placement));
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|
@@ -1427,7 +1662,12 @@ fn callTtyRun(
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
     _ = owner;
-    return finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
+    const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
+    // A tty run is local (admission refuses any other), so no host timeout line applies.
+    return attachSnapshotNotice(ctx.allocator, result, reason_line, null) catch |err| {
+        result.deinit(ctx.allocator);
+        return err;
+    };
 }
 
 fn callTtyInteract(
@@ -2095,6 +2335,8 @@ fn finishPrepared(
         .run, .command => body = try noteSteeringYield(ctx, runtime, prepared, body, action == .run),
         .stop => {},
     }
+    // A run's host note goes with its reason line in `callRun`, so only the other actions attach it here.
+    if (action != .run) body = try withHostNote(ctx.allocator, runtime, prepared.snapshot.execution_id, body);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,
@@ -2136,10 +2378,7 @@ fn publishSnapshotMetadata(
             .signal = null,
             .termination_indeterminate = false,
         };
-    const timed_out = if (snapshot.error_name) |name|
-        std.mem.eql(u8, name, "TimeoutExpired")
-    else
-        false;
+    const timed_out = timedOutByHost(snapshot);
     var memory = types.ToolResultMemory{
         .output_bytes = snapshot.stdout_bytes +| snapshot.stderr_bytes,
         .stored_output_bytes = snapshot.stdout_bytes +| snapshot.stderr_bytes,
@@ -2725,6 +2964,425 @@ test "shell action fields are closed and command authority covers every run" {
         &.{ "action", "session_id", "chars", "yield_time_ms" },
         actionFieldContract(.interact).allowed,
     );
+}
+
+fn decodeFailureText(alloc: Allocator, ctx: tool_dispatch.DispatchContext, args: []const u8) ![]u8 {
+    const decoded = try decode(ctx, args);
+    return switch (decoded) {
+        .failure => |reason| reason,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+const remote_test_token = "fx-shell-token";
+const remote_rule_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}]}";
+const remote_ready_config = "{\"rules\":[{\"command\":\"zig build*\",\"runner\":\"remote\"}],\"remote\":{\"backend\":\"vercel\",\"team_id\":\"team_1\",\"team_slug\":\"acme\",\"project_id\":\"prj_1\",\"project_name\":\"repo\",\"user_id\":\"usr_1\",\"confirmed_at\":\"2026-11-21T10:00:00Z\"}}";
+const remote_e5_text = "fx did not run this command: no Vercel login. Run `vercel login`, then try again.";
+const remote_e6_text = "fx did not run this command: the Vercel login has expired or was rejected. Run `vercel whoami` to refresh it, or `vercel login`, then try again.";
+const remote_e7_text = "fx did not run this command: remote is not set up, and fx cannot ask the user here. Ask again in an interactive fx session.";
+const remote_e8_text = "fx did not run this command: the user did not set up remote.";
+const remote_e10_text = "fx did not run this command: remote is not set up. Set it up from the main conversation first.";
+
+var remote_prompt_context: u8 = 0;
+
+/// A responder that must not be asked. A test that asks it fails.
+fn unexpectedRemotePrompt(
+    context: *anyopaque,
+    alloc: std.mem.Allocator,
+    origin: tool_mcp_runtime.InputOrigin,
+    required: tool_mcp_runtime.InputRequired,
+) anyerror![]const u8 {
+    _ = context;
+    _ = alloc;
+    _ = origin;
+    _ = required;
+    return error.UnexpectedRemotePrompt;
+}
+
+const form_responder: tool_mcp_runtime.InputResponder = .{
+    .context = &remote_prompt_context,
+    .capabilities = .{ .form = true },
+    .callback = unexpectedRemotePrompt,
+};
+
+/// A sandbox policy whose fx home holds `config` when it is not null. The PATH
+/// is fixed, and the login token is a test value, so the result does not
+/// depend on the developer's machine. The caller calls `policy.destroy()`.
+fn loadRemoteSetupPolicy(alloc: std.mem.Allocator, dir: std.Io.Dir, config: ?[]const u8) !*sandbox_runner.Policy {
+    try dir.createDirPath(io_mod.getIo(), "fxhome/sandbox");
+    if (config) |text| try dir.writeFile(io_mod.getIo(), .{ .sub_path = "fxhome/sandbox/config.json", .data = text });
+    const fx_home = try io_mod.dirRealpathAlloc(alloc, dir, "fxhome");
+    defer alloc.free(fx_home);
+    const policy = try sandbox_runner.load(alloc, fx_home, "/Users/example", "/usr/bin:/bin");
+    policy.remote_host.env = .{ .vercel_token = remote_test_token, .home = "/Users/example" };
+    return policy;
+}
+
+/// Caches `usr_1` as the user of the test token, so the login needs no request.
+fn primeRemoteLoginUser(policy: *sandbox_runner.Policy) !void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(remote_test_token, &digest, .{});
+    try policy.remote_host.user_check.store(policy.gpa, digest, "usr_1");
+}
+
+test "a default DispatchContext gives E10 for a remote run that needs setup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e10_text, text);
+}
+
+test "a sub-agent call gets E10 even with a session key, and its mark is left alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    try policy.remote.recordMark("session-a", 5, .declined);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = false, .session_key = "session-a", .turn_id = 5 },
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e10_text, text);
+    try std.testing.expect(policy.remote.markFor("session-a", 5) == .declined);
+}
+
+test "a run with no prompt channel gets E7 and asks nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e7_text, text);
+}
+
+test "a declined mark refuses E8 in its turn, and asks nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    try policy.remote.recordMark("session-a", 5, .declined);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e8_text, text);
+}
+
+test "a missing login gives E5 with no request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    policy.remote_host.env = .{ .home = "/Users/example/no-login" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e5_text, text);
+}
+
+test "an expired login gives E6 with no request" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const policy = try loadRemoteSetupPolicy(alloc, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    try tmp.dir.createDirPath(io_mod.getIo(), ".local/share/com.vercel.cli");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = ".local/share/com.vercel.cli/auth.json",
+        .data = "{\"token\":\"fx-expired-token\",\"expiresAt\":1700000000}",
+    });
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    policy.remote_host.env = .{ .home = home };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = alloc,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const text = (try remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote)) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(remote_e6_text, text);
+}
+
+test "a canceled remote setup starts nothing and ends the run canceled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_rule_config);
+    defer policy.destroy();
+    try primeRemoteLoginUser(policy);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var cancel = std.atomic.Value(bool).init(true);
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = "/Users/example/work",
+        .cancel_flag = &cancel,
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    try std.testing.expectError(error.Cancelled, remoteSetupRefusal(ctx, arena_state.allocator(), "zig build test", .remote));
+}
+
+test "a ready remote setup lets the run go on, and the run is placed with its launch" {
+    try self_exe.requireInstalledForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_ready_config);
+    defer policy.destroy();
+    try primeRemoteLoginUser(policy);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The workspace must exist: a built-in run keys its state folder by the canonical path (spec L5).
+    try tmp.dir.createDirPath(io_mod.getIo(), "work");
+    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "work");
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .sandbox_policy = policy,
+        .workspace_root = workspace,
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), try remoteSetupRefusal(ctx, arena, "zig build test", .remote));
+    var refusal: sandbox_runner.Refusal = .{};
+    const placed = try tool_admission.placeShellCommand(policy, arena, workspace, "zig build test", true, .remote, &refusal);
+    try std.testing.expectEqual(command_environment.Placement.remote, placed.placement);
+    try std.testing.expect(placed.launch != null);
+}
+
+test "a built-in remote run with no config is admitted, and a refused setup starts nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const policy = try loadRemoteSetupPolicy(alloc, tmp.dir, null);
+    defer policy.destroy();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Admission checks the cwd inside the workspace, so the workspace must exist.
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+
+    // Admission admits the run as a remote run, so it reaches the setup.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try tool_admission.shellRunRefusal(arena, policy, root, "zig build test", .{ .runner = .remote }, true),
+    );
+    const command_ctx: command_admission.CommandContext = .{
+        .command = "zig build test",
+        .resolved_cwd = root,
+        .target_os = builtin.target.os.tag,
+        .placement = .remote,
+    };
+    // The default context is a sub-agent's: its setup is refused, and nothing starts.
+    const ctx: tool_dispatch.DispatchContext = .{ .allocator = arena, .sandbox_policy = policy, .workspace_root = root };
+    const start = try placeRunStart(ctx, arena, command_admission.AdmissionFingerprint.init(command_ctx), command_ctx, .remote);
+    switch (start) {
+        .placed => return error.TestUnexpectedPlacement,
+        .refused => |result| try std.testing.expectEqualStrings(remote_e10_text, result.failure),
+    }
+}
+
+test "a run whose provider failed to prepare is refused, and starts nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = try loadRemoteSetupPolicy(std.testing.allocator, tmp.dir, remote_ready_config);
+    defer policy.destroy();
+    try primeRemoteLoginUser(policy);
+    policy.provider.state = .unavailable;
+    policy.provider.reason = "fx-test-reason";
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "/Users/example/work";
+    const command_ctx: command_admission.CommandContext = .{
+        .command = "zig build test",
+        .resolved_cwd = root,
+        .target_os = builtin.target.os.tag,
+        .placement = .remote,
+    };
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = arena,
+        .sandbox_policy = policy,
+        .workspace_root = root,
+        .mcp_input_responder = form_responder,
+        .remote_setup = .{ .allowed = true, .session_key = "session-a", .turn_id = 5 },
+    };
+    const start = try placeRunStart(ctx, arena, command_admission.AdmissionFingerprint.init(command_ctx), command_ctx, .remote);
+    switch (start) {
+        .placed => return error.TestUnexpectedPlacement,
+        .refused => |result| {
+            try std.testing.expect(std.mem.startsWith(u8, result.failure, tool_admission.refusal_prefix ++ "the sandbox provider cannot be used: "));
+            try std.testing.expect(std.mem.find(u8, result.failure, "fx-test-reason") != null);
+        },
+    }
+}
+
+test "runner with the runner field off gets the unknown field result that foo gets" {
+    const alloc = std.testing.allocator;
+    const off: tool_dispatch.DispatchContext = .{ .allocator = alloc };
+    const foo = try decodeFailureText(alloc, off, "{\"action\":\"run\",\"command\":\"true\",\"foo\":\"remote\"}");
+    defer alloc.free(foo);
+    const runner = try decodeFailureText(alloc, off, "{\"action\":\"run\",\"command\":\"true\",\"runner\":\"remote\"}");
+    defer alloc.free(runner);
+    const renamed = try std.mem.replaceOwned(u8, alloc, foo, "foo", "runner");
+    defer alloc.free(renamed);
+    try std.testing.expectEqualStrings(renamed, runner);
+    try std.testing.expect(std.mem.find(u8, runner, "runner is not accepted for run.") != null);
+}
+
+test "runner with the runner field on is accepted for run as local or remote" {
+    const alloc = std.testing.allocator;
+    // decode reads only whether a policy is present, so an unused value is enough.
+    var policy: sandbox_runner.Policy = undefined;
+    const on: tool_dispatch.DispatchContext = .{ .allocator = alloc, .sandbox_policy = &policy };
+    const cases = [_]struct { word: []const u8, want: sandbox_runner.Request }{
+        .{ .word = "local", .want = .local },
+        .{ .word = "remote", .want = .remote },
+    };
+    for (cases) |case| {
+        const args = try alloc.print("{{\"action\":\"run\",\"command\":\"true\",\"runner\":\"{s}\"}}", .{case.word});
+        defer alloc.free(args);
+        const decoded = try decode(on, args);
+        switch (decoded) {
+            .input => |input| {
+                defer input.deinit(alloc);
+                try std.testing.expectEqual(case.want, input.as(OwnedInput).runner.?);
+            },
+            .failure => |reason| {
+                defer alloc.free(reason);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "runner with a value other than local or remote is refused before anything runs" {
+    const alloc = std.testing.allocator;
+    var policy: sandbox_runner.Policy = undefined;
+    const on: tool_dispatch.DispatchContext = .{ .allocator = alloc, .sandbox_policy = &policy };
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"true\",\"runner\":\"gpu\"}",
+        "{\"action\":\"run\",\"command\":\"true\",\"runner\":3}",
+    }) |args| {
+        const reason = try decodeFailureText(alloc, on, args);
+        defer alloc.free(reason);
+        try std.testing.expectEqualStrings("runner must be \"local\" or \"remote\"", reason);
+    }
+}
+
+test "runner on interact or stop gets the existing correction for a field the action does not take" {
+    const alloc = std.testing.allocator;
+    var policy: sandbox_runner.Policy = undefined;
+    const on: tool_dispatch.DispatchContext = .{ .allocator = alloc, .sandbox_policy = &policy };
+    const interact = try decodeFailureText(alloc, on, "{\"action\":\"interact\",\"session_id\":\"s1\",\"runner\":\"remote\"}");
+    defer alloc.free(interact);
+    try std.testing.expect(std.mem.find(u8, interact, "runner is not accepted for interact.") != null);
+    const stop = try decodeFailureText(alloc, on, "{\"action\":\"stop\",\"session_id\":\"s1\",\"runner\":\"remote\"}");
+    defer alloc.free(stop);
+    try std.testing.expect(std.mem.find(u8, stop, "runner is not accepted for stop.") != null);
+}
+
+test "a runner key does not change which action a call's fields fit" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { args: []const u8, action: ?[]const u8 }{
+        .{ .args = "{\"command\":\"ls\",\"runner\":\"remote\"}", .action = "run" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\",\"runner\":\"remote\"}", .action = "interact" },
+        .{ .args = "{\"runner\":\"remote\"}", .action = null },
+        .{ .args = "{}", .action = null },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.args, .{});
+        defer parsed.deinit();
+        const inferred = inferAction(parsed.value.object);
+        if (case.action) |expected| {
+            try std.testing.expectEqualStrings(expected, inferred orelse return error.TestExpectedEqual);
+        } else {
+            try std.testing.expectEqual(@as(?[]const u8, null), inferred);
+        }
+    }
+}
+
+test "a call that names only runner is refused like an empty call" {
+    const alloc = std.testing.allocator;
+    var policy: sandbox_runner.Policy = undefined;
+    const on: tool_dispatch.DispatchContext = .{ .allocator = alloc, .sandbox_policy = &policy };
+    const runner_only = try decodeFailureText(alloc, on, "{\"runner\":\"remote\"}");
+    defer alloc.free(runner_only);
+    const empty = try decodeFailureText(alloc, on, "{}");
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings(empty, runner_only);
+    try std.testing.expect(std.mem.find(u8, empty, "action is required.") != null);
+}
+
+test "runner on a run with the runner field off is refused as an unknown field, with no action problem" {
+    const alloc = std.testing.allocator;
+    const off: tool_dispatch.DispatchContext = .{ .allocator = alloc };
+    const text = try decodeFailureText(alloc, off, "{\"action\":\"run\",\"command\":\"true\",\"runner\":\"remote\"}");
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"invalid_shell_request\",\"executed\":false,\"problems\":[\"runner is not accepted for run.\"]}}",
+        text,
+    );
+}
+
+test "a suggested retry keeps a valid runner with the field on and adds none with it off" {
+    const alloc = std.testing.allocator;
+    var policy: sandbox_runner.Policy = undefined;
+    const on: tool_dispatch.DispatchContext = .{ .allocator = alloc, .sandbox_policy = &policy };
+    const off: tool_dispatch.DispatchContext = .{ .allocator = alloc };
+    const with_field = try decodeFailureText(alloc, on, "{\"command\":\"true\",\"runner\":\"remote\"}");
+    defer alloc.free(with_field);
+    try std.testing.expect(std.mem.find(
+        u8,
+        with_field,
+        "\"retry_with\":{\"action\":\"run\",\"command\":\"true\",\"runner\":\"remote\"}",
+    ) != null);
+    const without_field = try decodeFailureText(alloc, off, "{\"command\":\"true\",\"runner\":\"remote\"}");
+    defer alloc.free(without_field);
+    try std.testing.expect(std.mem.find(u8, without_field, "retry_with") == null);
 }
 
 test "shell timeout minimum is enforced before correction and execution" {
@@ -4523,11 +5181,11 @@ test "shell run result carries a snapshot fallback notice once" {
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     try std.testing.expect((try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
 
-    const plain = try attachSnapshotNotice(alloc, .{ .failure = try alloc.dupe(u8, "shell result is unavailable") });
+    const plain = try attachSnapshotNotice(alloc, .{ .failure = try alloc.dupe(u8, "shell result is unavailable") }, null, null);
     defer plain.deinit(alloc);
     try std.testing.expectEqualStrings("shell result is unavailable", plain.failure);
 
-    const first = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    const first = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") }, null, null);
     defer first.deinit(alloc);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, first.success, .{});
     defer parsed.deinit();
@@ -4535,9 +5193,69 @@ test "shell run result carries a snapshot fallback notice once" {
     const notice = parsed.value.object.get("notice").?.string;
     try std.testing.expect(std.mem.find(u8, notice, "did not finish within 10 s") != null);
 
-    const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") }, null, null);
     defer second.deinit(alloc);
     try std.testing.expectEqualStrings("{\"state\":\"completed\"}", second.success);
+}
+
+test "a reason line is the notice of a shell result, once" {
+    const alloc = std.testing.allocator;
+    if (try shell_snapshot.processOwner().takeResultNotice(alloc)) |pending| alloc.free(pending);
+    const line = "fx: ran on local because of your rule for echo*";
+    const result = try attachSnapshotNotice(
+        alloc,
+        .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\",\"output_delta\":\"hi\\n\"}") },
+        line,
+        null,
+    );
+    defer result.deinit(alloc);
+    const body = result.success;
+    try std.testing.expect(std.mem.endsWith(u8, body, "\"notice\":\"" ++ line ++ "\"}"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"notice\""));
+}
+
+test "a host timeout line is the notice of its result, once, after the reason line" {
+    const alloc = std.testing.allocator;
+    if (try shell_snapshot.processOwner().takeResultNotice(alloc)) |pending| alloc.free(pending);
+    const reason = "fx: ran on remote because of your rule for make*";
+    const timeout = "fx: timed out after 1000 ms";
+    const result = try attachSnapshotNotice(
+        alloc,
+        .{ .success = try alloc.dupe(u8, "{\"state\":\"stopped\",\"error\":\"TimeoutExpired\",\"output_delta\":\"\"}") },
+        reason,
+        timeout,
+    );
+    defer result.deinit(alloc);
+    const body = result.success;
+    try std.testing.expect(std.mem.endsWith(u8, body, "\"notice\":\"" ++ reason ++ "\\n" ++ timeout ++ "\"}"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"notice\""));
+}
+
+test "joinedNotice keeps the present lines in order and gives nothing when none is present" {
+    const alloc = std.testing.allocator;
+    const all = (try joinedNotice(alloc, &.{ "snapshot notice", "fx: ran on local because of your rule for echo*", "fx: timed out after 1000 ms" })).?;
+    defer alloc.free(all);
+    try std.testing.expectEqualStrings("snapshot notice\nfx: ran on local because of your rule for echo*\nfx: timed out after 1000 ms", all);
+    const reason_only = (try joinedNotice(alloc, &.{ null, "fx: ran isolated because of your folder rule for /w", null })).?;
+    defer alloc.free(reason_only);
+    try std.testing.expectEqualStrings("fx: ran isolated because of your folder rule for /w", reason_only);
+    try std.testing.expect((try joinedNotice(alloc, &.{ null, null, null })) == null);
+}
+
+test "a pending process notice and a reason line share one notice, process first" {
+    const alloc = std.testing.allocator;
+    shell_snapshot.resetProcessOwnerForTest(timedOutSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    try std.testing.expect((try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+    const line = "fx: ran on local because of your rule for echo*";
+    const result = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") }, line, null);
+    defer result.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.success, .{});
+    defer parsed.deinit();
+    const notice = parsed.value.object.get("notice").?.string;
+    try std.testing.expect(std.mem.endsWith(u8, notice, "\n" ++ line));
+    const process = notice[0 .. notice.len - line.len - 1];
+    try std.testing.expect(std.mem.find(u8, process, "did not finish within 10 s") != null);
 }
 
 test "a turn cancel gives up a steered tty stop the full terminal client keeps refusing" {

@@ -8,7 +8,7 @@ const command_runner = @import("command_runner.zig");
 const contract = @import("managed_execution_contract.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const execution_router = @import("router.zig");
-const sandbox_launch = @import("../sandbox/launch.zig");
+const sandbox_launch = @import("../runner/runner.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
@@ -166,6 +166,32 @@ pub const Snapshot = struct {
     }
 };
 
+/// Why the host ended a placed command itself: its timeout (N7, with the timeout in ms) or a
+/// force stop (N6). A local command leaves none.
+pub const HostNote = union(enum) {
+    timed_out: usize,
+    force_stopped,
+};
+
+/// The note a timeout leaves: only a placed command has one, and only with a timeout set.
+fn timeoutNote(placement: command_environment.Placement, timeout_ms: ?usize) ?HostNote {
+    if (placement == .local) return null;
+    return .{ .timed_out = timeout_ms orelse return null };
+}
+
+/// The note a force stop leaves: only a placed command has one.
+fn forceStopNote(placement: command_environment.Placement) ?HostNote {
+    return if (placement == .local) null else .force_stopped;
+}
+
+test "only a placed command leaves the host's timeout and force-stop notes" {
+    try std.testing.expectEqual(@as(?HostNote, null), timeoutNote(.local, 1000));
+    try std.testing.expectEqual(@as(?HostNote, null), forceStopNote(.local));
+    try std.testing.expectEqual(@as(?HostNote, null), timeoutNote(.remote, null));
+    try std.testing.expectEqual(HostNote{ .timed_out = 1000 }, timeoutNote(.remote, 1000).?);
+    try std.testing.expectEqual(HostNote.force_stopped, forceStopNote(.isolated).?);
+}
+
 pub const PreparedSnapshot = struct {
     snapshot: Snapshot,
     reservation_id: u64,
@@ -287,6 +313,12 @@ const Entry = struct {
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
+    /// Where the command runs (spec A1). A placed command's timeout and force stop leave a
+    /// `host_note` for its result.
+    placement: command_environment.Placement = .local,
+    /// The host's note for the placed command's end. The first result that reports the end takes
+    /// it (`Runtime.takeHostNote`), so a note is delivered once. Guarded by `mutex`.
+    host_note: ?HostNote = null,
 
     fn init(runtime: *Runtime, input: StartCapturedInput) !*Entry {
         const entry = try runtime.alloc.create(Entry);
@@ -351,6 +383,7 @@ const Entry = struct {
             .backend_kind = .captured,
             .persistence_kind = .process,
             .backend_state = .{ .captured = .{ .route = route } },
+            .placement = command_ctx.placement,
             .replay_capture = replay_capture,
             .replay_capability = replay_capability,
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
@@ -612,6 +645,7 @@ const Entry = struct {
             self.mutex.lockUncancelable(zio);
             self.finalizeReplayLocked();
             self.error_name = @errorName(err);
+            if (err == error.TimeoutExpired) self.host_note = timeoutNote(self.placement, self.timeout_ms);
             debug_trace.logf(
                 "core",
                 "managed execution became lost boundary=worker_route execution_id={s} err={s}",
@@ -1125,6 +1159,19 @@ pub const Runtime = struct {
         return self.prepareSnapshotForEntry(alloc, entry);
     }
 
+    /// The host's note for a placed command (N6, N7), taken once. The first result that reports
+    /// the command's end takes it, and later results get none.
+    pub fn takeHostNote(self: *Runtime, execution_id: []const u8) ?HostNote {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const zio = io_mod.getIo();
+        entry.mutex.lockUncancelable(zio);
+        defer entry.mutex.unlock(zio);
+        const note = entry.host_note;
+        entry.host_note = null;
+        return note;
+    }
+
     pub fn stop(
         self: *Runtime,
         alloc: Allocator,
@@ -1158,6 +1205,8 @@ pub const Runtime = struct {
             const next = contract.transition(entry.state, entry.barrier, .stop_requested);
             entry.state = next.state;
             entry.barrier = next.barrier;
+            // Only the first force stop leaves the note, so a second one adds none.
+            if (force and !entry.force_cancel.load(.seq_cst)) entry.host_note = forceStopNote(entry.placement);
             // Force only escalates: a later cooperative stop must not undo a
             // force-kill already requested, such as the one at process exit.
             if (force) entry.force_cancel.store(true, .seq_cst);
@@ -1845,6 +1894,7 @@ fn entryCommandContext(
         .target_os = builtin.target.os.tag,
         .environment = environment,
     };
+    command_ctx.timeout_ms = input.timeout_ms;
     const approved = admittedFingerprint(input.authority);
     if (approved.placement == .local) return command_ctx;
     command_ctx.placement = approved.placement;
@@ -1857,30 +1907,8 @@ fn entryCommandContext(
 
 fn dupeLaunch(alloc: Allocator, source: *const sandbox_launch.Launch) !*const sandbox_launch.Launch {
     const copy = try alloc.create(sandbox_launch.Launch);
-    copy.* = .{
-        .provider = try dupeStrings(alloc, source.provider),
-        .provider_args = try dupeStrings(alloc, source.provider_args),
-        .state_dir = try alloc.dupe(u8, source.state_dir),
-        .workspace_root = try alloc.dupe(u8, source.workspace_root),
-        .env = try dupeStrings(alloc, source.env),
-        .profiles = try dupeProfiles(alloc, source.profiles),
-        .grace_ms = source.grace_ms,
-    };
+    copy.* = try sandbox_launch.duplicateLaunch(source, alloc);
     return copy;
-}
-
-fn dupeStrings(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
-    const out = try alloc.alloc([]const u8, items.len);
-    for (items, out) |item, *slot| slot.* = try alloc.dupe(u8, item);
-    return out;
-}
-
-fn dupeProfiles(alloc: Allocator, items: []const sandbox_launch.Profile) ![]const sandbox_launch.Profile {
-    const out = try alloc.alloc(sandbox_launch.Profile, items.len);
-    for (items, out) |item, *slot| {
-        slot.* = .{ .name = try alloc.dupe(u8, item.name), .args = try dupeStrings(alloc, item.args) };
-    }
-    return out;
 }
 
 fn rebindAuthority(
@@ -3004,7 +3032,7 @@ test "a managed rebuild without a launch refuses a placed command instead of run
         .command = "zig build test",
         .resolved_cwd = "/Users/example/repo",
         .target_os = builtin.target.os.tag,
-        .placement = .workspace,
+        .placement = .remote,
     };
     const authority: command_admission.CommandExecutionAuthority = .{ .shell_allowed = .{
         .fingerprint = .init(admitted),
@@ -3021,7 +3049,7 @@ test "a managed rebuild without a launch refuses a placed command instead of run
         .command_artifact_dir = null,
     };
     const rebuilt = try entryCommandContext(owned, input, input.command, input.cwd, input.environment);
-    try std.testing.expectEqual(command_environment.Placement.workspace, rebuilt.placement);
+    try std.testing.expectEqual(command_environment.Placement.remote, rebuilt.placement);
     try std.testing.expect(rebuilt.sandbox == null);
     try std.testing.expectError(
         error.SandboxUnavailable,

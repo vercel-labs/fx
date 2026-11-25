@@ -81,5 +81,6 @@
   { "file": "web-search-live.test.ts", "weight": 1 },
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
   { "file": "yolo-permission-mode.test.ts", "weight": 29 },
-  { "file": "sandbox-provider.test.ts", "weight": 2 }
+  { "file": "sandbox-provider.test.ts", "weight": 2 },
+  { "file": "runner.test.ts", "weight": 2 }
 ]

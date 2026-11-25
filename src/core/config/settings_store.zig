@@ -126,6 +126,8 @@ pub const UserSettingsPatch = struct {
     provider_strict: ?bool = null,
     context: ?bool = null,
     cache_warming: ?bool = null,
+    /// `experimental.sandbox_execution`, the profile-only switch for sandboxed shell runs.
+    experimental_sandbox_execution: ?bool = null,
     /// One `tool_placement.<tool>` entry.
     tool_placement: ?ToolPlacementPatch = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
@@ -161,6 +163,7 @@ pub const UserSettingsPatch = struct {
             self.provider_strict == null and
             self.context == null and
             self.cache_warming == null and
+            self.experimental_sandbox_execution == null and
             self.tool_placement == null and
             self.remove == null;
     }
@@ -1293,6 +1296,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("prompt_history").?;
         };
         application.changed = try putBool(arena, &prompt_history.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.experimental_sandbox_execution) |enabled| {
+        var experimental = if (root.object.getPtr("experimental")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "experimental", .{ .object = .empty });
+            break :blk root.object.getPtr("experimental").?;
+        };
+        application.changed = try putBool(arena, &experimental.object, "sandbox_execution", enabled) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {

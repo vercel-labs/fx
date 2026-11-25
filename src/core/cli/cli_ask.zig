@@ -89,6 +89,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
+const shell_projection = @import("../../builtins/shell_projection.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -99,7 +100,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
-const sandbox_policy = @import("../sandbox/policy.zig");
+const sandbox_policy = @import("../runner/runner.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
@@ -283,8 +284,9 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    var child_projection = ctx.cfg.mode_registry.buildModelToolProjection(
+    var child_projection = shell_projection.buildModelToolProjection(
         ctx.alloc,
+        ctx.cfg.mode_registry,
         ctx.deps.tool_set,
         ctx.mode_id,
         .{
@@ -293,6 +295,7 @@ fn runAskChild(
             .subagent_available = true,
             .behind_toolbox = ctx.toolbox_behind.slice(),
         },
+        .{ .runner = ctx.sandbox_policy != null },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
     return subagent_agent_adapter.run(.{
@@ -564,47 +567,12 @@ fn buildAskGatewayToolProjection(
     mode_id: []const u8,
     options: tool_projection_mod.Options,
     has_child_capability: bool,
+    sandbox_on: bool,
 ) !tool_projection_mod.EffectiveToolProjection {
-    if (has_child_capability) {
-        return registry.buildModelToolProjection(
-            alloc,
-            tool_set,
-            mode_id,
-            options,
-        );
-    }
-
-    const shell_index = for (tool_set.registry.tools, 0..) |tool, index| {
-        if (tool.executor_kind == .terminal and
-            std.mem.eql(u8, tool.name, "shell"))
-        {
-            break index;
-        }
-    } else {
-        return registry.buildModelToolProjection(
-            alloc,
-            tool_set,
-            mode_id,
-            options,
-        );
-    };
-
-    const projected_tools = try alloc.dupe(
-        tool_dispatch.Tool,
-        tool_set.registry.tools,
-    );
-    defer alloc.free(projected_tools);
-    projected_tools[shell_index] = builtin_tools.shellProcessOnlySpec();
-    return registry.buildModelToolProjection(
-        alloc,
-        .{
-            .registry = .{ .tools = projected_tools },
-            .order = tool_set.order,
-            .read_only_tool_names = tool_set.read_only_tool_names,
-        },
-        mode_id,
-        options,
-    );
+    return shell_projection.buildModelToolProjection(alloc, registry, tool_set, mode_id, options, .{
+        .process_only = !has_child_capability,
+        .runner = sandbox_on,
+    });
 }
 
 const StdinSource = union(enum) {
@@ -725,6 +693,9 @@ const AskContext = struct {
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     active_turn_id: u64 = 0,
+    /// The turn of this `fx ask` process, set once at its start. Mail turns that
+    /// follow run under it too (the known U4 gap).
+    user_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
@@ -1211,17 +1182,10 @@ const AskContext = struct {
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
+            .user_turn_id = self.user_turn_id,
         };
         if (self.mcp_host) |h| h.catalog.wire(&tc);
-        // On a terminal, a server's question is put to the user.
-        if (self.mcp_host != null and self.mcp_elicitation_capabilities.any()) {
-            tc.mcp_input_responder = .{
-                .context = @ptrCast(self),
-                .capabilities = self.mcp_elicitation_capabilities,
-                .legacy_url_manual_completion = true,
-                .callback = respondToAskMcpInput,
-            };
-        }
+        tc.mcp_input_responder = askInputResponder(@ptrCast(self), self.mcp_elicitation_capabilities);
         return tc;
     }
 
@@ -1305,6 +1269,22 @@ fn askElicitationCapabilities(
 ) @import("../mcp/elicitation.zig").Capabilities {
     if (!output_mode.isTerminal() or !stdin_is_tty or !stderr_is_tty) return .{};
     return .{ .form = true, .url = true };
+}
+
+/// The responder `fx ask` gives its tools when a terminal can show a prompt. The
+/// capabilities come from the terminal alone, so a run with no MCP server has
+/// the same channel as one with a server.
+fn askInputResponder(
+    context: *anyopaque,
+    capabilities: mcp_elicitation.Capabilities,
+) ?tool_mcp_runtime.InputResponder {
+    if (!capabilities.any()) return null;
+    return .{
+        .context = context,
+        .capabilities = capabilities,
+        .legacy_url_manual_completion = true,
+        .callback = respondToAskMcpInput,
+    };
 }
 
 fn checkHeadlessCancellation(deps: RunDeps) !void {
@@ -1963,7 +1943,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
         .behind_toolbox = ctx.toolbox_behind.slice(),
-    }, session_child_capability != null);
+    }, session_child_capability != null, ctx.sandbox_policy != null);
     defer tool_projection.deinit(alloc);
 
     const context_history = try ctx.session.snapshotHistory(alloc);
@@ -1975,6 +1955,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     defer alloc.free(root_user_intent_context);
     ctx.active_turn_id = debug_trace.nextTurnId();
+    ctx.user_turn_id = ctx.active_turn_id;
 
     const job: worker_runtime.QueuedPrompt = .{
         .turn_id = ctx.active_turn_id,
@@ -6744,6 +6725,30 @@ test "disabled headless ask scope leaves the interactive SIGINT handler untouche
     try std.testing.expectEqual(@as(usize, 1), test_previous_sigint_count.load(.seq_cst));
 }
 
+test "fx ask's prompt channel needs a terminal, not an MCP host" {
+    var anchor: u8 = 0;
+    // The responder takes no MCP host, so a run with a server gets this same answer.
+    const cases = [_]struct { mode: OutputMode, stdin_tty: bool, stderr_tty: bool, expected: bool }{
+        .{ .mode = .terminal, .stdin_tty = true, .stderr_tty = true, .expected = true },
+        .{ .mode = .terminal_no_color, .stdin_tty = true, .stderr_tty = true, .expected = true },
+        .{ .mode = .json, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .raw, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .quiet, .stdin_tty = true, .stderr_tty = true, .expected = false },
+        .{ .mode = .terminal, .stdin_tty = false, .stderr_tty = true, .expected = false },
+        .{ .mode = .terminal, .stdin_tty = true, .stderr_tty = false, .expected = false },
+    };
+    for (cases) |case| {
+        const capabilities = askElicitationCapabilities(case.mode, case.stdin_tty, case.stderr_tty);
+        const responder = askInputResponder(&anchor, capabilities);
+        try std.testing.expectEqual(case.expected, responder != null);
+        if (responder) |value| {
+            try std.testing.expect(value.capabilities.form);
+            try std.testing.expect(value.legacy_url_manual_completion);
+            try std.testing.expect(value.context == @as(*anyopaque, &anchor));
+        }
+    }
+}
+
 test "fx ask auto mode applies automatic clear and caution without a prompt" {
     const FakeClassifier = struct {
         calls: usize = 0,
@@ -7544,6 +7549,7 @@ test "exec-only terminal projection propagates view allocation failure" {
             builtin_tools.advertisement_set,
             "inspect",
             .{},
+            false,
             false,
         ),
     );

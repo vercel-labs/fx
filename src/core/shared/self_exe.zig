@@ -68,6 +68,19 @@ fn sameFile(left: []const u8, right: []const u8) !bool {
     return left_stat.inode == right_stat.inode;
 }
 
+/// For a test that needs the installed fx binary. `zig build test` installs it first, and
+/// `zig build install-test` does not, so the test says what to build instead of failing on
+/// a missing file.
+pub fn requireInstalledForTest() !void {
+    if (comptime !builtin.is_test) return;
+    const path = @import("test_paths").product_exe;
+    var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch |err| {
+        std.debug.print("build fx first: run `zig build` (no fx binary at {s}: {s})\n", .{ path, @errorName(err) });
+        return err;
+    };
+    file.close(io_mod.getIo());
+}
+
 /// Returns an owned absolute path to the installed fx binary that
 /// `zig build test` launches, or null outside tests.
 fn testProductExe(alloc: Allocator) !?[]u8 {
