@@ -309,7 +309,7 @@ manager:
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
   `context_note` (D93), `runtime_context` (D94), `model_call` (D96),
   `mcp_bridge_call` (D99), `cancelled_command` (D100), `subagent_started`
-  (D101), `turn_end` (files
+  (D101), `cancelled_wait` (D102), `turn_end` (files
   and turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery`, `model_recovery` (a model request's recovery
   status, for reading the log), `workspace_capture` (D98) and `continues`.
@@ -2187,6 +2187,39 @@ as it was sent):
   result, which change what the model reads; or the first `child_spawned`
   of each child, matched to the call through the hash in its work id,
   which only a resume can read and the live screen cannot.
+- **D102 Decision:** when the user cancels a turn while a `subagent` wait
+  waits, the turn saves a `cancelled_wait` item right before its
+  `interruption`: `{"call_id":…,"subagents":"lander"}`, the wait and the
+  subagents its row named. `subagents` is left out when the host named
+  none. A resume then shows the wait's row as live, `Stopped waiting for
+  lander`.
+  - **Write:** core fills it at the cancel site, which has the names the
+    row showed. The item goes out in the turn's commit, with the
+    `interruption` it comes before, so it takes the session's lock with
+    it (`tests/tla/session/SessionWrite.tla`). The `interruption` piece
+    keeps the same bytes. Every host saves it. Names that are long, not
+    valid UTF-8, or hold a control character are left out.
+  - **Reading:** the replay keeps the item until the `interruption` ends
+    the turn, and gives the turn a cancelled wait only when the item names
+    the turn's own `subagent` call. An item it can't read, or one for
+    another call, is left out with a trace line, and the row names no
+    subagent.
+  - **Other cancelled calls:** a read, a fetch, an MCP call, or any other
+    call that is no command keeps its row on resume from the saved call
+    alone, with no item: `Cancelled` and the call, as live.
+  - **Not in the journal or checkpoints:** their codec rejects a key it
+    does not know, and older fx read them, so a turn rebuilt from them
+    shows the wait's row with no names.
+  - **Older fx:** an fx from before D102 leaves the item out (D17) and
+    shows the turn as before, with no wait row.
+
+  **Why:** a cancelled wait has no result, and the names on its row come
+  from the host, which the saved call does not hold, so a resume could
+  show the row only without them.
+  **Alternative:** a new field in the `interruption` piece, which an older
+  fx's strict reader rejects with the whole session; or the names of the
+  turn's last completed wait, which miss a subagent that started or ended
+  after it.
 
 ## Design Risks And Failure Behavior
 

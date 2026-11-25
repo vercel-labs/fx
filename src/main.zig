@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.17";
+pub const version = "0.0.18";
 
 /// Panics save a crash record for `/trace`, except in tests, which keep the
 /// default handler.
@@ -523,6 +523,10 @@ const App = struct {
 
     pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
         return self.providerSet().select(provider).model_catalog;
+    }
+
+    pub fn providerCredits(self: *const Self, provider: model_provider.ProviderId) ?gateway_provider.CreditsProvider {
+        return self.providerSet().select(provider).credits;
     }
 
     pub fn cooperativeTransportPulse(self: *Self, agent: *agents.Agent) !void {
@@ -2149,10 +2153,18 @@ const App = struct {
         // A message needs room where it goes; a report never does.
         const from_owner = delivery == .message and delivery.message.to == .owners_parent;
         if (delivery == .message) try AgentsAppRuntime.reserveMessagePlace(self, reporting_host, from_owner);
-        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery) catch |err| {
+        const started_by = if (delivery == .message) AgentsAppRuntime.messageStartedBy(self, reporting_host, from_owner, delivery.message.child_id) else null;
+        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery, started_by) catch |err| {
             if (delivery == .message) AgentsAppRuntime.releaseMessagePlace(self, reporting_host, from_owner);
             return err;
         };
+    }
+
+    /// The subagent host's `ReportSink.mail_waiting_fn`: whether mail that
+    /// `postSubagentReport` queued has yet to reach the owner's worker.
+    pub fn subagentMailWaiting(raw: ?*anyopaque, waiting_host: *subagent_tool_host.Runtime) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.hostMailWaiting(self, waiting_host);
     }
 
     /// The user stopped `agent`'s turn on its own screen.
@@ -2801,6 +2813,10 @@ const App = struct {
         try self.shell.attachHistoricalBridgeCall(self.alloc, entry_id, tool, outcome);
     }
 
+    pub fn attachHistoricalMcpToolName(self: *App, entry_id: u32, name: types.McpToolName) !void {
+        try self.shell.attachHistoricalMcpToolName(self.alloc, entry_id, name);
+    }
+
     pub fn attachHistoricalCommandOutput(self: *App, entry_id: u32) void {
         self.shell.attachHistoricalCommandOutput(self.alloc, entry_id);
     }
@@ -2986,6 +3002,11 @@ const App = struct {
         return SessionAppRuntime.childCapability(agent);
     }
 
+    pub fn pacerTailDue(ctx: *anyopaque, tail_id: u64) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.shell.applyStagedAssistantTail(self.alloc, tail_id);
+    }
+
     pub fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(ctx));
         _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
@@ -3048,6 +3069,7 @@ const App = struct {
             .finish_ctx = self,
             .finish_fn = App.pacerFinish,
             .model_call_fn = App.pacerModelCall,
+            .tail_due_fn = App.pacerTailDue,
         };
     }
 
@@ -3483,10 +3505,14 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
+        // Posts go first, before any agent's events, the shown one's too. A
+        // message carries who started the turn that sent it
+        // (`messageStartedBy`), so it stays right when that turn's end is
+        // handled first.
+        AgentsAppRuntime.takePosts(self);
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.
-        AgentsAppRuntime.takePosts(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);
@@ -4296,7 +4322,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
-        std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
         std.mem.eql(u8, command, "update") or
         // Resolve a stored credential, which reads the platform key store out of process.
@@ -4320,7 +4345,6 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
 }
 
 test "every alias of an early threaded io command uses early threaded io" {
@@ -5912,6 +5936,118 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
     try std.testing.expect(child.screen.pacer.hasPending());
 }
 
+test "a hidden main agent's assistant tail lands in its own transcript while a child is on screen" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    app.agent_on_screen = child;
+
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming **bo") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &events);
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 0), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Streaming **bo",
+        app.main_screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+}
+
+test "a hidden child with only a due tail is visited and its tail is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Tail only") };
+    child.screen.transcript.staged_assistant_tail_id = 1;
+    child.screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
+    child.screen.pacer.setTail(1);
+    try std.testing.expect(!child.screen.pacer.hasPending());
+
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 1), child.screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Tail only",
+        child.screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+}
+
+test "a hidden main agent with only a due tail is visited and its tail lands in its own transcript" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    app.agent_on_screen = child;
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Main tail only") };
+    app.main_screen.transcript.staged_assistant_tail_id = 1;
+    app.main_screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
+    app.main_screen.pacer.setTail(1);
+    try std.testing.expect(!app.main_screen.pacer.hasPending());
+
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Main tail only",
+        app.main_screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), child.screen.transcript.assistant_tail.items.len);
+}
+
+test "the shown tail stays until the committed text replaces it in the same tick" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+
+    var shown = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming bold") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &shown);
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+
+    const deps = app_callbacks.Bindings(App).workerEventHandlers(&app.main_agent);
+    try deps.append_text(deps.ctx, "Streaming bold\n");
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Streaming bold",
+        app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.transcript.items.len);
+
+    var next = [_]assistant_presentation.Event{.{ .text = @constCast("Next line") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &next);
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "Streaming bold\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Next line",
+        app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+}
+
 test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -6931,6 +7067,28 @@ test "an idle agent's waiting row counts a subagent until its finished turn is a
     defer app.approval_lender = null;
     try std.testing.expectEqualStrings("needs approval", try menuRowState(runtime.menuProjection(&app), "asking"));
     try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
+}
+
+test "a working subagent's row shows how long its turn has run, with no call open" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const timed = try addTestChildAgent(&app, "timed");
+    defer timed.agent.session.agent.history.deinit(alloc);
+    timed.agent.worker.worker_processing = true;
+    defer timed.agent.worker.worker_processing = false;
+    // The turn began 2m5s ago and waits on the model, so no tool call is open.
+    timed.agent.stream = .{ .active = true, .turn_started_ms = io_mod.milliTimestamp() - 125 * std.time.ms_per_s };
+    try runtime.openMenu(&app);
+    const state = try menuRowState(runtime.menuProjection(&app), "timed");
+    try std.testing.expect(std.mem.startsWith(u8, state, "working 2m"));
 }
 
 /// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
@@ -8504,7 +8662,190 @@ fn postTestReport(app: *App, reporter: *subagent_tool_host.Runtime, output: []co
         .work_id = "w1",
         .outcome = .completed,
         .output = output,
+    } }, null);
+}
+
+test "a report or message in the hand-off waits for its own agent until the main loop gives it to the worker" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    const bystander = try addTestChildAgent(&app, "child-2");
+    const Runtime = App.AgentsAppRuntime;
+
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &child.agent));
+    try postTestReport(&app, &reporter, "A_REPORT");
+    // It is the owner's, not the bystander's, and it stays in sight until the worker has it.
+    try std.testing.expect(Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &bystander.agent));
+    try std.testing.expectEqual(@as(usize, 0), child.agent.worker.queuedPromptCount());
+    Runtime.takePosts(&app);
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+
+    // A subagent's message to its parent waits in the same list for the same agent.
+    // It is left undelivered here; "a subagent's message keeps who started its turn
+    // when the turn ends before the main loop delivers it" delivers one.
+    try app_agents_runtime.postDelivery(&app.child_handoffs, &reporter, .{ .message = .{
+        .to = .owner,
+        .agent = "worker",
+        .child_id = "c1",
+        .text = "A_MESSAGE",
+    } }, null);
+    try std.testing.expect(Runtime.handoffMailWaiting(&app, &child.agent));
+    try std.testing.expect(!Runtime.handoffMailWaiting(&app, &bystander.agent));
+}
+
+test "a subagent's message keeps who started its turn when the turn ends before the main loop delivers it" {
+    const alloc = std.testing.allocator;
+    const child_state = @import("core/subagent/child_state.zig");
+    const authority = @import("core/subagent/authority.zig");
+    const model_contract = @import("core/subagent/model_contract.zig");
+    const session_language = @import("core/session/session.zig").ConversationLanguage;
+    // A subagent that answers each message at once.
+    const Child = struct {
+        fn resolve(_: ?*anyopaque, a: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(a, &.{}, &.{}, .{}, &.{});
+        }
+
+        fn run(_: ?*anyopaque, turn: *subagent_execution.TurnContext, message: subagent_domain.QueuedMessage, _: subagent_domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) subagent_execution.ServiceError!subagent_execution.RunOutcome {
+            if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
+            turn.commit(turn.active_work_id.?, .{ .assistant = .{
+                .user = .{ .text = message.content },
+                .assistant = @constCast("CHILD_OK"),
+            } }) catch return error.ProviderFailed;
+            return .completed;
+        }
+    };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    // The host the subagent runs on. Its owner messages the subagent once, so
+    // the subagent exists and is idle.
+    const parent_host = try subagent_tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Child.resolve }, .{ .run_fn = Child.run });
+    defer parent_host.deinit();
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "reviewer", .message = "look" } });
+    defer request.deinit(alloc);
+    _ = try parent_host.executeManaged(arena, &request, .{
+        .caller_id = parent.parent.id(),
+        .invocation_id = "main-sub",
+        .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session_language.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+    });
+    for (0..5000) |_| {
+        if (parent_host.quiet()) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    } else return error.Timeout;
+    const child_id = blk: {
+        var lock = parent_host.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try parent_host.managed.state_store.load(arena);
+        break :blk try arena.dupe(u8, registry.findPersistent("reviewer").?.id);
+    };
+
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // The agent that owns `parent_host` and gets the message.
+    var resolver: authority.Resolver = undefined;
+    const receiver = try addReportTarget(&app, "receiver", parent_host, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer receiver.agent.session_persistence.subagent_host = null;
+    // The subagent, run on `parent_host`, with a host of its own whose owner
+    // it is. Only that host's address is read.
+    const child = try addTestChildAgent(&app, child_id);
+    child.parent_host = parent_host;
+    var own_host: subagent_tool_host.Runtime = undefined;
+    child.agent.session_persistence.subagent_host = &own_host;
+    defer child.agent.session_persistence.subagent_host = null;
+
+    // The user types a turn on the subagent's screen, and that turn messages
+    // its parent.
+    const work_id = parent_host.beginUserWork(alloc, child_id, null) orelse return error.TestUnexpectedResult;
+    defer alloc.free(work_id);
+    try App.postSubagentReport(&app, &own_host, .{ .message = .{
+        .to = .owners_parent,
+        .agent = "",
+        .child_id = child_id,
+        .text = "HI_FROM_CHILD",
     } });
+    // The turn ends before the main loop takes the message, as it does when
+    // the message comes after the pass took its posts and the same pass
+    // handles the turn's end.
+    parent_host.endUserWork(child_id, work_id, .completed, "");
+    App.AgentsAppRuntime.takePosts(&app);
+
+    const queued = receiver.agent.worker.queued_prompts.items;
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    try std.testing.expect(std.mem.find(u8, queued[0].prompt, "HI_FROM_CHILD") != null);
+    try std.testing.expect(std.mem.find(u8, queued[0].prompt, "\"started_by\":\"user\"") != null);
+}
+
+test "the hand-off wait waits for a report that can still join the turn, up to its bound" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    const deps = app_callbacks.Bindings(App).agentRuntimeDeps(&app, &child.agent);
+    const Wait = @TypeOf(deps).HandoffMailWait;
+    child.agent.worker.worker_processing = true;
+    child.agent.worker.active_turn_id = 9;
+
+    // With nothing in the hand-off the call does not wait.
+    try std.testing.expectEqual(Wait.none, deps.wait_for_handoff_mail.?(deps.ctx, 9, 5_000));
+
+    // A report there, and nothing queued ahead of it: it can still join, so the call waits its bound.
+    try postTestReport(&app, &reporter, "A_REPORT");
+    const started = io_mod.milliTimestamp();
+    try std.testing.expectEqual(Wait.timed_out, deps.wait_for_handoff_mail.?(deps.ctx, 9, 100));
+    try std.testing.expect(io_mod.milliTimestamp() - started >= 90);
+}
+
+test "the hand-off wait ends at once, as delivered, for a report that cannot join because older work waits" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    var reporter: subagent_tool_host.Runtime = undefined;
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const child = try addReportTarget(&app, "child-1", &reporter, &resolver);
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    defer child.agent.session_persistence.subagent_host = null;
+    const deps = app_callbacks.Bindings(App).agentRuntimeDeps(&app, &child.agent);
+    const Wait = @TypeOf(deps).HandoffMailWait;
+
+    // Older work waits for a later turn: a report posted while the worker is idle.
+    try postTestReport(&app, &reporter, "OLDER_REPORT");
+    App.AgentsAppRuntime.takePosts(&app);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+    child.agent.worker.worker_processing = true;
+    child.agent.worker.active_turn_id = 9;
+
+    // A second report is in the hand-off, or has just left it (the mail is posted and the
+    // list not yet updated, or the reverse): either way it queues behind that work.
+    // The bound is far past the test's own limit, so only the state can end the wait.
+    try postTestReport(&app, &reporter, "SECOND_REPORT");
+    const started = io_mod.milliTimestamp();
+    try std.testing.expectEqual(Wait.delivered, deps.wait_for_handoff_mail.?(deps.ctx, 9, 5_000));
+    try std.testing.expect(io_mod.milliTimestamp() - started < 2_000);
 }
 
 /// The lines of a saved session's log that hold `needle`.

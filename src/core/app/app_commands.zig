@@ -14,6 +14,7 @@ const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const token_pass = @import("../gateway/token_pass.zig");
 const token_pass_check = @import("token_pass_check.zig");
+const update_target = @import("../upgrade/update_target.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -302,7 +303,6 @@ pub fn Handlers(comptime App: type) type {
                 .login = commandLogin,
                 .logout = commandLogout,
                 .provider = commandProvider,
-                .setup_alias = commandSetupAlias,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
@@ -512,17 +512,6 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             app.input_runtime.help_menu.open();
             app.shell.render_requests.request(.footer);
-        }
-
-        /// `/setup` is the deprecated alias of `/provider`.
-        fn commandSetupAlias(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app.writeDomainNotice(.{
-                .topic = "",
-                .tone = .warning,
-                .body = "/setup " ++ command_specs.deprecated_until ++ "; use /login to sign in or add an API key, or /provider to choose a provider",
-            }, true);
-            try commandProvider(ctx);
         }
 
         fn commandLogin(ctx: *anyopaque) !void {
@@ -1520,19 +1509,26 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowVersion(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            var label_buf: [update_target.max_version_label_bytes]u8 = undefined;
+            const build: update_target.CurrentBuild = .{
+                .channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel else .stable,
+                .version = App.app_version,
+                .revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
+            };
+            const label = try build.writeVersionLabel(&label_buf);
             try app.writeDomainNotice(.{
                 .topic = "version",
                 .tone = .neutral,
-                .body = App.app_version,
+                .body = label,
             }, true);
         }
 
-        fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
+        fn commandUnknown(ctx: *anyopaque, cmd: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(.{
                 .topic = "command",
                 .tone = .@"error",
-                .body = "Unknown command. Try /help.",
+                .body = command_router.removedSlashNotice(cmd) orelse "Unknown command. Try /help.",
             }, true);
         }
     };
@@ -2851,4 +2847,46 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}
+
+fn VersionTestApp(comptime channel: update_target.Channel, comptime revision: []const u8) type {
+    return struct {
+        pub const app_version = "0.0.17";
+        pub const build_update_channel = channel;
+        pub const build_revision = revision;
+
+        alloc: std.mem.Allocator,
+        notice_topic: ?[]const u8 = null,
+        notice_tone: ?types.NoticeTone = null,
+        notice_body: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.notice_body.deinit(self.alloc);
+        }
+
+        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
+            self.notice_topic = notice.topic;
+            self.notice_tone = notice.tone;
+            try self.notice_body.appendSlice(self.alloc, notice.body);
+        }
+    };
+}
+
+fn expectVersionCommandBody(comptime channel: update_target.Channel, comptime revision: []const u8, expected: []const u8) !void {
+    const App = VersionTestApp(channel, revision);
+    var app = App{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(App).commandShowVersion(@ptrCast(&app));
+
+    try std.testing.expectEqualStrings("version", app.notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
+    try std.testing.expectEqualStrings(expected, app.notice_body.items);
+}
+
+test "/version command writes dev build label and omits unresolved revision" {
+    try expectVersionCommandBody(.stable, "f1862c5061f5", "0.0.17");
+    try expectVersionCommandBody(.dev, "f1862c5061f5", "0.0.17-f1862c5 (dev)");
+    try expectVersionCommandBody(.dev, "unknown", "0.0.17 (dev)");
+    try expectVersionCommandBody(.dev, "", "0.0.17 (dev)");
 }

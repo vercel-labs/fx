@@ -1066,14 +1066,43 @@ fn authorizeBridgeCall(
     if (ctx.tool_registry.lookup(tool) != null) {
         return .{ .deny = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
     }
-    const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with toolbox search.", .{text_utils.terminalSafe(tool)}) };
+    const resolved = switch (try resolveBridgeTool(ctx, arena, tool)) {
+        .found => |found| found,
+        .refused => |why| return .{ .deny = why },
     };
     const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
     return switch (try checkNestedCall(ctx, arena, call, resolved)) {
         .allow => .{ .allow = .{ .binding = resolved.mcp_binding } },
         .deny => |why| .{ .deny = why },
     };
+}
+
+/// What `fx mcp call` and `fx mcp call help` hear for an MCP tool: the tool, or why the agent may not use it.
+const BridgeTool = union(enum) {
+    found: tool_mcp_runtime.SelectedTool,
+    /// Terminal-safe words for the command's output.
+    refused: []const u8,
+};
+
+/// Resolves the tool a command names, as `toolbox {open}` does, so the reason a tool that exists can't be used
+/// now, such as its server needing a login or being down, reaches the command in the same words. A tool fx has
+/// none of for this agent, one outside its view or denied in its mode included, is the same answer on every path.
+fn resolveBridgeTool(ctx: Context, arena: Allocator, tool: []const u8) !BridgeTool {
+    return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
+        .found => |found| .{ .found = found.tool },
+        .rejected => |why| .{ .refused = try arena.print("{f}", .{text_utils.terminalSafe(why)}) },
+        // As `toolbox {open}` says it: a subagent whose view the servers changed under hears why, not that the tool is gone.
+        .missing => .{ .refused = if (types.isMcpToolName(tool) and mcpAccessChanged(ctx))
+            try arena.print("{f}", .{text_utils.terminalSafe(try staleViewRefusal(arena, tool))})
+        else
+            try noMcpToolText(arena, tool) },
+    };
+}
+
+/// What a command hears when fx has no MCP tool by that name for this agent; `fx mcp call` and `fx mcp call
+/// help` both say it, and the way on is the command's own search, which a command can run.
+fn noMcpToolText(arena: Allocator, tool: []const u8) Allocator.Error![]const u8 {
+    return arena.print("No MCP tool named {f} is available to this agent. Find tool names with fx mcp call search.", .{text_utils.terminalSafe(tool)});
 }
 
 const NestedCheck = union(enum) {
@@ -1416,8 +1445,9 @@ fn lookupBridge(
             if (ctx.tool_registry.lookup(tool) != null) {
                 return .{ .status = .failed, .bytes = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
             }
-            const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with fx mcp call search.", .{text_utils.terminalSafe(tool)}) };
+            const resolved = switch (try resolveBridgeTool(ctx, arena, tool)) {
+                .found => |found| found,
+                .refused => |why| return .{ .status = .failed, .bytes = why },
             };
             mcp_tool_lookup.writeHelp(arena, &out.writer, resolved.schema_json) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
@@ -1441,6 +1471,7 @@ fn lookupBridge(
                     .server = if (question == .list) text else null,
                     .limit = capability_retrieval.max_limit,
                     .cursor = cursor,
+                    .login_sentence = true,
                 };
                 request.validate() catch |err| {
                     return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
@@ -1865,6 +1896,61 @@ test "a toolbox run whose MCP definition changed before it ran says to open it a
 
 fn accessAlwaysChanged(_: *anyopaque, _: tool_mcp_runtime.Access) bool {
     return true;
+}
+
+const login_reason = "MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.";
+
+fn needsLoginSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .rejected = .{ .model_output = try arena.dupe(u8, login_reason) } };
+}
+
+fn escapeReasonSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .rejected = .{ .model_output = try arena.dupe(u8, "MCP server 'fixture' is unavailable: it said \x1b[31mno") } };
+}
+
+test "a command's fx mcp call and help hear why a tool can't be used, as toolbox open does, and one sentence when fx has none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = needsLoginSchema };
+    defer rt.deinit(std.testing.allocator);
+    var state: McpCallBridgeState = .{ .runtime = rt.context() };
+    var cancel = std.atomic.Value(bool).init(false);
+
+    // The tool exists but its server needs a login: the reason, not "no such tool", from both.
+    const denied = try authorizeBridgeCall(&state, arena, "1", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(login_reason, denied.deny);
+    const help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expect(help.status == .failed);
+    try std.testing.expectEqualStrings(login_reason, help.bytes);
+    // It is the very text `toolbox {open}` gives.
+    const opened = try executeToolCall(rt.context(), arena, .{ .id = "2", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_fixture_echo\",\"kind\":\"tool\"}" });
+    try std.testing.expectEqualStrings(login_reason, opened.model_output);
+
+    // A server's words never reach the terminal as control bytes.
+    rt.mcp_tool_schema = escapeReasonSchema;
+    state.runtime = rt.context();
+    const escaped = try authorizeBridgeCall(&state, arena, "3", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings("MCP server 'fixture' is unavailable: it said \\x1b[31mno", escaped.deny);
+
+    // A tool fx has none of says one sentence from both, and the command can run the search it names.
+    rt.mcp_tool_schema = goneMcpSchema;
+    state.runtime = rt.context();
+    const none = "No MCP tool named mcp_fixture_echo is available to this agent. Find tool names with fx mcp call search.";
+    const gone = try authorizeBridgeCall(&state, arena, "4", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(none, gone.deny);
+    const gone_help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expectEqualStrings(none, gone_help.bytes);
+
+    // A subagent whose view the servers changed under hears why, as toolbox open says it.
+    rt.mcp_access_changed = accessAlwaysChanged;
+    state.runtime = rt.context();
+    const stale = "mcp_fixture_echo is not available to this work: " ++ tool_mcp_runtime.servers_changed_reason;
+    const stale_call = try authorizeBridgeCall(&state, arena, "5", "mcp_fixture_echo", "{}");
+    try std.testing.expectEqualStrings(stale, stale_call.deny);
+    const stale_help = try lookupBridge(&state, arena, .{ .help = "mcp_fixture_echo" }, &cancel);
+    try std.testing.expectEqualStrings(stale, stale_help.bytes);
 }
 
 test "a subagent whose MCP view the servers changed under hears why for toolbox open of a tool" {
@@ -2967,6 +3053,7 @@ fn executeSubagentProvider(
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
         .caller_worker = ctx.worker,
+        .turn_messages = ctx.current_turn_messages,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,

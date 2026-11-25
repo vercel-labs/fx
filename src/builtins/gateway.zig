@@ -150,6 +150,8 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
     .build_request_fn = buildAgentRequestForProvider,
     .project_replay_fn = vercel_protocol.selectReplayParts,
+    .provider_compaction_fn = vercel_model_policy.providerCompaction,
+    .holds_compaction_block_fn = vercel_protocol.holdsCompactionBlock,
 };
 
 pub const provider_bundle = provider_set.Bundle{
@@ -711,6 +713,7 @@ fn streamAgentCompletion(
             .transport => .transport,
             .agent => .agent,
         },
+        .conversation = .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
         .shared_pool = shared_pool,
     };
     const result = (if (request.deadline) |deadline|

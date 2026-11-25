@@ -15,6 +15,7 @@
 //! `Session.sync_mutex` (one fsync at a time). Hosts never lock anything.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
@@ -571,6 +572,7 @@ pub const Session = struct {
         const lock = s.createFile(dir, "lock") catch |io_err| return storage.ioFault(io_err);
         errdefer s.closeFile(lock);
         if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return error.Io;
+        s.writeLockPid(lock, currentPid());
         s.syncDir(dir) catch |io_err| return storage.ioFault(io_err);
         if (!rename_first) try session.publishRename(tmp);
         s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
@@ -926,7 +928,10 @@ pub const Session = struct {
                 session.phase = .closed;
             },
             .failed => |maybe_live| {
-                if (maybe_live) |live| session.release(live);
+                if (maybe_live) |live| {
+                    session.env.s.clearLockPid(live.lock);
+                    session.release(live);
+                }
                 session.phase = .closed;
             },
             .live => |*live| {
@@ -948,6 +953,7 @@ pub const Session = struct {
                     .failed => |l| l.?,
                     else => unreachable,
                 };
+                session.env.s.clearLockPid(resources.lock);
                 session.release(resources);
                 session.phase = .closed;
                 return result;
@@ -1232,7 +1238,13 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         else => |io_err| storage.ioFault(io_err),
     };
     errdefer s.closeFile(lock);
-    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    const locked = !env.isPlanted(.skip_flock);
+    if (locked) {
+        try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+        s.writeLockPid(lock, currentPid());
+    }
+    // Declared after `closeFile`, so it runs first: the PID is cleared before the file closes.
+    errdefer if (locked) s.clearLockPid(lock);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -2273,20 +2285,41 @@ pub fn discardStaging(env: *const Env, id_: []const u8) storage.IoFault!void {
     s.deleteTree(tmp, id_) catch |io_err| return storage.ioFault(io_err);
 }
 
-/// Whether a session with this id is open for writing anywhere.
-pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
+pub const LockStatus = union(enum) {
+    free,
+    /// Held by another process; null when no valid PID was recorded.
+    busy: ?i64,
+};
+
+fn currentPid() i64 {
+    if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .freestanding) return 0;
+    return std.c.getpid();
+}
+
+/// Whether another process has session `id_` open for writing, and its PID
+/// when it recorded one. When none has, this holds the lock for an instant.
+pub fn lockStatus(env: *const Env, id_: []const u8) DeleteError!LockStatus {
     const s = env.s;
     if (!schema.validId(id_)) return error.NotFound;
     const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
     defer s.closeDir(dir);
     const lock = s.openFile(dir, "lock", .read_write) catch |err| return switch (err) {
-        error.NotFound => false,
+        error.NotFound => .free,
         else => |io_err| storage.ioFault(io_err),
     };
     defer s.closeFile(lock);
-    if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) return true;
+    if (!(s.tryLock(lock) catch |io_err| return storage.ioFault(io_err))) {
+        return .{ .busy = s.readLockPid(lock) };
+    }
     s.unlock(lock);
-    return false;
+    return .free;
+}
+
+pub fn isBusy(env: *const Env, id_: []const u8) DeleteError!bool {
+    return switch (try lockStatus(env, id_)) {
+        .free => false,
+        .busy => true,
+    };
 }
 
 /// The distinct child ids named by `child_spawned` lines.
@@ -3817,6 +3850,51 @@ const session_tests = struct {
         }
         try testing.expectEqual(@as(usize, 1), roots);
         try testing.expectEqual(@as(usize, 2), sessions);
+    }
+
+    fn expectLockStatus(env: *const session_mod.Env, id: []const u8, want: LockStatus) !void {
+        try testing.expectEqual(want, try lockStatus(env, id));
+    }
+
+    fn lockFileLength(t: *TestEnv, id: []const u8) !u64 {
+        const dir = try t.env.s.openDir(t.env.root, id);
+        defer t.env.s.closeDir(dir);
+        const file = try t.env.s.openFile(dir, "lock", .read_only);
+        defer t.env.s.closeFile(file);
+        return t.env.s.length(file);
+    }
+
+    test "lockStatus names the writer's PID while a session is open, and is free after a close or a crash" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const writer = try newRoot(&t);
+        _ = try writer.append(&.{ .turn_started, .turn_committed });
+        const id = try gpa.dupe(u8, writer.id());
+        defer gpa.free(id);
+        try expectLockStatus(&t.env, id, .{ .busy = currentPid() });
+        try closeAndDestroy(writer);
+        try expectLockStatus(&t.env, id, .free);
+        try testing.expectEqual(@as(u64, 0), try lockFileLength(&t, id));
+
+        {
+            const dir = try t.env.s.openDir(t.env.root, id);
+            defer t.env.s.closeDir(dir);
+            const holder = try t.env.s.openFile(dir, "lock", .read_write);
+            defer t.env.s.closeFile(holder);
+            try testing.expect(try t.env.s.tryLock(holder));
+            try expectLockStatus(&t.env, id, .{ .busy = null });
+            try t.env.s.writeAt(holder, "not-a-pid\n", 0);
+            try t.env.s.sync(holder);
+            try expectLockStatus(&t.env, id, .{ .busy = null });
+            t.env.s.unlock(holder);
+        }
+
+        const again = try resumeRoot(&t, id);
+        try expectLockStatus(&t.env, id, .{ .busy = currentPid() });
+        crash(&t, again);
+        try expectLockStatus(&t.env, id, .free);
+        try testing.expect(try lockFileLength(&t, id) > 0);
     }
 };
 

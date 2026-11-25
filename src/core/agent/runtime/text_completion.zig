@@ -190,6 +190,26 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     return .{ .text = try alloc.dupe(u8, capture.text.items) };
 }
 
+fn providerFailed(alloc: Allocator, reason: compactor.FailureReason, comptime fmt: []const u8, args: anytype) compactor.CallError!compactor.ProviderReply {
+    return .{ .failed = .{ .reason = reason, .detail = try alloc.print(fmt, args) } };
+}
+
+/// The same message as the agent sends it: what the provider reads of it.
+fn sameMessage(a: types.ChatMessage, b: types.ChatMessage) bool {
+    if (a.role != b.role) return false;
+    if (!std.mem.eql(u8, a.content orelse "", b.content orelse "")) return false;
+    if (!std.mem.eql(u8, a.tool_call_id orelse "", b.tool_call_id orelse "")) return false;
+    if (a.tool_calls.len != b.tool_calls.len or a.images.len != b.images.len) return false;
+    for (a.tool_calls, b.tool_calls) |left, right| {
+        if (!std.mem.eql(u8, left.id, right.id) or !std.mem.eql(u8, left.name, right.name) or !std.mem.eql(u8, left.arguments_json, right.arguments_json)) return false;
+    }
+    const left = a.provider_replay;
+    const right = b.provider_replay;
+    if ((left == null) != (right == null)) return false;
+    if (left) |value| if (!std.mem.eql(u8, value.parts_json, right.?.parts_json)) return false;
+    return true;
+}
+
 fn failed(alloc: Allocator, reason: Reason, comptime fmt: []const u8, args: anytype) Error!Outcome {
     return .{ .failed = .{ .reason = reason, .detail = try alloc.print(fmt, args) } };
 }
@@ -290,7 +310,7 @@ pub const CompactorCaller = struct {
     pub fn caller(self: *CompactorCaller) compactor.ModelCaller {
         return .{
             .context = self,
-            .vtable = &.{ .capabilities = capabilities, .send = send },
+            .vtable = &.{ .capabilities = capabilities, .send = send, .compact_with_provider = compactWithProvider },
             .model = self.model,
             .provider = self.provider,
             .credential_source = self.credential_source,
@@ -298,7 +318,147 @@ pub const CompactorCaller = struct {
             // A Token Pass conversation of a team with Token Pass retries its
             // summary on Token Pass.
             .fallback_model = if (self.provider == .gateway) token_pass_team.compactionFallback(self.model) else null,
+            .provider_compaction = if (self.provider == .gateway) self.stream_provider.providerCompaction(self.model) else null,
         };
+    }
+
+    /// Sends the start of the request the agent was about to send, or all of
+    /// it, to the conversation's own model with the provider's compaction
+    /// option, and returns the block it writes. Never another model: only
+    /// this one can read the block.
+    fn compactWithProvider(context: *anyopaque, alloc: Allocator, call: compactor.ProviderCall) compactor.CallError!compactor.ProviderReply {
+        const self: *CompactorCaller = @ptrCast(@alignCast(context));
+        const sent = self.conversation orelse return providerFailed(alloc, .provider, "kind=no_conversation", .{});
+        const kind = (if (self.provider == .gateway) self.stream_provider.providerCompaction(self.model) else null) orelse
+            return providerFailed(alloc, .provider, "kind=unsupported model={s}", .{self.model});
+        var conversation = sent;
+        if (call.older) |older| {
+            // The session's projection of the compacted turns must be where
+            // the request starts, or the block would stand for something the
+            // provider never read before the kept turns.
+            if (older.len > sent.messages.len) return providerFailed(alloc, .provider, "kind=prefix_mismatch older={d} sent={d}", .{ older.len, sent.messages.len });
+            for (older, sent.messages[0..older.len], 0..) |projected, message, index| {
+                if (!sameMessage(projected, message)) {
+                    const left = projected.content orelse "";
+                    const right = message.content orelse "";
+                    return providerFailed(alloc, .provider, "kind=prefix_mismatch index={d} roles={s}/{s} content_bytes={d}/{d} first_diff={d} replay={}/{}", .{
+                        index,                             @tagName(projected.role),        @tagName(message.role),
+                        left.len,                          right.len,                       std.mem.findDiff(u8, left, right) orelse 0,
+                        projected.provider_replay != null, message.provider_replay != null,
+                    });
+                }
+            }
+            conversation.messages = sent.messages[0..older.len];
+        }
+        conversation.provider_options.compaction = kind;
+        conversation.provider_options.ultrafast = false;
+        // Another fx process may have renewed the sign-in since the compaction
+        // read it: one more send with the renewed credential, as `send` does.
+        var attempt = try self.providerCompactionAttempt(alloc, call, conversation);
+        if (attempt == .unauthorized and try self.renewCredential(call.trace_ctx)) {
+            attempt = try self.providerCompactionAttempt(alloc, call, conversation);
+        }
+        return switch (attempt) {
+            .reply => |reply| reply,
+            .unauthorized => providerFailed(alloc, .provider, "kind=unauthorized", .{}),
+        };
+    }
+
+    /// One provider compaction request: the provider's reply, or a 401 the
+    /// sign-in can be renewed for.
+    const ProviderAttempt = union(enum) { reply: compactor.ProviderReply, unauthorized };
+
+    fn providerCompactionAttempt(self: *CompactorCaller, alloc: Allocator, call: compactor.ProviderCall, conversation: agent_stream_provider.RequestData) compactor.CallError!ProviderAttempt {
+        var capture = StreamCapture{ .alloc = alloc, .max_bytes = types.ProviderReplay.max_bytes };
+        defer capture.deinit();
+        var delivery = runtime_gateway_step.DeliveryCertainty.init();
+        var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
+        const started_ms = io_mod.milliTimestamp();
+        var streamed = runtime_gateway_step.streamModelCompletion(
+            self.stream_provider,
+            alloc,
+            .{
+                .observer = self.observer,
+                .purpose = .compaction,
+                .credential = if (self.credential_source == .host_managed) .host_managed else .{ .direct = .{
+                    .secret_bytes = self.api_key,
+                    .source = self.credential_source,
+                    .account_id = self.account_id,
+                    .tenant_context = self.gateway_team,
+                } },
+                .session_id = self.session_id,
+                .model = self.model,
+                .retry_count = self.retry_count,
+                .instructions = conversation.instructions,
+                .messages = conversation.messages,
+                .tools = conversation.tools,
+                .tool_choice = conversation.tool_choice,
+                .vision_mode = conversation.vision_mode,
+                .verified_images = conversation.verified_images,
+                .provider_options = conversation.provider_options,
+                .max_output_tokens = self.max_output_tokens,
+                .budget = .{ .cancel_flag = call.cancel_flag },
+                // No capture limit: the stream records the reply's provider
+                // replay only without one, and that replay is the block. The
+                // replay itself stops at `ProviderReplay.max_bytes`.
+                .content_capture_limit = null,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &capture, .emit_fn = onEvent },
+                .admission = .{},
+                .cancel_flag = call.cancel_flag,
+                .trace_ctx = call.trace_ctx,
+                .cooperative_pulse = self.cooperative_transport_pulse,
+            },
+        ) catch |err| {
+            if (self.model_calls) |sink| sink.record(model_call_record.ofError(
+                sink.provider,
+                self.model,
+                attempt_evidence.sentEffort(delivery.load()),
+                .compaction,
+                started_ms,
+                io_mod.milliTimestamp(),
+                err == error.Cancelled,
+                err,
+            ));
+            return switch (err) {
+                error.Cancelled => error.Cancelled,
+                error.OutOfMemory => error.OutOfMemory,
+                else => ProviderAttempt{ .reply = try providerFailed(alloc, .transport, "err={s}", .{@errorName(err)}) },
+            };
+        };
+        defer streamed.deinit(alloc);
+        if (self.model_calls) |sink| sink.record(model_call_record.ofResult(
+            sink.provider,
+            self.model,
+            attempt_evidence.sentEffort(delivery.load()),
+            .compaction,
+            started_ms,
+            io_mod.milliTimestamp(),
+            &streamed,
+            call.cancel_flag.load(.seq_cst),
+        ));
+        if (call.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const completion = switch (streamed) {
+            .failed => |failure| {
+                if (failure.kind == .unauthorized) return .unauthorized;
+                return .{ .reply = try providerFailed(alloc, .provider, "kind={s}", .{@tagName(failure.kind)}) };
+            },
+            .completed => |completed| completed.completion,
+        };
+        if (capture.failed) return error.OutOfMemory;
+        if (capture.saw_tool_call or completion.tool_calls.len > 0) return .{ .reply = try providerFailed(alloc, .tool_call, "", .{}) };
+        // Anthropic ends a compaction with its own stop reason, which reads
+        // as `other`; OpenAI's ends as a normal stop.
+        if (completion.finish_reason != .stop and completion.finish_reason != .other) {
+            return .{ .reply = try providerFailed(alloc, .incomplete, "finish_reason={s}", .{if (completion.finish_reason) |reason| @tagName(reason) else "missing"}) };
+        }
+        const parts = completion.provider_state_json orelse return .{ .reply = try providerFailed(alloc, .provider, "kind=no_block", .{}) };
+        if (!self.stream_provider.holdsCompactionBlock(alloc, parts)) return .{ .reply = try providerFailed(alloc, .provider, "kind=no_block parts_bytes={d}", .{parts.len}) };
+        const text = completion.content orelse "";
+        if (!std.unicode.utf8ValidateSlice(text)) return .{ .reply = try providerFailed(alloc, .truncated, "bytes={d}", .{text.len}) };
+        compactor.traceLog(false, "provider compaction block model={s} text_bytes={d} parts_bytes={d} input_tokens={any} cache_read_tokens={any}", .{ self.model, text.len, parts.len, completion.usage.input_tokens, completion.usage.cache_read_tokens });
+        return .{ .reply = .{ .block = .{ .provider = try alloc.dupe(u8, self.provider.label()), .text = try alloc.dupe(u8, text), .parts_json = try alloc.dupe(u8, parts) } } };
     }
 
     fn capabilities(context: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -684,4 +844,129 @@ test "a compaction request rejected with 401 is sent once more with the sign-in 
     }
     try testing.expectEqual(@as(usize, 3), fake.sends);
     try testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{.reload}, hooks.credential_refresh_modes.items);
+}
+
+test "a provider compaction request rejected with 401 is sent once more with the sign-in renewed" {
+    const testing = std.testing;
+    const support = @import("tests/support.zig");
+    const Transport = enum { normal, refused, reset };
+    const Fake = struct {
+        transport: Transport,
+        recorded: [2]agent_stream_provider.RequestEffort = .{ .{}, .{} },
+        record_count: usize = 0,
+        sends: usize = 0,
+        last_key: [32]u8 = undefined,
+        last_key_len: usize = 0,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            const key = request.credential.secret().?;
+            @memcpy(self.last_key[0..key.len], key);
+            self.last_key_len = key.len;
+            self.sends += 1;
+            request.data().effort_out.?.set(request.provider_options.reasoning.?.label());
+            if (self.transport == .refused) return error.ConnectionRefused;
+            request.delivery.markPossiblySent();
+            if (self.transport == .reset) return error.ConnectionResetByPeer;
+            if (std.mem.eql(u8, key, "launch-key")) return .{ .failed = .{
+                .kind = .unauthorized,
+                .http_status = .unauthorized,
+                .detail = try alloc.dupe(u8, "{\"error\":\"expired\"}"),
+                .ownership = .owned,
+            } };
+            return .{ .completed = .{
+                .completion = .{
+                    .content = try alloc.dupe(u8, "block summary"),
+                    .finish_reason = .stop,
+                    .provider_state_json = try alloc.dupe(u8, "[{\"type\":\"text\"}]"),
+                },
+                .ownership = .owned,
+            } };
+        }
+
+        fn record(raw: *anyopaque, value: types.ModelCallRecord) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.recorded[self.record_count].set(value.effort);
+            self.record_count += 1;
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+
+        fn providerCompaction(_: []const u8) ?model_capabilities.ProviderCompaction {
+            return .anthropic;
+        }
+
+        fn holdsBlock(_: Allocator, _: []const u8) bool {
+            return true;
+        }
+    };
+    const Case = struct { tokens: []const []const u8, sends: usize, block: bool, transport: Transport = .normal };
+    const cases = [_]Case{
+        // Another fx renewed the sign-in: the block comes back on its token.
+        .{ .tokens = &.{"stored-key"}, .sends = 2, .block = true },
+        // Nothing to renew to: the 401 stands, and fx writes its own summary.
+        .{ .tokens = &.{}, .sends = 1, .block = false },
+        .{ .tokens = &.{}, .sends = 1, .block = false, .transport = .refused },
+        .{ .tokens = &.{}, .sends = 1, .block = false, .transport = .reset },
+    };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "the agent's instructions" }};
+    const history = [_]types.ChatMessage{ .{ .role = .user, .content = "fix the build" }, .{ .role = .assistant, .content = "Fixed." } };
+    var cancel = std.atomic.Value(bool).init(false);
+    for (cases) |case| {
+        var fake: Fake = .{ .transport = case.transport };
+        var hooks = support.FakeAgentRuntimeDeps.init(testing.allocator);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = case.tokens;
+        const deps = hooks.deps();
+        var summary_model: CompactorCaller = .{
+            .stream_provider = .{
+                .context = &fake,
+                .stream_fn = Fake.stream,
+                .provider_compaction_fn = Fake.providerCompaction,
+                .holds_compaction_block_fn = Fake.holdsBlock,
+            },
+            .provider = .gateway,
+            .model = "m",
+            .api_key = "launch-key",
+            .credential_source = .fx_login,
+            .retry_count = 0,
+            .capabilities_context = &fake,
+            .capabilities_fn = Fake.capabilities,
+            .renewal_deps = &deps,
+            .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") } },
+            .model_calls = .{ .context = &fake, .record_fn = Fake.record, .provider = "gateway" },
+        };
+        defer summary_model.deinit();
+        const caller = summary_model.caller();
+        const reply = try caller.vtable.compact_with_provider.?(caller.context, testing.allocator, .{ .older = null, .cancel_flag = &cancel, .trace_ctx = .{} });
+        try testing.expectEqual(case.sends, fake.sends);
+        try testing.expectEqual(case.sends, fake.record_count);
+        for (fake.recorded[0..fake.record_count]) |*effort| {
+            if (case.transport == .refused) try testing.expect(effort.slice() == null) else try testing.expectEqualStrings("high", effort.slice().?);
+        }
+        switch (reply) {
+            .block => |block| {
+                defer {
+                    testing.allocator.free(block.provider);
+                    testing.allocator.free(block.text);
+                    testing.allocator.free(block.parts_json);
+                }
+                try testing.expect(case.block);
+                try testing.expectEqualStrings("block summary", block.text);
+                try testing.expectEqualStrings("stored-key", fake.last_key[0..fake.last_key_len]);
+            },
+            .failed => |failure| {
+                defer testing.allocator.free(failure.detail);
+                try testing.expect(!case.block);
+                try testing.expectEqualStrings(switch (case.transport) {
+                    .normal => "kind=unauthorized",
+                    .refused => "err=ConnectionRefused",
+                    .reset => "err=ConnectionResetByPeer",
+                }, failure.detail);
+            },
+        }
+    }
 }

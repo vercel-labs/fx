@@ -138,6 +138,12 @@ pub const ConversationInterruption = struct {
     /// holds it: a v2 session saves it as a `cancelled_command` item of its
     /// own right before the piece, which older fx versions skip (D100).
     cancelled_command_call_id: ?[]const u8 = null,
+    /// The `subagent` wait the turn cancelled while it waited, and the
+    /// subagents its row named. The piece never holds them either: a v2
+    /// session saves them as a `cancelled_wait` item right before the piece
+    /// (D102).
+    cancelled_wait_call_id: ?[]const u8 = null,
+    cancelled_wait_subagents: ?[]const u8 = null,
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ConversationInterruption {
         const Wire = struct {
@@ -638,6 +644,8 @@ pub fn appendHistoryTurnConversationEvents(
                 .files = entry.execution.files,
                 .turn_summary = entry.execution.turn_summary,
                 .cancelled_command_call_id = cancelledCommandWithoutOutput(entry),
+                .cancelled_wait_call_id = cancelledWaitCall(entry),
+                .cancelled_wait_subagents = if (entry.cancelled_wait) |wait| wait.waited_for else null,
             } });
         },
         .compacted_summary => return error.ConversationCheckpointRequiresSequence,
@@ -651,6 +659,14 @@ fn cancelledCommandWithoutOutput(entry: types.InterruptedHistoryTurn) ?[]const u
     const presentation = entry.cancelled_command orelse return null;
     const call = entry.tool_call orelse return null;
     if (interruptedCommandReplayRef(entry) != null or presentation.command_artifact_handle != null) return null;
+    return call.id;
+}
+
+/// The call of `entry`'s cancelled `subagent` wait, or null when it has none
+/// (D102).
+fn cancelledWaitCall(entry: types.InterruptedHistoryTurn) ?[]const u8 {
+    if (entry.cancelled_wait == null) return null;
+    const call = entry.tool_call orelse return null;
     return call.id;
 }
 

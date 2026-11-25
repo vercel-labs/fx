@@ -38,6 +38,7 @@ import {
   startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
@@ -404,7 +405,7 @@ test.skipIf(!tmuxAvailable())(
       expect(await active.capturePane()).not.toContain(labels[0]!);
 
       await active.sendText("Continue with the prepared follow-up.");
-      await active.waitForText("AFTER_RESUME_INTERACTION", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("AFTER_RESUME_INTERACTION") && turnSettled(pane), TIMEOUT);
       await active.waitForStableComposer(TIMEOUT);
       expectPublishedRows(await active.captureFullScrollbackEscapes());
       await waitForPersistedSessionMarker(home, "AFTER_RESUME_INTERACTION");
@@ -968,6 +969,7 @@ test.skipIf(!tmuxAvailable())(
         await active.sendText("Continue without using tools.");
         const answer = index === 0 ? "FIRST_CONTINUATION_OK" : "SECOND_CONTINUATION_OK";
         expectInternal(await waitForScrollback(active, answer));
+        await active.waitForPane(turnSettled, TIMEOUT);
         await active.sendText("/quit");
         expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
         active = null;
@@ -1266,7 +1268,7 @@ printf '${trailingMarker}   '
       expect(readFileSync(tracePath, "utf8")).toContain("route=approved_shell");
 
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("Streaming ("),
+        (pane) => pane.includes(doneMarker) && turnSettled(pane),
         TIMEOUT,
       );
       const compactGrid = await active.capturePaneGrid();
@@ -1454,7 +1456,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Apply the block edit.");
-      await waitForScrollback(active, doneMarker);
+      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe(original.replace(oldBlock, newBlock));
 
       await active.sendKeys("C-o");
@@ -1558,7 +1560,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Apply the edit.");
-      await waitForScrollback(active, doneMarker);
+      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target).equals(edited)).toBe(true);
 
       await active.sendKeys("C-o");
@@ -1635,7 +1637,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared watcher and stop it.");
-      const live = await waitForScrollback(active, "SESSION_LABEL_DONE");
+      await active.waitForPane((pane) => pane.includes("SESSION_LABEL_DONE") && turnSettled(pane), TIMEOUT);
+      const live = await active.captureFullScrollback();
       // The launch returned while its command ran on, and the session's input
       // and its stop join its row, which shows the latest state.
       expect(live).toContain("● Stopped cat, sleep · 3 calls");
@@ -1724,6 +1727,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the watcher.");
       await waitForScrollback(active, "STALE_NOTE_PHASE1_DONE");
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(gatewaySawNote(gateway)).toBe(false);
 
       await active.sendText("/quit");
@@ -1745,7 +1749,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Is the watcher still running?");
-      await waitForScrollback(active, "STALE_NOTE_PHASE2_DONE");
+      await active.waitForPane((pane) => pane.includes("STALE_NOTE_PHASE2_DONE") && turnSettled(pane), TIMEOUT);
       expect(gatewaySawNote(resumedGateway)).toBe(true);
       // The note rides on the resumed turn's own message, so the instructions
       // stay as they were cached; the next turn of this process keeps that one
@@ -1804,7 +1808,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the watcher for session one.");
-      await waitForScrollback(active, "LIVE_HANDLE_S1_DONE");
+      await active.waitForPane((pane) => pane.includes("LIVE_HANDLE_S1_DONE") && turnSettled(pane), TIMEOUT);
 
       await active.sendText("/new");
       await active.waitForPane((pane) => hasEmptyComposer(stripAnsi(pane)), TIMEOUT);
@@ -1820,6 +1824,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("Checking in on the watcher.");
       await waitForScrollback(active, "LIVE_HANDLE_FOLLOWUP_DONE");
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(gateway.requests).toHaveLength(3);
       expect(gatewaySawNote(gateway)).toBe(false);
 
@@ -1877,14 +1882,14 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      const compact = await waitForScrollback(active, "FULL_CTRL_O_DONE");
+      await active.waitForPane(
+        (pane) => pane.includes("FULL_CTRL_O_DONE") && turnSettled(pane),
+        TIMEOUT,
+      );
+      const compact = await active.captureFullScrollback();
       expect(compact).toMatch(/^● Ran awk .*✓$/m);
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(tailMarker);
-      await active.waitForPane(
-        (pane) => pane.includes("FULL_CTRL_O_DONE") && !pane.includes("Streaming ("),
-        TIMEOUT,
-      );
       const compactGrid = await active.capturePaneGrid();
 
       await active.sendKeys("C-o");
@@ -2036,7 +2041,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared cap-crossing command.");
-      const compact = await waitForScrollback(active, finalMarker, timeout);
+      await active.waitForPane((pane) => pane.includes(finalMarker) && turnSettled(pane), timeout);
+      const compact = await active.captureFullScrollback();
       expect(compact).toContain("● Ran awk, printf, sleep +1 more ✓");
       expect(compact).not.toContain("lines more (ctrl+o to view)");
       expect(compact).not.toContain(stdoutTail);
@@ -2747,7 +2753,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText(prompt);
-      await waitForScrollback(active, finalMarker);
+      await active.waitForPane((pane) => pane.includes(finalMarker) && turnSettled(pane), TIMEOUT);
 
       const inlineVisible = await captureFullScrollbackArtifacts(
         active,
@@ -2852,7 +2858,8 @@ test.skipIf(!tmuxAvailable())(
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Return the prepared TypeScript block.");
-          const scrollback = await waitForScrollback(active, "WIRE_APPEND_DONE");
+          await active.waitForPane((pane) => pane.includes("WIRE_APPEND_DONE") && turnSettled(pane), TIMEOUT);
+          const scrollback = await active.captureFullScrollback();
           const markerRows = scrollback.split("\n").filter((line) =>
             line.includes("WIRE_LINE_")
           );
@@ -2984,7 +2991,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a session before testing Cmd+R.");
-      await active.waitForText(saved, TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(saved) && turnSettled(pane), TIMEOUT);
       await active.sendLiteralText(draft);
       await active.waitForText(draft, TIMEOUT);
 
@@ -3060,7 +3067,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the prepared Ctrl-O input check.");
-      await active.waitForText(firstDone, TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(firstDone) && turnSettled(pane), TIMEOUT);
       await active.waitForComposer(TIMEOUT);
 
       await active.sendKeys("C-o");
@@ -3366,7 +3373,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("esc close · pgup/pgdn scroll"),
+        (pane) => pane.includes(doneMarker) && !pane.includes("esc close · pgup/pgdn scroll") && turnSettled(pane),
         TIMEOUT,
       );
       const scrollback = await waitForScrollback(active, doneMarker);
@@ -3619,8 +3626,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared command.");
-      await waitForScrollback(active, afterMarker);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(afterMarker) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       const compactGrid = await active.capturePaneGrid();
       const compactTool = compactGrid.findIndex((line) => line.includes("Ran "));
       if (compactTool < 0) {
@@ -3728,7 +3734,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Return the prepared Markdown response.");
-      await waitForScrollback(active, doneMarker);
+      await active.waitForPane((pane) => pane.includes(doneMarker) && turnSettled(pane), TIMEOUT);
 
       await active.sendKeys("C-o");
       await Bun.sleep(250);
@@ -3786,7 +3792,7 @@ test.skipIf(!tmuxAvailable())(
           });
           await active.waitForComposer(TIMEOUT);
           await active.sendText("Show the prepared paragraphs.");
-          await active.waitForText("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", TIMEOUT);
+          await active.waitForPane((pane) => pane.includes("BRAVO28_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") && turnSettled(pane), TIMEOUT);
           await active.waitForStableComposer(TIMEOUT);
           await active.sendLiteral(draft);
           await active.waitForText(`┃ ${draft}`, TIMEOUT);
@@ -3880,7 +3886,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Read the prepared file.");
-      await waitForScrollback(active, "CTRL_O_READ_DONE");
+      await active.waitForPane((pane) => pane.includes("CTRL_O_READ_DONE") && turnSettled(pane), TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("READ_RESULT_MARKER", TIMEOUT);
@@ -3943,7 +3949,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared read-only tools.");
-      await waitForScrollback(active, "PARALLEL_DETAIL_DONE");
+      await active.waitForPane((pane) => pane.includes("PARALLEL_DETAIL_DONE") && turnSettled(pane), TIMEOUT);
 
       await active.sendKeys("C-o");
       await active.waitForText("LIST_FULL_DETAIL_MARKER", TIMEOUT);
@@ -4047,7 +4053,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const beforeHandoff = await waitForScrollback(active, priorSummary);
+      await active.waitForPane((pane) => pane.includes(priorSummary) && turnSettled(pane), TIMEOUT);
+      const beforeHandoff = await active.captureFullScrollback();
       expect(beforeHandoff).not.toContain("lines more (ctrl+o to view)");
       expect(countOccurrences(beforeHandoff, priorSummary)).toBe(1);
       const compactOutputRows = beforeHandoff.match(/CTRL_O_FILE_FOLD_\d{4}/g) ?? [];
@@ -4320,7 +4327,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane(
         (pane) =>
           pane.includes("CTRL_O_HANDOFF_SCROLLBACK_DONE") &&
-          !pane.includes("Streaming ("),
+          turnSettled(pane),
         actionTimeout,
       );
       const scrollback = await active.captureFullScrollback();
@@ -4485,6 +4492,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
+      await active.waitForPane((pane) => pane.includes(setupSentinel) && turnSettled(pane), TIMEOUT);
       const setupScrollback = await waitForScrollbackMarkers(active, [
         assistantHead,
         assistantTail,
@@ -5120,6 +5128,7 @@ test.skipIf(!tmuxAvailable())(
         "Read nested/input.txt, write nested/output.txt from that directory, and exercise the failure control.",
       );
       await waitForScrollback(active, finalMarker);
+      await active.waitForPane(turnSettled, TIMEOUT);
       await waitForCondition(
         () => gateway.requests.length === 3,
         "three scoped-tool completion requests",
@@ -5228,7 +5237,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a session for transient input reset.");
-      await active.waitForText("SESSION_INPUT_RESET_SAVED", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("SESSION_INPUT_RESET_SAVED") && turnSettled(pane), TIMEOUT);
 
       await seedTransientDraft("STALE_SESSION_DRAFT_NEW");
       await active.sendText("/new");
@@ -5614,12 +5623,10 @@ async function saveSessionEndingInCompaction(
     await active.waitForComposer(TIMEOUT);
     for (const [index, answer] of shortAnswers.entries()) {
       await active.sendText(`Give short answer ${index + 1}.`);
-      await active.waitForText(answer, TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(answer) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     await active.sendText("Write a long answer before the compaction.");
-    await active.waitForText(tail, TIMEOUT);
-    await active.waitForComposer(TIMEOUT);
+    await active.waitForPane((pane) => pane.includes(tail) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     const sessionId = sessionIdFromHome(home);
     // With no turn after the compaction, a resume shows the cycle before it,
     // and the transcript window holds those entries until the next turn ends.
@@ -5739,8 +5746,7 @@ test.skipIf(!tmuxAvailable())(
       // After the next turn ends, the cycle leaves memory, and the next
       // resize reprints only what came after the compaction.
       await active.sendText("Give a short answer after the resume.");
-      await active.waitForText(reply, TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       await active.resizeWindow(100, 32, 500);
       const after = stripAnsi(
         await active.waitForStableScrollback(
@@ -5952,7 +5958,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save Markdown for resume.");
-      const liveMarkdown = await waitForScrollback(active, "render_ready");
+      await active.waitForPane((pane) => pane.includes("render_ready") && turnSettled(pane), TIMEOUT);
+      const liveMarkdown = await active.captureFullScrollback();
       expectRenderedMarkdown(liveMarkdown, "tmux");
       expectInferredTypeScriptCodeBlock(liveMarkdown);
       expectExpandedCodeProfiles(liveMarkdown);
@@ -6060,7 +6067,8 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run pwd once for resume.");
-      const liveToolScrollback = await waitForScrollback(active, toolReply);
+      await active.waitForPane((pane) => pane.includes(toolReply) && turnSettled(pane), TIMEOUT);
+      const liveToolScrollback = await active.captureFullScrollback();
       expect(liveToolScrollback).toContain("Ran pwd");
       expect(liveToolScrollback).not.toContain(toolWorkspaceMarker);
       expectNoRawToolReplay(liveToolScrollback);
@@ -6198,6 +6206,52 @@ test("update runs the manual upgrade", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 }, UPGRADE_TIMEOUT);
+
+test.skipIf(!tmuxAvailable())(
+  "TTY upgrade prints bold fx version header before output",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-tty-header-")));
+    const argvLogPath = join(root, "upgrade-argv.log");
+    const installedFx = join(root, "fx");
+    const home = join(root, "home");
+    mkdirSync(home);
+    const release = startUpgradeServer(root, argvLogPath);
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let session: TmuxSession | null = null;
+    try {
+      const sq = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
+      const cmd = `${sq(installedFx)} upgrade --channel stable; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
+      session = await TmuxSession.create({
+        isolated: true,
+        cmd: `/bin/sh -c ${sq(cmd)}`,
+        cwd: root,
+        env: {
+          ...envWithoutFxHome(),
+          HOME: home,
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          NO_COLOR: undefined,
+        },
+        width: 96,
+        height: 24,
+        remainOnExit: true,
+      });
+      await session.waitForText("__FX_EXIT_0__", UPGRADE_TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("𝒇x v");
+      expect(scrollback).toContain("upgraded to v9.9.9");
+      expect(scrollback).not.toContain("Run /help for commands");
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(escaped).toMatch(/\x1b\[1m𝒇x\x1b\[0m v/);
+    } finally {
+      if (session) await session.kill();
+      release.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT,
+);
 
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
@@ -6569,8 +6623,7 @@ async function captureCtrlGRelaunch(options: {
     await active.waitForComposer(TIMEOUT);
     if (options.reply !== null) {
       await active.sendText(prompt);
-      await active.waitForText(options.reply.split("\n").at(-1)!, TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(options.reply.split("\n").at(-1)!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
     await active.waitForStableComposer(TIMEOUT, 250);
@@ -6746,7 +6799,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Main's turn ends while its subagent still works.
       await active.sendText("UPGRADE_MAIN start solo");
-      await active.waitForText("MAIN_DONE", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("MAIN_DONE") && turnSettled(pane), TIMEOUT);
       for (const deadline = Date.now() + TIMEOUT; !soloAsked; await Bun.sleep(50)) {
         if (Date.now() > deadline) throw new Error("the subagent never asked the model");
       }
@@ -6757,8 +6810,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Once the subagent is done, the same key upgrades.
       releaseSolo();
-      await active.waitForText("MAIN_SAW_REPORT", TIMEOUT);
-      await active.waitForComposer(TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("MAIN_SAW_REPORT") && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
       await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
@@ -6855,10 +6907,10 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("First turn before the control sequences, team \u{1f469}\u200d\u{1f4bb}.");
-      await active.waitForText("CONTROL_FIRST_TURN_DONE", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("CONTROL_FIRST_TURN_DONE") && turnSettled(pane), TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Reply with control sequences.");
-      await active.waitForText("CONTROL_REPLY_END", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("CONTROL_REPLY_END") && turnSettled(pane), TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await expectReplyShownAsText(active, "live turn");
       await active.sendText("/quit");
@@ -6974,7 +7026,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(questionMarker, TIMEOUT);
       await active.sendLiteralText("1");
       await active.sendKeys("Enter");
-      const live = await waitForScrollback(active, completion);
+      await active.waitForPane((pane) => pane.includes(completion) && turnSettled(pane), TIMEOUT);
+      const live = await active.captureFullScrollback();
       expectCompactQuestion(live);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -7101,6 +7154,10 @@ test.skipIf(!tmuxAvailable())(
       await active.sendLiteralText(
         Array.from({ length: batchSize }, (_, index) => (index % 2 === 0 ? "1" : "2")).join(""),
       );
+      await active.waitForPane(
+        (pane) => pane.includes(completion) && turnSettled(pane),
+        TIMEOUT,
+      );
       expectEveryAnswer(await waitForScrollback(active, completion));
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -7212,7 +7269,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const firstLive = await waitForScrollback(active, firstCompletion);
+      await active.waitForPane((pane) => pane.includes(firstCompletion) && turnSettled(pane), TIMEOUT);
+      const firstLive = await active.captureFullScrollback();
       expect(firstLive).toContain("Wrote first-large.md +120");
       expect(firstLive).not.toContain("RESUMED_FIRST_FILE_LINE_001");
       expect(readFileSync(join(workspace, "first-large.md"), "utf8")).toBe(
@@ -7223,7 +7281,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const live = await waitForScrollback(active, secondCompletion);
+      await active.waitForPane((pane) => pane.includes(secondCompletion) && turnSettled(pane), TIMEOUT);
+      const live = await active.captureFullScrollback();
       expect(live).toContain("Wrote first-large.md +120");
       expect(live).toContain("Wrote second-large.md +60");
       expect(live).not.toContain("RESUMED_SECOND_FILE_LINE_001");
@@ -7351,7 +7410,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Apply this change?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const live = await waitForScrollback(active, completion);
+      await active.waitForPane((pane) => pane.includes(completion) && turnSettled(pane), TIMEOUT);
+      const live = await active.captureFullScrollback();
       expect(live).toContain("Wrote spilled-diff.md +400");
       expect(readFileSync(join(workspace, "spilled-diff.md"), "utf8")).toBe(
         `${spilledLines.join("\n")}\n`,
@@ -8360,6 +8420,7 @@ while :; do sleep 1; done
 
       await active.sendText("Reply with the prepared follow-up marker.");
       await waitForScrollback(active, followUpMarker, timeout);
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(initialGateway.requests).toHaveLength(2);
       const followUpBody = initialGateway.requests[1]!.body;
       expect(followUpBody).toContain("<turn_aborted>");
@@ -8716,6 +8777,207 @@ for (const scenario of cancelledRowCases) {
   );
 }
 
+/// Calls that are no command, cancelled while they wait at their prompt.
+const cancelledCallCases = [
+  {
+    name: "a read",
+    permission: { read: { "notes.md": "ask" } },
+    call: () => fakeGatewayToolCall("cancelled-call-read", "read_file", { path: "notes.md" }),
+    row: "● Cancelled notes.md",
+    full: "notes.md",
+  },
+  {
+    name: "a web fetch",
+    permission: { web_fetch: { "domain:example.com": "ask" } },
+    call: () => fakeGatewayToolCall("cancelled-call-fetch", "web_fetch", { url: "https://example.com/docs" }),
+    // The row names the page and its host; Ctrl+O keeps the URL.
+    row: "● Cancelled docs · example.com",
+    full: "https://example.com/docs",
+  },
+];
+
+for (const scenario of cancelledCallCases) {
+  test.skipIf(!tmuxAvailable())(
+    `${scenario.name} the user cancelled keeps its row after resume, as live`,
+    async () => {
+      const timeout = 60_000;
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-call-resume-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(workspace, "notes.md"), "notes\n");
+      writeFileSync(stderrPath, "");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission: scenario.permission }),
+      );
+      const initialGateway = startFakeGateway([scenario.call()]);
+      const resumedGateway = startFakeGateway([]);
+      let active: TmuxSession | null = null;
+      let passed = false;
+      try {
+        active = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: realpathSync(workspace),
+          env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+          stderrPath,
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.sendText("Make the call.");
+        await active.waitForText("esc cancel", timeout);
+        await active.sendKeys("Escape");
+        const live = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        await waitForCondition(
+          () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+          "the interrupted turn on disk",
+          timeout,
+        );
+        await expectFullTranscriptShows(active, scenario.full, timeout);
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd()).toBe(true);
+        await active.kill();
+        active = null;
+        expect(live).toContain(scenario.row);
+
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume last`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumedGateway),
+          stderrPath,
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        // The row, and the notice under it, read as they did live, with no
+        // second notice of the turn's own.
+        const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+        expect(resumed).toEqual(live);
+        expect(resumed.filter((line) => line.startsWith("▪"))).toHaveLength(1);
+        // Ctrl+O gains the call's line, as it has live.
+        await expectFullTranscriptShows(active, scenario.full, timeout);
+        expect(resumedGateway.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        // The session saves the turn as before: no item of its own.
+        const items = savedItems(home, onlySessionId(home));
+        expect(items.filter((item) => item.cancelled_command || item.cancelled_wait)).toEqual([]);
+        passed = true;
+      } finally {
+        if (active) {
+          if (!passed) {
+            try {
+              writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+            } catch {}
+          }
+          await active.kill();
+        }
+        initialGateway.stop();
+        resumedGateway.stop();
+        if (passed) {
+          rmSync(root, { recursive: true, force: true });
+        } else {
+          console.error(`retained cancelled call resume artifacts at ${root}`);
+        }
+      }
+    },
+    120_000,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a question the user cancelled at its prompt keeps only the turn's notice after resume",
+  async () => {
+    const timeout = 60_000;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancelled-question-resume-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const tracePath = join(root, "trace.log");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none" }));
+    const initialGateway = startFakeGateway([
+      fakeGatewayToolCall("cancelled-question", "ask_user_question", {
+        questions: [{ question: "Which one?", options: [{ label: "A" }, { label: "B" }] }],
+      }),
+    ]);
+    const resumedGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    let passed = false;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: { ...gatewayEnv(home, initialGateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "session,interrupt" },
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Ask me.");
+      await active.waitForText("Which one?", timeout);
+      await active.sendKeys("Escape");
+      await waitForCondition(
+        () => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=interrupt_persisted"),
+        "the interrupted turn on disk",
+        timeout,
+      );
+      // Live, the question shows its prompt and never a row.
+      const live = compactToolRows(await waitForScrollback(active, "▪ Cancelled", timeout));
+      expect(live.filter((line) => !line.startsWith("▪"))).toEqual([]);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath,
+        width: 100,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      // A resume shows no row for it either, only the turn's notice.
+      const resumed = compactToolRows(await waitForScrollback(active, "What can fx do differently?", timeout));
+      expect(resumed).toEqual(["▪ Cancelled · What can fx do differently?"]);
+      // Ctrl+O shows no line of the call's own, and no raw arguments.
+      await active.sendKeys("C-o");
+      const full = stripAnsi(await active.waitForText("esc close · pgup/pgdn scroll", timeout));
+      expect(full).not.toContain("questions:");
+      expect(full).not.toContain("Cancelled  ·");
+      await active.sendKeys("Escape");
+      await active.waitForComposer(timeout);
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (active) {
+        if (!passed) {
+          try {
+            writeFileSync(join(root, "failure-scrollback.txt"), await active.captureFullScrollback());
+          } catch {}
+        }
+        await active.kill();
+      }
+      initialGateway.stop();
+      resumedGateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained cancelled question resume artifacts at ${root}`);
+      }
+    }
+  },
+  120_000,
+);
+
 test.skipIf(!tmuxAvailable())(
   "latest and picker resume preserve conversations beside incomplete session creation",
   async () => {
@@ -8813,8 +9075,7 @@ test.skipIf(!tmuxAvailable())(
         ["Latest visible request", "LATEST_VISIBLE_RESPONSE"],
       ]) {
         await active.sendText(prompt!);
-        await active.waitForText(response!, TIMEOUT);
-        await active.waitForComposer(TIMEOUT);
+        await active.waitForPane((pane) => pane.includes(response!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       const sessionId = sessionIdFromHome(home);
       const historyPath = logOf(home, sessionId);
@@ -8863,7 +9124,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["0f"]);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Continue after the compacted resume.");
-      await active.waitForText("AFTER_COMPACTED_RESUME_OK", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("AFTER_COMPACTED_RESUME_OK") && turnSettled(pane), TIMEOUT);
       const resumed = gateway.requests.at(-1)!.body;
       expect(resumed).toContain("<compacted_conversation>");
       expect(resumed).toContain(JSON.stringify(`User 1:\n${earlierRequest}\n`).slice(1, -1));
@@ -9083,7 +9344,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     await other.waitForText("REMEMBERED_B_HISTORY", TIMEOUT);
     await other.waitForStableComposer(TIMEOUT);
     await active.sendText("Continue the older active conversation without tools.");
-    await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("LATER_A_ACTIVITY") && turnSettled(pane), TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
     await close(other); other = null;

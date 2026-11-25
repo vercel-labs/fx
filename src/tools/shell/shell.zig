@@ -8,6 +8,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
+const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -786,8 +787,13 @@ fn callRun(
     };
     defer prepared.deinit(ctx.allocator);
     const result = try finishPrepared(withoutSteeringYield(ctx, input.yield_time_ms), runtime, &prepared, .run);
-    return attachSnapshotNotice(ctx.allocator, result) catch |err| {
+    const noticed = attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
+        return err;
+    };
+    if (!mcpCallNoticeDue(prepared.snapshot.state, commandCalledBridge(bridge_registration))) return noticed;
+    return attachResultField(ctx.allocator, noticed, "mcp_call_notice", mcp_call_notice) catch |err| {
+        noticed.deinit(ctx.allocator);
         return err;
     };
 }
@@ -798,20 +804,49 @@ fn attachSnapshotNotice(
     alloc: Allocator,
     result: tool_dispatch.ToolResult,
 ) Allocator.Error!tool_dispatch.ToolResult {
-    const body = switch (result) {
-        .success, .failure => |value| value,
-        .rich => return result,
-    };
-    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    if (!resultTakesField(result)) return result;
     const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
     defer alloc.free(notice);
-    const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
+    return attachResultField(alloc, result, "notice", notice);
+}
+
+/// Whether a result is a JSON object body that `attachResultField` can extend.
+fn resultTakesField(result: tool_dispatch.ToolResult) bool {
+    const body = switch (result) {
+        .success, .failure => |bytes| bytes,
+        .rich => return false,
+    };
+    return body.len > 0 and body[body.len - 1] == '}';
+}
+
+/// Adds the string field `name` to a JSON result and frees the old body only when it adds the field.
+fn attachResultField(
+    alloc: Allocator,
+    result: tool_dispatch.ToolResult,
+    comptime name: []const u8,
+    value: []const u8,
+) Allocator.Error!tool_dispatch.ToolResult {
+    const body = switch (result) {
+        .success, .failure => |bytes| bytes,
+        .rich => return result,
+    };
+    const updated = (try withJsonStringField(alloc, body, name, value)) orelse return result;
     alloc.free(body);
     return switch (result) {
         .success => .{ .success = updated },
         .failure => .{ .failure = updated },
         .rich => unreachable,
     };
+}
+
+fn commandCalledBridge(registration: ?*mcp_call_bridge.Registration) bool {
+    if (comptime !mcp_call_bridge.supported) return false;
+    const live = registration orelse return false;
+    return mcp_call_bridge.commandCalled(live);
+}
+
+fn mcpCallNoticeDue(state: managed_execution.SnapshotState, command_called: bool) bool {
+    return state == .running and command_called;
 }
 
 /// Returns a copy of the JSON object `body` with the string field `name`,
@@ -835,6 +870,9 @@ fn withJsonStringField(
 
 const steering_notice = "New steering arrived, so this call returned while the command keeps running. " ++
     "Read the steering first. The session stays yours: use interact with this session_id to follow it, or stop to end it.";
+
+const mcp_call_notice = "This command used fx mcp call, and this call returned while it still runs, so its later fx mcp call commands exit 3. If it still needs them, stop it. " ++
+    mcp_call_capability.short_checks_advice;
 
 fn steerYieldRequested(ctx: tool_dispatch.DispatchContext) bool {
     const flag = ctx.tool_yield_flag orelse return false;
@@ -2614,9 +2652,11 @@ fn hasUsageBannerOutput(output: []const u8) bool {
 /// model can still use, and otherwise only when they are not the default
 /// `captured` and `process`, such as a command that ran on a terminal.
 /// `output_terminal_safe` marks output whose unsafe bytes were written as
-/// escapes (`escaped`). A running captured command also says how long it has
-/// run (`running_ms`) and printed nothing (`quiet_ms`), and once that quiet
-/// time reaches the limit, `quiet_notice` asks the model to check it
+/// escapes (`escaped`). `full_output_handle` comes only when `output_delta`
+/// is not the exact output: cut off, incomplete, or escaped. A running
+/// captured command also says how long it has run (`running_ms`) and printed
+/// nothing (`quiet_ms`), and once that quiet time reaches the limit,
+/// `quiet_notice` asks the model to check it
 /// (`src/core/execution/quiet_notice.zig`).
 fn formatSnapshotRaw(
     alloc: Allocator,
@@ -2659,6 +2699,7 @@ fn formatSnapshotRaw(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const retained = snapshot.retained;
+    const output_exact = !(output_truncated or snapshot.output_incomplete or escaped);
     try std.json.Stringify.value(.{
         .session_id = if (retained) snapshot.execution_id else null,
         .state = snapshotStateName(snapshot.state),
@@ -2667,7 +2708,7 @@ fn formatSnapshotRaw(
         .output_truncated = presentFlag(output_truncated),
         .output_incomplete = presentFlag(snapshot.output_incomplete),
         .output_terminal_safe = presentFlag(escaped),
-        .full_output_handle = snapshot.output_file,
+        .full_output_handle = if (output_exact) null else snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
         .termination_indeterminate = presentFlag(projection.termination_indeterminate),
@@ -3348,6 +3389,36 @@ test "a command returned for steering tells the model it still runs" {
     try std.testing.expect(steerYieldRequested(.{ .allocator = alloc, .tool_yield_flag = &flag }));
 }
 
+test "a run result tells the model a running command's fx mcp calls stop" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-2\"}");
+    const updated = try attachResultField(alloc, .{ .success = body }, "mcp_call_notice", mcp_call_notice);
+    defer updated.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.success, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("shell-2", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings(mcp_call_notice, parsed.value.object.get("mcp_call_notice").?.string);
+}
+
+test "only a running command that used fx mcp call gets the notice" {
+    const State = managed_execution.SnapshotState;
+    try std.testing.expect(mcpCallNoticeDue(.running, true));
+    try std.testing.expect(!mcpCallNoticeDue(.running, false));
+    var others: usize = 0;
+    for (std.enums.values(std.meta.Tag(State))) |tag| {
+        const state: State = switch (tag) {
+            .running => .running,
+            .completed => .{ .completed = .finished },
+            .stopped => .{ .stopped = null },
+            .lost => .lost,
+        };
+        if (tag == .running) continue;
+        others += 1;
+        try std.testing.expect(!mcpCallNoticeDue(state, true));
+    }
+    try std.testing.expect(others > 0);
+}
+
 test "shell interaction wait bounds empty observations without delaying writes" {
     const cases = [_]struct {
         has_input: bool,
@@ -3984,6 +4055,102 @@ test "shell snapshot keeps a hostile output tail within the result limit" {
     try std.testing.expect(std.mem.find(u8, output_value.string, "bytes omitted") != null);
     try std.testing.expect(std.mem.find(u8, output_value.string, "CONTROL_TAIL") != null);
     try std.testing.expect(parsed.value.object.get("output_truncated").?.bool);
+}
+
+const test_replay_handle = "fx-command-replay-test.bin";
+
+fn testReplaySnapshot(
+    state: managed_execution.SnapshotState,
+    output: []const u8,
+    output_truncated: bool,
+    output_incomplete: bool,
+    output_file: ?[]const u8,
+) managed_execution.Snapshot {
+    return .{
+        .execution_id = @constCast("shell-replay"),
+        .command = @constCast("replay-fixture"),
+        .cwd = @constCast("/tmp"),
+        .retained = state == .running,
+        .state = state,
+        .output_delta = @constCast(output),
+        .output_truncated = output_truncated,
+        .output_incomplete = output_incomplete,
+        .output_file = if (output_file) |handle| @constCast(handle) else null,
+    };
+}
+
+fn expectReplayHandle(snapshot: managed_execution.Snapshot, expected: ?[]const u8) !void {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, snapshot, null);
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const handle = parsed.value.object.get("full_output_handle");
+    if (expected) |value| {
+        try std.testing.expectEqualStrings(value, handle.?.string);
+    } else {
+        try std.testing.expect(handle == null);
+    }
+}
+
+test "a complete printable shell result leaves out its replay handle" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, testReplaySnapshot(
+        .{ .completed = .{ .exit_code = 0 } },
+        "hi\n\x1b[1mbold\x1b[0m\n",
+        false,
+        false,
+        test_replay_handle,
+    ), null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"exit_code\":0,\"output_delta\":\"hi\\n\\u001b[1mbold\\u001b[0m\\n\"}",
+        body,
+    );
+}
+
+test "a shell result without exact output, or without a saved copy, says so through its handle" {
+    const completed: managed_execution.SnapshotState = .{ .completed = .{ .exit_code = 0 } };
+    // Nothing printed, or nothing saved: there is nothing to read back.
+    try expectReplayHandle(testReplaySnapshot(completed, "", false, false, null), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "ok\n", false, false, null), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "\xff\n", false, false, null), null);
+    // Capture dropped bytes, or the output is partial: the handle reads the rest.
+    try expectReplayHandle(testReplaySnapshot(completed, "tail\n", true, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "partial", false, true, test_replay_handle), test_replay_handle);
+    // NUL and invalid UTF-8 are written as escapes, so the text is not the bytes.
+    try expectReplayHandle(testReplaySnapshot(completed, "a\x00b\n", false, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "a\xffb\n", false, false, test_replay_handle), test_replay_handle);
+}
+
+test "each observation of a running command carries a handle only when its own delta is not exact" {
+    const running: managed_execution.SnapshotState = .running;
+    const completed: managed_execution.SnapshotState = .{ .completed = .{ .exit_code = 0 } };
+    try expectReplayHandle(testReplaySnapshot(running, "first\n", false, false, test_replay_handle), null);
+    try expectReplayHandle(testReplaySnapshot(completed, "second\n", false, false, test_replay_handle), null);
+    try expectReplayHandle(testReplaySnapshot(running, "first\xff\n", false, false, test_replay_handle), test_replay_handle);
+    try expectReplayHandle(testReplaySnapshot(completed, "second\n", true, false, test_replay_handle), test_replay_handle);
+}
+
+test "a shell result clipped only by the result limit keeps its handle" {
+    const alloc = std.testing.allocator;
+    const output = "HEAD\n" ++ text_utils.repeat("y", 4 * 1024) ++ "\nTAIL";
+    const snapshot = testReplaySnapshot(
+        .{ .completed = .{ .exit_code = 0 } },
+        output,
+        false,
+        false,
+        test_replay_handle,
+    );
+    const body = try formatSnapshotWithLimit(alloc, snapshot, null, 1024);
+    defer alloc.free(body);
+    try std.testing.expect(body.len <= 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expect(object.get("output_truncated").?.bool);
+    try std.testing.expectEqualStrings(test_replay_handle, object.get("full_output_handle").?.string);
+    try std.testing.expect(std.mem.find(u8, object.get("output_delta").?.string, "use full_output_handle") != null);
 }
 
 test "running shell snapshot leaves continuation intent to the caller" {

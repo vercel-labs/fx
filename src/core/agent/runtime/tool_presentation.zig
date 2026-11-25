@@ -777,6 +777,9 @@ pub const ToolPresentationGroupObservation = struct {
     has_visible_text: bool,
     saw_tool_start: bool,
     saw_visible_text_after_tool_start: bool,
+    /// The step called `ask_user_question`. Its answered question draws
+    /// below the open group, so calls after the answer start a new group.
+    asked_question: bool,
 };
 
 pub const ToolPresentationGroupTransition = struct {
@@ -817,7 +820,8 @@ pub fn transitionPresentationGroup(
     if (observation.has_visible_tool_calls) {
         next_active_group_id = resolved_tool_group_id;
     }
-    if (observation.saw_visible_text_after_tool_start or
+    if (observation.asked_question or
+        observation.saw_visible_text_after_tool_start or
         (observation.has_visible_text and !observation.has_visible_tool_calls))
     {
         next_active_group_id = null;
@@ -1856,7 +1860,15 @@ fn failureStatusDetail(
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
         if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
-    if (safe_result.len == 0 or !mcp_call) return null;
+    if (!mcp_call) return null;
+    return mcpFailureCause(arena, safe_result);
+}
+
+/// Why an MCP call failed, from the result the model got, for its status
+/// line: terminal-safe, and null when the result says nothing. A resume
+/// writes a saved call's line with it too, so the line reads as it did live.
+pub fn mcpFailureCause(arena: Allocator, safe_result: []const u8) !?[]const u8 {
+    if (safe_result.len == 0) return null;
     // A result over the cap is stored, and the model's copy is the head of the text in a preview block.
     // The cause comes from that head, as it does in the trace.
     const model_text = result_store.storedPreview(safe_result) orelse safe_result;
@@ -2332,6 +2344,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = false,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     const inherited = presentationGroupForStep(first_transition.active_group_id, 7, 12);
@@ -2347,6 +2360,7 @@ test "presentation grouping spans silent tool steps and splits on visible prose"
             .has_visible_text = true,
             .saw_tool_start = false,
             .saw_visible_text_after_tool_start = false,
+            .asked_question = false,
         },
     );
     try std.testing.expectEqual(
@@ -2374,10 +2388,54 @@ test "visible prose after streamed tools closes the group for the next step" {
             .has_visible_text = true,
             .saw_tool_start = true,
             .saw_visible_text_after_tool_start = true,
+            .asked_question = false,
         },
     );
 
     try std.testing.expectEqual(current, transition.tool_group_id.?);
+    try std.testing.expect(transition.active_group_id == null);
+}
+
+test "a step that only asks a question closes the group for the calls after the answer" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const asked = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = false,
+            .has_visible_text = false,
+            .saw_tool_start = true,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expect(asked.active_group_id == null);
+
+    const after_answer = presentationGroupForStep(asked.active_group_id, 7, 13);
+    try std.testing.expectEqual(
+        types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 13 },
+        after_answer,
+    );
+}
+
+test "calls in the step that asks keep the open group, and the group closes after it" {
+    const open = types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 11 };
+    const transition = transitionPresentationGroup(
+        open,
+        open,
+        7,
+        12,
+        .{
+            .has_visible_tool_calls = true,
+            .has_visible_text = false,
+            .saw_tool_start = false,
+            .saw_visible_text_after_tool_start = false,
+            .asked_question = true,
+        },
+    );
+    try std.testing.expectEqual(open, transition.tool_group_id.?);
     try std.testing.expect(transition.active_group_id == null);
 }
 

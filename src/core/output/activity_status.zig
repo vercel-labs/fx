@@ -58,6 +58,7 @@ pub fn compactionDoneNotice(buf: []u8, op: compaction_activity.Operation) ?[]con
 }
 
 fn compactionFeedbackLabel(feedback: compaction_activity.Feedback) []const u8 {
+    if (feedback.scheduled) return "Context will be compacted before your next message.";
     if (feedback.publication == .uncertain)
         return "Compaction could not confirm saved context. Reopen the session before retrying.";
     if (feedback.publication == .committed)
@@ -150,6 +151,12 @@ fn turnMarks(stream: StreamState) turn_clock.Marks {
     return .{ .started_ms = stream.turn_started_ms, .waiting_since_ms = stream.waiting_since_ms };
 }
 
+/// Whole seconds the turn clock of `stream` shows at `now_ms`, or null when
+/// no turn is timed (`turn_clock.seconds`).
+pub fn turnSeconds(stream: StreamState, now_ms: i64) ?i64 {
+    return turn_clock.seconds(turnMarks(stream), now_ms);
+}
+
 /// Marker visibility locked to the elapsed counter's clock: on for the first
 /// half of every elapsed second, so the marker relights exactly when the
 /// seconds digit advances. Steady on while waiting on user input (a frozen
@@ -163,7 +170,7 @@ pub fn activityBlinkVisible(stream: StreamState, now_ms: i64) ?bool {
 }
 
 fn appendTurnElapsedSuffix(writer: *std.Io.Writer, stream: StreamState, now_ms: i64) !void {
-    const seconds = turn_clock.seconds(turnMarks(stream), now_ms) orelse return;
+    const seconds = turnSeconds(stream, now_ms) orelse return;
     try writer.writeAll(" (");
     try writeElapsed(writer, seconds);
     try writer.writeByte(')');

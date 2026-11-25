@@ -7,6 +7,8 @@ const Allocator = std.mem.Allocator;
 
 pub const ConfigurationIssue = struct {
     message: []u8,
+    /// The entry is in `~/.fx/mcp.json`, not the project's `.mcp.json`.
+    profile: bool = false,
 
     pub fn deinit(self: *ConfigurationIssue, alloc: Allocator) void {
         alloc.free(self.message);

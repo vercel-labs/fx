@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
-import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER, turnSettled } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
 import { rotateFxLogin, startFakeIssuer, storedFxLoginToken, writeFxLogin } from "./fx-login-fakes";
@@ -35,6 +35,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  tokenPassCatalog,
 } from "./tmux-helpers";
 
 const HAS_TMUX = tmuxAvailable();
@@ -1471,7 +1472,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.sendKeys("Escape");
       await session.sendKeys("C-u");
       await session.sendText("Use the remaining provider.");
-      await session.waitForText("LOGOUT_GATEWAY_RESPONSE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("LOGOUT_GATEWAY_RESPONSE") && turnSettled(pane), TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForSessionEnd(TIMEOUT);
@@ -2079,7 +2080,7 @@ tmuxTest(
   60_000,
 );
 
-for (const command of ["/provider", "/login", "/setup"]) {
+for (const command of ["/provider", "/login"]) {
   tmuxTest(`provider picker retains type-ahead after ${command} Enter`, async () => {
     home = mkdtempSync(join(tmpdir(), "fx-provider-typeahead-"));
     stderrPath = join(home, "stderr.log");
@@ -2132,7 +2133,6 @@ tmuxTest("provider picker consumes selection keys while inventory is pending", a
 
 for (const scenario of [
   { name: "bare provider", command: "/provider" },
-  { name: "setup alias", command: "/setup" },
   { name: "login alias", command: "/login" },
   { name: "typed provider query", command: "/provider " },
 ]) {
@@ -3046,7 +3046,12 @@ tmuxTest(
         headers: { "content-type": "application/json" },
       }),
       fakeGatewayFinalText("SIGNED_IN_RECOVERY_RESPONSE"),
-    ]);
+    ], {
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
     // The refresh token is rejected, so only a new sign-in can help.
     oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
       rejectRefreshGrant: true,
@@ -5097,7 +5102,7 @@ tmuxTest(
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "fx login");
     expect(JSON.parse(readFileSync(authPath, "utf8")).team_slug).toBe("vercel-labs");
     await session.sendText("use the remembered credential after restart");
-    await session.waitForText(RESTART_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(RESTART_RESPONSE) && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
@@ -6416,6 +6421,13 @@ test("Grok logout keeps a sign-out xAI refuses and finishes it at the next logou
     expect(second.stderr).toBe("");
     const revoked = working.requests.filter((request) => request.path === "/oauth2/revoke");
     expect(revoked.map((request) => new URLSearchParams(request.body ?? "").get("token"))).toEqual(["grok-refresh"]);
+    const grokRevokeForms = [...refusing.requests, ...working.requests]
+      .filter((request) => request.path === "/oauth2/revoke")
+      .map((request) => Object.fromEntries(new URLSearchParams(request.body ?? "")));
+    expect(grokRevokeForms).toEqual([
+      { token: "grok-refresh", client_id: "b1a00492-073a-47ea-816f-4c329264a828" },
+      { token: "grok-refresh", client_id: "b1a00492-073a-47ea-816f-4c329264a828" },
+    ]);
     expect(existsSync(pendingPath)).toBe(false);
   } finally {
     refusing.stop();
@@ -6919,7 +6931,7 @@ tmuxTest(
       writeSeededGrokLogin(home, grok.initialAccessToken);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", statusLine: { context: true } }) + "\n",
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", status_line: { context: true } }) + "\n",
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -7023,7 +7035,7 @@ tmuxTest(
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
-      await session.waitForText("GROK_LIMIT_RECOVERED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("GROK_LIMIT_RECOVERED") && turnSettled(pane), TIMEOUT);
       await session.sendText("Accept one more prompt after recovery.");
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
@@ -7839,7 +7851,7 @@ test("provider context accounting is independent of image encoding size", async 
   }
 }, 60_000);
 
-test("direct provider tool identities obey the session boundary before execution", async () => {
+test("a direct provider tool id past the session limit runs under an fx id", async () => {
   for (const provider of ["codex", "grok"] as const) {
     for (const bytes of [256, 257]) {
       const profile = mkdtempSync(join(tmpdir(), `fx-${provider}-identity-`));
@@ -7864,23 +7876,22 @@ test("direct provider tool identities obey the session boundary before execution
           FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
         };
         const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
-        const accepted = bytes === 256;
-        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(accepted ? 0 : 1);
+        // An id fx can store stays the call's id; a longer one gets an fx id.
+        const kept = bytes === 256 ? options.toolCallId : "fx_call_1";
+        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(0);
         expect(result.signal).toBeNull();
-        expect(existsSync(join(profile, "result.txt"))).toBe(accepted);
-        expect(direct.bodies).toHaveLength(accepted ? 2 : 1);
+        expect(existsSync(join(profile, "result.txt"))).toBe(true);
+        expect(direct.bodies).toHaveLength(2);
+        expect(direct.bodies[1]).toContain(`"call_id":"${kept}"`);
+        if (bytes === 257) expect(direct.bodies[1]).not.toContain(options.toolCallId);
         expect(testGateway.requests).toHaveLength(0);
         const json = JSON.parse(result.stdout);
-        expect(json.tool_calls).toEqual(accepted ? [{ name: "write_file", status: "success" }] : []);
-        if (!accepted) expect(json.error).toBe("MalformedAuthoritativeToolIdentity");
+        expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
         const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
         expect(history).toHaveLength(1);
-        if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
-        // A refused identity fails the turn before anything runs: it is kept
-        // as interrupted (D1), holding only the prompt.
-        else expect(history[0]).toMatchObject({ kind: "interrupted", tool_call: null, completed_tool_names: [] });
+        expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(kept);
       } finally {
         direct.stop(); testGateway.stop();
         rmSync(profile, { recursive: true, force: true });
@@ -7956,7 +7967,7 @@ tmuxTest(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Read enough lines to complete the capacity loop.");
-      await session.waitForText("CODEX_CAPACITY_65_OK", 120_000);
+      await session.waitForPane((pane) => pane.includes("CODEX_CAPACITY_65_OK") && turnSettled(pane), 120_000);
       expect(codex.bodies).toHaveLength(65);
 
       await session.sendText("Confirm the same process remains usable.");
@@ -8547,7 +8558,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await selectFxLoginCredential(session);
     await session.sendText("prove fx login is active before logout");
-    await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(LOGIN_RESPONSE) && turnSettled(pane), TIMEOUT);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/logout");
@@ -8818,7 +8829,7 @@ tmuxTest(
     await session.waitForText("Signed out of fx.", TIMEOUT);
     await readStatusPanel(session, TIMEOUT, (panel) => panelAuth(panel) === "missing");
 
-    await session.sendText("/setup");
+    await session.sendText("/provider");
     const picker = await session.waitForPane(
       (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
       TIMEOUT,
@@ -8908,9 +8919,9 @@ tmuxTest(
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_FIRST.");
-    await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_SECOND.");
-    await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
@@ -8945,7 +8956,7 @@ tmuxTest(
     expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
-    await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("COMPACT_AUTH_CONTINUED") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(5);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
@@ -8978,9 +8989,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     }, home);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_FIRST.");
-    await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_FIRST_REPLY") && turnSettled(pane), TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
-    await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_SECOND_REPLY") && turnSettled(pane), TIMEOUT);
     const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
     const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");
@@ -9009,7 +9020,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     await selectEnvKeyCredential(session);
     expect(gateway.requests).toHaveLength(2);
     await session.sendText("Continue the original conversation without tools.");
-    await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("AUTH_BOUNDARY_RECOVERED") && turnSettled(pane), TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
     expect(readFileSync(historyPath, "utf8")).not.toContain('"kind":"compacted"');
@@ -9385,7 +9396,7 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("refresh login and answer");
-    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    await session.waitForPane((pane) => pane.includes(REFRESH_RECOVERY_RESPONSE) && turnSettled(pane), TIMEOUT);
     await waitForModelRequestCount(gateway, 2);
     expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
       "GET /.well-known/openid-configuration",
@@ -10490,7 +10501,7 @@ for (const outcome of ["cancel", "failure"] as const) {
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
       await session.sendText("Use the validated team.");
-      await session.waitForText("TEAM_PREPARATION_OK", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("TEAM_PREPARATION_OK") && turnSettled(pane), TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -10816,3 +10827,254 @@ tmuxTest(
   },
   60_000,
 );
+
+tmuxTest(
+  "picking a Vercel team with Token Pass confirms active credit instead of asking to buy it",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-active-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: (request) => {
+        const teamId = new URL(request.url).searchParams.get("teamId");
+        return tokenPassCatalog(teamId === "team_tp");
+      },
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        if (url.searchParams.get("teamId") === "team_tp") {
+          return Response.json({
+            balance: "12.50",
+            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+          });
+        }
+        return Response.json({ balance: "12.50", token_pass: null });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("tp-team", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Vercel Token Pass is active ($79.93 remaining).");
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team with catalog Token Pass marks confirms active when credits fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-marks-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("tp-team", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Vercel Token Pass is active.");
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team omits the buy offer when credits fails and catalog has no marks",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-unknown-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(false),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({ error: { message: "unavailable" } }, { status: 500 });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_a", slug: "team-a", name: "Team A" },
+        { id: "team_b", slug: "team-b", name: "Team B" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_a");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("team-b", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team B (team-b).", TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain("Get $150 of tokens");
+    expect(scrollback).not.toContain("Vercel Token Pass is active");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "switching from Codex to a Vercel Token Pass team confirms active credit instead of asking to buy it",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-to-token-pass-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return Response.json({
+          balance: "12.50",
+          token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+        });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [{ id: "team_tp", slug: "tp-team", name: "Token Pass Team" }],
+    });
+    const chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_tp");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: FAKE_GATEWAY_MODEL } }),
+    );
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        ...chatgptOauth.env,
+        AI_GATEWAY_API_KEY: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
+        FX_MODEL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/login");
+      await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("tp-team", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Vercel Token Pass is active ($79.93 remaining).");
+      expect(scrollback).not.toContain("Get $150 of tokens");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      chatgptOauth.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "picking a Vercel team with a stalled credits endpoint does not hang and confirms active from catalog marks",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-team-token-pass-slow-credits-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let releaseCredits = () => {};
+    gateway = startFakeGateway([], {
+      models: () => tokenPassCatalog(true),
+      usage: (url) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        return new Promise<Response>((resolve) => {
+          releaseCredits = () =>
+            resolve(Response.json({
+              balance: "12.50",
+              token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            }));
+        });
+      },
+    });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_plain", slug: "plain-team", name: "Plain Team" },
+        { id: "team_tp", slug: "tp-team", name: "Token Pass Team" },
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_plain");
+
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        AI_GATEWAY_API_KEY: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/login");
+      await session.waitForPane((pane) => pane.includes("vercel") && pane.includes("codex"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("tp-team", TIMEOUT);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Changed Vercel team to Token Pass Team (tp-team).", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Vercel Token Pass is active.");
+      expect(scrollback).not.toContain("Get $150 of tokens");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      releaseCredits();
+    }
+  },
+  60_000,
+);
+

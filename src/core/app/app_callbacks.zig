@@ -315,6 +315,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering_boundary = if (comptime @hasDecl(@TypeOf(agent.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
+                .wait_for_handoff_mail = if (comptime @hasField(App, "child_handoffs") and @hasDecl(@TypeOf(agent.worker), "waitForJoinedMail")) agentWaitForHandoffMail else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -509,6 +510,7 @@ pub fn Bindings(comptime App: type) type {
                 .table = agentPushTable,
                 .code_block = agentPushCodeBlock,
                 .thematic_rule = agentPushThematicRule,
+                .assistant_tail = agentPushAssistantTail,
             };
         }
 
@@ -522,6 +524,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_table = workerBridgeAppendTable,
                 .append_code_block = workerBridgeAppendCodeBlock,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
+                .append_assistant_tail = workerBridgeAppendAssistantTail,
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .hold_model_call = workerBridgeHoldModelCall,
                 .open_model_picker = workerBridgeOpenModelPicker,
@@ -874,6 +877,31 @@ pub fn Bindings(comptime App: type) type {
                 .turn_id = turn_id,
                 .outcome = outcome,
             });
+        }
+
+        /// While the hand-off holds a report or message for this agent, waits on
+        /// the worker's condition until the main loop has given it to the
+        /// worker, at most `bound_ms` in all. Holds no lock between the peek
+        /// and the wait.
+        fn agentWaitForHandoffMail(ctx: *anyopaque, turn_id: u64, bound_ms: i64) agent_runtime.AgentRuntimeDeps.HandoffMailWait {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            const io = io_mod.getIo();
+            const until: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(bound_ms) });
+            var waited = false;
+            while (app_agents_runtime.Runtime(App).handoffMailWaiting(app, agent)) {
+                if (!std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, until)) return .timed_out;
+                waited = true;
+                switch (agent.worker.waitForJoinedMail(turn_id, .{ .deadline = until })) {
+                    .joined => return .joined,
+                    .behind => return .delivered,
+                    .closed => return .closed,
+                    .interrupted => return .interrupted,
+                    .timed_out => return .timed_out,
+                    .woken => {},
+                }
+            }
+            return if (waited) .delivered else .none;
         }
 
         fn agentTakeSteeringBoundary(
@@ -1378,6 +1406,13 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushThematicRule(app, agent);
         }
 
+        fn agentPushAssistantTail(ctx: *anyopaque, alloc: std.mem.Allocator, events: []assistant_presentation.Event) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            try app_worker_runtime.Runtime(App).pushAssistantTail(app, agent, events);
+            assistant_presentation.freeEventSlice(alloc, events);
+        }
+
         fn agentPushToolLifecycle(
             ctx: *anyopaque,
             event: types.ToolLifecycleEvent,
@@ -1571,12 +1606,14 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendText(ctx: *anyopaque, text: []const u8) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            app.pacer.dropTail();
             try app.pacer.enqueue(app.alloc, text);
         }
 
         fn workerBridgeAppendTable(ctx: *anyopaque, table: assistant_presentation.TablePayload) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            app.pacer.dropTail();
             var owned = table;
             var handed_off = false;
             errdefer if (!handed_off) owned.deinit(app.alloc);
@@ -1592,6 +1629,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendCodeBlock(ctx: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            app.pacer.dropTail();
             var owned = block;
             var handed_off = false;
             errdefer if (!handed_off) owned.deinit(app.alloc);
@@ -1607,9 +1645,18 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeAppendThematicRule(ctx: *anyopaque) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            app.pacer.dropTail();
             if (comptime @hasDecl(App, "appendAssistantThematicRule")) {
                 try app.appendAssistantThematicRule();
             }
+        }
+
+        /// The tail goes to the screen's transcript; its id is the pacer's tail.
+        fn workerBridgeAppendAssistantTail(ctx: *anyopaque, events: []assistant_presentation.Event) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            const id = app.shell.stageAssistantTail(std.heap.c_allocator, events);
+            app.pacer.setTail(id);
         }
 
         fn workerBridgeDrainAssistantText(ctx: *anyopaque) !app_worker_runtime.AssistantTextDrainResult {
@@ -1779,7 +1826,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule, .attempt_start, .attempt_restart => {},
+                    .text, .thematic_rule, .attempt_start, .attempt_restart, .assistant_tail => {},
                 },
                 else => {},
             }
@@ -1862,6 +1909,7 @@ const FakePacer = struct {
     defer_history: bool = false,
     enqueue_count: usize = 0,
     flush_count: usize = 0,
+    tail_id: ?u64 = null,
 
     fn deinit(self: *FakePacer, alloc: std.mem.Allocator) void {
         self.text.deinit(alloc);
@@ -1870,6 +1918,14 @@ const FakePacer = struct {
     fn enqueue(self: *FakePacer, alloc: std.mem.Allocator, text: []const u8) !void {
         self.enqueue_count += 1;
         try self.text.appendSlice(alloc, text);
+    }
+
+    fn dropTail(self: *FakePacer) void {
+        self.tail_id = null;
+    }
+
+    fn setTail(self: *FakePacer, id: u64) void {
+        self.tail_id = id;
     }
 
     pub fn deferFinish(self: *FakePacer, alloc: std.mem.Allocator, finished: types.FinishedPrompt) !bool {
@@ -1897,6 +1953,11 @@ const FakeShell = struct {
     render_requests: render_request.RenderRequestState = .{},
     lifecycle: transcript_runtime.TranscriptRuntime = .{},
     preserved_anchor_apply_count: usize = 0,
+
+    fn stageAssistantTail(_: *FakeShell, alloc: std.mem.Allocator, events: []assistant_presentation.Event) u64 {
+        assistant_presentation.freeEventSlice(alloc, events);
+        return 0;
+    }
 
     pub fn replaceableEntryId(self: *FakeShell) ?u32 {
         _ = self;

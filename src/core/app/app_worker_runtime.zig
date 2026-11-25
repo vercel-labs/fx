@@ -65,6 +65,9 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardAssistantTail(_: *anyopaque, events: []assistant_presentation.Event) !void {
+    assistant_presentation.freeEventSlice(std.heap.c_allocator, events);
+}
 fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 fn holdNoModelCall(_: *anyopaque, _: types.ModelCallRecord) !bool {
@@ -86,6 +89,7 @@ pub const WorkerEventHandlers = struct {
     append_table: *const fn (*anyopaque, assistant_presentation.TablePayload) anyerror!void = discardTable,
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
+    append_assistant_tail: *const fn (*anyopaque, []assistant_presentation.Event) anyerror!void = discardAssistantTail,
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     /// Holds a call's Ctrl+O line until the paced text before it is shown;
     /// false when nothing is pending and the line is written now.
@@ -533,12 +537,12 @@ pub fn Runtime(comptime App: type) type {
 
         /// Shows the finished turn that the pacer of `agent`, the agent in
         /// context, keeps behind an open prompt, and commits it, when the
-        /// worker holds mail for that commit. The loop does not tick a pacer
-        /// under a prompt, so the commit waits for the prompt to close; and
-        /// the mail's turn, whose start flushes the pacer
+        /// worker holds mail or a typed prompt for that commit. The loop does
+        /// not tick a pacer under a prompt, so the commit waits for the prompt
+        /// to close; and the held prompt's turn, whose start flushes the pacer
         /// (`workerBridgeDrainAssistantText`), waits for the commit. Without
-        /// this the worker's time limit is all that ends the hold, and the
-        /// mail's turn then starts before the commit and cuts the finished
+        /// this the worker's time limit is all that ends the hold, and the held
+        /// prompt's turn then starts before the commit and cuts the finished
         /// turn off in the session. It runs on the loop's thread, which owns
         /// the pacer. A flush that fails is logged and not tried again until
         /// the hold is over: the finished turn stays in the pacer, and the
@@ -727,6 +731,10 @@ pub fn Runtime(comptime App: type) type {
             try pushEvent(app, agent, .{ .assistant_presentation = .thematic_rule });
         }
 
+        pub fn pushAssistantTail(app: *App, agent: *AppAgent, events: []assistant_presentation.Event) !void {
+            try pushEvent(app, agent, .{ .assistant_presentation = .{ .assistant_tail = events } });
+        }
+
         pub fn pushCommandOutput(
             app: *App,
             agent: *AppAgent,
@@ -759,7 +767,28 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             event: types.ToolLifecycleEvent,
         ) !void {
-            try pushEvent(app, agent, .{ .tool_lifecycle = event });
+            var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer scratch.deinit();
+            try pushEvent(app, agent, .{ .tool_lifecycle = try withMcpToolName(app, agent, scratch.allocator(), event) });
+        }
+
+        /// `event`, with the MCP tool a starting call runs
+        /// (`app_session_runtime.Runtime.liveMcpToolName`); any other event
+        /// as it is. The name lives in `arena`.
+        fn withMcpToolName(app: *App, agent: *AppAgent, arena: std.mem.Allocator, event: types.ToolLifecycleEvent) !types.ToolLifecycleEvent {
+            if (comptime !@hasField(App, "main_agent")) return event;
+            const Session = app_session_runtime.Runtime(App);
+            var named = event;
+            switch (named) {
+                .provisional => |*started| if (started.mcp_tool == null) if (started.tool_name) |name| {
+                    started.mcp_tool = try Session.liveMcpToolName(app, agent, arena, name, started.arguments_json);
+                },
+                .authoritative_started => |*started| if (started.mcp_tool == null) {
+                    started.mcp_tool = try Session.liveMcpToolName(app, agent, arena, started.tool_name, started.arguments_json);
+                },
+                else => {},
+            }
+            return named;
         }
 
         pub fn pushWebSearchProgress(app: *App, agent: *AppAgent, call_id: []const u8, progress: types.WebSearchProgress) !void {
@@ -1333,6 +1362,12 @@ pub fn Runtime(comptime App: type) type {
                             .thematic_rule => {
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
+                            },
+                            .assistant_tail => |events| {
+                                if (!isSubagent(app, agent)) {
+                                    drain_owns_current = false;
+                                    try handlers.append_assistant_tail(handlers.ctx, events);
+                                }
                             },
                             .attempt_start => {
                                 // Earlier text has shown, so the transcript
@@ -6230,7 +6265,7 @@ test "the loop flushes the pacer behind a prompt for held mail, and the commit r
     try std.testing.expectEqual(@as(usize, 1), app.commits);
 }
 
-test "the loop leaves a pacer alone unless it holds a finished turn the worker holds mail for" {
+test "the loop leaves a pacer alone unless it holds a finished turn the worker holds mail or a typed prompt for" {
     const gpa = std.heap.c_allocator;
 
     // Text still being shown, and no finished turn: nothing waits for a commit.
@@ -6263,7 +6298,8 @@ test "the loop leaves a pacer alone unless it holds a finished turn the worker h
         try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
     }
 
-    // A prompt the user typed heads the queue: the gate holds nothing.
+    // A prompt the user typed after the turn finished heads the queue: the gate
+    // holds it, so the loop shows and commits the turn, and the prompt may start.
     {
         var app: FlushApp = .{ .alloc = std.testing.allocator };
         defer app.deinit();
@@ -6272,9 +6308,15 @@ test "the loop leaves a pacer alone unless it holds a finished turn the worker h
         try agent.worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = FlushApp.finished_turn } });
         try agent.worker.enqueuePrompt(gpa, try FlushApp.queuedRequest(gpa, "typed"));
         try app.pacerHoldsFinishedTurn("still showing");
+        try std.testing.expect(agent.worker.commitGateWaitsForCommit());
         Runtime(FlushApp).flushPacerForHeldMail(&app, agent, 0);
-        try std.testing.expectEqual(@as(usize, 0), app.emit_attempts);
-        try std.testing.expect(app.pacer.deferred_turn != null);
+        try std.testing.expectEqualStrings("still showing", app.emitted.items);
+        try std.testing.expectEqual(@as(usize, 1), app.commits);
+        try std.testing.expect(app.pacer.deferred_turn == null);
+        try std.testing.expect(!agent.worker.commitGateWaitsForCommit());
+        const work = (try agent.worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedTypedPromptToStart;
+        defer worker_runtime.freeWorkItem(gpa, work);
+        try std.testing.expectEqualStrings("typed", work.prompt.prompt);
     }
 }
 

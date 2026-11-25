@@ -10,6 +10,7 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
@@ -382,6 +383,7 @@ pub fn completeFromStream(
         request.cancel_flag,
         request.content_capture_limit,
         progress,
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -407,8 +409,9 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     progress: ?sse_stream.Progress,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
     var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes, .progress = progress };
     defer sse.deinit(alloc);
@@ -668,6 +671,7 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         null,
+        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -1008,6 +1012,7 @@ fn consumeTestSse(bytes: []const u8) !types.ModelCompletion {
         &cancelled,
         null,
         null,
+        .{},
     );
 }
 
