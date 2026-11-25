@@ -2979,7 +2979,7 @@ pub const Runtime = struct {
             arena.allocator().print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason})
         else
             arena.allocator().print("fx: my last request failed and waits for the user ({s}). Only the user can continue it, on my screen, so tell them.", .{reason})) catch return;
-        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text, .started_by = self.turnStartedBy(child_id) } }) catch |err|
             debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
     }
 
@@ -3000,7 +3000,7 @@ pub const Runtime = struct {
         var writer = std.Io.Writer.fixed(&buffer);
         quietNoteText(&writer, command, crossing.quiet_ms) catch
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason=too_long quiet_ms={d}", .{ child_id, crossing.quiet_ms });
-        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered() } }) catch |err|
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = writer.buffered(), .started_by = self.turnStartedBy(child_id) } }) catch |err|
             return debug_trace.eventf("mailbox", "quiet_note_dropped", .{}, "child={s} reason={s} quiet_ms={d}", .{ child_id, @errorName(err), crossing.quiet_ms });
         debug_trace.eventf("mailbox", "quiet_note_posted", .{}, "child={s} quiet_ms={d}", .{ child_id, crossing.quiet_ms });
     }
@@ -8205,6 +8205,45 @@ test "a subagent's message to its parent keeps who started the turn that sent it
     try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
     try std.testing.expectEqual(@as(usize, 1), capture.messages);
     try std.testing.expectEqual(@as(?reports.StartedBy, .user), capture.started_by);
+}
+
+test "fx's waiting and quiet notes for a subagent say who started the turn they are about" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+
+    const Capture = struct {
+        messages: usize = 0,
+        started_by: [2]?reports.StartedBy = .{ null, null },
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (delivery != .message) return;
+            if (self.messages < self.started_by.len) self.started_by[self.messages] = delivery.message.started_by;
+            self.messages += 1;
+        }
+    };
+    var capture: Capture = .{};
+    runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    runtime.noteChildWaiting(child_id, "reviewer", "Sign-in expired", false);
+    runtime.noteChildQuiet(child_id, "reviewer", .{ .command = "sleep 600", .quiet_ms = 120_000 });
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try std.testing.expectEqual(@as(usize, 2), capture.messages);
+    try std.testing.expectEqual(@as(?reports.StartedBy, .user), capture.started_by[0]);
+    try std.testing.expectEqual(@as(?reports.StartedBy, .user), capture.started_by[1]);
 }
 
 test "a subagent's message its parent can't take says so, and keeps nothing of what the user typed" {
