@@ -8,7 +8,7 @@
     "start": "node .output/server/index.mjs"
   },
   "dependencies": {
-    "libfx": "0.0.17",
+    "libfx": "0.0.18",
     "nuxt": "4.6.4"
   },
   "engines": {

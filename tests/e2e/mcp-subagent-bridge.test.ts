@@ -152,6 +152,36 @@ describe("a subagent's fx mcp call", () => {
     }
   }
 
+  // Two servers whose names share a prefix: `linear`, which never loads, and `linear_dev`, which does. A tool name that
+  // `linear_dev`'s list lacks could be a tool of either by its spelling, and no list or alias binds it, so neither is blamed.
+  test("blames no server for a name that two servers' names could own, and the one that could only be one's", async () => {
+    const ghost = "mcp_linear_dev_ghost";
+    const run = await runPaths({
+      bin: FX_BIN, mode: "full", agent: "main", only: [], label: "prefix-twins", rules: {}, extraServers: ["linear", "linear_dev"],
+      extra: [
+        shellStep("call", mcp(`${ghost} '{}'`)),
+        shellStep("help", mcp(`help ${ghost}`)),
+        { id: "open", name: "toolbox", args: { open: ghost } },
+        { id: "open_unknown", name: "toolbox", args: { open: "mcp_nothing_here" } },
+        // `linear_dev`'s own tool runs, and a name only `linear` could own still hears why `linear` is held.
+        shellStep("twin_call", mcp("mcp_linear_dev_echo '{\"text\":\"hi\"}'")),
+        shellStep("linear_call", mcp("mcp_linear_list '{}'")),
+        { id: "linear_open", name: "toolbox", args: { open: "mcp_linear_list" } },
+      ],
+    });
+    ok(run);
+    expectRefused(run.texts.call!, ghost);
+    expect(run.texts.help).toContain("exit=1");
+    expect(run.texts.help).toContain(`fx mcp call: ${noSuchTool(ghost)}`);
+    expect(run.texts.open!.replaceAll(ghost, "TOOL")).toBe(run.texts.open_unknown!.replaceAll("mcp_nothing_here", "TOOL"));
+    for (const text of [run.texts.call!, run.texts.help!, run.texts.open!]) expect(text).not.toContain(NOT_SET_VARIABLE);
+    expectRan(run.texts.twin_call!, SMALL_RESULT);
+    const why = `MCP server 'linear' needs ${NOT_SET_VARIABLE} set before fx starts.`;
+    expect(run.texts.linear_call).toContain("exit=5");
+    expect(run.texts.linear_call).toContain(`fx mcp call: mcp_linear_list did not run. ${why}`);
+    expect(run.texts.linear_open).toContain(why);
+  }, 240_000);
+
   for (const { state, tool, extra, down, why } of SERVERS) {
     test(`tells the main agent why a ${state} server's tool can't be used, though a rule hides the tool, as toolbox open always has`, async () => {
       const run = await runPaths({

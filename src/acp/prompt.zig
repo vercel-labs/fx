@@ -3657,9 +3657,13 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
-        if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
-            journal.yieldsAt(io_mod.milliTimestamp()))
-        {
+        const kind: libfx_journal.QuiesceKind = if (!checkpoint.outstanding_reservation)
+            .other
+        else if (checkpoint.cause == .compaction_prepared)
+            .compaction
+        else
+            .request;
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -5253,6 +5257,14 @@ test "stripAnsiAlloc returns the original slice for clean text and strips escape
     defer alloc.free(stripped);
     try std.testing.expectEqualStrings("red and [link](https://example.com)", stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
+}
+
+test "stripAnsiAlloc drops an escape with intermediate bytes whole" {
+    const alloc = std.testing.allocator;
+    // Command output that resets its style as `tput sgr0` does.
+    const stripped = try stripAnsiAlloc(alloc, "Build failed\x1b(B\x1b[m\n");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("Build failed\n", stripped);
 }
 
 test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {
