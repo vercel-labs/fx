@@ -3231,7 +3231,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         (grid) => grid.some((row) => row.includes(TALL_QUESTION_PROMPT)),
       );
       // The question displaced earlier rows into scrollback; the first row
-      // still on screen is the anchor that must not move.
+      // still on screen is the anchor. The cancel refills the screen, so the anchor moves down.
       const anchorRow = questionGrid.findIndex((row) => row.includes("FILL_LINE_"));
       expect(anchorRow).toBeGreaterThanOrEqual(0);
       expect(anchorRow).toBeLessThanOrEqual(1);
@@ -3245,12 +3245,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           grid.some((row) => row.includes("▪ Cancelled")) &&
           findFooterBlocks(grid).length > 0,
       );
-      expect(cancelledGrid.findIndex((row) => row.trim() === anchorText)).toBe(anchorRow);
+      expect(cancelledGrid.findIndex((row) => row.trim() === anchorText)).toBe(9);
       const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       const footer = findFooterBlocks(cancelledGrid).at(-1)!;
       expect(footer.topDivider).toBe(cancelledRow + 2);
       expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
-      expect(cancelledGrid.at(-1)!.trim()).toBe("");
+      expect(cancelledGrid.at(-1)!.trim()).toBe("ask · gpt-5");
+      expect(cancelledGrid.length - 1).toBe(footer.bottomDivider + 1);
 
       const history = (await ctx.session.captureFullScrollback()).split("\n");
       expect(longestBlankRunBetween(history, fillLine(1), "▪ Cancelled")).toBe(1);
@@ -3299,12 +3300,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
       const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(cancelledFooter).toBeDefined();
-      // The transcript stays at the top and the rows the question freed go
-      // below the footer, not above the transcript.
-      expect(cancelledGrid[0]!.trim()).not.toBe("");
+      // The footer returns to the last row, and the transcript refills the
+      // rows above it, starting with a blank separator line.
+      expect(cancelledGrid[1]!.trim()).toBe("0s (↑9 ↓5)");
       expect(cancelledFooter!.topDivider).toBe(cancelledRow + 2);
       expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
-      expect(cancelledGrid.at(-1)!.trim()).toBe("");
+      expect(cancelledGrid.at(-1)!.trim()).toBe("ask · gpt-5");
+      expect(cancelledGrid.length - 1).toBe(cancelledFooter!.bottomDivider + 1);
 
       await ctx.session.sendLiteralText("x");
       const editedGrid = await waitForGridState(

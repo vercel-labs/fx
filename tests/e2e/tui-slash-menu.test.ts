@@ -1437,9 +1437,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
-      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
-      expect(composerRow(afterDismiss)).toBe(64);
-      expect(footerStatusRow(afterDismiss)).toBe(66);
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(visibleTranscriptTailRow(afterResponse));
+      expect(composerRow(afterDismiss)).toBe(closedComposerRow);
+      expect(footerStatusRow(afterDismiss)).toBe(75);
       await session.sendLiteralText("x");
       await session.waitForPane(
         (pane) =>
@@ -1448,9 +1448,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
-      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
-      expect(composerRow(afterDismissEdit)).toBe(64);
-      expect(footerStatusRow(afterDismissEdit)).toBe(66);
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(visibleTranscriptTailRow(afterResponse));
+      expect(composerRow(afterDismissEdit)).toBe(closedComposerRow);
+      expect(footerStatusRow(afterDismissEdit)).toBe(75);
 
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
@@ -1471,10 +1471,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(new Set(openComposerRows).size).toBe(1);
       expect(new Set(openFooterRows).size).toBe(1);
       expect(openComposerRows[0]).toBeLessThan(composerRow(afterResponse));
-      expect(composerRow(afterDismiss)).toBeLessThan(closedComposerRow);
+      expect(composerRow(afterDismiss)).toBe(closedComposerRow);
       expect(composerRow(afterDismissEdit)).toBe(composerRow(afterDismiss));
       expect(composerRow(afterClear)).toBe(composerRow(afterDismiss));
-      expect(footerStatusRow(afterDismiss)).toBeLessThan(footerStatusRow(afterResponse));
+      expect(footerStatusRow(afterDismiss)).toBe(footerStatusRow(afterResponse));
       expect(footerStatusRow(afterDismissEdit)).toBe(footerStatusRow(afterDismiss));
       expect(footerStatusRow(afterClear)).toBe(footerStatusRow(afterDismiss));
 
