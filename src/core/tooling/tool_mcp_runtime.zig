@@ -158,10 +158,18 @@ pub const InputResponder = struct {
     legacy_url_manual_completion: bool = false,
     callback: *const fn (*anyopaque, Allocator, InputOrigin, InputRequired) anyerror![]const u8,
     continuation_terminal: ?*const fn (*anyopaque, Allocator, InputOrigin, ContinuationTerminal) void = null,
+    /// Tells the user, where this surface shows MCP warnings, that fx declined a question it could not take.
+    /// The text is fx's reason (`elicitation_interaction.declinedText`), safe for a terminal, and valid for the call.
+    declined_notice: ?*const fn (*anyopaque, text: []const u8) void = null,
 
     pub fn finish(self: InputResponder, alloc: Allocator, origin: InputOrigin, outcome: ContinuationTerminal) void {
         const callback = self.continuation_terminal orelse return;
         callback(self.context, alloc, origin, outcome);
+    }
+
+    pub fn declined(self: InputResponder, text: []const u8) void {
+        const notice = self.declined_notice orelse return;
+        notice(self.context, text);
     }
 };
 

@@ -569,6 +569,18 @@ pub const State = struct {
         }
     };
 
+    /// From any thread: a warning for the UI's notice row. Copies `text`.
+    pub fn addHostWarning(self: *State, text: []const u8) void {
+        const sink = self.host_sink orelse {
+            debug_trace.logf("mcp", "MCP warning dropped: no host sink", .{});
+            return;
+        };
+        const copy = std.heap.c_allocator.dupe(u8, text) catch return;
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        defer sink.mutex.unlock(io_mod.getIo());
+        sink.pushLocked(copy, true);
+    }
+
     /// The notices waiting for the UI, owned by `std.heap.c_allocator`.
     pub fn takeHostNotices(self: *State) []HostNotice {
         const sink = self.host_sink orelse return &.{};

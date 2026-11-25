@@ -23,6 +23,7 @@ const tool_result = @import("../mcp/tool_result.zig");
 const tool_search = @import("../mcp/tool_search.zig");
 const tools_feature = @import("../mcp/features/tools.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 
 const Allocator = std.mem.Allocator;
 const Runtime = runtime_mod.Runtime;
@@ -806,6 +807,8 @@ const Asking = struct {
     io: std.Io,
     /// The last question's origin, once one was asked.
     origin: ?tool_mcp_runtime.InputOrigin = null,
+    /// The user has heard that fx declined a question of this call; a server that asks again is not told again.
+    told: bool = false,
 
     fn finish(self: *const Asking, alloc: Allocator, outcome: tool_mcp_runtime.ContinuationTerminal) void {
         if (self.origin) |origin| self.responder.finish(alloc, origin, outcome);
@@ -827,18 +830,34 @@ const Asking = struct {
         };
         self.origin = origin;
         const signal = question.url_wait orelse {
-            const answer = try self.responder.callback(self.responder.context, alloc, origin, .{ .input_requests_json = question.input_requests_json });
+            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json }, question.server);
             return @constCast(answer);
         };
         // A surface with no Retry control (ACP) waits for the server alone.
         if (!self.responder.legacy_url_manual_completion) return self.waitForUrls(signal, origin.deadline_ms);
-        const answer = try self.responder.callback(self.responder.context, alloc, origin, .{
+        const answer = try self.respond(alloc, origin, .{
             .input_requests_json = question.input_requests_json,
             .legacy_retry_without_responses = true,
             .legacy_url_phase = .await_completion,
             .legacy_url_completion_signal = signal,
-        });
+        }, question.server);
         return @constCast(answer);
+    }
+
+    /// Puts the question to the surface's responder. When the responder refuses it, the user hears why, and the
+    /// error goes on, so the form is declined as before.
+    fn respond(self: *Asking, alloc: Allocator, origin: tool_mcp_runtime.InputOrigin, required: tool_mcp_runtime.InputRequired, server: []const u8) anyerror![]const u8 {
+        return self.responder.callback(self.responder.context, alloc, origin, required) catch |err| {
+            self.tellDeclined(alloc, server, err);
+            return err;
+        };
+    }
+
+    fn tellDeclined(self: *Asking, alloc: Allocator, server: []const u8, err: anyerror) void {
+        if (self.told) return;
+        const text = (elicitation_interaction.declinedText(alloc, server, err) catch return) orelse return;
+        self.told = true;
+        self.responder.declined(text);
     }
 
     /// Waits until the server completes every URL, the question's deadline,
@@ -1464,6 +1483,77 @@ test "what the model got before stays the same: an error without data, a -32042,
     const ok = (try render(a, "srv", "mcp_srv_tool", .{ .result = .{ .content = "[{\"type\":\"text\",\"text\":\"hi\"}]", .structured = null, .is_error = false } }, 4096, .terminal, null)).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, ok.status);
     try testing.expectEqualStrings("{\"server\":\"srv\",\"tool\":\"mcp_srv_tool\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}", ok.model_output);
+}
+
+const RefusingSurface = struct {
+    result: anyerror![]const u8,
+    said: [4][256]u8 = undefined,
+    said_len: [4]usize = @splat(0),
+    count: usize = 0,
+
+    fn callback(context: *anyopaque, _: Allocator, _: tool_mcp_runtime.InputOrigin, _: tool_mcp_runtime.InputRequired) anyerror![]const u8 {
+        const self: *RefusingSurface = @ptrCast(@alignCast(context));
+        return self.result;
+    }
+
+    fn declined(context: *anyopaque, text: []const u8) void {
+        const self: *RefusingSurface = @ptrCast(@alignCast(context));
+        if (self.count < self.said.len) {
+            @memcpy(self.said[self.count][0..text.len], text);
+            self.said_len[self.count] = text.len;
+        }
+        self.count += 1;
+    }
+
+    fn saidAt(self: *const RefusingSurface, index: usize) []const u8 {
+        return self.said[index][0..self.said_len[index]];
+    }
+
+    fn asking(self: *RefusingSurface, with_notice: bool) Asking {
+        return .{
+            .responder = .{ .context = self, .callback = callback, .declined_notice = if (with_notice) declined else null },
+            .tool = "mcp_docs_echo",
+            .cancel = null,
+            .io = testing.io,
+        };
+    }
+};
+
+test "a question the surface refuses is told to the user once for the call, and the form is still declined" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const question: runtime_mod.Question = .{ .server = "docs", .input_requests_json = "{}", .version = null };
+
+    var surface: RefusingSurface = .{ .result = error.PresentationLimitExceeded };
+    var asking = surface.asking(true);
+    // The error still goes up, where the runtime declines the form.
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&asking, a, question));
+    try testing.expectEqual(@as(usize, 1), surface.count);
+    try testing.expectEqualStrings("MCP server 'docs' asked for input, and fx declined it: the form is larger than fx can show.", surface.saidAt(0));
+    // A server that asks again in the same call is not told again.
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&asking, a, question));
+    try testing.expectEqual(@as(usize, 1), surface.count);
+    // The next call is its own.
+    var next = surface.asking(true);
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&next, a, question));
+    try testing.expectEqual(@as(usize, 2), surface.count);
+
+    // A cancel is no refusal, and an answer is told to no one.
+    var cancelled: RefusingSurface = .{ .result = error.Cancelled };
+    var cancelled_asking = cancelled.asking(true);
+    try testing.expectError(error.Cancelled, Asking.ask(&cancelled_asking, a, question));
+    try testing.expectEqual(@as(usize, 0), cancelled.count);
+    var answered: RefusingSurface = .{ .result = "{}" };
+    var answered_asking = answered.asking(true);
+    try testing.expectEqualStrings("{}", (try Asking.ask(&answered_asking, a, question)).?);
+    try testing.expectEqual(@as(usize, 0), answered.count);
+
+    // A surface with nowhere to say it declines the form as before.
+    var mute: RefusingSurface = .{ .result = error.SecretField };
+    var mute_asking = mute.asking(false);
+    try testing.expectError(error.SecretField, Asking.ask(&mute_asking, a, question));
+    try testing.expectEqual(@as(usize, 0), mute.count);
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {

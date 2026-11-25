@@ -531,6 +531,7 @@ pub fn Runtime(comptime App: type) type {
                     .capabilities = .{ .form = true, .url = true },
                     .legacy_url_manual_completion = true,
                     .callback = respondToMcpInput,
+                    .declined_notice = if (comptime @hasDecl(App, "addMcpHostNotice")) tellMcpDeclined else null,
                 };
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(agent);
@@ -565,6 +566,12 @@ pub fn Runtime(comptime App: type) type {
         fn profileAllowsMcpServer(raw: *const anyopaque, server: []const u8) bool {
             const profile: *const profiles.Profile = @ptrCast(@alignCast(raw));
             return profiles.allowsMcpServer(profile, server);
+        }
+
+        /// A question fx declined, in the notice row the host's other warnings use.
+        fn tellMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(raw_ctx));
+            app_agents_runtime.appOf(App, agent).addMcpHostNotice(text);
         }
 
         fn respondToMcpInput(
