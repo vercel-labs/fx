@@ -241,7 +241,7 @@ When the detector can't read the change, the `macOS arm64` check fails instead o
 
 The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel, take about 20 minutes each, and run their checks when the change touches:
 
-- `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
+- `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, or `src/core/tool_bridge/`
 - The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
 - The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
 

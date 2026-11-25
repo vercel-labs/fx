@@ -12,7 +12,7 @@ This describes the code on `6bb36a928` (`origin/main` when this workspace was ma
 | The engine call | `src/core/mcp_host/runtime.zig:647-667` (`call`, `callObserved`), `:708-735` (`submit`) | Queues the call to the runtime's owner thread, waits, and sends a cancel once when the cancel flag is set, then waits for that too |
 | `fx mcp` verbs | `src/core/cli/cli_surface.zig:587` (top-level `mcp`), `:2273` (`mcp_verbs.run`); `src/core/mcp_host/verbs.zig:259` (`run`), `:349` (`list`), `:483` (`show`); spec in `src/builtins/commands.zig:144-147` | `fx mcp list`, `fx mcp show`, and the login and config verbs. There is no verb that calls a tool |
 | The shell tool's environment | `src/tools/shell/shell.zig:1925-1936` (`commandEnvironment`), `src/core/execution/command_environment.zig:12-34` (`Environment`) | Chooses the clean, user, or workspace environment a command runs in. It adds no fx variables a command could use to reach the session |
-| The bridge core (this change) | `src/core/mcp_host/mcp_call.zig` (`step`, `abstract`) | The pure decision this workspace designs. Nothing imports it yet except the MCP host's test block (`src/core/mcp_host/host.zig:136-141`, this change) |
+| The bridge core (this change) | `src/core/tool_bridge/core.zig` (`step`, `abstract`) | The pure decision this workspace designs. Nothing imports it yet except the MCP host's test block (`src/core/mcp_host/host.zig:136-141`, this change) |
 
 ## Data flow of a direct MCP call
 
@@ -69,5 +69,5 @@ The drivers run the real core. The harness (`tests/tla/drivers/mcp_call/harness.
 
 The bridge runs real sockets, threads, and the real core. Its tests fake only what a tool call lends it:
 
-- **`FakeTool`** (`src/core/mcp_host/mcp_call_bridge.zig`): a capability whose permission check allows or denies, can wait behind a gate as a prompt does, and whose call echoes the tool and arguments. The Zig tests use it for the happy path, a forged token, a denial, a client that leaves while its prompt waits, and the socket's removal.
+- **`FakeTool`** (`src/core/tool_bridge/bridge.zig`): a capability whose permission check allows or denies, can wait behind a gate as a prompt does, and whose call echoes the tool and arguments. The Zig tests use it for the happy path, a forged token, a denial, a client that leaves while its prompt waits, and the socket's removal.
 - **The E2E tests** (`tests/e2e/mcp-stdio.test.ts`, `fx mcp call`) fake only the model, with the fake gateway, and the MCP server, with `tests/e2e/fixtures/mcp-modern-stdio.mjs`. Everything between them is the built `zig-out/bin/fx`.

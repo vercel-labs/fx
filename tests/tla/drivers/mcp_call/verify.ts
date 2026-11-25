@@ -4,8 +4,8 @@
 //   1. the pinned TLC and the Java that runs it;
 //   2. TLC on McpCall.tla with MCMcpCall.cfg, which also writes the state
 //      graph;
-//   3. the core's own tests, `zig test src/core/mcp_host/mcp_call.zig`;
-//   4. the harness, built from the real src/core/mcp_host/mcp_call.zig;
+//   3. the core's own tests, `zig test src/core/tool_bridge/core.zig`;
+//   4. the harness, built from the real src/core/tool_bridge/core.zig;
 //   5. spec to code: every distinct transition of the graph replayed against
 //      the real core;
 //   6. code to spec: scripted and random traces with faults, checked by TLC;
@@ -71,7 +71,7 @@ try {
 
   at = performance.now();
   const bin = buildHarness(join(out, "harness"));
-  stage("harness", true, `built from src/core/mcp_host/mcp_call.zig in ${elapsed(at)}`);
+  stage("harness", true, `built from src/core/tool_bridge/core.zig in ${elapsed(at)}`);
 
   at = performance.now();
   const sweep = await specToCode(bin, graphPath);

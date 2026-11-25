@@ -1061,7 +1061,7 @@ pub fn Runtime(comptime App: type) type {
             // The execution reads the approvals the call began with, from the
             // request, and the copy ends with the call. A command's
             // `fx mcp call` borrows it only while the call runs, since
-            // `mcp_call_bridge.unregister` waits for its borrowers.
+            // `tool_bridge.unregister` waits for its borrowers.
             var copy = std.heap.ArenaAllocator.init(app.alloc);
             defer copy.deinit();
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;

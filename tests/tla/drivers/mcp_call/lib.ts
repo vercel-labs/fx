@@ -8,7 +8,7 @@ import { REPO_ROOT, TLA_ROOT, runTlc, tlcToolchain, type TlcRun } from "../lib/t
 
 export const SPEC_DIR = join(TLA_ROOT, "mcp_call", "spec");
 export const MODEL_DIR = join(TLA_ROOT, "mcp_call");
-export const CORE_SOURCE = join(REPO_ROOT, "src", "core", "mcp_host", "mcp_call.zig");
+export const CORE_SOURCE = join(REPO_ROOT, "src", "core", "tool_bridge", "core.zig");
 export const HARNESS_SOURCE = join(import.meta.dirname, "harness.zig");
 /// MaxInFlight in MCMcpCall.cfg and TraceMcpCall.cfg; the harness runs the
 /// core with this capacity.

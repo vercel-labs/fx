@@ -4,7 +4,7 @@
 // A spec bug is checked twice: TLC on the mutated model with only the named
 // property, which must report exactly that property violated, and with all of
 // MCMcpCall.cfg, which must fail. A code bug is planted in a copy of
-// src/core/mcp_host/mcp_call.zig, the harness is rebuilt from the copy, and
+// src/core/tool_bridge/core.zig, the harness is rebuilt from the copy, and
 // both directions run: the spec-to-code sweep must find the core leaving the
 // model, and the code-to-spec traces must violate the named property alone and
 // fail the full trace check.
@@ -57,7 +57,7 @@ export async function codeMutations(dir: string, graphPath: string, seed: number
   for (const mutation of mutations.code) {
     const work = join(dir, mutation.id);
     mkdirSync(work, { recursive: true });
-    const source = join(work, "mcp_call.zig");
+    const source = join(work, "core.zig");
     writeFileSync(source, plant(core, mutation.find, mutation.replace, mutation.id));
     const bin = buildHarness(work, source);
     const sweep = await specToCode(bin, graphPath);

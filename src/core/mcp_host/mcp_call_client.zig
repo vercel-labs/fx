@@ -1,6 +1,6 @@
 //! `fx mcp call TOOL [JSON | -]`: runs one of the session's MCP tools from
 //! a command that fx's shell tool runs, through the session's bridge
-//! (`mcp_call_bridge.zig`). It prints just the tool's data on stdout, so
+//! (`../tool_bridge/bridge.zig`). It prints just the tool's data on stdout, so
 //! the command can write it to a file or pipe it into `jq`, and only what
 //! the command prints reaches the model. When stdout is not a terminal, one
 //! stderr line describes the data (`shapeSummary`), so the agent can filter
@@ -16,9 +16,10 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const capability_mod = @import("../tooling/mcp_call_capability.zig");
-const mcp_call = @import("mcp_call.zig");
-const wire = @import("mcp_call_wire.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
+const capability_mod = tool_bridge.capability;
+const mcp_call = tool_bridge.core;
+const wire = tool_bridge.wire;
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
