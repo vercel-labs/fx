@@ -16,6 +16,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// fx's own bounds, for a connection whose settings name none.
@@ -102,21 +103,22 @@ pub const Headers = struct {
     /// asterisks, in the forms a server may quote them. Takes `detail` and
     /// returns owned text.
     fn mask(self: *const Headers, alloc: Allocator, detail: []u8, token: ?[]const u8) Allocator.Error![]u8 {
-        // Longest first, so a secret inside another never splits the longer one.
-        const values = self.secrets(alloc, token) catch |err| {
-            alloc.free(detail);
-            return err;
-        };
+        const shown = try shownForm(alloc, detail);
+        defer alloc.free(shown);
+        const values = try self.secrets(alloc, token);
         defer alloc.free(values);
-        var masked = detail;
-        for (values) |value| masked = try maskOne(alloc, masked, value);
-        return masked;
+        // Every span is found before any is masked, so secrets that overlap
+        // never leave part of one showing.
+        return text_utils.maskSecretValues(alloc, shown, values);
     }
 };
 
-fn maskOne(alloc: Allocator, detail: []u8, value: []const u8) Allocator.Error![]u8 {
+/// `detail` as fx shows a server's error: decoded and written back when it
+/// is JSON, within the error text's limits. Takes `detail`; the caller owns
+/// the result.
+fn shownForm(alloc: Allocator, detail: []u8) Allocator.Error![]u8 {
     defer alloc.free(detail);
-    return chat_codec.redact_error_detail(alloc, detail, value);
+    return chat_codec.redact_error_detail(alloc, detail, "");
 }
 
 fn expired(deadline: std.Io.Clock.Timestamp) bool {
@@ -456,6 +458,24 @@ test "Headers lists exactly the secrets the request sent, longest first, on ever
         }
     };
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
+}
+
+test "Headers masks secrets that overlap at their ends whole, as written and in a JSON body" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{
+        .{ .name = "X-First", .value = "abcdef" },
+        .{ .name = "X-Second", .value = "defghi" },
+    };
+    const headers = Headers{ .list = storage[0..], .owned = 2 };
+    const Case = struct { detail: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .detail = "key abcdefghi refused", .expected = "key ********* refused" },
+        .{ .detail = "{\"error\":{\"message\":\"key abcdefghi refused\"}}", .expected = "{\"error\":{\"message\":\"key ********* refused\"}}" },
+    }) |case| {
+        const masked = try headers.mask(alloc, try alloc.dupe(u8, case.detail), null);
+        defer alloc.free(masked);
+        try std.testing.expectEqualStrings(case.expected, masked);
+    }
 }
 
 test "Headers masks a secret whole when a shorter one is part of it" {
