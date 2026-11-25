@@ -47,6 +47,7 @@ const ISOLATED_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  "FX_SESSION_ID",
 ] as const;
 
 test("pane exit matching requires the expected observed status", () => {

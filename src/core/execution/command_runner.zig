@@ -40,8 +40,13 @@ pub const Config = struct {
     /// Shell snapshot epoch of the remembered grant that admitted a `user`
     /// profile command, or null when it was not admitted by a grant.
     shell_grant_epoch: ?u64 = null,
-    /// Variables added to the command's environment after `AI_AGENT`,
-    /// such as the `fx mcp call` bridge's address. Borrowed for the run.
+    /// Durable session ID of the calling fx session or subagent, exported as
+    /// `FX_SESSION_ID`. Null or empty clears any inherited value from an outer
+    /// fx process. Borrowed for the run.
+    session_id: ?[]const u8 = null,
+    /// Variables added to the command's environment after `AI_AGENT` and
+    /// `FX_SESSION_ID`, such as the `fx mcp call` bridge's address. Borrowed
+    /// for the run.
     extra_environment: []const EnvironmentVariable = &.{},
 };
 
@@ -52,13 +57,26 @@ pub const EnvironmentVariable = struct {
 
 const ai_agent_env = "AI_AGENT";
 const ai_agent_name = "fx";
+const session_id_env = "FX_SESSION_ID";
 
-pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {
+pub fn applyAgentEnvironment(
+    environment: *std.process.Environ.Map,
+    session_id: ?[]const u8,
+) !void {
     try environment.put(ai_agent_env, ai_agent_name);
+    // Drop any inherited session id from an outer fx so unsaved sessions do not
+    // advertise the outer session.
+    if (session_id) |id| {
+        if (id.len > 0) {
+            try environment.put(session_id_env, id);
+            return;
+        }
+    }
+    _ = environment.swapRemove(session_id_env);
 }
 
 fn applyCommandEnvironment(environment: *std.process.Environ.Map, cfg: Config) !void {
-    try applyAgentEnvironment(environment);
+    try applyAgentEnvironment(environment, cfg.session_id);
     for (cfg.extra_environment) |variable| try environment.put(variable.name, variable.value);
 }
 
@@ -4192,6 +4210,49 @@ test "agent environment preserves the supplied environment without mutating it" 
     try std.testing.expectEqualStrings("fx:retained", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
     try std.testing.expectEqualStrings("other-agent", environment.get("AI_AGENT").?);
+}
+
+test "command environment clears inherited FX_SESSION_ID unless session_id is non-empty" {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put(session_id_env, "outer-session");
+
+    var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch_state.deinit();
+    const cleared = try executeProcessWithScript(
+        scratch_state.allocator(),
+        .{ .max_command_output_bytes = 4096 },
+        &.{ "/bin/sh", "-c", "printf '%s' \"${FX_SESSION_ID-unset}\"" },
+        "/tmp",
+        "",
+        &environment,
+    );
+    try std.testing.expectEqualStrings("unset", cleared.stdout);
+    try std.testing.expectEqualStrings("outer-session", environment.get(session_id_env).?);
+
+    const cleared_empty = try executeProcessWithScript(
+        scratch_state.allocator(),
+        .{ .max_command_output_bytes = 4096, .session_id = "" },
+        &.{ "/bin/sh", "-c", "printf '%s' \"${FX_SESSION_ID-unset}\"" },
+        "/tmp",
+        "",
+        &environment,
+    );
+    try std.testing.expectEqualStrings("unset", cleared_empty.stdout);
+    try std.testing.expectEqualStrings("outer-session", environment.get(session_id_env).?);
+
+    const overridden = try executeProcessWithScript(
+        scratch_state.allocator(),
+        .{ .max_command_output_bytes = 4096, .session_id = "inner-subagent" },
+        &.{ "/bin/sh", "-c", "printf '%s' \"${FX_SESSION_ID-unset}\"" },
+        "/tmp",
+        "",
+        &environment,
+    );
+    try std.testing.expectEqualStrings("inner-subagent", overridden.stdout);
+    try std.testing.expectEqualStrings("outer-session", environment.get(session_id_env).?);
 }
 
 test "authorized command executes exactly once" {

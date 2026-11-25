@@ -1719,6 +1719,7 @@ const Session = struct {
             control_path,
             &nonce,
             command_path,
+            if (request.persistence) |persistence| persistence.grant.principal.durable_session_id else null,
         );
         defer self.alloc.free(bootstrap);
         const source_command = try shell_resolver.buildSourceCommand(

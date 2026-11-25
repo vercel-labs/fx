@@ -94,6 +94,9 @@ pub const StartCapturedInput = struct {
     /// When set, `startCaptured` stops waiting before `yield_time_ms` and
     /// returns the command running (`steerYieldDue`). It never stops it.
     tool_yield_flag: ?*const std.atomic.Value(bool) = null,
+    /// Calling session or subagent ID exported as `FX_SESSION_ID`. Copied
+    /// before `startCaptured` returns.
+    session_id: ?[]const u8 = null,
     /// Added to the command's environment. Copied before `startCaptured`
     /// returns.
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
@@ -266,6 +269,7 @@ const Entry = struct {
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
+    session_id: ?[]const u8 = null,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
@@ -313,6 +317,7 @@ const Entry = struct {
         const cwd = try owned.dupe(u8, input.cwd);
         const execution_id = try owned.dupe(u8, input.execution_id);
         const environment = try dupeEnvironment(owned, input.environment);
+        const session_id = if (input.session_id) |id| try owned.dupe(u8, id) else null;
         const extra_environment = try owned.alloc(command_runner.EnvironmentVariable, input.extra_environment.len);
         for (input.extra_environment, extra_environment) |source, *target| {
             target.* = .{ .name = try owned.dupe(u8, source.name), .value = try owned.dupe(u8, source.value) };
@@ -372,6 +377,7 @@ const Entry = struct {
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
+            .session_id = session_id,
             .extra_environment = extra_environment,
         };
         entry.started_ms = io_mod.milliTimestamp();
@@ -622,6 +628,7 @@ const Entry = struct {
             .timeout_ms = self.timeout_ms,
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
+            .session_id = self.session_id,
             .extra_environment = self.extra_environment,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
