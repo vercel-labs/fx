@@ -2944,10 +2944,28 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-        error.ReadFailed => return bodyReadError(&response),
+        error.ReadFailed => {
+            if (decompressError(response.head.content_encoding, &decompress)) |decoded| return decoded;
+            return bodyReadError(&response);
+        },
         else => |e| return e,
     };
     return .{ .status = response.head.status };
+}
+
+/// The decoder's own error. ReadFailed means the input read failed, and an
+/// identity body with no length leaves decompress unset.
+fn decompressError(content_encoding: std.http.ContentEncoding, decompress: *const std.http.Decompress) ?anyerror {
+    if (content_encoding == .identity) return null;
+    const err: ?anyerror = switch (decompress.*) {
+        .flate => |*flate| flate.err,
+        .zstd => |*zstd| zstd.err,
+        .none => null,
+    };
+    if (err) |decoder_error| {
+        if (decoder_error == error.ReadFailed) return null;
+    }
+    return err;
 }
 
 /// Watches one provider request on its connection with the lifecycle the
@@ -11197,6 +11215,73 @@ test "gateway JSON fetch requests compression and decodes gzip responses" {
     joined = true;
     if (state.failure) |err| return err;
     try std.testing.expect(state.accept_encoding_ok);
+}
+
+test "fetchOnOpenJob returns the gzip decoder's error for a body it cannot decode" {
+    const zio = io_mod.getIo();
+    const alloc = std.testing.allocator;
+    const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    var server = try std.Io.net.IpAddress.listen(&address, zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+
+    const ServeOnce = struct {
+        server: *std.Io.net.Server,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const inner_zio = io_mod.getIo();
+            const stream = self.server.accept(inner_zio) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(inner_zio);
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(inner_zio, &read_buf);
+            var request: [16 * 1024]u8 = undefined;
+            var request_len: usize = 0;
+            while (request_len < request.len) {
+                request[request_len] = reader.interface.takeByte() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                request_len += 1;
+                if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+            } else {
+                self.failure = error.TestRequestTooLarge;
+                return;
+            }
+
+            var write_buf: [4096]u8 = undefined;
+            var writer = stream.writer(inner_zio, &write_buf);
+            writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var serve = ServeOnce{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ServeOnce.run, .{&serve});
+
+    const url = try alloc.print("http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()});
+    defer alloc.free(url);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const result = fetchOnOpenJob(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+        .response_writer = &out.writer,
+    });
+    thread.join();
+    if (serve.failure) |err| return err;
+    try std.testing.expectError(error.BadGzipHeader, result);
 }
 
 fn readLoopbackGatewayRequest(zio: std.Io, stream: std.Io.net.Stream, fixture: *LoopbackGatewayFixture) !void {
