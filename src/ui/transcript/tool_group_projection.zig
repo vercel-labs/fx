@@ -185,8 +185,9 @@ const Summary = struct {
 
 const PresentationGroup = struct {
     anchor_index: usize,
-    /// How many user messages come before the group's first row.
-    user_messages_before: usize = 0,
+    /// How many entries that break a group (`breaksPresentationGroup`) come
+    /// before the group's first row.
+    breaks_before: usize = 0,
     status_indices: std.ArrayList(usize) = .empty,
     summary: Summary = .{},
 
@@ -8044,6 +8045,20 @@ fn statusDetail(
     return detailForEntry(details, detail_indices, entry_id, null);
 }
 
+/// Whether the calls of one presentation group before and after `entry` take
+/// separate rows. Core keeps a turn's group open across a message the user
+/// sends while it runs and across a notice the main screen shows in the
+/// middle of it, such as `✓ Context compacted`, but the calls after either
+/// belong below it, not in the row above it. A notice that only Ctrl+O shows
+/// draws nothing between the rows, so it keeps them together.
+fn breaksPresentationGroup(entry: TranscriptEntry) bool {
+    return switch (entry) {
+        .user_turn => true,
+        .semantic_notice => transcript_blocks.isEntryVisibleInCompactPresentation(entry),
+        else => false,
+    };
+}
+
 /// Fills `projection` with every entry's action. The caller owns the state
 /// it works in and frees it.
 fn fillProjection(
@@ -8086,13 +8101,10 @@ fn fillProjection(
 
     @memset(presentation_group_indices, null);
 
-    // A message the user sends while a turn runs joins that turn, so the
-    // calls after it share the turn's group. Their rows belong after the
-    // message, not above it, so they start a new group.
-    var user_messages: usize = 0;
+    var group_breaks: usize = 0;
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
-        if (entry == .user_turn) user_messages += 1;
+        if (breaksPresentationGroup(entry)) group_breaks += 1;
         if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, stats);
@@ -8100,9 +8112,9 @@ fn fillProjection(
         const group_id = presentationGroupId(detail) orelse continue;
 
         const result = try presentation_group_by_id.getOrPut(alloc, group_id);
-        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].user_messages_before != user_messages) {
+        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].breaks_before != group_breaks) {
             result.value_ptr.* = presentation_groups.items.len;
-            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .user_messages_before = user_messages });
+            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .breaks_before = group_breaks });
         }
         const group_index = result.value_ptr.*;
         const group = &presentation_groups.items[group_index];
@@ -8322,6 +8334,86 @@ fn fillProjection(
     }
 
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
+}
+
+/// A notice both the main screen and Ctrl+O show, as the second entry.
+fn shownNoticeForTest(topic: []const u8, tone: types.NoticeTone, body: []const u8) TranscriptEntry {
+    return .{ .semantic_notice = .{ .id = 2, .topic = topic, .tone = tone, .body = body, .visibility = .compact_and_full } };
+}
+
+/// Three reads of one presentation group, as core gives a turn's silent
+/// steps, with `middle` after the first.
+fn readsAroundForTest(middle: TranscriptEntry) struct { entries: [4]TranscriptEntry, details: [3]ToolDetailRecord } {
+    var details = [_]ToolDetailRecord{
+        storyReadDetailForTest(1, "a.txt"),
+        storyReadDetailForTest(3, "b.txt"),
+        storyReadDetailForTest(4, "c.txt"),
+    };
+    for (&details) |*detail| detail.presentation_group_id = .{ .turn_id = 2, .anchor_step_id = 3 };
+    return .{
+        .entries = .{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.txt\n", .class = .tool_status } },
+            middle,
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Read b.txt\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Read c.txt\n", .class = .tool_status } },
+        },
+        .details = details,
+    };
+}
+
+test "a notice the main screen shows in the middle of a turn starts a new row for the calls after it" {
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "compaction", .middle = shownNoticeForTest("", .success, "Context compacted (10s)") },
+        .{ .name = "provider reason while fx waits", .middle = shownNoticeForTest("system", .warning, "API access denied · HTTP 403") },
+        .{ .name = "effort chosen during the turn", .middle = shownNoticeForTest("", .neutral, "Next turn will use reasoning effort high for openai/gpt-5") },
+        .{ .name = "Vision outage", .middle = shownNoticeForTest("vision", .@"error", "Tip: Vision is unavailable right now.") },
+        .{ .name = "message the user sent", .middle = .{ .user_turn = .{ .id = 2, .turn = .{ .text = @constCast("Read the rest too.") } } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        const reads = readsAroundForTest(case.middle);
+        const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Read a.txt\n● Read b.txt, c.txt", std.mem.trim(u8, text, "\n"));
+        var projection = try build(alloc, &reads.entries, &reads.details, 120);
+        defer projection.deinit(alloc);
+        // The middle line draws between the two rows.
+        try std.testing.expect(projection.entry_actions.items[1] == .keep);
+        try std.testing.expect(projection.entry_actions.items[2] == .override);
+        try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    }
+}
+
+test "a notice the main screen hides keeps the calls around it in one row" {
+    // A model call's line shows only in Ctrl+O, between every two steps.
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "Ctrl+O only", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "model call", .tone = .neutral, .body = "21:25:41 · gpt-5 · 0.0 s", .visibility = .full_only } } },
+        .{ .name = "hidden by a display clear", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "", .tone = .success, .body = "Context compacted (10s)", .visibility = .compact_and_full, .inline_hidden = true } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        const reads = readsAroundForTest(case.middle);
+        const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("● Read a.txt, b.txt, c.txt", std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "Ctrl+O still gives each call around a notice its own line, in order" {
+    const alloc = std.testing.allocator;
+    const reads = readsAroundForTest(shownNoticeForTest("", .success, "Context compacted (10s)"));
+    var expanded = try buildExpandedStyledInterruptible(alloc, &reads.entries, &reads.details, 120, null);
+    defer expanded.deinit(alloc);
+    const actions = expanded.entry_actions.items;
+    try std.testing.expect(actions[1] == .keep);
+    for ([_]usize{ 0, 2, 3 }, [_][]const u8{ "a.txt", "b.txt", "c.txt" }) |index, path| {
+        try std.testing.expect(actions[index] == .override);
+        try std.testing.expect(std.mem.find(u8, actions[index].override.bytes, path) != null);
+    }
 }
 
 /// Leads each visible turn summary with its turn's recap. A function of its

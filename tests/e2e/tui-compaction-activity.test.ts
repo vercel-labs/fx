@@ -10,7 +10,7 @@ import { bearer, rotateFxLogin, startFakeIssuer, writeFxLogin } from "./fx-login
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const {
-  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall,
+  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewaySse, fakeGatewayToolCall,
   fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
   hasEmptyComposer, tmuxAvailable,
   turnSettled,
@@ -1070,6 +1070,237 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);
+});
+
+// Core keeps a turn's tool calls in one presentation group until the model
+// writes text, so the calls after a notice in the middle of the turn share
+// the group of the calls before it. The main screen draws them below the
+// notice. These notices are not saved, so after `--resume` the calls share
+// one row again.
+const NOTICE_PROMPT = "Read the three files.";
+const NOTICE_DONE = "NOTICE_ROWS_DONE_7c1a";
+const NOTICE_REJECTION = "REJECTED_9d2e";
+const NOTICE_HANDOFF = "Facts:\nF1: NOTICE_ROWS_HANDOFF_51aa: the user asked to read three files.";
+// fx estimates the turn's first request at about 5k to 6k tokens and the
+// next one, with a.txt's preview of one-letter words, at about 7k to 8k.
+// Compaction starts at 10% of the usable input: the window less the 8192
+// tokens kept for output, so 6.7k, between the two.
+const NOTICE_AUTO_CONTEXT_WINDOW = 67_000 + 8192;
+const NOTICE_CLOCK = /\((?:\d+h)?(?:\d+m)?\d+s\)/g;
+
+type NoticeMiddle = "overflow" | "auto" | "provider-error" | "effort";
+
+/// The rows from the turn's prompt to its answer, without blank rows and
+/// with clocks as `(Ns)`, so live and resumed screens compare row for row.
+function noticeTurnRows(grid: string[]): string[] {
+  const rows = grid.map((row) => row.trimEnd().replace(NOTICE_CLOCK, "(Ns)")).filter((row) => row !== "");
+  const start = rows.findLastIndex((row) => row === `┃ ${NOTICE_PROMPT}`);
+  const end = rows.findLastIndex((row) => row.includes(NOTICE_DONE));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start, end + 1);
+}
+
+function noticeTurnDone(pane: string): boolean {
+  return pane.includes(NOTICE_DONE) && hasEmptyComposer(pane) && turnSettled(pane) && /Explored \d+ files/.test(pane);
+}
+
+/// Reads a.txt, shows the notice `middle` makes, reads b.txt and then c.txt,
+/// and answers. Returns the turn's rows live, in Ctrl+O, and after
+/// `--resume last`.
+async function readAroundNotice(middle: NoticeMiddle) {
+  const compacts = middle === "overflow" || middle === "auto";
+  const root = mkdtempSync(join(tmpdir(), "fx-notice-rows-"));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
+  const oneLetterWords = Array.from({ length: 1000 }, () => "a b c d e f g h i j k l m n o p q r s t").join("\n");
+  writeFileSync(join(workspace, "a.txt"), middle === "auto" ? `${oneLetterWords}\n` : "alpha\n");
+  writeFileSync(join(workspace, "b.txt"), "bravo\n");
+  writeFileSync(join(workspace, "c.txt"), "charlie\n");
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+    model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    ...(middle === "auto" ? { auto_compact_percent: 10 } : {}),
+  }));
+  // The earlier turn gives compaction something to fold. It reports no
+  // usage, since fx would scale its later size estimates by it.
+  const seedLines = middle === "auto" ? 40 : 1600;
+  const seedReply = `${"history alpha beta gamma delta sample line\n".repeat(seedLines)}SEED_DONE`;
+  let seeding = compacts;
+  let steps = 0;
+  let releaseSecondRead = () => {};
+  const secondReadReleased = new Promise<void>((resolve) => { releaseSecondRead = resolve; });
+  const turnSteps: Array<() => Response | Promise<Response>> = [
+    () => fakeGatewayToolCall("read_a", "read_file", { path: "a.txt" }),
+    ...(middle === "overflow" ? [() => Response.json({ error: {
+      type: "invalid_request_error", code: "context_length_exceeded",
+      message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+    } }, { status: 400 })] : []),
+    ...(middle === "provider-error" ? [() => Response.json({ error: {
+      type: "invalid_request_error", message: NOTICE_REJECTION,
+    } }, { status: 403 })] : []),
+    middle === "effort"
+      ? async () => {
+        await secondReadReleased;
+        return fakeGatewayToolCall("read_b", "read_file", { path: "b.txt" });
+      }
+      : () => fakeGatewayToolCall("read_b", "read_file", { path: "b.txt" }),
+    () => fakeGatewayToolCall("read_c", "read_file", { path: "c.txt" }),
+    () => fakeGatewayFinalText(NOTICE_DONE),
+  ];
+  const gateway = startDynamicFakeGateway((raw) => {
+    const request = JSON.parse(raw);
+    // A summary request can keep the conversation's tools for the cache,
+    // so its instruction marks it too.
+    const summary = (request.toolChoice?.type === "none" && request.tools?.length === 0) ||
+      raw.includes("Write the compaction notes") || raw.includes("Your notes on the turns above left some out");
+    if (summary) return fakeGatewayFinalText(NOTICE_HANDOFF);
+    if (seeding) {
+      if (!raw.includes('"seed-read"')) return fakeGatewayToolCall("seed-read", "read_file", { path: "seed-notes.txt" });
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: seedReply },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+    }
+    const next = turnSteps[steps++];
+    return next ? next() : new Response("unexpected request", { status: 500 });
+  }, { models: [{
+    id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"],
+    context_window: middle === "auto" ? NOTICE_AUTO_CONTEXT_WINDOW : 128000, max_tokens: 8192,
+    reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+  }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-notice-key",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
+    FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  const stderrPaths: string[] = [];
+  let terminal: InstanceType<typeof TmuxSession> | undefined;
+  async function launch(args: string) {
+    const stderrPath = join(root, `terminal-${stderrPaths.length + 1}.stderr`);
+    stderrPaths.push(stderrPath);
+    const command = `/usr/bin/env -i ${Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} ${args}`;
+    terminal = await TmuxSession.create({
+      cmd: command, cwd: workspace, env: { HOME: home, FX_SOUND: "0" }, isolated: true,
+      stderrPath, width: 100, height: 40, startupWaitMs: 0,
+    });
+    await terminal.waitForStableComposer(20_000);
+    return terminal;
+  }
+  let passed = false;
+  try {
+    const live = await launch("");
+    if (seeding) {
+      await live.sendText("Seed one turn.");
+      await live.waitForPane((pane) => pane.includes("SEED_DONE") && hasEmptyComposer(pane) && turnSettled(pane), 20_000);
+      seeding = false;
+    }
+    await live.sendText(NOTICE_PROMPT);
+    if (middle === "provider-error") {
+      await live.waitForPane((pane) => pane.includes(NOTICE_REJECTION) && pane.includes("press Esc"), 15_000);
+      await live.sendKeys("Enter");
+    } else if (middle === "effort") {
+      await live.waitForPane((pane) => pane.includes("● Read a.txt") && /Thinking \(/.test(pane), 15_000);
+      await until(() => steps === 2, "the second read's request");
+      await live.sendText("/effort high");
+      await live.waitForText("Next turn will use reasoning effort high", 10_000);
+      releaseSecondRead();
+    }
+    const liveRows = noticeTurnRows((await live.waitForPane(noticeTurnDone, 20_000)).split("\n"));
+    await live.sendKeys("C-o");
+    await live.waitForText("esc close · pgup/pgdn scroll", 5000);
+    await live.sendKeys("End");
+    const fullRows = (await live.waitForPane((pane) => pane.includes(NOTICE_DONE) && pane.includes("esc close"), 5000)).split("\n");
+    await live.sendKeys("C-o");
+    await live.waitForComposer(5000);
+    await live.sendText("/quit");
+    expect(await live.waitForSessionEnd(10_000)).toBe(true);
+    await live.kill();
+
+    const resumed = await launch("--resume last");
+    const resumedRows = noticeTurnRows((await resumed.waitForPane(noticeTurnDone, 20_000)).split("\n"));
+    await resumed.sendText("/quit");
+    expect(await resumed.waitForSessionEnd(10_000)).toBe(true);
+    for (const path of stderrPaths) expect(readFileSync(path, "utf8")).toBe("");
+    passed = true;
+    return { liveRows, fullRows, resumedRows };
+  } finally {
+    if (!passed) {
+      if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+      console.error(`notice rows evidence retained: ${root}; steps=${steps}`);
+    }
+    await terminal?.kill();
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/// Checks that Ctrl+O's page shows each of `marks`, in this order.
+function expectFullTranscriptOrder(rows: string[], marks: string[]) {
+  const at = marks.map((mark) => rows.findIndex((row) => row.includes(mark)));
+  expect(at.every((index) => index >= 0)).toBe(true);
+  expect(at).toEqual([...at].sort((left, right) => left - right));
+}
+
+describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle of a turn", () => {
+  const compactedRows = [
+    `┃ ${NOTICE_PROMPT}`,
+    "● Read a.txt",
+    "✓ Context compacted (Ns)",
+    "● Read b.txt, c.txt",
+    `  ${NOTICE_DONE}`,
+  ];
+
+  test("overflow: the calls after an in-turn compaction draw below its line, and share one row after resume", async () => {
+    const { liveRows, fullRows, resumedRows } = await readAroundNotice("overflow");
+    expect(liveRows).toEqual(compactedRows);
+    expectFullTranscriptOrder(fullRows, ["● Read a.txt", "Context compacted", "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
+  }, 120_000);
+
+  test("auto: the calls after an in-turn compaction draw below its line, and share one row after resume", async () => {
+    const { liveRows, resumedRows } = await readAroundNotice("auto");
+    expect(liveRows).toEqual(compactedRows);
+    // This compaction folds the turn's first step into its summary. Whether
+    // resume draws that step is not what this test checks: the calls share
+    // one row.
+    expect(resumedRows).toHaveLength(3);
+    expect(resumedRows[0]).toBe(`┃ ${NOTICE_PROMPT}`);
+    expect(resumedRows[1]).toMatch(/^● Read (?:a\.txt, )?b\.txt, c\.txt$/);
+    expect(resumedRows[2]).toBe(`  ${NOTICE_DONE}`);
+  }, 120_000);
+
+  test("provider error: the calls after the reason fx showed while it waited draw below it, and share one row after resume", async () => {
+    const { liveRows, fullRows, resumedRows } = await readAroundNotice("provider-error");
+    expect(liveRows).toEqual([
+      `┃ ${NOTICE_PROMPT}`,
+      "● Read a.txt",
+      `! system: API access denied · HTTP 403 · invalid_request_error: ${NOTICE_REJECTION}`,
+      "● Read b.txt, c.txt",
+      `  ${NOTICE_DONE}`,
+    ]);
+    expectFullTranscriptOrder(fullRows, ["● Read a.txt", NOTICE_REJECTION, "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
+  }, 120_000);
+
+  test("/effort during the turn: the calls after its line draw below it, and share one row after resume", async () => {
+    const { liveRows, fullRows, resumedRows } = await readAroundNotice("effort");
+    expect(liveRows).toEqual([
+      `┃ ${NOTICE_PROMPT}`,
+      "● Read a.txt",
+      "* Next turn will use reasoning effort high for openai/gpt-5",
+      "● Read b.txt, c.txt",
+      `  ${NOTICE_DONE}`,
+    ]);
+    expectFullTranscriptOrder(fullRows, ["● Read a.txt", "Next turn will use reasoning effort high", "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
+  }, 120_000);
 });
 
 // A real model writes the summary of an automatic compaction that starts in
