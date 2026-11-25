@@ -9,6 +9,7 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const cli_flags = @import("cli_flags.zig");
 const completion = @import("completion.zig");
 const agent_run_flags = @import("agent_run_flags.zig");
@@ -1153,6 +1154,42 @@ test "a command whose output reader went away reports that, however the write fa
     try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
 }
 
+test "writeFdAll reports WriteFailed rather than BrokenPipe on a non-tty unwritable fd" {
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.c.close(fds[0]);
+    _ = std.c.close(fds[1]);
+    var output: OwnOutput = .{};
+    const err = writeFdAll(fds[0], "x");
+    try std.testing.expectError(error.WriteFailed, err);
+    OwnOutput.noteFailure(&output, error.WriteFailed);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+}
+
+test "writeFdAll preserves InputOutput on a closed TestPty while open files keep OutputWriteFailed" {
+    const shell_runtime = @import("../../ui/shell_runtime.zig");
+    var output: OwnOutput = .{};
+    try std.testing.expectEqual(@as(anyerror, error.TerminalHungUp), output.commandError(error.TerminalHungUp));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "out.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expect(!ui_terminal.terminalGone(file.handle, error.InputOutput));
+    OwnOutput.noteFailure(&output, error.InputOutput);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |f| f.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expectError(error.InputOutput, writeFdAll(slave.handle, "x"));
+    try std.testing.expect(ui_terminal.terminalGone(slave.handle, error.InputOutput));
+}
+
 fn runNoConfigIfRequestedWithDeps(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -1421,6 +1458,7 @@ fn activateProviderSelectionFallible(
     var performed_login: ?model_provider.ProviderId = null;
     if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
         runProviderLogin(alloc, cfg, target) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writeProviderLoginFailure(alloc, deps, target, caller, err);
             return false;
         };
@@ -1803,6 +1841,7 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = login_args.provider orelse .gateway;
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
+                if (isTerminalOrOutputGone(err)) return err;
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
             };
@@ -1966,6 +2005,7 @@ fn runNonInteractiveWithDeps(
                     .validate_fn = validateCliTeamCredential,
                 },
             ) catch |err| {
+                if (isTerminalOrOutputGone(err)) return err;
                 const message = switch (err) {
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
@@ -2704,7 +2744,8 @@ fn runPasteSetup(
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
-    const stored_interactively = secret_store.storeInteractive() catch {
+    const stored_interactively = secret_store.storeInteractive() catch |err| {
+        if (isTerminalOrOutputGone(err)) return err;
         try writeStderr(deps, "\n");
         try writePasteFailure(alloc, deps, command, "API key was not saved");
         return false;
@@ -2715,14 +2756,16 @@ fn runPasteSetup(
             alloc,
             deps.write_stderr,
             deps.stderr_ctx,
-        ) catch {
+        ) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writeStderr(deps, "\n");
             try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
-        secret_store.store(alloc, key) catch {
+        secret_store.store(alloc, key) catch |err| {
+            if (isTerminalOrOutputGone(err)) return err;
             try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
@@ -2764,7 +2807,14 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        const n = std.posix.read(std.posix.STDIN_FILENO, &byte) catch |err| {
+            if (ui_terminal.terminalGone(std.posix.STDIN_FILENO, err)) return error.TerminalHungUp;
+            return err;
+        };
+        if (n == 0) {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return error.SetupCancelled;
+        }
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2803,7 +2853,10 @@ const MaskedKeyRawMode = struct {
         }
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = io_mod.tcgetattr(std.posix.STDIN_FILENO) catch |err| {
+            if (ui_terminal.terminalInputGone(std.posix.STDIN_FILENO)) return error.TerminalHungUp;
+            return err;
+        };
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2973,12 +3026,21 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     };
 }
 
+fn isTerminalOrOutputGone(err: anyerror) bool {
+    return err == error.TerminalHungUp or
+        err == error.TerminalInputClosed or
+        err == error.OutputReaderGone;
+}
+
 fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
     const written = if (comptime builtin.target.os.tag != .windows)
         writeFdAll(std.posix.STDOUT_FILENO, text)
     else
         std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
     written catch |err| {
+        if (comptime builtin.target.os.tag != .windows) {
+            if (ui_terminal.terminalGone(std.posix.STDOUT_FILENO, err)) return error.TerminalHungUp;
+        }
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
@@ -2990,6 +3052,9 @@ fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
     else
         std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
     written catch |err| {
+        if (comptime builtin.target.os.tag != .windows) {
+            if (ui_terminal.terminalGone(std.posix.STDERR_FILENO, err)) return error.TerminalHungUp;
+        }
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
@@ -3001,8 +3066,12 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     while (remaining.len > 0) {
         const written = std.c.write(fd, remaining.ptr, remaining.len);
         if (written <= 0) {
-            // A reader that went away, as `head` does, is told apart.
-            if (written < 0 and std.posix.errno(written) == .PIPE) return error.BrokenPipe;
+            // Preserve PIPE and IO so callers separate pipe closes and terminal hang-ups from generic write errors.
+            if (written < 0) switch (std.posix.errno(written)) {
+                .PIPE => return error.BrokenPipe,
+                .IO => return error.InputOutput,
+                else => {},
+            };
             return error.WriteFailed;
         }
         remaining = remaining[@intCast(written)..];

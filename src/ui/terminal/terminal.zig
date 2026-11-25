@@ -33,6 +33,12 @@ pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
     return (fds[0].revents & gone_mask) != 0;
 }
 
+/// Whether terminal `fd` hung up when a read hit EOF (`0`) or `poll` reported
+/// `POLLHUP`/`POLLERR`/`POLLNVAL` (`tests/tla/cli_hangup/CliHangup.tla` `GoneIsQuiet`).
+pub fn terminalInputGone(fd: std.posix.fd_t) bool {
+    return terminalGone(fd, error.InputOutput);
+}
+
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
 pub const bracketed_paste_enable_sequence = "\x1b[?2004h";
@@ -215,6 +221,28 @@ test "terminalGone returns false for non-InputOutput errors" {
     master.?.close(io_mod.getIo());
     master = null;
     try std.testing.expect(!terminalGone(slave.handle, error.BrokenPipe));
+}
+
+test "terminalInputGone returns true on a closed TestPty and false on an open TestPty or file" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const pty = try shell_runtime.TestPty.open();
+    var master: ?std.Io.File = .{ .handle = pty.master, .flags = .{ .nonblocking = false } };
+    defer if (master) |file| file.close(io_mod.getIo());
+    const slave: std.Io.File = .{ .handle = pty.slave, .flags = .{ .nonblocking = false } };
+    defer slave.close(io_mod.getIo());
+
+    try std.testing.expect(!terminalInputGone(slave.handle));
+    master.?.close(io_mod.getIo());
+    master = null;
+    try std.testing.expect(terminalInputGone(slave.handle));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "regular.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+    try std.testing.expect(!terminalInputGone(file.handle));
 }
 
 test "terminalGone returns true when a foreign foreground group owns the terminal" {
