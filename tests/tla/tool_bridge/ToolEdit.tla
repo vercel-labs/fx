@@ -1,8 +1,8 @@
 ---------------------------- MODULE ToolEdit ----------------------------
 (***************************************************************************)
 (* How the file edits of a bash program reach fx, for the experimental    *)
-(* bash tool. This is a design model: the code it describes has not       *)
-(* landed.                                                                 *)
+(* bash tool. This is a design model. The code it describes has landed,   *)
+(* and tests/tla/drivers/tool_bridge/ runs the real file path along it.   *)
 (*                                                                         *)
 (* Design = "current": a program writes files itself, and fx sees only    *)
 (*   its output.                                                           *)

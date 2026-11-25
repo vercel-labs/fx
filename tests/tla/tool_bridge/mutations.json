@@ -1,0 +1,34 @@
+[
+  {
+    "id": "no-recheck",
+    "breaks": "The prompt re-check passes for a request that left, so a prompt opens for it (bridge.zig authorizeGated, through awaitingPermission).",
+    "file": "src/core/tool_bridge/core.zig",
+    "find": "    return state.slots[index].?.stage == .authorizing;",
+    "replace": "    _ = index;\n    return true;",
+    "expect": "NoAskAfterGone"
+  },
+  {
+    "id": "no-stale-check",
+    "breaks": "The apply writes without checking that the file is still the version fx read (file_mutation.zig validatePreimage).",
+    "file": "src/core/tooling/file_mutation.zig",
+    "find": "    return switch (prepared.preimage) {",
+    "replace": "    if (true) return .{ .valid = null };\n    return switch (prepared.preimage) {",
+    "expect": "NoStaleApply"
+  },
+  {
+    "id": "apply-after-gone",
+    "breaks": "A call keeps running after its client left, so the edit is applied for a program that is gone (core.zig letGo).",
+    "file": "src/core/tool_bridge/core.zig",
+    "find": "            entry.stage = .abandoned_call;\n            out.push(.{ .cancel = entry.id });",
+    "replace": "            // planted: the call keeps running after its client left",
+    "expect": "NoApplyAfterGone"
+  },
+  {
+    "id": "double-push",
+    "breaks": "One committed change is pushed twice to the change tracker, so the transcript shows it twice (change_tracker.zig pushOperation).",
+    "file": "src/core/workspace/change_tracker.zig",
+    "find": "        try self.stack.append(alloc, op);\n    }\n\n    pub fn undoLast",
+    "replace": "        try self.stack.append(alloc, op);\n        try self.stack.append(alloc, op);\n    }\n\n    pub fn undoLast",
+    "expect": "ShownOnce"
+  }
+]

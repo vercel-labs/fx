@@ -1,7 +1,10 @@
 #!/bin/sh
 # Model-check ToolEdit, how a bash program's file edits reach fx, and
 # require each config's expected verdict. This is a design model for
-# `fx tool edit` and `fx tool write`; the code has not landed.
+# `fx tool edit` and `fx tool write`. The code has landed: the bridge core,
+# the file change, and the change tracker. The Bun driver in
+# tests/tla/drivers/tool_bridge/ runs that real path along this model after
+# TLC, see its last line, which FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 skips.
 #
 # design-bridge and design-diff must pass. current-raw shows that today a
 # program's own edits are invisible. bridge-raw and the diff-* configs show
@@ -43,3 +46,12 @@ ToolEdit witness-stale NeverStale
 ToolEdit simulate-ideal simulate $sim
 ToolEdit simulate-nonideal simulate $sim
 EOT
+
+# The driver: the design-bridge state graph walked on the real harness,
+# code traces checked by TraceToolEdit.tla, and each planted bug in
+# mutations.json caught. FX_TLA_TOOL_BRIDGE_QUICK=1 runs the quick settings.
+# FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 skips the driver and keeps the TLC verdicts,
+# which every pull request checks in ci.yml.
+if [ "${FX_TLA_TOOL_BRIDGE_TLC_ONLY:-0}" != "1" ]; then
+    bun ../drivers/tool_bridge/verify.ts
+fi
