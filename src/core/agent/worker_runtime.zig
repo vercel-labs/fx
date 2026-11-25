@@ -1042,9 +1042,22 @@ pub const WorkerRuntime = struct {
     /// The sign-in fx opened for a request that waits for one closed without
     /// a new login, for example because its code expired. The request tries
     /// its saved login once more; a request that does not wait for a sign-in
-    /// ignores it.
+    /// ignores it. Its caller asks only while one waits, so the turn goes on
+    /// (`began_work`).
     pub fn requestRecoverySignInClosed(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_sign_in_closed.store(true, .seq_cst);
+    }
+
+    /// A request that waited for the user goes on without a call above, as
+    /// after the out-of-credits picker's retry, or a sign-in another fx
+    /// process stored (`began_work`).
+    pub fn markBeganWork(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
     }
 
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
@@ -3727,7 +3740,9 @@ pub const WorkerRuntime = struct {
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = new_response;
         if (answers != null) {
-            self.began_work = true;
+            // A route-recovery picker's answer can end the turn; its asker
+            // marks the one that goes on (`markBeganWork`).
+            if (self.pending_question_shared.?.source != .route_recovery) self.began_work = true;
             if (on_resume) |observer| observer.run(observer.ctx);
         }
         self.worker_cond.broadcast(io_mod.getIo());
@@ -9620,7 +9635,7 @@ test "question resume observer runs only for accepted answers before releasing t
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
-test "a turn's start, an accepted answer or approval, and a continue mark began work until it is taken" {
+test "a turn's start, an accepted answer or approval, and a continued request mark began work until it is taken" {
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
@@ -9651,7 +9666,24 @@ test "a turn's start, an accepted answer or approval, and a continue mark began 
     runtime.requestRecoveryContinue();
     try std.testing.expect(runtime.recovery_continue_requested.load(.seq_cst));
     try std.testing.expect(runtime.takeBeganWork());
+
+    // A sign-in that closed without a login tries the saved one again.
+    runtime.requestRecoverySignInClosed();
+    try std.testing.expect(runtime.recovery_sign_in_closed.load(.seq_cst));
+    try std.testing.expect(runtime.takeBeganWork());
+
     runtime.finishProcessing();
+
+    // An answer to a route-recovery picker marks nothing by itself: only the
+    // choice that goes on does.
+    var picker = WorkerRuntime{};
+    defer picker.deinit(alloc);
+    picker.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .route_recovery);
+    try picker.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    try std.testing.expect(picker.pending_question_response == .answered);
+    try std.testing.expect(!picker.takeBeganWork());
+    picker.markBeganWork();
+    try std.testing.expect(picker.takeBeganWork());
 
     // A cancelled question ends its turn: no work goes on.
     var cancelled = WorkerRuntime{};
