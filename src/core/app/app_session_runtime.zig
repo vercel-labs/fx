@@ -14076,7 +14076,7 @@ test "eb03: restore with FIFO at snapshot path does not block and counts image n
 
     // Replace the snapshot file with a FIFO; restore must not block and must count 1 image not restored.
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), att.snapshot_path.?);
-    const snap_z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{att.snapshot_path.?}, 0);
+    const snap_z = try alloc.printSentinel("{s}", .{att.snapshot_path.?}, 0);
     defer alloc.free(snap_z);
     try std.testing.expectEqual(@as(c_int, 0), mkfifo(snap_z.ptr, 0o600));
 

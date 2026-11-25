@@ -4875,7 +4875,7 @@ test "eb03: verifySnapshotFile rejects a FIFO without blocking" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const fifo_path = try std.fmt.allocPrintSentinel(alloc, "{s}/snap.fifo", .{root}, 0);
+    const fifo_path = try alloc.printSentinel("{s}/snap.fifo", .{root}, 0);
     defer alloc.free(fifo_path);
     try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
     const fake_sha: [snapshot_digest_hex_len]u8 = @splat('0');
