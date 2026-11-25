@@ -2813,13 +2813,15 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         defer session.session_write_mutex.unlock(io_mod.getIo());
         if (comptime has_v2_session_store) {
             if (session.v2) |v2| {
-                const v2_ids = session.steering.collectV2InputIds(active.alloc) catch null;
-                defer if (v2_ids) |ids| active.alloc.free(ids);
-                if (v2_ids) |ids| if (ids.len > 0) {
+                var chunk_buf: [32]u64 = undefined;
+                var cursor: usize = 0;
+                while (true) {
+                    const ids = session.steering.collectV2InputIdsChunk(&cursor, &chunk_buf);
+                    if (ids.len == 0) break;
                     v2.recordInputsWithdrawn(ids) catch |err| {
                         debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ ids.len, @errorName(err) });
                     };
-                };
+                }
             }
         }
         break :blk session.steering.finishTurn(active.state.alloc, active.alloc, "turn_finished") catch |err| {
@@ -5678,4 +5680,84 @@ test "eb03: $/cancel_request withdraws queued steer, records input_withdrawn, an
     defer alloc.free(out);
     try std.testing.expect(std.mem.find(u8, out, "\"id\":99") != null);
     try std.testing.expect(std.mem.find(u8, out, "\"steering\":\"dropped\"") != null);
+}
+
+test "eb03: turn end withdraws queued v2 steering ids in chunks even when active.alloc fails" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    var store = try session_adapter.Store.open(alloc, home_path);
+    defer store.deinit(alloc);
+    var model = "m".*;
+    const v2 = try session_adapter.Session.create(alloc, &store, "/tmp", .acp, .{
+        .preferences = .{ .provider = .gateway, .model = &model, .effort = .auto, .fast_mode = false },
+        .language = session_runtime.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, session_runtime.ConversationLanguage.default());
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "chunk-withdraw.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.cfg.auth_mode = .host_managed;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, v2.id()),
+        .v2 = v2,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    try v2.beginTurn();
+    state.active_session.?.steering.open(alloc);
+
+    const queued_count: usize = 40;
+    for (0..queued_count) |i| {
+        var text_buf: [24]u8 = undefined;
+        const text = try std.mem.print(&text_buf, "steer-{d}", .{i});
+        const input_id = try v2.recordInputAccepted(text);
+        try state.active_session.?.steering.enqueueRequestWithV2Id(alloc, text, .{ .integer = @intCast(i + 100) }, input_id);
+    }
+
+    var active = ActivePrompt{
+        .state = &state,
+        .alloc = std.testing.failing_allocator,
+        .msg = .{
+            .id = .{ .integer = 1 },
+            .method = "session/prompt",
+            .params_raw = null,
+        },
+        .mode = "default",
+        .permission_mode = .ask,
+    };
+    promptWorkerMain(&active);
+
+    var pending = try v2.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
 }

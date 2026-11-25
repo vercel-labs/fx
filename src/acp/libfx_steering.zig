@@ -374,22 +374,19 @@ pub const Runtime = struct {
         return false;
     }
 
-    pub fn collectV2InputIds(self: *Runtime, result_alloc: Allocator) Allocator.Error![]u64 {
+    pub fn collectV2InputIdsChunk(self: *Runtime, start_index: *usize, out: []u64) []const u64 {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         var count: usize = 0;
-        for (self.messages.items) |entry| {
-            if (entry.v2_input_id != null) count += 1;
+        while (start_index.* < self.messages.items.len and count < out.len) {
+            const entry = self.messages.items[start_index.*];
+            start_index.* += 1;
+            if (entry.v2_input_id) |id| {
+                out[count] = id;
+                count += 1;
+            }
         }
-        if (count == 0) return &.{};
-        const ids = try result_alloc.alloc(u64, count);
-        var copied: usize = 0;
-        for (self.messages.items) |entry| {
-            const id = entry.v2_input_id orelse continue;
-            ids[copied] = id;
-            copied += 1;
-        }
-        return ids;
+        return out[0..count];
     }
 
     pub fn validateEnqueue(self: *Runtime, text_len: usize) EnqueueError!void {
@@ -932,9 +929,11 @@ test "eb03: steering runtime carries v2_input_id, peeks ids, and withdraws reque
     try runtime.enqueueRequestWithV2Id(alloc, "first", .{ .integer = 11 }, 101);
     try runtime.enqueueRequestWithV2Id(alloc, "second", .{ .string = "req-2" }, 102);
 
-    const peeked = try runtime.collectV2InputIds(alloc);
-    defer alloc.free(peeked);
-    try std.testing.expectEqualSlices(u64, &.{ 101, 102 }, peeked);
+    var chunk_buf: [1]u64 = undefined;
+    var cursor: usize = 0;
+    try std.testing.expectEqualSlices(u64, &.{101}, runtime.collectV2InputIdsChunk(&cursor, &chunk_buf));
+    try std.testing.expectEqualSlices(u64, &.{102}, runtime.collectV2InputIdsChunk(&cursor, &chunk_buf));
+    try std.testing.expectEqual(@as(usize, 0), runtime.collectV2InputIdsChunk(&cursor, &chunk_buf).len);
 
     try std.testing.expectEqual(@as(?u64, 101), runtime.findQueuedRequest(.{ .integer = 11 }).?.v2_input_id);
     try std.testing.expect(runtime.withdrawRequest(alloc, .{ .integer = 11 }));
