@@ -370,6 +370,9 @@ fn commitRun(
     for (ordered) |entry| {
         if (!listed(notes.covered.items, entry.stamp) and !listed(notes.missing.items, entry.stamp)) continue;
         sandbox.removePending(ctx, entry.run_id) catch return "the pending runs could not be removed";
+        if (listed(notes.missing.items, entry.stamp)) {
+            debug_trace.logf("remote run", "event=pending_dropped run_id={s} reason=stamp_missing_in_sandbox", .{entry.run_id});
+        }
     }
     return null;
 }
@@ -1800,6 +1803,58 @@ test "a failed manifest write keeps every covered pending record for the next ru
     const pending = try sandbox.readPending(arena, &context);
     try testing.expectEqual(@as(usize, 1), pending.len);
     try testing.expectEqualStrings("0123456789abcdef", pending[0].run_id);
+}
+
+test "a pending run whose stamp is gone from the sandbox is dropped, and the trace names it (N8)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    const baseline = [_]sandbox.BringBackFile{.{ .rel = "out/app", .size = 7, .mtime_ns = 9 }};
+    try notePending(&context, "0123456789abcdef", 42, &baseline, .{ .exited = 0 }, true);
+    const ordered = try sandbox.readPending(arena, &context);
+    var manifest = try testManifest(arena, &.{});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    try notes.missing.append(arena, ordered[0].stamp);
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    apply.ctx = &context;
+
+    const root = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(root);
+    const trace_path = try std.Io.Dir.path.join(testing.allocator, &.{ root, "bring-back.log" });
+    defer testing.allocator.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(testing.allocator, trace_path, "remote run");
+
+    try testing.expect(commitRun(&context, &apply, &manifest, &.{}, ordered, &notes, &.{}) == null);
+    try testing.expectEqual(@as(usize, 0), (try sandbox.readPending(arena, &context)).len);
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(testing.allocator, &file, 8192);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "event=pending_dropped run_id=0123456789abcdef reason=stamp_missing_in_sandbox") != null);
 }
 
 test "a pending record that outlives a committed bring-back is walked again, and no file is brought back twice (N8)" {

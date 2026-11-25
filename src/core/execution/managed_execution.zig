@@ -193,6 +193,34 @@ test "only a placed command leaves the host's timeout and force-stop notes" {
     try std.testing.expectEqual(HostNote.force_stopped, forceStopNote(.isolated).?);
 }
 
+test "a host note goes only to a result that reports the command's end" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var input = StartCapturedInput{
+        .execution_id = "host-note-at-end",
+        .command = "sleep 1; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    const entry = runtime.acquireEntry(input.execution_id).?;
+    defer runtime.releaseEntry(entry);
+    entry.host_note = .force_stopped;
+    try std.testing.expectEqual(@as(?HostNote, null), runtime.takeHostNoteAtEnd(input.execution_id, .running));
+    try std.testing.expectEqual(HostNote.force_stopped, runtime.takeHostNoteAtEnd(input.execution_id, .lost).?);
+    try std.testing.expectEqual(@as(?HostNote, null), runtime.takeHostNote(input.execution_id));
+}
+
 pub const PreparedSnapshot = struct {
     snapshot: Snapshot,
     reservation_id: u64,
@@ -1171,6 +1199,14 @@ pub const Runtime = struct {
         const note = entry.host_note;
         entry.host_note = null;
         return note;
+    }
+
+    /// The host's note for a placed command (N6, N7), handed out once like `takeHostNote`, but only
+    /// to a result that reports the command's end. A running result leaves the note in place for
+    /// the later call that reports the end.
+    pub fn takeHostNoteAtEnd(self: *Runtime, execution_id: []const u8, state: SnapshotState) ?HostNote {
+        if (std.meta.activeTag(state) == .running) return null;
+        return self.takeHostNote(execution_id);
     }
 
     pub fn stop(

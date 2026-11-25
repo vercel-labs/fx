@@ -10,6 +10,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const git_config = @import("git_config.zig");
 const layout = @import("layout.zig");
 const scan_mod = @import("scan.zig");
+const sources_mod = @import("sources.zig");
 const snapshot_mod = @import("snapshot.zig");
 const tree_mod = @import("tree.zig");
 const bounded_read = @import("bounded_read.zig");
@@ -99,7 +100,7 @@ pub fn ignoreFiles(arena: Allocator, workspace_root: []const u8) Allocator.Error
             .unavailable => result.unavailable = true,
         }
     }
-    const info_exclude = try scan_mod.infoExcludePath(arena, found.common_dir);
+    const info_exclude = try sources_mod.infoExcludePath(arena, found.common_dir);
     switch (try bounded_read.readAbsolute(arena, info_exclude, ignore.max_pattern_file_bytes)) {
         .content => |content| result.info_exclude = content,
         .missing => {},

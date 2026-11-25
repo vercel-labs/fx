@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const io_mod = @import("../../shared/io.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
+const testing = std.testing;
 const credentials = @import("credentials.zig");
 const transport = @import("transport.zig");
 const stream = @import("stream.zig");
@@ -972,6 +974,7 @@ pub fn readManifest(ctx: *Context) Error!Manifest {
     return parseManifest(ctx.alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BadReply => {
+            debug_trace.logf("remote run", "event=manifest_reset what=manifest reason=damaged effect=read_as_empty", .{});
             ctx.manifest_reset = true;
             return emptyManifest();
         },
@@ -1412,6 +1415,9 @@ pub fn freshGeneration(ctx: *Context) Allocator.Error![]const u8 {
 /// Keeps the newest `max_brought_entries` records and drops the oldest (V9). A dropped record
 /// only makes a later run keep that Mac file (N9).
 pub fn trimBrought(brought: *FileMap) void {
+    if (brought.count() > max_brought_entries) {
+        debug_trace.logf("remote run", "event=brought_dropped what=brought count={d} reason=over_cap cap={d}", .{ brought.count() - max_brought_entries, max_brought_entries });
+    }
     while (brought.count() > max_brought_entries) brought.orderedRemoveAt(0);
 }
 
@@ -1438,12 +1444,18 @@ pub fn applyBackRecord(alloc: Allocator, manifest: *Manifest, record: journal.Re
 pub fn foldJournal(ctx: *Context) Error!void {
     const bytes = (readVerified(ctx.alloc, ctx.state_dir, journal.file_name, journal.max_bytes) catch |err| return refuseError(ctx, "journal", err)) orelse return;
     const parsed = journal.parse(ctx.alloc, bytes) catch |err| switch (err) {
-        error.BadJournal => return setJournalAside(ctx),
+        error.BadJournal => {
+            debug_trace.logf("remote run", "event=journal_set_aside what=journal reason=damaged", .{});
+            return setJournalAside(ctx);
+        },
         error.OutOfMemory => return error.OutOfMemory,
     };
     var manifest = try readManifest(ctx);
     // A manifest with no generation cannot be committed, and the records have nothing to apply to (V9).
-    if (manifest.generation == null) return setJournalAside(ctx);
+    if (manifest.generation == null) {
+        debug_trace.logf("remote run", "event=journal_set_aside what=journal reason=no_manifest_generation", .{});
+        return setJournalAside(ctx);
+    }
     for (parsed.records) |record| try applyBackRecord(ctx.alloc, &manifest, record);
     try commitManifest(ctx, &manifest);
     journal.remove(ctx.state_dir) catch |err| return refuseError(ctx, "journal", err);
@@ -1486,6 +1498,70 @@ const size_answer = "{\"sandbox\":{\"name\":\"fx-test\",\"vcpus\":4,\"expiresAt\
 
 fn baseFor(buffer: []u8, port: u16) !transport.BaseUrl {
     return transport.resolveBaseUrl(try std.mem.print(buffer, "http://127.0.0.1:{d}", .{port}));
+}
+
+test "a damaged manifest is read as empty, and the trace says so (V5)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    try state_dir.dir.writeFile(io_mod.getIo(), .{ .sub_path = manifest_file, .data = "{\"generation\": " });
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, transport.resolveBaseUrl(null), &capture, &state_dir);
+
+    const trace_path = try traceFileIn(tmp.dir, "manifest.log");
+    defer testing.allocator.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(testing.allocator, trace_path, "remote run");
+
+    const manifest = try readManifest(&ctx);
+    try testing.expect(manifest.generation == null);
+    try testing.expect(ctx.manifest_reset);
+    try expectTraceHas(trace_path, "event=manifest_reset what=manifest reason=damaged effect=read_as_empty");
+}
+
+test "a damaged journal is set aside, and the trace says why (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    try state_dir.dir.writeFile(io_mod.getIo(), .{ .sub_path = journal.file_name, .data = "not a journal record\n" });
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, transport.resolveBaseUrl(null), &capture, &state_dir);
+
+    const trace_path = try traceFileIn(tmp.dir, "journal.log");
+    defer testing.allocator.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(testing.allocator, trace_path, "remote run");
+
+    try foldJournal(&ctx);
+    try testing.expect(ctx.journal_set_aside);
+    try expectTraceHas(trace_path, "event=journal_set_aside what=journal reason=damaged");
+}
+
+/// The absolute path of `name` in `dir`, for a trace file the test configures.
+fn traceFileIn(dir: std.Io.Dir, name: []const u8) ![]u8 {
+    const root = try io_mod.dirRealpathAlloc(testing.allocator, dir, ".");
+    defer testing.allocator.free(root);
+    return std.Io.Dir.path.join(testing.allocator, &.{ root, name });
+}
+
+fn expectTraceHas(path: []const u8, needle: []const u8) !void {
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(testing.allocator, &file, 8192);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, needle) != null);
 }
 
 fn contextFor(

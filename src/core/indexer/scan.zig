@@ -13,11 +13,6 @@
 
 const std = @import("std");
 
-/// The repository's `info/exclude`, under the common git directory. The scan and the
-/// excludes read in `indexer.zig` both name it through this one join.
-pub fn infoExcludePath(arena: std.mem.Allocator, common_dir: []const u8) std.mem.Allocator.Error![]const u8 {
-    return std.Io.Dir.path.join(arena, &.{ common_dir, "info", "exclude" });
-}
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const git_config = @import("git_config.zig");
@@ -378,7 +373,7 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
     if (wide.unavailable.len > 0) incomplete.* = true;
     for (loaded.paths) |read| try rules.sources.append(arena, .{ .path = read.path, .identity_only = false, .follow_symlinks = read.follow_symlinks });
     if (settings.excludes_file) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false, .follow_symlinks = settings.excludes_file_follows_symlinks });
-    try rules.sources.append(arena, .{ .path = try infoExcludePath(arena, found.common_dir), .identity_only = false });
+    try rules.sources.append(arena, .{ .path = try sources.infoExcludePath(arena, found.common_dir), .identity_only = false });
     for ([_][]const u8{ "index", "HEAD", "commondir" }) |name| try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ found.git_dir, name }), .identity_only = false });
 
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;

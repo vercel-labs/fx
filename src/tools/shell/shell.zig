@@ -904,7 +904,7 @@ fn callRun(
     defer prepared.deinit(ctx.allocator);
     // The host's note for a placed run (N7, N6) goes in the notice of the call that reports its
     // end, with the reason line. `finishPrepared` leaves a run's note to this call.
-    const host_line: ?[]const u8 = if (runtime.takeHostNote(execution_id)) |note|
+    const host_line: ?[]const u8 = if (runtime.takeHostNoteAtEnd(execution_id, prepared.snapshot.state)) |note|
         try hostNoteLine(request_arena, note)
     else
         null;
@@ -930,9 +930,9 @@ fn hostNoteLine(alloc: Allocator, note: managed_execution.HostNote) Allocator.Er
 }
 
 /// Adds the host's N6 or N7 line to a result body, when the placed command has one to report
-/// (`Runtime.takeHostNote`). Frees `body` only when it returns the new one.
-fn withHostNote(alloc: Allocator, runtime: *managed_execution.Runtime, execution_id: []const u8, body: []u8) Allocator.Error![]u8 {
-    const note = runtime.takeHostNote(execution_id) orelse return body;
+/// (`Runtime.takeHostNoteAtEnd`). Frees `body` only when it returns the new one.
+fn withHostNote(alloc: Allocator, runtime: *managed_execution.Runtime, execution_id: []const u8, state: managed_execution.SnapshotState, body: []u8) Allocator.Error![]u8 {
+    const note = runtime.takeHostNoteAtEnd(execution_id, state) orelse return body;
     const line = try hostNoteLine(alloc, note);
     defer alloc.free(line);
     const updated = (try withJsonStringField(alloc, body, "notice", line)) orelse return body;
@@ -2340,7 +2340,7 @@ fn finishPrepared(
         .stop => {},
     }
     // A run's host note goes with its reason line in `callRun`, so only the other actions attach it here.
-    if (action != .run) body = try withHostNote(ctx.allocator, runtime, prepared.snapshot.execution_id, body);
+    if (action != .run) body = try withHostNote(ctx.allocator, runtime, prepared.snapshot.execution_id, prepared.snapshot.state, body);
     publishSnapshotMetadata(ctx, prepared.snapshot) catch |err| {
         runtime.cancelDelivery(
             prepared.snapshot.execution_id,

@@ -192,6 +192,15 @@ pub const Slot = struct {
         try self.marks.put(self.alloc, key, .{ .turn_id = turn_id, .mark = mark });
     }
 
+    /// Removes the mark that `session_key` holds, when that session ends, so the marks of ended
+    /// sessions do not build up in a long process. A null key is a no-op (U2).
+    pub fn forgetSession(self: *Slot, session_key: ?[]const u8) void {
+        const session = session_key orelse return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.removeMarkLocked(session);
+    }
+
     fn removeMarkLocked(self: *Slot, session: []const u8) void {
         const removed = self.marks.fetchSwapRemove(session) orelse return;
         self.alloc.free(removed.key);
@@ -392,6 +401,20 @@ test "U4: a turn id of 0 never clears a mark, and a mark cannot be recorded with
     try testing.expectEqual(setup.Mark.declined, slot.markFor("session-a", 5));
     try slot.recordMark("session-a", 5, .none);
     try testing.expectEqual(setup.Mark.none, slot.markFor("session-a", 5));
+}
+
+test "U4: a session that ends takes its own mark with it, and no other session's" {
+    const slot = try Slot.create(testing.allocator);
+    defer slot.destroy();
+
+    try slot.recordMark("session-a", 5, .declined);
+    try slot.recordMark("session-b", 5, .no_answer);
+    slot.forgetSession("session-a");
+    try testing.expectEqual(setup.Mark.none, slot.markFor("session-a", 5));
+    try testing.expectEqual(setup.Mark.no_answer, slot.markFor("session-b", 5));
+    slot.forgetSession(null);
+    slot.forgetSession("session-never-seen");
+    try testing.expectEqual(setup.Mark.no_answer, slot.markFor("session-b", 5));
 }
 
 test "U2: a call without a session key never touches the mark" {

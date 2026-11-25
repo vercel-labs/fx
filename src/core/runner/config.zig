@@ -4,6 +4,7 @@
 const std = @import("std");
 const command_environment = @import("../execution/command_environment.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const pathing = @import("../workspace/pathing.zig");
 
 /// Where a command runs. `profile` applies to `.isolated` only. Null means the
 /// profile named `default`.
@@ -265,21 +266,13 @@ fn pathsCovering(lists: []const FolderPaths, workspace_root: []const u8) []const
 pub fn longestCovering(folders: anytype, workspace_root: []const u8) ?usize {
     var best: ?usize = null;
     for (folders, 0..) |entry, index| {
-        if (!covers(entry.folder, workspace_root)) continue;
+        if (!pathing.pathInside(entry.folder, workspace_root)) continue;
         if (best) |current| {
             if (folders[current].folder.len >= entry.folder.len) continue;
         }
         best = index;
     }
     return best;
-}
-
-/// True when `workspace_root` is `folder` or lies inside it. The folder is
-/// normalized. The workspace root is expected to be an absolute path.
-fn covers(folder: []const u8, workspace_root: []const u8) bool {
-    if (std.mem.eql(u8, folder, "/")) return std.mem.startsWith(u8, workspace_root, "/");
-    if (!std.mem.startsWith(u8, workspace_root, folder)) return false;
-    return workspace_root.len == folder.len or workspace_root[folder.len] == '/';
 }
 
 fn parseProfiles(arena: std.mem.Allocator, diagnostic: *Diagnostic, value: std.json.Value) ParseError![]const Profile {

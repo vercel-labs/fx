@@ -2442,20 +2442,12 @@ pub fn shellRunRefusal(
     return null;
 }
 
-/// Whether `path` is `root` or lies under it, compared on whole path segments:
-/// `/repo2` is not inside `/repo`.
-pub fn pathInsideRoot(root: []const u8, path: []const u8) bool {
-    const base = std.mem.trimEnd(u8, root, "/");
-    if (!std.mem.startsWith(u8, path, base)) return false;
-    return path.len == base.len or path[base.len] == '/';
-}
-
 fn cwdInsideRoot(arena: Allocator, workspace_root: []const u8, cwd_arg: ?[]const u8) Allocator.Error!bool {
     const resolved = pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, cwd_arg orelse ".") catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
-    return pathInsideRoot(workspace_root, resolved);
+    return pathing.pathInside(workspace_root, resolved);
 }
 
 /// The refusal text for a placement error from `sandbox`. A terminal cannot
@@ -7335,12 +7327,12 @@ fn expectRunRefusal(input: Input, arena: Allocator, extra: []const u8, expected:
 }
 
 test "a cwd is inside the workspace by path segments, not by string prefix" {
-    try std.testing.expect(pathInsideRoot("/Users/example/repo", "/Users/example/repo"));
-    try std.testing.expect(pathInsideRoot("/Users/example/repo", "/Users/example/repo/sub"));
-    try std.testing.expect(pathInsideRoot("/Users/example/repo/", "/Users/example/repo/sub"));
-    try std.testing.expect(!pathInsideRoot("/Users/example/repo", "/Users/example/repo2"));
-    try std.testing.expect(!pathInsideRoot("/Users/example/repo", "/Users/example"));
-    try std.testing.expect(pathInsideRoot("/", "/anywhere"));
+    try std.testing.expect(pathing.pathInside("/Users/example/repo", "/Users/example/repo"));
+    try std.testing.expect(pathing.pathInside("/Users/example/repo", "/Users/example/repo/sub"));
+    try std.testing.expect(pathing.pathInside("/Users/example/repo/", "/Users/example/repo/sub"));
+    try std.testing.expect(!pathing.pathInside("/Users/example/repo", "/Users/example/repo2"));
+    try std.testing.expect(!pathing.pathInside("/Users/example/repo", "/Users/example"));
+    try std.testing.expect(pathing.pathInside("/", "/anywhere"));
 }
 
 test "a built-in remote run with no config is admitted, and gets no provider refusal" {

@@ -13,6 +13,8 @@ const sandbox = @import("sandbox.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const sync = @import("sync.zig");
 const transport = @import("transport.zig");
+const credentials = @import("credentials.zig");
+const test_server = @import("test_server.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -198,9 +200,18 @@ pub fn sweep(arena: Allocator, ctx: *sandbox.Context, prefix: []const u8, now_ms
     var cursor: ?[]const u8 = null;
     var seen: usize = 0;
     while (seen < sweep_list_limit) {
-        const response = sandbox.listIsolatedPage(ctx, prefix, cursor) catch return;
-        if (response.status != 200) return;
-        const page = parseListPage(arena, response.body) catch return;
+        const response = sandbox.listIsolatedPage(ctx, prefix, cursor) catch |err| {
+            debug_trace.logf("remote run", "event=sweep_skipped what=isolated reason=list_failed err={s}", .{@errorName(err)});
+            return;
+        };
+        if (response.status != 200) {
+            debug_trace.logf("remote run", "event=sweep_skipped what=isolated reason=list_refused status={d}", .{response.status});
+            return;
+        }
+        const page = parseListPage(arena, response.body) catch |err| {
+            debug_trace.logf("remote run", "event=sweep_skipped what=isolated reason=list_unreadable err={s}", .{@errorName(err)});
+            return;
+        };
         if (page.items.len == 0) return;
         for (page.items) |item| {
             if (seen >= sweep_list_limit) return;
@@ -209,6 +220,53 @@ pub fn sweep(arena: Allocator, ctx: *sandbox.Context, prefix: []const u8, now_ms
         }
         cursor = page.next orelse return;
     }
+}
+
+test "a sweep that cannot list the sandboxes says so in the trace, and deletes nothing (I1)" {
+    const alloc = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sweep.log" });
+    defer alloc.free(trace_path);
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+
+    var server: test_server.Server = .{ .replies = &.{.{ .status = "500 Internal Server Error", .body = "{}" }} };
+    try server.listen();
+    try server.start();
+    defer server.close();
+    var buffer: [64]u8 = undefined;
+    const origin = try std.fmt.bufPrint(&buffer, "http://127.0.0.1:{d}", .{server.port()});
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(origin),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-test",
+        .repo_root = "/w/repo",
+        .state_dir = &state_dir,
+    };
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "remote run");
+    sweep(arena, &ctx, "fx-", 0);
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(alloc, &file, 8192);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "event=sweep_skipped what=isolated reason=list_refused status=500") != null);
 }
 
 pub const RunEntry = struct {

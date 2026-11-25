@@ -28,13 +28,19 @@ pub const RepositoryWide = struct {
     unavailable: []const Unavailable,
 };
 
+/// The repository's `info/exclude`, under the common git directory. Every reader of it,
+/// the scan and the repository-wide excludes, names it through this one join.
+pub fn infoExcludePath(arena: Allocator, common_dir: []const u8) Allocator.Error![]const u8 {
+    return std.Io.Dir.path.join(arena, &.{ common_dir, "info", "exclude" });
+}
+
 /// Loads the excludes file named by `settings` and `info/exclude` from the
 /// common git directory. Only an excludes file the user's own config names
 /// follows a symlink. Memory belongs to `arena`.
 pub fn loadRepositoryWide(arena: Allocator, layout: layout_mod.Layout, settings: git_config.IgnoreSettings) Allocator.Error!RepositoryWide {
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;
     var unavailable: std.ArrayList(Unavailable) = .empty;
-    const info_exclude = try std.Io.Dir.path.join(arena, &.{ layout.common_dir, "info", "exclude" });
+    const info_exclude = try infoExcludePath(arena, layout.common_dir);
     const files = [_]struct { path: ?[]const u8, follow_symlinks: bool }{
         .{ .path = settings.excludes_file, .follow_symlinks = settings.excludes_file_follows_symlinks },
         .{ .path = info_exclude, .follow_symlinks = false },

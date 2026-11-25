@@ -941,6 +941,7 @@ fn destroyActiveSession(state: *ServerState) void {
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp_host) |h| h.destroy();
+        if (state.sandbox_policy) |policy| policy.remote.forgetSession(active.session_id);
     }
     active.session_rt.deinit(state.alloc);
     if (active.v2) |v2| v2.close();

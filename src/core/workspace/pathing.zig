@@ -1190,6 +1190,10 @@ test "pathInside preserves exact child empty-root and prefix semantics" {
     try std.testing.expect(pathInside("", ""));
     try std.testing.expect(!pathInside("", "/workspace"));
     try std.testing.expect(!pathInside("/workspace", "/workspace-evil/file.txt"));
+    try std.testing.expect(pathInside("/", "/anywhere"));
+    try std.testing.expect(!pathInside("/", "anywhere"));
+    try std.testing.expect(pathInside("/Users/example/repo/", "/Users/example/repo/sub"));
+    try std.testing.expect(!pathInside("/Users/example/repo", "/Users/example/repo2"));
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {

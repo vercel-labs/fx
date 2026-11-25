@@ -207,7 +207,7 @@ pub fn stopBudget(grace_ms: i64) i64 {
 
 const StopStage = enum { none, wait_id, end_after_15, end_after_9, cancelled };
 
-fn watchLoop(shared: *Shared) void {
+fn watchLoop(shared: *Shared, io: std.Io) error{Canceled}!void {
     const quarter = @divFloor(shared.stop_budget_ms, 4);
     var sent_at: ?i64 = null;
     var stop_at: ?i64 = null;
@@ -259,7 +259,8 @@ fn watchLoop(shared: *Shared) void {
             next_extend = io_mod.milliTimestamp() + shared.limits.extend_every_ms;
         }
         // No event covers the cadence clock (V12) or the stop flag (V10), so the watch checks both every poll_ns.
-        io_mod.sleep(poll_ns);
+        // The sleep is cancelable: a cancel of the watch task ends the loop at once.
+        try io.sleep(.{ .nanoseconds = @intCast(poll_ns) }, .real);
     }
 }
 
@@ -392,11 +393,12 @@ pub fn run(ctx: *sandbox.Context, session_id: []const u8, request: Request, sink
         .limits = limits,
         .mark_dir = if (ctx.mode == .remote) ctx.state_dir else null,
     };
-    const thread = std.Thread.spawn(.{}, watchLoop, .{&shared}) catch return .{ .not_sent = "a thread could not start" };
+    const io = io_mod.getIo();
+    var watch = io.concurrent(watchLoop, .{ &shared, io }) catch return .{ .not_sent = "a task could not start" };
     var seen: Seen = .{};
     const outcome = execOnce(ctx, path, body, &shared, sinks, &seen);
     shared.done.store(true, .release);
-    thread.join();
+    watch.await(io) catch {};
     if (shared.extend_failures.load(.seq_cst) > 0) {
         writeExtendNote(sinks.stderr, shared.extend_detail[0..shared.extend_detail_len]);
     }

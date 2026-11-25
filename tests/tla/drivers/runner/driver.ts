@@ -1140,7 +1140,16 @@ function remoteRunEvents(
       add(end, 2, "send_failed");
     }
   } else {
-    add(when(exec) - 0.5, 1, "push_ok");
+    // A 410 on the exec is the session ending before the command line (V3): the send is refused, the
+    // one resume (a GET with resume=true, logged as getSandbox) runs, and the exec goes out again.
+    // The fake logs the refused exec with no kind, so it is told apart from the exec that ran.
+    const gone = log.find((entry) => entry.route === "cmd" && entry.status === 410);
+    add(when(gone ?? exec) - 0.5, 1, "push_ok");
+    if (gone) {
+      add(when(gone), 2, "send_gone");
+      const resumedEntry = log.find((entry) => entry.route === "getSandbox" && entry.status === 200 && entry.seq > gone.seq);
+      if (resumedEntry) add(when(resumedEntry), 2, "resumed");
+    }
     const dropped = exec.notes.find((note: string) => note.startsWith("fault: dropped"));
     add(when(exec), 2, dropped && dropped.includes("not_run") ? "send_not_run" : "send_ran");
     const held = Number(f.drive.faults?.delayCommandLineMs) || 0;
@@ -1158,11 +1167,15 @@ function remoteRunEvents(
       : (remoteEdited ? exitedAt : null);
     if (editAt !== null) add(editAt, 5, "cmd_edits");
     if (seen.macEditAt !== null) add(seen.macEditAt, 6, "mac_edit");
-    const idle = exec.notes.find((note: string) => note.startsWith("idle close"));
+    // The fake's idle close (`idleCloseAfterBytes`) ends the exec stream with this note.
+    const idle = exec.notes.find((note: string) => note.startsWith("stream closed after"));
     const logs = log.filter((entry) => entry.route === "cmdLogs" && entry.commandId === exec.commandId);
     if (idle) {
       add(logs[0] ? when(logs[0]) - 0.5 : end - 2, 7, "idle_close");
-      if (logs[0]?.status === 200) add(when(logs[0]), 8, "reattach_ok");
+      // The first stream is the one the idle close ended, so the reattach is the first answered log
+      // read after the exec, not necessarily the first log read.
+      const reattach = logs.find((entry) => entry.status === 200 && entry.seq > exec.seq);
+      if (reattach) add(when(reattach), 8, "reattach_ok");
       else if (exitCode === 255) add(end - 1, 8, "reattach_lost");
     }
     const kill = log.find((entry) => entry.route === "kill" && entry.commandId === exec.commandId);
