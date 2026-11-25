@@ -329,7 +329,13 @@ pub const Catalog = struct {
         try c.ensure(name, cancel);
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        const found = c.findLocked(name) orelse return c.whyUnavailableLocked(alloc, name);
+        const found = c.findLocked(name) orelse {
+            // A caller with a limited view (a subagent) hears nothing of a server it may not use: not for a name the
+            // rules hide, nor for one on a server its view leaves out. The main agent's view is not limited, and it
+            // hears why a tool can't be used, as it always has, even when a rule hides the tool.
+            if (access != .unrestricted and permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
+            return c.whyUnavailableLocked(alloc, name, access);
+        };
         if (!c.allowsLocked(access, found.server, name)) return null;
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
         const instructions = try c.runtime.instructions(alloc, c.servers[found.server].name);
@@ -750,10 +756,11 @@ pub const Catalog = struct {
     }
 
     /// Why `name` can't be selected when its server's list didn't load, so
-    /// the model hears more than "not found".
-    fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8) !?tool_mcp_runtime.ToolSchemaResult {
-        for (c.servers, c.lists) |s, l| {
+    /// the model hears more than "not found". A server outside the caller's view says nothing.
+    fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8, access: Access) !?tool_mcp_runtime.ToolSchemaResult {
+        for (c.servers, c.lists, 0..) |s, l, i| {
             if (!tool_names.matchesServer(name, s.name)) continue;
+            if (!c.allowsLocked(access, i, name)) continue;
             const text = try c.unavailableText(alloc, s, l) orelse continue;
             return .{ .rejected = .{ .model_output = text } };
         }
@@ -769,15 +776,10 @@ pub const Catalog = struct {
         for (c.servers, c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
-                const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
-                defer alloc.free(step);
-                step[0] = std.ascii.toUpper(step[0]);
+                const how = signIn(c.runtime.options.slash_commands, s.source);
                 const refused = try c.runtime.refusedLogin(alloc, s.name);
                 defer if (refused) |text| alloc.free(text);
-                const guidance = if (refused) |why|
-                    try alloc.print("{s} {s}, then search again.", .{ why, step })
-                else
-                    try alloc.print("{s}, then search again.", .{step});
+                const guidance = try loginGuidance(alloc, request.login_sentence, s.name, how, refused);
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -793,6 +795,17 @@ pub const Catalog = struct {
         return null;
     }
 };
+
+/// What a search page says to do about a server that needs a login. A command prints the page's message as it is,
+/// so it gets the sentence `toolbox {open}` says; the model gets the step to take, then to search again.
+fn loginGuidance(alloc: Allocator, login_sentence: bool, server: []const u8, how: SignIn, refused: ?[]const u8) ![]u8 {
+    if (login_sentence) return needsLoginText(alloc, server, how, refused);
+    const step = try signInStep(alloc, server, how);
+    defer alloc.free(step);
+    step[0] = std.ascii.toUpper(step[0]);
+    if (refused) |why| return alloc.print("{s} {s}, then search again.", .{ why, step });
+    return alloc.print("{s}, then search again.", .{step});
+}
 
 /// How long fx's question UI waits for the user before giving up.
 const question_timeout_ms: i64 = 10 * 60 * 1000;
@@ -990,6 +1003,7 @@ fn snapshotToolFn(raw: *anyopaque, alloc: Allocator, name: []const u8, known_bin
 const testing = std.testing;
 const Fixture = @import("fake_server.zig").Fixture;
 const login_words = @import("login_words.zig");
+const tool_lookup = @import("../mcp/tool_lookup.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 
@@ -1464,6 +1478,100 @@ test "what the model got before stays the same: an error without data, a -32042,
     const ok = (try render(a, "srv", "mcp_srv_tool", .{ .result = .{ .content = "[{\"type\":\"text\",\"text\":\"hi\"}]", .structured = null, .is_error = false } }, 4096, .terminal, null)).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, ok.status);
     try testing.expectEqualStrings("{\"server\":\"srv\",\"tool\":\"mcp_srv_tool\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}", ok.model_output);
+}
+
+test "a search a command makes gets toolbox open's own sentence for a server that needs a login, and the model's page keeps its guidance" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{
+        .name = "keyed",
+        .transport = .http,
+        .url = "https://example.invalid/mcp",
+    }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    c.lists[0].state = .needs_login;
+
+    const query = try lexical_relevance.prepare("keyed");
+    const sentence = try needsLoginText(a, "keyed", .terminal, null);
+    try testing.expectEqualStrings("MCP server 'keyed' needs a login. Ask the user to run fx mcp login keyed in a terminal, then try again.", sentence);
+    // The model's page keeps the guidance it always had.
+    const for_model = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed" })).?;
+    try testing.expect(std.mem.find(u8, for_model, "\"message\":\"Run fx mcp login keyed in a terminal, then search again.\"") != null);
+    // A command's page carries the sentence, which the command prints as it is.
+    const for_command = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed", .login_sentence = true })).?;
+    var lines: std.Io.Writer.Allocating = .init(a);
+    const page = try tool_lookup.writeToolLines(a, &lines.writer, for_command);
+    try testing.expectEqualStrings(sentence, page.problem.?);
+    // And it is the very text `toolbox {open}` gives for a tool of that server.
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    const opened = (try c.whyUnavailableLocked(a, "mcp_keyed_list", .unrestricted)).?;
+    try testing.expectEqualStrings(sentence, opened.rejected.model_output);
+}
+
+test "a tool the rules or view of a caller with a limited view hide says nothing of its server's state, whatever the state" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{
+        .name = "keyed",
+        .transport = .http,
+        .url = "https://example.invalid/mcp",
+        .bearer_token_env = @constCast("FX_MCP_HOST_TEST_UNSET"),
+    }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Named = struct {
+        fn allows(raw: *const anyopaque, server: []const u8) bool {
+            const wanted: *const []const u8 = @ptrCast(@alignCast(raw));
+            return std.mem.eql(u8, wanted.*, server);
+        }
+    };
+    const keyed_name: []const u8 = "keyed";
+    const other_name: []const u8 = "other";
+    const in_view: Access = .{ .servers = .{ .context = @ptrCast(&keyed_name), .allows_fn = Named.allows } };
+    const outside: Access = .{ .servers = .{ .context = @ptrCast(&other_name), .allows_fn = Named.allows } };
+    var deny = [_]types.PermissionRule{.{ .permission = @constCast("mcp_keyed_list"), .pattern = @constCast("*"), .action = .deny }};
+    const denied: types.PermissionRuleSet = .{ .rules = deny[0..] };
+
+    // A server held for a variable that is not set: the caller who may use the tool is told why it can't.
+    const held = "MCP server 'keyed' needs FX_MCP_HOST_TEST_UNSET set before fx starts.";
+    try testing.expectEqualStrings(held, (try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, .unrestricted, null)).?.rejected.model_output);
+    try testing.expectEqualStrings(held, (try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, in_view, null)).?.rejected.model_output);
+    // The main agent's view is not limited: a rule that hides the tool does not hide why it can't be used.
+    const main_agent = try c.toolSchema(a, "mcp_keyed_list", denied, .{}, .unrestricted, null);
+    try testing.expect(main_agent != null);
+    try testing.expectEqualStrings(held, main_agent.?.rejected.model_output);
+    // A caller with a limited view: the rules hide it, or the view leaves its server out, and it is not found, as a
+    // tool that does not exist.
+    try testing.expect((try c.toolSchema(a, "mcp_keyed_list", denied, .{}, in_view, null)) == null);
+    try testing.expect((try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, outside, null)) == null);
+
+    // The same for a list that failed and one that needs a login.
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    inline for (.{ .failed, .needs_login }) |state| {
+        c.lists[0].state = state;
+        try testing.expect((try c.whyUnavailableLocked(a, "mcp_keyed_list", in_view)) != null);
+        try testing.expect((try c.whyUnavailableLocked(a, "mcp_keyed_list", outside)) == null);
+    }
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
