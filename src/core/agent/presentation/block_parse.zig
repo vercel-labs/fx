@@ -286,7 +286,7 @@ pub fn isPipeLine(line: []const u8) bool {
     return false;
 }
 
-fn isSeparatorLine(line: []const u8) bool {
+pub fn isSeparatorLine(line: []const u8) bool {
     const trimmed = tu.leftTrim(line);
     if (trimmed.len == 0) return false;
     var seen_dash = false;

@@ -25,6 +25,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 90_000;
@@ -632,7 +633,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("Edit the readme.");
-    await session.waitForText("STORY_BAD_REQUEST", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("STORY_BAD_REQUEST") && turnSettled(pane), TIMEOUT);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Read it again.");
     await session.waitForText("The readme says hello.", TIMEOUT);
@@ -1466,7 +1467,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("LAND_IT");
-    await session.waitForText("LANDED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
     const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
     // One line for the waits and the messages they took; the report keeps
     // a line of its own.
@@ -1527,7 +1528,7 @@ async function landerWaitStory(prompt: string, calls: Array<() => Response>) {
   sessions.push(session);
   await session.waitForComposer();
   await session.sendText(prompt);
-  await session.waitForText("LANDED", TIMEOUT);
+  await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
   const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
   expect(waitsBegun()).toBe(3);
 
@@ -1641,7 +1642,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendInterruptEscapePair(TIMEOUT);
     await session.waitForPane(() => readFileSync(trace, "utf8").includes("event=interrupt_persisted"), TIMEOUT);
     releaseReport();
-    await session.waitForText("LANDED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
     const live = toolLines(await session.waitForComposer(TIMEOUT));
     const liveTranscript = await fullTranscriptOf(session);
 
@@ -1715,7 +1716,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("TWO_AGENTS");
-    await session.waitForText("LANDED", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("LANDED") && turnSettled(pane), TIMEOUT);
     const live = paneLines(await session.waitForComposer(TIMEOUT)).filter((line) => /^(●|├|└) /.test(line));
     // The last wait's row waits for scout only, so it counts scout's
     // message, and lander's keeps its own line.

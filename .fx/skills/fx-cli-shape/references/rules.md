@@ -116,7 +116,7 @@ Each env var has one job and that job's namespace:
 - Every public control carries one label: stable, experimental, deprecated, or internal.
 - During the cleanup, stable means `fx ask --json` fields, ACP behavior, and env vars documented on fx.sh. Everything else may change with a changelog entry. From 1.0, everything documented on fx.sh is stable.
 - A renamed or removed stable control keeps working with a warning that names its replacement, for at least two releases and at least 30 days, whichever is later. Help and completion show only the new name.
-- The warning also names the release that drops the old spelling: `old_spelling_removal` in `src/core/slash_commands/command_specs.zig`, 0.0.18 for the current set. Pick a release after the first one that ships the warning, so every user sees it at least once. The shape check fails once fx's version in `src/main.zig` reaches that release, so the old spellings come out on time.
+- The warning also names the release that drops the old spelling. A new deprecation adds `pub const old_spelling_removal = "<version>"` back to `src/core/slash_commands/command_specs.zig`, and its warning names that release. Pick a release after the first one that ships the warning, so every user sees it at least once. `scripts/check_cli_shape.py` fails once fx's version in `src/main.zig` reaches that release, so the old spellings come out on time.
 
 ## One source of truth
 

@@ -55,6 +55,7 @@ import {
   tmuxAvailable,
   localCreditsEnv,
   tokenPassCatalog,
+  turnSettled,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -14569,8 +14570,7 @@ test.skipIf(!tmuxAvailable())(
         ["Latest ACP request", "ACP_LATEST_VISIBLE_RESPONSE"],
       ]) {
         await tui.sendText(prompt!);
-        await tui.waitForText(answer!, TIMEOUT);
-        await tui.waitForComposer(TIMEOUT);
+        await tui.waitForPane((pane) => pane.includes(answer!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       const ids = savedSessionIds(root.home);
       expect(ids).toHaveLength(1);

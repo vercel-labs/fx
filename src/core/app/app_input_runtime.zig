@@ -3361,6 +3361,8 @@ const FakeApprovalShell = struct {
     },
     transcript: std.ArrayList(u8) = .empty,
 
+    pub fn freezeAssistantTail(_: *FakeApprovalShell, _: std.mem.Allocator, _: []const u8) !void {}
+
     fn deinit(self: *FakeApprovalShell, alloc: std.mem.Allocator) void {
         self.transcript.deinit(alloc);
     }

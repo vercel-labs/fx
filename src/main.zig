@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "0.0.17";
+pub const version = "0.0.18";
 
 /// Panics save a crash record for `/trace`, except in tests, which keep the
 /// default handler.
@@ -2994,6 +2994,11 @@ const App = struct {
         return SessionAppRuntime.childCapability(agent);
     }
 
+    pub fn pacerTailDue(ctx: *anyopaque, tail_id: u64) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.shell.applyStagedAssistantTail(self.alloc, tail_id);
+    }
+
     pub fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(ctx));
         _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
@@ -3056,6 +3061,7 @@ const App = struct {
             .finish_ctx = self,
             .finish_fn = App.pacerFinish,
             .model_call_fn = App.pacerModelCall,
+            .tail_due_fn = App.pacerTailDue,
         };
     }
 
@@ -4304,7 +4310,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "provider") or
-        std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
         std.mem.eql(u8, command, "update") or
         // Resolve a stored credential, which reads the platform key store out of process.
@@ -4328,7 +4333,6 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
 }
 
 test "every alias of an early threaded io command uses early threaded io" {
@@ -5920,6 +5924,118 @@ test "visiting a child agent puts its context, transcript, and pacer on the scre
     try std.testing.expectEqualStrings("child text\n", child.screen.transcript.notebook.transcript.items);
     try std.testing.expect(app.pacer.hasPending());
     try std.testing.expect(child.screen.pacer.hasPending());
+}
+
+test "a hidden main agent's assistant tail lands in its own transcript while a child is on screen" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    app.agent_on_screen = child;
+
+    var events = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming **bo") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &events);
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 0), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Streaming **bo",
+        app.main_screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+}
+
+test "a hidden child with only a due tail is visited and its tail is applied" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Tail only") };
+    child.screen.transcript.staged_assistant_tail_id = 1;
+    child.screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
+    child.screen.pacer.setTail(1);
+    try std.testing.expect(!child.screen.pacer.hasPending());
+
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 1), child.screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Tail only",
+        child.screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+}
+
+test "a hidden main agent with only a due tail is visited and its tail lands in its own transcript" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const child = try addTestChildAgent(&app, "child-1");
+    app.agent_on_screen = child;
+
+    const events = try alloc.alloc(assistant_presentation.Event, 1);
+    events[0] = .{ .text = try alloc.dupe(u8, "Main tail only") };
+    app.main_screen.transcript.staged_assistant_tail_id = 1;
+    app.main_screen.transcript.staged_assistant_tail = .{ .id = 1, .events = events, .alloc = alloc };
+    app.main_screen.pacer.setTail(1);
+    try std.testing.expect(!app.main_screen.pacer.hasPending());
+
+    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
+
+    try std.testing.expectEqual(@as(usize, 1), app.main_screen.transcript.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Main tail only",
+        app.main_screen.transcript.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), child.screen.transcript.assistant_tail.items.len);
+}
+
+test "the shown tail stays until the committed text replaces it in the same tick" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+
+    var shown = [_]assistant_presentation.Event{.{ .text = @constCast("Streaming bold") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &shown);
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+
+    const deps = app_callbacks.Bindings(App).workerEventHandlers(&app.main_agent);
+    try deps.append_text(deps.ctx, "Streaming bold\n");
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Streaming bold",
+        app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.transcript.items.len);
+
+    var next = [_]assistant_presentation.Event{.{ .text = @constCast("Next line") }};
+    try App.WorkerAppRuntime.pushAssistantTail(&app, &app.main_agent, &next);
+    try App.tickAgentInContext({}, &app, &app.main_agent);
+
+    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "Streaming bold\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.assistant_tail.items.len);
+    try std.testing.expectEqualStrings(
+        "Next line",
+        app.shell.assistant_tail.items[0].assistant_turn.segments.text.items,
+    );
 }
 
 test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {

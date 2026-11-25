@@ -751,6 +751,30 @@ fn waitForSocket(alloc: Allocator, home: []const u8) ![]u8 {
     return error.SocketNeverAppeared;
 }
 
+/// Welcomes one client and holds the connection: the test feeds the frames
+/// after the welcome and sets `stop` when it is done with it, so no owner or
+/// server process runs for it.
+fn welcomingOwner(io: std.Io, path: []const u8, stop: *std.Io.Event) void {
+    const address = std.Io.net.UnixAddress.init(path) catch return;
+    var server = address.listen(io, .{}) catch return;
+    defer server.deinit(io);
+    // The first connection is `waitForSocket`'s probe for the socket: it sends
+    // nothing and is closed here, so the next one is the client's.
+    const probe = server.accept(io) catch return;
+    probe.close(io);
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var storage: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&storage);
+    const welcome: wire.OwnerMessage = .{ .welcome = .{ .owner = 1 } };
+    const frame = wire.encode(fixed.allocator(), welcome) catch return;
+    var buffer: [4096]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    writer.interface.writeAll(frame) catch return;
+    writer.interface.flush() catch return;
+    stop.waitUncancelable(io);
+}
+
 fn wakeNothing(_: *anyopaque) void {}
 
 fn sharedFor(alloc: Allocator, home: []const u8, woken: *u8) !Shared {
@@ -1098,6 +1122,76 @@ test "an owner that goes away ends a call in flight as lost" {
         }
     }
     try testing.expect(lost);
+}
+
+test "a refused call ends as never run, and the other calls stay in flight" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "refcall");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run);
+    try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
+    defer alloc.free(path);
+    var stop: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, welcomingOwner, .{ testing.io, path, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.set(testing.io);
+        thread.join();
+    };
+    const socket = try waitForSocket(alloc, home);
+    alloc.free(socket);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+
+    // Two calls are in flight on the one shared server.
+    const first = try shared.call("fake", "slow", "{}");
+    const second = try shared.call("fake", "slow", "{}");
+    try testing.expectEqual(@as(usize, 2), shared.calls.count());
+
+    // The owner refuses the first: it ends as a call that never went out.
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const refused: wire.OwnerMessage = .{ .refused = .{ .reason = .too_many_calls, .key = key, .call = sharedId(first).? } };
+    try feedOwner(&shared, a, refused);
+    const ended = try takeCalled(&shared, "fake", first);
+    try testing.expectEqual(engine.Outcome.transport_failed, ended.kind.called.outcome);
+    try testing.expect(!ended.kind.called.maybe_ran);
+    try testing.expect(!ended.kind.called.timed_out);
+    try testing.expect(ended.kind.called.answer == null);
+
+    // The other call is still in flight, and ends normally when its frame comes.
+    try testing.expectEqual(@as(usize, 1), shared.calls.count());
+    try testing.expect(shared.calls.get(sharedId(second).?) != null);
+    const answered: wire.OwnerMessage = .{ .called = .{
+        .id = sharedId(second).?,
+        .outcome = .result,
+        .maybe_ran = true,
+        .timed_out = false,
+    } };
+    try feedOwner(&shared, a, answered);
+    const done = try takeCalled(&shared, "fake", second);
+    try testing.expectEqual(engine.Outcome.result, done.kind.called.outcome);
+    try testing.expectEqual(@as(usize, 0), shared.calls.count());
+
+    // A refused call is not a refused key: this server stays the shared one.
+    try testing.expect(shared.slots.items[0].registered);
+    try testing.expect(!shared.slots.items[0].refused);
+    try testing.expect(shared.nextRefused() == null);
+
+    stop.set(testing.io);
+    thread.join();
+    joined = true;
 }
 
 test "an fx home whose socket path is too long cannot share" {

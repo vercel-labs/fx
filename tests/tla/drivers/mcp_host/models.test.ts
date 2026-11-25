@@ -11,16 +11,23 @@ import { runModels } from "./model";
 import { save } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
 
+// CI checks the catalog in two model parts beside the drivers part, because SignIn alone is half of the TLC time: FX_MCP_HOST_MODELS=SignIn runs
+// that model, and FX_MCP_HOST_MODELS=-SignIn runs every other. Unset, one run checks them all.
+const part = process.env.FX_MCP_HOST_MODELS;
+const SIGNIN = { smoke: 1, stress: 1, findings: 5, repairs: 1 };
+const expected = (all: number, signin: number) => (part === undefined ? all : part === "SignIn" ? signin : all - signin);
+
 test("TLC: every model's smoke and stress pass, every planted bug is caught, stated-property findings and repair witnesses hold", async () => {
-  const results = await runModels(join(artifacts, "tlc"));
+  expect([undefined, "SignIn", "-SignIn"]).toContain(part);
+  const results = await runModels(join(artifacts, "tlc"), part);
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
   // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
   // RefreshLease, ErrorData, ConfigEdit, McpRules, Connect and SharedServers
   // joined the four.
-  expect(count("smoke", "PASS")).toBe(15);
-  expect(count("stress", "PASS")).toBe(15);
+  expect(count("smoke", "PASS")).toBe(expected(15, SIGNIN.smoke));
+  expect(count("stress", "PASS")).toBe(expected(15, SIGNIN.stress));
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -45,8 +52,8 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // skips, a profile rewritten under a misspelled key) and the two designs fx
   // does not use for the check: its bounded load scan gives up on a big file,
   // and a dry run outside the lock does not see a change another fx makes.
-  expect(count("finding", "FINDING")).toBe(17);
-  expect(count("repair", "PASS")).toBe(2);
+  expect(count("finding", "FINDING")).toBe(expected(17, SIGNIN.findings));
+  expect(count("repair", "PASS")).toBe(expected(2, SIGNIN.repairs));
 }, 1_800_000);
 
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
@@ -178,6 +185,20 @@ const controls: { name: string; module: string; constants: Record<string, never>
     badAt: 1,
   },
   {
+    name: "config edit inspect", module: "ConfigEdit",
+    constants: { ObsNames: ["a", "b"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "inspect", data: { file: "profile", shown: ["a"], noted: ["b"] } },
+    ],
+    // The good entry hidden by the bad one, as `fx status` did before it read the profile as the runtime does: the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "inspect", data: { file: "profile", shown: [], noted: [] } },
+    ],
+    badAt: 1,
+  },
+  {
     name: "MCP rules", module: "McpRules",
     constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
     good: [
@@ -192,6 +213,23 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "ask", data: { path: "open_tool", agent: "main", tool: "a", answer: "hidden" } },
     ],
     badAt: 1,
+  },
+  {
+    name: "subagent access", module: "SubagentAccess",
+    constants: { ObsServers: ["a", "b"], ObsMaxRuns: 1, ObsMaxViews: 1, ObsBridge: true, ObsDeniedFirst: ["a"] },
+    good: [
+      { event: "init", data: { usable: ["a", "b"] } },
+      { event: "create", data: { scope: ["b"], mode: "full" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "a", n: 1, answer: "refused" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "b", n: 1, answer: "ran" } },
+    ],
+    // A call to a server outside the profile's scope that ran.
+    bad: [
+      { event: "init", data: { usable: ["a", "b"] } },
+      { event: "create", data: { scope: ["b"], mode: "full" } },
+      { event: "bridge", data: { scope: ["b"], mode: "full", server: "a", n: 1, answer: "ran" } },
+    ],
+    badAt: 2,
   },
 ];
 

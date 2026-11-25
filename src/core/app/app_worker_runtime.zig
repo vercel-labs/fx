@@ -65,6 +65,9 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardAssistantTail(_: *anyopaque, events: []assistant_presentation.Event) !void {
+    assistant_presentation.freeEventSlice(std.heap.c_allocator, events);
+}
 fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 fn holdNoModelCall(_: *anyopaque, _: types.ModelCallRecord) !bool {
@@ -86,6 +89,7 @@ pub const WorkerEventHandlers = struct {
     append_table: *const fn (*anyopaque, assistant_presentation.TablePayload) anyerror!void = discardTable,
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
+    append_assistant_tail: *const fn (*anyopaque, []assistant_presentation.Event) anyerror!void = discardAssistantTail,
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     /// Holds a call's Ctrl+O line until the paced text before it is shown;
     /// false when nothing is pending and the line is written now.
@@ -727,6 +731,10 @@ pub fn Runtime(comptime App: type) type {
             try pushEvent(app, agent, .{ .assistant_presentation = .thematic_rule });
         }
 
+        pub fn pushAssistantTail(app: *App, agent: *AppAgent, events: []assistant_presentation.Event) !void {
+            try pushEvent(app, agent, .{ .assistant_presentation = .{ .assistant_tail = events } });
+        }
+
         pub fn pushCommandOutput(
             app: *App,
             agent: *AppAgent,
@@ -1354,6 +1362,12 @@ pub fn Runtime(comptime App: type) type {
                             .thematic_rule => {
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
+                            },
+                            .assistant_tail => |events| {
+                                if (!isSubagent(app, agent)) {
+                                    drain_owns_current = false;
+                                    try handlers.append_assistant_tail(handlers.ctx, events);
+                                }
                             },
                             .attempt_start => {
                                 // Earlier text has shown, so the transcript
