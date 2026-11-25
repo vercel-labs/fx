@@ -10,9 +10,9 @@
 
 pub const core = @import("core.zig");
 pub const wire = @import("wire.zig");
-pub const bridge = @import("bridge.zig");
 pub const capability = @import("capability.zig");
 pub const edit_blocks = @import("edit_blocks.zig");
+const bridge = @import("bridge.zig");
 
 pub const supported = bridge.supported;
 pub const Registration = bridge.Registration;

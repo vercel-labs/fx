@@ -496,6 +496,12 @@ pub fn Runtime(comptime App: type) type {
                     .push_fn = app_callbacks.Bindings(App).pushNestedToolLifecycle,
                     .save_bridge_call_fn = app_callbacks.Bindings(App).saveNestedBridgeCall,
                 },
+                .nested_file_publisher = .{
+                    .context = @ptrCast(agent),
+                    .publish_fn = app_callbacks.Bindings(App).publishNestedCommittedFile,
+                    .added_marker = app_callbacks.Bindings(App).nestedFileAddedMarker(),
+                    .removed_marker = app_callbacks.Bindings(App).nestedFileRemovedMarker(),
+                },
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,

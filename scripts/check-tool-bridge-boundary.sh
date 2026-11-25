@@ -13,12 +13,65 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
 folder="src/core/tool_bridge"
+front_door="$folder/tool_bridge.zig"
 
-reaching_in="$({
-  git grep --untracked -n -E '@import\("[^"]*tool_bridge/[a-z_]+\.zig"\)' -- src ":(exclude)$folder" || true
-} | grep -v 'tool_bridge/tool_bridge\.zig")' || true)"
+# Prints PATH with its `.`, empty, and `..` parts resolved, as the compiler
+# resolves an import: `a//b/./c` becomes `a/b/c`, and `a/b/../c` becomes `a/c`.
+normalize_path() {
+  local result="" part
+  local IFS=/
+  set -f
+  for part in $1; do
+    case "$part" in
+      .) ;;
+      ..)
+        if [[ "$result" == */* ]]; then
+          result="${result%/*}"
+        else
+          result=""
+        fi
+        ;;
+      *)
+        if [[ -z "$result" ]]; then
+          result="$part"
+        else
+          result="$result/$part"
+        fi
+        ;;
+    esac
+  done
+  set +f
+  printf '%s' "$result"
+}
+
+# Every import in src outside the folder, as "file:line:target", with the
+# target resolved from the importing file's folder. Imports by module name
+# have no slash and never name a file inside the folder.
+reaching_in=""
+while IFS= read -r line; do
+  file="${line%%:*}"
+  rest="${line#*:}"
+  target="${rest#*@import(\"}"
+  target="${target%\")}"
+  case "$target" in
+    */* | *.zig) ;;
+    *) continue ;;
+  esac
+  if [[ "$target" == /* ]]; then
+    resolved="$(normalize_path "$target")"
+  else
+    resolved="$(normalize_path "${file%/*}/$target")"
+  fi
+  case "$resolved" in
+    "$folder"/*)
+      if [[ "$resolved" != "$front_door" ]]; then
+        reaching_in+="$line"$'\n'
+      fi
+      ;;
+  esac
+done < <(git grep --untracked -n -o -E '@import\("[^"]+"\)' -- src ":(exclude)$folder" || true)
 if [[ -n "$reaching_in" ]]; then
-  printf 'Only %s/tool_bridge.zig may be imported from outside the tool bridge module:\n%s\n' "$folder" "$reaching_in" >&2
+  printf 'Only %s may be imported from outside the tool bridge module:\n%s' "$front_door" "$reaching_in" >&2
   exit 1
 fi
 

@@ -1628,6 +1628,10 @@ pub const BridgeCallRecord = struct {
     request_id: []const u8,
     tool: []const u8,
     outcome: BridgeCallOutcome,
+    /// A file change's row text, as the live row shows it without colors. Set
+    /// only for a file change, so a resume can show the same row (`tool` names
+    /// the file tool then).
+    summary: ?[]const u8 = null,
 };
 
 /// Whether a record may be saved and shown: each string short, valid UTF-8
@@ -1637,6 +1641,7 @@ pub fn validBridgeCallRecord(record: BridgeCallRecord) bool {
     inline for (.{ record.call_id, record.request_id, record.tool }) |text| {
         if (!validModelCallText(text)) return false;
     }
+    if (record.summary) |summary| if (!validModelCallText(summary)) return false;
     return true;
 }
 
@@ -1646,13 +1651,17 @@ pub fn dupeBridgeCallRecord(alloc: std.mem.Allocator, record: BridgeCallRecord) 
     errdefer alloc.free(call_id);
     const request_id = try alloc.dupe(u8, record.request_id);
     errdefer alloc.free(request_id);
-    return .{ .call_id = call_id, .request_id = request_id, .tool = try alloc.dupe(u8, record.tool), .outcome = record.outcome };
+    const tool = try alloc.dupe(u8, record.tool);
+    errdefer alloc.free(tool);
+    const summary = if (record.summary) |text| try alloc.dupe(u8, text) else null;
+    return .{ .call_id = call_id, .request_id = request_id, .tool = tool, .outcome = record.outcome, .summary = summary };
 }
 
 pub fn freeBridgeCallRecordStrings(alloc: std.mem.Allocator, record: BridgeCallRecord) void {
     alloc.free(record.call_id);
     alloc.free(record.request_id);
     alloc.free(record.tool);
+    if (record.summary) |summary| alloc.free(summary);
 }
 
 /// Caller owns the copy; free it with `freeBridgeCallRecords`.

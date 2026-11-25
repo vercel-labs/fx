@@ -5052,13 +5052,17 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             for (records) |record| {
                 if (!std.mem.eql(u8, record.call_id, call_id)) continue;
-                const status = try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
+                // A file change's row is saved with its text; an MCP call's row is rebuilt from its tool.
+                const status = if (record.summary) |summary|
+                    try app.alloc.dupe(u8, summary)
+                else
+                    try tooling_presentation.bridgeCallRowSummary(app.alloc, record.tool, record.outcome);
                 defer app.alloc.free(status);
                 const kind = record.outcome.toolOutcome();
                 const entry_id = try writeCompletedToolStatus(sink, kind, status);
                 try sink.attachHistoricalBridgeCall(entry_id, record.tool, kind);
                 if (comptime @hasField(@TypeOf(sink.*), "agent")) if (sink.agent) |agent| {
-                    try attachReplayedMcpToolName(app, agent, sink, entry_id, record.tool);
+                    if (record.summary == null) try attachReplayedMcpToolName(app, agent, sink, entry_id, record.tool);
                 };
             }
         }
@@ -7564,6 +7568,31 @@ test "a resume shows each saved fx mcp call row right after its shell call's row
         try std.testing.expectEqualStrings(want, std.mem.trimEnd(u8, status, "\n"));
     }
     try std.testing.expect(std.mem.startsWith(u8, statuses[4], "● Completed read_file"));
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .completed, .completed, .completed, .failed, .completed },
+        app.completed_tool_outcomes.items,
+    );
+}
+
+test "a resume shows a saved bridged file row as it ended, and an old MCP row as before" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    var fixture: BridgeReplayFixture = .{};
+    fixture.bridge_calls[0] = .{ .call_id = "call_pages", .request_id = "fx-mcp-call-1", .tool = "edit_file", .outcome = .completed, .summary = "Edited notes.txt +2 / -1" };
+    fixture.bridge_calls[2] = .{ .call_id = "call_pages", .request_id = "fx-mcp-call-3", .tool = "edit_file", .outcome = .failed, .summary = "Failed notes.txt" };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), fixture.execution());
+
+    const statuses = app.completed_tool_statuses.items;
+    errdefer for (statuses) |status| std.debug.print("row: {s}", .{status});
+    try std.testing.expectEqual(@as(usize, 5), statuses.len);
+    try std.testing.expectEqualStrings("Edited notes.txt +2 / -1", std.mem.trimEnd(u8, statuses[1], "\n"));
+    const ran = try tooling_presentation.formatToolActionValue(alloc, "Ran MCP", "mcp_fixture_echo");
+    defer alloc.free(ran);
+    try std.testing.expectEqualStrings(ran, std.mem.trimEnd(u8, statuses[2], "\n"));
+    try std.testing.expectEqualStrings("Failed notes.txt", std.mem.trimEnd(u8, statuses[3], "\n"));
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
         &.{ .completed, .completed, .completed, .failed, .completed },

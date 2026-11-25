@@ -6286,13 +6286,35 @@ fn checkWorkspaceCapture(alloc: Allocator, payload: []const u8) error{ OutOfMemo
 /// group (D99). Older fx drops it as an unknown item.
 const bridge_call_type = "mcp_bridge_call";
 
-/// The `mcp_bridge_call` item data for `record`, owned by `a`.
+/// The `mcp_bridge_call` item data for `record`, owned by `a`. An unset summary
+/// is left out, so an MCP call's record is written as it always was.
 fn encodeBridgeCall(a: Allocator, record: types.BridgeCallRecord) ![]u8 {
     if (!types.validBridgeCallRecord(record)) return error.InvalidBridgeCall;
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
-    try std.json.Stringify.value(record, .{}, &out.writer);
+    try std.json.Stringify.value(record, .{ .emit_null_optional_fields = false }, &out.writer);
     return try out.toOwnedSlice();
+}
+
+test "a bridge call record keeps a file row's summary, and an MCP record is written as before" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mcp = types.BridgeCallRecord{ .call_id = "call-1", .request_id = "fx-mcp-call-1", .tool = "mcp_fixture_echo", .outcome = .completed };
+    const mcp_data = try encodeBridgeCall(arena, mcp);
+    try testing.expectEqualStrings(
+        "{\"call_id\":\"call-1\",\"request_id\":\"fx-mcp-call-1\",\"tool\":\"mcp_fixture_echo\",\"outcome\":\"completed\"}",
+        mcp_data,
+    );
+
+    const file = types.BridgeCallRecord{ .call_id = "call-1", .request_id = "fx-mcp-call-2", .tool = "edit_file", .outcome = .completed, .summary = "Edited notes.txt +2 / -1" };
+    const decoded = decodeBridgeCall(arena, try encodeBridgeCall(arena, file)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("edit_file", decoded.tool);
+    try testing.expectEqualStrings("Edited notes.txt +2 / -1", decoded.summary orelse return error.TestUnexpectedResult);
+
+    // A record saved before the field existed has no summary.
+    const old = decodeBridgeCall(arena, mcp_data) orelse return error.TestUnexpectedResult;
+    try testing.expect(old.summary == null);
 }
 
 /// A bridge call's record from the log, or null when it can't be parsed or
