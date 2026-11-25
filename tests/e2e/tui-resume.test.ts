@@ -15,6 +15,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9820,11 +9821,17 @@ async function launchFxRecordingTty(
   fixture: ReturnType<typeof resumeFixture>,
   gateway: ReturnType<typeof startFakeGateway>,
   name: string,
+  opts: {
+    extraEnv?: Record<string, string | undefined>;
+    waitForComposer?: boolean;
+  } = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   const ttyAfterPath = join(fixture.root, `${name}-tty-after.txt`);
+  const statusPath = join(fixture.root, `${name}-status.txt`);
   const wrapperPath = join(fixture.root, `${name}-wrapper.sh`);
   const tmpPath = `${ttyAfterPath}.tmp`;
+  const statusTmpPath = `${statusPath}.tmp`;
   writeFileSync(stderrPath, "");
   writeFileSync(
     wrapperPath,
@@ -9834,6 +9841,8 @@ async function launchFxRecordingTty(
       "status=$?",
       `/bin/stty -a > ${shellQuote(tmpPath)}`,
       `/bin/mv ${shellQuote(tmpPath)} ${shellQuote(ttyAfterPath)}`,
+      `printf '%s\\n' "$status" > ${shellQuote(statusTmpPath)}`,
+      `/bin/mv ${shellQuote(statusTmpPath)} ${shellQuote(statusPath)}`,
       `echo ${CLOSE_RECORDED_MARK}`,
       'exit "$status"',
       "",
@@ -9842,14 +9851,45 @@ async function launchFxRecordingTty(
   const session = await TmuxSession.create({
     cmd: `/bin/sh ${shellQuote(wrapperPath)}`,
     cwd: fixture.workspace,
-    env: gatewayEnv(fixture.home, gateway),
+    env: { ...gatewayEnv(fixture.home, gateway), ...opts.extraEnv },
     stderrPath,
     width: 100,
     height: 32,
     remainOnExit: true,
   });
-  await session.waitForComposer(TIMEOUT);
-  return { session, stderrPath, ttyAfterPath };
+  if (opts.waitForComposer ?? true) await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath, ttyAfterPath, statusPath };
+}
+
+function waitForMarkerFile(path: string, timeoutMs = TIMEOUT): Promise<void> {
+  if (existsSync(path)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const dir = join(path, "..");
+    const signal = AbortSignal.timeout(timeoutMs);
+    const watcher = watch(dir, () => {
+      if (existsSync(path)) {
+        watcher.close();
+        resolve();
+      }
+    });
+    signal.addEventListener("abort", () => {
+      watcher.close();
+      reject(new Error(`timed out waiting for ${path}`));
+    });
+    if (existsSync(path)) {
+      watcher.close();
+      resolve();
+    }
+  });
+}
+
+function singleWrapperChildPid(session: TmuxSession): number {
+  const wrapper = session.processPid();
+  const children = execFileSync("pgrep", ["-P", String(wrapper)], { encoding: "utf8" })
+    .trim()
+    .split("\n");
+  if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapper}, saw ${children.length}`);
+  return Number(children[0]);
 }
 
 /// Sends `signal` to fx, the wrapper's one child, and waits for the wrapper
@@ -9858,12 +9898,7 @@ async function signalFxRecordingTty(
   launch: Awaited<ReturnType<typeof launchFxRecordingTty>>,
   signal: NodeJS.Signals,
 ) {
-  const wrapper = launch.session.processPid();
-  const children = execFileSync("pgrep", ["-P", String(wrapper)], { encoding: "utf8" })
-    .trim()
-    .split("\n");
-  if (children.length !== 1) throw new Error(`expected one child of wrapper ${wrapper}, saw ${children.length}`);
-  process.kill(Number(children[0]), signal);
+  process.kill(singleWrapperChildPid(launch.session), signal);
   await launch.session.waitForText(CLOSE_RECORDED_MARK, TIMEOUT);
 }
 
@@ -9904,6 +9939,190 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
     TIMEOUT * 3,
   );
 }
+
+for (const [signal, expectedStatus] of [
+  ["SIGTERM", 143],
+  ["SIGHUP", 129],
+] as const) {
+  test.skipIf(!tmuxAvailable())(
+    `${signal} during normal /exit shutdown leaves the terminal in normal mode and off the alternate screen`,
+    async () => {
+      const fixture = resumeFixture(`fx-shutdown-${signal.toLowerCase()}-`);
+      const { gateway } = holdingGateway("Unused.");
+      const heldPath = join(fixture.root, "shutdown.held");
+      const releasePath = join(fixture.root, "shutdown.release");
+      let active: TmuxSession | null = null;
+      try {
+        const run = await launchFxRecordingTty(fixture, gateway, "exit", {
+          extraEnv: {
+            FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+            FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+          },
+        });
+        active = run.session;
+        await active.sendText("/exit");
+        await waitForMarkerFile(heldPath, TIMEOUT);
+        process.kill(singleWrapperChildPid(active), signal);
+        await waitForMarkerFile(run.statusPath, TIMEOUT);
+        expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(expectedStatus);
+        expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+        expect(alternateScreenOn(active)).toBe(false);
+      } finally {
+        await active?.kill();
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "SIGTERM during active-turn /exit shutdown restores the terminal and saves the request to resume",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-turn-term-");
+    const prompt = "Save this turn on SIGTERM in shutdown.";
+    const { gateway, heldAtLeast } = holdingGateway(prompt);
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = await launchFxRecordingTty(fixture, gateway, "first", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      sessions.push(first.session);
+      await first.session.sendText(prompt);
+      await heldAtLeast(1);
+      await first.session.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(first.session), "SIGTERM");
+      await waitForMarkerFile(first.statusPath, TIMEOUT);
+      expect(Number(readFileSync(first.statusPath, "utf8").trim())).toBe(143);
+      expect(enabledTtyFlags(readFileSync(first.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(first.session)).toBe(false);
+
+      const id = onlySessionId(fixture.home);
+      const lastRecord = savedRecords(fixture.home, id).filter((r) => r !== null).at(-1);
+      expect(lastRecord?.clean).toBe(true);
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      sessions.push(second.session);
+      await heldAtLeast(2);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed?.body).toContain(prompt);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "SIGTERM during error shutdown leaves the terminal in normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-err-term-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+    writeFileSync(join(fixture.home, ".fx", "recordings"), "not-a-directory");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "err", {
+        waitForComposer: false,
+        extraEnv: {
+          FX_DEBUG_RECORD: "1",
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(active), "SIGTERM");
+      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(143);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "/exit with no signal during shutdown exits 0 and restores normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-clean-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "clean", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await active.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      writeFileSync(releasePath, "go");
+      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "SIGINT during normal /exit shutdown stays ignored and exits 0 with normal mode",
+  async () => {
+    const fixture = resumeFixture("fx-shutdown-int-guard-");
+    const { gateway } = holdingGateway("Unused.");
+    const heldPath = join(fixture.root, "shutdown.held");
+    const releasePath = join(fixture.root, "shutdown.release");
+    let active: TmuxSession | null = null;
+    try {
+      const run = await launchFxRecordingTty(fixture, gateway, "int", {
+        extraEnv: {
+          FX_TEST_SHUTDOWN_RELEASE_HELD: heldPath,
+          FX_TEST_SHUTDOWN_RELEASE_RELEASE: releasePath,
+        },
+      });
+      active = run.session;
+      await active.sendText("/exit");
+      await waitForMarkerFile(heldPath, TIMEOUT);
+      process.kill(singleWrapperChildPid(active), "SIGINT");
+      writeFileSync(releasePath, "go");
+      await waitForMarkerFile(run.statusPath, TIMEOUT);
+      expect(Number(readFileSync(run.statusPath, "utf8").trim())).toBe(0);
+      expect(enabledTtyFlags(readFileSync(run.ttyAfterPath, "utf8"))).toEqual(NORMAL_TTY_FLAGS);
+      expect(alternateScreenOn(active)).toBe(false);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
 
 test.skipIf(!tmuxAvailable())(
   "an outside SIGINT is a closed window too: two closes in flight still resume without asking",

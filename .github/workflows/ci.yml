@@ -87,7 +87,7 @@ jobs:
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
       - name: Model-check how the TUI ends on an outside signal
-        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tui_close/check.sh design-a design-b mutant-a-early-uninstall mutant-a-minimal-handler
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

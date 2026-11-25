@@ -269,6 +269,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SHUTDOWN_RELEASE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SHUTDOWN_RELEASE_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SKIP_ONBOARDING": {
       "job": "test",
       "stability": "internal"

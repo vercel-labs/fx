@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -1178,19 +1179,93 @@ fn pushLaunchRowsIntoScrollback(
     }
 }
 
+const shutdown_hold_timeout_ms: i64 = 15_000;
+const shutdown_hold_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+
+const ShutdownReleaseControls = struct {
+    held_path: []const u8,
+    release_path: []const u8,
+};
+
+fn shutdownReleaseControls(
+    held_path: ?[]const u8,
+    release_path: ?[]const u8,
+) ?ShutdownReleaseControls {
+    return .{
+        .held_path = held_path orelse return null,
+        .release_path = release_path orelse return null,
+    };
+}
+
+fn writeShutdownMarker(path: []const u8) !void {
+    var marker = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
+        .truncate = true,
+        .permissions = shutdown_hold_file_permissions,
+    });
+    defer marker.close(io_mod.getIo());
+    try marker.writeStreamingAll(io_mod.getIo(), "shutdown_release_held");
+    try marker.sync(io_mod.getIo());
+}
+
+// Test-only barrier holding `shutdownInteractiveShell` before `disableRawMode`
+// (`tests/e2e/tui-resume.test.ts`); compiled out of libfx and returns after one
+// getenv when unset. Move onto `test_markers.zig` after PR #2295 merges.
+var before_disable_raw_test_hook: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+fn holdBeforeDisableRawMode() void {
+    if (builtin.is_test) {
+        if (before_disable_raw_test_hook) |hook| hook();
+    }
+    if (comptime build_options.libfx) return;
+    const controls = shutdownReleaseControls(
+        io_mod.getenvAbsolutePath("FX_TEST_SHUTDOWN_RELEASE_HELD"),
+        io_mod.getenvAbsolutePath("FX_TEST_SHUTDOWN_RELEASE_RELEASE"),
+    ) orelse return;
+    writeShutdownMarker(controls.held_path) catch return;
+
+    const deadline = io_mod.milliTimestamp() + shutdown_hold_timeout_ms;
+    while (io_mod.milliTimestamp() < deadline) {
+        if (std.Io.Dir.accessAbsolute(io_mod.getIo(), controls.release_path, .{})) |_| break else |_| {}
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
 pub fn shutdownInteractiveShell(
     terminal: *TerminalState,
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     terminal_title: host.TerminalTitle,
 ) void {
+    shutdownInteractiveShellWithOptions(terminal, shell, metrics, terminal_title, true);
+}
+
+/// Restores the terminal without removing TERM/HUP close handlers yet, so
+/// `App.shutdownForProcessExit` keeps saving any active request until
+/// persistence finishes (`tests/tla/tui_close/TuiClose.tla` `CloseSavesRequest`).
+pub fn shutdownInteractiveShellForProcessExit(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
+) void {
+    shutdownInteractiveShellWithOptions(terminal, shell, metrics, terminal_title, false);
+}
+
+fn shutdownInteractiveShellWithOptions(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
+    uninstall_close_handlers: bool,
+) void {
     leaveAlternateScreens(terminal, shell, metrics);
-    terminal.uninstallResizeSignal();
-    uninstallAbnormalExitHandlers();
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
     terminal_title.clear();
     record_tape.shutdown();
+    holdBeforeDisableRawMode();
     finishLeavingInteractiveMode(terminal, shell, metrics);
+    terminal.uninstallResizeSignal();
+    if (uninstall_close_handlers) uninstallAbnormalExitHandlers();
 }
 
 /// Stage timing for interactive shutdown. Each mark logs the delta since the
@@ -2568,6 +2643,145 @@ test "the close path puts back the tty mode fx found at startup" {
     try std.testing.expectEqual(found.lflag.ICANON, after.lflag.ICANON);
     try std.testing.expectEqual(found.lflag.ECHO, after.lflag.ECHO);
     try std.testing.expectEqual(found.lflag.ISIG, after.lflag.ISIG);
+}
+
+test "shutdown release test controls require both absolute paths" {
+    try std.testing.expect(shutdownReleaseControls("/tmp/held", null) == null);
+    try std.testing.expect(shutdownReleaseControls(null, "/tmp/release") == null);
+    try std.testing.expect(shutdownReleaseControls("/tmp/held", "/tmp/release") != null);
+}
+
+test "shutdownInteractiveShell keeps TERM and HUP close handlers until after disableRawMode" {
+    if (!shell_runtime.supports_resize_signal or !shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    defer _ = std.c.close(pty.master);
+    defer _ = std.c.close(pty.slave);
+
+    var saved_int: std.posix.Sigaction = undefined;
+    var saved_term: std.posix.Sigaction = undefined;
+    var saved_hup: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    std.posix.sigaction(std.posix.SIG.TERM, null, &saved_term);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &saved_hup);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+    defer std.posix.sigaction(std.posix.SIG.TERM, &saved_term, null);
+    defer std.posix.sigaction(std.posix.SIG.HUP, &saved_hup, null);
+
+    const found = try io_mod.tcgetattr(pty.slave);
+    installAbnormalExitHandlers(null, found);
+    defer uninstallAbnormalExitHandlers();
+    defer found_termios = null;
+
+    var raw = found;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false;
+    try io_mod.tcsetattr(pty.slave, .NOW, raw);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), "shut.out", .{ .truncate = true });
+    var shell = TranscriptRuntime{ .stdout_file = out_file };
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var terminal = TerminalState{
+        .stdin_fd = pty.slave,
+        .original_termios = found,
+        .raw_enabled = true,
+    };
+
+    const Probe = struct {
+        var saw_term_during_raw: bool = false;
+        var saw_hup_during_raw: bool = false;
+        fn check() void {
+            var act_term: std.posix.Sigaction = undefined;
+            var act_hup: std.posix.Sigaction = undefined;
+            std.posix.sigaction(std.posix.SIG.TERM, null, &act_term);
+            std.posix.sigaction(std.posix.SIG.HUP, null, &act_hup);
+            saw_term_during_raw = act_term.handler.handler == closeSignalHandler;
+            saw_hup_during_raw = act_hup.handler.handler == closeSignalHandler;
+        }
+    };
+    Probe.saw_term_during_raw = false;
+    Probe.saw_hup_during_raw = false;
+    before_disable_raw_test_hook = Probe.check;
+    defer before_disable_raw_test_hook = null;
+
+    shutdownInteractiveShell(&terminal, &shell, &metrics, host.unavailable_terminal_title);
+    shell.stdout_file.close(io_mod.getIo());
+
+    try std.testing.expect(Probe.saw_term_during_raw);
+    try std.testing.expect(Probe.saw_hup_during_raw);
+    try std.testing.expect(!terminal.raw_enabled);
+    const after_tty = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(found.lflag.ICANON, after_tty.lflag.ICANON);
+    try std.testing.expectEqual(found.lflag.ECHO, after_tty.lflag.ECHO);
+    try std.testing.expectEqual(found.lflag.ISIG, after_tty.lflag.ISIG);
+
+    var term_after: std.posix.Sigaction = undefined;
+    var hup_after: std.posix.Sigaction = undefined;
+    var int_after: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_after);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_after);
+    std.posix.sigaction(std.posix.SIG.INT, null, &int_after);
+    try std.testing.expectEqual(saved_term.handler.handler, term_after.handler.handler);
+    try std.testing.expectEqual(saved_hup.handler.handler, hup_after.handler.handler);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), int_after.handler.handler);
+}
+
+test "shutdownInteractiveShellForProcessExit keeps TERM and HUP close handlers until uninstall" {
+    if (!shell_runtime.supports_resize_signal or !shell_runtime.supports_test_pty) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const pty = try shell_runtime.TestPty.open();
+    defer _ = std.c.close(pty.master);
+    defer _ = std.c.close(pty.slave);
+
+    var saved_int: std.posix.Sigaction = undefined;
+    var saved_term: std.posix.Sigaction = undefined;
+    var saved_hup: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &saved_int);
+    std.posix.sigaction(std.posix.SIG.TERM, null, &saved_term);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &saved_hup);
+    defer std.posix.sigaction(std.posix.SIG.INT, &saved_int, null);
+    defer std.posix.sigaction(std.posix.SIG.TERM, &saved_term, null);
+    defer std.posix.sigaction(std.posix.SIG.HUP, &saved_hup, null);
+
+    const found = try io_mod.tcgetattr(pty.slave);
+    installAbnormalExitHandlers(null, found);
+    defer uninstallAbnormalExitHandlers();
+    defer found_termios = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_file = try tmp.dir.createFile(io_mod.getIo(), "shut-pe.out", .{ .truncate = true });
+    var shell = TranscriptRuntime{ .stdout_file = out_file };
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var terminal = TerminalState{
+        .stdin_fd = pty.slave,
+        .original_termios = found,
+        .raw_enabled = true,
+    };
+
+    shutdownInteractiveShellForProcessExit(&terminal, &shell, &metrics, host.unavailable_terminal_title);
+    shell.stdout_file.close(io_mod.getIo());
+    try std.testing.expect(!terminal.raw_enabled);
+
+    var term_mid: std.posix.Sigaction = undefined;
+    var hup_mid: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_mid);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_mid);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), term_mid.handler.handler);
+    try std.testing.expectEqual(@as(?std.posix.Sigaction.handler_fn, closeSignalHandler), hup_mid.handler.handler);
+
+    uninstallAbnormalExitHandlers();
+    var term_end: std.posix.Sigaction = undefined;
+    var hup_end: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &term_end);
+    std.posix.sigaction(std.posix.SIG.HUP, null, &hup_end);
+    try std.testing.expectEqual(saved_term.handler.handler, term_end.handler.handler);
+    try std.testing.expectEqual(saved_hup.handler.handler, hup_end.handler.handler);
 }
 
 test "exit and suspend restoration clear the program status record" {
