@@ -1428,7 +1428,7 @@ pub const RunningCopy = struct {
         notices,
         /// A prompt chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
         /// `listed`, and it is not `sender`, the connection that sent the prompt.
-        prompt_chunk: struct { listed: bool, sender: ConnectionId },
+        prompt_chunk: struct { listed: bool, sender: ?ConnectionId },
         /// A steer chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
         /// `listed`, and its `sh.fx/steerInput` is `steer_input`.
         steer_chunk: struct { listed: bool, steer_input: bool },
@@ -1445,6 +1445,9 @@ pub const RunningCopy = struct {
         with: []u8,
         /// The params the other members take; null when they take nothing.
         without: ?[]u8,
+        /// A user chunk kept as its inputs, in place of `with` and `without`. Replay builds the
+        /// version each joiner's client takes. Null for every other entry.
+        chunk: ?UserChunk = null,
     };
 
     /// Why the copy is freed. The save that commits the turn frees it, since the
@@ -1510,6 +1513,20 @@ pub const RunningCopy = struct {
         self.dropped += 1;
     }
 
+    /// Keeps one user chunk as its inputs, with its own copies. Past the limit, or when an allocation
+    /// fails, the chunk is dropped and logged, as `add` does.
+    fn addChunk(self: *RunningCopy, alloc: Allocator, chunk: UserChunk) void {
+        // Only a joined connection replays the copy, and one exists only where `follow_supported` holds.
+        if (comptime !follow_supported) return;
+        const size = chunk.size();
+        if (self.dropped > 0 or self.bytes + size > limit_bytes) return self.drop("session/update", "limit");
+        const kept = dupeUserChunk(alloc, chunk) catch return self.drop("session/update", "out_of_memory");
+        self.entries.append(alloc, .{ .method = "session/update", .need = .none, .with = &.{}, .without = null, .chunk = kept }) catch {
+            freeUserChunk(alloc, kept);
+            return self.drop("session/update", "out_of_memory");
+        };
+        self.bytes += size;
+    }
     /// Keeps `params` as the turn's latest progress, in place of an earlier one.
     fn setProgress(self: *RunningCopy, alloc: Allocator, params: []const u8) void {
         // Only a joined connection replays the progress; see `follow_supported`.
@@ -1540,6 +1557,10 @@ pub const RunningCopy = struct {
             );
         }
         for (self.entries.items) |entry| {
+            if (entry.chunk) |chunk| {
+                freeUserChunk(alloc, chunk);
+                continue;
+            }
             alloc.free(entry.with);
             if (entry.without) |bytes| alloc.free(bytes);
         }
@@ -1552,14 +1573,142 @@ pub const RunningCopy = struct {
     }
 };
 
+/// A user chunk that fx sends to the other clients: a prompt's text or image, or a steer.
+pub const UserChunk = struct {
+    /// The connection that sent the prompt or the steer. A listing client gets it as `sh.fx/client`.
+    /// Null for a host's steer.
+    sender: ?ConnectionId,
+    message_id: []const u8,
+    content: Content,
+
+    pub const Content = union(enum) {
+        text: []const u8,
+        image: struct { media_type: []const u8, bytes: []const u8 },
+        steer: struct { text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8 },
+    };
+
+    /// The bytes the chunk holds, which the running copy counts against its limit.
+    pub fn size(self: UserChunk) usize {
+        return self.message_id.len + switch (self.content) {
+            .text => |text| text.len,
+            .image => |image| image.media_type.len + image.bytes.len,
+            .steer => |steer| steer.text.len + (if (steer.input_id) |id| id.len else 0),
+        };
+    }
+};
+
+/// Copies `chunk` into memory that the running copy owns. Free it with `freeUserChunk`.
+fn dupeUserChunk(alloc: Allocator, chunk: UserChunk) !UserChunk {
+    var owned = UserChunk{ .sender = chunk.sender, .message_id = &.{}, .content = .{ .text = &.{} } };
+    errdefer freeUserChunk(alloc, owned);
+    owned.message_id = try alloc.dupe(u8, chunk.message_id);
+    switch (chunk.content) {
+        .text => |text| owned.content = .{ .text = try alloc.dupe(u8, text) },
+        .image => |image| {
+            owned.content = .{ .image = .{ .media_type = &.{}, .bytes = &.{} } };
+            owned.content.image.media_type = try alloc.dupe(u8, image.media_type);
+            owned.content.image.bytes = try alloc.dupe(u8, image.bytes);
+        },
+        .steer => |steer| {
+            owned.content = .{ .steer = .{ .text = &.{}, .request_id = null, .input_id = null } };
+            owned.content.steer.text = try alloc.dupe(u8, steer.text);
+            owned.content.steer.request_id = if (steer.request_id) |id| try jsonrpc.dupeRequestId(alloc, id) else null;
+            owned.content.steer.input_id = if (steer.input_id) |id| try alloc.dupe(u8, id) else null;
+        },
+    }
+    return owned;
+}
+
+/// Frees a chunk that `dupeUserChunk` made.
+fn freeUserChunk(alloc: Allocator, chunk: UserChunk) void {
+    alloc.free(chunk.message_id);
+    switch (chunk.content) {
+        .text => |text| alloc.free(text),
+        .image => |image| {
+            alloc.free(image.media_type);
+            alloc.free(image.bytes);
+        },
+        .steer => |steer| {
+            alloc.free(steer.text);
+            if (steer.request_id) |id| jsonrpc.freeRequestId(alloc, id);
+            if (steer.input_id) |id| alloc.free(id);
+        },
+    }
+}
+
+/// Whether a prompt from `sender` is not echoed to `member`: the sender sees its own prompt in its own client.
+fn takesPromptFrom(member: *const Member, sender: ?ConnectionId) bool {
+    const id = sender orelse return true;
+    return !connection.sameConnection(member.connection_id, id);
+}
+
+/// Whether `member` takes `chunk` at all. A steer goes to every member; a prompt is not echoed to its sender.
+fn takesUserChunk(member: *const Member, chunk: UserChunk) bool {
+    if (std.meta.activeTag(chunk.content) == .steer) return true;
+    return takesPromptFrom(member, chunk.sender);
+}
+
+/// The `session/update` params of `chunk` for a member that lists `sh.fx/sessionClients` as `listed`
+/// and takes `sh.fx/steerInput` as `steer_input`. `sh.fx/client` names the sender when `listed`.
+/// The caller frees the bytes.
+fn userChunkParams(alloc: Allocator, session_id: []const u8, chunk: UserChunk, listed: bool, steer_input: bool) ![]u8 {
+    const client: ?u64 = if (listed) if (chunk.sender) |sender| connection.clientNumber(sender) else null else null;
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    switch (chunk.content) {
+        .text => |text| try acp_types.writeUserMessageChunkFrom(&update.writer, chunk.message_id, text, client),
+        .image => |image| try acp_types.writeUserImageChunkFrom(&update.writer, chunk.message_id, image.media_type, image.bytes, client),
+        .steer => |steer| try acp_types.writeSteeringUserMessageChunk(&update.writer, chunk.message_id, steer.text, steer.request_id, steer.input_id, steer_input, client),
+    }
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try acp_types.writeSessionUpdate(&params.writer, session_id, update.writer.buffered());
+    return params.toOwnedSlice();
+}
+
+/// Whether some member of `session` is a receiver of `chunk` of the given kind.
+fn hasUserChunkReceiver(session: *ActiveSessionState, chunk: UserChunk, listed: bool, steer_input: bool) bool {
+    for (session.members.items) |member| {
+        if (member.extensions.contains(.session_clients) != listed) continue;
+        if (std.meta.activeTag(chunk.content) == .steer and member.sendsSteerInput() != steer_input) continue;
+        if (takesUserChunk(member, chunk)) return true;
+    }
+    return false;
+}
+
+/// Sends one user chunk to the members that take it, and keeps its inputs in the running copy, so a
+/// joiner's replay builds the version its client takes. A version is built only for each kind of
+/// receiver that is present: listing or not, and for a steer, with or without `sh.fx/steerInput`.
+/// Returns how many versions it built. The caller holds the audience.
+pub fn deliverUserChunk(audience: *Audience, alloc: Allocator, session_id: []const u8, chunk: UserChunk) !usize {
+    var built: usize = 0;
+    for ([_]bool{ true, false }) |listed| {
+        for ([_]bool{ true, false }) |steer_input| {
+            if (std.meta.activeTag(chunk.content) != .steer and steer_input) continue;
+            if (!hasUserChunkReceiver(audience.session, chunk, listed, steer_input)) continue;
+            const params = try userChunkParams(alloc, session_id, chunk, listed, steer_input);
+            defer alloc.free(params);
+            const need: RunningCopy.Need = if (std.meta.activeTag(chunk.content) == .steer)
+                .{ .steer_chunk = .{ .listed = listed, .steer_input = steer_input } }
+            else
+                .{ .prompt_chunk = .{ .listed = listed, .sender = chunk.sender } };
+            // Each kind walks the members from the first one, so a later kind reaches them all.
+            audience.next_member = 0;
+            try audience.writeEach(alloc, "session/update", need, params, null);
+            built += 1;
+        }
+    }
+    audience.session.running_copy.addChunk(mainLocked(audience.session).?.alloc, chunk);
+    return built;
+}
+
 /// Whether `member` takes the `with` params of an entry that needs `need`.
 fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
     return switch (need) {
         .none => true,
         .extension => |extension| member.extensions.contains(extension),
         .notices => member.client_notices,
-        .prompt_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and
-            !connection.sameConnection(member.connection_id, chunk.sender),
+        .prompt_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and takesPromptFrom(member, chunk.sender),
         .steer_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and
             member.sendsSteerInput() == chunk.steer_input,
         .except_sender => |sender| !connection.sameConnection(member.connection_id, sender),
@@ -1580,26 +1729,6 @@ pub fn releaseRunningCopy(session: *ActiveSessionState, reason: RunningCopy.Reas
 
 /// The params of a steering chunk, with `sh.fx/steerInput` when `steer_input`
 /// holds. The caller frees them.
-pub fn steerChunkParams(
-    alloc: Allocator,
-    session_id: []const u8,
-    message_id: []const u8,
-    text: []const u8,
-    request_id: ?jsonrpc.RequestId,
-    input_id: ?[]const u8,
-    steer_input: bool,
-    client: ?u64,
-) ![]u8 {
-    var update: std.Io.Writer.Allocating = .init(alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id, steer_input, client);
-    try update.writer.writeByte('}');
-    return try update.toOwnedSlice();
-}
-
 /// The member record this connection holds in `session`. A session the connection has open always
 /// has its membership, and only the connection's reader thread changes the membership list, so no lock is needed.
 fn ownMember(state: *ServerState, session: *ActiveSessionState) *Member {
@@ -1829,6 +1958,13 @@ pub fn replayRunningCopy(member: *Member, alloc: Allocator, session: *ActiveSess
     if (comptime !follow_supported) return;
     const copy = &session.running_copy;
     for (copy.entries.items) |entry| {
+        if (entry.chunk) |chunk| {
+            if (!takesUserChunk(member, chunk)) continue;
+            const params = try userChunkParams(alloc, session.session_id, chunk, member.extensions.contains(.session_clients), member.sendsSteerInput());
+            defer alloc.free(params);
+            try member.writer.writeNotification(alloc, entry.method, params);
+            continue;
+        }
         const params = (if (memberTakes(member, entry.need)) entry.with else entry.without) orelse continue;
         try member.writer.writeNotification(alloc, entry.method, params);
     }
@@ -1858,7 +1994,7 @@ pub fn announcePromptTurn(
     var audience = lockAudience(session);
     defer audience.unlock();
     if (text.len > 0) {
-        try deliverPromptChunk(&audience, alloc, sender, session.session_id, .{ .text = .{ .message_id = message_id, .text = text } });
+        _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .text = text } });
     }
     for (images) |attachment| {
         var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
@@ -1866,66 +2002,15 @@ pub fn announcePromptTurn(
             debug_trace.logf("acp", "prompt image unavailable id={d} err={s}", .{ attachment.id, @errorName(err) });
             var unavailable: [96]u8 = undefined;
             const notice = try std.mem.print(&unavailable, "Image #{d} unavailable", .{attachment.id});
-            try deliverPromptChunk(&audience, alloc, sender, session.session_id, .{ .text = .{ .message_id = message_id, .text = notice } });
+            _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .text = notice } });
             continue;
         };
         defer snapshot.deinit(alloc);
-        try deliverPromptChunk(&audience, alloc, sender, session.session_id, .{ .image = .{
-            .message_id = message_id,
+        _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .image = .{
             .media_type = snapshot.media_type,
             .bytes = snapshot.bytes,
-        } });
+        } } });
     }
-}
-
-/// One chunk of a user's prompt, as the other clients see it.
-const PromptChunk = union(enum) {
-    text: struct { message_id: []const u8, text: []const u8 },
-    image: struct { message_id: []const u8, media_type: []const u8, bytes: []const u8 },
-};
-
-/// Sends one prompt chunk to the other members, and records it in the running copy. A member
-/// that lists `sh.fx/sessionClients` gets `sh.fx/client` in the chunk's `_meta`, which names the
-/// sender; the others get the chunk without it. The sender gets neither. The caller holds the audience.
-fn deliverPromptChunk(
-    audience: *Audience,
-    alloc: Allocator,
-    sender: ConnectionId,
-    session_id: []const u8,
-    chunk: PromptChunk,
-) !void {
-    var listed: std.Io.Writer.Allocating = .init(alloc);
-    defer listed.deinit();
-    try writePromptChunk(&listed.writer, chunk, connection.clientNumber(sender));
-    try deliverSessionUpdate(audience, alloc, session_id, listed.writer.buffered(), .{ .prompt_chunk = .{ .listed = true, .sender = sender } });
-
-    var plain: std.Io.Writer.Allocating = .init(alloc);
-    defer plain.deinit();
-    try writePromptChunk(&plain.writer, chunk, null);
-    try deliverSessionUpdate(audience, alloc, session_id, plain.writer.buffered(), .{ .prompt_chunk = .{ .listed = false, .sender = sender } });
-}
-
-fn writePromptChunk(w: *std.Io.Writer, chunk: PromptChunk, client: ?u64) !void {
-    switch (chunk) {
-        .text => |text| try acp_types.writeUserMessageChunkFrom(w, text.message_id, text.text, client),
-        .image => |image| try acp_types.writeUserImageChunkFrom(w, image.message_id, image.media_type, image.bytes, client),
-    }
-}
-
-/// Sends `update` as a `session/update` to the members that `need` covers.
-fn deliverSessionUpdate(
-    audience: *Audience,
-    alloc: Allocator,
-    session_id: []const u8,
-    update: []const u8,
-    need: RunningCopy.Need,
-) !void {
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    try acp_types.writeSessionUpdate(&params.writer, session_id, update);
-    // Each delivery walks the members from the first one, so a second delivery reaches them all.
-    audience.next_member = 0;
-    try audience.deliver(alloc, "session/update", need, params.writer.buffered(), null);
 }
 
 /// Writes the partial-copy notice to `member`: an ACP notice when its client
@@ -5434,32 +5519,12 @@ fn publishStartingSteers(session: *ActiveSessionState, alloc: Allocator, steers:
         const message_id = acp_types.generateMessageId(&message_id_storage);
         var audience = lockAudience(session);
         defer audience.unlock();
-        deliverSteerChunk(&audience, alloc, session.session_id, message_id, steer.text, steer.request_id, null, steer.from) catch |err|
+        _ = deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = steer.from, .message_id = message_id, .content = .{ .steer = .{
+            .text = steer.text,
+            .request_id = steer.request_id,
+            .input_id = null,
+        } } }) catch |err|
             debug_trace.logf("acp", "failed to send the update for a steer that starts a turn err={s}", .{@errorName(err)});
-    }
-}
-
-/// Delivers one steer's chunk to every member, each in the version that its own listing of
-/// `sh.fx/sessionClients` and its `sh.fx/steerInput` ask for. `sh.fx/client` names `sender` on the
-/// listing members; a host's steer has no `sender`. The caller holds the audience.
-pub fn deliverSteerChunk(
-    audience: *Audience,
-    alloc: Allocator,
-    session_id: []const u8,
-    message_id: []const u8,
-    text: []const u8,
-    request_id: ?jsonrpc.RequestId,
-    input_id: ?[]const u8,
-    sender: ?ConnectionId,
-) !void {
-    for ([_]bool{ true, false }) |listed| {
-        const client: ?u64 = if (listed) if (sender) |id| connection.clientNumber(id) else null else null;
-        for ([_]bool{ true, false }) |steer_input| {
-            const params = try steerChunkParams(alloc, session_id, message_id, text, request_id, input_id, steer_input, client);
-            defer alloc.free(params);
-            audience.next_member = 0;
-            try audience.deliver(alloc, "session/update", .{ .steer_chunk = .{ .listed = listed, .steer_input = steer_input } }, params, null);
-        }
     }
 }
 
@@ -9806,6 +9871,164 @@ test "a steer group's chunks each name their own sender, for the listing members
     try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "first steer"), "\"sh.fx/client\":\"c1\"") != null);
     try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "second steer"), "\"sh.fx/client\":\"c2\"") != null);
     try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "second steer"), "\"sh.fx/client\":\"c2\"") != null);
+}
+
+/// The frames of `wire` from index `start` on that contain `needle`.
+fn frameSince(wire: *const ClientsWire, start: usize, needle: []const u8) []const u8 {
+    for (wire.frames.items[start..]) |frame| {
+        if (std.mem.find(u8, frame, needle) != null) return frame;
+    }
+    return "";
+}
+
+test "with every member listing sh.fx/sessionClients, a user chunk is built once" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const built = try deliverUserChunk(&audience, alloc, session.session_id, .{
+        .sender = owner.connection_id,
+        .message_id = "m-all",
+        .content = .{ .text = "ALL_LISTING" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), built);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "ALL_LISTING"), "\"sh.fx/client\":\"c1\"") != null);
+}
+
+test "with listing and non-listing members, a user chunk is built once for each kind" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var third_wire = ClientsWire{ .alloc = alloc };
+    defer third_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    var third = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&third_wire, ClientsWire.write),
+        .connection_id = 3,
+    };
+    defer third.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    try joinMemberForTest(session, &third);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const built = try deliverUserChunk(&audience, alloc, session.session_id, .{
+        .sender = owner.connection_id,
+        .message_id = "m-mixed",
+        .content = .{ .text = "MIXED" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), built);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "MIXED"), "\"sh.fx/client\":\"c1\"") != null);
+    const plain = frameWith(&third_wire, "MIXED");
+    try std.testing.expect(std.mem.find(u8, plain, "user_message_chunk") != null);
+    try std.testing.expect(std.mem.find(u8, plain, "sh.fx/client") == null);
+}
+
+test "a joiner's replay of a running image names the sender only for a listing joiner" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var plain_wire = ClientsWire{ .alloc = alloc };
+    defer plain_wire.deinit();
+    var listing_wire = ClientsWire{ .alloc = alloc };
+    defer listing_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var plain = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&plain_wire, ClientsWire.write),
+        .connection_id = 2,
+    };
+    defer plain.deinit();
+    const session = try openAnswerSession(alloc, &owner, &plain);
+
+    const png = "\x89PNG\r\n\x1a\nimage-bytes";
+    const image = try image_attachments.captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, image);
+    const images = [_]types.ImageAttachment{image};
+    try announcePromptTurn(session, owner.connection_id, alloc, "m-img", "", &images);
+
+    var listing = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&listing_wire, ClientsWire.write),
+        .connection_id = 3,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer listing.deinit();
+    try joinMemberForTest(session, &listing);
+
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const plain_start = plain_wire.frames.items.len;
+    try replayRunningCopy(findMemberLocked(session, plain.connection_id).?, alloc, session);
+    const listing_start = listing_wire.frames.items.len;
+    try replayRunningCopy(findMemberLocked(session, listing.connection_id).?, alloc, session);
+
+    const plain_image = frameSince(&plain_wire, plain_start, "m-img");
+    try std.testing.expect(std.mem.find(u8, plain_image, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.find(u8, plain_image, "sh.fx/client") == null);
+    const listing_image = frameSince(&listing_wire, listing_start, "m-img");
+    try std.testing.expect(std.mem.find(u8, listing_image, "\"sh.fx/client\":\"c1\"") != null);
 }
 
 test "a steer's outcome is written on the connection that sent the steer" {

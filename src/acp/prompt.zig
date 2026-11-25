@@ -2695,7 +2695,11 @@ fn publishSteeringReplay(
     const message_id = acp_types.generateMessageId(&message_id_storage);
     var audience = server.lockAudience(ctx.session);
     defer audience.unlock();
-    try server.deliverSteerChunk(&audience, ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, sender);
+    _ = try server.deliverUserChunk(&audience, ctx.alloc, ctx.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .steer = .{
+        .text = text,
+        .request_id = request_id,
+        .input_id = input_id,
+    } } });
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
