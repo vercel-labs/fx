@@ -5930,6 +5930,13 @@ fn parseInitializeRequest(
     return request;
 }
 
+test "ACP initialize gives a client id only to a client that lists sh.fx/sessionClients" {
+    const id = connection.newConnectionId();
+    try std.testing.expectEqual(@as(?u64, null), answerClientId(.empty, id));
+    try std.testing.expectEqual(@as(?u64, null), answerClientId(.initMany(&.{.hooks}), id));
+    try std.testing.expectEqual(@as(?u64, connection.clientNumber(id)), answerClientId(.initMany(&.{.session_clients}), id));
+}
+
 test "ACP initialize keeps the clientInfo the client sent, and keeps nothing when it sent none" {
     const alloc = std.testing.allocator;
     var sent = try parseInitializeRequest(
@@ -6337,9 +6344,17 @@ fn writeInitializeAnswer(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
     try state.writer.writeResponse(alloc, id, out.writer.buffered());
 }
 
+/// The `sh.fx/clientId` that an `initialize` answer carries. Only a client that
+/// lists `sh.fx/sessionClients` gets one, so a plain client's answer stays ACP v1.
+fn answerClientId(extensions: sh_fx.Set, id: connection.ConnectionId) ?u64 {
+    if (!extensions.contains(.session_clients)) return null;
+    return connection.clientNumber(id);
+}
+
 /// The capabilities fx answers `initialize` with. A socket connection's answer
 /// adds `leader` (see `writeInitializeAnswer`), and the rest is this same value,
-/// so the two always agree. It reads only `cfg`, never the client's request.
+/// so the two always agree. It reads `cfg`, and the client's listed extensions
+/// for the client id, which `handleInitialize` sets before the answer.
 fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
     return .{
         .image_prompts = !host_target.is_wasm,
@@ -6351,7 +6366,7 @@ fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
         // HTTP.
         .mcp_over_acp = false,
         .mcp_sse = false,
-        .client_id = connection.clientNumber(state.connection_id),
+        .client_id = answerClientId(state.extensions, state.connection_id),
     };
 }
 

@@ -15273,9 +15273,13 @@ describe("acp: model-independent", () => {
     });
     const loaded = await follower.request(options.method ?? "session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
     expect(loaded.answer.error).toBeUndefined();
-    const clientId = initialized.answer.result._meta?.["sh.fx/clientId"] as string;
-    expect(clientId).toMatch(/^c\d+$/);
-    return { follower, clientId, loaded };
+    const clientId = initialized.answer.result._meta?.["sh.fx/clientId"];
+    if (options.lists === false) {
+      expect(clientId).toBeUndefined();
+    } else {
+      expect(clientId).toMatch(/^c\d+$/);
+    }
+    return { follower, clientId: clientId as string | undefined, loaded };
   }
 
   test(
