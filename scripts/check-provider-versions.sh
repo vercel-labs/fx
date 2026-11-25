@@ -3,15 +3,26 @@
 # provider's current stable release. fx sends these versions to ChatGPT and
 # Grok and pins them in each release, so it never looks them up at runtime
 # (RULES.md R4.7). The stable release runs this check before it publishes.
+# scripts/tests/test_check_provider_versions.py pins its behavior.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 pins_file="src/core/gateway/provider_versions.zig"
 version_pattern='^[0-9]+\.[0-9]+\.[0-9]+$'
+max_shown_bytes=40
 status=0
 
 pinned() {
   sed -n "s/^pub const $1 = \"\([0-9.]*\)\";\$/\1/p" "$pins_file"
+}
+
+# Upstream text goes into the release log, so show only a short printable part.
+printable() {
+  printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | head -c "$max_shown_bytes"
+}
+
+is_version() {
+  [[ "$1" =~ $version_pattern ]]
 }
 
 is_behind() {
@@ -22,22 +33,18 @@ check() {
   local label="$1" constant="$2" latest="$3"
   local pin
   pin="$(pinned "$constant")"
-  if ! [[ "$pin" =~ $version_pattern ]]; then
+  if ! is_version "$pin"; then
     echo "::error file=$pins_file::Could not read $constant from $pins_file."
     status=1
-    return
-  fi
-  if ! [[ "$latest" =~ $version_pattern ]]; then
-    echo "::error::Could not read the current $label release, got '$latest'."
+  elif ! is_version "$latest"; then
+    echo "::error::Could not read the current $label release, got '$(printable "$latest")'."
     status=1
-    return
-  fi
-  if is_behind "$pin" "$latest"; then
+  elif is_behind "$pin" "$latest"; then
     echo "::error file=$pins_file::$label client version $pin is behind the current release $latest. Set $constant to \"$latest\" in $pins_file."
     status=1
-    return
+  else
+    echo "$label client version $pin is current."
   fi
-  echo "$label client version $pin is current."
 }
 
 codex_latest="$(curl -fsS --max-time 20 https://registry.npmjs.org/@openai/codex/latest |
