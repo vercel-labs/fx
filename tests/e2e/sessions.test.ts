@@ -38,6 +38,8 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
+  hasEmptyComposer,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 import { childLines, childWork, committedRootTurns, compactionRecordPath, holdChildAnswer, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot, waitForRootTurnCommitted } from "./saved-sessions";
@@ -1408,7 +1410,7 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
@@ -1669,7 +1671,7 @@ test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with 
   try {
     const first = await startApp(fixture, gateway, []);
     await first.session.sendText("First interactive question.");
-    await first.session.waitForText("APP_V2_FIRST", TIMEOUT);
+    await first.session.waitForPane((pane) => pane.includes("APP_V2_FIRST") && turnSettled(pane), TIMEOUT);
     await quitApp(first);
     const id = onlySessionId(fixture.home);
     expectNoV1Sessions(fixture);
@@ -1841,7 +1843,7 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
   try {
     const owner = await startApp(fixture, gateway, []);
     await owner.session.sendText("Hold this session open.");
-    await owner.session.waitForText("PICKER_BUSY_SAVED", TIMEOUT);
+    await owner.session.waitForPane((pane) => pane.includes("PICKER_BUSY_SAVED") && turnSettled(pane), TIMEOUT);
     const id = onlySessionId(fixture.home);
 
     const contenderStderr = join(fixture.root, "contender-stderr.log");
@@ -1951,7 +1953,7 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     const app = await startApp(fixture, gateway, [], true, wiringTrace(trace));
     for (const [prompt, answer] of [["Fork prompt one.", "FORK_ONE"], ["Fork prompt two.", "FORK_TWO"], ["Fork prompt three.", "FORK_THREE"]]) {
       await app.session.sendText(prompt!);
-      await app.session.waitForText(answer!, TIMEOUT);
+      await app.session.waitForPane((pane) => pane.includes(answer!) && turnSettled(pane), TIMEOUT);
     }
     await app.session.sendText("/rename Fork source");
     await app.session.waitForText('renamed to "Fork source"', TIMEOUT);
@@ -2036,7 +2038,7 @@ test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access", FX_TRACE: "1", FX_TRACE_LOG: trace });
     await app.session.sendText("Fork busy prompt one.");
-    await app.session.waitForText("BUSY_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("BUSY_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork busy prompt two.");
     await scrollbackContains(app.session, "BUSY_PARENT_SENT");
@@ -2165,7 +2167,7 @@ test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell co
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork shell prompt one.");
-    await app.session.waitForText("SHELL_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("SHELL_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork shell prompt two.");
     await scrollbackContains(app.session, "SHELL_PARENT_SENT");
@@ -2226,7 +2228,7 @@ test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its
   try {
     app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
     await app.session.sendText("Fork stop prompt one.");
-    await app.session.waitForText("STOP_ONE", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("STOP_ONE") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Fork stop prompt two.");
     await scrollbackContains(app.session, "STOP_PARENT_SENT");
@@ -2390,6 +2392,7 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     await app.session.waitForStableComposer();
     await app.session.sendText("Keep prompt two.");
     await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForPane(() => held, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
@@ -2731,6 +2734,7 @@ test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first p
     await app.session.waitForStableComposer();
     await app.session.sendText("Twice prompt two.");
     await scrollbackContains(app.session, "TWICE_PARENT_TWO");
+    await app.session.waitForPane(turnSettled, TIMEOUT);
     await app.session.waitForStableComposer();
     const source = rootSessionIds(fixture.home)[0]!;
 
@@ -2800,10 +2804,10 @@ test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and
     const lastLine = lines.at(-1)!;
     longAnswer = ["```text", ...lines, "```"].join("\n");
     await app.session.sendText("Long fork prompt one.");
-    await app.session.waitForText(lastLine, TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes(lastLine) && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     await app.session.sendText("Long fork prompt two.");
-    await app.session.waitForText("LONG_FORK_TWO", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("LONG_FORK_TWO") && turnSettled(pane), TIMEOUT);
     await app.session.waitForStableComposer();
     const source = onlySessionId(fixture.home);
 
@@ -3660,7 +3664,7 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
@@ -4487,7 +4491,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
       for (const [prompt, answer] of turns) {
         await session.sendText(prompt!);
         await scrollbackContains(session, answer!);
-        await session.waitForComposer(TIMEOUT);
+        await session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       await session.sendText("/compact");
       await waitForSavedText(join(fixture.home, ".fx", "sessions"), "fx-compactor-v1");
@@ -5540,7 +5544,7 @@ test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summ
     ]) {
       await app.session.sendText(prompt!);
       await scrollbackContains(app.session, answer!);
-      await app.session.waitForComposer(TIMEOUT);
+      await app.session.waitForPane((pane) => hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
@@ -5836,7 +5840,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await tui.sendText("STEERING_START");
     await tui.waitForPane(() => childRequests === 1, 10000);
     // The parent's turn ends with the receipt while its child works.
-    await tui.waitForText("START_SENT", 10000);
+    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
     const parent = rootSessionIds(fixture.home)[0]!;
     await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
     const original = childWork(fixture.home, parent);

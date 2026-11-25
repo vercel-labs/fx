@@ -24,6 +24,7 @@ import {
   startFakeGateway as startGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { findActiveFileApprovalBlock } from "./tui-render-assertions";
 import { stdoutFrames } from "./render-lab/tape";
@@ -909,7 +910,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(resized).toContain(`Apply once, ${feedback}`);
 
       await session.sendKeys("Enter");
-      await session.waitForText("amended review complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("amended review complete") && turnSettled(pane), TIMEOUT);
       const finalPane = await session.capturePane();
       expect(finalPane).toContain(feedback);
       const terminalTool = finalPane.indexOf("Wrote amended-review.txt");
@@ -1521,7 +1522,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         scope: "workspace file access for this session",
       });
       await decide(session, 2);
-      await session.waitForText("first grant complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("first grant complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe("first\n");
 
       await session.sendText("Update the granted fixture.");
@@ -1587,14 +1588,14 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["CTRL_O_FIRST_120"],
       });
       await decide(session, 1);
-      await session.waitForText("CTRL_O_FIRST_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("CTRL_O_FIRST_DONE") && turnSettled(pane), TIMEOUT);
 
       await session.sendText("Create the second Ctrl-O file fixture.");
       await waitForFileApproval(session, {
         required: ["CTRL_O_SECOND_060"],
       });
       await decide(session, 1);
-      await session.waitForText("CTRL_O_SECOND_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("CTRL_O_SECOND_DONE") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(join(root.workspace, "first.txt"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -1688,7 +1689,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         required: ["OLD_WRAP_TAIL", "NEW_WRAP_TAIL"],
       });
       await decide(session, 1);
-      await session.waitForText("WRAP_DIFF_COMPLETE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("WRAP_DIFF_COMPLETE") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(target, "utf8")).toBe(newLine);
 
       const inline = await session.captureFullScrollback();
@@ -1910,7 +1911,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(controlTarget)).toBe(false);
       await decide(session, 3);
-      await session.waitForText("consolidated control complete", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("consolidated control complete") && turnSettled(pane), TIMEOUT);
 
       await session.sendText("Create the consolidated large fixture.");
       pane = await waitForFileApproval(session, {
@@ -2023,7 +2024,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(approval).toContain("+ hostile");
       expect(existsSync(target)).toBe(false);
       await decide(session, 1);
-      let settled = await session.waitForText("hostile write complete", TIMEOUT);
+      let settled = await session.waitForPane((pane) => pane.includes("hostile write complete") && turnSettled(pane), TIMEOUT);
 
       expect(readFileSync(target, "utf8")).toBe("hostile\n");
       expect(settled).toContain(encodedName);
