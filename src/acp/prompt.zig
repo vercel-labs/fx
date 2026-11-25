@@ -1163,6 +1163,7 @@ pub fn handlePrompt(
 }
 
 fn withdrawUnusedV2Input(session: *server.ActiveSessionState, maybe_id: ?u64) void {
+    if (comptime !server.has_v2_session_store) return;
     const id = maybe_id orelse return;
     const v2 = session.v2 orelse return;
     session.session_write_mutex.lockUncancelable(io_mod.getIo());

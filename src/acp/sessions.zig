@@ -2061,6 +2061,7 @@ fn notifyPendingAcceptedInputs(
     alloc: Allocator,
     session_id: []const u8,
 ) !void {
+    if (comptime !server.has_v2_session_store) return;
     const active = if (state.active_session) |*value| value else return;
     const v2 = active.v2 orelse return;
     var pending = blk: {

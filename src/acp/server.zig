@@ -1,10 +1,16 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+
+/// The headless wasm core runs host-managed sessions (`wasm_state`) and has no
+/// fx v2 session store (`sessions.zig` only compiles Wasm and libfx handlers),
+/// so v2 accepted-input records and notices compile out of `fx-core.wasm` only.
+pub const has_v2_session_store = !(host_target.is_wasm and build_options.wasm_surface == .core);
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -1792,12 +1798,14 @@ fn handleRequestCancellation(
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const queued = session.steering.findQueuedRequest(requested) orelse break :withdrawn false;
-        if (queued.v2_input_id) |input_id| {
-            if (session.v2) |v2| {
-                v2.recordInputWithdrawn(input_id) catch |err| {
-                    debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ input_id, @errorName(err) });
-                    break :withdrawn false;
-                };
+        if (comptime has_v2_session_store) {
+            if (queued.v2_input_id) |input_id| {
+                if (session.v2) |v2| {
+                    v2.recordInputWithdrawn(input_id) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ input_id, @errorName(err) });
+                        break :withdrawn false;
+                    };
+                }
             }
         }
         break :withdrawn session.steering.withdrawRequest(state.alloc, requested);
@@ -1996,35 +2004,39 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
         else => return writeSteeringEnqueueError(state, alloc, msg.id, err),
     };
 
-    var accepted_id: ?u64 = null;
-    const enqueued: libfx_steering.EnqueueError!void = blk: {
+    const enqueue_result: struct { err: ?libfx_steering.EnqueueError, accepted_id: ?u64 } = blk: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        if (!sessionInputsDurable(session)) {
-            if (session.v2) |v2| {
-                accepted_id = v2.recordInputAccepted(text) catch |err| err_blk: {
-                    debug_trace.logf("session", "event=input_accepted_write_failed surface=acp kind=steer bytes={d} err={s}", .{ text.len, @errorName(err) });
-                    break :err_blk null;
-                };
-            }
-        }
-        session.steering.enqueueRequestWithV2Id(state.alloc, text, msg.id, accepted_id) catch |err| {
-            if (err != error.SteeringNotActive) {
-                if (accepted_id) |id| {
-                    if (session.v2) |v2| v2.recordInputWithdrawn(id) catch |w_err| {
-                        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(w_err) });
+        const accepted_id: ?u64 = if (comptime !has_v2_session_store) null else accept_blk: {
+            if (!sessionInputsDurable(session)) {
+                if (session.v2) |v2| {
+                    break :accept_blk v2.recordInputAccepted(text) catch |err| err_blk: {
+                        debug_trace.logf("session", "event=input_accepted_write_failed surface=acp kind=steer bytes={d} err={s}", .{ text.len, @errorName(err) });
+                        break :err_blk null;
                     };
                 }
             }
-            break :blk err;
+            break :accept_blk null;
         };
-        break :blk {};
+        session.steering.enqueueRequestWithV2Id(state.alloc, text, msg.id, accepted_id) catch |err| {
+            if (comptime has_v2_session_store) {
+                if (err != error.SteeringNotActive) {
+                    if (accepted_id) |id| {
+                        if (session.v2) |v2| v2.recordInputWithdrawn(id) catch |w_err| {
+                            debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(w_err) });
+                        };
+                    }
+                }
+            }
+            break :blk .{ .err = err, .accepted_id = accepted_id };
+        };
+        break :blk .{ .err = null, .accepted_id = accepted_id };
     };
-    enqueued catch |err| switch (err) {
+    if (enqueue_result.err) |err| switch (err) {
         error.SteeringNotActive => {
             debug_trace.logf("acp", "steering prompt arrived after the turn closed input; starting next turn", .{});
             reapActivePrompt(state, true);
-            return startPromptWithInputId(state, alloc, msg, accepted_id);
+            return startPromptWithInputId(state, alloc, msg, enqueue_result.accepted_id);
         },
         else => return writeSteeringEnqueueError(state, alloc, msg.id, err),
     };
@@ -2660,14 +2672,16 @@ fn startPromptWithInputId(
     v2_input_id: ?u64,
 ) !void {
     var unused_v2_input_id = v2_input_id;
-    errdefer if (unused_v2_input_id) |id| {
-        if (state.active_session) |*active_session| {
-            if (active_session.v2) |v2| {
-                active_session.session_write_mutex.lockUncancelable(io_mod.getIo());
-                defer active_session.session_write_mutex.unlock(io_mod.getIo());
-                v2.recordInputWithdrawn(id) catch |err| {
-                    debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
-                };
+    errdefer if (comptime has_v2_session_store) {
+        if (unused_v2_input_id) |id| {
+            if (state.active_session) |*active_session| {
+                if (active_session.v2) |v2| {
+                    active_session.session_write_mutex.lockUncancelable(io_mod.getIo());
+                    defer active_session.session_write_mutex.unlock(io_mod.getIo());
+                    v2.recordInputWithdrawn(id) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
+                    };
+                }
             }
         }
     };
@@ -2797,14 +2811,16 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     const finished_steering: ?libfx_steering.Finished = if (active.state.active_session) |*session| blk: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        if (session.v2) |v2| {
-            const v2_ids = session.steering.collectV2InputIds(active.alloc) catch null;
-            defer if (v2_ids) |ids| active.alloc.free(ids);
-            if (v2_ids) |ids| if (ids.len > 0) {
-                v2.recordInputsWithdrawn(ids) catch |err| {
-                    debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ ids.len, @errorName(err) });
+        if (comptime has_v2_session_store) {
+            if (session.v2) |v2| {
+                const v2_ids = session.steering.collectV2InputIds(active.alloc) catch null;
+                defer if (v2_ids) |ids| active.alloc.free(ids);
+                if (v2_ids) |ids| if (ids.len > 0) {
+                    v2.recordInputsWithdrawn(ids) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ ids.len, @errorName(err) });
+                    };
                 };
-            };
+            }
         }
         break :blk session.steering.finishTurn(active.state.alloc, active.alloc, "turn_finished") catch |err| {
             debug_trace.logf("acp", "failed to collect steering prompts at turn end err={s}", .{@errorName(err)});
