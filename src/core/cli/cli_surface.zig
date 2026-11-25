@@ -67,6 +67,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -93,6 +94,7 @@ pub const Command = union(enum) {
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
+    tool: []const [:0]const u8,
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
@@ -834,6 +836,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
+            if (comptime tool_bridge.supported) if (command_specs.matchesTopLevel(command_catalog, command, .tool)) return .{ .tool = args[1..] };
         },
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
@@ -2110,6 +2113,9 @@ fn runNonInteractiveWithDeps(
         .mcp => |rest| {
             return runTopLevelMcp(alloc, rest, cfg, deps);
         },
+        .tool => |rest| {
+            return runTopLevelTool(alloc, rest, cfg, deps);
+        },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(modelsListArgs(rest)) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
@@ -3014,6 +3020,41 @@ fn localMcpView(
         .servers = inspection.snapshot.servers,
         .configuration_issues = inspection.snapshot.configuration_issues,
         .inspection_error = inspection.inspection_error,
+    };
+}
+
+/// `fx tool`: the group's help alone, or a change from a program fx's bash or
+/// shell tool runs, through the session's bridge (`tool_bridge/tool_command.zig`).
+fn runTopLevelTool(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    if (rest.len == 0) {
+        const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .tool);
+        defer alloc.free(text);
+        try writeStdout(deps, text);
+        return .handled_success;
+    }
+    const args = try alloc.alloc([]const u8, rest.len);
+    defer alloc.free(args);
+    for (rest, args) |r, *a| a.* = r;
+    const command = tool_bridge.tool_command.parse(args) catch |parse_err| {
+        var err_buffer: [512]u8 = undefined;
+        var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+        try tool_bridge.tool_command.writeUsage(&err.interface, parse_err, args);
+        try err.interface.flush();
+        return usage_failure;
+    };
+    var out_buffer: [1024]u8 = undefined;
+    var err_buffer: [1024]u8 = undefined;
+    var out: DepsWriter = .init(deps, .stdout, &out_buffer);
+    var err: DepsWriter = .init(deps, .stderr, &err_buffer);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const code = try tool_bridge.tool_command.run(arena.allocator(), io_mod.getIo(), &out.interface, &err.interface, command);
+    try out.interface.flush();
+    try err.interface.flush();
+    return switch (code) {
+        0 => .handled_success,
+        1 => .handled_failure,
+        else => .{ .handled_exit = code },
     };
 }
 

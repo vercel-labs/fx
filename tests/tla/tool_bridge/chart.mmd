@@ -1,0 +1,56 @@
+%% ToolEdit.tla, design "bridge": one `edit` from a bash program.
+%% Rule-breaking states (red) come from the current-* and mutant-* configs.
+stateDiagram-v2
+  [*] --> Running: the program starts
+  Running --> Reading: the program runs edit
+  Reading --> Waiting: fx needs your approval
+  Reading --> Approved: a rule, grant, or auto review allows it
+  Reading --> Denied: the review cannot complete
+  Waiting --> Approved: you allow it
+  Waiting --> Denied: you deny it
+  Approved --> Applied: the file is as fx read it
+  Approved --> Refused: the file changed since fx read it
+  Applied --> Shown: fx records undo and the Edited row
+  Running --> Gone: the program ends or is killed
+  Waiting --> Gone: the program is killed
+  Approved --> Gone: the program is killed
+  Gone --> Closing: fx sees the socket hang up
+  Closing --> Finished: fx withdraws the program's requests
+  Closing --> AnsweredLate: a prompt is still open
+  AnsweredLate --> Finished: you answer it, and nothing runs
+  Finished --> [*]
+
+  Closing --> LatePrompt: a queued edit opens a prompt anyway
+  Approved --> StaleWrite: fx writes without checking the file
+  Closing --> GhostEdit: fx applies after the program is gone
+  Reading --> Unreviewed: fx applies with no review
+
+  state "Program running" as Running
+  state "fx reads the file and builds the edit" as Reading
+  state "Waiting for your approval" as Waiting
+  state "Edit approved" as Approved
+  state "Edit written" as Applied
+  state "Edited row with diff and undo" as Shown
+  state "Edit refused: file changed" as Refused
+  state "Edit denied" as Denied
+  state "Program gone, not seen yet" as Gone
+  state "fx closing the program's requests" as Closing
+  state "Bash call finished" as Finished
+  state "Prompt opens for a gone program (NoAskAfterGone; MCP bridge today)" as LatePrompt
+  state "Prompt waits for your answer (the bridge's recorded rule)" as AnsweredLate
+  state "Edit written over a changed file (NoStaleApply)" as StaleWrite
+  state "Edit written for a gone program (NoApplyAfterGone)" as GhostEdit
+  state "Edit written with no review (ExactReview)" as Unreviewed
+
+  classDef broken fill:#fdd,stroke:#c00
+  class LatePrompt,StaleWrite,GhostEdit,Unreviewed broken
+
+%% Shortest paths to each red state:
+%%   LatePrompt:  Running -> Reading (edit sent) -> Gone (killed) -> Closing (hang-up seen) -> prompt opens
+%%   StaleWrite:  Running -> Reading -> Approved -> another process writes -> write without the check
+%%   GhostEdit:   Running -> Reading -> Approved -> Gone (killed) -> Closing -> write anyway
+%%   Unreviewed:  Running -> Reading -> write with no allow decision
+%% Left out: two edits at once (the model has two; they only share the one
+%% prompt), the program's own raw writes (design "diff" covers them), the
+%% user's later /undo, and session end while a call is open. Teardown ends only
+%% when a person answers an open prompt (config no-answer-teardown).

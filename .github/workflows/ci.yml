@@ -95,6 +95,11 @@ jobs:
       - name: Model-check the bash tool's session
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/bash_tool/check.sh
 
+      # The Bun driver that walks the real file path along this model runs in
+      # tla-tool-bridge.yml.
+      - name: Model-check the bash tool's file-change model (TLC only)
+        run: FX_TLA_TOOL_BRIDGE_TLC_ONLY=1 TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/tool_bridge/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

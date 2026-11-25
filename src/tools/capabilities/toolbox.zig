@@ -796,6 +796,9 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
         fn authorize(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!mcp_call_capability.Authorization {
             return error.TestUnexpectedCall;
         }
+        fn authorizeFile(_: *anyopaque, _: Allocator, _: []const u8, _: mcp_call_capability.FileRequest) anyerror!mcp_call_capability.Authorization {
+            return error.TestUnexpectedCall;
+        }
         fn call(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(mcp_call_capability.Authorization, "allow"), _: *std.atomic.Value(bool)) anyerror!mcp_call_capability.CallOutcome {
             return error.TestUnexpectedCall;
         }
@@ -806,7 +809,7 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
     var context: u8 = 0;
     const with_mcp: tool_dispatch.DispatchContext = .{
         .allocator = std.testing.allocator,
-        .mcp_call_capability = .{ .context = &context, .authorize_fn = Failing.authorize, .call_fn = Failing.call, .lookup_fn = Failing.lookup },
+        .mcp_call_capability = .{ .context = &context, .authorize_fn = Failing.authorize, .authorize_file_fn = Failing.authorizeFile, .call_fn = Failing.call, .lookup_fn = Failing.lookup },
     };
     const Case = struct { ctx: tool_dispatch.DispatchContext, args: []const u8, says: []const []const u8 };
     const cases = [_]Case{

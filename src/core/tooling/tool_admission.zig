@@ -316,8 +316,9 @@ pub const FileMutationActionIdentity = struct {
                 );
             },
             .edit => |edit| {
-                identity.first_argument_hash = hashIdentityField(edit.old_string);
-                identity.second_argument_hash = hashIdentityField(edit.new_string);
+                const hashes = editIdentityHashes(edit.edits);
+                identity.first_argument_hash = hashes.first;
+                identity.second_argument_hash = hashes.second;
             },
         }
         return identity;
@@ -330,6 +331,86 @@ pub const FileMutationActionIdentity = struct {
         return std.meta.eql(a, b);
     }
 };
+
+const EditIdentityHashes = struct {
+    first: types.ContentHash,
+    second: types.ContentHash,
+};
+
+/// One replacement hashes its two strings, as a single edit always has. Several
+/// replacements hash their count and every block in order, so a changed or
+/// reordered block is a different action.
+fn editIdentityHashes(replacements: []const file_mutation_contract.Replacement) EditIdentityHashes {
+    if (replacements.len == 1) return .{
+        .first = hashIdentityField(replacements[0].old_string),
+        .second = hashIdentityField(replacements[0].new_string),
+    };
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const count: u64 = replacements.len;
+    hasher.update(std.mem.asBytes(&count));
+    for (replacements) |replacement| {
+        hashLengthPrefixed(&hasher, replacement.old_string);
+        hashLengthPrefixed(&hasher, replacement.new_string);
+    }
+    return .{ .first = hasher.finalResult(), .second = hashIdentityField("edit blocks") };
+}
+
+fn hashLengthPrefixed(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    const length: u64 = value.len;
+    hasher.update(std.mem.asBytes(&length));
+    hasher.update(value);
+}
+
+fn editInputOf(replacements: []file_mutation_contract.Replacement) file_mutation_contract.FileMutationInput {
+    return .{ .edit = .{
+        .path = @constCast("note.txt"),
+        .edits = replacements,
+    } };
+}
+
+test "one replacement keeps the single-edit identity hashes" {
+    var replacements = [_]file_mutation_contract.Replacement{.{
+        .old_string = @constCast("old text"),
+        .new_string = @constCast("new text"),
+    }};
+    const identity = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&replacements));
+    const old_hash = hashIdentityField("old text");
+    const new_hash = hashIdentityField("new text");
+    try std.testing.expectEqualSlices(u8, &old_hash, &identity.first_argument_hash);
+    try std.testing.expectEqualSlices(u8, &new_hash, &identity.second_argument_hash);
+}
+
+test "a changed block changes a multi-block edit identity" {
+    var first_blocks = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+    };
+    var second_blocks = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("e\n") },
+    };
+    const first = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&first_blocks));
+    const second = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&second_blocks));
+    if (first.eql(second)) return error.IdentityIgnoredChangedBlock;
+}
+
+test "the order of blocks changes a multi-block edit identity" {
+    // Both lists start with the same block, so only the order of the later
+    // blocks differs.
+    var forward = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+        .{ .old_string = @constCast("e\n"), .new_string = @constCast("f\n") },
+    };
+    var reordered = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("e\n"), .new_string = @constCast("f\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+    };
+    const first = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&forward));
+    const second = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&reordered));
+    if (first.eql(second)) return error.IdentityIgnoredBlockOrder;
+}
 
 fn hashIdentityField(value: []const u8) types.ContentHash {
     var digest: types.ContentHash = undefined;
@@ -400,7 +481,7 @@ fn decodeFileMutationInput(
                     break :blk .{ .failure = reason };
                 }
             }
-            var input = take_input(tool_input, arena);
+            var input = try take_input(tool_input, arena);
             tool_input_owned = false;
             if (std.meta.activeTag(input) != kind) {
                 input.deinit(arena);
@@ -419,7 +500,7 @@ pub fn prepareFileMutationCall(
     call: ToolCall,
     request: FileMutationPreparationRequest,
 ) !FileMutationPreparation {
-    var input = switch (try decodeFileMutationInput(
+    const input = switch (try decodeFileMutationInput(
         alloc,
         request.tool_registry,
         call,
@@ -428,13 +509,33 @@ pub fn prepareFileMutationCall(
         .not_file_mutation => return .not_file_mutation,
         .input => |value| value,
     };
+    return switch (try prepareDecodedFileMutation(alloc, call, input, request.workspace_root)) {
+        .prepared => |value| .{ .prepared = value },
+        .tool_failure => |reason| .{ .tool_failure = reason },
+    };
+}
+
+const PreparedDecodedMutation = union(enum) {
+    prepared: PreparedFileMutationCall,
+    tool_failure: []const u8,
+};
+
+/// Resolves the target of a decoded file change and binds the call to it. The
+/// caller hands over `input`, which is freed on every path that does not keep it.
+fn prepareDecodedFileMutation(
+    alloc: Allocator,
+    call: ToolCall,
+    input_value: file_mutation_contract.FileMutationInput,
+    workspace_root: []const u8,
+) !PreparedDecodedMutation {
+    var input = input_value;
     var input_owned = true;
     defer if (input_owned) input.deinit(alloc);
 
     if (builtin.is_test) file_mutation_resolution_count += 1;
     var targets = switch (try permissions.prepareFileMutationTargets(
         alloc,
-        request.workspace_root,
+        workspace_root,
         input,
     )) {
         .target_resolution_failure => |failure| return .{ .tool_failure = try alloc.print(
@@ -445,8 +546,8 @@ pub fn prepareFileMutationCall(
     };
     errdefer targets.deinit(alloc);
 
-    const workspace_root = try alloc.dupe(u8, request.workspace_root);
-    errdefer alloc.free(workspace_root);
+    const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(owned_workspace_root);
     const call_id = try alloc.dupe(u8, call.id);
     var arguments_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     arguments_hasher.update(call.arguments_json);
@@ -454,10 +555,43 @@ pub fn prepareFileMutationCall(
     return .{ .prepared = .{
         .call_id = call_id,
         .arguments_hash = arguments_hasher.finalResult(),
-        .workspace_root = workspace_root,
+        .workspace_root = owned_workspace_root,
         .input = input,
         .targets = targets,
     } };
+}
+
+/// What a file change that did not come from the model's own call decided.
+pub const DecodedFileMutation = union(enum) {
+    /// It failed before any permission check, so nothing was asked or applied.
+    tool_failure: []const u8,
+    outcome: command_admission.PermissionOutcome,
+};
+
+/// The permission check, prompt, and review of a file change whose input the
+/// caller built: the bridge's `fx tool edit` and `write`. Everything after the
+/// decode is the same as for the model's own `edit_file` or `write_file` call,
+/// and `call` must name that tool. Takes ownership of `decoded`.
+pub fn requestDecodedFileMutationPermission(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    decoded: file_mutation_contract.FileMutationInput,
+    permission_mode: PermissionMode,
+    local_grants: []const PermissionGrant,
+) !DecodedFileMutation {
+    var prepared = switch (try prepareDecodedFileMutation(arena, call, decoded, input.workspace_root)) {
+        .tool_failure => |reason| return .{ .tool_failure = reason },
+        .prepared => |value| value,
+    };
+    return .{ .outcome = try requestPreparedFileMutationPermissionOutcome(
+        input,
+        arena,
+        call,
+        &prepared,
+        permission_mode,
+        local_grants,
+    ) };
 }
 
 pub fn preflightPreparedFileMutation(

@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../shared/types.zig");
+const edit_blocks = @import("edit_blocks.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,11 +24,40 @@ pub const supported = switch (builtin.target.os.tag) {
 /// on one HTTP message (`src/mcp/io/http.zig` `max_message`).
 pub const max_result_bytes: usize = 16 * 1024 * 1024;
 
+/// fx tool's text when fx cannot take a file change from this command: a
+/// program that the experimental bash tool did not start, or outside fx.
+pub const file_tool_unavailable_text = "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.";
+
+/// fx tool's text when fx cannot review a change: the bash call that ran this
+/// program has returned, or fx's bash tool did not start it. Nothing changed.
+pub const file_change_unreviewable_text = "fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.";
+
 pub const Authorization = union(enum) {
-    /// The check allowed the call, for the tool definition it checked.
-    allow: struct { binding: ?types.McpToolBinding = null },
+    /// The check allowed the call, for the tool definition it checked. `prepared`
+    /// is what the handler keeps for the call step: a file change's authority,
+    /// owned by the handler; null for an MCP call.
+    allow: struct { binding: ?types.McpToolBinding = null, prepared: ?*anyopaque = null },
     /// Why not, for the client: a denial, a held review, or an unknown tool.
     deny: []const u8,
+};
+
+/// `fx tool edit PATH`: one or more SEARCH/REPLACE blocks for one file.
+pub const EditRequest = struct {
+    path: []const u8,
+    blocks: []const edit_blocks.Edit,
+};
+
+/// `fx tool write PATH`: the whole content of one file.
+pub const WriteRequest = struct {
+    path: []const u8,
+    content: []const u8,
+};
+
+/// A file change a bridge command asks for. It runs as the agent's own
+/// `edit_file` or `write_file` call would.
+pub const FileRequest = union(enum) {
+    edit: EditRequest,
+    write: WriteRequest,
 };
 
 pub const CallStatus = enum { ok, tool_error, failed };
@@ -62,8 +92,17 @@ pub const Capability = struct {
         tool: []const u8,
         arguments_json: []const u8,
     ) anyerror!Authorization,
+    /// Decides a file change as `file` with call `request_id`. Like
+    /// `authorize_fn`, it may prompt. Allocates in `arena`.
+    authorize_file_fn: ?*const fn (
+        context: *anyopaque,
+        arena: Allocator,
+        request_id: []const u8,
+        file: FileRequest,
+    ) anyerror!Authorization,
     /// Runs an allowed call. Setting `cancel` cancels it, and the call still
-    /// returns. Allocates in `arena`.
+    /// returns. For a file change, `allowed.prepared` names the change and the
+    /// tool and arguments are empty. Allocates in `arena`.
     call_fn: *const fn (
         context: *anyopaque,
         arena: Allocator,
@@ -84,6 +123,11 @@ pub const Capability = struct {
 
     pub fn authorize(self: Capability, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8) anyerror!Authorization {
         return self.authorize_fn(self.context, arena, request_id, tool, arguments_json);
+    }
+
+    pub fn authorizeFile(self: Capability, arena: Allocator, request_id: []const u8, file: FileRequest) anyerror!Authorization {
+        const handler = self.authorize_file_fn orelse return .{ .deny = file_tool_unavailable_text };
+        return handler(self.context, arena, request_id, file);
     }
 
     pub fn call(self: Capability, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8, allowed: @FieldType(Authorization, "allow"), cancel: *std.atomic.Value(bool)) anyerror!CallOutcome {

@@ -22,6 +22,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const capability_mod = @import("capability.zig");
+const edit_blocks = @import("edit_blocks.zig");
 const mcp_call = @import("core.zig");
 const wire = @import("wire.zig");
 
@@ -403,6 +404,7 @@ fn refusalMessage(reason: wire.Reason) []const u8 {
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
         .too_large => "The request is over 1 MiB. Pass smaller arguments.",
+        .file_tool_unavailable => capability_mod.file_tool_unavailable_text,
     };
 }
 
@@ -546,26 +548,21 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
     // A lookup reads tool metadata only, like the agent's own toolbox
     // search, so it has no permission check to wait for.
-    const authorization: capability_mod.Authorization = switch (request.operation) {
-        .call => |value| blk: {
-            bridge.prompt.lockUncancelable(io);
-            defer bridge.prompt.unlock(io);
-            // The client may have left while this request waited for the lock. Then
-            // no prompt opens for it, and the core frees its slot with the answer.
-            bridge.mutex.lockUncancelable(io);
-            const waiting = mcp_call.awaitingPermission(&bridge.state, work.id);
-            bridge.mutex.unlock(io);
-            if (!waiting) break :blk .{ .deny = "The request left before its permission check." };
-            break :blk registration.capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
-                .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(value.tool), @errorName(err) }) catch "The permission check failed." };
-        },
+    // Only the bash tool's programs get file changes. Another registration's
+    // are denied as the core's deny, and the client is told why.
+    const file_refused = switch (request.operation) {
+        .edit, .write => registration.capability.authorize_file_fn == null,
+        .call, .list, .search, .help => false,
+    };
+    const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
+        .call, .edit, .write => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
         .list, .search, .help => .{ .allow = .{} },
     };
     bridge.mutex.lockUncancelable(io);
     const decided = step(.{ .authorized = .{ .id = work.id, .decision = if (authorization == .allow) .allow else .deny } });
     bridge.mutex.unlock(io);
 
-    var reply: ?struct { status: wire.Status, bytes: []const u8 } = null;
+    var reply: ?struct { status: wire.Status, reason: ?wire.Reason = null, bytes: []const u8 } = null;
     for (decided.effects()) |effect| switch (effect) {
         .call => {
             const outcome = runOperation(arena, registration.capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
@@ -587,17 +584,51 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
                 else => {},
             };
         },
-        .reply => reply = .{ .status = .denied, .bytes = authorization.deny },
+        .reply => {
+            if (file_refused) {
+                reply = .{ .status = .refused, .reason = .file_tool_unavailable, .bytes = authorization.deny };
+            } else {
+                reply = .{ .status = .denied, .bytes = authorization.deny };
+            }
+        },
         else => {},
     };
     const answer = reply orelse return;
-    const delivered = writeReply(stream, answer.status, null, answer.bytes);
+    const delivered = writeReply(stream, answer.status, answer.reason, answer.bytes);
     bridge.mutex.lockUncancelable(io);
     _ = step(.{ .reply_done = .{ .id = work.id, .delivery = if (delivered) .delivered else .lost } });
     bridge.mutex.unlock(io);
 }
 
-/// Runs an admitted request's work: its MCP call, or its lookup.
+/// Decides a request that calls an MCP tool or changes a file. One permission
+/// prompt runs at a time, so the request waits here for the prompt lock; if its
+/// client left while it waited, no prompt opens for it.
+fn authorizeGated(
+    io: std.Io,
+    registration: *Registration,
+    id: mcp_call.RequestId,
+    arena: Allocator,
+    request_id: []const u8,
+    operation: wire.Operation,
+) capability_mod.Authorization {
+    bridge.prompt.lockUncancelable(io);
+    defer bridge.prompt.unlock(io);
+    // The client may have left while this request waited for the lock. Then
+    // no prompt opens for it, and the core frees its slot with the answer.
+    bridge.mutex.lockUncancelable(io);
+    const waiting = mcp_call.awaitingPermission(&bridge.state, id);
+    bridge.mutex.unlock(io);
+    if (!waiting) return .{ .deny = "The request left before its permission check." };
+    const checked = switch (operation) {
+        .call => |value| registration.capability.authorize(arena, request_id, value.tool, value.arguments_json),
+        .edit => |value| registration.capability.authorizeFile(arena, request_id, .{ .edit = value }),
+        .write => |value| registration.capability.authorizeFile(arena, request_id, .{ .write = value }),
+        .list, .search, .help => unreachable, // lookups have no permission check
+    };
+    return checked catch |err| .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(operation.subject()), @errorName(err) }) catch "The permission check failed." };
+}
+
+/// Runs an admitted request's work: its MCP call, its file change, or its lookup.
 fn runOperation(
     arena: Allocator,
     capability: capability_mod.Capability,
@@ -607,7 +638,12 @@ fn runOperation(
     cancel: *std.atomic.Value(bool),
 ) anyerror!capability_mod.CallOutcome {
     if (operation.lookup()) |question| return capability.lookup(arena, question, cancel);
-    return capability.call(arena, request_id, operation.call.tool, operation.call.arguments_json, allowed, cancel);
+    return switch (operation) {
+        .call => |value| capability.call(arena, request_id, value.tool, value.arguments_json, allowed, cancel),
+        // A file change's authority holds its call, so the tool and arguments are empty.
+        .edit, .write => capability.call(arena, request_id, operation.subject(), "", allowed, cancel),
+        .list, .search, .help => unreachable, // answered by the lookup above
+    };
 }
 
 /// A capability whose permission check and call the test controls.
@@ -620,10 +656,30 @@ const FakeTool = struct {
     authorizing: std.atomic.Value(bool) = .init(false),
     /// Permission checks begun. Guarded by the bridge mutex, which signals each one.
     authorize_calls: u32 = 0,
+    /// File permission checks begun. Guarded by the bridge mutex, like `authorize_calls`.
+    file_authorize_calls: u32 = 0,
     calls: std.atomic.Value(u32) = .init(0),
+    /// File changes run. The fake changes nothing.
+    file_calls: std.atomic.Value(u32) = .init(0),
+    /// The registration offers no file handler, as a shell command's does.
+    no_files: bool = false,
 
     fn capability(self: *FakeTool) capability_mod.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .call_fn = run, .lookup_fn = lookup };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .authorize_file_fn = if (self.no_files) null else authorizeFile, .call_fn = run, .lookup_fn = lookup };
+    }
+
+    fn authorizeFile(raw: *anyopaque, arena: Allocator, request_id: []const u8, file: capability_mod.FileRequest) anyerror!capability_mod.Authorization {
+        _ = .{ arena, request_id, file };
+        const self: *FakeTool = @ptrCast(@alignCast(raw));
+        self.authorizing.store(true, .release);
+        const io = io_mod.getIo();
+        bridge.mutex.lockUncancelable(io);
+        self.file_authorize_calls += 1;
+        bridge.changed.broadcast(io);
+        bridge.mutex.unlock(io);
+        while (self.gate.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
+        if (self.fail) return error.PermissionCheckFailed;
+        return if (self.allow) .{ .allow = .{ .prepared = @ptrCast(self) } } else .{ .deny = "Denied by the test." };
     }
 
     fn lookup(raw: *anyopaque, arena: Allocator, question: capability_mod.Lookup, cancel: *std.atomic.Value(bool)) anyerror!capability_mod.CallOutcome {
@@ -648,8 +704,12 @@ const FakeTool = struct {
     }
 
     fn run(raw: *anyopaque, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8, allowed: @FieldType(capability_mod.Authorization, "allow"), cancel: *std.atomic.Value(bool)) anyerror!capability_mod.CallOutcome {
-        _ = .{ request_id, allowed, cancel };
+        _ = .{ request_id, cancel };
         const self: *FakeTool = @ptrCast(@alignCast(raw));
+        if (allowed.prepared != null) {
+            _ = self.file_calls.fetchAdd(1, .acq_rel);
+            return .{ .status = .ok, .bytes = try arena.print("file {s}\n", .{tool}) };
+        }
         _ = self.calls.fetchAdd(1, .acq_rel);
         return .{ .status = .ok, .bytes = try arena.print("{s} {s}\n", .{ tool, arguments_json }) };
     }
@@ -663,7 +723,7 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
     }
 }
 
-const client = @import("../mcp_host/mcp_call_client.zig");
+const client = @import("client.zig");
 
 test "a shell call's command reaches its MCP tool, and a forged token reaches nothing" {
     if (!supported) return error.SkipZigTest;
@@ -819,6 +879,98 @@ test "a request that leaves while it waits for the prompt lock opens no prompt" 
     try std.testing.expectEqual(wire.Status.ok, header.status);
     const bytes = try reader.interface.readAllocAll(arena, @intCast(header.bytes));
     try std.testing.expectEqualStrings("mcp_s_first {}\n", bytes);
+}
+
+test "an edit and a write go through their permission check, then their call" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{};
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    const socket_path = variables[0].value;
+    const token = wire.parseToken(variables[1].value).?;
+    const blocks = [_]edit_blocks.Edit{
+        .{ .search = "a\n", .replace = "b\n" },
+        .{ .search = "c\n", .replace = "" },
+    };
+
+    const edit = try client.call(arena, std.testing.io, socket_path, token, .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } });
+    try std.testing.expectEqual(wire.Status.ok, edit.header.status);
+    try std.testing.expectEqualStrings("file notes.txt\n", edit.bytes);
+
+    const write = try client.call(arena, std.testing.io, socket_path, token, .{ .write = .{ .path = "new.txt", .content = "" } });
+    try std.testing.expectEqual(wire.Status.ok, write.header.status);
+    try std.testing.expectEqualStrings("file new.txt\n", write.bytes);
+
+    try std.testing.expectEqual(@as(u32, 2), fileAuthorizeCount(std.testing.io, &tool));
+    try std.testing.expectEqual(@as(u32, 2), tool.file_calls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a file change on a registration with no file handler is refused as fx tool's, and no check runs" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{ .no_files = true };
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    const socket_path = variables[0].value;
+    const token = wire.parseToken(variables[1].value).?;
+    const blocks = [_]edit_blocks.Edit{.{ .search = "a\n", .replace = "b\n" }};
+
+    const edit = try client.call(arena, std.testing.io, socket_path, token, .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } });
+    try std.testing.expectEqual(wire.Status.refused, edit.header.status);
+    try std.testing.expectEqual(wire.Reason.file_tool_unavailable, edit.header.reason.?);
+    const write = try client.call(arena, std.testing.io, socket_path, token, .{ .write = .{ .path = "new.txt", .content = "x" } });
+    try std.testing.expectEqual(wire.Reason.file_tool_unavailable, write.header.reason.?);
+
+    try std.testing.expectEqual(@as(u32, 0), fileAuthorizeCount(std.testing.io, &tool));
+    try std.testing.expectEqual(@as(u32, 0), tool.file_calls.load(.acquire));
+}
+
+test "an edit whose client leaves while its permission check waits applies nothing" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tool: FakeTool = .{};
+    tool.gate.store(true, .release);
+    const registration = try register(tool.capability());
+    var unregistered = false;
+    // Declared first, so it runs last: the gate opens before unregister waits for the requests.
+    defer if (!unregistered) unregister(registration);
+    defer tool.gate.store(false, .release);
+    const variables = registration.environment();
+    const address = try std.Io.net.UnixAddress.init(variables[0].value);
+    const blocks = [_]edit_blocks.Edit{.{ .search = "a\n", .replace = "b\n" }};
+    const stream = try address.connect(io);
+    errdefer stream.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    try wire.writeRequest(&writer.interface, wire.parseToken(variables[1].value).?, .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } });
+    try writer.interface.flush();
+    try waitAtLeast(io, &tool.file_authorize_calls, 1);
+
+    // The check waits on the gate, as for a prompt. The client leaves, and the
+    // request is withdrawn, so the change must never run.
+    stream.close(io);
+    try waitAtLeast(io, &bridge.withdrawn, 1);
+    tool.gate.store(false, .release);
+    try waitAtMost(io, &registration.in_use, 0);
+    unregister(registration);
+    unregistered = true;
+    try std.testing.expectEqual(@as(u32, 0), tool.file_calls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+/// The file permission checks a fake tool has begun, read under the bridge mutex.
+fn fileAuthorizeCount(io: std.Io, tool: *const FakeTool) u32 {
+    bridge.mutex.lockUncancelable(io);
+    defer bridge.mutex.unlock(io);
+    return tool.file_authorize_calls;
 }
 
 test "the bridge removes its socket after the last shell call" {

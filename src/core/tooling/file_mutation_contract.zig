@@ -506,10 +506,20 @@ pub const WriteInput = struct {
     content: []u8,
 };
 
-pub const EditInput = struct {
-    path: []u8,
+/// The words a failure text uses: `edit_file` for the file tool and `edit` for
+/// the bridge caller. Only the text changes, never the edit.
+pub const Wording = enum { edit_file, edit };
+
+/// One block: `old_string` is found exactly once and replaced by `new_string`.
+pub const Replacement = struct {
     old_string: []u8,
     new_string: []u8,
+};
+
+pub const EditInput = struct {
+    path: []u8,
+    edits: []Replacement,
+    wording: Wording = .edit_file,
 };
 
 pub const FileMutationInput = union(Kind) {
@@ -530,8 +540,11 @@ pub const FileMutationInput = union(Kind) {
             },
             .edit => |edit| {
                 alloc.free(edit.path);
-                alloc.free(edit.old_string);
-                alloc.free(edit.new_string);
+                for (edit.edits) |replacement| {
+                    alloc.free(replacement.old_string);
+                    alloc.free(replacement.new_string);
+                }
+                alloc.free(edit.edits);
             },
         }
         self.* = undefined;
@@ -554,17 +567,21 @@ test "file mutation input owns write and edit fields" {
     const edit_path = "note.txt";
     const old_string = "hello";
     const new_string = "goodbye";
-    var edit_input: FileMutationInput = .{ .edit = .{
-        .path = try std.testing.allocator.dupe(u8, edit_path),
+    const edits = try std.testing.allocator.alloc(Replacement, 1);
+    edits[0] = .{
         .old_string = try std.testing.allocator.dupe(u8, old_string),
         .new_string = try std.testing.allocator.dupe(u8, new_string),
+    };
+    var edit_input: FileMutationInput = .{ .edit = .{
+        .path = try std.testing.allocator.dupe(u8, edit_path),
+        .edits = edits,
     } };
     try std.testing.expectEqualStrings(edit_path, edit_input.path());
-    try std.testing.expectEqualStrings(old_string, edit_input.edit.old_string);
-    try std.testing.expectEqualStrings(new_string, edit_input.edit.new_string);
+    try std.testing.expectEqualStrings(old_string, edit_input.edit.edits[0].old_string);
+    try std.testing.expectEqualStrings(new_string, edit_input.edit.edits[0].new_string);
     try std.testing.expect(edit_input.edit.path.ptr != edit_path.ptr);
-    try std.testing.expect(edit_input.edit.old_string.ptr != old_string.ptr);
-    try std.testing.expect(edit_input.edit.new_string.ptr != new_string.ptr);
+    try std.testing.expect(edit_input.edit.edits[0].old_string.ptr != old_string.ptr);
+    try std.testing.expect(edit_input.edit.edits[0].new_string.ptr != new_string.ptr);
     edit_input.deinit(std.testing.allocator);
 }
 

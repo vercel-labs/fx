@@ -393,7 +393,7 @@ pub const RunCommandCompatibility = struct {
 pub const TakeFileMutationInputFn = *const fn (
     ToolInput,
     Allocator,
-) file_mutation_contract.FileMutationInput;
+) Allocator.Error!file_mutation_contract.FileMutationInput;
 
 /// Function pointer classifying whether an input is read-only.
 pub const ReadsOnlyFn = *const fn (ToolInput) bool;

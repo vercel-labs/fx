@@ -804,6 +804,22 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).saveBridgeCall(agent, record);
         }
 
+        /// Publishes a bridged file change's diff row and undo entry as the
+        /// agent's own file calls publish theirs (`tool_runtime.NestedFilePublisher`).
+        pub fn publishNestedCommittedFile(ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
+            return agentPublishCommittedFileHandoff(ctx, handoff);
+        }
+
+        /// The diff marker colors a bridged change's row counts use, as the transcript's rows do.
+        /// The theme sets them at run time, so they are read here, not at compile time.
+        pub fn nestedFileAddedMarker() []const u8 {
+            return ui_render.diff_added_marker_style;
+        }
+
+        pub fn nestedFileRemovedMarker() []const u8 {
+            return ui_render.diff_removed_marker_style;
+        }
+
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);

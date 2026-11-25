@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { rootSessionIds } from "./saved-sessions";
 import { requestToolNames, toolResultText } from "./fixtures/request-body";
+import { findActiveFileApprovalBlock } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -1589,6 +1590,386 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText("/quit");
     expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
     expect(bashFolders(tmp)).toEqual([]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+async function waitForEditApproval(
+  session: TmuxSession,
+  required: string[] = [],
+  timeoutMs = TIMEOUT,
+): Promise<string> {
+  await session.waitForPane(
+    (pane) =>
+      pane.includes("Apply this change?") &&
+      required.every((token) => pane.includes(token)),
+    timeoutMs,
+  );
+  const block = findActiveFileApprovalBlock(await session.capturePaneGrid());
+  expect(block).not.toBeNull();
+  expect(block!.text).toContain("Apply this change?");
+  for (const token of required) expect(block!.text).toContain(token);
+  return block!.text;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash edit shows Edited row in the bash call group, changes the file, and /undo restores it",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-edit-undo-", { experimental: { bash_tool: true } });
+    const target = join(fixture.workspace, "app.py");
+    writeFileSync(target, "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_edit_app", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\nEOF",
+      }),
+      fakeGatewayFinalText("BASH_EDIT_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Edit app.py.");
+    await active.waitForText("BASH_EDIT_DONE", TIMEOUT);
+
+    expect(readFileSync(target, "utf8")).toBe("print('b')\n");
+    const scrollback = await active.captureFullScrollback();
+    const lines = scrollback.split("\n");
+    const headerIdx = lines.findIndex((line) => line.includes("Ran edit"));
+    const editedIdx = lines.findIndex((line) => line.includes("Edited app.py +1/-1"));
+    expect(headerIdx).toBeGreaterThanOrEqual(0);
+    expect(editedIdx).toBeGreaterThan(headerIdx);
+
+    await active.sendKeys("C-o");
+    await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+    const full = await active.capturePane();
+    expect(full).toContain("Edited app.py +1 / -1");
+    expect(full).toContain("print('a')");
+    expect(full).toContain("print('b')");
+    await active.sendKeys("C-o");
+    await active.waitForComposer(TIMEOUT);
+
+    await active.sendText("/undo");
+    await active.waitForText(`Restored ${target}`, TIMEOUT);
+    expect(readFileSync(target, "utf8")).toBe("print('a')\n");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash edit in ask mode shows the diff prompt, and deny leaves file unchanged with deny text",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-edit-deny-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+    });
+    const target = join(fixture.workspace, "app.py");
+    writeFileSync(target, "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_edit_deny", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\nEOF\necho \"exit=$?\"",
+      }),
+      fakeGatewayFinalText("BASH_EDIT_DENIED_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+
+    await active.sendText("Edit app.py.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+    const approval = await waitForEditApproval(active, ["app.py", "- print('a')", "+ print('b')"]);
+    expect(approval).toContain("3  Don't apply");
+    expect(readFileSync(target, "utf8")).toBe("print('a')\n");
+
+    await active.sendKeys("3");
+    await active.waitForText("BASH_EDIT_DENIED_DONE", TIMEOUT);
+
+    expect(readFileSync(target, "utf8")).toBe("print('a')\n");
+    const result = gateway.requests
+      .map((request) => toolResultText(request.body, "bash_edit_deny"))
+      .find((output) => output !== "") ?? "";
+    expect(result).toContain("fx tool edit:");
+    expect(result).toContain("denied");
+    expect(result).toContain("exit=5");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash two concurrent edits open one prompt at a time, show two rows, and undo separately",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-concurrent-edits-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+    });
+    const fileA = join(fixture.workspace, "a.txt");
+    const fileB = join(fixture.workspace, "b.txt");
+    writeFileSync(fileA, "alpha\n");
+    writeFileSync(fileB, "beta\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_two_edits", "bash", {
+        command: [
+          "edit a.txt <<'EOF' &",
+          "<<<<<<< SEARCH",
+          "alpha",
+          "=======",
+          "ALPHA",
+          ">>>>>>> REPLACE",
+          "EOF",
+          "edit b.txt <<'EOF' &",
+          "<<<<<<< SEARCH",
+          "beta",
+          "=======",
+          "BETA",
+          ">>>>>>> REPLACE",
+          "EOF",
+          "wait",
+        ].join("\n"),
+      }),
+      fakeGatewayFinalText("TWO_EDITS_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+
+    await active.sendText("Edit both files.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+
+    const firstPrompt = await waitForEditApproval(active);
+    const firstFile = firstPrompt.includes("a.txt") ? "a.txt" : "b.txt";
+    const secondFile = firstFile === "a.txt" ? "b.txt" : "a.txt";
+    expect(firstPrompt).toContain(firstFile);
+    expect(firstPrompt).not.toContain(secondFile);
+
+    await active.sendKeys("1");
+    const secondPrompt = await waitForEditApproval(active, [secondFile]);
+    expect(secondPrompt).toContain(secondFile);
+    await active.sendKeys("1");
+
+    await active.waitForText("TWO_EDITS_DONE", TIMEOUT);
+    expect(readFileSync(fileA, "utf8")).toBe("ALPHA\n");
+    expect(readFileSync(fileB, "utf8")).toBe("BETA\n");
+
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Edited a.txt +1/-1");
+    expect(scrollback).toContain("Edited b.txt +1/-1");
+
+    await active.sendText("/undo");
+    await active.waitForText(`Restored ${join(fixture.workspace, secondFile)}`, TIMEOUT);
+    await active.sendText("/undo");
+    await active.waitForText(`Restored ${join(fixture.workspace, firstFile)}`, TIMEOUT);
+    expect(readFileSync(fileA, "utf8")).toBe("alpha\n");
+    expect(readFileSync(fileB, "utf8")).toBe("beta\n");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash program killed while edit prompt is open keeps prompt, allow writes nothing, and bash call ends",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-kill-prompt-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+    });
+    const target = join(fixture.workspace, "app.py");
+    const pidFile = join(fixture.root, "bash.pid");
+    writeFileSync(target, "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_kill_prompt", "bash", {
+        command: `echo $$ > "${pidFile}"\nedit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\nEOF`,
+      }),
+      fakeGatewayFinalText("KILLED_PROMPT_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, {
+      FX_PERMISSION_MODE: "ask",
+      FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent,mcp-call",
+    });
+
+    await active.sendText("Edit app.py.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+    await waitForEditApproval(active, ["app.py", "- print('a')", "+ print('b')"]);
+
+    const bashPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(bashPid).toBeGreaterThan(0);
+    let childPids: number[] = [];
+    try {
+      const out = execFileSync("pgrep", ["-P", String(bashPid)], { encoding: "utf8" }).trim();
+      childPids = out.split(/\s+/).filter(Boolean).map(Number);
+    } catch {}
+    for (const pid of childPids) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+    try { process.kill(bashPid, "SIGKILL"); } catch {}
+
+    await waitUntilGone([bashPid, ...childPids], TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        pane.includes("Apply this change?") &&
+        readFileSync(fixture.tracePath, "utf8").includes("client or owner gone"),
+      TIMEOUT,
+    );
+    const stillPrompting = await waitForEditApproval(active, ["app.py"]);
+    expect(stillPrompting).toContain("Apply this change?");
+    expect(readFileSync(target, "utf8")).toBe("print('a')\n");
+
+    await active.sendKeys("1");
+    await active.waitForText("KILLED_PROMPT_DONE", TIMEOUT);
+    await active.waitForComposer(TIMEOUT);
+
+    expect(readFileSync(target, "utf8")).toBe("print('a')\n");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash edit refuses stale file changed after preview without writing",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-stale-edit-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+    });
+    const target = join(fixture.workspace, "app.py");
+    writeFileSync(target, "line1\nline2\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_stale_edit", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nline1\n=======\nchanged1\n>>>>>>> REPLACE\nEOF\necho \"exit=$?\"",
+      }),
+      fakeGatewayFinalText("STALE_EDIT_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+
+    await active.sendText("Edit app.py.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+    await waitForEditApproval(active, ["app.py", "- line1", "+ changed1"]);
+
+    writeFileSync(target, "external\nline2\n");
+    await active.sendKeys("1");
+    await active.waitForText("STALE_EDIT_DONE", TIMEOUT);
+
+    expect(readFileSync(target, "utf8")).toBe("external\nline2\n");
+    const result = gateway.requests
+      .map((request) => toolResultText(request.body, "bash_stale_edit"))
+      .find((output) => output !== "") ?? "";
+    expect(result).toContain("changed after preview");
+    expect(result).toContain("exit=6");
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Couldn't edit app.py");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash outside-workspace edit in ask mode prompts with outside scope, and overwrite write reviews as write with undo",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-outside-and-write-", {
+      permission_mode: "ask",
+      experimental: { bash_tool: true },
+    });
+    const outsideTarget = join(fixture.root, "outside.txt");
+    const existingTarget = join(fixture.workspace, "existing.txt");
+    const emptyTarget = join(fixture.workspace, "empty.txt");
+    writeFileSync(outsideTarget, "outside-old\n");
+    writeFileSync(existingTarget, "old1\nold2\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_outside_ask", "bash", {
+        command: "edit ../outside.txt <<'EOF'\n<<<<<<< SEARCH\noutside-old\n=======\noutside-new\n>>>>>>> REPLACE\nEOF",
+      }),
+      fakeGatewayFinalText("OUTSIDE_DENIED"),
+      fakeGatewayToolCall("bash_write_cases", "bash", {
+        command: "write empty.txt </dev/null\nwrite existing.txt <<'EOF'\nnew1\nEOF",
+      }),
+      fakeGatewayFinalText("WRITES_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { FX_PERMISSION_MODE: "ask" });
+
+    await active.sendText("Edit outside.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+    const outsidePrompt = await waitForEditApproval(active, [outsideTarget, "- outside-old", "+ outside-new"]);
+    expect(outsidePrompt).toContain(`allow file changes under ${fixture.root}`);
+    await active.sendKeys("3");
+    await active.waitForText("OUTSIDE_DENIED", TIMEOUT);
+    expect(readFileSync(outsideTarget, "utf8")).toBe("outside-old\n");
+
+    await active.sendText("Run writes.");
+    await active.waitForText("1. Yes", TIMEOUT);
+    await active.sendKeys("1");
+    const emptyPrompt = await waitForEditApproval(active, ["empty.txt"]);
+    expect(emptyPrompt).toContain("Write");
+    await active.sendKeys("1");
+    const overwritePrompt = await waitForEditApproval(active, ["existing.txt", "- old1", "- old2", "+ new1"]);
+    expect(overwritePrompt).toContain("Write");
+    await active.sendKeys("1");
+    await active.waitForText("WRITES_DONE", TIMEOUT);
+
+    expect(existsSync(emptyTarget)).toBe(true);
+    expect(readFileSync(emptyTarget, "utf8")).toBe("");
+    expect(readFileSync(existingTarget, "utf8")).toBe("new1\n");
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Wrote empty.txt");
+    expect(scrollback).toContain("Wrote existing.txt +1/-2");
+
+    await active.sendText("/undo");
+    await active.waitForText(`Restored ${existingTarget}`, TIMEOUT);
+    expect(readFileSync(existingTarget, "utf8")).toBe("old1\nold2\n");
+    await active.sendText("/undo");
+    await active.waitForText(`Deleted ${emptyTarget}`, TIMEOUT);
+    expect(existsSync(emptyTarget)).toBe(false);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash cd sub && edit app.py shows Edited sub/app.py in the bash call group and undoes sub/app.py",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-cd-sub-", { experimental: { bash_tool: true } });
+    mkdirSync(join(fixture.workspace, "sub"), { recursive: true });
+    const rootFile = join(fixture.workspace, "app.py");
+    const subFile = join(fixture.workspace, "sub", "app.py");
+    writeFileSync(rootFile, "root\n");
+    writeFileSync(subFile, "sub\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_cd_sub", "bash", {
+        command: "cd sub && edit app.py <<'EOF'\n<<<<<<< SEARCH\nsub\n=======\nsub2\n>>>>>>> REPLACE\nEOF",
+      }),
+      fakeGatewayFinalText("CD_SUB_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Edit sub/app.py from sub.");
+    await active.waitForText("CD_SUB_DONE", TIMEOUT);
+
+    expect(readFileSync(rootFile, "utf8")).toBe("root\n");
+    expect(readFileSync(subFile, "utf8")).toBe("sub2\n");
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Edited app.py +1/-1");
+    const toolOut = gateway.requests
+      .map((request) => toolResultText(request.body, "bash_cd_sub"))
+      .find((output) => output !== "") ?? "";
+    expect(toolOut).toContain("edited sub/app.py +1 -1");
+
+    await active.sendKeys("C-o");
+    await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+    const full = await active.capturePane();
+    expect(full).toContain("Edited sub/app.py +1 / -1");
+    await active.sendKeys("C-o");
+    await active.waitForComposer(TIMEOUT);
+
+    await active.sendText("/undo");
+    await active.waitForText(`Restored ${subFile}`, TIMEOUT);
+    expect(readFileSync(subFile, "utf8")).toBe("sub\n");
+    expect(readFileSync(rootFile, "utf8")).toBe("root\n");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   60_000,

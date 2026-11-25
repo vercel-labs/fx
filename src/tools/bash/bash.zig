@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const self_exe = @import("../../core/shared/self_exe.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
 const tool_bridge = @import("../../core/tool_bridge/tool_bridge.zig");
@@ -217,7 +218,10 @@ fn callRun(
         .run_command => |value| value,
         else => return unavailableResult(ctx),
     };
-    const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables) catch |err| return runtimeFailure(ctx, err);
+    // The functions `edit` and `write` call this binary, so the path must be the one running now.
+    const fx_binary = self_exe.pathForPeerReexec(ctx.allocator) catch |err| return runtimeFailure(ctx, err);
+    defer ctx.allocator.free(fx_binary);
+    const swept = session.prepare(io_mod.getIo(), tmpRoot(), &fx_variables, fx_binary) catch |err| return runtimeFailure(ctx, err);
     // Before the program, the session folder is checked and repaired, so no shell
     // the program starts waits on a FIFO, a link, or a missing file. Every repair
     // made is logged, even when a later one fails.
@@ -607,6 +611,8 @@ fn tmpRootFor(raw: []const u8) []const u8 {
     if (std.mem.findAny(u8, trimmed, "$`\\") != null) return "/tmp";
     return if (trimmed.len == 0) "/" else trimmed;
 }
+
+const test_fx_binary = "/usr/local/bin/fx";
 
 test "tmpRoot uses an absolute TMPDIR without trailing slashes, and /tmp otherwise" {
     try std.testing.expectEqualStrings("/var/folders/fx", tmpRootFor("/var/folders/fx/"));
@@ -1418,7 +1424,7 @@ test "a saved folder that a program removed after its save is dropped: the next 
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1456,7 +1462,7 @@ test "a saved folder that is not an absolute path is a bad record: the next prog
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1483,7 +1489,7 @@ test "a fresh session with no saved folder gives no notice and no trace line" {
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1509,7 +1515,7 @@ test "a startup record that is a FIFO is replaced before the next program, which
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1538,7 +1544,7 @@ test "a session folder a program removes is made again: the next call says the s
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1586,7 +1592,7 @@ test "a state file that is a FIFO is removed before the next program, which star
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1628,7 +1634,7 @@ test "an env file that is a FIFO is written again before the next program, which
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1658,7 +1664,7 @@ test "a program's EXIT trap that puts a FIFO at the folder file gives the next c
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // The program's save writes the folder file, then its EXIT trap replaces it with a FIFO, as review PROBE1 does.
     const replace = "trap '/bin/rm -f -- \"$__fx_folder\"; /usr/bin/mkfifo \"$__fx_folder\"' EXIT; x=1";
@@ -1687,7 +1693,7 @@ test "a directory at the save record, made after the program's save, is replaced
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1724,7 +1730,7 @@ test "a program that leaves a directory at its save record gets no save notice, 
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // The program puts a directory where its save record is, then sets x. Its own result has no save notice.
     const leave = "rm -f -- \"$__fx_status\"; mkdir -p \"$__fx_status/x\"; x=1";
@@ -1746,7 +1752,7 @@ test "a directory at a startup record is replaced before the next program, which
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1780,7 +1786,7 @@ test "a program that puts a FIFO where its save record is returns its own result
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // The program replaces its own save record with a FIFO, then sets x. The call must return, not wait on the FIFO.
     const replace = "rm -f -- \"$__fx_status\"; /usr/bin/mkfifo \"$__fx_status\"; x=1";
@@ -1801,7 +1807,7 @@ test "a repair that cannot complete starts a fresh session: the next program has
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1855,7 +1861,7 @@ test "a repair that cannot complete, with no new folder either, fails the call w
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
     const trace_path = try alloc.print("{s}/trace.log", .{bash.workspace});
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
@@ -1920,7 +1926,7 @@ test "a refused call carries the folder notice, since the folder it was approved
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // The session keeps a folder, and the next program is approved to start in it.
     try bash.tmp.dir.createDirPath(bash.io, "refused-target");
@@ -1945,7 +1951,7 @@ test "a failed start carries the folder notice too" {
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // A folder file that is not a usable path: the next call drops it, and starts in the workspace root.
     try bash.writeSessionFolder("relative/folder");
@@ -2094,7 +2100,7 @@ test "bash refuses a program whose start folder changed after its approval" {
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     // Approved while the session starts in the workspace root.
     try bash.authorize(&ctx, "echo moved");
@@ -2111,7 +2117,7 @@ test "a program starts in the folder the session holds, not one the saved state 
     var bash = try TestBash.init(alloc);
     defer bash.deinit();
     var ctx = bash.context();
-    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables);
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
 
     try bash.authorize(&ctx, "cd /");
     const moved = try callRun(ctx, "cd /", program_yield_ms);

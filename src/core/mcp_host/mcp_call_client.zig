@@ -17,37 +17,18 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
-const capability_mod = tool_bridge.capability;
-const mcp_call = tool_bridge.core;
+const client = tool_bridge.client;
 const wire = tool_bridge.wire;
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
-/// What `fx mcp call` exits with.
-pub const exit = struct {
-    pub const ok: u8 = 0;
-    /// The call failed, or the connection to fx was lost.
-    pub const failed: u8 = 1;
-    /// A usage mistake, as for every `fx mcp` verb.
-    pub const usage: u8 = 2;
-    /// No running fx shell call to reach: outside fx, after the shell call
-    /// ended, or another fx version.
-    pub const unavailable: u8 = 3;
-    /// Too many calls are running; nothing ran.
-    pub const busy: u8 = 4;
-    /// Permission was not granted; nothing ran.
-    pub const denied: u8 = 5;
-    /// The tool ran and returned an error.
-    pub const tool_error: u8 = 6;
-};
+/// What `fx mcp call` exits with: the bridge clients' table, shared with `fx tool`.
+pub const exit = client.exit;
 
-pub const Reply = struct {
-    header: wire.Header,
-    bytes: []const u8,
-};
+pub const Reply = client.Reply;
 
-pub const CallError = error{ MalformedReply, UnsupportedReply, ConnectionLost, OutOfMemory };
+pub const CallError = client.CallError;
 
 /// What `fx mcp call` was asked: a tool to run, or a question about tools.
 pub const Command = union(enum) {
@@ -60,37 +41,6 @@ pub const Command = union(enum) {
     /// A tool's name.
     help: []const u8,
 };
-
-/// Sends one request to the bridge at `socket_path` and reads its whole reply.
-pub fn call(
-    arena: Allocator,
-    io: std.Io,
-    socket_path: []const u8,
-    token: mcp_call.Token,
-    operation: wire.Operation,
-) (CallError || std.Io.net.UnixAddress.ConnectError || std.Io.net.UnixAddress.InitError)!Reply {
-    const address = try std.Io.net.UnixAddress.init(socket_path);
-    const stream = try address.connect(io);
-    defer stream.close(io);
-    var write_buffer: [4096]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    wire.writeRequest(&writer.interface, token, operation) catch return error.ConnectionLost;
-    writer.interface.flush() catch return error.ConnectionLost;
-    var read_buffer: [wire.max_header_bytes]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    const line = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-        error.StreamTooLong => return error.MalformedReply,
-        error.ReadFailed => return error.ConnectionLost,
-    }) orelse return error.ConnectionLost;
-    const header = try wire.parseHeader(arena, line);
-    // A reply carries at most the bridge's result limit and a short message.
-    if (header.bytes > capability_mod.max_result_bytes + 64 * 1024) return error.MalformedReply;
-    const bytes = reader.interface.readAllocAll(arena, @intCast(header.bytes)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.EndOfStream, error.ReadFailed => return error.ConnectionLost,
-    };
-    return .{ .header = header, .bytes = bytes };
-}
 
 /// The arguments object of a call: the JSON argument, stdin for `-`, or `{}`
 /// for none. Null after telling the user what is wrong with it.
@@ -129,8 +79,12 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
     const socket_path = io_mod.getenv(wire.socket_env) orelse return unavailable(err);
     const token = wire.parseToken(io_mod.getenv(wire.token_env) orelse "") orelse return unavailable(err);
 
-    const reply = call(arena, io, socket_path, token, operation) catch |e| switch (e) {
+    const reply = client.call(arena, io, socket_path, token, operation) catch |e| switch (e) {
         error.OutOfMemory => return e,
+        error.RequestTooLarge => {
+            try err.print("fx mcp call: the encoded request is larger than {d} bytes.\n", .{wire.max_request_bytes});
+            return exit.usage;
+        },
         error.UnsupportedReply => {
             try err.writeAll("fx mcp call: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n");
             return exit.unavailable;
@@ -159,23 +113,23 @@ fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operatio
         },
         .tool_error => {
             try err.print("fx mcp call: {f} returned an error:\n", .{text_utils.terminalSafe(tool)});
-            try writeTerminalSafeLine(arena, err, reply.bytes);
+            try client.writeSafeLine(arena, err, reply.bytes);
             return exit.tool_error;
         },
         .failed => {
             try err.writeAll("fx mcp call: ");
-            try writeTerminalSafeLine(arena, err, reply.bytes);
+            try client.writeSafeLine(arena, err, reply.bytes);
             return exit.failed;
         },
         .denied => {
             try err.print("fx mcp call: {f} did not run. ", .{text_utils.terminalSafe(tool)});
-            try writeTerminalSafeLine(arena, err, reply.bytes);
+            try client.writeSafeLine(arena, err, reply.bytes);
             return exit.denied;
         },
         .refused => {
             try err.writeAll("fx mcp call: ");
-            try writeTerminalSafeLine(arena, err, reply.bytes);
-            return if (reply.header.reason == .busy) exit.busy else if (reply.header.reason == .malformed or reply.header.reason == .too_large) exit.usage else exit.unavailable;
+            try client.writeSafeLine(arena, err, reply.bytes);
+            return client.refusalExit(reply.header.reason);
         },
     }
 }
@@ -297,23 +251,6 @@ fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hin
 fn unavailable(err: *Writer) !u8 {
     try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, while that call runs.\n");
     return exit.unavailable;
-}
-
-fn writeLine(w: *Writer, text: []const u8) !void {
-    try w.writeAll(text);
-    if (!std.mem.endsWith(u8, text, "\n")) try w.writeByte('\n');
-}
-
-/// `writeLine` for the text of a reply. It can be an MCP server's own, such as
-/// a JSON-RPC error's message. A person may read it on a terminal, and fx's
-/// shell tool hands it to the model as it is, so a control byte in it must
-/// show as text instead of acting. Line breaks and tabs stay, so the server's
-/// own lines read as it wrote them (a CRLF becomes a line feed); every other
-/// control byte, C1 control, and invalid UTF-8 byte becomes a visible escape.
-fn writeTerminalSafeLine(arena: Allocator, w: *Writer, text: []const u8) !void {
-    var safe: std.ArrayList(u8) = .empty;
-    try text_utils.appendTerminalSafeText(arena, &safe, text);
-    try writeLine(w, safe.items);
 }
 
 fn isJsonObject(arena: Allocator, text: []const u8) bool {

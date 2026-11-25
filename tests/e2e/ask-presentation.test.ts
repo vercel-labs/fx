@@ -1559,6 +1559,86 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[3]!.body, "bash-read")).toContain("x=1 big=0");
   }, TIMEOUT);
 
+  test("edit changes a file from a heredoc, and the result names the counts", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-edit", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\nEOF",
+      }),
+      fakeGatewayFinalText("Edited.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Change the print."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('b')\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-edit")).toContain("edited app.py +1 -1");
+  }, TIMEOUT);
+
+  test("write creates a file from stdin, and the result names it", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-write", "bash", {
+        command: "write new.txt <<'EOF'\nhello\nEOF",
+      }),
+      fakeGatewayFinalText("Written.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Create the file."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "new.txt"), "utf8")).toBe("hello\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-write")).toContain("wrote new.txt +1");
+  }, TIMEOUT);
+
+  test("a malformed edit shows its line, and changes nothing", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-bad", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\nprint('b')\nEOF",
+      }),
+      fakeGatewayFinalText("Refused.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Change the print."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-bad")).toContain("fx tool edit: line 1: ");
+  }, TIMEOUT);
+
+  test("fx tool run outside a program fx started exits 3 and changes nothing", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+
+    const result = await runFx(["tool", "edit", "app.py"], {
+      cwd: root.workspace,
+      env: { FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined },
+      stdin: "<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\n",
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(3);
+    expect(result.stderr).toContain(
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+    );
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
+  }, TIMEOUT);
+
   test("a bash state over the size cap that the program ends with exit is reported, and the old value stays", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -1749,5 +1829,541 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(waitResult).toContain("Nothing is running.");
     expect(waitResult).not.toContain("send wait_more");
     expect(gateway.classifierRequests).toHaveLength(0);
+  }, TIMEOUT);
+
+  test("2a: outside-workspace paths (../x and /tmp/x) are denied in fx ask without a prompter and reviewed in auto mode", async () => {
+    const root = createRoot();
+    const relTarget = join(root.root, "outside-rel.txt");
+    const absDir = mkdtempSync(join(tmpdir(), "fx-bash-outside-"));
+    roots.push(absDir);
+    const absTarget = join(absDir, "outside-abs.txt");
+    writeFileSync(relTarget, "orig-rel\n");
+
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow" } }) + "\n",
+    );
+    writeFileSync(
+      join(root.workspace, "run-rel.sh"),
+      "edit ../outside-rel.txt <<'EOF'\n<<<<<<< SEARCH\norig-rel\n=======\nhacked-rel\n>>>>>>> REPLACE\nEOF\necho \"rel_exit=$?\"\n",
+    );
+    writeFileSync(
+      join(root.workspace, "run-abs.sh"),
+      `write "${absTarget}" <<'EOF'\nhacked-abs\nEOF\necho "abs_exit=$?"\n`,
+    );
+
+    const denyGateway = startFakeGateway([
+      fakeGatewayToolCall("bash-out-rel", "bash", { command: ". ./run-rel.sh" }),
+      fakeGatewayToolCall("bash-out-abs", "bash", { command: ". ./run-abs.sh" }),
+      fakeGatewayFinalText("Denied.\n"),
+    ]);
+    gateways.push(denyGateway);
+
+    const denyResult = await runFx(
+      ["ask", "--json", "--ask", "--no-save", ...BASH_SETTING, "Touch outside files."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, denyGateway), FX_PERMISSION_MODE: "ask" }, timeoutMs: TIMEOUT },
+    );
+    expect(denyResult.code).toBe(0);
+    expect(readFileSync(relTarget, "utf8")).toBe("orig-rel\n");
+    expect(existsSync(absTarget)).toBe(false);
+    const relOut = toolResultText(denyGateway.requests[1]!.body, "bash-out-rel");
+    const absOut = toolResultText(denyGateway.requests[2]!.body, "bash-out-abs");
+    expect(relOut).toContain("rel_exit=5");
+    expect(relOut).toContain("fx tool edit:");
+    expect(absOut).toContain("abs_exit=5");
+    expect(absOut).toContain("fx tool write:");
+
+    const cautionGateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-auto-caution", "bash", { command: ". ./run-rel.sh" }),
+        fakeGatewayFinalText("Caution held.\n"),
+      ],
+      {
+        classifierResponses: [
+          fakeGatewayToolCall("permission_decision_1", "permission_decision", {
+            risk: "high",
+            decision: "caution",
+            category: "system_harm",
+            evidence: relTarget,
+            rationale: "outside workspace",
+          }),
+          fakeGatewayToolCall("permission_decision_2", "permission_decision", {
+            risk: "high",
+            decision: "caution",
+            category: "system_harm",
+            evidence: relTarget,
+            rationale: "outside workspace",
+          }),
+        ],
+      },
+    );
+    gateways.push(cautionGateway);
+
+    const cautionResult = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Edit outside in auto mode."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, cautionGateway), timeoutMs: TIMEOUT },
+    );
+    expect(cautionResult.code).toBe(0);
+    expect(readFileSync(relTarget, "utf8")).toBe("orig-rel\n");
+    expect(cautionGateway.classifierRequests.length).toBeGreaterThanOrEqual(1);
+    const reviewBody = cautionGateway.classifierRequests[0]!.body;
+    expect(reviewBody).toContain(relTarget);
+
+    const clearGateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-auto-clear", "bash", {
+          command: "edit ../outside-rel.txt <<'EOF'\n<<<<<<< SEARCH\norig-rel\n=======\nallowed-rel\n>>>>>>> REPLACE\nEOF\necho \"exit=$?\"",
+        }),
+        fakeGatewayFinalText("Allowed.\n"),
+      ],
+      { classifierResponses: [fakeGatewayPermissionDecision()] },
+    );
+    gateways.push(clearGateway);
+
+    const clearResult = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Edit outside with clear."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, clearGateway), timeoutMs: TIMEOUT },
+    );
+    expect(clearResult.code).toBe(0);
+    expect(readFileSync(relTarget, "utf8")).toBe("allowed-rel\n");
+    expect(toolResultText(clearGateway.requests[1]!.body, "bash-auto-clear")).toContain("exit=0");
+  }, TIMEOUT);
+
+  test("2b: a workspace symlink pointing outside is resolved to its canonical path like edit_file", async () => {
+    const root = createRoot();
+    const outsideDir = join(root.root, "outside-dir");
+    mkdirSync(outsideDir);
+    const outsideFile = join(outsideDir, "outside-target.txt");
+    writeFileSync(outsideFile, "before\n");
+    symlinkSync(outsideFile, join(root.workspace, "link.txt"));
+    symlinkSync(outsideDir, join(root.workspace, "dir-link"));
+
+    mkdirSync(join(root.home, ".fx"), { recursive: true });
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { bash: "allow" } }) + "\n",
+    );
+    writeFileSync(
+      join(root.workspace, "run-sym-file.sh"),
+      "edit link.txt <<'EOF'\n<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE\nEOF\necho \"file_exit=$?\"\n",
+    );
+    writeFileSync(
+      join(root.workspace, "run-sym-dir.sh"),
+      "edit dir-link/outside-target.txt <<'EOF'\n<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE\nEOF\necho \"dir_exit=$?\"\n",
+    );
+
+    const askGateway = startFakeGateway([
+      fakeGatewayToolCall("bash-sym-file", "bash", { command: ". ./run-sym-file.sh" }),
+      fakeGatewayToolCall("bash-sym-dir", "bash", { command: ". ./run-sym-dir.sh" }),
+      fakeGatewayFinalText("Denied symlink.\n"),
+    ]);
+    gateways.push(askGateway);
+
+    const askRes = await runFx(
+      ["ask", "--json", "--ask", "--no-save", ...BASH_SETTING, "Edit symlink."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, askGateway), FX_PERMISSION_MODE: "ask" }, timeoutMs: TIMEOUT },
+    );
+    expect(askRes.code).toBe(0);
+    expect(readFileSync(outsideFile, "utf8")).toBe("before\n");
+    // Symlink file target is rejected as not a regular file (same as edit_file).
+    const symFileOut = toolResultText(askGateway.requests[1]!.body, "bash-sym-file");
+    expect(symFileOut).toContain("target is not a regular file");
+    expect(symFileOut).toContain("file_exit=6");
+    // Symlink directory target fails traversal check as path_outside_workspace (same as edit_file).
+    const symDirOut = toolResultText(askGateway.requests[2]!.body, "bash-sym-dir");
+    expect(symDirOut).toContain("path_outside_workspace");
+    expect(symDirOut).toContain("dir_exit=6");
+
+    const autoGateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-sym-auto", "bash", { command: ". ./run-sym-file.sh" }),
+        fakeGatewayFinalText("Refused symlink in auto mode.\n"),
+      ],
+    );
+    gateways.push(autoGateway);
+
+    const autoRes = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Edit symlink in auto mode."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, autoGateway), timeoutMs: TIMEOUT },
+    );
+    expect(autoRes.code).toBe(0);
+    expect(autoGateway.classifierRequests).toHaveLength(0);
+    expect(readFileSync(outsideFile, "utf8")).toBe("before\n");
+    expect(toolResultText(autoGateway.requests[1]!.body, "bash-sym-auto")).toContain("target is not a regular file");
+  }, TIMEOUT);
+
+  test("2c: 65 blocks exits 2 with the at-most-64-blocks line message and sends nothing", async () => {
+    const root = createRoot();
+    const tracePath = join(root.root, "trace-65.log");
+    const lines = Array.from({ length: 65 }, (_, i) => `line-${i + 1}`);
+    writeFileSync(join(root.workspace, "app.py"), `${lines.join("\n")}\n`);
+    const blocks = lines
+      .map((line, i) => `<<<<<<< SEARCH\n${line}\n=======\nupdated-${i + 1}\n>>>>>>> REPLACE`)
+      .join("\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-65", "bash", {
+        command: `edit app.py <<'EOF'\n${blocks}\nEOF\necho "exit=$?"`,
+      }),
+      fakeGatewayFinalText("Refused 65 blocks.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Send 65 blocks."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp-call",
+        },
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-65");
+    expect(shown).toContain("exit=2");
+    expect(shown).toContain("fx tool edit: line 321: an edit takes at most 64 blocks");
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe(`${lines.join("\n")}\n`);
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).not.toContain("bridge refused");
+    expect(trace).not.toContain("request=");
+  }, TIMEOUT);
+
+  test("2d: a write larger than the request limit exits 2 with the split message", async () => {
+    const root = createRoot();
+    const target = join(root.workspace, "big.txt");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-over-stdin", "bash", {
+        command: "head -c 1048577 /dev/zero | tr '\\0' a | write big.txt; echo \"over_exit=$?\"",
+      }),
+      fakeGatewayFinalText("Too big.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Write over limit."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-over-stdin");
+    expect(shown).toContain("over_exit=2");
+    expect(shown).toContain("fx tool write: the change on stdin is larger than 1048576 bytes. Split the change into several smaller calls.");
+    expect(existsSync(target)).toBe(false);
+  }, TIMEOUT);
+
+  test("2d-edge: a write under stdin limit whose JSON wire request exceeds 1 MiB exits 2 without ConnectionLost", async () => {
+    const root = createRoot();
+    const target = join(root.workspace, "exact1m.txt");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-exact-1m", "bash", {
+        command: "head -c 1048576 /dev/zero | tr '\\0' a | write exact1m.txt; echo \"exact_exit=$?\"",
+      }),
+      fakeGatewayFinalText("Checked exact 1 MiB.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Write exact 1 MiB."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-exact-1m");
+    expect(existsSync(target)).toBe(false);
+    expect(shown).toContain("exact_exit=2");
+  }, TIMEOUT);
+
+  test("2d-encoded: 700000 quotes under stdin limit exceeds encoded wire limit, exits 2 with split message, and creates nothing", async () => {
+    const root = createRoot();
+    const target = join(root.workspace, "quotes.txt");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-quotes-over", "bash", {
+        command: 'head -c 700000 /dev/zero | tr \'\\0\' \'"\' | write quotes.txt; echo "quotes_exit=$?"',
+      }),
+      fakeGatewayFinalText("Encoded too big.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Write 700000 quotes."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-quotes-over");
+    expect(shown).toContain("quotes_exit=2");
+    expect(shown).toContain("encoded");
+    expect(shown).toContain("1048576 bytes. Split the change into several smaller calls.");
+    expect(existsSync(target)).toBe(false);
+  }, TIMEOUT);
+
+  test("finding 3: cd sub && edit app.py changes sub/app.py and edit ../app.py from sub changes root app.py", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.workspace, "sub"), { recursive: true });
+    writeFileSync(join(root.workspace, "app.py"), "root-before\n");
+    writeFileSync(join(root.workspace, "sub", "app.py"), "sub-before\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-cd-sub", "bash", {
+        command: [
+          "cd sub && edit app.py <<'EOF'",
+          "<<<<<<< SEARCH",
+          "sub-before",
+          "=======",
+          "sub-after",
+          ">>>>>>> REPLACE",
+          "EOF",
+          "edit ../app.py <<'EOF'",
+          "<<<<<<< SEARCH",
+          "root-before",
+          "=======",
+          "root-after",
+          ">>>>>>> REPLACE",
+          "EOF",
+        ].join("\n"),
+      }),
+      fakeGatewayFinalText("Cwd edits done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Edit in sub and parent."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "sub", "app.py"), "utf8")).toBe("sub-after\n");
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("root-after\n");
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-cd-sub");
+    expect(shown).toContain("edited sub/app.py +1 -1");
+    expect(shown).toContain("edited app.py +1 -1");
+  }, TIMEOUT);
+
+  test("exported edit and write work inside a bash -c child process and do not leak into saved state", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-child-edit", "bash", {
+        command: [
+          "bash -c \"edit app.py <<'EOF'",
+          "<<<<<<< SEARCH",
+          "print('a')",
+          "=======",
+          "print('child')",
+          ">>>>>>> REPLACE",
+          "EOF\"",
+          "bash -c \"write child.txt <<'EOF'",
+          "from-child",
+          "EOF\"",
+          "saved_ok=1",
+        ].join("\n"),
+      }),
+      fakeGatewayToolCall("bash-after-child", "bash", {
+        command: "echo \"saved_ok=$saved_ok\"; declare -f edit write >/dev/null && echo funcs=yes || echo funcs=no",
+      }),
+      fakeGatewayFinalText("Child bash done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Run edit and write in bash -c."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('child')\n");
+    expect(readFileSync(join(root.workspace, "child.txt"), "utf8")).toBe("from-child\n");
+    const childResult = toolResultText(gateway.requests[1]!.body, "bash-child-edit");
+    expect(childResult).toContain("edited app.py +1 -1");
+    expect(childResult).toContain("wrote child.txt +1");
+    const nextResult = toolResultText(gateway.requests[2]!.body, "bash-after-child");
+    expect(nextResult).toContain("saved_ok=1");
+    expect(nextResult).toContain("funcs=yes");
+  }, TIMEOUT);
+
+  test("2h: a CRLF file with LF search text is not found with closest-lines hint and writes nothing", async () => {
+    const root = createRoot();
+    const target = join(root.workspace, "crlf.txt");
+    writeFileSync(target, "alpha\r\nbeta\r\ngamma\r\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-crlf", "bash", {
+        command: "edit crlf.txt <<'EOF'\n<<<<<<< SEARCH\nalpha\nbeta\n=======\nALPHA\nBETA\n>>>>>>> REPLACE\nEOF\necho \"exit=$?\"",
+      }),
+      fakeGatewayFinalText("CRLF refused.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Edit CRLF with LF."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-crlf");
+    expect(shown).toContain("exit=6");
+    expect(shown).toContain("not found in file; the closest match is lines 1-2");
+    expect(readFileSync(target, "utf8")).toBe("alpha\r\nbeta\r\ngamma\r\n");
+  }, TIMEOUT);
+
+  test("2i: path with spaces and non-ASCII, empty write, and overwrite of existing file reviewed as write", async () => {
+    const root = createRoot();
+    const spacedName = "my dir/café naïve.txt";
+    const spacedPath = join(root.workspace, spacedName);
+    const emptyPath = join(root.workspace, "empty.txt");
+    const existingPath = join(root.workspace, "existing.txt");
+    const externalExistingPath = join(root.root, "external-existing.txt");
+    writeFileSync(existingPath, "old1\nold2\n");
+    writeFileSync(externalExistingPath, "ext1\next2\n");
+
+    const gateway = startFakeGateway(
+      [
+        fakeGatewayToolCall("bash-2i", "bash", {
+          command: [
+            `write "${spacedName}" <<'EOF'`,
+            "hello café",
+            "EOF",
+            `edit "${spacedName}" <<'EOF'`,
+            "<<<<<<< SEARCH",
+            "hello café",
+            "=======",
+            "bonjour café",
+            ">>>>>>> REPLACE",
+            "EOF",
+            "write empty.txt </dev/null",
+            "echo \"empty_exit=$?\"",
+            "write existing.txt <<'EOF'",
+            "new1",
+            "EOF",
+            "echo \"overwrite_exit=$?\"",
+            "write ../external-existing.txt <<'EOF'",
+            "ext-new1",
+            "EOF",
+            "echo \"ext_overwrite_exit=$?\"",
+          ].join("\n"),
+        }),
+        fakeGatewayFinalText("All 2i done.\n"),
+      ],
+      {
+        classifierResponses: [
+          fakeGatewayPermissionDecision(),
+          fakeGatewayPermissionDecision(),
+        ],
+      },
+    );
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", ...BASH_SETTING, "Run 2i cases."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(spacedPath, "utf8")).toBe("bonjour café\n");
+    expect(existsSync(emptyPath)).toBe(true);
+    expect(readFileSync(emptyPath, "utf8")).toBe("");
+    expect(readFileSync(existingPath, "utf8")).toBe("new1\n");
+    expect(readFileSync(externalExistingPath, "utf8")).toBe("ext-new1\n");
+
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-2i");
+    expect(shown).toContain(`wrote ${spacedName} +1`);
+    expect(shown).toContain(`edited ${spacedName} +1 -1`);
+    expect(shown).toContain("empty_exit=0");
+    expect(shown).toContain("wrote existing.txt +1 -2");
+    expect(shown).toContain("overwrite_exit=0");
+    expect(shown).toContain(`wrote ${externalExistingPath} +1 -2`);
+    expect(shown).toContain("ext_overwrite_exit=0");
+
+    // Overwriting an external existing file goes through the write_file review path with preimage present.
+    const writeReview = gateway.classifierRequests.find(
+      ({ body }) => body.includes("action: prepared_file_mutation") && body.includes("external-existing.txt"),
+    );
+    expect(writeReview).toBeDefined();
+    expect(writeReview!.body).toContain("preimage: present");
+    expect(writeReview!.body).toContain("additions: 1");
+    expect(writeReview!.body).toContain("deletions: 2");
+  }, TIMEOUT);
+});
+
+describe("fx tool and fx mcp call without MCP servers", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("the shell tool starts no bridge, and fx mcp call exits 3 as it does outside fx", async () => {
+    const root = createRoot();
+    const command =
+      'echo "socket=[$FX_MCP_CALL_SOCKET] token=[$FX_MCP_CALL_TOKEN]"; "' + FX_BIN + '" mcp call list fixture; echo "exit=$?"';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      fakeGatewayFinalText("Checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", "Check the bridge."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "run_call");
+    expect(shown).toContain("socket=[] token=[]");
+    expect(shown).toContain("no running fx shell call to reach");
+    expect(shown).toContain("exit=3");
+  }, TIMEOUT);
+
+  test("the bash tool without MCP servers: fx mcp call says MCP is not available, and fx tool still edits", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const command =
+      '"' + FX_BIN + '" mcp call list fixture; echo "exit=$?"; edit app.py <<\'EOF\'\n<<<<<<< SEARCH\nprint(\'a\')\n=======\nprint(\'b\')\n>>>>>>> REPLACE\nEOF';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-both", "bash", { command }),
+      fakeGatewayFinalText("Done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Read and edit."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-both");
+    expect(shown).toContain("fx mcp call: MCP is not available in this session.");
+    expect(shown).toContain("exit=1");
+    expect(shown).toContain("edited app.py +1 -1");
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('b')\n");
+  }, TIMEOUT);
+
+  test("2j: the shell tool with no MCP servers has no bridge env at all and fx tool edit exits 3", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const command =
+      'echo "socket=[$FX_MCP_CALL_SOCKET] token=[$FX_MCP_CALL_TOKEN]"; "' +
+      FX_BIN +
+      '" tool edit app.py <<\'EOF\'\n<<<<<<< SEARCH\nprint(\'a\')\n=======\nprint(\'b\')\n>>>>>>> REPLACE\nEOF\necho "exit=$?"';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("run_tool_edit", "shell", { action: "run", command }),
+      fakeGatewayFinalText("Checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", "Check fx tool edit without MCP."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "run_tool_edit");
+    expect(shown).toContain("socket=[] token=[]");
+    expect(shown).toContain("exit=3");
+    expect(shown).toContain(
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+    );
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
   }, TIMEOUT);
 });

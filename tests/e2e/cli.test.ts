@@ -485,6 +485,24 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 
   test(
+    "fx tool help documents edit, write, and the exit codes",
+    async () => {
+      for (const args of [["tool"], ["tool", "--help"], ["tool", "edit", "--help"]]) {
+        const r = await runFx(args);
+        expect(r.code).toBe(0);
+        expect(r.stderr).toBe("");
+        expect(r.stdout).toContain("edit PATH");
+        expect(r.stdout).toContain("write PATH");
+        expect(r.stdout).toContain("Exit codes:");
+        expect(r.stdout).toContain("5 denied");
+        expect(r.stdout).toContain("6 the change did not apply");
+        expect(r.stdout).toContain("the experimental bash tool runs");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx acp help documents accepted options",
     async () => {
       for (const alias of ["--help", "-h"]) {

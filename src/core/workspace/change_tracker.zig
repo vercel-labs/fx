@@ -29,20 +29,33 @@ pub const UndoResult = union(enum) {
 
 pub const ChangeTracker = struct {
     stack: std.ArrayList(FileOperation) = .empty,
+    /// Guards every operation on `stack`. A bridged change is pushed from its
+    /// bridge task while undo runs on the UI side, so each method holds it for
+    /// its whole body, undo's file restore included.
+    mutex: std.Io.Mutex = .init,
 
     const max_stack_size: usize = 100;
 
     pub fn deinit(self: *ChangeTracker, alloc: Allocator) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         for (self.stack.items) |op| freeOperation(alloc, op);
         self.stack.deinit(alloc);
     }
 
     pub fn clear(self: *ChangeTracker, alloc: Allocator) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         for (self.stack.items) |op| freeOperation(alloc, op);
         self.stack.clearRetainingCapacity();
     }
 
     pub fn pushOperation(self: *ChangeTracker, alloc: Allocator, op: FileOperation) !void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (self.stack.items.len >= max_stack_size) {
             freeOperation(alloc, self.stack.items[0]);
             _ = self.stack.orderedRemove(0);
@@ -51,6 +64,9 @@ pub const ChangeTracker = struct {
     }
 
     pub fn undoLast(self: *ChangeTracker, alloc: Allocator) UndoResult {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (self.stack.items.len == 0) return .empty;
 
         const op = self.stack.pop().?;
@@ -207,6 +223,56 @@ test "file size limit setup restores SIGXFSZ on failure" {
     var actual: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
     std.posix.sigaction(std.posix.SIG.XFSZ, null, &actual);
     try expectSignalHandlerEqual(expected, actual);
+}
+
+const PushRun = struct {
+    tracker: *ChangeTracker,
+    alloc: Allocator,
+    op: FileOperation,
+    entered: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
+
+    fn run(self: *PushRun) void {
+        self.entered.store(true, .release);
+        self.tracker.pushOperation(self.alloc, self.op) catch {
+            self.failed = true;
+        };
+        self.finished.store(true, .release);
+    }
+};
+
+test "a push waits while another holder has the tracker's lock" {
+    const alloc = std.testing.allocator;
+    var tracker: ChangeTracker = .{};
+    defer tracker.deinit(alloc);
+    const io = io_mod.getIo();
+    var run: PushRun = .{
+        .tracker = &tracker,
+        .alloc = alloc,
+        .op = .{
+            .kind = .write,
+            .path = try alloc.dupe(u8, "/tracked/held.txt"),
+            .previous_content = null,
+            .timestamp_ms = 1,
+        },
+    };
+
+    tracker.mutex.lockUncancelable(io);
+    const thread = try std.Thread.spawn(.{}, PushRun.run, .{&run});
+    // Wait for the push to begin. It must then wait for the lock, so it stores nothing yet.
+    while (!run.entered.load(.acquire)) std.Thread.yield() catch {};
+    // A push that ignored the lock finishes within these yields; one that waits never does.
+    for (0..1000) |_| std.Thread.yield() catch {};
+    const finished_while_held = run.finished.load(.acquire);
+    const stored_while_held = tracker.stack.items.len;
+    // Release before any assertion, so a failure cannot leave the push blocked.
+    tracker.mutex.unlock(io);
+    thread.join();
+    try std.testing.expect(!finished_while_held);
+    try std.testing.expectEqual(@as(usize, 0), stored_while_held);
+    try std.testing.expect(!run.failed);
+    try std.testing.expectEqual(@as(usize, 1), tracker.stack.items.len);
 }
 
 test "undoLast returns empty on an initially empty stack" {

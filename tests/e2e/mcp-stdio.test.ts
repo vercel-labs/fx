@@ -5536,6 +5536,33 @@ describe("fx mcp call", () => {
     });
   }, 30_000);
 
+  test("a shell command with MCP servers cannot change a file with fx tool, and the file stays", async () => {
+    const root = bridgeRoot("bridge-tool-refused");
+    writeFileSync(join(root.workspace, "app.txt"), "old\n");
+    const change = `"${FX_BIN}" tool edit app.txt <<'EOF'\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\nEOF\necho "exit=$?"`;
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_change", "shell", { action: "run", command: change }),
+      (body: string) => {
+        seen = toolResultText(body, "run_change");
+        return fakeGatewayFinalText("REFUSED_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Change the file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=3");
+    expect(seen).toContain(
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+    );
+    expect(readFileSync(join(root.workspace, "app.txt"), "utf8")).toBe("old\n");
+  }, 40_000);
+
   test("a bridge that closes without replying exits 1 and writes no data", async () => {
     await withFakeBridge(null, async (env) => {
       const lost = await runClient(env);

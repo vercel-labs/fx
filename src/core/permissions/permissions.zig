@@ -3191,8 +3191,10 @@ fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationI
 fn testEditMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {
     return .{ .edit = .{
         .path = @constCast(path),
-        .old_string = @constCast("a"),
-        .new_string = @constCast("b"),
+        .edits = @constCast(&[_]file_mutation_contract.Replacement{.{
+            .old_string = @constCast("a"),
+            .new_string = @constCast("b"),
+        }}),
     } };
 }
 
