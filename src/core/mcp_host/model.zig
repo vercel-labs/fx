@@ -769,15 +769,19 @@ pub const Catalog = struct {
         for (c.servers, c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
-                const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
-                defer alloc.free(step);
-                step[0] = std.ascii.toUpper(step[0]);
+                const how = signIn(c.runtime.options.slash_commands, s.source);
                 const refused = try c.runtime.refusedLogin(alloc, s.name);
                 defer if (refused) |text| alloc.free(text);
-                const guidance = if (refused) |why|
-                    try alloc.print("{s} {s}, then search again.", .{ why, step })
-                else
-                    try alloc.print("{s}, then search again.", .{step});
+                // A command prints the page's message as it is, so it gets the sentence `toolbox {open}` says.
+                const guidance = if (request.login_sentence) try needsLoginText(alloc, s.name, how, refused) else blk: {
+                    const step = try signInStep(alloc, s.name, how);
+                    defer alloc.free(step);
+                    step[0] = std.ascii.toUpper(step[0]);
+                    break :blk if (refused) |why|
+                        try alloc.print("{s} {s}, then search again.", .{ why, step })
+                    else
+                        try alloc.print("{s}, then search again.", .{step});
+                };
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -990,6 +994,7 @@ fn snapshotToolFn(raw: *anyopaque, alloc: Allocator, name: []const u8, known_bin
 const testing = std.testing;
 const Fixture = @import("fake_server.zig").Fixture;
 const login_words = @import("login_words.zig");
+const tool_lookup = @import("../mcp/tool_lookup.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 
@@ -1464,6 +1469,44 @@ test "what the model got before stays the same: an error without data, a -32042,
     const ok = (try render(a, "srv", "mcp_srv_tool", .{ .result = .{ .content = "[{\"type\":\"text\",\"text\":\"hi\"}]", .structured = null, .is_error = false } }, 4096, .terminal, null)).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, ok.status);
     try testing.expectEqualStrings("{\"server\":\"srv\",\"tool\":\"mcp_srv_tool\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}", ok.model_output);
+}
+
+test "a search a command makes gets toolbox open's own sentence for a server that needs a login, and the model's page keeps its guidance" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{
+        .name = "keyed",
+        .transport = .http,
+        .url = "https://example.invalid/mcp",
+    }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    c.lists[0].state = .needs_login;
+
+    const query = try lexical_relevance.prepare("keyed");
+    const sentence = try needsLoginText(a, "keyed", .terminal, null);
+    try testing.expectEqualStrings("MCP server 'keyed' needs a login. Ask the user to run fx mcp login keyed in a terminal, then try again.", sentence);
+    // The model's page keeps the guidance it always had.
+    const for_model = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed" })).?;
+    try testing.expect(std.mem.find(u8, for_model, "\"message\":\"Run fx mcp login keyed in a terminal, then search again.\"") != null);
+    // A command's page carries the sentence, which the command prints as it is.
+    const for_command = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed", .login_sentence = true })).?;
+    var lines: std.Io.Writer.Allocating = .init(a);
+    const page = try tool_lookup.writeToolLines(a, &lines.writer, for_command);
+    try testing.expectEqualStrings(sentence, page.problem.?);
+    // And it is the very text `toolbox {open}` gives for a tool of that server.
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    const opened = (try c.whyUnavailableLocked(a, "mcp_keyed_list")).?;
+    try testing.expectEqualStrings(sentence, opened.rejected.model_output);
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {

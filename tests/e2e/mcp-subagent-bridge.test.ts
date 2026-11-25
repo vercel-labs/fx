@@ -7,9 +7,11 @@ import { describe, expect, test } from "bun:test";
 import { FX_BIN } from "../evals/eval-helpers";
 import { LARGE_RESULT, LARGE_TOOL, LIST_CHANGE_RELEASE, OTHER_TOOL, SMALL_RESULT, SMALL_TOOL, runPaths, seen, shellStep, type PathsRun } from "./mcp-rules-paths";
 
+/** What `fx mcp call` and `fx mcp call help` both say when fx has no MCP tool by that name for this agent. */
+const noSuchTool = (tool: string) => `No MCP tool named ${tool} is available to this agent. Find tool names with fx mcp call search.`;
+
 /** The words fx mcp call prints, with its exit code 5, when the agent may not call the tool. */
-const refusal = (tool: string) =>
-  `fx mcp call: ${tool} did not run. No MCP tool named ${tool} is available to this agent. Find tool names with toolbox search.`;
+const refusal = (tool: string) => `fx mcp call: ${tool} did not run. ${noSuchTool(tool)}`;
 
 const call = (run: PathsRun, tool: string) => seen(run, "bridge_call", tool).text;
 const ok = (run: PathsRun) => expect([run.code, run.stderr.slice(-200)]).toEqual([0, run.stderr.slice(-200)]);
@@ -69,6 +71,40 @@ describe("a subagent's fx mcp call", () => {
     expectRefused(call(run, SMALL_TOOL), SMALL_TOOL);
     expectRan(call(run, OTHER_TOOL), LARGE_RESULT);
     expect(run.fixtureCalls).toEqual(["echo"]);
+  }, 240_000);
+
+  test("says the same words in fx mcp call and fx mcp call help for a tool outside its view or denied in its mode", async () => {
+    const run = await runPaths({
+      bin: FX_BIN, mode: "full", childMode: "auto", agent: "child", rules: { [SMALL_TOOL]: "deny" },
+      only: [`bridge_call:${SMALL_TOOL}`, `bridge_help:${SMALL_TOOL}`], label: "same-words-denied",
+    });
+    ok(run);
+    expectRefused(call(run, SMALL_TOOL), SMALL_TOOL);
+    const help = seen(run, "bridge_help", SMALL_TOOL).text;
+    expect(help).toContain("exit=1");
+    expect(help).toContain(`fx mcp call: ${noSuchTool(SMALL_TOOL)}`);
+    expect(run.fixtureCalls).toEqual([]);
+  }, 240_000);
+
+  test("tells fx mcp call and help why a tool can't be used, in the words toolbox open uses for it", async () => {
+    // The small server exits at once, so its tool exists but its server is unavailable.
+    const run = await runPaths({
+      bin: FX_BIN, mode: "full", agent: "child", rules: {}, down: true,
+      only: [`open_tool:${SMALL_TOOL}`, `bridge_call:${SMALL_TOOL}`, `bridge_help:${SMALL_TOOL}`], label: "server-down",
+    });
+    ok(run);
+    const opened = seen(run, "open_tool", SMALL_TOOL).text;
+    const reason = /MCP server 'fixture' is unavailable: [^"\\\n]*/.exec(opened)?.[0];
+    expect(reason, `toolbox open said: ${opened}`).toStartWith("MCP server 'fixture' is unavailable: its process exited");
+    const called = call(run, SMALL_TOOL);
+    expect(called).toContain("exit=5");
+    expect(called).toContain(`fx mcp call: ${SMALL_TOOL} did not run. ${reason}`);
+    expect(called).not.toContain("No MCP tool named");
+    const help = seen(run, "bridge_help", SMALL_TOOL).text;
+    expect(help).toContain("exit=1");
+    expect(help).toContain(`fx mcp call: ${reason}`);
+    expect(help).not.toContain("No MCP tool named");
+    expect(run.fixtureCalls).toEqual([]);
   }, 240_000);
 
   test("runs the subagent's first call, with no open or search before it", async () => {

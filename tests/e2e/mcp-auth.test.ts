@@ -1600,6 +1600,42 @@ describe("MCP login", () => {
     expect(seen).not.toContain(ACCESS_INITIAL);
   }, 90_000);
 
+  // The reason a tool can't be used is one sentence, whoever says it: `toolbox open` and a command's
+  // `fx mcp call`, `help`, `list` and `search` word a server that needs a login the same way.
+  test("fx mcp call, run from the agent's shell, says a server needs a login in the words toolbox open uses", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const sentence = "MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.";
+    const command = [
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '{}' 2>&1; echo "call=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME} 2>&1; echo "help=$?"`,
+      `"${FX_BIN}" mcp call list fixture 2>&1; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search fixture 2>&1; echo "search=$?"`,
+    ].join("; ");
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("CALL_DONE");
+      },
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the commands."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    // The call did not run; help, list and search each print the sentence.
+    expect(seen).toContain(`fx mcp call: ${TOOL_NAME} did not run. ${sentence}`);
+    expect(seen.split(`fx mcp call: ${sentence}`).length - 1).toBe(3);
+    expect(seen).toContain("call=5");
+    expect(seen).not.toContain("No MCP tool named");
+    expect(seen).not.toContain("then search again");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 90_000);
+
   // A server's words go in quotes inside fx's sentence, so a description that tries to end it and
   // start one of fx's own stays inside the quotes, wherever fx says it.
   test("a server's words are quoted, so they cannot close fx's sentence, in the sign-in's words and the model's", async () => {
