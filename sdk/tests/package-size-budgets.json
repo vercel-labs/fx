@@ -4,10 +4,10 @@
     "unpacked": 11647000
   },
   "fx-core.wasm": {
-    "bytes": 2490000
+    "bytes": 2512000
   },
   "fx-term.wasm": {
-    "bytes": 4292000
+    "bytes": 4314000
   },
   "engine.js": {
     "gzip": 34600

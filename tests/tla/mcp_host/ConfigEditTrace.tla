@@ -26,6 +26,8 @@
 \*                             InspectKeepsGood and InspectNotesSkipped hold in every state, so
 \*                             the model's configs check them, and Viol, which TraceInit runs for
 \*                             every starting state, leaves them out.
+\*   acp {file, shown}         the servers a real `fx acp` session that asks for the profile's servers
+\*                             lists from the file, by what the model is told of them (AcpRuns)
 \*   tamper {kind, file, name, class}
 \*                             the harness edits a file itself, as an editor would:
 \*                             typo_appears (name: the server the key holds, or
@@ -66,6 +68,9 @@ Step(rec) ==
       [] rec.event = "inspect" ->
             /\ InspectShown(rec.data.file) = rec.data.shown
             /\ InspectNoted(rec.data.file) = rec.data.noted
+            /\ UNCHANGED vars
+      [] rec.event = "acp" ->
+            /\ AcpRuns(rec.data.file) = rec.data.shown
             /\ UNCHANGED vars
       [] rec.event = "tamper" ->
             \/ rec.data.kind = "typo_appears" /\ TypoAppears(IF rec.data.name \in Names THEN rec.data.name ELSE OtherTypo)
