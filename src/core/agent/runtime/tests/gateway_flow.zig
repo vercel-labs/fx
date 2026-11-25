@@ -10916,6 +10916,37 @@ test "a question dropped from a length-cut reply and sent again leaves the prese
     );
 }
 
+test "a question run through toolbox starts a new presentation group for the calls after it" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const toolbox_ask = [_]ToolCall{toolCall(
+        "call_ask",
+        "toolbox",
+        "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}",
+    )};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &toolbox_ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    const first = startedPresentationGroup(&hooks, "call_1").?;
+    const second = startedPresentationGroup(&hooks, "call_2").?;
+    try std.testing.expect(!std.meta.eql(first, second));
+    try std.testing.expectEqual(second, startedPresentationGroup(&hooks, "call_3").?);
+}
+
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};

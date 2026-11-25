@@ -10426,7 +10426,9 @@ fn processQueuedPromptLoop(
         var step_has_visible_tool_calls = false;
         var step_asked_question = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) {
+            // A toolbox run of a built-in tool counts as the call it runs.
+            const shown = try toolbox.shownBuiltinRun(arena, deps.tool_registry, call) orelse call;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, shown) == .ask) {
                 step_asked_question = true;
             } else {
                 step_has_visible_tool_calls = true;
