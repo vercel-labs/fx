@@ -8785,7 +8785,8 @@ const cancelledCallCases = [
     name: "a web fetch",
     permission: { web_fetch: { "domain:example.com": "ask" } },
     call: () => fakeGatewayToolCall("cancelled-call-fetch", "web_fetch", { url: "https://example.com/docs" }),
-    row: "● Cancelled https://example.com/docs",
+    // The row names the page and its host; Ctrl+O keeps the URL.
+    row: "● Cancelled docs · example.com",
     full: "https://example.com/docs",
   },
 ];

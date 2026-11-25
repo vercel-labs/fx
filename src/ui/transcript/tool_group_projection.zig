@@ -2115,6 +2115,9 @@ const StoryRowKind = enum {
     /// wherever it is: one row that names the source by its short name and
     /// each search once.
     output_search,
+    /// Every fetch of a web page on one host in the group, wherever it is:
+    /// one row that names each page once, then the host.
+    fetch,
     /// The same subagent: its messages, status, and close.
     subagent,
     /// A subagent wait or status that names no agent, keyed by its action.
@@ -2211,13 +2214,14 @@ const StoryRow = struct {
     joined_calls: usize = 0,
 };
 
-/// The name a call adds to a `.read`, `.search`, `.more_output`, or
-/// `.output_search` row: the file's path, the pattern after the search key's
-/// tool name, the output's source, or the search after the source.
+/// The name a call adds to a `.read`, `.search`, `.more_output`,
+/// `.output_search`, or `.fetch` row: the file's path, the pattern after the
+/// search key's tool name, the output's source, the search after the source,
+/// or the page's URL after its host.
 fn storyRowName(identity: StoryIdentity) ?[]const u8 {
     return switch (identity.kind) {
         .read, .more_output => identity.key,
-        .search => if (findByte(identity.key, 0)) |at| identity.key[at + 1 ..] else identity.key,
+        .search, .fetch => if (findByte(identity.key, 0)) |at| identity.key[at + 1 ..] else identity.key,
         .output_search => outputSearchQuery(identity.key),
         else => null,
     };
@@ -2256,11 +2260,11 @@ fn storySearchTool(key: []const u8) []const u8 {
     return if (findByte(key, 0)) |at| key[0..at] else key;
 }
 
-/// Whether a row names several files, patterns, sources, or searches, so its
-/// text lists them.
+/// Whether a row names several files, patterns, sources, searches, or pages,
+/// so its text lists them.
 fn rowListsNames(row: *const StoryRow) bool {
     return switch (row.identity.kind) {
-        .read, .search, .more_output, .output_search => row.names.items.len > 1,
+        .read, .search, .more_output, .output_search, .fetch => row.names.items.len > 1,
         else => false,
     };
 }
@@ -2801,12 +2805,37 @@ fn moreOutputSource(phrase: []const u8) ?[]const u8 {
     return if (source.len == 0) null else source;
 }
 
+/// A web address's host, without the user name and password a URL may put
+/// before it, and its path, without the query and fragment after it.
+const UrlParts = struct { host: []const u8, path: []const u8 };
+
+fn urlParts(url: []const u8) ?UrlParts {
+    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
+    const rest = url[scheme_end + 3 ..];
+    const authority_end = std.mem.findAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..authority_end];
+    const host = if (std.mem.findScalarLast(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
+    if (host.len == 0) return null;
+    const after_host = rest[authority_end..];
+    return .{ .host = host, .path = after_host[0 .. std.mem.findAny(u8, after_host, "?#") orelse after_host.len] };
+}
+
 /// A web page's host, such as "example.com" for "https://example.com/a".
 fn urlHost(url: []const u8) ?[]const u8 {
-    const at = std.mem.find(u8, url, "://") orelse return null;
-    const rest = url[at + 3 ..];
-    const host = rest[0 .. std.mem.findAny(u8, rest, "/?#") orelse rest.len];
-    return if (host.len > 0) host else null;
+    return (urlParts(url) orelse return null).host;
+}
+
+/// The last part of a URL's path that is not empty, such as "prompt-turn"
+/// for "/protocol/v1/prompt-turn/". Empty for a path with no such part.
+fn urlPathPage(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    const start = if (std.mem.findScalarLast(u8, trimmed, '/')) |slash| slash + 1 else 0;
+    return trimmed[start..];
+}
+
+/// Whether core cut `text` short, which it marks with an ellipsis.
+fn endsCutShort(text: []const u8) bool {
+    return std.mem.endsWith(u8, text, "...") or std.mem.endsWith(u8, text, "\u{2026}");
 }
 
 /// A file's name, without the folders before it.
@@ -2835,7 +2864,7 @@ fn outputSourceName(scratch: std.mem.Allocator, source: *const ToolDetailRecord)
 /// call in the transcript saved the output. Null when core cut the source
 /// short, since the end it cut off is what tells sources apart.
 fn phraseSourceName(scratch: std.mem.Allocator, source: []const u8, handle: []const u8) !?OutputSourceName {
-    if (std.mem.endsWith(u8, source, "...") or std.mem.endsWith(u8, source, "\u{2026}")) return null;
+    if (endsCutShort(source)) return null;
     if (command_replay_store.isReplayHandle(handle)) return .{ .full = source, .short = try shortCommand(scratch, source) orelse source };
     if (urlHost(source)) |host| return .{ .full = source, .short = host };
     return .{ .full = source, .short = pathFileName(source) orelse source };
@@ -2915,23 +2944,67 @@ fn sharedSavedOutputIdentity(
     }
     const search = try read_tool_result_presentation.outputSearch(scratch, arguments_json) orelse return null;
     const noun = read_tool_result_presentation.savedOutputNoun(search.handle);
-    // An output no call names goes by core's noun for it, and by its handle
-    // in full, so two such outputs stay apart.
-    const name = try savedOutputName(scratch, search.handle, searchedOutputSource(phrase, noun, search.quoted_query), details, output_sources) orelse
-        OutputSourceName{ .full = search.handle, .short = noun };
-    return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short, "\x00", search.quoted_query }) };
+    const output = try searchedOutputName(scratch, search.handle, searchedOutputSource(phrase, noun, search.quoted_query), details, output_sources);
+    return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ output.full, "\x00", output.short, "\x00", try rowQuotedQuery(scratch, search.quoted_query) }) };
 }
 
-/// The short name a `.more_output` or `.output_search` row shows for a
-/// source, after the first 0 byte in its key.
+/// What a row of searches of one saved output calls a web search's results.
+/// The search tool's name is fx's own, and the row's verb already says
+/// "Searched".
+const web_results_label = "web results";
+
+/// What a row of searches of one saved output puts between the output and
+/// the searches.
+const output_search_marker = " for ";
+
+/// Whether a call searches the web: fx's own search, or one the provider
+/// runs.
+fn isWebSearchName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "web_search") or isProviderSearchName(name) or tooling_presentation.isProviderSearchAlias(name);
+}
+
+/// The saved output a row of searches looks in, in full and as the row names
+/// it before `output_search_marker`: its source's short name and "output",
+/// such as "github.com output", "web results" for a web search's results,
+/// or core's noun for an output no call names, such as "saved output". An
+/// output named by a noun goes by its handle in full, so two such outputs
+/// stay apart.
+fn searchedOutputName(
+    scratch: std.mem.Allocator,
+    handle: []const u8,
+    phrase_source: ?[]const u8,
+    details: []const ToolDetailRecord,
+    output_sources: *const OutputSources,
+) !OutputSourceName {
+    if (output_sources.get(handle)) |index| if (isWebSearchName(details[index].tool_name)) {
+        return .{ .full = handle, .short = web_results_label };
+    };
+    const name = try savedOutputName(scratch, handle, phrase_source, details, output_sources) orelse
+        OutputSourceName{ .full = handle, .short = read_tool_result_presentation.savedOutputNoun(handle) };
+    return .{ .full = name.full, .short = try std.mem.concat(scratch, u8, &.{ name.short, " output" }) };
+}
+
+/// A search as its compact row repeats it. Core puts it in straight quotes
+/// (`quotedQuery` in src/core/tooling/read_tool_result_presentation.zig); a
+/// search that holds a straight quote goes in curly quotes instead, so its
+/// own quotes do not run into the row's, as in “"url":"https://…”.
+fn rowQuotedQuery(scratch: std.mem.Allocator, quoted_query: []const u8) ![]const u8 {
+    if (quoted_query.len < 2) return quoted_query;
+    const query = quoted_query[1 .. quoted_query.len - 1];
+    if (findByte(query, '"') == null) return quoted_query;
+    return std.mem.concat(scratch, u8, &.{ "\u{201C}", query, "\u{201D}" });
+}
+
+/// What a `.more_output` row shows for a source, or a `.output_search` row
+/// for its output, after the first 0 byte in its key.
 fn moreOutputShortName(key: []const u8) []const u8 {
     const source = outputSearchSource(key);
     return if (findByte(source, 0)) |at| source[at + 1 ..] else source;
 }
 
 /// The part of a `.output_search` key that searches of one output share:
-/// the source in full, a 0 byte, and its short name. The whole key for any
-/// other key.
+/// the output's source in full, a 0 byte, and the row's name for the output
+/// (`searchedOutputName`). The whole key for any other key.
 fn outputSearchSource(key: []const u8) []const u8 {
     const first = findByte(key, 0) orelse return key;
     const second = std.mem.findScalarPos(u8, key, first + 1, 0) orelse return key;
@@ -2984,7 +3057,7 @@ fn savedReadVerb(scratch: std.mem.Allocator, row: *const StoryRow, fallback: []c
 /// "Searched github.com output for ": what a row of searches of one saved
 /// output says before the searches.
 fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u8) ![]const u8 {
-    return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), searched_output_marker });
+    return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), output_search_marker });
 }
 
 /// What a row of reads of saved output names after its verb, such as
@@ -2992,7 +3065,7 @@ fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u
 fn savedOutputRowTarget(scratch: std.mem.Allocator, identity: StoryIdentity) ![]const u8 {
     const source = try terminalSafeText(scratch, moreOutputShortName(identity.key));
     return switch (identity.kind) {
-        .output_search => std.mem.concat(scratch, u8, &.{ source, searched_output_marker, outputSearchQuery(identity.key) }),
+        .output_search => std.mem.concat(scratch, u8, &.{ source, output_search_marker, outputSearchQuery(identity.key) }),
         else => std.mem.concat(scratch, u8, &.{ more_output_marker, source }),
     };
 }
@@ -3091,6 +3164,79 @@ test "searches of one saved output share one row that names the source by its sh
     errdefer std.debug.print("wide: {s}\n", .{wide_row});
     try std.testing.expectEqualStrings("● Searched github.com output for +1, \" fx\", \"検索語\"", wide_row);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide_row) <= 54);
+}
+
+test "a search of a web search's saved results names them web results, and a search with a straight quote goes in curly quotes" {
+    const alloc = std.testing.allocator;
+    const handle = "result-a228d.txt";
+    const search = ToolDetailRecord{
+        .entry_id = 1,
+        .tool_name = @constCast("read_tool_result"),
+        .activity_kind = .read,
+        // The search starts with a straight quote.
+        .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\":\\\"https://agentclientprotocol.com\"}"),
+        .outcome = .completed,
+    };
+    // Core names no source for a web search's results, and quotes the
+    // search in straight quotes.
+    const searched = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"url\":\"https://agentclientprotocol.com\"\n", .class = .tool_status } };
+    for ([_][]const u8{ "exa_search", "web_search", "web_search_preview" }) |tool| {
+        const web_search = ToolDetailRecord{ .entry_id = 90, .tool_name = @constCast(tool), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol slash commands\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+        const text = try groupTextForTest(alloc, &.{searched}, &.{ web_search, search });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ tool, text });
+        try std.testing.expectEqualStrings("● Searched web results for “\"url\":\"https://agentclientprotocol.com”", std.mem.trim(u8, text, "\n"));
+    }
+    const web_search = ToolDetailRecord{ .entry_id = 90, .tool_name = @constCast("exa_search"), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+    var running = search;
+    running.outcome = null;
+    const searching = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Searching saved output for \"\"url\":\"https://agentclientprotocol.com\"\n", .class = .tool_status } };
+    const running_text = try groupTextForTest(alloc, &.{searching}, &.{ web_search, running });
+    defer alloc.free(running_text);
+    try std.testing.expectEqualStrings("● Searching web results for “\"url\":\"https://agentclientprotocol.com”", std.mem.trim(u8, running_text, "\n"));
+
+    // Searches of one output that hold a straight quote go in curly quotes,
+    // and one without keeps core's straight quotes, whatever the output.
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, row: []const u8 };
+    const notes = ToolDetailRecord{ .entry_id = 91, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/notes.md\"}"), .outcome = .completed, .result_handle = @constCast("result-2222.txt") };
+    const mcp = ToolDetailRecord{ .entry_id = 92, .tool_name = @constCast("mcp_linear_list_issues"), .activity_kind = .mcp, .arguments_json = @constCast("{}"), .outcome = .completed, .result_handle = @constCast("result-3333.txt") };
+    const cases = [_]Case{
+        .{
+            .entries = &.{
+                .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"url\"\"\n", .class = .tool_status } },
+                .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched saved output for \"docs\"\n", .class = .tool_status } },
+            },
+            .details = &.{
+                web_search,
+                .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\"\"}"), .outcome = .completed },
+                .{ .entry_id = 2, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"docs\"}"), .outcome = .completed },
+            },
+            .row = "● Searched web results for “\"url\"”, \"docs\"",
+        },
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched /w/notes.md output for \"say \"hi\"\"\n", .class = .tool_status } }},
+            .details = &.{ notes, .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-2222.txt\",\"query\":\"say \\\"hi\\\"\"}"), .outcome = .completed } },
+            .row = "● Searched notes.md output for “say \"hi\"”",
+        },
+        // An output no call in view saved keeps core's noun.
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"a\"\"\n", .class = .tool_status } }},
+            .details = &.{.{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-9999.txt\",\"query\":\"\\\"a\\\"\"}"), .outcome = .completed }},
+            .row = "● Searched saved output for “\"a\"”",
+        },
+        // An MCP tool's output keeps the name core gives it.
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched mcp_linear_list_issues output for \"bug\"\n", .class = .tool_status } }},
+            .details = &.{ mcp, .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-3333.txt\",\"query\":\"bug\"}"), .outcome = .completed } },
+            .row = "● Searched mcp_linear_list_issues output for \"bug\"",
+        },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, case.details);
+        defer alloc.free(text);
+        errdefer std.debug.print("rows:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
 }
 
 test "a search of a long command's saved output names the command by the short form its own row shows" {
@@ -3214,6 +3360,259 @@ test "a cancelled look into saved output names what it read as its running row d
         try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, "\n"), header));
         try std.testing.expect(std.mem.find(u8, row, notice) != null);
     }
+}
+
+/// What a fetch row puts between its pages and their host.
+const fetch_host_separator = " · ";
+
+/// The verb a row's phrase opens with, such as "Fetched" or "Failed": its
+/// letters before the first space, when more text follows. Null for any
+/// other phrase, such as a bare "Fetching" or `fx ask`'s "Failed: …".
+fn phraseVerb(phrase: []const u8) ?[]const u8 {
+    const space = findByte(phrase, ' ') orelse return null;
+    if (space == 0 or space + 1 == phrase.len) return null;
+    for (phrase[0..space]) |byte| if (!std.ascii.isAlphabetic(byte)) return null;
+    return phrase[0..space];
+}
+
+/// The URL a `web_fetch` call reads: its `url`, or, for a call without one,
+/// such as a toolbox run still streaming its arguments in or one that failed
+/// before it started, the URL core's row names after its verb. Core names it
+/// only once that whole value has streamed in (`streamedLabelValue` in
+/// src/core/tooling/tool_presentation.zig). Null for any other call and for
+/// a URL core cut short.
+fn fetchedUrl(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !?[]const u8 {
+    if (!std.mem.eql(u8, record.tool_name, "web_fetch")) return null;
+    if (storyArgString(scratch, record, "url")) |url| return std.mem.trim(u8, url, " \t\r\n");
+    const status = try entryStatus(scratch, entry) orelse return null;
+    const phrase = if (splitFailedPhrase(status, record)) |split| split.row else status;
+    const verb = phraseVerb(phrase) orelse return null;
+    const after_verb = phrase[verb.len + 1 ..];
+    const url = after_verb[0 .. findByte(after_verb, ' ') orelse after_verb.len];
+    return if (endsCutShort(url)) null else url;
+}
+
+/// A fetched page's name in a row's list: the last part of its URL's path,
+/// such as "prompt-turn", or the host for a URL with no path.
+fn fetchedPageName(url: []const u8) []const u8 {
+    const parts = urlParts(url) orelse return url;
+    const page = urlPathPage(parts.path);
+    return if (page.len > 0) page else parts.host;
+}
+
+/// The page and host a fetch row names, such as "prompt-turn ·
+/// agentclientprotocol.com", or the host alone for a URL with no path.
+/// Terminal-safe. Null for a URL with no host.
+fn fetchTargetText(scratch: std.mem.Allocator, url: []const u8) !?[]const u8 {
+    const parts = urlParts(url) orelse return null;
+    const host = try terminalSafeText(scratch, parts.host);
+    const page = urlPathPage(parts.path);
+    if (page.len == 0) return host;
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, page), fetch_host_separator, host });
+}
+
+/// The host a `.fetch` key names, before its first 0 byte.
+fn fetchKeyHost(key: []const u8) []const u8 {
+    return key[0 .. findByte(key, 0) orelse key.len];
+}
+
+/// A fetch that ran or still runs joins the group's row for its host, which
+/// names each page once. One that failed, was denied, or was cancelled keeps
+/// its own row, as a file read does. The key is the host, a 0 byte, and the
+/// URL. Any other call keeps `identity`.
+fn fetchIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    const record = detail orelse return identity;
+    if (storyCallFailed(detail)) return identity;
+    if (record.outcome) |outcome| if (outcome != .completed) return identity;
+    const url = try fetchedUrl(scratch, entry, record) orelse return identity;
+    const parts = urlParts(url) orelse return identity;
+    return .{ .kind = .fetch, .key = try std.mem.concat(scratch, u8, &.{ parts.host, "\x00", url }) };
+}
+
+/// A fetch row by its page and host, such as "Fetched prompt-turn ·
+/// agentclientprotocol.com", in place of the URL core's row names. Core's
+/// live row adds the final URL, size, status, time, and cache state, which a
+/// resumed row does not have, so the compact row names only what the call
+/// asked for, and reads the same live and after a resume. The verb is core's,
+/// so a failed fetch reads "Failed …" until `couldNotPhrase` words it. Null
+/// for any other row and for a phrase with no verb.
+fn fetchRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    const url = try fetchedUrl(scratch, row.entry, record) orelse return null;
+    const verb = phraseVerb(phrase) orelse return null;
+    const target = try fetchTargetText(scratch, url) orelse return null;
+    return try std.mem.concat(scratch, u8, &.{ verb, " ", target });
+}
+
+/// Core's live row of a completed fetch of `url`: the final URL, size,
+/// status, time, and cache state after it, dimmed
+/// (`formatWebFetchCompletion` in src/core/agent/runtime/tool_presentation.zig).
+fn liveFetchStatusForTest(comptime url: []const u8) []const u8 {
+    return "● Fetched\x1b[0m \x1b[38;5;245m" ++ url ++ "\x1b[0m \x1b[38;5;245m| " ++ url ++ " | 48213 bytes | HTTP 200 | 412ms | fetched | artifact stored\x1b[0m\n";
+}
+
+fn fetchDetailForTest(entry_id: u32, comptime url: []const u8, outcome: ?types.ToolOutcomeKind) ToolDetailRecord {
+    return .{ .entry_id = entry_id, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = @constCast("{\"url\":\"" ++ url ++ "\"}"), .outcome = outcome };
+}
+
+fn fetchEntryForTest(id: u32, status: []const u8) TranscriptEntry {
+    return .{ .raw_bytes = .{ .id = id, .bytes = status, .class = .tool_status } };
+}
+
+test "a fetch row names the page and its host, the same live and after a resume, in every state" {
+    const alloc = std.testing.allocator;
+    const url = "https://agentclientprotocol.com/protocol/v1/prompt-turn";
+    const turn_ended = TranscriptEntry{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    var streaming = fetchDetailForTest(1, url, null);
+    streaming.arguments_json = null;
+    streaming.streaming = true;
+    var unstarted = fetchDetailForTest(1, url, .failed);
+    unstarted.arguments_json = null;
+    const failed_status = "● Failed " ++ url ++ ": web_fetch target returned HTTP 404\n";
+    const Case = struct { entries: []const TranscriptEntry, detail: ToolDetailRecord, row: []const u8 };
+    const cases = [_]Case{
+        // Core's live row adds the final URL, size, status, time, and cache
+        // state, and a resumed row has none of them.
+        .{ .entries = &.{fetchEntryForTest(1, liveFetchStatusForTest(url))}, .detail = fetchDetailForTest(1, url, .completed), .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetched " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, .completed), .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetching " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, null), .row = "● Fetching prompt-turn · agentclientprotocol.com" },
+        // Before its arguments arrive, the row reads the URL core names.
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetching " ++ url ++ "\n")}, .detail = streaming, .row = "● Fetching prompt-turn · agentclientprotocol.com" },
+        // A failure says why only when the turn ended on it.
+        .{ .entries = &.{fetchEntryForTest(1, failed_status)}, .detail = fetchDetailForTest(1, url, .failed), .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{ fetchEntryForTest(1, failed_status), turn_ended }, .detail = fetchDetailForTest(1, url, .failed), .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com · web_fetch target returned HTTP 404" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Failed " ++ url ++ "\n")}, .detail = unstarted, .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Denied " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, .denied), .row = "● Denied prompt-turn · agentclientprotocol.com" },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, &.{case.detail});
+        defer alloc.free(text);
+        errdefer std.debug.print("{s} =>\n{s}\n", .{ case.entries[0].raw_bytes.bytes, text });
+        try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+    }
+
+    // A cancelled fetch's row and the notice under it name the page the
+    // same way.
+    const cancelled = try groupTextForTest(alloc, &.{fetchEntryForTest(1, "▪ Cancelled " ++ url ++ cancellation_follow_up ++ "\n")}, &.{fetchDetailForTest(1, url, .cancelled)});
+    defer alloc.free(cancelled);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{cancelled});
+    try std.testing.expectEqualStrings("● Cancelled prompt-turn · agentclientprotocol.com", firstLineForTest(cancelled));
+    try std.testing.expect(std.mem.find(u8, cancelled, "▪ Cancelled prompt-turn · agentclientprotocol.com" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "https://") == null);
+}
+
+test "a fetch row names the last part of the URL's path, or the host for a URL with no path, terminal-safe" {
+    const alloc = std.testing.allocator;
+    const Case = struct { url: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .url = "https://agentclientprotocol.com", .row = "● Fetched agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com/?tab=1#top", .row = "● Fetched agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com/protocol/v1/prompt-turn/?tab=1#top", .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com:8443/docs#intro", .row = "● Fetched docs · agentclientprotocol.com:8443" },
+        // A user name and password never show.
+        .{ .url = "https://user:secret@agentclientprotocol.com/docs", .row = "● Fetched docs · agentclientprotocol.com" },
+        .{ .url = " https://agentclientprotocol.com/docs\n", .row = "● Fetched docs · agentclientprotocol.com" },
+        // An escape sequence in the URL shows as text.
+        .{ .url = "https://agentclientprotocol.com/a\x1b[31mred", .row = "● Fetched a\\x1b[31mred · agentclientprotocol.com" },
+        // A URL with no host keeps core's row.
+        .{ .url = "agentclientprotocol.com/docs", .row = "● Fetched agentclientprotocol.com/docs" },
+    };
+    for (cases) |case| {
+        const arguments = try alloc.print("{{\"url\":{f}}}", .{std.json.fmt(case.url, .{})});
+        defer alloc.free(arguments);
+        const status = try std.mem.concat(alloc, u8, &.{ "● Fetched ", std.mem.trim(u8, case.url, " \n"), "\n" });
+        defer alloc.free(status);
+        const detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = arguments, .outcome = .completed };
+        const text = try groupTextForTest(alloc, &.{fetchEntryForTest(1, status)}, &.{detail});
+        defer alloc.free(text);
+        errdefer std.debug.print("{s} =>\n{s}\n", .{ case.url, text });
+        try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+    }
+}
+
+test "fetches from one host share a row that names each page once, and another host keeps its own" {
+    const alloc = std.testing.allocator;
+    const site = "https://agentclientprotocol.com/protocol/v1/";
+    const prompt_turn = site ++ "prompt-turn";
+    const slash = site ++ "slash-commands";
+    const other = "https://docs.example.dev/guide/install";
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, rows: []const u8 };
+    var streaming = fetchDetailForTest(2, slash, null);
+    streaming.arguments_json = null;
+    streaming.streaming = true;
+    const cases = [_]Case{
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(slash)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, slash, .completed) },
+            .rows = "● Fetched prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+        // Another host keeps its own row, and a page fetched again shows once.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(other)), fetchEntryForTest(3, liveFetchStatusForTest(slash)), fetchEntryForTest(4, liveFetchStatusForTest(prompt_turn)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, other, .completed), fetchDetailForTest(3, slash, .completed), fetchDetailForTest(4, prompt_turn, .completed) },
+            .rows = "● Read web pages\n├ Fetched slash-commands, prompt-turn · agentclientprotocol.com\n└ Fetched install · docs.example.dev",
+        },
+        // One page fetched twice counts its calls, as a joined row does.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetched " ++ prompt_turn ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, prompt_turn, .completed) },
+            .rows = "● Fetched prompt-turn · agentclientprotocol.com · 2 calls",
+        },
+        // While the newest page still loads, the row says what it does.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetching " ++ slash ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, slash, null) },
+            .rows = "● Fetching prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetching " ++ slash ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), streaming },
+            .rows = "● Fetching prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, case.details);
+        defer alloc.free(text);
+        errdefer std.debug.print("rows:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings(case.rows, std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "a narrow row of fetched pages leaves out the oldest pages first and keeps the host" {
+    const alloc = std.testing.allocator;
+    const site = "https://agentclientprotocol.com/protocol/v1/";
+    const pages = [_][]const u8{ "overview", "initialization", "prompt-turn", "slash-commands" };
+    var entries: [pages.len]TranscriptEntry = undefined;
+    var details: [pages.len]ToolDetailRecord = undefined;
+    var status_bufs: [pages.len][128]u8 = undefined;
+    var json_bufs: [pages.len][128]u8 = undefined;
+    for (pages, 0..) |page, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = fetchEntryForTest(id, try std.mem.print(&status_bufs[index], "● Fetched {s}{s}\n", .{ site, page }));
+        details[index] = .{ .entry_id = id, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = try std.mem.print(&json_bufs[index], "{{\"url\":\"{s}{s}\"}}", .{ site, page }), .outcome = .completed };
+    }
+    const Case = struct { cols: u16, row: []const u8 };
+    const cases = [_]Case{
+        .{ .cols = 120, .row = "● Fetched overview, initialization, prompt-turn, slash-commands · agentclientprotocol.com" },
+        .{ .cols = 72, .row = "● Fetched +2, prompt-turn, slash-commands · agentclientprotocol.com" },
+        .{ .cols = 60, .row = "● Fetched +3, slash-commands · agentclientprotocol.com" },
+    };
+    for (cases) |case| {
+        const painted = try paintedGroupForTest(alloc, &entries, &details, case.cols);
+        defer alloc.free(painted);
+        const text = try visibleLinesForTest(alloc, painted, case.cols);
+        defer alloc.free(text);
+        errdefer std.debug.print("cols {d}:\n{s}\n", .{ case.cols, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A lone page too wide for its row clips at its end, on one line.
+    const lone = try paintedGroupForTest(alloc, entries[2..3], details[2..3], 30);
+    defer alloc.free(lone);
+    const lone_text = try visibleLinesForTest(alloc, lone, 30);
+    defer alloc.free(lone_text);
+    errdefer std.debug.print("lone:\n{s}\n", .{lone_text});
+    try std.testing.expectEqualStrings("● Fetched prompt-turn · agent…", std.mem.trim(u8, lone_text, "\n"));
 }
 
 /// A read row by the file's name and the lines it read, such as
@@ -3511,24 +3910,27 @@ test "a read row links to the file core read, never to the symlink the model nam
     try std.testing.expect(std.mem.find(u8, painted, "\x1b]8;") == null);
 }
 
-/// The text of a row that names several files, patterns, sources, or
-/// searches: what they did, how many older names do not fit, then the
-/// newest names that fit in `cols` after the row's two-column connector,
-/// oldest first, such as "Read +3, c.zig, d.zig". The last name is the
-/// newest call's, which may still run. At least one name shows; the row
-/// clips it when even that one is too wide. Ctrl+O shows every call.
+/// The text of a row that names several files, patterns, sources, searches,
+/// or pages: what they did, how many older names do not fit, then the newest
+/// names that fit in `cols` after the row's two-column connector, oldest
+/// first, such as "Read +3, c.zig, d.zig", and for pages their host after
+/// them. The last name is the newest call's, which may still run. At least
+/// one name shows; the row clips it when even that one is too wide. Ctrl+O
+/// shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) !StoryRowText {
     const kind = row.identity.kind;
     // A row of reads or searches stands for every call it names, so it says
     // what they did, even while the newest still runs. A row of reads of
-    // saved output says what its newest call does, as that call's own row
-    // does.
+    // saved output or of fetches says what its newest call does, as that
+    // call's own row does.
     const head = switch (kind) {
         .read => "Read ",
         .more_output => try std.mem.concat(scratch, u8, &.{ try savedReadVerb(scratch, row, "Read"), " ", more_output_marker }),
         .output_search => try outputSearchHead(scratch, try savedReadVerb(scratch, row, "Searched"), row.identity.key),
+        .fetch => try std.mem.concat(scratch, u8, &.{ phraseVerb(try entryStatus(scratch, row.entry) orelse "") orelse "Fetched", " " }),
         else => if (std.mem.eql(u8, storySearchTool(row.identity.key), "glob_files")) "Matched " else "Searched ",
     };
+    const tail = if (kind == .fetch) try std.mem.concat(scratch, u8, &.{ fetch_host_separator, try terminalSafeText(scratch, fetchKeyHost(row.identity.key)) }) else "";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     const names = row.names.items;
@@ -3540,19 +3942,20 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
             .more_output => try writeTerminalSafe(&text.writer, moreOutputShortName(name)),
             // Core quotes a search terminal-safe.
             .output_search => try text.writer.writeAll(name),
+            .fetch => try writeTerminalSafe(&text.writer, fetchedPageName(name)),
             else => try writeTerminalSafe(&text.writer, name),
         }
         piece.* = text.written();
     }
     // The most names, counted from the newest, whose row fits.
-    const head_width = display_width.visibleWidthIgnoringAnsi(head);
+    const frame_width = display_width.visibleWidthIgnoringAnsi(head) + display_width.visibleWidthIgnoringAnsi(tail);
     var shown: usize = 0;
     var names_width: usize = 0;
     while (shown < names.len) {
         const piece_width = display_width.visibleWidthIgnoringAnsi(pieces[names.len - shown - 1]) + @as(usize, if (shown > 0) 2 else 0);
         const left_out = names.len - shown - 1;
         const count_width: usize = if (left_out == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, "+", left_out, ", "));
-        if (shown > 0 and head_width + count_width + names_width + piece_width > budget) break;
+        if (shown > 0 and frame_width + count_width + names_width + piece_width > budget) break;
         names_width += piece_width;
         shown += 1;
     }
@@ -3564,6 +3967,7 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
         if (position > 0) try body.writer.writeAll(", ");
         try body.writer.writeAll(piece);
     }
+    try body.writer.writeAll(tail);
     return .{ .display = body.written(), .body = body.written(), .suffix = "" };
 }
 
@@ -4272,7 +4676,7 @@ fn collectStoryRows(
             try unshown.put(scratch, entry_id, {});
             continue :calls;
         };
-        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)))));
+        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try fetchIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -4379,10 +4783,10 @@ fn collectStoryRows(
 /// A finished row that says the same as an earlier row of its group joins
 /// that row, which then counts the calls of both, so a repeat shows once and
 /// the other rows keep their order. A row still running or that failed keeps
-/// its own, and so does a row for a file, a saved output, or a pattern, whose
-/// calls already share a row: two files with the same name stay two rows. A
-/// subagent's report keeps its own line, and so does a subagent wait or
-/// status, whose row tells what main did while its subagents worked.
+/// its own, and so does a row for a file, a saved output, a pattern, or a
+/// host, whose calls already share a row: two files with the same name stay
+/// two rows. A subagent's report keeps its own line, and so does a subagent
+/// wait or status, whose row tells what main did while its subagents worked.
 fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) !void {
     // Where the first row with each key went among the kept rows.
     var firsts: std.StringHashMapUnmanaged(usize) = .empty;
@@ -4411,7 +4815,7 @@ fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     if (record.activity_kind == .subagent and !isSubagentMessage(scratch, record)) return null;
     switch (row.identity.kind) {
-        .read, .more_output, .search, .edit, .subagent_wait => return null,
+        .read, .more_output, .search, .fetch, .edit, .subagent_wait => return null,
         // A command, read, search, or change whose arguments do not name
         // what it ran or touched may not be the same call, so it keeps its
         // own row, and so does any call with no usable arguments.
@@ -4531,8 +4935,8 @@ fn sessionRunRow(rows: []StoryRow, follow_up: *const ToolDetailRecord) ?*StoryRo
 }
 
 /// Whether a call with `identity` joins the row of an earlier call with
-/// `row`. Every read shares one row, every search with the same tool, and
-/// every search of the same saved output.
+/// `row`. Every read shares one row, every search with the same tool, every
+/// search of the same saved output, and every fetch from the same host.
 /// A bare subagent wait or status says what main did while its subagents
 /// worked, so it keeps a row of its own; later calls with the same action
 /// join it with their latest state, and a status and a wait stay apart, so
@@ -4543,6 +4947,7 @@ fn sharesStoryRow(row: StoryIdentity, identity: StoryIdentity) bool {
         .read, .more_output => true,
         .search => std.mem.eql(u8, storySearchTool(row.key), storySearchTool(identity.key)),
         .output_search => std.mem.eql(u8, outputSearchSource(row.key), outputSearchSource(identity.key)),
+        .fetch => std.mem.eql(u8, fetchKeyHost(row.key), fetchKeyHost(identity.key)),
         else => std.mem.eql(u8, row.key, identity.key),
     };
 }
@@ -4605,6 +5010,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record, row.starts) else null;
     const named_phrase = if (try savedReadRowPhrase(scratch, row)) |saved|
         saved
+    else if (try fetchRowPhrase(scratch, full_phrase, row)) |fetch|
+        fetch
     else if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
     else if (try editRowPhrase(scratch, full_phrase, row)) |edit|
@@ -4663,6 +5070,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .read, .more_output => try countNote(scratch, " · ", row.count, " parts"),
         .search => if (many_folders) "" else try countNote(scratch, " ×", row.count, ""),
         .output_search => try countNote(scratch, " ×", row.count, ""),
+        // One page fetched again, which a joined row counts the same way.
+        .fetch => try countNote(scratch, " · ", row.count, " calls"),
         .edit => try countNote(scratch, " · ", row.count, if (row.writes == 0) " edits" else if (row.writes == row.count) " writes" else " changes"),
         .single, .subagent, .subagent_wait, .commands => "",
     };
@@ -5356,15 +5765,19 @@ fn writeGroupBlock(
 }
 
 /// What the row of the cancelled call `entry_id` names it by in the compact
-/// row's words, such as "github.com output for "npx"" or "using Fixture to echo".
-/// Null for a call whose row keeps core's name.
+/// row's words, such as "github.com output for "npx"", "prompt-turn ·
+/// agentclientprotocol.com", or "using Fixture to echo". Null for a call
+/// whose row keeps core's name.
 fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_id: u32) !?[]const u8 {
     const row = for (rows) |*candidate| {
         if (candidate.entry_id == entry_id) break candidate;
     } else return null;
-    const phrase = try savedReadRowPhrase(scratch, row) orelse
-        try mcpRowPhrase(scratch, try entryStatus(scratch, row.entry) orelse return null, row) orelse
-        return null;
+    const phrase = try savedReadRowPhrase(scratch, row) orelse named: {
+        const status = try entryStatus(scratch, row.entry) orelse return null;
+        break :named try fetchRowPhrase(scratch, status, row) orelse
+            try mcpRowPhrase(scratch, status, row) orelse
+            return null;
+    };
     return withoutPrefix(phrase, cancelled_label ++ " ");
 }
 
@@ -8538,7 +8951,7 @@ test "a toolbox run of a built-in tool reads as a direct call of it, by the tool
     const cases = [_]Case{
         // A run that failed before it started has only its streamed row,
         // which core names for the tool it runs, with no arguments.
-        .{ .status = "● Failed http://127.0.0.1/page\n", .tool_name = "web_fetch", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't fetch http://127.0.0.1/page" },
+        .{ .status = "● Failed http://127.0.0.1/page\n", .tool_name = "web_fetch", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't fetch page · 127.0.0.1" },
         .{ .status = "● Failed zig release notes\n", .tool_name = "web_search", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't search zig release notes" },
         // A run that started, live or on resume, has that tool's arguments.
         .{ .status = "● Failed notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .failed, .row = "● Couldn't read notes.txt" },
@@ -12713,6 +13126,38 @@ fn checkStoryRows(input: []const u8) !void {
         entries[index] = .{ .raw_bytes = .{
             .id = @intCast(index + 1),
             .bytes = try arena.print("● Ran {s}\n", .{display}),
+            .class = .tool_status,
+        } };
+    }
+
+    // Some calls become fetches of a fuzzed URL, with or without their
+    // arguments, under core's live row. Inputs that end before here keep
+    // every row as it was.
+    const url_pieces = [_][]const u8{
+        "https://", "http://",     "user:pw@", "agentclientprotocol.com", ":8443", "/", "//", "protocol",
+        "v1",       "prompt-turn", "?q=1",     "#top",                    "...",
+        "…",
+        "[::1]",    "%2F",
+    };
+    const fetch_verbs = [_][]const u8{ "Fetching", "Fetched", "Failed", "Denied", "Cancelled" };
+    for (0..count) |index| {
+        if (fuzz.byte() % 4 != 3) continue;
+        var url: std.Io.Writer.Allocating = .init(arena);
+        const piece_count = 1 + fuzz.byte() % 8;
+        for (0..piece_count) |_| {
+            if (fuzz.byte() % 4 == 0) try url.writer.writeAll(fuzz.chunk(12)) else try url.writer.writeAll(url_pieces[fuzz.byte() % url_pieces.len]);
+        }
+        var arguments: std.Io.Writer.Allocating = .init(arena);
+        try arguments.writer.writeAll("{\"url\":");
+        std.json.Stringify.value(url.written(), .{}, &arguments.writer) catch try arguments.writer.writeAll("\"\"");
+        try arguments.writer.writeByte('}');
+        details[index].tool_name = @constCast("web_fetch");
+        details[index].activity_kind = .read;
+        details[index].arguments_json = if (fuzz.byte() % 3 == 0) null else arguments.written();
+        const shown = try arena.print("{f}", .{text_utils.terminalSafe(url.written())});
+        entries[index] = .{ .raw_bytes = .{
+            .id = @intCast(index + 1),
+            .bytes = try arena.print("● {s} {s} | {s} | 120 bytes | HTTP 200 | 9ms | fetched\n", .{ fetch_verbs[fuzz.byte() % fetch_verbs.len], shown, shown }),
             .class = .tool_status,
         } };
     }
