@@ -40,8 +40,8 @@
 # tests/tla/drivers/session/live.test.ts, and
 # tests/tla/drivers/session/accepted-input.test.ts, the shared code in
 # tests/tla/lib/ and tests/tla/drivers/lib/, or the helpers those drivers load:
-# tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts,
-# tests/e2e/fixtures/mcp-*, and tests/evals/eval-helpers.ts.
+# tests/e2e/tmux-helpers.ts, tests/e2e/saved-sessions.ts, and
+# tests/evals/eval-helpers.ts.
 #
 # All four run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
@@ -169,11 +169,7 @@ while IFS= read -r path; do
     tests/e2e/saved-sessions.ts)
       require_subagent "$path: a file the accepted-input driver loads changed" ;;
     tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
-      require_mcp "$path: a file the MCP drivers load changed"
-      case "$path" in
-        tests/e2e/fixtures/mcp-*)
-          require_subagent "$path: a file the accepted-input driver loads changed" ;;
-      esac ;;
+      require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
 done <<<"$changed_files"
 
