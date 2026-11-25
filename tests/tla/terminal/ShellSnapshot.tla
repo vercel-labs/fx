@@ -15,26 +15,44 @@
 (*                                                                          *)
 (* A dotfile change detected before a command, /shell reload, or            *)
 (* shell.run reload=true marks the snapshot dirty and bumps the approval    *)
-(* epoch. A remembered session grant authorizes only calls that execute     *)
-(* under the epoch it was granted in, so a refresh resets approvals.        *)
+(* epoch. Each session keeps its own remembered grant. A remembered grant  *)
+(* authorizes only calls that execute, in that same session, under the     *)
+(* epoch it was granted in, so a refresh resets approvals in every session. *)
+(*                                                                          *)
+(* `Sessions` are the fx sessions that share the owner. A command belongs   *)
+(* to one of them. Every session is checked against its own grant.         *)
 (*                                                                          *)
 (* `Mutation` enables one deliberately broken rule so TLC can show each     *)
 (* invariant detects the defect it exists for. "none" is the design.        *)
+(* "shared_command_epoch" keeps the epoch per command for the whole         *)
+(* process: a grant recorded by any session stamps the command, so another  *)
+(* session's older grant admits a call without a question. All commands     *)
+(* here are one command text.                                               *)
 (* "reload_per_command" is the behavior without a snapshot: dotfiles run   *)
 (* on every call.                                                           *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
-CONSTANTS Cmds, MaxGen, Mutation
+CONSTANTS Cmds, MaxGen, Mutation, Sessions, FirstSession
 
 ASSUME MaxGen \in Nat \ {0}
+ASSUME Sessions \subseteq {"s1", "s2"} /\ Sessions # {}
+ASSUME FirstSession \subseteq Cmds
 ASSUME Mutation \in {"none", "no_single_flight", "free_while_leased",
                      "stale_grant", "reload_per_command", "notice_repeat",
-                     "use_partial", "clear_dirty_late", "keep_broken"}
+                     "use_partial", "clear_dirty_late", "keep_broken",
+                     "shared_command_epoch"}
 
 Gens    == 1..MaxGen
 NoGen   == 0
 NoGrant == -1
+
+\* The run-time recheck of a grant-authorized call. The stale-grant planted bug
+\* removes it; the shared-epoch bug breaks only the admission rule.
+NoRecheck == Mutation = "stale_grant"
+
+\* Commands in FirstSession belong to session "s1"; the others belong to "s2".
+SessOf(c) == IF c \in FirstSession THEN "s1" ELSE "s2"
 
 VARIABLES
     owner,        \* "empty" | "capturing" | "ready" | "failed"
@@ -55,7 +73,8 @@ VARIABLES
     failEpisodes, \* transitions into "failed"
     notices,      \* one-line fallback notices shown
     noticeShown,  \* notice already shown for the current failure episode
-    grant,        \* epoch of the remembered session grant, or NoGrant
+    grant,        \* per session: epoch of its remembered grant, or NoGrant
+    sharedEpoch,  \* epoch of the latest remembered grant by any session
     pc,           \* per-command control state
     auth,         \* how each command was authorized
     authEpoch,    \* grant epoch a grant-authorized command relied on
@@ -65,7 +84,7 @@ VARIABLES
 snapVars  == <<owner, active, capGen, inflight, nextGen, genEpoch, completed, freed, broken>>
 countVars == <<loads, triggers, fullRuns, failEpisodes, notices, noticeShown>>
 cmdVars   == <<pc, auth, authEpoch, cgen, runEpoch>>
-vars      == <<snapVars, countVars, cmdVars, epoch, dirty, leases, grant>>
+vars      == <<snapVars, countVars, cmdVars, epoch, dirty, leases, grant, sharedEpoch>>
 
 PcStates == {"idle", "admitted", "waiting", "run_snap", "run_full", "done"}
 
@@ -85,7 +104,8 @@ TypeOK ==
     /\ loads \in Nat /\ triggers \in Nat /\ fullRuns \in Nat
     /\ failEpisodes \in Nat /\ notices \in Nat
     /\ noticeShown \in BOOLEAN
-    /\ grant \in {NoGrant} \cup Nat
+    /\ grant \in [Sessions -> {NoGrant} \cup Nat]
+    /\ sharedEpoch \in Nat
     /\ pc \in [Cmds -> PcStates]
     /\ auth \in [Cmds -> {"none", "grant", "explicit"}]
     /\ authEpoch \in [Cmds -> Nat]
@@ -111,7 +131,8 @@ Init ==
     /\ failEpisodes = 0
     /\ notices = 0
     /\ noticeShown = FALSE
-    /\ grant = NoGrant
+    /\ grant = [s \in Sessions |-> NoGrant]
+    /\ sharedEpoch = 0
     /\ pc = [c \in Cmds |-> "idle"]
     /\ auth = [c \in Cmds |-> "none"]
     /\ authEpoch = [c \in Cmds |-> 0]
@@ -126,16 +147,20 @@ Pending(c) == pc[c] \in {"admitted", "waiting"}
 
 AdmitByGrant(c) ==
     /\ pc[c] = "idle"
-    /\ grant # NoGrant
-    /\ (grant = epoch \/ Mutation = "stale_grant")
+    /\ grant[SessOf(c)] # NoGrant
+    /\ \/ grant[SessOf(c)] = epoch
+       \/ Mutation = "stale_grant"
+       \/ (Mutation = "shared_command_epoch" /\ sharedEpoch = epoch)
     /\ pc' = [pc EXCEPT ![c] = "admitted"]
     /\ auth' = [auth EXCEPT ![c] = "grant"]
-    /\ authEpoch' = [authEpoch EXCEPT ![c] = grant]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, cgen, runEpoch>>
+    /\ authEpoch' = [authEpoch EXCEPT ![c] = grant[SessOf(c)]]
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, cgen, runEpoch>>
 
 AdmitExplicit(c) ==
     /\ pc[c] = "idle"
-    /\ \E remember \in BOOLEAN : grant' = IF remember THEN epoch ELSE grant
+    /\ \E remember \in BOOLEAN :
+         /\ grant' = IF remember THEN [grant EXCEPT ![SessOf(c)] = epoch] ELSE grant
+         /\ sharedEpoch' = IF remember THEN epoch ELSE sharedEpoch
     /\ pc' = [pc EXCEPT ![c] = "admitted"]
     /\ auth' = [auth EXCEPT ![c] = "explicit"]
     /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, authEpoch, cgen, runEpoch>>
@@ -144,7 +169,7 @@ AdmitExplicit(c) ==
 ReAsk(c) ==
     /\ pc' = [pc EXCEPT ![c] = "idle"]
     /\ auth' = [auth EXCEPT ![c] = "none"]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, authEpoch, cgen, runEpoch>>
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, authEpoch, cgen, runEpoch>>
 
 -----------------------------------------------------------------------------
 (* Snapshot owner.                                                          *)
@@ -169,7 +194,7 @@ StartCapture(c) ==
     /\ loads' = loads + 1
     /\ pc' = [pc EXCEPT ![c] = "waiting"]
     /\ UNCHANGED <<active, completed, freed, broken, triggers, fullRuns, failEpisodes,
-                   notices, noticeShown, epoch, leases, grant, auth, authEpoch,
+                   notices, noticeShown, epoch, leases, grant, sharedEpoch, auth, authEpoch,
                    cgen, runEpoch>>
 
 \* Release a replaced generation now, or when its last lease ends.
@@ -189,7 +214,7 @@ CaptureOk ==
     /\ noticeShown' = FALSE
     /\ dirty' = IF Mutation = "clear_dirty_late" THEN FALSE ELSE dirty
     /\ UNCHANGED <<nextGen, genEpoch, broken, loads, triggers, fullRuns, failEpisodes,
-                   notices, epoch, leases, grant, cmdVars>>
+                   notices, epoch, leases, grant, sharedEpoch, cmdVars>>
 
 \* Non-zero exit, 10 s timeout, size cap, or invalid capture output. The old
 \* snapshot is retired too: commands use the full startup, which reflects
@@ -205,14 +230,14 @@ CaptureFail ==
     /\ noticeShown' = FALSE
     /\ dirty' = IF Mutation = "clear_dirty_late" THEN FALSE ELSE dirty
     /\ UNCHANGED <<nextGen, genEpoch, completed, broken, loads, triggers, fullRuns,
-                   notices, epoch, leases, grant, cmdVars>>
+                   notices, epoch, leases, grant, sharedEpoch, cmdVars>>
 
 Acquire(c) ==
     /\ Pending(c)
     /\ \/ (owner = "ready" /\ ~dirty)
        \/ (Mutation = "use_partial" /\ owner = "capturing")
     /\ LET g == IF owner = "ready" THEN active ELSE capGen
-       IN  IF auth[c] = "grant" /\ authEpoch[c] # genEpoch[g] /\ Mutation # "stale_grant"
+       IN  IF auth[c] = "grant" /\ authEpoch[c] # genEpoch[g] /\ ~NoRecheck
            THEN ReAsk(c)
            ELSE /\ leases' = [leases EXCEPT ![g] = @ + 1]
                 /\ cgen' = [cgen EXCEPT ![c] = g]
@@ -220,13 +245,13 @@ Acquire(c) ==
                 /\ pc' = [pc EXCEPT ![c] = "run_snap"]
                 /\ loads' = IF Mutation = "reload_per_command" THEN loads + 1 ELSE loads
                 /\ UNCHANGED <<snapVars, triggers, fullRuns, failEpisodes, notices,
-                               noticeShown, epoch, dirty, grant, auth, authEpoch>>
+                               noticeShown, epoch, dirty, grant, sharedEpoch, auth, authEpoch>>
 
 RunFull(c) ==
     /\ Pending(c)
     /\ owner = "failed"
     /\ ~dirty
-    /\ IF auth[c] = "grant" /\ authEpoch[c] # epoch /\ Mutation # "stale_grant"
+    /\ IF auth[c] = "grant" /\ authEpoch[c] # epoch /\ ~NoRecheck
        THEN ReAsk(c)
        ELSE /\ pc' = [pc EXCEPT ![c] = "run_full"]
             /\ runEpoch' = [runEpoch EXCEPT ![c] = epoch]
@@ -237,7 +262,7 @@ RunFull(c) ==
                           ELSE notices
             /\ noticeShown' = TRUE
             /\ UNCHANGED <<snapVars, triggers, failEpisodes, epoch, dirty, leases,
-                           grant, auth, authEpoch, cgen>>
+                           grant, sharedEpoch, auth, authEpoch, cgen>>
 
 Finish(c) ==
     /\ pc[c] \in {"run_snap", "run_full"}
@@ -250,7 +275,7 @@ Finish(c) ==
             /\ cgen' = [cgen EXCEPT ![c] = NoGen]
        ELSE UNCHANGED <<leases, freed, cgen>>
     /\ UNCHANGED <<owner, active, capGen, inflight, nextGen, genEpoch, completed,
-                   broken, countVars, epoch, dirty, grant, auth, authEpoch, runEpoch>>
+                   broken, countVars, epoch, dirty, grant, sharedEpoch, auth, authEpoch, runEpoch>>
 
 \* The restored shell rejected the replay and exited with the failure marker.
 \* The call reruns with the full startup. If the owner still holds that
@@ -279,13 +304,13 @@ ReplayFail(c) ==
                                ELSE freed
                    /\ UNCHANGED <<owner, active, failEpisodes, notices, noticeShown>>
     /\ UNCHANGED <<capGen, inflight, nextGen, genEpoch, completed, triggers,
-                   epoch, dirty, grant, auth, authEpoch, runEpoch>>
+                   epoch, dirty, grant, sharedEpoch, auth, authEpoch, runEpoch>>
 
 \* Cancelling a waiting command does not cancel the shared capture.
 Cancel(c) ==
     /\ Pending(c)
     /\ pc' = [pc EXCEPT ![c] = "done"]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, auth,
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, auth,
                    authEpoch, cgen, runEpoch>>
 
 \* Dotfile fingerprint changed, /shell reload, or shell.run reload=true.
@@ -296,7 +321,7 @@ MarkDirty ==
     /\ epoch' = epoch + 1
     /\ triggers' = triggers + 1
     /\ UNCHANGED <<snapVars, loads, fullRuns, failEpisodes, notices, noticeShown,
-                   leases, grant, cmdVars>>
+                   leases, grant, sharedEpoch, cmdVars>>
 
 Done ==
     /\ \A c \in Cmds : pc[c] = "done"
@@ -349,7 +374,8 @@ NoLeak ==
 \* command, except for commands that fell back to the full startup.
 DotfilesPaidOnce == loads <= 1 + triggers + fullRuns
 
-\* A remembered grant authorizes only calls executing under its own epoch.
+\* A remembered grant authorizes only calls executing under its own epoch, in
+\* the session that granted it.
 GrantMatchesEpoch ==
     \A c \in Cmds :
         (pc[c] \in {"run_snap", "run_full"} /\ auth[c] = "grant")
@@ -361,6 +387,14 @@ NoticeOncePerEpisode == notices <= failEpisodes
 \* A generation the restored shell rejected is never offered again. During a
 \* refresh the old generation stays active but is not leasable.
 NoReuseOfBroken == owner = "ready" => active \notin broken
+
+\* A grant admits a call only when the grant was made in the current epoch,
+\* so an older grant never admits a call without a question. (An action
+\* property: it is checked on every step.)
+AdmissionUsesCurrentEpoch ==
+    [][\A c \in Cmds :
+          (pc[c] = "idle" /\ pc'[c] = "admitted" /\ auth'[c] = "grant")
+              => authEpoch'[c] = epoch']_vars
 
 \* With no pending refresh, the ready snapshot reflects the latest dotfiles.
 FreshWhenClean == (owner = "ready" /\ ~dirty) => genEpoch[active] = epoch

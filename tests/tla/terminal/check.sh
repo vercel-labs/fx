@@ -26,6 +26,7 @@ ShellSnapshot ShellSnapshot-no_single_flight SingleFlight -deadlock
 ShellSnapshot ShellSnapshot-free_while_leased NoUseAfterFree -deadlock
 ShellSnapshot ShellSnapshot-use_partial RunsCompleteSnapshot -deadlock
 ShellSnapshot ShellSnapshot-stale_grant GrantMatchesEpoch -deadlock
+ShellSnapshot ShellSnapshot-shared_command_epoch AdmissionUsesCurrentEpoch -deadlock
 ShellSnapshot ShellSnapshot-notice_repeat NoticeOncePerEpisode -deadlock
 ShellSnapshot ShellSnapshot-clear_dirty_late FreshWhenClean -deadlock
 ShellSnapshot ShellSnapshot-keep_broken NoReuseOfBroken -deadlock
