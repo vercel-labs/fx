@@ -211,8 +211,9 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
-  # minutes, the two TLA+ MCP jobs about 20 each, and the TLA+ transcript
-  # window and subagent models a few each. A pull request runs each only when
+  # minutes, the TLA+ MCP jobs 7 to 28 each (the engine's the longest, the host's
+  # three parts the shortest), and the TLA+ transcript window and subagent
+  # models a few each. A pull request runs each only when
   # it changes the code that check covers; see scripts/detect-ci-need.sh.
   # Pushes to main and manual dispatches always run all four, so the main run
   # that Publish libfx waits for includes them.
@@ -697,8 +698,8 @@ jobs:
         run: npm run --prefix sdk test:browser-wasm
 
   # The MCP engine models and the driver that runs src/mcp/ along them. The
-  # host models and drivers run in the next job, in parallel, so neither job
-  # takes the whole 40 minutes alone. Their planted bugs stay local
+  # host models and drivers run in the next job's three parts, in parallel, so
+  # no job takes the whole 40 minutes alone. Their planted bugs stay local
   # (tests/tla/mcp/check.sh): they measure the checks, not the code.
   tla-mcp:
     name: TLA+ MCP engine models and driver
@@ -744,13 +745,29 @@ jobs:
           bun tests/tla/drivers/mcp/driver.ts
 
   # The MCP host models, which models.test.ts checks with TLC, and the drivers
-  # that run fx along them. It runs beside the engine job above. Planted bugs
-  # stay local (tests/tla/mcp_host/check.sh).
+  # that run fx along them. It runs beside the engine job above, in three
+  # parts that run in parallel. The model checks take about 20 minutes and the
+  # SignIn model is half of them, so SignIn has a part and the other models
+  # have one (models.test.ts, which also holds the bridge controls). Every
+  # other test file in tests/tla/drivers/mcp_host/ takes about 10 minutes in
+  # the drivers part, which takes the files by listing the folder, so a new
+  # driver runs without a change here. Planted bugs stay local
+  # (tests/tla/mcp_host/check.sh).
   tla-mcp-host:
-    name: TLA+ MCP host models and drivers
+    name: TLA+ MCP host ${{ matrix.label }}
     needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: signin
+            label: SignIn model
+          - part: models
+            label: other models
+          - part: drivers
+            label: drivers
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
@@ -768,7 +785,7 @@ jobs:
         uses: ./.github/actions/setup-zig
         with:
           version: "0.17.1"
-          cache-key: ci-tla-mcp-host
+          cache-key: ci-tla-mcp-host-${{ matrix.part }}
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -778,15 +795,40 @@ jobs:
           command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
-      - name: Model-check the MCP host, and drive fx along the models
+      - name: Model-check the MCP host, or drive fx along the models
         if: needs.ci-need.outputs.mcp == 'true'
+        env:
+          PART: ${{ matrix.part }}
         run: |
           set -euo pipefail
           jar="$RUNNER_TEMP/tla2tools.jar"
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
-          bun test ./tests/tla/drivers/mcp_host/
+          dir=./tests/tla/drivers/mcp_host
+          args=()
+          case "$PART" in
+            signin)
+              export FX_MCP_HOST_MODELS=SignIn
+              files=("$dir/models.test.ts")
+              args=(-t 'TLC: ')
+              ;;
+            models)
+              export FX_MCP_HOST_MODELS=-SignIn
+              files=("$dir/models.test.ts")
+              ;;
+            drivers)
+              mapfile -t files < <(find "$dir" -maxdepth 1 -type f \( -name '*.test.*' -o -name '*_test.*' -o -name '*.spec.*' -o -name '*_spec.*' \) ! -name models.test.ts | sort)
+              ;;
+            *) echo "unknown part: $PART" >&2; exit 1 ;;
+          esac
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no test files found in $dir" >&2
+            exit 1
+          fi
+          printf 'MCP host %s part runs:\n' "$PART"
+          printf '  %s\n' "${files[@]}"
+          bun test "${files[@]}" "${args[@]}"
 
   # The transcript window model and the window's core driven along it both
   # ways. Its planted bugs and the run of a built fx along the model stay local
