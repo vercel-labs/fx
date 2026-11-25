@@ -76,5 +76,17 @@
     "old": "InspectNoted(f) == IF InspectFailed THEN {} ELSE SkippedNames(f)",
     "new": "InspectNoted(f) == IF InspectFailed \\/ f = \"profile\" THEN {} ELSE SkippedNames(f)",
     "invariant": "InspectNotesSkipped"
+  },
+  {
+    "description": "An ACP session that asks for the profile's servers loses all of them when one entry is bad, as it did before it read the profile as the terminal app does",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == IF SkippedNames(\"profile\") # {} THEN {} ELSE HostLoads(f)",
+    "invariant": "AcpKeepsGood"
+  },
+  {
+    "description": "An ACP session runs an entry the terminal app skips",
+    "old": "AcpRuns(f) == HostLoads(f)",
+    "new": "AcpRuns(f) == HostLoads(f) \\cup SkippedNames(f)",
+    "invariant": "AcpRunsWhatTheTerminalRuns"
   }
 ]

@@ -10,8 +10,8 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { artifacts, binary } from "../lib/context";
-import { fixture, fxEnv, runFx, save, type Fixture, type Ran } from "./driver";
+import { artifacts, binary, targetHelpers } from "../lib/context";
+import { fixture, fxEnv, runFx, save, waitFor, type Fixture, type Ran } from "./driver";
 import { checkTrace, type TraceRecord, type Value } from "./trace";
 
 type Cls = "ok" | "bad" | "auth";
@@ -130,6 +130,69 @@ class Scenario {
       .sort();
     this.records.push({ event: "inspect", data: { file, shown, noted } });
     return { shown, noted };
+  }
+
+  /**
+   * The servers a real `fx acp` session that asks for the profile's servers (`_meta.fx.profileMcpServers`) lists: the
+   * names the model's first request holds in its list of MCP servers. The session's project servers are left out, as
+   * a project server runs only once the person approves it.
+   */
+  async acp() {
+    const { startFakeGateway, fakeGatewayFinalText } = await targetHelpers();
+    const model = "openai/gpt-5";
+    const gateway = startFakeGateway([fakeGatewayFinalText("ACP_LIST_DONE")], { models: [{ id: model, type: "language", tags: ["tool-use"] }] });
+    const child = Bun.spawn([binary, "acp"], {
+      cwd: this.f.workspace,
+      env: fxEnv(this.f, { VERCEL_OIDC_TOKEN: "", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: model }),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const decoder = new TextDecoder();
+    const reader = child.stdout.getReader();
+    let buffer = "";
+    const readLine = async (): Promise<string> => {
+      while (!buffer.includes("\n")) {
+        // A session that never answers ends with the test's own timeout, and the `finally` stops it.
+        const next = await reader.read();
+        if (next.done) throw new Error("fx acp ended before it answered");
+        buffer += decoder.decode(next.value);
+      }
+      const at = buffer.indexOf("\n");
+      const line = buffer.slice(0, at);
+      buffer = buffer.slice(at + 1);
+      return line;
+    };
+    const rpc = async (id: number, method: string, params: unknown): Promise<any> => {
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      await child.stdin.flush();
+      for (;;) {
+        const message = JSON.parse(await readLine());
+        if (message.id === id) return message;
+      }
+    };
+    try {
+      expect((await rpc(1, "initialize", { protocolVersion: 1 })).error).toBeUndefined();
+      const created = await rpc(2, "session/new", { cwd: this.f.workspace, mcpServers: [], _meta: { fx: { profileMcpServers: true } } });
+      expect(created.error).toBeUndefined();
+      const prompt = rpc(3, "session/prompt", { sessionId: created.result.sessionId, prompt: [{ type: "text", text: "List the servers." }] });
+      const body = await waitFor("the model's first request", () => gateway.requests[0]?.body, 30_000);
+      await prompt;
+      writeFileSync(join(this.f.base, "acp-model-request.json"), body);
+      const strings: string[] = [];
+      const walk = (value: unknown) => {
+        if (typeof value === "string") strings.push(value);
+        else if (Array.isArray(value)) value.forEach(walk);
+        else if (value && typeof value === "object") Object.values(value).forEach(walk);
+      };
+      walk(JSON.parse(body));
+      const shown = [...new Set(strings.flatMap((text) => [...text.matchAll(/^- ([a-z])$/gm)].map((found) => found[1]!)).filter((name) => NAMES.includes(name)))].sort();
+      this.records.push({ event: "acp", data: { file: "profile", shown } });
+      return shown;
+    } finally {
+      child.kill();
+      gateway.stop();
+    }
   }
 
   /** The harness edits a file itself, as an editor would, without fx's lock. */
@@ -518,5 +581,19 @@ test("a profile that isn't JSON still fails the whole inspection: no server of e
   expect(await s.inspect("project")).toEqual({ shown: [], noted: [] });
   s.tamper("repairs", "profile");
   expect(await s.inspect("project")).toEqual({ shown: ["c"], noted: [] });
+  await s.verify();
+}, 240_000);
+
+test("an ACP session that asks for the profile's servers lists the good entries beside a bad one, as the terminal app does (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-acp", { st: "ok", ent: { a: "ok", b: "bad", c: "auth" } }, NONE);
+  const terminal = await s.inspect("profile");
+  expect(terminal.shown).toEqual(["a"]);
+  expect(await s.acp()).toEqual(terminal.shown);
+  await s.verify();
+}, 240_000);
+
+test("an ACP session goes on without the servers of a profile that isn't JSON (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-acp-broken", { st: "broken" }, NONE);
+  expect(await s.acp()).toEqual([]);
   await s.verify();
 }, 240_000);
