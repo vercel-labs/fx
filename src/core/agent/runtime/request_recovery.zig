@@ -177,7 +177,7 @@ pub const RequestRecovery = struct {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         if (self.deps.save_recovery_record != null) register(self);
         const from = resumed orelse Resume{};
-        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale } });
+        return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
     }
 
     /// The record for the write just before a send: the module's save for
@@ -256,6 +256,54 @@ pub const RequestRecovery = struct {
         self.closed = true;
         debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written={}", .{written});
         return written;
+    }
+
+    /// The turn stops before this request's send, between steps, for an
+    /// upgrade's restart: saves the clean record `closing` returns, as
+    /// SIGTERM does, so the next launch continues the request without
+    /// counting a death (`tests/tla/recovery/Resume.tla` Relaunch,
+    /// NoFalseCrashQuestion). Nothing replaces that record afterwards.
+    /// When the clean record does not land, the request stays as it was,
+    /// open and with its send's record, so the turn goes on and its next
+    /// boundary asks again (`Resume.tla` YieldSaveFails). Returns whether
+    /// this call saved the clean record: a request that SIGTERM already
+    /// closed returns false and keeps the record that close wrote, and its
+    /// turn ends with the process. Called on the request's own thread.
+    pub fn closeForYield(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        if (!lockWithin(&self.mutex, close_wait_ms)) {
+            debug_trace.eventf("recovery", "closing_skipped", self.trace_ctx, "reason=request_busy", .{});
+            return false;
+        }
+        defer self.mutex.unlock(io);
+        if (self.closed) return false;
+        const state_before = self.state;
+        const record_before = self.record;
+        const written_before = self.record_written;
+        _ = self.stepLocked(.closing) catch |err| {
+            debug_trace.logf("recovery", "closing status publication failed err={s}", .{@errorName(err)});
+        };
+        if (!self.record_written) {
+            self.state = state_before;
+            self.record = record_before;
+            self.record_written = written_before;
+            debug_trace.eventf("recovery", "yield_close_failed", self.trace_ctx, "reason=clean_record_not_saved", .{});
+            return false;
+        }
+        self.closed = true;
+        debug_trace.eventf("recovery", "closed", self.trace_ctx, "record_written=true", .{});
+        return true;
+    }
+
+    /// Whether this request's record is in the session log, so a turn
+    /// stopped before its send can be resumed from it after a restart.
+    /// False on hosts that keep no record. Called on the request's own
+    /// thread.
+    pub fn recordSaved(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return !self.closed and self.record_live;
     }
 
     /// Reports a failed send. Returns the send the module asks for at once,
@@ -1305,6 +1353,89 @@ test "closing saves a clean record that resumes without a death, and nothing rep
     }
     // Ended requests are not closed.
     try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
+
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a yield saves a clean record that resumes without a death" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        _ = (try request.start(false, null)).?;
+        // The write before the send carries the send's record.
+        try std.testing.expect(request.sendRecord() == .save);
+        try std.testing.expect(request.closeForYield());
+        const saved = fake.recovery_record.?;
+        // Once closed, nothing writes over the clean record.
+        try std.testing.expect(!request.closeForYield());
+        try std.testing.expect(request.sendRecord() == .keep);
+        try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
+        try std.testing.expectEqual(saved, fake.recovery_record.?);
+    }
+    var probe: recovery.State = .{};
+    const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+    try std.testing.expect(plan.send != null);
+    try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "a request reports its record saved from its send until it is closed" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        _ = (try request.start(false, null)).?;
+        try std.testing.expect(!request.recordSaved());
+        try std.testing.expect(request.sendRecord() == .save);
+        try std.testing.expect(request.recordSaved());
+        try std.testing.expect(request.closeForYield());
+        try std.testing.expect(!request.recordSaved());
+    }
+
+    // A host that keeps no record saves nothing with the send.
+    var no_record = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer no_record.deinit();
+    const no_record_deps = no_record.deps();
+    var no_record_request = RequestRecovery.init(&no_record_deps, &cancel_flag, .{});
+    defer no_record_request.deinit();
+    _ = (try no_record_request.start(false, null)).?;
+    try std.testing.expect(no_record_request.sendRecord() == .keep);
+    try std.testing.expect(!no_record_request.recordSaved());
+}
+
+test "a yield whose clean record does not land leaves the request open with its send's record" {
+    var fake = recordingFake();
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    _ = (try request.start(false, null)).?;
+    const send_write = request.sendRecord();
+    try std.testing.expect(send_write == .save);
+    // The write before the send stores the send's record.
+    const sent = send_write.save;
+    fake.recovery_record = sent;
+    fake.recovery_record_save_failures = 1;
+
+    // The clean record does not land: the request stays open with the send's record.
+    try std.testing.expect(!request.closeForYield());
+    try std.testing.expect(request.recordSaved());
+    try std.testing.expectEqual(sent, fake.recovery_record.?);
+
+    // The next boundary asks again, and the clean record lands.
+    try std.testing.expect(request.closeForYield());
+    try std.testing.expect(!request.recordSaved());
 
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);

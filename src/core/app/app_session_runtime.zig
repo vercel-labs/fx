@@ -352,6 +352,79 @@ pub fn shouldCreateResumeHandoff(state: ResumeHandoffState) bool {
         (!state.is_pristine or state.intent == .upgrade_requested);
 }
 
+/// How a replayed interrupted turn ends on screen.
+const InterruptedTurnEnd = enum { none, cancellation, notice };
+
+/// The line that ends `entry` in a replay: a cancel shows as cancelled, unless
+/// the cancelled call's row already says the turn stopped (`wrote_cancelled_call`),
+/// as it did live; a failure or a crash shows as its notice. A turn that yielded
+/// for an upgrade's restart shows none, since the turn that continues it says so
+/// (`session.continued_turn_notice`).
+fn interruptedTurnEnd(entry: types.InterruptedHistoryTurn, wrote_cancelled_call: bool) InterruptedTurnEnd {
+    if (entry.yielded) return .none;
+    return switch (entry.terminal_reason) {
+        .cancelled => if (entry.cancelled_command == null and !wrote_cancelled_call and entry.cancellation_origin == .turn) .cancellation else .none,
+        .failed => .notice,
+    };
+}
+
+/// What a JavaScript host snapshot does with the recovery checkpoint it saves.
+const CheckpointAction = union(enum) {
+    /// Keeps the stored checkpoint: preferences and compaction.
+    keep,
+    /// Drops it: a whole turn was added, so nothing is left to resume.
+    clear,
+    /// Stores a copy of this checkpoint: the turn so far, before a model request.
+    /// `turn` is what the copy holds, recorded once the save succeeds.
+    set: struct {
+        checkpoint: *const session_codec.RecoveryCheckpoint,
+        turn: session_persistence.SavedTurnKey,
+    },
+};
+
+/// The checkpoint that continues a turn which yielded between steps, as
+/// libfx continues one (`libfx_journal.resumeCheckpoint` with `yielded`):
+/// its prompt and finished steps, no partial reply, nothing sent yet, and
+/// no tool evidence, so the resend strategy adds no text and the model
+/// reads no note. Owned by `alloc`; the caller calls `deinit`.
+fn yieldedTurnCheckpoint(
+    alloc: Allocator,
+    entry: types.InterruptedHistoryTurn,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+) !session_codec.RecoveryCheckpoint {
+    return turnCheckpoint(alloc, entry.user, entry.execution, provider, model);
+}
+
+/// The checkpoint for a turn whose prompt and finished steps are `user` and
+/// `execution`, as the agent loop saves them before a model request. Owned by
+/// `alloc`; the caller calls `deinit`.
+fn turnCheckpoint(
+    alloc: Allocator,
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+) !session_codec.RecoveryCheckpoint {
+    const view: session_codec.RecoveryCheckpoint = .{
+        .turn_id = debug_trace.nextTurnId(),
+        .user = user,
+        .assistant_source = @constCast(""),
+        .execution = execution,
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .tool_state = .none,
+        .authority = .{ .provider = provider, .model = @constCast(model) },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        // As the agent loop saves it: no cap of its own.
+        .max_provider_attempts = std.math.maxInt(u16) + 1,
+        .consumed_provider_attempts = 0,
+        .outstanding_reservation = false,
+    };
+    return view.dupe(alloc);
+}
+
 test "resume handoff policy requires requested durable non-pristine state" {
     const cases = [_]struct {
         state: ResumeHandoffState,
@@ -402,6 +475,36 @@ test "resume handoff policy requires requested durable non-pristine state" {
     for (cases) |case| {
         try std.testing.expectEqual(case.expected, shouldCreateResumeHandoff(case.state));
     }
+}
+
+test "a yielded turn's checkpoint holds its prompt and steps and nothing sent" {
+    const alloc = std.testing.allocator;
+    const entry: types.InterruptedHistoryTurn = .{
+        .user = .{ .text = @constCast("work") },
+        .terminal_reason = .cancelled,
+    };
+    var checkpoint = try yieldedTurnCheckpoint(alloc, entry, .gateway, "test/model");
+    defer checkpoint.deinit(alloc);
+    try std.testing.expectEqualStrings("work", checkpoint.user.text);
+    try std.testing.expectEqualStrings("", checkpoint.assistant_source);
+    try std.testing.expectEqualStrings("test/model", checkpoint.authority.model);
+    try std.testing.expectEqual(session_codec.RecoveryToolState.none, checkpoint.tool_state);
+    try std.testing.expect(!checkpoint.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 0), checkpoint.consumed_provider_attempts);
+}
+
+test "a replayed turn that yielded for an upgrade ends with no cancelled line" {
+    const yielded: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true, .yielded = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(yielded, false));
+    // A closed, crashed, or cancelled turn without the marker keeps its line.
+    const closed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .stopped_by_exit = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.cancellation, interruptedTurnEnd(closed, false));
+    // The cancelled call's row already says the turn stopped.
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(closed, true));
+    const crashed: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
+    try std.testing.expectEqual(InterruptedTurnEnd.notice, interruptedTurnEnd(crashed, false));
+    const compaction: types.InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .cancellation_origin = .compaction };
+    try std.testing.expectEqual(InterruptedTurnEnd.none, interruptedTurnEnd(compaction, false));
 }
 
 /// Owns `session_id`; callers must release it with `deinit`.
@@ -1403,6 +1506,18 @@ pub fn Runtime(comptime App: type) type {
             var loaded_owned = true;
             defer if (loaded_owned) loaded.deinit(app.alloc);
 
+            // A checkpoint is a turn the page reloaded during: it stopped, and
+            // the resume sends its request again once the session is up.
+            const resend_saved_ms: u64 = std.math.cast(u64, loaded.state.updated_at_ms) orelse 0;
+            const resend = loaded.state.recovery_checkpoint != null;
+            if (resend) {
+                appendCheckpointInterruptedTurn(app, &loaded.state) catch |err| {
+                    traceJsHostRestoreFailure("checkpoint", session_id, err);
+                    try continueWithFreshJsHostSession(app, agent);
+                    return;
+                };
+            }
+
             var display = session_display_metadata.deriveFromHistory(
                 app.alloc,
                 loaded.state.history,
@@ -1426,6 +1541,35 @@ pub fn Runtime(comptime App: type) type {
             loaded_owned = false;
             loaded = undefined;
             try app.commitStartupResumeReplayAnchor();
+            if (resend) {
+                agent.session_persistence.pending_request_resume = .{
+                    .record = null,
+                    .stale = resumeIsStale(io_mod.milliTimestamp(), resend_saved_ms),
+                    .continues = false,
+                };
+            }
+        }
+
+        /// Appends the turn a reload stopped, built from the checkpoint, and
+        /// clears the checkpoint, so the turn is history and its request can
+        /// be sent again. The turn copies the checkpoint; the checkpoint is freed.
+        fn appendCheckpointInterruptedTurn(app: *App, state: *session_codec.DurableSessionState) !void {
+            if (state.recovery_checkpoint == null) return;
+            const checkpoint = &state.recovery_checkpoint.?;
+            var turn: types.HistoryTurn = .{ .interrupted = .{
+                .user = try types.dupeUserTurn(app.alloc, checkpoint.user),
+                .terminal_reason = .failed,
+                .stopped_by_exit = true,
+            } };
+            errdefer types.freeHistoryTurn(app.alloc, turn);
+            turn.interrupted.execution = try types.dupeExecutionMemory(app.alloc, checkpoint.execution);
+            const grown = try app.alloc.alloc(types.HistoryTurn, state.history.len + 1);
+            @memcpy(grown[0..state.history.len], state.history);
+            grown[state.history.len] = turn;
+            app.alloc.free(state.history);
+            state.history = grown;
+            checkpoint.deinit(app.alloc);
+            state.recovery_checkpoint = null;
         }
 
         fn continueWithFreshJsHostSession(app: *App, agent: *AppAgent) !void {
@@ -1635,6 +1779,7 @@ pub fn Runtime(comptime App: type) type {
         /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
         fn noteInterruptedRequest(agent: *AppAgent, v2: *session_adapter.Session) void {
             agent.session_persistence.pending_request_resume = null;
+            agent.session_persistence.pending_resume_yielded = false;
             const found = (v2.interruptedRequest() catch |err| {
                 debug_trace.logf("recovery", "event=resume_check_failed err={s}", .{@errorName(err)});
                 return;
@@ -1642,7 +1787,8 @@ pub fn Runtime(comptime App: type) type {
             const now_ms = io_mod.milliTimestamp();
             const stale = resumeIsStale(now_ms, found.saved_ms);
             agent.session_persistence.pending_request_resume = .{ .record = found.record, .stale = stale };
-            debug_trace.logf("recovery", "event=resume_pending record={} stale={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.saved_ms, now_ms });
+            agent.session_persistence.pending_resume_yielded = found.yielded;
+            debug_trace.logf("recovery", "event=resume_pending record={} stale={} yielded={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.yielded, found.saved_ms, now_ms });
         }
 
         /// Sends the noted request again, as a turn whose prompt is fx's note
@@ -1652,9 +1798,70 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "queueResumedRequest")) return;
             const resumed = agent.session_persistence.pending_request_resume orelse return;
             agent.session_persistence.pending_request_resume = null;
+            const yielded = agent.session_persistence.pending_resume_yielded;
+            agent.session_persistence.pending_resume_yielded = false;
+            // The resume reads the project instructions and the session from
+            // disk. It runs once the resumed session's first frame is on
+            // screen (`commitStartupResumeReplayAnchor`), so nothing is read
+            // before the first paint (RULES.md R2.2).
+            debug_trace.logf("recovery", "event=resume_start yielded={}", .{yielded});
+            // A turn that stopped for an upgrade's restart goes on as the
+            // same turn, with no note to the model; if it cannot, the note
+            // resume still sends the request again.
+            // Only a host that restarts for an upgrade stops a turn so.
+            if (comptime runtime_profile.allows(App, .auto_upgrade)) {
+                if (yielded) {
+                    if (continueYieldedTurn(app, agent, resumed)) return else |err| {
+                        debug_trace.logf("recovery", "event=yield_continue_failed err={s} fallback=resume_note", .{@errorName(err)});
+                    }
+                }
+            }
             _ = app.queueResumedRequest(agent, session_runtime.resumed_request_prompt, resumed) catch |err| {
                 debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
+                noteResumeDropped(app, err);
             };
+        }
+
+        /// Says in a notice that the interrupted request was not sent again.
+        /// Its turn's work stays in the session, so a message goes on from it.
+        fn noteResumeDropped(app: *App, err: anyerror) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            var buffer: [256]u8 = undefined;
+            const body = std.mem.print(&buffer, "fx could not send the interrupted request again ({s}). The turn's work is saved; send a message to go on from it.", .{@errorName(err)}) catch "fx could not send the interrupted request again. The turn's work is saved; send a message to go on from it.";
+            app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |write_err|
+                debug_trace.logf("recovery", "event=resume_drop_notice_failed err={s}", .{@errorName(write_err)});
+        }
+
+        /// Continues the turn that yielded for an upgrade's restart, which
+        /// the resume left as the history's newest turn: takes it out of the
+        /// history and queues a turn that goes on from its pieces. The
+        /// session's next turn then says it continues the yielded one, so a
+        /// later replay drops that one (`session_adapter.Session.setContinuesYielded`).
+        fn continueYieldedTurn(app: *App, agent: *AppAgent, resumed: types.RecoveryResume) !void {
+            if (comptime !@hasDecl(App, "queueYieldedTurn")) return error.YieldedTurnUnsupported;
+            const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            const taken = agent.session.takeNewestTurn() orelse return error.YieldedTurnMissing;
+            var taken_owned_elsewhere = false;
+            errdefer if (!taken_owned_elsewhere) agent.session.returnNewestTurn(taken);
+            const entry = switch (taken.turn) {
+                .interrupted => |value| value,
+                else => return error.YieldedTurnMissing,
+            };
+            var checkpoint = try yieldedTurnCheckpoint(
+                app.alloc,
+                entry,
+                provider_runtime.providerOf(app, agent),
+                provider_runtime.modelOf(app, agent),
+            );
+            defer checkpoint.deinit(app.alloc);
+            v2.setContinuesYielded(&checkpoint.execution);
+            app.queueYieldedTurn(agent, &checkpoint, resumed) catch |err| {
+                v2.setContinuesYielded(null);
+                return err;
+            };
+            taken_owned_elsewhere = true;
+            debug_trace.logf("recovery", "event=yield_continued tool_steps={d}", .{entry.execution.tool_steps.len});
+            types.freeHistoryTurn(app.alloc, taken.turn);
         }
 
         /// `AgentRuntimeDeps.save_recovery_record` on v2.
@@ -1673,6 +1880,16 @@ pub fn Runtime(comptime App: type) type {
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
             try v2.saveBridgeCall(record);
+        }
+
+        /// `AgentRuntimeDeps.mark_turn_yielded` on v2. A marker the session
+        /// does not write, with no open turn, is an error, so the yield's
+        /// trace says the turn was not marked.
+        pub fn markTurnYielded(agent: *AppAgent) !void {
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return error.NoSession;
+            if (!try v2.markYielded()) return error.NoOpenTurn;
         }
 
         /// Saves a model request's recovery status in the open turn as a
@@ -2420,7 +2637,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
-                commitJsHostSnapshot(app, agent, "history_turn");
+                commitJsHostSnapshot(app, agent, "history_turn", .clear);
                 return .committed;
             }
             // The turn's end capture was taken on its worker as the turn
@@ -2449,7 +2666,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app, agent) catch {};
-            commitJsHostSnapshot(app, agent, "history_turn");
+            commitJsHostSnapshot(app, agent, "history_turn", .clear);
             return .committed;
         }
 
@@ -2624,7 +2841,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (result.session_error == null) {
-                commitJsHostSnapshot(app, agent, "preferences");
+                commitJsHostSnapshot(app, agent, "preferences", .keep);
             }
 
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
@@ -4181,13 +4398,12 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.tool_call) |call| {
                             try writeBridgeCallRows(app, sink, entry.execution.bridge_calls, call.id);
                         }
-                        switch (entry.terminal_reason) {
-                            // The cancelled call's row says the turn stopped, as
-                            // it did live.
-                            .cancelled => if (entry.cancelled_command == null and !wrote_cancelled_call and entry.cancellation_origin == .turn) {
-                                try sink.appendTurnCancellation();
-                            },
-                            .failed => try sink.appendNotice(
+                        // The cancelled call's row says the turn stopped, as
+                        // it did live.
+                        switch (interruptedTurnEnd(entry, wrote_cancelled_call)) {
+                            .none => {},
+                            .cancellation => try sink.appendTurnCancellation(),
+                            .notice => try sink.appendNotice(
                                 session_runtime.interruptedTurnNotice(entry),
                             ),
                         }
@@ -5475,7 +5691,7 @@ pub fn Runtime(comptime App: type) type {
                 if (agent.session_persistence.v2) |v2| {
                     try v2.commitCompaction(summary, active_prefix != null, retained_from);
                 } else if (agent.session_persistence.js_host_session) |*owner| {
-                    var next = try snapshotCurrentState(app, agent, owner.state, io_mod.milliTimestamp());
+                    var next = try snapshotCurrentState(app, agent, owner.state, io_mod.milliTimestamp(), .keep);
                     var next_owned = true;
                     defer if (next_owned) next.deinit(app.alloc);
                     const history = try session_runtime.snapshotOwnedContextHistory(app.alloc, prepared, 0, 0);
@@ -5511,24 +5727,52 @@ pub fn Runtime(comptime App: type) type {
             return v2.setPermissions(permission_state);
         }
 
-        fn commitJsHostSnapshot(app: *App, agent: *AppAgent, boundary: []const u8) void {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+        /// Saves the turn so far as the recovery checkpoint before each model
+        /// request, so a reload during the turn can send that request again.
+        /// Does nothing without a JavaScript host session.
+        pub fn saveJsHostTurnPiece(app: *App, agent: *AppAgent, progress: agent_runtime.TurnProgress) void {
             if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
-            commitJsHostSnapshotEnabled(app, agent, boundary);
+            const owner = if (agent.session_persistence.js_host_session) |*value| value else return;
+            const turn = session_persistence.SavedTurnKey.of(progress.execution);
+            // The after-response and final-reply saves hold nothing a reload could use that the save before the request did not.
+            if (owner.saved_turn) |saved| {
+                if (saved.eql(turn)) return;
+            }
+            var checkpoint = turnCheckpoint(
+                app.alloc,
+                progress.user,
+                progress.execution,
+                provider_runtime.providerOf(app, agent),
+                provider_runtime.modelOf(app, agent),
+            ) catch |err| {
+                debug_trace.logf("session", "event=js_host_session_commit outcome=dropped boundary=turn_piece err={s}", .{@errorName(err)});
+                return;
+            };
+            defer checkpoint.deinit(app.alloc);
+            commitJsHostSnapshot(app, agent, "turn_piece", .{ .set = .{ .checkpoint = &checkpoint, .turn = turn } });
         }
 
-        fn commitJsHostSnapshotEnabled(app: *App, agent: *AppAgent, boundary: []const u8) void {
+        fn commitJsHostSnapshot(app: *App, agent: *AppAgent, boundary: []const u8, checkpoint: CheckpointAction) void {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
+            if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
+            commitJsHostSnapshotEnabled(app, agent, boundary, checkpoint);
+        }
+
+        fn commitJsHostSnapshotEnabled(app: *App, agent: *AppAgent, boundary: []const u8, checkpoint: CheckpointAction) void {
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const owner = if (agent.session_persistence.js_host_session) |*value|
                 value
             else
                 return;
+            // A failed turn-end commit must not make the next turn skip its first save.
+            if (std.meta.activeTag(checkpoint) == .clear) owner.saved_turn = null;
             var next = snapshotCurrentState(
                 app,
                 agent,
                 owner.state,
                 io_mod.milliTimestamp(),
+                checkpoint,
             ) catch |err| {
                 debug_trace.logf(
                     "session",
@@ -5561,6 +5805,10 @@ pub fn Runtime(comptime App: type) type {
             owner.state.deinit(app.alloc);
             owner.state = next;
             owner.revision = revision;
+            switch (checkpoint) {
+                .keep, .clear => {},
+                .set => |value| owner.saved_turn = value.turn,
+            }
             next_owned = false;
         }
 
@@ -5569,6 +5817,7 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             base_state: session_codec.DurableSessionState,
             now_ms: i64,
+            checkpoint: CheckpointAction,
         ) !session_codec.DurableSessionState {
             const preferences = agent.session_persistence.session_preferences orelse
                 base_state.preferences;
@@ -5593,11 +5842,12 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const recovery_checkpoint = if (base_state.recovery_checkpoint) |checkpoint|
-                try checkpoint.dupe(app.alloc)
-            else
-                null;
-            errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(app.alloc);
+            const recovery_checkpoint: ?session_codec.RecoveryCheckpoint = switch (checkpoint) {
+                .keep => if (base_state.recovery_checkpoint) |stored| try stored.dupe(app.alloc) else null,
+                .clear => null,
+                .set => |value| try value.checkpoint.dupe(app.alloc),
+            };
+            errdefer if (recovery_checkpoint) |*value| value.deinit(app.alloc);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -6155,12 +6405,20 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
+    resume_queue_count: usize = 0,
+    resume_queue_error: ?anyerror = null,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
             .alloc = alloc,
             .workspace_root = try alloc.dupe(u8, workspace_root),
         };
+    }
+
+    pub fn queueResumedRequest(self: *TestApp, _: anytype, _: []const u8, _: types.RecoveryResume) !bool {
+        self.resume_queue_count += 1;
+        if (self.resume_queue_error) |err| return err;
+        return true;
     }
 
     fn toolAdvertisementSet(_: *const TestApp, _: anytype) tool_set_contract.ToolSet {
@@ -6647,6 +6905,22 @@ test "js-host resume restores transcript context preferences and revision" {
     );
 }
 
+test "a resumed request that cannot be queued says so in a notice" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    (&app).agent().session_persistence.pending_request_resume = .{};
+    app.resume_queue_error = error.AccessDenied;
+
+    Runtime(TestApp).startPendingResume(&app, (&app).agent());
+
+    try std.testing.expectEqual(@as(usize, 1), app.resume_queue_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "could not send the interrupted request again") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "AccessDenied") != null);
+    try std.testing.expect((&app).agent().session_persistence.pending_request_resume == null);
+}
+
 test "js-host compaction store failure preserves live history and revision" {
     const alloc = std.testing.allocator;
     var fake: FakeJsHostSessionStore = .{
@@ -6787,7 +7061,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     const first_turn = try session_runtime.makeAssistantTurn(alloc, "first prompt", "first reply");
     defer session_runtime.freeHistoryTurn(alloc, first_turn);
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), first_turn);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "history_turn");
+    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "history_turn", .clear);
     try std.testing.expectEqual(@as(usize, 1), fake.commit_count);
     try std.testing.expect(fake.expected_revision == null);
     try std.testing.expectEqual(@as(usize, 1), fake.committed_state.?.history.len);
@@ -6802,7 +7076,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .assistant = @constCast("partial reply"),
     } };
     try Runtime(TestApp).appendHistoryTurn(&app, (&app).agent(), second_turn);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "history_turn");
+    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "history_turn", .clear);
     try std.testing.expectEqual(@as(usize, 2), fake.commit_count);
     try std.testing.expectEqual(@as(usize, 2), app.agent().session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.agent().session_persistence.js_host_session.?.state.history.len);
@@ -6912,7 +7186,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         .fast_mode = true,
     });
     defer result.deinit(alloc);
-    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "preferences");
+    Runtime(TestApp).commitJsHostSnapshotEnabled(&app, (&app).agent(), "preferences", .keep);
 
     try std.testing.expect(result.session_error == null);
     try std.testing.expectEqual(@as(usize, 1), fake.commit_count);

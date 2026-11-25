@@ -2836,6 +2836,9 @@ pub const AssistantHistoryTurn = struct {
 pub const RecoveryResume = struct {
     record: ?[32]u8 = null,
     stale: bool = false,
+    /// The request continues a turn that stopped between steps for the
+    /// host's restart (`recovery.zig` `Start.continues`).
+    continues: bool = false,
 };
 
 pub const RecoveryRecordWrite = union(enum) {
@@ -2869,6 +2872,10 @@ pub const InterruptedHistoryTurn = struct {
     /// rather than the turn failing or being cancelled. Only a session's
     /// replay sets it, and nothing saves it.
     stopped_by_exit: bool = false,
+    /// fx stopped the turn between steps for an upgrade's restart
+    /// (`turn_yielded`), and a later turn goes on from it. Only a session's
+    /// replay sets it, and nothing saves it.
+    yielded: bool = false,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -3309,6 +3316,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
+                .yielded = entry.yielded,
             } };
         },
     };
@@ -3933,10 +3941,12 @@ test "dupeHistoryTurn keeps a turn fx stopped as stopped" {
         .user = .{ .text = @constCast("go") },
         .terminal_reason = .failed,
         .stopped_by_exit = true,
+        .yielded = true,
     } };
     const copy = try dupeHistoryTurn(alloc, source);
     defer freeHistoryTurn(alloc, copy);
     try std.testing.expect(copy.interrupted.stopped_by_exit);
+    try std.testing.expect(copy.interrupted.yielded);
     try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
 }
 
