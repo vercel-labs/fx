@@ -373,6 +373,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_WEB_FETCH_DNS_READY": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WEB_FETCH_DNS_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_WORKSPACE_CAPTURE_START_HELD": {
       "job": "test",
       "stability": "internal"
