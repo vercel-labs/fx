@@ -8,6 +8,8 @@
 //!   {"v":1,"token":"<64 hex digits>","op":"list","server":"linear"}
 //!   {"v":1,"token":"<64 hex digits>","op":"search","query":"open issues"}
 //!   {"v":1,"token":"<64 hex digits>","op":"help","tool":"mcp_linear_list_issues"}
+//!   {"v":1,"token":"<64 hex digits>","op":"edit","path":"f.txt","blocks":[{"search":"a\n","replace":"b\n"}]}
+//!   {"v":1,"token":"<64 hex digits>","op":"write","path":"f.txt","content":"..."}
 //!
 //! and the bridge answers with one header line and the bytes it announces:
 //!
@@ -18,6 +20,7 @@
 //! `reason` naming the refusal. Pure: no I/O, so it is tested on bytes.
 const std = @import("std");
 const capability_mod = @import("capability.zig");
+const edit_blocks = @import("edit_blocks.zig");
 const mcp_call = @import("core.zig");
 
 const Allocator = std.mem.Allocator;
@@ -53,11 +56,15 @@ pub const Operation = union(enum) {
     list: []const u8,
     search: []const u8,
     help: []const u8,
+    /// `fx tool edit PATH`: one or more blocks, applied in order.
+    edit: capability_mod.EditRequest,
+    /// `fx tool write PATH`: the whole content of a file.
+    write: capability_mod.WriteRequest,
 
-    /// The lookup this operation is, or null for a call.
+    /// The lookup this operation is, or null for a change or a call.
     pub fn lookup(self: Operation) ?capability_mod.Lookup {
         return switch (self) {
-            .call => null,
+            .call, .edit, .write => null,
             .list => |server| .{ .list = server },
             .search => |query| .{ .search = query },
             .help => |tool| .{ .help = tool },
@@ -68,6 +75,8 @@ pub const Operation = union(enum) {
     pub fn subject(self: Operation) []const u8 {
         return switch (self) {
             .call => |value| value.tool,
+            .edit => |value| value.path,
+            .write => |value| value.path,
             .list, .search, .help => |text| text,
         };
     }
@@ -108,6 +117,8 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
         .list => .{ .list = try nonEmptyString(object, "server") },
         .search => .{ .search = try nonEmptyString(object, "query") },
         .help => .{ .help = try nonEmptyString(object, "tool") },
+        .edit => .{ .edit = .{ .path = try nonEmptyString(object, "path"), .blocks = try parseEditBlocks(arena, object) } },
+        .write => .{ .write = .{ .path = try nonEmptyString(object, "path"), .content = try stringField(object, "content") } },
     };
     return .{
         .version = @intCast(version.integer),
@@ -116,10 +127,33 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
     };
 }
 
-fn nonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestError![]const u8 {
+fn stringField(object: std.json.ObjectMap, key: []const u8) RequestError![]const u8 {
     const value = object.get(key) orelse return error.MalformedRequest;
-    if (value != .string or value.string.len == 0) return error.MalformedRequest;
+    if (value != .string) return error.MalformedRequest;
     return value.string;
+}
+
+fn nonEmptyString(object: std.json.ObjectMap, key: []const u8) RequestError![]const u8 {
+    const text = try stringField(object, key);
+    if (text.len == 0) return error.MalformedRequest;
+    return text;
+}
+
+/// The blocks of an edit line: one to `edit_blocks.max_blocks`, each with a
+/// non-empty search and a replace, which may be empty to delete the search text.
+fn parseEditBlocks(arena: Allocator, object: std.json.ObjectMap) RequestError![]const edit_blocks.Edit {
+    const value = object.get("blocks") orelse return error.MalformedRequest;
+    if (value != .array) return error.MalformedRequest;
+    const items = value.array.items;
+    if (items.len == 0 or items.len > edit_blocks.max_blocks) return error.MalformedRequest;
+    const blocks = try arena.alloc(edit_blocks.Edit, items.len);
+    for (items, blocks) |item, *block| {
+        if (item != .object) return error.MalformedRequest;
+        const search = try stringField(item.object, "search");
+        if (search.len == 0) return error.MalformedRequest;
+        block.* = .{ .search = search, .replace = try stringField(item.object, "replace") };
+    }
+    return blocks;
 }
 
 /// Writes one request line. A call's `arguments_json` must be a JSON object.
@@ -136,6 +170,23 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
         .list => |server| try writeField(writer, "server", server),
         .search => |query| try writeField(writer, "query", query),
         .help => |tool| try writeField(writer, "tool", tool),
+        .edit => |value| {
+            try writeField(writer, "path", value.path);
+            try writer.writeAll(",\"blocks\":[");
+            for (value.blocks, 0..) |block, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writer.writeAll("{\"search\":");
+                try std.json.Stringify.value(block.search, .{}, writer);
+                try writer.writeAll(",\"replace\":");
+                try std.json.Stringify.value(block.replace, .{}, writer);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        },
+        .write => |value| {
+            try writeField(writer, "path", value.path);
+            try writeField(writer, "content", value.content);
+        },
     }
     try writer.writeAll("}\n");
 }
@@ -281,4 +332,87 @@ test "a reply header round-trips and rejects another version" {
     try std.testing.expectEqual(@as(u64, 12), header.bytes);
     try std.testing.expectError(error.UnsupportedReply, parseHeader(arena, "{\"v\":2,\"status\":\"ok\",\"bytes\":0}"));
     try std.testing.expectError(error.MalformedReply, parseHeader(arena, "{\"v\":1,\"status\":\"maybe\",\"bytes\":0}"));
+}
+
+test "an edit line keeps its path and its blocks in order, quotes and newlines included" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x02);
+    const blocks = [_]edit_blocks.Edit{
+        .{ .search = "old \"quoted\"\n", .replace = "new\n" },
+        .{ .search = "gone\n", .replace = "" },
+    };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeRequest(&out.writer, token, .{ .edit = .{ .path = "a/b.txt", .blocks = &blocks } });
+    const line = out.written();
+    try std.testing.expect(std.mem.endsWith(u8, line, "}\n"));
+    const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+    try std.testing.expectEqual(Operation.edit, std.meta.activeTag(parsed.operation));
+    try std.testing.expectEqualStrings("a/b.txt", parsed.operation.edit.path);
+    try std.testing.expectEqual(@as(usize, 2), parsed.operation.edit.blocks.len);
+    try std.testing.expectEqualStrings("old \"quoted\"\n", parsed.operation.edit.blocks[0].search);
+    try std.testing.expectEqualStrings("new\n", parsed.operation.edit.blocks[0].replace);
+    try std.testing.expectEqualStrings("gone\n", parsed.operation.edit.blocks[1].search);
+    try std.testing.expectEqualStrings("", parsed.operation.edit.blocks[1].replace);
+    try std.testing.expect(parsed.operation.lookup() == null);
+    try std.testing.expectEqualStrings("a/b.txt", parsed.operation.subject());
+}
+
+test "a write line keeps its path and content, and an empty content is a write" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x03);
+    for ([_][]const u8{ "first\nsecond \"line\"\n", "" }) |content| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try writeRequest(&out.writer, token, .{ .write = .{ .path = "notes.txt", .content = content } });
+        const line = out.written();
+        const parsed = try parseRequest(arena, line[0 .. line.len - 1]);
+        try std.testing.expectEqual(Operation.write, std.meta.activeTag(parsed.operation));
+        try std.testing.expectEqualStrings("notes.txt", parsed.operation.write.path);
+        try std.testing.expectEqualStrings(content, parsed.operation.write.content);
+    }
+}
+
+test "an edit line with no blocks, an empty search, a missing field, or too many blocks is malformed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\",\"blocks\":[]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\",\"blocks\":[{\"search\":\"\",\"replace\":\"x\"}]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\",\"blocks\":[{\"search\":\"a\"}]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\",\"blocks\":{}}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"\",\"blocks\":[{\"search\":\"a\",\"replace\":\"b\"}]}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\"}",
+    }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
+
+    const full = try editLineWithBlocks(arena, edit_blocks.max_blocks);
+    const parsed = try parseRequest(arena, full);
+    try std.testing.expectEqual(edit_blocks.max_blocks, parsed.operation.edit.blocks.len);
+    const over = try editLineWithBlocks(arena, edit_blocks.max_blocks + 1);
+    try std.testing.expectError(error.MalformedRequest, parseRequest(arena, over));
+}
+
+fn editLineWithBlocks(arena: Allocator, count: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll("{\"v\":1,\"token\":\"\",\"op\":\"edit\",\"path\":\"f\",\"blocks\":[");
+    for (0..count) |index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"search\":\"a\",\"replace\":\"b\"}");
+    }
+    try out.writer.writeAll("]}");
+    return out.written();
+}
+
+test "a write line needs its content field" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"path\":\"f\"}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"path\":\"f\",\"content\":3}",
+        "{\"v\":1,\"token\":\"\",\"op\":\"write\",\"content\":\"x\"}",
+    }) |line| try std.testing.expectError(error.MalformedRequest, parseRequest(arena, line));
 }

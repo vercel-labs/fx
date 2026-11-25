@@ -500,7 +500,7 @@ pub fn prepareFileMutationCall(
     call: ToolCall,
     request: FileMutationPreparationRequest,
 ) !FileMutationPreparation {
-    var input = switch (try decodeFileMutationInput(
+    const input = switch (try decodeFileMutationInput(
         alloc,
         request.tool_registry,
         call,
@@ -509,13 +509,33 @@ pub fn prepareFileMutationCall(
         .not_file_mutation => return .not_file_mutation,
         .input => |value| value,
     };
+    return switch (try prepareDecodedFileMutation(alloc, call, input, request.workspace_root)) {
+        .prepared => |value| .{ .prepared = value },
+        .tool_failure => |reason| .{ .tool_failure = reason },
+    };
+}
+
+const PreparedDecodedMutation = union(enum) {
+    prepared: PreparedFileMutationCall,
+    tool_failure: []const u8,
+};
+
+/// Resolves the target of a decoded file change and binds the call to it. The
+/// caller hands over `input`, which is freed on every path that does not keep it.
+fn prepareDecodedFileMutation(
+    alloc: Allocator,
+    call: ToolCall,
+    input_value: file_mutation_contract.FileMutationInput,
+    workspace_root: []const u8,
+) !PreparedDecodedMutation {
+    var input = input_value;
     var input_owned = true;
     defer if (input_owned) input.deinit(alloc);
 
     if (builtin.is_test) file_mutation_resolution_count += 1;
     var targets = switch (try permissions.prepareFileMutationTargets(
         alloc,
-        request.workspace_root,
+        workspace_root,
         input,
     )) {
         .target_resolution_failure => |failure| return .{ .tool_failure = try alloc.print(
@@ -526,8 +546,8 @@ pub fn prepareFileMutationCall(
     };
     errdefer targets.deinit(alloc);
 
-    const workspace_root = try alloc.dupe(u8, request.workspace_root);
-    errdefer alloc.free(workspace_root);
+    const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(owned_workspace_root);
     const call_id = try alloc.dupe(u8, call.id);
     var arguments_hasher = std.crypto.hash.sha2.Sha256.init(.{});
     arguments_hasher.update(call.arguments_json);
@@ -535,10 +555,43 @@ pub fn prepareFileMutationCall(
     return .{ .prepared = .{
         .call_id = call_id,
         .arguments_hash = arguments_hasher.finalResult(),
-        .workspace_root = workspace_root,
+        .workspace_root = owned_workspace_root,
         .input = input,
         .targets = targets,
     } };
+}
+
+/// What a file change that did not come from the model's own call decided.
+pub const DecodedFileMutation = union(enum) {
+    /// It failed before any permission check, so nothing was asked or applied.
+    tool_failure: []const u8,
+    outcome: command_admission.PermissionOutcome,
+};
+
+/// The permission check, prompt, and review of a file change whose input the
+/// caller built: the bridge's `fx tool edit` and `write`. Everything after the
+/// decode is the same as for the model's own `edit_file` or `write_file` call,
+/// and `call` must name that tool. Takes ownership of `decoded`.
+pub fn requestDecodedFileMutationPermission(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    decoded: file_mutation_contract.FileMutationInput,
+    permission_mode: PermissionMode,
+    local_grants: []const PermissionGrant,
+) !DecodedFileMutation {
+    var prepared = switch (try prepareDecodedFileMutation(arena, call, decoded, input.workspace_root)) {
+        .tool_failure => |reason| return .{ .tool_failure = reason },
+        .prepared => |value| value,
+    };
+    return .{ .outcome = try requestPreparedFileMutationPermissionOutcome(
+        input,
+        arena,
+        call,
+        &prepared,
+        permission_mode,
+        local_grants,
+    ) };
 }
 
 pub fn preflightPreparedFileMutation(

@@ -1050,7 +1050,7 @@ const McpCallBridgeState = struct {
     runtime: Context,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = authorizeBridgeFile, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
     }
 };
 
@@ -1078,6 +1078,225 @@ fn authorizeBridgeCall(
         .allow => .{ .allow = .{ .binding = resolved.mcp_binding } },
         .deny => |why| .{ .deny = why },
     };
+}
+
+/// What a bridge file change was decided to do, kept from its check to its call
+/// step in `Authorization.allow.prepared`. The handler owns it, in the
+/// connection arena.
+const BridgeFileAuthority = union(enum) {
+    /// The change failed before any check. The call step reports this text and
+    /// applies nothing.
+    failed: []const u8,
+    /// The check allowed the change, which the call step applies as `call`.
+    allowed: struct {
+        call: ToolCall,
+        execution: file_mutation_contract.FileExecutionAuthorization,
+        /// The change's blocks, for the failure wording: 1 for a write.
+        block_count: usize,
+    },
+};
+
+/// Checks a bridge file change as the agent's own `edit_file` or `write_file`
+/// call: the same rules, prompt, and automatic review, which see exactly this
+/// call (`checkNestedCall` does the same for MCP calls).
+fn authorizeBridgeFile(
+    raw: *anyopaque,
+    arena: Allocator,
+    request_id: []const u8,
+    file: mcp_call_capability.FileRequest,
+) anyerror!mcp_call_capability.Authorization {
+    const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    const block_count: usize = switch (file) {
+        .edit => |value| value.blocks.len,
+        .write => 1,
+    };
+    const call = try bridgeFileToolCall(arena, request_id, file);
+    const input = try bridgeFileMutationInput(arena, file);
+    var check = ctx;
+    check.permission_review_turn = .{
+        .observer = ctx.observer,
+        .model = ctx.model,
+        .pending_assistant = .{ .role = .assistant, .tool_calls = try arena.dupe(ToolCall, &.{call}) },
+        .target_call_id = call.id,
+        .origin = if (ctx.lifecycle_scope.kind == .subagent) .subagent else .root,
+        .trusted_root_context = auto_classifier_context.rootUserRequestContext(ctx.root_user_intent_context) orelse "",
+        .current_turn_untrusted_messages = ctx.current_turn_messages,
+    };
+    const decided = try tool_admission.requestDecodedFileMutationPermission(
+        check.admissionInput(),
+        arena,
+        call,
+        input,
+        ctx.permission_mode,
+        ctx.session_grants,
+    );
+    const outcome = switch (decided) {
+        .tool_failure => |reason| return failedBridgeFile(arena, reason, block_count),
+        .outcome => |value| value,
+    };
+    if (outcome.tool_failure) |reason| return failedBridgeFile(arena, reason, block_count);
+    if (outcome.decision.isDenied() or outcome.execution_authority == null) {
+        if (outcome.feedback) |message| return .{ .deny = message };
+        const reason = outcome.denial_reason orelse outcome.decision.denialReason() orelse .user_denied;
+        return .{ .deny = try tool_result_errors.permissionDenialText(
+            arena,
+            call.name,
+            reason,
+            if (outcome.auto_review_result) |result| result.rationale else null,
+            outcome.auto_review_failure,
+        ) };
+    }
+    const execution = switch (outcome.execution_authority.?) {
+        .file_mutation => |value| value,
+        else => return .{ .deny = "fx tool edit and write did not get file authority." },
+    };
+    const authority = try arena.create(BridgeFileAuthority);
+    authority.* = .{ .allowed = .{ .call = call, .execution = execution, .block_count = block_count } };
+    return .{ .allow = .{ .prepared = authority } };
+}
+
+/// The authorization of a change that failed before its check. A multi-block
+/// failure says that nothing was applied.
+fn failedBridgeFile(arena: Allocator, reason: []const u8, block_count: usize) !mcp_call_capability.Authorization {
+    const authority = try arena.create(BridgeFileAuthority);
+    authority.* = .{ .failed = try failureWithBlockNote(arena, reason, block_count) };
+    return .{ .allow = .{ .prepared = authority } };
+}
+
+fn failureWithBlockNote(arena: Allocator, reason: []const u8, block_count: usize) ![]const u8 {
+    if (block_count <= 1) return reason;
+    return arena.print("{s}\nNo block was applied, so the file is unchanged.", .{reason});
+}
+
+/// The one tool call a bridge file change stands for: `edit_file` or
+/// `write_file`, with the canonical JSON of the request. The check and the apply
+/// both see this call, so a changed request is a different action.
+fn bridgeFileToolCall(arena: Allocator, request_id: []const u8, file: mcp_call_capability.FileRequest) !ToolCall {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    switch (file) {
+        .edit => |value| {
+            try out.writer.writeAll("{\"path\":");
+            try std.json.Stringify.value(value.path, .{}, &out.writer);
+            try out.writer.writeAll(",\"blocks\":[");
+            for (value.blocks, 0..) |block, index| {
+                if (index > 0) try out.writer.writeByte(',');
+                try out.writer.writeAll("{\"search\":");
+                try std.json.Stringify.value(block.search, .{}, &out.writer);
+                try out.writer.writeAll(",\"replace\":");
+                try std.json.Stringify.value(block.replace, .{}, &out.writer);
+                try out.writer.writeByte('}');
+            }
+            try out.writer.writeAll("]}");
+            return .{ .id = request_id, .name = "edit_file", .arguments_json = out.written() };
+        },
+        .write => |value| {
+            try out.writer.writeAll("{\"path\":");
+            try std.json.Stringify.value(value.path, .{}, &out.writer);
+            try out.writer.writeAll(",\"content\":");
+            try std.json.Stringify.value(value.content, .{}, &out.writer);
+            try out.writer.writeByte('}');
+            return .{ .id = request_id, .name = "write_file", .arguments_json = out.written() };
+        },
+    }
+}
+
+/// The file change a bridge request names. Its strings are copies in `arena`,
+/// so they need not outlive the request's bytes.
+fn bridgeFileMutationInput(arena: Allocator, file: mcp_call_capability.FileRequest) !file_mutation_contract.FileMutationInput {
+    return switch (file) {
+        .edit => |value| blk: {
+            const edits = try arena.alloc(file_mutation_contract.Replacement, value.blocks.len);
+            for (value.blocks, edits) |block, *replacement| {
+                replacement.* = .{
+                    .old_string = try arena.dupe(u8, block.search),
+                    .new_string = try arena.dupe(u8, block.replace),
+                };
+            }
+            break :blk .{ .edit = .{
+                .path = try arena.dupe(u8, value.path),
+                .edits = edits,
+                .wording = .edit,
+            } };
+        },
+        .write => |value| .{ .write = .{
+            .path = try arena.dupe(u8, value.path),
+            .content = try arena.dupe(u8, value.content),
+        } },
+    };
+}
+
+/// Applies a bridge file change that its check allowed, through the same
+/// execution the agent's own `edit_file` or `write_file` call uses.
+fn runBridgeFileCall(
+    arena: Allocator,
+    authority: *BridgeFileAuthority,
+    cancel: *std.atomic.Value(bool),
+) anyerror!mcp_call_capability.CallOutcome {
+    const allowed = switch (authority.*) {
+        .failed => |text| return .{ .status = .tool_error, .bytes = text },
+        .allowed => |*value| value,
+    };
+    if (cancel.load(.acquire)) {
+        return .{ .status = .failed, .bytes = "The change was cancelled before it started; nothing was applied." };
+    }
+    // A check that needed no prompt did not prepare the change, so it is prepared
+    // here, and a block that is not found fails now, before anything is applied.
+    if (allowed.execution.prepared == null) {
+        switch (try file_mutation.prepare(
+            arena,
+            allowed.call,
+            allowed.execution.input,
+            allowed.execution.policy_targets,
+            allowed.execution.edit_failure_detail,
+        )) {
+            .semantic_failure => |reason| return .{
+                .status = .tool_error,
+                .bytes = try failureWithBlockNote(arena, reason, allowed.block_count),
+            },
+            .prepared => |prepared| allowed.execution.prepared = prepared,
+        }
+    }
+    const prepared = allowed.execution.prepared.?;
+    // The result takes its own allocator: execution needs two different ones.
+    var result_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer result_arena.deinit();
+    const result = file_mutation_execution.execute(.{
+        .call_allocator = arena,
+        .result_allocator = result_arena.allocator(),
+        .call = allowed.call,
+        .authorization = allowed.execution,
+        .maybe_cancel_flag = cancel,
+    }) catch |err| return .{
+        .status = .failed,
+        .bytes = try arena.print("The change failed: {s}", .{@errorName(err)}),
+    };
+    if (result.status != .success) {
+        return .{ .status = .tool_error, .bytes = try arena.dupe(u8, result.model_output) };
+    }
+    if (result.committed_file_handoff != null) {
+        debug_trace.logf("tool", "bridge file change call_id={s} dropped its undo entry and diff row: publishing them is not wired yet", .{allowed.call.id});
+    }
+    if (file_mutation_contract.preparedMutationIsNoop(prepared)) {
+        return .{ .status = .ok, .bytes = try arena.dupe(u8, result.model_output) };
+    }
+    const verb = if (prepared.kind == .write) "wrote" else "edited";
+    return .{ .status = .ok, .bytes = try bridgeChangeReply(
+        arena,
+        verb,
+        prepared.display_path,
+        prepared.preview.additions,
+        prepared.preview.deletions,
+    ) };
+}
+
+/// `edited PATH +A -D` (or `wrote`), leaving out a side that is zero.
+fn bridgeChangeReply(arena: Allocator, verb: []const u8, path: []const u8, additions: usize, deletions: usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("{s} {s}", .{ verb, path });
+    if (additions > 0) try out.writer.print(" +{d}", .{additions});
+    if (deletions > 0) try out.writer.print(" -{d}", .{deletions});
+    return out.written();
 }
 
 const NestedCheck = union(enum) {
@@ -1244,6 +1463,10 @@ fn runBridgeCall(
     allowed: @FieldType(mcp_call_capability.Authorization, "allow"),
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
+    if (allowed.prepared) |prepared| {
+        const authority: *BridgeFileAuthority = @ptrCast(@alignCast(prepared));
+        return runBridgeFileCall(arena, authority, cancel);
+    }
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const row = BridgeCallRow.start(state.runtime, arena, request_id, tool, arguments_json);
     const outcome = callBridgeTool(state.runtime, arena, request_id, tool, arguments_json, allowed, cancel) catch |err| {
@@ -1608,6 +1831,279 @@ test "a bridge call's row ends, then keeps its shell call, tool, and outcome for
     var rowless_state = McpCallBridgeState{ .runtime = ok_runtime.context() };
     _ = try runBridgeCall(@ptrCast(&rowless_state), arena, "fx-mcp-call-10", "mcp_fs_read", secret_arguments, .{}, &cancel);
     try std.testing.expectEqual(@as(usize, 2), rows.saved.items.len);
+}
+
+/// Answers each permission prompt with `decision`, and records that one came and
+/// whether it carried the file review.
+const BridgePrompter = struct {
+    decision: types.ToolPermissionDecision = .once,
+    calls: usize = 0,
+    review_seen: bool = false,
+
+    fn request(
+        raw: *anyopaque,
+        alloc: Allocator,
+        _: permission_request.PermissionRequest,
+        _: ToolCall,
+        review: ?*const diff_mod.FileReview,
+        _: ?[]const types.PermissionGrant,
+    ) anyerror!permission_request.OwnedPermissionResponse {
+        const self: *BridgePrompter = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.review_seen = review != null;
+        return permission_request.OwnedPermissionResponse.init(alloc, self.decision, null);
+    }
+
+    fn prompter(self: *BridgePrompter) permission_prompter.Prompter {
+        return .{ .context = @ptrCast(self), .request_fn = request };
+    }
+};
+
+fn writeBridgeTestFile(tmp: std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
+    var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), content);
+}
+
+fn readBridgeTestFile(alloc: Allocator, tmp: std.testing.TmpDir, sub_path: []const u8) ![]u8 {
+    var file = try tmp.dir.openFile(io_mod.getIo(), sub_path, .{});
+    defer file.close(io_mod.getIo());
+    return io_mod.readFileToEnd(alloc, &file, 64 * 1024);
+}
+
+test "a bridge edit that a configured deny rule covers writes nothing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "one\ntwo\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var deny_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .deny,
+    }};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{
+        .workspace_root = workspace,
+        .permission_mode = .ask,
+        .cancel_flag = &cancel,
+        .permission_rules = .{ .rules = &deny_rules },
+    };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context() };
+    const blocks = [_]tool_bridge.edit_blocks.Edit{.{ .search = "two\n", .replace = "2\n" }};
+
+    const authorization = try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-1", .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } });
+    try std.testing.expect(authorization == .deny);
+    try std.testing.expectEqualStrings("one\ntwo\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
+}
+
+test "a bridge edit in ask mode shows its diff, and on allow applies its blocks in order" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "one\ntwo\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .ask, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var prompter: BridgePrompter = .{ .decision = .once };
+    var ctx = rt.context();
+    ctx.permission_prompter = prompter.prompter();
+    var state = McpCallBridgeState{ .runtime = ctx };
+    // Block 2 finds the text that block 1 wrote, so the blocks apply in order.
+    const blocks = [_]tool_bridge.edit_blocks.Edit{
+        .{ .search = "two\n", .replace = "2\nthree\n" },
+        .{ .search = "three\n", .replace = "3\n" },
+    };
+
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-2", .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    try std.testing.expectEqual(@as(usize, 1), prompter.calls);
+    try std.testing.expect(prompter.review_seen);
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-2", "notes.txt", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("edited notes.txt +2 -1", outcome.bytes);
+    try std.testing.expectEqualStrings("one\n2\n3\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
+}
+
+test "a bridge edit whose block is not found names that block, and leaves the file unchanged" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "alpha\nbeta\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const blocks = [_]tool_bridge.edit_blocks.Edit{
+        .{ .search = "alpha\n", .replace = "ALPHA\n" },
+        .{ .search = "gamma\n", .replace = "GAMMA\n" },
+        .{ .search = "beta\n", .replace = "BETA\n" },
+    };
+    const file: mcp_call_capability.FileRequest = .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } };
+    const expected_line = "No block was applied, so the file is unchanged.";
+
+    // Ask mode: the failure comes before any prompt, so none opens.
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var ask_rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .ask, .cancel_flag = &cancel };
+    defer ask_rt.deinit(alloc);
+    var prompter: BridgePrompter = .{ .decision = .once };
+    var ask_ctx = ask_rt.context();
+    ask_ctx.permission_prompter = prompter.prompter();
+    var ask_state = McpCallBridgeState{ .runtime = ask_ctx };
+    const asked = switch (try authorizeBridgeFile(@ptrCast(&ask_state), arena, "fx-mcp-call-3", file)) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    try std.testing.expectEqual(@as(usize, 0), prompter.calls);
+    const ask_outcome = try runBridgeCall(@ptrCast(&ask_state), arena, "fx-mcp-call-3", "notes.txt", "", asked, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, ask_outcome.status);
+    try std.testing.expect(std.mem.find(u8, ask_outcome.bytes, "block 2 of 3: search text not found in file") != null);
+    try std.testing.expect(std.mem.endsWith(u8, ask_outcome.bytes, expected_line));
+
+    // Full access: the check allows, so the failure comes at the call, and says the same.
+    var yolo_rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer yolo_rt.deinit(alloc);
+    var yolo_state = McpCallBridgeState{ .runtime = yolo_rt.context() };
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&yolo_state), arena, "fx-mcp-call-4", file)) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const yolo_outcome = try runBridgeCall(@ptrCast(&yolo_state), arena, "fx-mcp-call-4", "notes.txt", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, yolo_outcome.status);
+    try std.testing.expect(std.mem.find(u8, yolo_outcome.bytes, "block 2 of 3: search text not found in file") != null);
+    try std.testing.expect(std.mem.endsWith(u8, yolo_outcome.bytes, expected_line));
+    try std.testing.expectEqualStrings("alpha\nbeta\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
+}
+
+test "a bridge edit whose file changed after the check is refused, and keeps the new content" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "one\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    // Ask mode prepares the change for its prompt, so the call compares it with the file it was shown.
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .ask, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var prompter: BridgePrompter = .{ .decision = .once };
+    var ctx = rt.context();
+    ctx.permission_prompter = prompter.prompter();
+    var state = McpCallBridgeState{ .runtime = ctx };
+    const blocks = [_]tool_bridge.edit_blocks.Edit{.{ .search = "one\n", .replace = "two\n" }};
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-5", .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    try std.testing.expectEqual(@as(usize, 1), prompter.calls);
+
+    // Someone else writes the file between the check and the call.
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "changed\n");
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-5", "notes.txt", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.tool_error, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "changed after preview") != null);
+    try std.testing.expectEqualStrings("changed\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
+}
+
+test "a bridge write creates its file and reports its added lines" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context() };
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-6", .{ .write = .{ .path = "new.txt", .content = "a\nb\n" } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-6", "new.txt", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("wrote new.txt +2", outcome.bytes);
+    try std.testing.expectEqualStrings("a\nb\n", try readBridgeTestFile(arena, tmp, "workspace/new.txt"));
+}
+
+test "a bridge change cancelled before its call applies nothing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "one\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context() };
+    const blocks = [_]tool_bridge.edit_blocks.Edit{.{ .search = "one\n", .replace = "two\n" }};
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-7", .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-7", "notes.txt", "", allowed, &cancelled);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, outcome.status);
+    try std.testing.expect(std.mem.find(u8, outcome.bytes, "nothing was applied") != null);
+    try std.testing.expectEqualStrings("one\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
+}
+
+test "a bridge edit that leaves the file as it was says so, and changes nothing" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeBridgeTestFile(tmp, "workspace/notes.txt", "one\ntwo\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var state = McpCallBridgeState{ .runtime = rt.context() };
+    const blocks = [_]tool_bridge.edit_blocks.Edit{
+        .{ .search = "two\n", .replace = "2\n" },
+        .{ .search = "2\n", .replace = "two\n" },
+    };
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-8", .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-8", "notes.txt", "", allowed, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("No changes to notes.txt; it already contains the requested content", outcome.bytes);
+    try std.testing.expectEqualStrings("one\ntwo\n", try readBridgeTestFile(arena, tmp, "workspace/notes.txt"));
 }
 
 const RunCommandBackendState = struct {
