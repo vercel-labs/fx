@@ -182,14 +182,14 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
 
 /// Parses a successful streamed Chat Completions reply from `reader`,
 /// telling `progress` about each event when it is set.
-pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress, _: []const []const u8) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
 /// The same for an Anthropic Messages reply.
-fn consume_messages(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+fn consume_messages(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress, _: []const []const u8) !streams.Result {
     var limits: anthropic_messages.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return anthropic_messages.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);

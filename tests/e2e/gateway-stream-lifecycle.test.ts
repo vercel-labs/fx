@@ -14618,6 +14618,44 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  // A streamed provider error can quote the request's credential back, as an
+  // HTTP error body can; fx masks it whole before it shows, traces, or saves
+  // the error, even where it cuts the provider's text short.
+  for (const placement of ["whole", "across the notice's cut"] as const) {
+    test(`a streamed error that echoes the active key masks it everywhere: ${placement}`, async () => {
+      const root = createFixtureRoot(`echoed-key-${placement === "whole" ? "whole" : "cut"}`);
+      const tracePath = join(root.root, "trace.log");
+      const key = "fake-gateway-lifecycle-key";
+      // The notice reads "invalid_request_error: <message>" and keeps 253
+      // bytes, so a key starting 10 bytes before that would show its start.
+      const pad = placement === "whole" ? "" : "x".repeat(253 - 10 - "invalid_request_error: ".length);
+      const gateway = startGateway(() =>
+        fakeGatewaySse([{ type: "error", error: { code: "invalid_request_error", message: `${pad}${key} was refused.` } }])
+      );
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--auto", "Inspect the binary."],
+          { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+        );
+        const keyStart = key.slice(0, 8);
+
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("*".repeat(placement === "whole" ? key.length : 10));
+        expect(result.stdout).not.toContain(keyStart);
+        expect(result.stderr).not.toContain(keyStart);
+        expect(readFileSync(tracePath, "utf8")).not.toContain(keyStart);
+        const saved = readdirSync(join(root.home, ".fx"), { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isFile())
+          .map((entry) => join(entry.parentPath, entry.name));
+        expect(saved.some((file) => file.includes("sessions"))).toBe(true);
+        for (const file of saved) expect(readFileSync(file).toString("latin1")).not.toContain(keyStart);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   test("genuine bad request in a stream ends the turn after one model request", async () => {
     const root = createFixtureRoot("streamed-genuine-bad-request");
     const tracePath = join(root.root, "trace.log");

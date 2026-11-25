@@ -883,6 +883,10 @@ pub const Reducer = struct {
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
     call_ids: tool_call_ids.ReplyIds,
+    /// The secrets the request sent, borrowed until deinit. A failure's text
+    /// is kept with them masked, before it is cut short; its code is still
+    /// classified as the provider sent it.
+    secrets: []const []const u8 = &.{},
 
     /// Borrows `conversation` until deinit.
     pub fn init(alloc: std.mem.Allocator, conversation: tool_call_ids.Conversation) !Reducer {
@@ -1188,8 +1192,12 @@ pub const Reducer = struct {
         self.failure_explained = true;
         const code = stringField(fields, "code") orelse "provider_error";
         const message = stringField(fields, "message") orelse "Provider response failed";
-        const bounded_code = types.ModelFailureDiagnostic.init(code);
-        const bounded_message = types.ModelFailureDiagnostic.init(message);
+        const shown_code = try self.maskedCopy(alloc, code);
+        defer alloc.free(shown_code);
+        const shown_message = try self.maskedCopy(alloc, message);
+        defer alloc.free(shown_message);
+        const bounded_code = types.ModelFailureDiagnostic.init(shown_code);
+        const bounded_message = types.ModelFailureDiagnostic.init(shown_message);
         var buffer: [2 * types.ModelFailureDiagnostic.max_bytes + 2]u8 = undefined;
         const text = try std.mem.print(&buffer, "{s}: {s}", .{ bounded_code.view(), bounded_message.view() });
         const detail = types.ModelFailureDiagnostic.init(text);
@@ -1200,6 +1208,14 @@ pub const Reducer = struct {
             .rate_limited
         else
             .non_retryable;
+    }
+
+    /// `text` with every secret the request sent masked. The caller owns the
+    /// result.
+    fn maskedCopy(self: *const Reducer, alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+        const copy = try alloc.dupe(u8, text);
+        for (self.secrets) |secret| text_utils.maskLiteral(copy, secret);
+        return copy;
     }
 
     fn accept_text(
@@ -1981,6 +1997,40 @@ test "Responses terminal failure classification is conservative and diagnostics 
     try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
     try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
     try std.testing.expect(completion.provider_failure_detail.?.len > 0);
+}
+
+test "Responses masks every secret in a failure before it cuts it short, and classifies the code as sent" {
+    const token = "test-token-0123456789";
+    const header = "test-header-secret-42";
+    const Case = struct { message: []const u8, code: []const u8, secrets: []const []const u8, cause: ?types.ProviderFailureCause };
+    // The detail reads "<code>: <message>" and keeps 253 bytes, so a secret
+    // placed 9 bytes before the cut would show its start.
+    const cut_pad = 253 - 9 - "invalid_prompt: ".len;
+    const cases = [_]Case{
+        .{ .message = "key " ++ token ++ " refused", .code = "invalid_prompt", .secrets = &.{token}, .cause = .non_retryable },
+        .{ .message = text_utils.repeat("x", cut_pad) ++ token ++ " refused", .code = "invalid_prompt", .secrets = &.{token}, .cause = .non_retryable },
+        .{ .message = text_utils.repeat("x", cut_pad) ++ header ++ " refused", .code = "invalid_prompt", .secrets = &.{ token, header }, .cause = .non_retryable },
+        // A secret that overlaps the code changes what fx shows, not the cause.
+        .{ .message = "slow down", .code = "rate_limit_exceeded", .secrets = &.{"rate_limit"}, .cause = .rate_limited },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.reducer.secrets = case.secrets;
+        const event = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+            .type = "response.failed",
+            .response = .{ .@"error" = .{ .code = case.code, .message = case.message } },
+        }, .{});
+        defer std.testing.allocator.free(event);
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        const detail = completion.provider_failure_detail.?;
+        errdefer std.debug.print("detail: {s}\n", .{detail});
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+        try std.testing.expect(detail.len <= types.ModelFailureDiagnostic.max_bytes);
+        for (case.secrets) |secret| try std.testing.expect(std.mem.find(u8, detail, secret[0..4]) == null);
+    }
 }
 
 test "Responses terminal metadata rejects contradictions before publishing final text" {

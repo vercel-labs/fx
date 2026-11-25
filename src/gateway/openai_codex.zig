@@ -385,6 +385,7 @@ pub fn completeFromStream(
         .{},
         progress,
         .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
+        request.credential.secret() orelse "",
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -412,9 +413,13 @@ fn consumeSse(
     limits: CodexLimits,
     progress: ?sse_stream.Progress,
     conversation: tool_call_ids.Conversation,
+    /// The credential the request sent, masked out of a failure it reports.
+    credential: []const u8,
 ) !types.ModelCompletion {
     var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
+    const secrets = [_][]const u8{credential};
+    reducer.secrets = &secrets;
     var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
@@ -844,6 +849,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         .{},
         null,
         .{},
+        "",
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -882,6 +888,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         limits,
         null,
         .{},
+        "",
     );
 }
 
@@ -1070,7 +1077,7 @@ fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
     var source = fixed.limited(.unlimited, read_buffer);
     var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
     var cancelled = std.atomic.Value(bool).init(false);
-    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null, .{});
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null, .{}, "");
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));

@@ -27,7 +27,9 @@ const max_secret_bytes = 16 * 1024;
 pub const max_models_bytes = 4 * 1024 * 1024;
 
 /// Reads a successful streamed reply. `progress` is told about each event.
-pub const ConsumeFn = *const fn (alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) anyerror!streams.Result;
+/// `secrets` are the token and header values the request sent, for a reader
+/// that cuts a reported failure short to mask first.
+pub const ConsumeFn = *const fn (alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress, secrets: []const []const u8) anyerror!streams.Result;
 
 /// The connection's extra headers with their values read from the
 /// environment, and the header its protocol needs. Free with `deinit`, which
@@ -77,6 +79,21 @@ pub const Headers = struct {
         for (self.list[0..self.owned]) |header| secret.zeroAndFree(alloc, @constCast(header.value));
         alloc.free(self.storage);
         self.* = .{};
+    }
+
+    /// The bearer token and every header value, in a list the caller frees.
+    fn secrets(self: *const Headers, alloc: Allocator, token: ?[]const u8) Allocator.Error![]const []const u8 {
+        const list = try alloc.alloc([]const u8, self.owned + 1);
+        var count: usize = 0;
+        if (token) |value| {
+            list[count] = value;
+            count += 1;
+        }
+        for (self.list[0..self.owned]) |header| {
+            list[count] = header.value;
+            count += 1;
+        }
+        return list[0..count];
     }
 
     /// `detail` with the bearer token and every header value replaced by
@@ -216,21 +233,32 @@ fn post(
         detail = try headers.mask(alloc, detail, token);
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    const sent_secrets = try headers.secrets(alloc, token);
+    defer alloc.free(sent_secrets);
+    var result = consume(alloc, reader, request, watch.progress(), sent_secrets) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
     }
     // A reply that reports its own failure may quote a secret, as an error
-    // body may.
-    if (result == .failed and result.failed.ownership == .owned) {
-        if (result.failed.detail) |detail| {
-            result.failed.detail = null;
-            result.failed.detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+    // body may, whether it failed to stream or streamed its failure. The
+    // reader already masked the secrets before it cut the text; this also
+    // masks the forms a server may quote them in.
+    switch (result) {
+        .failed => |*failed| if (failed.ownership == .owned) if (failed.detail) |detail| {
+            failed.detail = null;
+            failed.detail = headers.mask(alloc, detail, token) catch |err| {
                 result.deinit(alloc);
                 return err;
             };
-        }
+        },
+        .completed => |*completed| if (completed.ownership == .owned) if (completed.completion.provider_failure_detail) |detail| {
+            completed.completion.provider_failure_detail = null;
+            completed.completion.provider_failure_detail = headers.mask(alloc, @constCast(detail), token) catch |err| {
+                result.deinit(alloc);
+                return err;
+            };
+        },
     }
     return result;
 }

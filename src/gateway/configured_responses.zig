@@ -176,10 +176,11 @@ fn selectTools(alloc: Allocator, request: stream_provider.RequestData) !Selected
 }
 
 /// Reads a successful streamed reply. The result owns the completion.
-pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: stream_provider.ModelRequest, progress: ?sse.Progress) !stream_provider.Result {
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: stream_provider.ModelRequest, progress: ?sse.Progress, secrets: []const []const u8) !stream_provider.Result {
     var events = request.events;
     var reducer = try responses_protocol.Reducer.init(alloc, .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages });
     defer reducer.deinit(alloc);
+    reducer.secrets = secrets;
     var lines: sse.Reader = .{ .max_event_bytes = max_event_bytes, .max_total_bytes = max_stream_bytes, .progress = progress };
     defer lines.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
@@ -439,7 +440,7 @@ fn test_consume_in(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvent
         .attempt_evidence = &evidence,
         .events = .{ .context = recorded, .emit_fn = RecordedEvents.emit },
         .cancel_flag = &cancel,
-    }, null);
+    }, null, &.{});
 }
 
 test "configured responses reads a real server's text reply with its cached and reasoning counts" {
