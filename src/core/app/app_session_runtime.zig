@@ -1884,8 +1884,13 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasDecl(App, "writeDomainNotice")) {
                 var notice_buf: [288]u8 = undefined;
-                const body = try formatRestoreNotice(&notice_buf, pending.texts.len, failed_images, pending.unreadable_ids.len);
-                try app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = body }, true);
+                if (formatRestoreNotice(&notice_buf, pending.texts.len, failed_images, pending.unreadable_ids.len)) |body| {
+                    app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = body }, true) catch |err| {
+                        debug_trace.logf("session", "event=restore_notice_failed err={s}", .{@errorName(err)});
+                    };
+                } else |err| {
+                    debug_trace.logf("session", "event=restore_notice_failed err={s}", .{@errorName(err)});
+                }
             }
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -14156,4 +14161,46 @@ test "eb03: restore result is held while recovering and applied on first poll af
     try std.testing.expect(!app.agent().session_persistence.pending_input_restore.isActive());
     try std.testing.expectEqualStrings("held until handoff", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(notices_before + 1, app.notices.items.len);
+}
+
+test "eb03: failed restore notice still withdraws accepted inputs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("withdraw despite failed notice");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+
+    app.fail_notice_substr = "was not delivered";
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("withdraw despite failed notice", app.input_runtime.edit_state.input.items);
+    var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
 }

@@ -2076,9 +2076,14 @@ fn notifyPendingAcceptedInputs(
     if (pending.ids.len == 0 and pending.unreadable_ids.len == 0) return;
 
     if (pending.ids.len > 0) {
-        const notice = try formatPendingInputsNotice(alloc, pending.texts);
-        defer alloc.free(notice);
-        try sendAgentHistoryChunk(state, alloc, session_id, notice);
+        if (formatPendingInputsNotice(alloc, pending.texts)) |notice| {
+            defer alloc.free(notice);
+            sendAgentHistoryChunk(state, alloc, session_id, notice) catch |err| {
+                debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(err)});
+            };
+        } else |err| {
+            debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(err)});
+        }
     }
 
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -3742,4 +3747,84 @@ test "eb03: ACP session/load and session/resume report pending accepted inputs o
         defer alloc.free(second_out);
         try std.testing.expect(std.mem.find(u8, second_out, "were not delivered:") == null);
     }
+}
+
+test "eb03: failed ACP restore notice still withdraws accepted inputs" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace_path);
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-init.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("withdraw despite acp notice error");
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    const FailingWriter = struct {
+        fn write(_: ?*anyopaque, _: []const u8) !void {
+            return error.BrokenPipe;
+        }
+    };
+    var sink: u8 = 0;
+    state.writer = jsonrpc.Writer.initCallback(&sink, FailingWriter.write);
+    const reopened = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, sid),
+        .v2 = reopened,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = workspace_path,
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer {
+        state.active_session.?.session_rt.deinit(alloc);
+        alloc.free(state.active_session.?.session_id);
+        alloc.free(state.active_session.?.model);
+        if (state.active_session.?.v2) |s| s.close();
+        state.active_session = null;
+    }
+
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    var remaining = try reopened.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
 }
