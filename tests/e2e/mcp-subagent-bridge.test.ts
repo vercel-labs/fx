@@ -5,7 +5,7 @@
 // tests/tla/drivers/mcp_host/subagent-access.test.ts runs the same scripts against the model.
 import { describe, expect, test } from "bun:test";
 import { FX_BIN } from "../evals/eval-helpers";
-import { LARGE_RESULT, LARGE_TOOL, LIST_CHANGE_RELEASE, OTHER_TOOL, SMALL_RESULT, SMALL_TOOL, runPaths, seen, shellStep, type PathsRun } from "./mcp-rules-paths";
+import { LARGE_RESULT, LARGE_TOOL, LIST_CHANGE_RELEASE, NOT_SET_VARIABLE, OTHER_TOOL, SMALL_RESULT, SMALL_TOOL, runPaths, seen, shellStep, type PathsRun } from "./mcp-rules-paths";
 
 /** What `fx mcp call` and `fx mcp call help` both say when fx has no MCP tool by that name for this agent. */
 const noSuchTool = (tool: string) => `No MCP tool named ${tool} is available to this agent. Find tool names with fx mcp call search.`;
@@ -113,6 +113,60 @@ describe("a subagent's fx mcp call", () => {
     expectRan(call(run, SMALL_TOOL), SMALL_RESULT);
     expect(run.fixtureCalls).toEqual(["echo"]);
   }, 240_000);
+
+  // A subagent's view is limited. A tool the rules hide, or one on a server outside its profile, is not there for it,
+  // so what that tool's server is doing (held, down, or waiting for a login) is none of its business: the same words
+  // as a tool that does not exist. The main agent's view is not limited, and it hears why, as `toolbox open` always has.
+  type Extra = Array<"keyed" | "locked">;
+  const SERVERS = [
+    { state: "down", server: "fixture", tool: SMALL_TOOL, extra: [] as Extra, down: true, why: "MCP server 'fixture' is unavailable: its process exited" },
+    { state: "held", server: "keyed", tool: "mcp_keyed_list", extra: ["keyed"] as Extra, down: false, why: `MCP server 'keyed' needs ${NOT_SET_VARIABLE} set before fx starts.` },
+    { state: "login", server: "locked", tool: "mcp_locked_list", extra: ["locked"] as Extra, down: false, why: "MCP server 'locked' needs a login. Ask the user to run fx mcp login locked in a terminal, then try again." },
+  ];
+  const commands = (tool: string) => [
+    shellStep("call", mcp(`${tool} '{}'`)),
+    shellStep("help", mcp(`help ${tool}`)),
+    { id: "open", name: "toolbox", args: { open: tool } },
+    { id: "open_unknown", name: "toolbox", args: { open: "mcp_nothing_here" } },
+  ];
+  for (const { state, server, tool, extra, down } of SERVERS) {
+    for (const hidden of ["denied by a rule", "outside the profile"] as const) {
+      test(`says nothing of a ${state} server's state to a subagent for a tool ${hidden}`, async () => {
+        const denied = hidden === "denied by a rule";
+        const view = ["fixture", "big", ...extra].filter((name) => denied || name !== server);
+        const run = await runPaths({
+          bin: FX_BIN, mode: "full", childMode: "auto", agent: "child", only: [], label: `hidden-${state}-${denied ? "rule" : "view"}`,
+          rules: denied ? { [tool]: "deny" } : {}, childServers: view, extraServers: extra, down, extra: commands(tool),
+        });
+        ok(run);
+        expectRefused(run.texts.call!, tool);
+        expect(run.texts.help).toContain("exit=1");
+        expect(run.texts.help).toContain(`fx mcp call: ${noSuchTool(tool)}`);
+        // `toolbox open` says what it says of a tool that does not exist at all.
+        expect(run.texts.open!.replaceAll(tool, "TOOL")).toBe(run.texts.open_unknown!.replaceAll("mcp_nothing_here", "TOOL"));
+        for (const text of [run.texts.call!, run.texts.help!, run.texts.open!]) {
+          for (const word of ["needs a login", "is unavailable", `needs ${NOT_SET_VARIABLE}`, "set before fx starts"]) expect(text).not.toContain(word);
+        }
+        expect(run.fixtureCalls).toEqual([]);
+      }, 240_000);
+    }
+  }
+
+  for (const { state, tool, extra, down, why } of SERVERS) {
+    test(`tells the main agent why a ${state} server's tool can't be used, though a rule hides the tool, as toolbox open always has`, async () => {
+      const run = await runPaths({
+        bin: FX_BIN, mode: "auto", agent: "main", only: [], label: `hidden-${state}-main`,
+        rules: { [tool]: "deny" }, extraServers: extra, down, extra: commands(tool),
+      });
+      ok(run);
+      expect(run.texts.call).toContain("exit=5");
+      expect(run.texts.call).toContain(`fx mcp call: ${tool} did not run. ${why}`);
+      expect(run.texts.help).toContain("exit=1");
+      expect(run.texts.help).toContain(`fx mcp call: ${why}`);
+      expect(run.texts.open).toContain(why);
+      expect(run.fixtureCalls).toEqual([]);
+    }, 240_000);
+  }
 
   test("runs a search and then a call in one shell command", async () => {
     const command = `{ ${mcp("search echo")} > search.txt 2>&1; ${mcp(`${SMALL_TOOL} '{"text":"hello"}'`)}; }`;
