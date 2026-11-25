@@ -8,6 +8,7 @@ const io_mod = @import("../../shared/io.zig");
 const credentials = @import("credentials.zig");
 const transport = @import("transport.zig");
 const stream = @import("stream.zig");
+const journal = @import("journal.zig");
 const reply = @import("reply.zig");
 const api = @import("api.zig");
 const attempt = @import("attempt.zig");
@@ -1272,6 +1273,44 @@ pub fn freshGeneration(ctx: *Context) Allocator.Error![]const u8 {
     return ctx.alloc.dupe(u8, &hex);
 }
 
+/// Keeps the newest `max_brought_entries` records and drops the oldest (V9). A dropped record
+/// only makes a later run keep that Mac file (N9).
+pub fn trimBrought(brought: *FileMap) void {
+    while (brought.count() > max_brought_entries) brought.orderedRemoveAt(0);
+}
+
+/// Applies one bring-back record to the manifest, the way the write did (V9): a tracked file's
+/// `files` record is replaced, and any other file goes to `brought`.
+pub fn applyBackRecord(alloc: Allocator, manifest: *Manifest, record: journal.Record) Allocator.Error!void {
+    const file_record: FileRecord = .{
+        .size = record.size,
+        .mtime_ns = record.mtime_ns,
+        .sha256 = try alloc.dupe(u8, record.sha256),
+    };
+    switch (record.kind) {
+        .files => try manifest.files.put(alloc, record.rel, file_record),
+        .brought => {
+            _ = manifest.brought.fetchOrderedRemove(record.rel);
+            try manifest.brought.put(alloc, record.rel, file_record);
+            trimBrought(&manifest.brought);
+        },
+    }
+}
+
+/// Folds a journal that a crash left into the manifest, then removes it (V9). It runs under the
+/// lock, before anything reads the manifest, so the next read sees every record the journal holds.
+pub fn foldJournal(ctx: *Context) Error!void {
+    const bytes = (readVerified(ctx.alloc, ctx.state_dir, journal.file_name, journal.max_bytes) catch |err| return refuseError(ctx, "journal", err)) orelse return;
+    const parsed = journal.parse(ctx.alloc, bytes) catch |err| switch (err) {
+        error.BadJournal => return refuse(ctx, "journal", 0, "the manifest journal could not be read"),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var manifest = try readManifest(ctx);
+    for (parsed.records) |record| try applyBackRecord(ctx.alloc, &manifest, record);
+    try commitManifest(ctx, &manifest);
+    journal.remove(ctx.state_dir) catch |err| return refuseError(ctx, "journal", err);
+}
+
 /// Reads a file of the state folder without following a link. A missing file is null.
 fn readVerified(alloc: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, max: usize) !?[]u8 {
     var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch |err| switch (err) {
@@ -2088,7 +2127,7 @@ fn fuzzStateFiles(_: void, smith: *std.testing.Smith) !void {
     const len = smith.slice(raw);
     if (len == 0) return;
     const body = raw[1..len];
-    switch (raw[0] % 3) {
+    switch (raw[0] % 4) {
         0 => {
             const state = parseState(arena, body) catch |err| return refusedOnly(err);
             try std.testing.expect(state.name.len > 0 and state.session_id.len > 0);
@@ -2100,6 +2139,18 @@ fn fuzzStateFiles(_: void, smith: *std.testing.Smith) !void {
             try std.testing.expectEqual(manifest.files.count(), again.files.count());
             try std.testing.expectEqual(manifest.brought.count(), again.brought.count());
             try std.testing.expectEqual(manifest.pending_back.len, again.pending_back.len);
+        },
+        3 => {
+            const parsed = journal.parse(arena, body) catch |err| switch (err) {
+                error.BadJournal => return,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            for (parsed.records) |record| {
+                const line = try journal.encodeLine(arena, record);
+                const again = try journal.parse(arena, line);
+                try std.testing.expectEqual(@as(usize, 1), again.records.len);
+                try std.testing.expectEqualStrings(record.rel, again.records[0].rel);
+            }
         },
         else => {
             const pending = parsePending(arena, body) catch |err| return refusedOnly(err);
@@ -2198,10 +2249,51 @@ test "a sandbox answer parses or is refused, and a parsed size and session id ar
     });
 }
 
-test "sandbox.json, manifest.json and a pending record parse or are refused, and a parsed manifest writes back to the same records, on fuzzed bytes" {
+test "sandbox.json, manifest.json, the journal and a pending record parse or are refused, and a parsed one writes back to the same records, on fuzzed bytes" {
     try std.testing.fuzz({}, fuzzStateFiles, .{
         .corpus = &@import("fuzz_corpus").vercel_state_files.*,
     });
+}
+
+test "a journal of three records and a torn fourth folds into the manifest at the next start, then is removed (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var buffer: [64]u8 = undefined;
+    const base = try baseFor(&buffer, 9);
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, base, &capture, &state_dir);
+
+    const sha_one = "1111111111111111" ++ "1111111111111111" ++ "1111111111111111" ++ "1111111111111111";
+    const sha_two = "2222222222222222" ++ "2222222222222222" ++ "2222222222222222" ++ "2222222222222222";
+    var manifest = emptyManifest();
+    manifest.generation = "generation-1";
+    try manifest.files.put(arena, "c.txt", .{ .size = 1, .mtime_ns = 1, .sha256 = "0000000000000000" ++ "0000000000000000" ++ "0000000000000000" ++ "0000000000000000" });
+    try commitManifest(&ctx, &manifest);
+
+    const records = [_]journal.Record{
+        .{ .kind = .brought, .rel = "a.txt", .size = 10, .mtime_ns = 11, .sha256 = sha_one },
+        .{ .kind = .brought, .rel = "b.txt", .size = 20, .mtime_ns = 21, .sha256 = sha_one },
+        .{ .kind = .files, .rel = "c.txt", .size = 30, .mtime_ns = 31, .sha256 = sha_two },
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    for (records) |record| try bytes.appendSlice(arena, try journal.encodeLine(arena, record));
+    try bytes.appendSlice(arena, "{\"k\":\"b\",\"p\":\"d.txt\",\"s\"");
+    try state_dir.dir.writeFile(io_mod.getIo(), .{ .sub_path = journal.file_name, .data = bytes.items });
+
+    try foldJournal(&ctx);
+
+    var folded = try readManifest(&ctx);
+    try std.testing.expectEqual(@as(usize, 2), folded.brought.count());
+    try std.testing.expectEqualStrings(sha_one, folded.brought.get("b.txt").?.sha256);
+    try std.testing.expectEqualStrings(sha_two, folded.files.get("c.txt").?.sha256);
+    try std.testing.expect(folded.brought.get("d.txt") == null);
+    try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io_mod.getIo(), journal.file_name, .{}));
 }
 
 test "a manifest without a generation writes back as one the reader accepts (V9)" {

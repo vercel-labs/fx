@@ -70,6 +70,7 @@ fn pushInner(ctx: *sandbox.Context, options: Options) sandbox.Error!Result {
         else => sandbox.refuseError(ctx, "lock", err),
     };
     defer lock.release();
+    try sandbox.foldJournal(ctx);
     removeChunk(ctx, chunk_name);
     config_write.removeStaleTemps(ctx.state_dir, sandbox.manifest_temp_prefix, @divFloor(io_mod.milliTimestamp(), 1000));
     var session = try sandbox.establish(ctx);

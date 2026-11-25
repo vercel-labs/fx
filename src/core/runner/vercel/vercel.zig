@@ -102,6 +102,7 @@ test {
     _ = sandbox;
     _ = attempt;
     _ = sync;
+    _ = @import("journal.zig");
     _ = exec;
     _ = bring_back;
     _ = isolated;

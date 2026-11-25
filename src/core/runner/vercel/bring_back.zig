@@ -10,6 +10,7 @@ const display_width = @import("../../shared/display_width.zig");
 const exec = @import("exec.zig");
 const io_mod = @import("../../shared/io.zig");
 const credentials = @import("credentials.zig");
+const journal = @import("journal.zig");
 const sandbox = @import("sandbox.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const stream = @import("stream.zig");
@@ -296,6 +297,7 @@ pub fn run(arena: Allocator, ctx: *sandbox.Context, session_id: []const u8, inpu
     } };
     defer lock.release();
 
+    sandbox.foldJournal(ctx) catch return .{ .failed = "the manifest journal could not be folded" };
     var manifest = sandbox.readManifest(ctx) catch return .{ .failed = "the manifest could not be read" };
     if (manifest.generation == null) return .{ .failed = "the sandbox has no generation" };
     var root = io_mod.openDirAbsoluteNoFollow(ctx.repo_root, .{ .iterate = true }) catch return .{ .failed = "the repository folder could not be opened" };
@@ -341,7 +343,7 @@ pub fn run(arena: Allocator, ctx: *sandbox.Context, session_id: []const u8, inpu
         sandbox.removePending(ctx, entry.run_id) catch return .{ .failed = "the pending runs could not be removed" };
     }
     manifest.pending_back = pending.names;
-    sandbox.commitManifest(ctx, &manifest) catch return .{ .failed = "the manifest could not be written" };
+    apply.finish() catch return .{ .failed = "the manifest could not be written" };
     return .{ .done = .{ .counts = counts, .pending = pending.names } };
 }
 
@@ -587,12 +589,6 @@ fn underRoot(roots: []const []const u8, rel: []const u8) bool {
         if (rel.len > root.len and std.mem.startsWith(u8, rel, root) and rel[root.len] == '/') return true;
     }
     return false;
-}
-
-/// Keeps the newest `sandbox.max_brought_entries` records and drops the oldest (V9). A dropped
-/// record only makes a later run keep that Mac file (N9).
-pub fn trimBrought(brought: *sandbox.FileMap) void {
-    while (brought.count() > sandbox.max_brought_entries) brought.orderedRemoveAt(0);
 }
 
 /// A run that ends without a bring-back leaves a pending record (V9). A stop or an unknown result
@@ -1027,6 +1023,7 @@ const Apply = struct {
     seen: std.array_hash_map.String(void) = .empty,
     max_files: usize,
     max_bytes: u64,
+    manifest_writes: usize = 0,
     written_files: usize = 0,
     written_bytes: u64 = 0,
 
@@ -1179,28 +1176,28 @@ const Apply = struct {
         return map.get(rel);
     }
 
-    /// A written file updates `brought`, and a tracked file's record too. The manifest is saved
-    /// under the lock after each write (V9).
+    /// Records a written file before the next one is written (V9). The record goes to the manifest
+    /// in memory, and to the journal under the lock, fsynced. The manifest is rewritten once, in finish.
     fn recordWritten(self: *Apply, rel: []const u8, parent: std.Io.Dir, base: []const u8, size: u64, sha: []const u8) !void {
         const stat = try parent.statFile(io_mod.getIo(), base, .{ .follow_symlinks = false });
-        const record: sandbox.FileRecord = .{
+        const record: journal.Record = .{
+            .kind = if (self.manifest.files.contains(rel)) .files else .brought,
+            .rel = rel,
             .size = size,
             .mtime_ns = sync.mtimeNs(stat),
-            .sha256 = try self.arena.dupe(u8, sha),
+            .sha256 = sha,
         };
-        if (self.manifest.files.getPtr(rel)) |found| {
-            found.* = record;
-        } else {
-            _ = self.manifest.brought.fetchOrderedRemove(rel);
-            try self.manifest.brought.put(self.arena, rel, record);
-            trimBrought(&self.manifest.brought);
-        }
-        try self.commit();
+        try sandbox.applyBackRecord(self.arena, self.manifest, record);
+        if (self.ctx) |ctx| try journal.append(self.arena, ctx.state_dir, record);
     }
 
-    fn commit(self: *Apply) !void {
+    /// Writes the manifest once, from the records this bring-back applied (V9), then removes the
+    /// journal they were in. If the write fails, the journal stays for the next run's fold.
+    fn finish(self: *Apply) !void {
+        self.manifest_writes += 1;
         const ctx = self.ctx orelse return;
         try sandbox.commitManifest(ctx, self.manifest);
+        try journal.remove(ctx.state_dir);
     }
 
     fn tempName(self: *Apply) ![]const u8 {
@@ -1621,6 +1618,58 @@ test "the write rules write, keep, drop and refuse each file (V9)" {
     try testing.expectEqual(@as(usize, 0), overflow.items.len);
 }
 
+test "fifty files written by one bring-back rewrite the manifest once, at its end (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const entries = try arena.alloc(TestEntry, 50);
+    for (entries, 0..) |*entry, index| {
+        entry.* = .{ .name = try std.fmt.allocPrint(arena, "batch/file-{d:0>2}.txt", .{index}), .data = "fresh" };
+    }
+    const archive = try buildArchive(arena, entries);
+    var manifest = try testManifest(arena, &.{});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    var input: std.Io.Reader = .fixed(archive);
+    try applyArchive(&input, &apply);
+
+    try testing.expectEqual(@as(usize, 50), counts.written);
+    try testing.expectEqual(@as(usize, 0), apply.manifest_writes);
+    try apply.finish();
+    try testing.expectEqual(@as(usize, 1), apply.manifest_writes);
+}
+
+test "a file written but never journaled counts as changed on this machine when the Mac copy then differs (N9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+
+    // The bring-back wrote "written" and crashed before its journal line. The Mac copy changed after that.
+    try tmp.dir.writeFile(io, .{ .sub_path = "unjournaled.txt", .data = "mac-edit" });
+    var manifest = try testManifest(arena, &.{});
+    const archive = try buildArchive(arena, &.{.{ .name = "unjournaled.txt", .data = "written" }});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    var input: std.Io.Reader = .fixed(archive);
+    try applyArchive(&input, &apply);
+
+    try testing.expectEqualStrings("mac-edit", try readBack(arena, tmp.dir, "unjournaled.txt"));
+    try testing.expectEqual(@as(usize, 1), counts.kept);
+    try testing.expectEqual(@as(usize, 0), counts.written);
+}
+
 test "an untracked file the bring-back wrote is written again only while the Mac still matches it (V9)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1757,7 +1806,7 @@ test "brought keeps the newest 20,000 records and drops the oldest first (V9)" {
         const rel = try arena.print("out/{d}", .{index});
         try map.put(arena, rel, .{ .size = 1, .mtime_ns = 1, .sha256 = &sha });
     }
-    trimBrought(&map);
+    sandbox.trimBrought(&map);
     try testing.expectEqual(sandbox.max_brought_entries, map.count());
     try testing.expectEqualStrings("out/3", map.keys()[0]);
 }

@@ -101,7 +101,7 @@
     {"name": "vercel_auth_json", "module": "fx", "test": "auth.json parses to one of three results, and a token equals its JSON string, on fuzzed bytes", "iterations": 300000},
     {"name": "vercel_setup_reply", "module": "fx", "test": "a setup API reply parses or is refused, and a parsed id is non-empty and bounded, on fuzzed bytes", "iterations": 300000},
     {"name": "vercel_sandbox_answer", "module": "fx", "test": "a sandbox answer parses or is refused, and a parsed size and session id are bounded, on fuzzed bytes", "iterations": 200000},
-    {"name": "vercel_state_files", "module": "fx", "test": "sandbox.json, manifest.json and a pending record parse or are refused, and a parsed manifest writes back to the same records, on fuzzed bytes", "iterations": 200000},
+    {"name": "vercel_state_files", "module": "fx", "test": "sandbox.json, manifest.json, the journal and a pending record parse or are refused, and a parsed one writes back to the same records, on fuzzed bytes", "iterations": 200000},
     {"name": "vercel_list_page", "module": "fx", "test": "a sandbox list page parses or is refused, and a parsed page has bounded names and a non-empty cursor, on fuzzed bytes", "iterations": 200000},
     {"name": "vercel_exec_line", "module": "fx", "test": "a command stream line parses or is refused, and a parsed line has a known stream or a non-empty id, on fuzzed bytes", "iterations": 200000},
     {"name": "vercel_back_archive", "module": "fx", "test": "the bring-back archive decodes and writes only files whose names pass the path rules, on fuzzed bytes", "iterations": 100000},

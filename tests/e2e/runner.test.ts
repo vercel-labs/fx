@@ -3003,17 +3003,24 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
 
   test("10,000 pending names of about 300 bytes travel as data, and the next run brings back 2,000 of them (V9)", async () => {
     const repo = makeRepo("pending-names");
-    const folder = "n".repeat(140);
-    const first = await runRemote(repo, `mkdir -p "big/${folder}/${folder}" && for i in $(seq 1 12000); do : > "big/${folder}/${folder}/f$i"; done`);
-    expect(first.code).toBe(0);
-    expect(first.stderr).toBe(`fx: 10000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
-    const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
-    expect(manifest.pending_back).toHaveLength(10_000);
-    expect(manifest.pending_back[0]!.length).toBeGreaterThan(280);
-    const second = await runRemote(repo, "true");
-    expect(second.code).toBe(0);
-    expect(readdirSync(join(repo, "big", folder, folder))).toHaveLength(4000);
-    expect(second.stderr).toBe(`fx: 8000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
+    try {
+      const folder = "n".repeat(140);
+      const first = await runRemote(repo, `mkdir -p "big/${folder}/${folder}" && for i in $(seq 1 12000); do : > "big/${folder}/${folder}/f$i"; done`);
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe(`fx: 10000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
+      const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
+      expect(manifest.pending_back).toHaveLength(10_000);
+      expect(manifest.pending_back[0]!.length).toBeGreaterThan(280);
+      const second = await runRemote(repo, "true");
+      expect(second.code).toBe(0);
+      expect(readdirSync(join(repo, "big", folder, folder))).toHaveLength(4000);
+      expect(second.stderr).toBe(`fx: 8000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
+    } finally {
+      // The 16,000 files of this test are removed inside the test, under its own timeout. Left to the
+      // describe's afterAll, their removal took 5.7 s on CI, past Bun's 5 s hook timeout.
+      rmSync(runner.api.remotePath(repo), { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
+    }
   }, TIMEOUT * 8);
 
   test("a pending name whose folder became a link in the sandbox brings back nothing from outside the repository (V9)", async () => {

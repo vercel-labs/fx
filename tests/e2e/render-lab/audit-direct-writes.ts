@@ -58,6 +58,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/terminal/native_session.zig", "(?:acceptMarker|runLauncher)", /fixed_descriptor/, "subprocess_protocol_transport", "private native launcher PTY and control descriptors"),
   rule("src/core/shared/darwin_process_spawn.zig", "process_spawn_inheriting_fd", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio and witness file-action mapping"),
   rule("src/core/app/app_entry_runtime.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "post-terminal handoff or failure output"),
+  rule("src/core/runner/runner_main.zig", "runBuiltin", /stdio_acquisition/, "noninteractive_output", "built-in runner output: its stdout and stderr are pipes the calling fx reads"),
   rule("src/core/upgrade/upgrade_runtime.zig", "progressWait", /stdio_(?:acquisition|write)/, "noninteractive_output", "upgrade progress output"),
   rule("src/core/cli/cli_ask.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "workflow CLI output"),
   rule("src/core/cli/cli_ask.zig", "realStdoutIsTty", /stdio_acquisition/, "terminal_probe", "ask presentation TTY capability probe"),
@@ -84,6 +85,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/session/session_adapter.zig", "expectLines", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/workspace/turn_capture.zig", "runGit", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/shared/self_exe.zig", "requireInstalledForTest", /debug_print/, "tests", "test diagnostics: the build message runs only in test builds"),
 ];
 
 function rule(
