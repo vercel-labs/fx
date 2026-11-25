@@ -3333,8 +3333,8 @@ test "doctor's MCP rows say what doctor found for each server it checked" {
 
 test "core permissions snapshot text and json stay stable" {
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("write_file"), .target_path = @constCast("/tmp/workspace/src/app.zig") },
-        .{ .tool_name = @constCast("run_command"), .target_path = @constCast("/tmp/workspace::npm test") },
+        .{ .tool_name = @constCast("write_file"), .target_path = @constCast("/tmp/workspace/src/app.zig"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("run_command"), .target_path = @constCast("/tmp/workspace::npm test"), .shell_epoch = 0 },
     };
     const rules = [_]types.PermissionRule{
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .allow },

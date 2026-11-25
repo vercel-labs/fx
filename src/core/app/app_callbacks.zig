@@ -3048,7 +3048,7 @@ test "worker bridge deps forward UI operations" {
         .turn_duration_ms = 130_000,
         .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
     } });
-    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") });
+    try deps.session_grant(deps.ctx, .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a"), .shell_epoch = 0 });
     try deps.error_text(deps.ctx, .{
         .topic = "system",
         .tone = .@"error",

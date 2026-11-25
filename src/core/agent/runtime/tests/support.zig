@@ -1602,6 +1602,7 @@ pub const FakeAgentRuntimeDeps = struct {
             self.last_execute_grants.clearRetainingCapacity();
             for (request.session_grants) |grant| {
                 try self.last_execute_grants.append(self.alloc, .{
+                    .shell_epoch = grant.shell_epoch,
                     .tool_name = try self.alloc.dupe(u8, grant.tool_name),
                     .target_path = try self.alloc.dupe(u8, grant.target_path),
                 });
@@ -2253,6 +2254,7 @@ fn freeStringList(alloc: Allocator, list: *std.ArrayList([]u8)) void {
 
 fn appendGrant(alloc: Allocator, list: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
     try list.append(alloc, .{
+        .shell_epoch = grant.shell_epoch,
         .tool_name = try alloc.dupe(u8, grant.tool_name),
         .target_path = try alloc.dupe(u8, grant.target_path),
     });

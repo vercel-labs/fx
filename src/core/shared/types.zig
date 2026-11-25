@@ -3125,7 +3125,7 @@ pub const PermissionGrant = struct {
     target_path: []u8,
     /// The shell approval epoch a bash grant was made under. It matches only
     /// while the shell owner is still in that epoch; other grants ignore it.
-    shell_epoch: u64 = 0,
+    shell_epoch: u64,
 };
 
 pub const PermissionAction = enum {
@@ -4583,6 +4583,7 @@ test "Permission helpers duplicate and free grants rules and rule sets" {
     const alloc = std.testing.allocator;
 
     const grants = [_]PermissionGrant{.{
+        .shell_epoch = 0,
         .tool_name = @constCast("run_command"),
         .target_path = @constCast("/tmp/workspace"),
     }};

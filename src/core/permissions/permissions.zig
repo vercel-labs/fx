@@ -2057,8 +2057,8 @@ test "permissionDecisionFromIndex maps approval choices" {
 
 test "isToolAllowed remains exact match only" {
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/*") },
-        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git *") },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/*"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git *"), .shell_epoch = 0 },
     };
 
     try std.testing.expect(isToolAllowed(&grants, "edit", "/tmp/workspace/*"));
@@ -2073,9 +2073,9 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status") },
-        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*") },
-        .{ .tool_name = @constCast("skill"), .target_path = @constCast("vercel-*") },
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("skill"), .target_path = @constCast("vercel-*"), .shell_epoch = 0 },
     };
 
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::git status"));
@@ -2090,7 +2090,7 @@ test "session command grants treat wildcard bytes literally" {
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'"), .shell_epoch = 0 },
     };
 
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", "/tmp/workspace::printf '*?'"));
@@ -2173,7 +2173,7 @@ test "web_search session grant authorizes subsequent query" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("web_search"), .target_path = @constCast("web_search") },
+        .{ .tool_name = @constCast("web_search"), .target_path = @constCast("web_search"), .shell_epoch = 0 },
     };
 
     const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
@@ -2652,7 +2652,7 @@ test "web_fetch exact matcher never calls generic url wildcard matcher" {
 
 test "web_fetch grants do not authorize other tools" {
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com") },
+        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com"), .shell_epoch = 0 },
     };
 
     try std.testing.expect(sessionGrantAllowed(&grants, "web_fetch", "domain:example.com"));
@@ -3146,6 +3146,7 @@ test "structured file grant offer rejects wildcard-bearing literal roots" {
 
 test "generic session matcher retains wildcard tree semantics" {
     const grants = [_]types.PermissionGrant{.{
+        .shell_epoch = 0,
         .tool_name = @constCast("edit"),
         .target_path = @constCast("/tmp/workspace*literal/**"),
     }};
@@ -3161,6 +3162,7 @@ test "formatPermissionsStatus adapts core grants and rules without taking field 
     const alloc = std.testing.allocator;
 
     var grants = [_]types.PermissionGrant{.{
+        .shell_epoch = 0,
         .tool_name = try alloc.dupe(u8, "edit"),
         .target_path = try alloc.dupe(u8, "/tmp/workspace/src/main.zig"),
     }};
@@ -3398,6 +3400,7 @@ test "file target evaluator scans intermediate deny before grants" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("existing/a"), .action = .deny },
     };
     const grants = [_]types.PermissionGrant{.{
+        .shell_epoch = 0,
         .tool_name = @constCast("edit"),
         .target_path = @constCast("/**"),
     }};
@@ -3484,6 +3487,7 @@ test "file target evaluator binds external parent and grant state" {
     defer alloc.free(external);
     const target = try std.Io.Dir.path.join(arena, &.{ external, "file.txt" });
     const grants = [_]types.PermissionGrant{.{
+        .shell_epoch = 0,
         .tool_name = @constCast("edit"),
         .target_path = @constCast("/**"),
     }};
@@ -3596,7 +3600,7 @@ test "a shell refresh resets remembered command grants only" {
     const command = "@fx-terminal-env:user:8:/bin/zsh::npm test";
     var grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast(command), .shell_epoch = owner.approvalEpoch() },
-        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/**") },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/**"), .shell_epoch = 0 },
     };
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));

@@ -5653,7 +5653,7 @@ test "web_fetch exact session grant authorizes only matching canonical domain" {
     const arena = arena_state.allocator();
 
     const grants = [_]PermissionGrant{
-        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com") },
+        .{ .tool_name = @constCast("web_fetch"), .target_path = @constCast("domain:example.com"), .shell_epoch = 0 },
     };
     var ask_rules = [_]types.PermissionRule{
         .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .ask },
@@ -7908,7 +7908,7 @@ test "a session grant for skill authorizes a toolbox open of that skill" {
     defer rt.deinit(alloc);
 
     const grants = [_]PermissionGrant{
-        .{ .tool_name = @constCast("skill"), .target_path = @constCast("workflow") },
+        .{ .tool_name = @constCast("skill"), .target_path = @constCast("workflow"), .shell_epoch = 0 },
     };
 
     const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena_state.allocator(), .{
@@ -9089,8 +9089,8 @@ const mcp_call_wire = @import("../mcp_host/mcp_call_wire.zig");
 
 test "a command's fx mcp call is checked against the approvals its tool call began with" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
-    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
-    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other") }};
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo"), .shell_epoch = 0 }};
+    const other = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_other"), .target_path = @constCast("mcp_fixture_other"), .shell_epoch = 0 }};
     var counting = McpFixture.CountingContext{};
     var rt = TestRuntime{
         .tool_registry = bridge_test_registry,
@@ -9129,7 +9129,7 @@ test "a command's fx mcp call is checked against the approvals its tool call beg
 
 test "in auto mode a command's fx mcp call skips the safety check for the approved tool only" {
     if (comptime !mcp_call_capability.supported) return error.SkipZigTest;
-    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo") }};
+    const echo = [_]PermissionGrant{.{ .tool_name = @constCast("mcp_fixture_echo"), .target_path = @constCast("mcp_fixture_echo"), .shell_epoch = 0 }};
     var counting = McpFixture.CountingContext{};
     var reviewer = TestAutoReview{};
     var rt = TestRuntime{

@@ -1700,6 +1700,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (targets.items, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
+                    .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(permission_name),
@@ -1723,6 +1724,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (vision_authority.targets, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
+                    .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(call.name),
@@ -4195,6 +4197,56 @@ test "exact command approval remains valid across live authority revalidation" {
         command_environment.commandFromPermissionIdentity(grants[0].target_path),
     );
     try std.testing.expect(sessionGrantsAllowAll(grants, "bash", targets.items) != null);
+}
+
+test "exact command approval records the shell epoch it was made under" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const call: ToolCall = .{
+        .id = "exact-command-epoch",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary);
+
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
+}
+
+test "vision approval grants record the shell epoch they were made under" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const targets = [_]command_admission.VisionPathExecutionTarget{.{
+        .canonical_path = "/tmp/workspace/shot.png",
+        .identity = std.mem.zeroes(file_mutation_contract.FileIdentity),
+    }};
+    const call: ToolCall = .{ .id = "vision-epoch", .name = "vision", .arguments_json = "{}" };
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .{ .vision_paths = .{ .targets = &targets } });
+
+    try std.testing.expectEqual(@as(usize, 1), grants.len);
+    try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
 }
 
 const test_review_tool_calls = [_]ToolCall{

@@ -193,6 +193,7 @@ pub fn Runtime(comptime App: type) type {
             for (live, merged[own.len..]) |grant, *slot| slot.* = .{
                 .tool_name = try arena.dupe(u8, grant.tool_name),
                 .target_path = try arena.dupe(u8, grant.target_path),
+                .shell_epoch = grant.shell_epoch,
             };
             return merged;
         }

@@ -28,6 +28,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -2457,8 +2458,8 @@ test "a merge of approvals makes one copy of the instance's list: a slice and tw
     var app = try FakeApp.init(std.testing.allocator);
     defer app.deinit();
     const own = [_]PermissionGrant{
-        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a") },
-        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/b") },
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/a"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/b"), .shell_epoch = 0 },
     };
     var held: usize = 0;
     for ([_]usize{ 1, 20, 200 }) |count| {
@@ -2534,7 +2535,7 @@ test "the request an execution runs under holds the call's approvals, then the i
     var app = try FakeApp.init(alloc);
     defer app.deinit();
     try app.permission_engine.allow(alloc, "skill", "granted", 0);
-    var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own"), .shell_epoch = 0 }};
     const request: agent_runtime.ToolExecutionRequest = .{
         .call_allocator = alloc,
         .result_allocator = alloc,
@@ -2603,7 +2604,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     var copy_arena = std.heap.ArenaAllocator.init(alloc);
     defer copy_arena.deinit();
     // A check reads the turn's own approvals, then a copy of the instance's.
-    var own = [_]PermissionGrant{.{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/own") }};
+    var own = [_]PermissionGrant{.{ .tool_name = @constCast("read_file"), .target_path = @constCast("/tmp/own"), .shell_epoch = 0 }};
     const merged = Runtime(FakeApp).mergeLiveGrants(&app, app.agent(), copy_arena.allocator(), &own);
     try std.testing.expectEqual(@as(usize, 2), merged.len);
     try std.testing.expectEqualStrings("read_file", merged[0].tool_name);
@@ -3700,6 +3701,7 @@ test "subagent tool context uses immutable admission authority" {
         .action = .allow,
     }};
     const admission_grants = [_]types.PermissionGrant{.{
+        .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
         .tool_name = @constCast("run_command"),
         .target_path = @constCast("/tmp/workspace::zig build"),
     }};

@@ -6074,8 +6074,8 @@ test "trace permissions and MCP servers become records with errors masked" {
         .{ .name = "env", .state = .missing_env, .transport = .stdio, .tools = 0, .signed_in = false, .needs_login = false, .missing = "API_TOKEN" },
     } };
     const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*") },
-        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build") },
+        .{ .tool_name = @constCast("exa_search"), .target_path = @constCast("*"), .shell_epoch = 0 },
+        .{ .tool_name = @constCast("shell"), .target_path = @constCast("zig build"), .shell_epoch = 0 },
     };
     const w = try TestWriter.create();
     defer w.destroy();

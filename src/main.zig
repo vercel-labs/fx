@@ -8442,7 +8442,7 @@ test "main's check reads the approvals its instance holds when it checks, and no
 
     // The turn began, or the prompt was queued, before the approval, so its own
     // list has none of it.
-    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
+    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own"), .shell_epoch = 0 }};
     try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
     try Worker.propagateGrant(app, &child.agent, "skill", "granted", 0);
 
@@ -8458,6 +8458,31 @@ test "main's check reads the approvals its instance holds when it checks, and no
     const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
     try std.testing.expectEqual(own.len, second_grants.len);
     try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
+}
+
+test "a subagent's shell grant made after a shell refresh stays live in main's check" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const Worker = app_worker_runtime.Runtime(App);
+    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const child = try addTestChildAgent(app, "child-1");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Merge = App.AgentAppRuntime;
+
+    const owner = shell_snapshot.processOwner();
+    owner.markDirty(.user_reload);
+    const epoch = owner.approvalEpoch();
+    try std.testing.expectEqual(@as(u64, 1), epoch);
+    try Worker.propagateGrant(app, &child.agent, "bash", "echo x", epoch);
+
+    const own: []const types.PermissionGrant = &.{};
+    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, own);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }
 
 test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
@@ -8521,7 +8546,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                 _ = arena.reset(.retain_capacity);
                 const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
                 _ = ctx;
-                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
+                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own"), .shell_epoch = 0 }};
                 self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
             }
         }

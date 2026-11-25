@@ -7413,6 +7413,7 @@ test "child live authority refresh denies the next tool action before execution"
         const allowed_tools = [_][]const u8{"read_file"};
         const integrations = [_][]const u8{"mcp_fixture"};
         var grants = [_]PermissionGrant{.{
+            .shell_epoch = 0,
             .tool_name = @constCast("read_file"),
             .target_path = @constCast("/tmp/workspace/first"),
         }};

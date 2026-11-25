@@ -212,6 +212,7 @@ test "Decision deinit frees owned grant suggestions" {
     errdefer alloc.free(target_path);
 
     grants[0] = .{
+        .shell_epoch = 0,
         .tool_name = tool_name,
         .target_path = target_path,
     };
