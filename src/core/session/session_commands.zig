@@ -1164,7 +1164,11 @@ pub fn Commands(comptime App: type) type {
             // A view that changed a waiting subagent's model continues that
             // subagent's request with it, as its picker would on its own
             // screen (`tests/tla/subagent/ViewWaits.tla` ActionReachesOwner).
-            if (target != agents.screenAgentOf(app)) target.worker.requestRecoveryContinue();
+            // The file's own way of probing a worker member a test fake may
+            // lack (`:402` does it for the session): the real worker has it.
+            if (comptime @hasDecl(@TypeOf(target.worker), "requestRecoveryContinue")) {
+                if (target != agents.screenAgentOf(app)) target.worker.requestRecoveryContinue();
+            }
             clearModelChoiceTarget(app);
         }
 

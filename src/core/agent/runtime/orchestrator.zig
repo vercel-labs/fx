@@ -9714,15 +9714,14 @@ fn processQueuedPromptLoop(
                             // person's choice continues this request with the
                             // new model, as "retry" does
                             // (`tests/tla/subagent/ViewWaits.tla`
-                            // ActionReachesOwner). Closing the picker without a
-                            // choice ends the turn as before.
+                            // ModelChosen, ActionReachesOwner). Closing the
+                            // picker without a choice leaves the wait open and
+                            // the card comes back; only a cancel ends the turn.
                             if (config.origin != .root) {
                                 if (try request_recovery.waitForSend() != null) {
-                                    // The person chose this subagent's model in
-                                    // the picker that wait opened, so this
-                                    // request continues on it
-                                    // (`tests/tla/subagent/ViewWaits.tla`
-                                    // ActionReachesOwner).
+                                    // The person chose this subagent's model
+                                    // in the picker that wait opened, so this
+                                    // request continues on it.
                                     if (deps.current_selection) |current| {
                                         if (current(deps.ctx)) |selection| {
                                             job.provider = selection.provider;

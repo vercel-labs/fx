@@ -293,6 +293,8 @@ TuiParentApproval tui-approval-simulate-nonideal simulate -simulate num=20000 -d
 #     view-only         the child's own screen cannot act  OwnScreenActable
 #     row-as-wait       the view shows a status row that outlived its wait
 #                                                   ShownOnlyWhileWaiting
+#     lend-under-picker a view lends the card under the picker it opened
+#                                                    CardYieldsToPicker
 #   The simulate pair runs under ideal and non-ideal conditions.
 #
 #   view-waits-chart is the same design with one child in each tree, small enough
@@ -313,6 +315,7 @@ ViewWaits view-waits-mutant-note-content NoSecretToModel
 ViewWaits view-waits-mutant-main-answers MainOnlyTellsOrStops
 ViewWaits view-waits-mutant-view-only OwnScreenActable
 ViewWaits view-waits-mutant-row-as-wait ShownOnlyWhileWaiting
+ViewWaits view-waits-mutant-lend-under-picker CardYieldsToPicker
 ViewWaits view-waits-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 ViewWaits view-waits-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

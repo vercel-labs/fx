@@ -9511,6 +9511,100 @@ test "wait card: the picker the subagent's own answer opened keeps the card back
     try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
 }
 
+test "wait card: a view's picker for one subagent lends no other item" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    const later = try addTestChildAgent(&app, "later-id");
+    later.name = try alloc.dupe(u8, "later");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent, &later.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    testLiveWait(&app, later, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The view's picker for the older item is its one modal: the newer item's
+    // card is not lent beside it (`tests/tla/subagent/ViewWaits.tla`
+    // OneAtATime).
+    try app.openModelPickerFor(&payer.agent);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+}
+
+test "wait card: the view lends the oldest item again once the picker closes" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    const later = try addTestChildAgent(&app, "later-id");
+    later.name = try alloc.dupe(u8, "later");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent, &later.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.quota, "Out of credits \u{b7} press Esc to end this turn"));
+    testLiveWait(&app, later, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+
+    // The older item's card is the view's one item.
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+
+    // A picker opens for the newer item: the card the view holds goes back,
+    // because the picker is its one modal.
+    try app.openModelPickerFor(&later.agent);
+    App.AgentsAppRuntime.settleLentWaitCard(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+
+    // Closed without a choice: the oldest item is lent again.
+    app.input_runtime.picker.dismissInlinePicker(.model);
+    App.AgentsAppRuntime.settleModelChoiceTarget(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == payer);
+    try std.testing.expectEqualStrings("payer", app.main_agent.wait_card_prompt.nameText());
+}
+
+test "wait card: a finished turn's row shows no card, and the footer names it" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const payer = try addTestChildAgent(&app, "payer-id");
+    payer.name = try alloc.dupe(u8, "payer");
+    defer for ([_]*agents.Agent{ &app.main_agent, &payer.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    testLiveWait(&app, payer, testWaitStatus(.rejected, "The provider rejected this request \u{b7} press Esc"));
+    // The turn ends and leaves the recovery's row behind. The live-wait guard
+    // keeps the card away, and the footer still names the subagent, so the
+    // person is never told nothing.
+    payer.agent.worker.worker_processing = false;
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.wait_card_lender == null);
+    try std.testing.expect(!app.main_agent.wait_card_prompt.isActive());
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("payer needs you", app.hiddenAgentWaitingNote(&buf));
+}
+
 test "wait card: the alternate screen holds the card back until it closes" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });

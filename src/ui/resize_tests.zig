@@ -5,6 +5,7 @@ const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const question_prompt = @import("../core/agent/question_prompt.zig");
+const wait_card = @import("../core/agent/wait_card.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -3594,6 +3595,85 @@ test "question modal replays displaced transcript rows into history" {
     );
     try expectGridContains(&h, "question context 24");
     try expectGridContains(&h, "How should the inspection proceed?");
+}
+
+/// The wait a subagent's failed request leaves, as the view's card copies it.
+fn testWaitCardStatus(need: @FieldType(types.RouteRecoveryStatus, "need"), comptime text: []const u8) types.RouteRecoveryStatus {
+    var status: types.RouteRecoveryStatus = .{ .kind = .need_user, .need = need };
+    @memcpy(status.text.bytes[0..text.len], text);
+    status.text.len = text.len;
+    return status;
+}
+
+// A card lent while main's turn is still writing takes the footer block the
+// question panel takes, and main's next report rows must not push it out of
+// the pane: the person answers it from the view they are on.
+test "a lent wait card stays in the visible pane while main's turn streams" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 120, 40, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var card: wait_card.WaitCardPrompt = .{};
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    var ctx = defaultFooterContext(&input);
+    ctx.stream = .{ .active = true, .turn_started_ms = 1 };
+
+    // Main's turn has filled the pane with its report.
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "report context 01\nreport context 02\nreport context 03\n" ++
+            "report context 04\nreport context 05\nreport context 06\n" ++
+            "report context 07\nreport context 08\nreport context 09\n" ++
+            "report context 10\nreport context 11\nreport context 12\n" ++
+            "report context 13\nreport context 14\nreport context 15\n" ++
+            "report context 16\nreport context 17\nreport context 18\n" ++
+            "report context 19\nreport context 20\nreport context 21\n" ++
+            "report context 22\nreport context 23\nreport context 24\n" ++
+            "report context 25\nreport context 26\nreport context 27\n" ++
+            "report context 28\nreport context 29\nreport context 30\n",
+    );
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    // ship's request was rejected, so the card is lent mid-turn.
+    _ = card.sync(
+        1,
+        testWaitCardStatus(.rejected, "The provider rejected this request \u{b7} press Esc"),
+        "ship",
+    );
+    ctx.wait_card = &card;
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+    try expectGridContains(&h, "Open ship's screen");
+
+    // Main's turn keeps taking in its reports under the card.
+    _ = try h.shell.streamAssistantChunk(
+        alloc,
+        &h.metrics,
+        "report noted 1\nship failure noted\ncards done\nreport tail 04\n" ++
+            "report tail 05\nreport tail 06\nreport tail 07\n" ++
+            "report tail 08\nreport tail 09\nreport tail 10\n" ++
+            "report tail 11\nreport tail 12\n",
+    );
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    try expectGridContains(&h, "The provider rejected this request");
+    try expectGridContains(&h, "Open ship's screen");
+    try expectGridContains(&h, "\u{2191}\u{2193} choose");
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
 }
 
 test "resized question cancellation keeps the footer in place through a repaint and the first edit" {

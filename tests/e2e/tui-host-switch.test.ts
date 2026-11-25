@@ -5719,9 +5719,10 @@ describe("a subagent's wait shows in the view the person is on", () => {
             expect(card).not.toContain("signer needs you");
             await session.sendKeys(cardDigit(card, "Sign in"));
             // The sign-in starts for the subagent and never submits main's
-            // draft. The sign-in picker may take the composer's line; what it
-            // must not do is send it.
-            await Bun.sleep(2000);
+            // draft. Its failure notice is fx's own record that the sign-in
+            // ran, in its own order; the picker may take the composer's line,
+            // but it must not send it.
+            await session.waitForText("Vercel sign-in failed", 30_000);
             expect(mainSubmits).toBe(0);
           },
           (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"),
@@ -5955,7 +5956,9 @@ describe("a subagent's wait shows in the view the person is on", () => {
           await session.sendKeys(cardDigit(card, "Retry"));
           // The Enter beside that digit, as a person may press: no main request.
           await session.sendKeys("Enter");
-          await Bun.sleep(2000);
+          // The child's retried turn runs to its report, so fx has handled the
+          // Enter before this check reads the draft's fate.
+          await session.waitForText("reviewer finished", 30_000);
           expect(draftSubmits).toBe(0);
           expect(composerContains(await session.capturePane(), "WAIT_S9_DRAFT")).toBe(true);
         },

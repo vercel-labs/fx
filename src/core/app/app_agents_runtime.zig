@@ -1259,6 +1259,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.approval_lender != null or app.question_lender != null or app.wait_card_lender != null) return;
             if (alternateScreenOwned(app)) return;
             const borrower = instanceOnScreen(app) orelse return;
+            if (viewPickerHoldsItem(app)) return;
             if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive() or borrower.wait_card_prompt.isActive()) return;
             var oldest: ?struct { child: *ChildAgent, kind: PromptKind, asked: u64 } = null;
             for (app.child_agents.items) |child| {
@@ -1362,6 +1363,16 @@ pub fn Runtime(comptime App: type) type {
             return input.picker.activeModelPickerQuery(&input.edit_state) != null;
         }
 
+        /// Whether the view holds the `/model` picker for a subagent's wait.
+        /// The picker is the view's one modal until it closes, so nothing else
+        /// is lent beside it and the item it stands for stays the view's own
+        /// (`tests/tla/subagent/ViewWaits.tla` OneAtATime, OldestFirst).
+        fn viewPickerHoldsItem(app: *App) bool {
+            if (comptime !@hasField(App, "model_choice_target")) return false;
+            if (app.model_choice_target == null) return false;
+            return modelPickerHolds(app);
+        }
+
         /// Whether the `/model` picker the view opened for `child`'s wait is
         /// still open. It stands where the card would, so the card is not
         /// lent over it, and the view keeps its wait as it does a card.
@@ -1427,6 +1438,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn viewKeepsWaitCard(app: *App, child: *ChildAgent) bool {
             if (alternateScreenOwned(app)) return false;
+            // The picker takes the footer, and the card comes back after it
+            // closes, oldest item first.
+            if (viewPickerHoldsItem(app)) return false;
             const borrower = rootInstance(app, child);
             if (instanceOnScreen(app) != borrower) return false;
             if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return false;
