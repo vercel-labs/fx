@@ -646,7 +646,7 @@ The next `fx acp` that loads the session takes the lock, and then:
 
 - It marks a turn that was running as interrupted, and it starts no model call until a client sends a prompt.
 - It starts with no queued prompts, no open permission questions, and no "allow for this session" grants. These lived in the dead process's memory, and none of them is restored.
-- It writes its own line to the lock. It removes the old leader's socket and folder only when all of these hold:
+- Before it writes its own line to the lock, it removes the old leader's socket and folder only when all of these hold:
   - the folder has the leader's own shape: a folder named `fx-leader-` and 16 lowercase hex characters, under an absolute base, holding a socket named `s`;
   - the folder is a real folder, not a link, with mode `0700`, owned by the same user;
   - a connection to the socket is refused, or the socket is gone. A socket that stays busy for 200 ms keeps the folder;
