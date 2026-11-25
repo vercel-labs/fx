@@ -166,9 +166,10 @@
             "title": { "type": "string" },
             "version": { "type": "string" }
           }
-        }
+        },
+        "main": { "type": "boolean" }
       },
-      "required": ["clientId"]
+      "required": ["clientId", "main"]
     },
     "ClientsUpdateParams": {
       "description": "The params of the `_sh.fx/session/clients_update` notification: every client that has the session open.",
