@@ -5,6 +5,7 @@ const input_action = @import("../input/input_action.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const cli_config = @import("../cli/cli_config.zig");
+const env_settings = @import("../config/env_settings.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
@@ -24,14 +25,11 @@ const ctrl_c: u8 = 3;
 const ctrl_d: u8 = 4;
 const module = @This();
 
-pub fn screenDisabled() bool {
-    const value = io_mod.getenv("FX_TEST_SKIP_WORKSPACE_TRUST") orelse return false;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    return !std.mem.eql(u8, trimmed, "0") and !std.ascii.eqlIgnoreCase(trimmed, "false");
+fn screenDisabled() bool {
+    return env_settings.testSwitchOn(io_mod.getenv("FX_TEST_SKIP_WORKSPACE_TRUST"));
 }
 
-pub fn inputFor(event: input_action.TerminalInputEvent) ?Input {
+fn inputFor(event: input_action.TerminalInputEvent) ?Input {
     return switch (event) {
         .raw => |raw| switch (raw.byte) {
             carriage_return, line_feed => .confirm,
@@ -133,17 +131,14 @@ pub fn Runtime(comptime App: type) type {
 
         fn workspaceMcpCounts(app: *App) McpCounts {
             var counts: McpCounts = .{};
-            if (comptime @hasField(App, "mcp")) {
-                if (comptime @hasDecl(@TypeOf(app.mcp), "leaseHost")) {
-                    if (app.mcp.leaseHost()) |lease| {
-                        defer lease.deinit();
-                        for (lease.host.runtime.servers()) |server| {
-                            if (server.source != .workspace) continue;
-                            counts.servers += 1;
-                            if (server.held == .waiting_for_approval) counts.pending += 1;
-                        }
-                    }
-                }
+            if (comptime !@hasField(App, "mcp")) return counts;
+            if (comptime !@hasDecl(@TypeOf(app.mcp), "leaseHost")) return counts;
+            const lease = app.mcp.leaseHost() orelse return counts;
+            defer lease.deinit();
+            for (lease.host.runtime.servers()) |server| {
+                if (server.source != .workspace) continue;
+                counts.servers += 1;
+                if (server.held == .waiting_for_approval) counts.pending += 1;
             }
             return counts;
         }
