@@ -80,7 +80,7 @@ Each extension gets its own section here when it is written.
 | Extension | What it adds | ACP proposal it follows |
 | --- | --- | --- |
 | Steering and queued prompts | Input to a running turn, and prompts that wait for the running turn to end | [Prompt delivery](https://github.com/agentclientprotocol/agent-client-protocol/pull/1261), a draft for ACP v2 |
-| Following a session | Several clients on one live session, and catching up after a reconnect | ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup), which lets a session be active on several connections, and [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) for the events between clients |
+| Following a session | Several clients on one live session, the list of clients that have it open, and catching up after a reconnect | ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup), which lets a session be active on several connections, and [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) for the events between clients |
 | Session status and list changes | Whether each session is open and running, and a notification when the list of sessions changes | [`session/status`](https://agentclientprotocol.com/rfds/session-status), in ACP's unstable schema, and [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) |
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
 | Fork and rewind | A new session copied from another, whole or up to a prompt, and the removal of the turns from a prompt on | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
@@ -270,7 +270,7 @@ After the replay, fx answers:
 
 #### Prompts from other clients
 
-When a prompt starts a turn, or runs after the queue, fx sends its content as `user_message_chunk` updates to every other client that has the session open. ACP v2 requires the Agent to report each prompt it takes, and the sender of a v1 prompt already shows it, so the sender gets no copy. A steer is different: when the turn takes it, every client gets its chunk, the sender included, as "Steers" says, because the chunk marks where the steer joined the turn. For a client that lists `sh.fx/sessionClients`, each chunk's `_meta` names the sender as `sh.fx/client`, with the id from "Who is connected".
+When a prompt starts a turn, or runs after the queue, fx sends its content as `user_message_chunk` updates to every other client that has the session open. ACP v2 requires the Agent to report each prompt it takes, and the sender of a v1 prompt already shows it, so the sender gets no copy. A steer is different: when the turn takes it, every client gets its chunk, the sender included, as "Steers" says, because the chunk marks where the steer joined the turn. For a client that lists `sh.fx/sessionClients`, each prompt or steer chunk that fx sends it carries the sender's id as `sh.fx/client` in its `_meta`, with the id from "Who is connected". A client that doesn't list it gets the chunk without that key.
 
 #### Permission requests
 
@@ -280,7 +280,7 @@ The first valid answer decides. An answer is valid when it uses the request id t
 
 A client that leaves takes its copy away, and nobody is asked again. The request stays open for the other clients. When no client is left, the request is denied at once. A `session/cancel` of the turn cancels every copy, and each client that received one is told with its own request id.
 
-Not built yet: a subagent's permission request to every client that has the parent session open, and the client list in "Who is connected".
+Not built yet: a subagent's permission request to every client that has the parent session open.
 
 `tests/tla/acp/AcpApprovals.tla` models these rules, and TLC checks that every client gets the request, that the first valid answer decides, that the other clients are told, that only the sender's copy offers "allow for this session", and that a leaving client's copy goes with no re-ask. `tests/tla/drivers/acp/approvals/driver.ts` checks the same rules on the built fx.
 
@@ -290,12 +290,20 @@ Not built yet: a subagent's permission request to every client that has the pare
 
 #### Who is connected
 
-A client that lists `sh.fx/sessionClients` learns which clients have the session open. fx gives each connection an id when it connects, and returns the caller's own id as `sh.fx/clientId` in the `_meta` of its `initialize` response. fx sends the `_sh.fx/session/clients_update` notification with the whole list:
+A client that lists `sh.fx/sessionClients` learns which clients have the session open. fx gives each connection an id when it connects, and returns the caller's own id as `sh.fx/clientId` in the `_meta` of its `initialize` response. An id is `c` followed by a number. An id gives its holder no authority: no request takes a client id as an argument.
 
-- after a client opens or closes the session, or its connection ends, to every client that has the session open;
-- to a client that opens the session, after any replay and before its response to a load or resume, and after its response to `session/new`.
+fx sends the `_sh.fx/session/clients_update` notification with the whole list, and only to clients that list `sh.fx/sessionClients`:
 
-Each entry gives a client's id and the `clientInfo` that the client sent at `initialize`:
+- after a client opens or closes the session, or its connection ends, to every listing client that has the session open;
+- to a client that opens the session with `session/load` or `session/resume`, after its replay and before its response; and to a client that opens it with `session/new`, after its response.
+
+fx sends no list when no client has the session open. A listing client that opens the session gets a list that includes its own entry.
+
+Each entry gives a client's id, the `clientInfo` that the client sent at `initialize`, and whether it is the main client:
+
+- `clientId` is the client's id.
+- `clientInfo` holds the `name`, `title` and `version` that the client sent, each string cut to 256 bytes at a character boundary. fx leaves the field out when the client sent none.
+- `main` is `true` for the main client and `false` for every other entry. The first client in join order is the main client (see "The main client"), so when the main client leaves, `main` moves to the next entry in the list.
 
 ```json
 {
@@ -304,14 +312,16 @@ Each entry gives a client's id and the `clientInfo` that the client sent at `ini
   "params": {
     "sessionId": "sess_abc123",
     "clients": [
-      { "clientId": "c1", "clientInfo": { "name": "fx-desktop", "version": "0.4.0" } },
-      { "clientId": "c2", "clientInfo": { "name": "zed", "version": "0.190.0" } }
+      { "clientId": "c1", "clientInfo": { "name": "fx-desktop", "version": "0.4.0" }, "main": true },
+      { "clientId": "c2", "clientInfo": { "name": "zed", "version": "0.190.0" }, "main": false }
     ]
   }
 }
 ```
 
-`tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. Its `Today` configs show where fx breaks them now. The permission rules are in "Permission requests" and `tests/tla/acp/AcpApprovals.tla`.
+A prompt or steer chunk that fx sends to a listing client carries the sender's id as `sh.fx/client` in the chunk's `_meta`, with the id from this list. A load's replay of saved turns carries no `sh.fx/client`, because the saved history has no sender.
+
+`tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. `tests/tla/drivers/acp/shared_session/driver.ts` checks the same rules on the built fx. The permission rules are in "Permission requests" and `tests/tla/acp/AcpApprovals.tla`.
 
 ### Session status and list changes
 
