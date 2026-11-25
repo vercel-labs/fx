@@ -616,7 +616,8 @@ pub const WorkerRuntime = struct {
     drain_continuation_due: bool = false,
     worker_processing: bool = false,
     /// Set when a turn begins, or goes on after the user answers its
-    /// question or approval; `takeBeganWork` clears it. A turn can begin
+    /// question, its approval, or a request that waits for them;
+    /// `takeBeganWork` clears it. A turn can begin
     /// and end between two looks at its state, as one that ends at once
     /// after an answer does. Guarded by `worker_mutex`.
     began_work: bool = false,
@@ -1029,8 +1030,12 @@ pub const WorkerRuntime = struct {
     }
 
     /// The user answered a request that waits for them, for example with
-    /// Enter. A request that is not waiting ignores it.
+    /// Enter. A request that is not waiting ignores it. Each caller asks only
+    /// while one waits, so the turn goes on (`began_work`).
     pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_continue_requested.store(true, .seq_cst);
     }
 
@@ -9615,7 +9620,7 @@ test "question resume observer runs only for accepted answers before releasing t
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
-test "a turn's start and an accepted answer or approval mark began work until it is taken" {
+test "a turn's start, an accepted answer or approval, and a continue mark began work until it is taken" {
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
@@ -9639,6 +9644,12 @@ test "a turn's start and an accepted answer or approval mark began work until it
         submitPermissionDecisionForTest(&runtime, request_id, .once),
     );
     thread.join();
+    try std.testing.expect(runtime.takeBeganWork());
+
+    // Enter, a sign-in, or the parent's message continues a request that
+    // waits for the user.
+    runtime.requestRecoveryContinue();
+    try std.testing.expect(runtime.recovery_continue_requested.load(.seq_cst));
     try std.testing.expect(runtime.takeBeganWork());
     runtime.finishProcessing();
 
