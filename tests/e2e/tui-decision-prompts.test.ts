@@ -253,30 +253,30 @@ function outerFittingCommandCall() {
   ]);
 }
 
-function outerQuestionCall() {
-  return outerToolCalls([
-    {
-      id: "question_outer_1",
-      name: "ask_user_question",
-      input: {
-        questions: [
+const QUESTION_CALL = {
+  id: "question_outer_1",
+  name: "ask_user_question",
+  input: {
+    questions: [
+      {
+        question: QUESTION_PROMPT,
+        options: [
           {
-            question: QUESTION_PROMPT,
-            options: [
-              {
-                label: "Inspect repo state",
-                description: "Review local files first.",
-              },
-              {
-                label: "Run tests",
-                description: "Start with verification.",
-              },
-            ],
+            label: "Inspect repo state",
+            description: "Review local files first.",
+          },
+          {
+            label: "Run tests",
+            description: "Start with verification.",
           },
         ],
       },
-    },
-  ]);
+    ],
+  },
+};
+
+function outerQuestionCall() {
+  return outerToolCalls([QUESTION_CALL]);
 }
 
 const TALL_QUESTION_PROMPT = "Who should relay events to the chat panes?";
@@ -783,6 +783,58 @@ async function resolveApprovalWithDeny(activeSession: TmuxSession) {
 async function resolveQuestionWithSecondOption(activeSession: TmuxSession) {
   await activeSession.sendKeys("Down");
   await activeSession.sendKeys("Enter");
+}
+
+const ORDER_PROMPT = "Read files and ask me.";
+const ORDER_DONE = "Done after the question.";
+const ORDER_SUMMARY = "Explored 3 files";
+const ORDER_FILES = ["first.txt", "second.txt", "third.txt"];
+
+function readCall(id: string, path: string) {
+  return { id, name: "read_file", input: { path } };
+}
+
+// The rows from the prompt to the final answer, without blank rows, so a live
+// screen and a resumed one compare row for row.
+function answeredQuestionRows(grid: string[]) {
+  const rows = grid.map((row) => row.trimEnd()).filter((row) => row !== "");
+  const start = rows.indexOf(`┃ ${ORDER_PROMPT}`);
+  const end = rows.findIndex((row) => row.includes(ORDER_DONE));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start, end + 1);
+}
+
+function hasOrderSummary(grid: string[]) {
+  return grid.some((row) => row.includes(ORDER_SUMMARY));
+}
+
+/// Reads three files around one answered question, then checks the rows the
+/// turn leaves, live and again after `--resume last`.
+async function expectAnsweredQuestionOrder(responses: GatewayResponse[], expected: string[]) {
+  const ctx = await launchScenario(responses, "input", {}, "auto");
+  for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
+  await ctx.session.sendText(ORDER_PROMPT);
+  await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+  await resolveQuestionWithSecondOption(ctx.session);
+  const live = await waitForGridState(ctx.session, "live answered question order", hasOrderSummary, TIMEOUT);
+  expect(answeredQuestionRows(live)).toEqual(expected);
+  await assertProcessAliveAndClean(ctx);
+
+  await ctx.session.sendText("/quit");
+  expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  await ctx.session.kill();
+  session = await TmuxSession.create({
+    cmd: `env -u VERCEL_OIDC_TOKEN ${FX_BIN} --resume last 2>${ctx.stderrPath}`,
+    cwd: ctx.root.workspace,
+    env: definedStringEnv(fakeGatewayEnv(ctx.root, ctx.gateway)),
+    width: 120,
+    height: 40,
+  });
+  const resumed = await waitForGridState(session, "resumed answered question order", hasOrderSummary, TIMEOUT);
+  expect(answeredQuestionRows(resumed)).toEqual(answeredQuestionRows(live));
+  expect(answeredQuestionRows(resumed)).toEqual(expected);
+  expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
 }
 
 async function waitForPaneState(
@@ -3710,5 +3762,72 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "calls after an answered question draw below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerQuestionCall(),
+        outerToolCalls([readCall("read_2", "second.txt")]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "prose before the calls after an answered question keeps them below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerQuestionCall(),
+        sse([
+          { type: "text-delta", id: "prose_1", delta: "Reading the second file." },
+          { type: "tool-call", toolCallId: "read_2", toolName: "read_file", input: { path: "second.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "  Reading the second file.",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a call before the question in the same step stays above the answered question, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([readCall("read_2", "second.txt"), QUESTION_CALL]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt, second.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
   );
 });

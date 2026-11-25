@@ -10843,6 +10843,40 @@ test "tool presentation groups span silent steps and split on visible assistant 
     try std.testing.expect(group_b_start_index != null);
 }
 
+test "tool calls after a question start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var groups: [3]types.ToolPresentationGroupId = undefined;
+    var group_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        try std.testing.expect(group_count < groups.len);
+        groups[group_count] = event.authoritative_started.presentation_group_id.?;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expect(!std.meta.eql(groups[0], groups[1]));
+    try std.testing.expectEqual(groups[1], groups[2]);
+}
+
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};

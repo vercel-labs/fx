@@ -10424,10 +10424,13 @@ fn processQueuedPromptLoop(
         }
         if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
+        var step_asked_question = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
-            step_has_visible_tool_calls = true;
-            break;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) {
+                step_asked_question = true;
+            } else {
+                step_has_visible_tool_calls = true;
+            }
         }
         const step_has_visible_text =
             stream_ctx.saw_visible_text or
@@ -10444,6 +10447,7 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
+                    .asked_question = step_asked_question,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =
@@ -10454,13 +10458,14 @@ fn processQueuedPromptLoop(
             "agent",
             "tool_presentation_group",
             step_ctx,
-            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s}",
+            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s} asked_question={s}",
             .{
                 if (active_presentation_group_id) |group| group.anchor_step_id else 0,
                 if (step_has_visible_tool_calls) "true" else "false",
                 if (stream_ctx.saw_tool_start) "true" else "false",
                 if (step_has_visible_text) "true" else "false",
                 if (stream_ctx.saw_visible_text_after_tool_start) "true" else "false",
+                if (step_asked_question) "true" else "false",
             },
         );
 
