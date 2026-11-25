@@ -1561,7 +1561,7 @@ fn expectTraceHas(path: []const u8, needle: []const u8) !void {
     defer file.close(io_mod.getIo());
     const text = try io_mod.readFileToEnd(testing.allocator, &file, 8192);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    try testing.expect(std.mem.find(u8, text, needle) != null);
 }
 
 fn contextFor(
@@ -2330,7 +2330,7 @@ test "a manifest of 2,000 brought records reads back, past the reply size limit 
     manifest.generation = "generation-1";
     const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     for (0..2000) |index| {
-        const rel = try std.fmt.allocPrint(arena, "zig-out/bin/file-{d:0>5}-padding-padding-padding-padding-padding.txt", .{index});
+        const rel = try arena.print("zig-out/bin/file-{d:0>5}-padding-padding-padding-padding-padding.txt", .{index});
         try manifest.brought.put(arena, rel, .{ .size = 1, .mtime_ns = 2, .sha256 = sha });
     }
     const bytes = try encodeManifest(arena, &manifest);
@@ -2401,7 +2401,7 @@ test "the real create, resume and size answers arrive whole through the buffered
         try server.start();
         defer server.close();
         var origin_buffer: [64]u8 = undefined;
-        const origin = try std.fmt.bufPrint(&origin_buffer, "http://127.0.0.1:{d}", .{server.port()});
+        const origin = try std.mem.print(&origin_buffer, "http://127.0.0.1:{d}", .{server.port()});
         var cancel = std.atomic.Value(bool).init(false);
         var capture: credentials.CaptureTrace = .{};
         const response = try stream.callBuffered(alloc, &cancel, transport.resolveBaseUrl(origin), .{ .value = transport.test_token }, capture.trace(), .{
@@ -2598,7 +2598,7 @@ test "a manifest with the most pending names reads back, so the reader's limit i
     manifest.generation = "generation-1";
     const names = try arena.alloc([]const u8, max_pending_names);
     for (names, 0..) |*name, index| {
-        name.* = try std.fmt.allocPrint(arena, "zig-out/bin/pending-{d:0>5}-padding-padding.txt", .{index});
+        name.* = try arena.print("zig-out/bin/pending-{d:0>5}-padding-padding.txt", .{index});
     }
     manifest.pending_back = names;
     const bytes = try encodeManifest(arena, &manifest);

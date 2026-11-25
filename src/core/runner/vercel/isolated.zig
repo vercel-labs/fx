@@ -241,7 +241,7 @@ test "a sweep that cannot list the sandboxes says so in the trace, and deletes n
     try server.start();
     defer server.close();
     var buffer: [64]u8 = undefined;
-    const origin = try std.fmt.bufPrint(&buffer, "http://127.0.0.1:{d}", .{server.port()});
+    const origin = try std.mem.print(&buffer, "http://127.0.0.1:{d}", .{server.port()});
     var cancel = std.atomic.Value(bool).init(false);
     var capture: credentials.CaptureTrace = .{};
     var ctx: sandbox.Context = .{
@@ -266,7 +266,7 @@ test "a sweep that cannot list the sandboxes says so in the trace, and deletes n
     defer file.close(io_mod.getIo());
     const text = try io_mod.readFileToEnd(alloc, &file, 8192);
     defer alloc.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "event=sweep_skipped what=isolated reason=list_refused status=500") != null);
+    try testing.expect(std.mem.find(u8, text, "event=sweep_skipped what=isolated reason=list_refused status=500") != null);
 }
 
 pub const RunEntry = struct {

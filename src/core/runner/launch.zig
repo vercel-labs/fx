@@ -52,8 +52,6 @@ pub const Launch = struct {
 
 pub const InvocationError = error{ LocalPlacement, UnknownProfile } || std.mem.Allocator.Error;
 
-const default_profile_name = "default";
-
 /// The one POSIX shell string that runs `command` through the runner in `cwd`. `exec` is the
 /// only word left bare. Every other word is quoted by `command_lex.quoteWord`, which leaves a
 /// word bare only when it is safe as it is. The caller owns the result, which is allocated with
@@ -118,7 +116,7 @@ fn buildInvocation(
     if (placement == .remote) {
         for (launch.env) |name| try appendPair(arena, &out, "--env", name);
     } else {
-        const name = profile orelse default_profile_name;
+        const name = profile orelse command_environment.default_profile_name;
         try appendPair(arena, &out, "--profile", name);
         for (try profileArgs(launch, name)) |word| try appendWord(arena, &out, word);
     }
@@ -191,7 +189,7 @@ fn profileArgs(launch: *const Launch, name: []const u8) error{UnknownProfile}![]
     for (launch.profiles) |profile| {
         if (std.mem.eql(u8, profile.name, name)) return profile.args;
     }
-    if (std.mem.eql(u8, name, default_profile_name)) return &.{};
+    if (std.mem.eql(u8, name, command_environment.default_profile_name)) return &.{};
     return error.UnknownProfile;
 }
 

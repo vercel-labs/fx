@@ -2537,6 +2537,12 @@ pub fn placementAsApproved(
 /// Refuses a shell run that fx must not start, before any prompt: a run the
 /// fields make impossible away from this machine, or any run while the sandbox
 /// config is invalid or its provider cannot run.
+/// LOG-01: one trace line for a refusal that stops a shell run before it starts. It names the site and
+/// the refusal text fx gives the model. The command itself is never traced.
+pub fn traceRefusal(site: []const u8, text: []const u8) void {
+    debug_trace.logf("permission", "event=shell_refused site={s} reason={f}", .{ site, text_utils.terminalSafe(text) });
+}
+
 fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
     if (comptime host_target.is_wasm) return null;
     const active = input.sandbox_policy orelse return null;
@@ -2551,7 +2557,9 @@ fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const 
         .runner = runnerRequest(args),
         .cwd = tool_args.nullablePlaceholderStringArg(args, "cwd"),
     };
-    return shellRunRefusal(arena, active, input.workspace_root, command, fields, tool.captured_command_host == .native);
+    const refusal = try shellRunRefusal(arena, active, input.workspace_root, command, fields, tool.captured_command_host == .native);
+    if (refusal) |text| traceRefusal("admission", text);
+    return refusal;
 }
 
 /// The request a run's `runner` names. Decode has already refused any other value.
@@ -7357,6 +7365,38 @@ test "a built-in remote run with no config is admitted, and gets no provider ref
     try std.testing.expect(launchlessRemote(remote));
     const local = try runCommandContext(input, arena, try runnerRunCall(arena, "ls", ",\"runner\":\"local\""));
     try std.testing.expect(!launchlessRemote(local));
+}
+
+test "a refused shell run leaves one trace line that names the reason, and never the command (LOG-01)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fx_home = try sandboxTestHome(arena, tmp.dir, false);
+    const policy = try sandbox_policy.load(std.testing.allocator, fx_home, "/Users/example", null);
+    defer policy.destroy();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.sandbox_policy = policy;
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const trace_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "admission.log" });
+    defer std.testing.allocator.free(trace_path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(std.testing.allocator, trace_path, "permission");
+
+    const refusal = try commandCallRefusal(input, arena, try runnerRunCall(arena, "secret-marker-command", ",\"runner\":\"remote\",\"tty\":true"));
+    try std.testing.expectEqualStrings(refusal_prefix ++ tty_sandbox_reason, refusal orelse return error.TestExpectedEqual);
+
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(std.testing.allocator, &file, 8192);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "event=shell_refused site=admission") != null);
+    try std.testing.expect(std.mem.find(u8, text, "secret-marker-command") == null);
 }
 
 test "a built-in remote tty run with no config is refused as a tty run, not as a missing provider" {

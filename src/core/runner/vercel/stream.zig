@@ -592,7 +592,7 @@ const CountingAllocator = struct {
 
 // Linux holds a connect to a full accept queue until the limit ends it. Other systems answer it
 // differently, and the timing varies by machine, so the real-socket tests check only the bound there (V11).
-const linux_holds = builtin.os.tag == .linux;
+const linux_holds = builtin.target.os.tag == .linux;
 /// How long past its limit a real-socket connect may end, in milliseconds (V11).
 const v11_slack_ms: i64 = 2_000;
 /// Off Linux, one filler connect gets this long before it is cancelled (V11). Zig 0.17's POSIX connect

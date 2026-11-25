@@ -2358,6 +2358,18 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     expect(readdirSync(join(stateOf(repo), "pending"))).toEqual([]);
   }, TIMEOUT * 4);
 
+  test("a file the command deletes in the sandbox comes back on the next run's push (V5, V9)", async () => {
+    const repo = makeRepo("sandbox-delete");
+    writeFileSync(join(repo, "a.txt"), "kept\n");
+    // Run 1 pushes a.txt, then the command deletes it in the sandbox. This machine keeps its copy.
+    expect((await runRemote(repo, "rm a.txt")).code).toBe(0);
+    expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("kept\n");
+    // Run 2 sees the file: run 1's bring-back noticed it was gone, so the push sends it again.
+    const next = await runRemote(repo, "cat a.txt");
+    expect(next.code).toBe(0);
+    expect(next.stdout).toContain("kept");
+  }, TIMEOUT * 2);
+
   test("AC-35 (a, c): a file the command installs with an old mtime comes back, and zig-out/other stays on the sandbox", async () => {
     const repo = makeRepo("ac-35-old-mtime");
     git(repo, ["init", "-q"]);

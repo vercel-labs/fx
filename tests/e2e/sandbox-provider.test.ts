@@ -275,7 +275,17 @@ describe("sandbox provider end to end", () => {
     TIMEOUT,
   );
 
-  test(
+  /// Polls the fake sandbox until a command runs there. The fake has no start signal to wait on, so this
+/// checks the state the stop depends on, with a deadline.
+async function waitForRunningCommand(timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!remoteSetup.api.commands().some((command) => command.status === "running")) {
+    if (Date.now() > deadline) throw new Error("the sandbox never started the command");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+test(
     "stopping a placed background command kills it in the sandbox",
     async () => {
       await withFixture(
@@ -283,7 +293,11 @@ describe("sandbox provider end to end", () => {
           rules: [{ command: "sleep *", runner: "remote" }],
           responses: [
             fakeShellRun("run_1", "sleep 30", { yield_time_ms: 500 }),
-            (body) => fakeGatewayToolCall("stop_1", "shell", { request: { action: "stop", session_id: sessionId(body) } }),
+            async (body) => {
+              // The stop follows the start: it is sent once the sandbox runs the command, not after a fixed yield.
+              await waitForRunningCommand();
+              return fakeGatewayToolCall("stop_1", "shell", { request: { action: "stop", session_id: sessionId(body) } });
+            },
             fakeGatewayFinalText("Stopped."),
           ],
         },

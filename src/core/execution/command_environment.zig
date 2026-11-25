@@ -46,7 +46,10 @@ const tty_permission_identity_prefix = "@fx-shell-mode:tty:";
 const placement_permission_identity_prefix = "@fx-placement:";
 const remote_placement_tag = "remote:";
 const isolated_placement_tag = "isolated/";
-const default_profile_name = "default";
+/// The name of the default profile, which every isolated run without a profile uses.
+pub const default_profile_name = "default";
+/// The longest profile name fx accepts. The error texts that name the rule use it too.
+pub const max_profile_name_len: usize = 40;
 
 pub fn isExplicitPermissionCommandIdentity(value: []const u8) bool {
     return std.mem.startsWith(u8, value, permission_identity_prefix) or
@@ -164,8 +167,8 @@ fn withoutDestination(text: []const u8, unchanged: []const u8) []const u8 {
 }
 
 /// A profile name is 1 to 40 characters of `a-z`, `0-9`, `_`, and `-`.
-fn isProfileName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 40) return false;
+pub fn isProfileName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_profile_name_len) return false;
     for (name) |byte| {
         const allowed = (byte >= 'a' and byte <= 'z') or
             (byte >= '0' and byte <= '9') or
@@ -243,6 +246,18 @@ pub const Host = enum {
     native,
     workspace_clean,
 };
+
+test "a profile name is 1 to max_profile_name_len characters of a-z, 0-9, _ or -, and default names the default profile" {
+    const longest: [max_profile_name_len]u8 = @splat('a');
+    const too_long: [max_profile_name_len + 1]u8 = @splat('a');
+    try std.testing.expect(isProfileName(&longest));
+    try std.testing.expect(!isProfileName(&too_long));
+    try std.testing.expect(!isProfileName(""));
+    try std.testing.expect(!isProfileName("Work"));
+    try std.testing.expect(isProfileName("ok_-9"));
+    try std.testing.expect(isProfileName(default_profile_name));
+    try std.testing.expectEqualStrings("default", default_profile_name);
+}
 
 test "command environment equality includes explicit shell identity" {
     try std.testing.expect((Environment{ .legacy = {} }).eql(.legacy));

@@ -384,7 +384,7 @@ test "a first write into an fx home with no sandbox folder creates it, and the w
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const text = try readConfig(arena_state.allocator(), tmp.dir);
-    try testing.expect(std.mem.indexOf(u8, text, "usr_1") != null);
+    try testing.expect(std.mem.find(u8, text, "usr_1") != null);
 }
 
 test "a new write sets remote when there was no config file" {

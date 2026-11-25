@@ -86,6 +86,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/app/trace_report.zig", "(?:parse|nth|fieldProblem|expectStartsWith|expectEndsWith|expectNotIn)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/shared/self_exe.zig", "requireInstalledForTest", /debug_print/, "tests", "test diagnostics: the build message runs only in test builds"),
   rule("src/core/runner/vercel/stream.zig", "(?:checkConnect|expectOpenJobsDone|setupStep)", /debug_print/, "tests", "test diagnostics: a V11 line prints only when a check or setup step fails"),
+  rule("src/tools/shell/shell.zig", "traceLineWith", /debug_print/, "tests", "test diagnostics: a test helper that finds a trace line, called only from test blocks"),
 ];
 
 function rule(

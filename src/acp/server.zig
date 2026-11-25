@@ -642,6 +642,16 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
     };
 }
 
+test "a second initialize keeps the sandbox policy the first one loaded" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    var state: ServerState = undefined;
+    state.alloc = std.testing.allocator;
+    var loaded: sandbox_policy.Policy = undefined;
+    state.sandbox_policy = &loaded;
+    loadSandboxPolicyOnce(&state);
+    try std.testing.expect(state.sandbox_policy.? == &loaded);
+}
+
 test "ACP credential preparation preserves the existing borrowed credential" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
@@ -923,6 +933,14 @@ fn dropQueuedMail(state: *ServerState, session_id: []const u8, scope: DropScope,
         }
     }
     state.report_calls.shrinkRetainingCapacity(kept);
+}
+
+/// Loads the process's sandbox policy once. A second `initialize` keeps the policy the first one loaded:
+/// active sessions hold its pointer, and loading again would leave the first policy unreleased.
+fn loadSandboxPolicyOnce(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    if (state.sandbox_policy != null) return;
+    state.sandbox_policy = sandbox_policy.loadForProcess(state.alloc);
 }
 
 fn destroyActiveSession(state: *ServerState) void {
@@ -3253,7 +3271,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.cache_warming = startup.cache_warming;
     state.workspace_capture = startup.workspace_capture;
     if (comptime !host_target.is_wasm) {
-        if (startup.sandbox_execution) state.sandbox_policy = sandbox_policy.loadForProcess(state.alloc);
+        if (startup.sandbox_execution) loadSandboxPolicyOnce(state);
     }
 
     if (comptime !host_target.is_wasm) {

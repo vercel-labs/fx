@@ -42,6 +42,7 @@ const word_skipped = "skipped ";
 const word_dropped = "dropped ";
 const word_linked = "linked ";
 const word_deferred = "deferred ";
+const word_gone = "gone ";
 
 /// The sandbox side of V9. `$1` is this run's stamp name, `$2` the number of pending stamp names
 /// that follow, each marked `b` when its run carries a baseline and `n` when not. The pending paths
@@ -238,6 +239,14 @@ const script_source =
     \\take_group a "$work/args"
     \\: > "$work/keep"
     \\if [ "${#keep[@]}" -gt 0 ]; then printf '%s\0' "${keep[@]}" > "$work/keep"; fi
+    \\      for p in "${pushed_list[@]}"; do
+    \\        if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+    \\      esc=${p//'\'/'\\'}
+    \\      esc=${esc//$'\n'/'\n'}
+    \\      esc=${esc//$'\r'/'\r'}
+    \\      printf 'gone %s\n' "$esc" >&2
+    \\        fi
+    \\      done
     \\printf 'dropped %s\n' "$dropped" >&2
     \\tar -cz --no-recursion --null -T - < "$work/keep" | base64
     \\status=$?
@@ -363,6 +372,11 @@ fn commitRun(
 ) ?[]const u8 {
     manifest.pending_back = pending_names;
     manifest.spent_stamps = spent;
+    for (notes.gone.items) |path| {
+        if (manifest.files.swapRemove(path)) {
+            debug_trace.logf("remote run", "event=file_dropped what=manifest reason=absent_in_sandbox", .{});
+        }
+    }
     apply.finish() catch |err| return switch (err) {
         error.JournalNotRemoved => "the journal could not be removed",
         else => "the manifest could not be written",
@@ -603,7 +617,7 @@ test "pending names past the cap are counted as untracked, once each (N8)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var names: [sandbox.max_pending_names + 2][]const u8 = undefined;
-    for (&names, 0..) |*name, index| name.* = try std.fmt.allocPrint(arena, "dir/file-{d}", .{index});
+    for (&names, 0..) |*name, index| name.* = try arena.print("dir/file-{d}", .{index});
     const overflow = names[0..sandbox.max_pending_names];
     const deferred = [_][]const u8{ names[sandbox.max_pending_names], names[sandbox.max_pending_names], names[sandbox.max_pending_names + 1] };
     const pending = try pendingBack(arena, overflow, &deferred);
@@ -797,6 +811,8 @@ pub const Note = union(enum) {
     linked: usize,
     /// A path the script deferred, still escaped (`\\`, `\n`, `\r`). `deferredBack` unescapes it.
     deferred: []const u8,
+    /// A path listed in `.git/fx-pushed` that the sandbox no longer has, still escaped. Its record leaves `files` (V9).
+    gone: []const u8,
     other,
 };
 
@@ -814,6 +830,7 @@ pub fn parseNote(line: []const u8) Note {
         return .{ .linked = count };
     }
     if (wordOf(line, word_deferred)) |text| return if (text.len > 0) .{ .deferred = text } else .other;
+    if (wordOf(line, word_gone)) |text| return if (text.len > 0) .{ .gone = text } else .other;
     if (wordOf(line, word_skipped)) |text| return if (isSkippedText(text)) .{ .skipped = text } else .other;
     return .other;
 }
@@ -842,11 +859,19 @@ const Notes = struct {
     missing: std.ArrayList([]const u8) = .empty,
     covered: std.ArrayList([]const u8) = .empty,
     deferred: std.ArrayList([]const u8) = .empty,
+    gone: std.ArrayList([]const u8) = .empty,
 
     fn note(self: *Notes, line: []const u8) !void {
         switch (parseNote(line)) {
             .root => |name| self.root = try self.alloc.dupe(u8, name),
             .missing => |name| try self.missing.append(self.alloc, try self.alloc.dupe(u8, name)),
+            .gone => |escaped| {
+                const path = unescapeName(self.alloc, escaped) catch |err| switch (err) {
+                    error.BadEscape => return,
+                    else => return err,
+                };
+                try self.gone.append(self.alloc, path);
+            },
             .covered => |name| try self.covered.append(self.alloc, try self.alloc.dupe(u8, name)),
             .skipped => |text| try self.skipped.append(self.alloc, try self.alloc.dupe(u8, text)),
             .dropped => |count| self.dropped = count,
@@ -1461,6 +1486,14 @@ test "the bring-back script is pinned byte for byte (V9)" {
         \\take_group a "$work/args"
         \\: > "$work/keep"
         \\if [ "${#keep[@]}" -gt 0 ]; then printf '%s\0' "${keep[@]}" > "$work/keep"; fi
+        \\      for p in "${pushed_list[@]}"; do
+        \\        if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+        \\      esc=${p//'\'/'\\'}
+        \\      esc=${esc//$'\n'/'\n'}
+        \\      esc=${esc//$'\r'/'\r'}
+        \\      printf 'gone %s\n' "$esc" >&2
+        \\        fi
+        \\      done
         \\printf 'dropped %s\n' "$dropped" >&2
         \\tar -cz --no-recursion --null -T - < "$work/keep" | base64
         \\status=$?
@@ -1680,7 +1713,7 @@ test "fifty files written by one bring-back rewrite the manifest once, at its en
 
     const entries = try arena.alloc(TestEntry, 50);
     for (entries, 0..) |*entry, index| {
-        entry.* = .{ .name = try std.fmt.allocPrint(arena, "batch/file-{d:0>2}.txt", .{index}), .data = "fresh" };
+        entry.* = .{ .name = try arena.print("batch/file-{d:0>2}.txt", .{index}), .data = "fresh" };
     }
     const archive = try buildArchive(arena, entries);
     var manifest = try testManifest(arena, &.{});
@@ -1805,6 +1838,50 @@ test "a failed manifest write keeps every covered pending record for the next ru
     try testing.expectEqualStrings("0123456789abcdef", pending[0].run_id);
 }
 
+test "a gone note carries the escaped path of a file the sandbox no longer has (V9)" {
+    switch (parseNote("gone a\\nb.txt")) {
+        .gone => |escaped| try testing.expectEqualStrings("a\\nb.txt", escaped),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(parseNote("gone ") == .other);
+}
+
+test "a path the sandbox no longer has leaves the manifest, so the next push sends it again (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    var manifest = try testManifest(arena, &.{.{ .path = "a.txt", .sha = "sha-a" }});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    try notes.gone.append(arena, "a.txt");
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    apply.ctx = &context;
+
+    try testing.expect(commitRun(&context, &apply, &manifest, &.{}, &.{}, &notes, &.{}) == null);
+    const committed = try sandbox.readManifest(&context);
+    try testing.expect(!committed.files.contains("a.txt"));
+}
+
 test "a pending run whose stamp is gone from the sandbox is dropped, and the trace names it (N8)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1854,7 +1931,7 @@ test "a pending run whose stamp is gone from the sandbox is dropped, and the tra
     defer file.close(io_mod.getIo());
     const text = try io_mod.readFileToEnd(testing.allocator, &file, 8192);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "event=pending_dropped run_id=0123456789abcdef reason=stamp_missing_in_sandbox") != null);
+    try testing.expect(std.mem.find(u8, text, "event=pending_dropped run_id=0123456789abcdef reason=stamp_missing_in_sandbox") != null);
 }
 
 test "a pending record that outlives a committed bring-back is walked again, and no file is brought back twice (N8)" {

@@ -87,7 +87,6 @@ const default_grace_ms: u32 = 5000;
 const min_grace_ms: i64 = 1000;
 const max_grace_ms: i64 = 60000;
 const max_env_name_len = 64;
-const max_profile_name_len = 40;
 const max_path_entries = 50;
 const max_path_bytes = 1024;
 const known_keys = [_][]const u8{ "provider", "provider_args", "grace_ms", "rules", "workspaces", "env", "profiles", "remote", "include", "bring_back", "vcpus" };
@@ -286,8 +285,8 @@ fn parseProfiles(arena: std.mem.Allocator, diagnostic: *Diagnostic, value: std.j
     while (keys.next()) |entry| : (index += 1) {
         const name = entry.key_ptr.*;
         const label = try arena.print("profiles[\"{s}\"]", .{name});
-        if (!isProfileName(name)) {
-            return failFmt(arena, diagnostic, "{s}: name must be 1 to 40 characters of a-z, 0-9, _, or -", .{label});
+        if (!command_environment.isProfileName(name)) {
+            return failFmt(arena, diagnostic, "{s}: name must be 1 to {d} characters of a-z, 0-9, _, or -", .{ label, command_environment.max_profile_name_len });
         }
         const args = try stringArray(arena, diagnostic, entry.value_ptr.*, label);
         profiles[index] = .{ .name = name, .args = args };
@@ -461,10 +460,10 @@ fn parseTarget(
         return failFmt(arena, diagnostic, "{s}: unknown runner \"{s}\"", .{ label, text });
     }
     const name = text[isolated_prefix.len..];
-    if (!isProfileName(name)) {
-        return failFmt(arena, diagnostic, "{s}: profile name \"{s}\" must be 1 to 40 characters of a-z, 0-9, _, or -", .{ label, name });
+    if (!command_environment.isProfileName(name)) {
+        return failFmt(arena, diagnostic, "{s}: profile name \"{s}\" must be 1 to {d} characters of a-z, 0-9, _, or -", .{ label, name, command_environment.max_profile_name_len });
     }
-    if (std.mem.eql(u8, name, "default")) return .{ .placement = .isolated };
+    if (std.mem.eql(u8, name, command_environment.default_profile_name)) return .{ .placement = .isolated };
     if (!hasProfile(profiles, name)) {
         return failFmt(arena, diagnostic, "{s}: profile \"{s}\" is not in profiles", .{ label, name });
     }
@@ -655,18 +654,6 @@ fn isEnvName(name: []const u8) bool {
         const valid = switch (byte) {
             'A'...'Z', 'a'...'z', '_' => true,
             '0'...'9' => index > 0,
-            else => false,
-        };
-        if (!valid) return false;
-    }
-    return true;
-}
-
-fn isProfileName(name: []const u8) bool {
-    if (name.len == 0 or name.len > max_profile_name_len) return false;
-    for (name) |byte| {
-        const valid = switch (byte) {
-            'a'...'z', '0'...'9', '_', '-' => true,
             else => false,
         };
         if (!valid) return false;

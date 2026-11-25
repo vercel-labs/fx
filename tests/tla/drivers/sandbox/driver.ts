@@ -271,7 +271,9 @@ async function runScenario(s: Scenario, dir: string): Promise<Run> {
   const callArgs = s.then ? { yield_time_ms: 500 } : s.tty ? { tty: true } : {};
   const responses: unknown[] = [fakeShellRun("run_1", remote, { ...callArgs, ...(s.timeoutMs ? { timeout_ms: s.timeoutMs } : {}) })];
   if (s.then === "stop") {
-    responses.push((body: string) => {
+    responses.push(async (body: string) => {
+      // The stop follows the start, so the before-start case (holdMs) stops first on purpose.
+      if (!s.holdMs) await waitForEvent(providerHome, "start");
       appendEvent(providerHome, "stop");
       return fakeGatewayToolCall("stop_1", "shell", { request: { action: "stop", session_id: sessionId(body) } });
     });

@@ -1604,7 +1604,7 @@ test "a cancel during the push ends it as Cancelled, and the upload does not han
     try seedSandbox(&state_dir);
     const repo_root = try io_mod.dirRealpathAlloc(arena, tmp.dir, repo_name);
 
-    var server: test_server.Server = .{ .replies = &.{.{ .body = write_ok }}, .stall_upload = true };
+    var server: test_server.Server = .{ .replies = &.{.{ .mode = .hold }}, .stall_upload = true };
     try server.listen();
     try server.start();
     defer server.close();

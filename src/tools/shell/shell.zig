@@ -750,11 +750,13 @@ pub fn validate(
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
-    return switch (input.action) {
-        .run => validateRun(ctx, arena, input),
-        .interact => validateInteract(ctx, input),
+    const refusal = switch (input.action) {
+        .run => try validateRun(ctx, arena, input),
+        .interact => try validateInteract(ctx, input),
         .stop => null,
     };
+    if (refusal) |text| tool_admission.traceRefusal("validate", text);
+    return refusal;
 }
 
 fn validateInteract(
@@ -1702,6 +1704,7 @@ fn placementFailure(
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
     const text = try tool_admission.placeErrorText(arena_state.allocator(), sandbox, err, refusal, false);
+    tool_admission.traceRefusal("placement", text);
     return .{ .failure = try ctx.allocator.dupe(u8, text) };
 }
 
@@ -1736,8 +1739,9 @@ fn placeRunStart(
         runner,
         &refusal,
     ) catch |err| return .{ .refused = try placementFailure(ctx, err, refusal) };
-    const placed = approved orelse return .{
-        .refused = .{ .failure = try ctx.allocator.dupe(u8, tool_admission.placement_changed_refusal) },
+    const placed = approved orelse {
+        tool_admission.traceRefusal("placement_changed", tool_admission.placement_changed_refusal);
+        return .{ .refused = .{ .failure = try ctx.allocator.dupe(u8, tool_admission.placement_changed_refusal) } };
     };
     if (tool_admission.launchlessRemote(placed.ctx)) {
         return .{ .refused = try placementFailure(ctx, error.SandboxRunnerNotPrepared, refusal) };
@@ -1767,11 +1771,13 @@ fn remoteSetupRefusal(
         ctx.mcp_input_responder,
         ctx.cancel_flag orelse &no_cancel,
     );
-    return switch (try policy.ensureRemote(setup_call)) {
+    const refusal = switch (try policy.ensureRemote(setup_call)) {
         .ready => null,
-        .canceled => error.Cancelled,
+        .canceled => return error.Cancelled,
         .refused => |text| text,
     };
+    if (refusal) |text| tool_admission.traceRefusal("remote_setup", text);
+    return refusal;
 }
 
 /// Refuses a tty run that the sandbox rules place in a sandbox, and every run
@@ -1792,6 +1798,7 @@ fn sandboxRefusal(
         .{ .tty = true },
         true,
     )) orelse return null;
+    tool_admission.traceRefusal("sandbox", text);
     return .{ .failure = try ctx.allocator.dupe(u8, text) };
 }
 
