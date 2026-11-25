@@ -2144,7 +2144,7 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             const terminal = switch (event) {
                 .terminal => |value| value,
-                .provisional, .authoritative_started, .progress, .turn_finished => return,
+                .provisional, .authoritative_started, .progress, .execution_started, .review_started, .turn_finished => return,
             };
             if (!captured_command_call) {
                 discardPendingCancelledCommand(app, agent, terminal.id, "non_command_terminal");

@@ -1090,7 +1090,7 @@ fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
             const child_id = context.turn.child_id orelse return;
             context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);
         },
-        .provisional, .progress, .turn_finished => {},
+        .provisional, .progress, .execution_started, .review_started, .turn_finished => {},
     }
 }
 

@@ -281,6 +281,16 @@ pub const ToolLifecycleEvent = union(enum) {
         id: ToolLifecycleId,
         text: []const u8,
     },
+    /// The call passed admission and runs now. A text host shows the call's
+    /// start line only from here, so a refused call never shows it.
+    execution_started: struct {
+        id: ToolLifecycleId,
+    },
+    /// An automatic review of the call starts now, before the review answers.
+    review_started: struct {
+        id: ToolLifecycleId,
+        tool_name: []const u8,
+    },
     terminal: struct {
         id: ToolLifecycleId,
         outcome: ToolOutcome,

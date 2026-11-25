@@ -3514,7 +3514,7 @@ pub fn Runtime(comptime App: type) type {
                     const crossing = memory.quiet_crossing orelse return;
                     host.noteChildQuiet(child.id, child.displayName(), crossing);
                 },
-                .provisional, .progress, .turn_finished => {},
+                .provisional, .progress, .execution_started, .review_started, .turn_finished => {},
             }
         }
 

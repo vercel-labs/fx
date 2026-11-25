@@ -328,6 +328,19 @@ pub fn isToolPermissionDeniedOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_permission_denied");
 }
 
+/// The `error.message` of a refused call's output, or null when the output
+/// has none. The caller owns the returned slice.
+pub fn refusalMessage(alloc: Allocator, output: []const u8) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, output, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const error_value = parsed.value.object.get("error") orelse return null;
+    if (error_value != .object) return null;
+    const message = error_value.object.get("message") orelse return null;
+    if (message != .string) return null;
+    return try alloc.dupe(u8, message.string);
+}
+
 pub fn isToolReviewHeldOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_review_held");
 }
@@ -978,4 +991,13 @@ test "malformed tool arguments JSON reports the diagnosis without source bytes" 
     const rejected_details = rejected_parsed.value.object.get("error").?.object.get("details").?.object;
     try std.testing.expectEqualStrings("rejected_value", rejected_details.get("failure").?.string);
     try std.testing.expect(rejected_details.get("error_offset") == null);
+}
+
+test "refusal message reads the error message of a refused call's output" {
+    const alloc = std.testing.allocator;
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"message\":\"Tool access was denied by configured policy\"}}";
+    const message = (try refusalMessage(alloc, denied)).?;
+    defer alloc.free(message);
+    try std.testing.expectEqualStrings("Tool access was denied by configured policy", message);
+    try std.testing.expect((try refusalMessage(alloc, "plain text")) == null);
 }

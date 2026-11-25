@@ -1342,7 +1342,7 @@ describe("filesystem path handling", () => {
         ).toBeGreaterThan(16 * 1024);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
-          { name: "write_file", status: "error" },
+          { name: "write_file", status: "error", reason: "Action held after safety review" },
         ]);
         expect(json.output).toContain("large reviewed write blocked");
         expect(result.stderr).not.toContain("Auto agent approved this request");
@@ -1408,7 +1408,7 @@ describe("filesystem path handling", () => {
         );
         expect(result.stdout).toContain("write safely skipped");
         expect(json.tool_calls).toEqual([
-          { name: "write_file", status: "error" },
+          { name: "write_file", status: "error", reason: "Action held after safety review" },
         ]);
         expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
         expect(result.stderr).not.toContain("permission required");

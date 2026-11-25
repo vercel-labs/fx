@@ -3796,7 +3796,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
             try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
         },
-        .progress, .turn_finished => {},
+        .progress, .execution_started, .review_started, .turn_finished => {},
     }
 }
 

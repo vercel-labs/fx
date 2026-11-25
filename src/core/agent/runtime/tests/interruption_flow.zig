@@ -741,8 +741,8 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
 
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
-    try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
-    const terminal = hooks.lifecycle_events.items[2].terminal;
+    try std.testing.expectEqual(@as(usize, 4), hooks.lifecycle_events.items.len);
+    const terminal = hooks.lifecycle_events.items[3].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
     try std.testing.expectEqualStrings("Cancelled terminal", terminal.outcome.summary);
     try std.testing.expectEqualStrings(
@@ -851,7 +851,7 @@ test "processQueuedPrompt does not interrupt for an unconfirmed cancellation res
     try std.testing.expectEqual(@as(usize, 1), hooks.command_complete_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .assistant);
-    try std.testing.expectEqual(types.ToolOutcomeKind.failed, hooks.lifecycle_events.items[2].terminal.outcome.kind);
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, hooks.lifecycle_events.items[3].terminal.outcome.kind);
     try expectBodyContains(&gateway, 1, "command cancelled");
 }
 

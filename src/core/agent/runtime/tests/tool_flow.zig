@@ -687,7 +687,7 @@ test "same completion duplicate toolbox opens both execute for explicit rereads"
     try std.testing.expect(!logContains(&hooks, "skip:toolbox"));
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_1", "call_1", "call_1", "call_2", "call_2", "call_2" },
+        &.{ "call_1", "call_1", "call_1", "call_1", "call_2", "call_2", "call_2", "call_2" },
     );
 
     const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
@@ -1929,6 +1929,8 @@ fn lifecycleCallId(event: types.ToolLifecycleEvent) ?[]const u8 {
         .provisional => |value| value.id.call_id,
         .authoritative_started => |value| value.id.call_id,
         .progress => |value| value.id.call_id,
+        .execution_started => |value| value.id.call_id,
+        .review_started => null,
         .terminal => |value| value.id.call_id,
         .turn_finished => null,
     };
@@ -2008,7 +2010,7 @@ test "local tool emits authoritative progress and terminal lifecycle by default"
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_read", "call_read", "call_read" },
+        &.{ "call_read", "call_read", "call_read", "call_read" },
     );
     try std.testing.expect(
         hooks.lifecycle_events.items[0].authoritative_started
@@ -2016,7 +2018,7 @@ test "local tool emits authoritative progress and terminal lifecycle by default"
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.completed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
 }
 
@@ -2055,7 +2057,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_vision", "call_vision", "call_vision" },
+        &.{ "call_vision", "call_vision", "call_vision", "call_vision" },
     );
     try std.testing.expectEqual(
         types.ToolActivityKind.read,
@@ -2063,7 +2065,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.completed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings("vision", hooks.executed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2221,15 +2223,15 @@ test "vision failure uses the generic failed terminal lifecycle" {
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_vision_failed", "call_vision_failed", "call_vision_failed" },
+        &.{ "call_vision_failed", "call_vision_failed", "call_vision_failed", "call_vision_failed" },
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings(
         "Failed vision: provider response stayed invalid after one retry",
-        hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     const persisted = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
     try std.testing.expectEqual(
@@ -2414,6 +2416,7 @@ test "interactive authoritative identity reconciles changed provisional id" {
         &.{
             "provisional_read",
             "provisional_read",
+            "final_read",
             "final_read",
             "final_read",
             "final_read",
@@ -3522,6 +3525,8 @@ test "same-batch retarget defers stale scoped call before permission and reloads
                 );
             },
             .authoritative_started => stale_authoritative += 1,
+            .execution_started => {},
+            .review_started => {},
             .turn_finished => unreachable,
         }
     }
@@ -3928,6 +3933,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
             "candidate_read",
             "candidate_read",
             "candidate_read",
+            "candidate_read",
             "terminal_unsupported",
             "terminal_unsupported",
             "terminal_unsupported",
@@ -3940,7 +3946,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     );
     try std.testing.expectEqualStrings(
         "Failed missing_tool",
-        hooks.lifecycle_events.items[5].terminal.outcome.summary,
+        hooks.lifecycle_events.items[6].terminal.outcome.summary,
     );
 
     const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
@@ -6178,11 +6184,11 @@ test "processQueuedPrompt command output completion fires on command success and
     try expectBodyContains(&error_gateway, 1, "Tool terminal failed: AccessDenied");
     try std.testing.expectEqualStrings(
         "Failed terminal",
-        error_hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        error_hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        error_hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        error_hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
 }
 
@@ -6224,11 +6230,11 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
 
     try std.testing.expectEqualStrings(
         "Failed browser_snapshot: Browser/CDP cdp failed during discover_targets: Browser is not reachable",
-        hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try expectBodyContains(&gateway, 1, "browser_cdp_error");
 }

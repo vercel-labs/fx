@@ -1171,6 +1171,17 @@ pub noinline fn startToolVisibleLifecycle(
     return true;
 }
 
+/// Tells the host that a call passed admission and runs now.
+pub fn startToolExecution(
+    hooks: *const AgentRuntimeDeps,
+    turn_id: u64,
+    call_id: []const u8,
+) !void {
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .execution_started = .{
+        .id = .{ .turn_id = turn_id, .call_id = call_id },
+    } });
+}
+
 pub fn finishDeniedToolStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,

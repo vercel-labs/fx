@@ -12600,6 +12600,8 @@ fn processQueuedPromptLoop(
                         advertised_dynamic_tool_names,
                     );
                 }
+                // The preflight checks ran, so the call started and failed.
+                try runtime_tool_presentation.startToolExecution(deps, turn_id, execution_call.id);
                 const failure: ToolExecutionResult = .{
                     .status = .failure,
                     .model_output = failure_output,
@@ -12906,6 +12908,7 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            try runtime_tool_presentation.startToolExecution(deps, turn_id, execution_call.id);
             var execution_error: ?anyerror = null;
             var execution = deps.executeToolCall(.{
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,

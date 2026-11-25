@@ -257,8 +257,20 @@ const ReviewView = enum {
 
 /// Borrowed view of the successful model turn. Every referenced slice must
 /// remain valid until `Reviewer.review` returns.
+/// Tells the host that an automatic review of one call starts. The caller
+/// of the reviewer calls it once for each review, before the reviewer answers.
+pub const ReviewStartedHook = struct {
+    context: *anyopaque,
+    notify_fn: *const fn (context: *anyopaque, call_id: []const u8, name: []const u8) anyerror!void,
+
+    pub fn notify(self: ReviewStartedHook, call_id: []const u8, name: []const u8) !void {
+        return self.notify_fn(self.context, call_id, name);
+    }
+};
+
 pub const ReviewTurnContext = struct {
     observer: ?*observation.Observer = null,
+    review_started: ?ReviewStartedHook = null,
     model: []const u8,
     pending_assistant: types.ChatMessage,
     target_call_id: []const u8,
