@@ -1,5 +1,5 @@
 //! The `fx mcp call` wire format between the client a shell command runs
-//! and the session's bridge (`mcp_call_bridge.zig`), over one Unix socket
+//! and the session's bridge (`bridge.zig`), over one Unix socket
 //! connection per call.
 //!
 //! The client sends one request line, a call or a lookup:
@@ -17,8 +17,8 @@
 //! tool's error), `failed` or `denied` (what went wrong), or `refused`, with
 //! `reason` naming the refusal. Pure: no I/O, so it is tested on bytes.
 const std = @import("std");
-const capability_mod = @import("../tooling/mcp_call_capability.zig");
-const mcp_call = @import("mcp_call.zig");
+const capability_mod = @import("capability.zig");
+const mcp_call = @import("core.zig");
 
 const Allocator = std.mem.Allocator;
 

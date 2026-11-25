@@ -3,7 +3,7 @@
 (* Checks traces the real core produced against McpCall.                   *)
 (*                                                                         *)
 (* tests/tla/drivers/mcp_call/code-to-spec.ts runs event sequences through *)
-(* the harness around src/core/mcp_host/mcp_call.zig, with crashes (the    *)
+(* the harness around src/core/tool_bridge/core.zig, with crashes (the     *)
 (* process is killed), forged and revoked tokens, duplicated, late, and    *)
 (* garbage answers, disconnects at every stage, lost replies, and stops    *)
 (* and subagent ends mid-call. It writes each run as one sequence of       *)

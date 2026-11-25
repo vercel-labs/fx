@@ -1,5 +1,5 @@
 {
-  "about": "Planted bugs. Each one breaks one guard, and the named property must fail. Spec mutations edit spec/McpCall.tla and run TLC on MCMcpCall.cfg, once with only the named property and once with all of it. Code mutations edit a copy of src/core/mcp_host/mcp_call.zig, rebuild the harness from it, and run both driver directions. Each find string must occur exactly once.",
+  "about": "Planted bugs. Each one breaks one guard, and the named property must fail. Spec mutations edit spec/McpCall.tla and run TLC on MCMcpCall.cfg, once with only the named property and once with all of it. Code mutations edit a copy of src/core/tool_bridge/core.zig, rebuild the harness from it, and run both driver directions. Each find string must occur exactly once.",
   "spec": [
     {
       "id": "S1",

@@ -10,7 +10,7 @@ The request, from a user of fx: let a tool call's output go to a file instead of
 
 The bridge that lets a command run by the agent's shell tool, inside a running fx session, call that session's MCP tools: `fx mcp call <tool> '<json>'`. The result goes to the command's standard output, so the command decides whether it goes to a file, a pipe, or the screen. Only what the agent prints reaches its context.
 
-This workspace designs and verifies the bridge's pure core, `src/core/mcp_host/mcp_call.zig`: which requests are admitted, the order of the permission check and the call, at most one call and one reply per request, what happens when a client, a subagent, or the session goes away, and what is logged when data is dropped. The shell around it (socket, client, permission and catalog adapters, environment, UI) is specified here and tracked in `FINISH.md`.
+This workspace designs and verifies the bridge's pure core, `src/core/tool_bridge/core.zig`: which requests are admitted, the order of the permission check and the call, at most one call and one reply per request, what happens when a client, a subagent, or the session goes away, and what is logged when data is dropped. The shell around it (socket, client, permission and catalog adapters, environment, UI) is specified here and tracked in `FINISH.md`.
 
 ## Decisions
 

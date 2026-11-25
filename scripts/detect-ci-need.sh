@@ -14,11 +14,11 @@
 # and drivers, model-check tests/tla/mcp/ and tests/tla/mcp_host/ and drive the
 # MCP engine and fx along them. They run in parallel and take about 20 minutes
 # each. A pull request runs them only when it touches src/mcp/,
-# src/core/mcp_host/, src/core/mcp/, src/core/shared/net_connect.zig (the
-# connect its model Connect.tla checks), those models, their drivers in
-# tests/tla/drivers/mcp/, tests/tla/drivers/mcp_host/, and
-# tests/tla/drivers/lib/, the MCP fixtures in tests/e2e/fixtures/, or the
-# helpers the drivers load: tests/e2e/tmux-helpers.ts,
+# src/core/mcp_host/, src/core/mcp/, src/core/tool_bridge/,
+# src/core/shared/net_connect.zig (the connect its model Connect.tla checks),
+# those models, their drivers in tests/tla/drivers/mcp/,
+# tests/tla/drivers/mcp_host/, and tests/tla/drivers/lib/, the MCP fixtures in
+# tests/e2e/fixtures/, or the helpers the drivers load: tests/e2e/tmux-helpers.ts,
 # tests/evals/eval-helpers.ts, and tests/e2e/render-lab/tape.ts.
 #
 # transcript_window: the TLA+ transcript window job model-checks
@@ -146,7 +146,7 @@ while IFS= read -r path; do
       require_libfx "$path: libfx entry point changed" ;;
     src/acp/* | src/core/hosts/* | src/core/session_manager/*)
       require_libfx "$path: code libfx owns changed" ;;
-    src/mcp/* | src/core/mcp_host/* | src/core/mcp/* | src/core/shared/net_connect.zig)
+    src/mcp/* | src/core/mcp_host/* | src/core/mcp/* | src/core/tool_bridge/* | src/core/shared/net_connect.zig)
       require_mcp "$path: MCP code changed" ;;
     tests/tla/mcp/* | tests/tla/mcp_host/*)
       require_mcp "$path: MCP model changed" ;;

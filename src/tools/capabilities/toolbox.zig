@@ -6,7 +6,7 @@
 //! with exactly the bytes of the earlier ones (`tests/tla/toolbox/Toolbox.tla`
 //! ToolsFixed and PrefixStable). A run reaches the real MCP tool through the
 //! same permission check and call as a shell command's `fx mcp call`
-//! (`src/core/tooling/mcp_call_capability.zig`): the configured and saved
+//! (`src/core/tool_bridge/capability.zig`): the configured and saved
 //! rules, the prompt, and automatic review all see the real tool
 //! (RunNeedsAdmission). A run does not need an earlier open, so compaction
 //! strands nothing (RunWorksWhenAllowed).
@@ -14,7 +14,7 @@ const std = @import("std");
 const tool_presentation = @import("../../core/tooling/tool_presentation.zig");
 const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
-const mcp_call_capability = @import("../../core/tooling/mcp_call_capability.zig");
+const mcp_call_capability = @import("../../core/tool_bridge/tool_bridge.zig").capability;
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");

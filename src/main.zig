@@ -5458,9 +5458,7 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
-    _ = @import("core/mcp_host/mcp_call.zig");
-    _ = @import("core/mcp_host/mcp_call_wire.zig");
-    _ = @import("core/mcp_host/mcp_call_bridge.zig");
+    _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/bash_session/bash_session.zig");
     _ = @import("tools/bash/bash.zig");
@@ -5693,7 +5691,6 @@ test {
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
-    _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");
     _ = @import("builtins/commands.zig");
