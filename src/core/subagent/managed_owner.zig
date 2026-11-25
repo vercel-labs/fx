@@ -2700,7 +2700,7 @@ test "a resolution completes while the route closes and reopens" {
             var index: usize = 0;
             while (index < 2000) : (index += 1) {
                 var buffer: [32]u8 = undefined;
-                const id = std.fmt.bufPrint(&buffer, "approval-{d}", .{index}) catch break;
+                const id = std.mem.print(&buffer, "approval-{d}", .{index}) catch break;
                 app.registerTool(id, "child-1", "root", "work-1", .{ .id = 7, .label = "Allow?" }, .{ .id = "call-1", .name = "shell", .arguments_json = "{}" }, &.{}, route_value, 1) catch break;
                 _ = app.resolve(id, "child-1", .once, null, 0) catch {
                     // The decision is not what this test reads.
