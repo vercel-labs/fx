@@ -969,6 +969,7 @@ test.skipIf(!tmuxAvailable())(
         await active.sendText("Continue without using tools.");
         const answer = index === 0 ? "FIRST_CONTINUATION_OK" : "SECOND_CONTINUATION_OK";
         expectInternal(await waitForScrollback(active, answer));
+        await active.waitForPane(turnSettled, TIMEOUT);
         await active.sendText("/quit");
         expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
         active = null;
@@ -1726,6 +1727,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Start the watcher.");
       await waitForScrollback(active, "STALE_NOTE_PHASE1_DONE");
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(gatewaySawNote(gateway)).toBe(false);
 
       await active.sendText("/quit");
@@ -1822,6 +1824,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("Checking in on the watcher.");
       await waitForScrollback(active, "LIVE_HANDLE_FOLLOWUP_DONE");
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(gateway.requests).toHaveLength(3);
       expect(gatewaySawNote(gateway)).toBe(false);
 
@@ -3370,7 +3373,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("esc close · pgup/pgdn scroll"),
+        (pane) => pane.includes(doneMarker) && !pane.includes("esc close · pgup/pgdn scroll") && turnSettled(pane),
         TIMEOUT,
       );
       const scrollback = await waitForScrollback(active, doneMarker);
@@ -5125,6 +5128,7 @@ test.skipIf(!tmuxAvailable())(
         "Read nested/input.txt, write nested/output.txt from that directory, and exercise the failure control.",
       );
       await waitForScrollback(active, finalMarker);
+      await active.waitForPane(turnSettled, TIMEOUT);
       await waitForCondition(
         () => gateway.requests.length === 3,
         "three scoped-tool completion requests",
@@ -8416,6 +8420,7 @@ while :; do sleep 1; done
 
       await active.sendText("Reply with the prepared follow-up marker.");
       await waitForScrollback(active, followUpMarker, timeout);
+      await active.waitForPane(turnSettled, TIMEOUT);
       expect(initialGateway.requests).toHaveLength(2);
       const followUpBody = initialGateway.requests[1]!.body;
       expect(followUpBody).toContain("<turn_aborted>");
