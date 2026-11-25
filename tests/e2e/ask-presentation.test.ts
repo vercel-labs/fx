@@ -1433,7 +1433,7 @@ describe("fx ask presentation", () => {
           { const: "design", title: "Design" },
           { const: "documentation", title: "Documentation" },
           { const: "operations", title: "Operations" },
-          { const: "vercel-internal-playground", title: "Internal Playground" },
+          { const: "acme-playground", title: "Acme Playground" },
         ],
       });
       const gateway = startFakeGateway([
@@ -1458,20 +1458,20 @@ describe("fx ask presentation", () => {
       await session.waitForText("Choose a number or enter a value:", 60_000);
       const menu = await session.captureFullScrollback();
       expect(menu).toMatch(/^ {2}1\. Design$/m);
-      expect(menu).toMatch(/^ {2}4\. Internal Playground$/m);
+      expect(menu).toMatch(/^ {2}4\. Acme Playground$/m);
       expect(menu).not.toContain("[4]");
 
       await session.sendText("4");
       await session.waitForText("Current values:", TIMEOUT);
       const review = await session.captureFullScrollback();
-      expect(review).toMatch(/^- Team: Internal Playground$/m);
-      expect(review).not.toContain("vercel-internal-playground");
+      expect(review).toMatch(/^- Team: Acme Playground$/m);
+      expect(review).not.toContain("acme-playground");
 
       await session.sendText("1");
       await session.waitForText("Team saved.", TIMEOUT);
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain(
-        '"answer":"vercel-internal-playground"',
+        '"answer":"acme-playground"',
       );
     },
     90_000,
