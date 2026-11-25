@@ -292,7 +292,7 @@ pub const ActiveSessionState = struct {
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
         for (self.session_grants) |grant| {
-            if (grant.shell_epoch == shell_epoch and
+            if (permissions.grantAppliesInShellEpoch(grant, shell_epoch) and
                 std.mem.eql(u8, grant.tool_name, tool_name) and
                 std.mem.eql(u8, grant.target_path, target_path)) return;
         }
@@ -5319,4 +5319,16 @@ test "ACP rejects refreshed Codex tokens for another account" {
         false,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
+}
+
+test "a non-bash approval made again after a shell refresh is retained once" {
+    const alloc = std.testing.allocator;
+    var active: ActiveSessionState = undefined;
+    active.session_grants = &.{};
+    defer types.freePermissionGrantSlice(alloc, active.session_grants);
+
+    try active.retainGrant(alloc, "edit", "/tmp/workspace/a.zig", 0);
+    try active.retainGrant(alloc, "edit", "/tmp/workspace/a.zig", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), active.session_grants.len);
 }

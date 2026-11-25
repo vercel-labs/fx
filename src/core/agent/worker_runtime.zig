@@ -11,6 +11,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const permissions = @import("../permissions/permissions.zig");
 const notification_contract = @import("../notifications/notification_contract.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -3874,7 +3875,7 @@ fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatc
 
 fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
     for (prompt.grants) |grant| {
-        if (grant.shell_epoch == shell_epoch and std.mem.eql(u8, grant.tool_name, tool_name) and std.mem.eql(u8, grant.target_path, target_path)) return;
+        if (permissions.grantAppliesInShellEpoch(grant, shell_epoch) and std.mem.eql(u8, grant.tool_name, tool_name) and std.mem.eql(u8, grant.target_path, target_path)) return;
     }
     const tool_name_dup = try alloc.dupe(u8, tool_name);
     errdefer alloc.free(tool_name_dup);
@@ -11136,4 +11137,15 @@ test "the commit gate logs a finish the app dropped, with its reason" {
     try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
+}
+
+test "a non-bash approval made again after a shell refresh adds no second queued grant" {
+    const alloc = std.testing.allocator;
+    var prompt = try makePrompt(alloc, "grant", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+
+    try appendGrantToQueuedPrompt(alloc, &prompt, "edit", "/tmp/workspace/a.zig", 0);
+    try appendGrantToQueuedPrompt(alloc, &prompt, "edit", "/tmp/workspace/a.zig", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), prompt.grants.len);
 }
