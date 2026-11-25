@@ -3754,10 +3754,17 @@ fn mapTerminalAnswer(
 ) ![]u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     const ordinal = std.fmt.parseInt(usize, trimmed, 10) catch 0;
-    if (ordinal > 0 and ordinal <= options.len) {
-        if (submission == .choice) return alloc.print("{{\"option\":{d}}}", .{ordinal - 1});
-        return alloc.dupe(u8, options[ordinal - 1].label);
+    if (submission == .choice) {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (ordinal > 0 and ordinal <= options.len) {
+            try out.writer.print("{{\"option\":{d}}}", .{ordinal - 1});
+        } else {
+            try std.json.Stringify.value(.{ .value = trimmed }, .{}, &out.writer);
+        }
+        return out.toOwnedSlice();
     }
+    if (ordinal > 0 and ordinal <= options.len) return alloc.dupe(u8, options[ordinal - 1].label);
     for (options) |option| {
         if (std.mem.eql(u8, trimmed, option.label)) return alloc.dupe(u8, option.label);
     }

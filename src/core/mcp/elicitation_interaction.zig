@@ -7,6 +7,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -167,6 +168,14 @@ const FieldAnswer = union(enum) {
     cancelled,
     declined,
     value: ?[]u8,
+    /// A single-select answer with the index of its option, so the review shows that
+    /// option's label even when another option has the same value.
+    choice: ChosenChoice,
+};
+
+const ChosenChoice = struct {
+    json: []u8,
+    index: usize,
 };
 
 const FillAction = enum {
@@ -250,6 +259,7 @@ fn answerForm(
                 },
                 else => return err,
             };
+            var chosen_index: ?usize = null;
             const value = switch (answer) {
                 .declined => return alloc.dupe(u8, "{\"action\":\"decline\"}"),
                 .cancelled => {
@@ -257,12 +267,21 @@ fn answerForm(
                     break;
                 },
                 .value => |value| value,
+                .choice => |chosen| blk: {
+                    chosen_index = chosen.index;
+                    break :blk chosen.json;
+                },
             };
             if (current.json) |previous| alloc.free(previous);
             current.json = value;
             if (current.choice_label) |previous| alloc.free(previous);
             current.choice_label = null;
-            current.choice_label = if (value) |json| try choiceLabelFor(alloc, field, json) else null;
+            current.choice_label = if (chosen_index) |index|
+                try choiceLabelAlloc(alloc, field.choices, &.{}, index)
+            else if (value) |json|
+                try choiceLabelFor(alloc, field, json)
+            else
+                null;
             current.answered = true;
         }
         if (cancelled) return alloc.dupe(u8, "{\"action\":\"cancel\"}");
@@ -361,6 +380,7 @@ fn answerField(
             alloc,
             server_name,
             field,
+            current.choice_label,
             current.json,
             deadline_ms,
             cancel_flag,
@@ -596,6 +616,7 @@ fn askToKeepCurrentValue(
     alloc: Allocator,
     server_name: []const u8,
     field: elicitation.Field,
+    current_label: ?[]const u8,
     current_json: ?[]const u8,
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
@@ -603,7 +624,10 @@ fn askToKeepCurrentValue(
 ) Error!KeepCurrentDecision {
     const display_name = try terminalSafeAlloc(alloc, field.displayName());
     defer alloc.free(display_name);
-    const display_value = if (current_json) |json|
+    // A choice label is already terminal-safe, so it is shown as it is.
+    const display_value = if (current_label) |label|
+        try alloc.dupe(u8, label)
+    else if (current_json) |json|
         try terminalSafeAlloc(alloc, json)
     else
         try alloc.dupe(u8, "(skipped)");
@@ -901,7 +925,8 @@ fn validateNumberAnswer(
 const ambiguous_choice_attempts = 3;
 const ambiguous_choice_notice = "That matches more than one choice. Type its number.";
 
-/// Asks a single-select field and returns the chosen value as JSON.
+/// Asks a single-select field and returns the chosen value as JSON, with the index of
+/// the chosen option.
 fn singleSelectAnswer(
     alloc: Allocator,
     field: elicitation.Field,
@@ -919,13 +944,13 @@ fn singleSelectAnswer(
         error.InvalidResponse => return error.InvalidAnswer,
         else => return err,
     };
-    return .{ .value = value };
+    return .{ .choice = .{ .json = value, .index = index } };
 }
 
 /// Asks one single-select question and returns the index of the chosen option, or null
-/// when the user cancels. A surface names a chosen option by its index as `{"option":N}`.
-/// Any other answer is text, and it names an option only when exactly one label equals
-/// it. Text that equals several labels asks again with a notice.
+/// when the user cancels. A surface answers with JSON only: `{"option":N}` names option N,
+/// and `{"value":S}` carries typed text S, which names the option whose label equals S.
+/// Text that equals several labels asks again with a notice.
 fn askChoiceIndex(
     alloc: Allocator,
     question: []const u8,
@@ -935,7 +960,7 @@ fn askChoiceIndex(
     questioner: Questioner,
 ) Error!?usize {
     var notice = false;
-    for (0..ambiguous_choice_attempts) |_| {
+    for (0..ambiguous_choice_attempts) |attempt| {
         const asked = if (notice)
             try alloc.print("{s}\n{s}", .{ question, ambiguous_choice_notice })
         else
@@ -950,9 +975,21 @@ fn askChoiceIndex(
         switch (try choiceAnswerIndex(alloc, options, answer)) {
             .none => return error.InvalidAnswer,
             .one => |index| return index,
-            .many => notice = true,
+            .many => {
+                debug_trace.logf(
+                    "mcp",
+                    "mcp elicitation dropped an ambiguous typed choice answer: it matched more than one choice attempt={d} of {d}",
+                    .{ attempt + 1, ambiguous_choice_attempts },
+                );
+                notice = true;
+            },
         }
     }
+    debug_trace.logf(
+        "mcp",
+        "mcp elicitation dropped the typed choice answer: every answer matched more than one choice",
+        .{},
+    );
     return error.InvalidAnswer;
 }
 
@@ -962,20 +999,28 @@ const ChoiceAnswer = union(enum) {
     many,
 };
 
+/// The answer to a single-select question: `{"option":N}` or `{"value":S}`, and nothing else.
+const ChoiceWire = struct {
+    option: ?usize = null,
+    value: ?[]const u8 = null,
+};
+
 fn choiceAnswerIndex(
     alloc: Allocator,
     options: []const types.QuestionOption,
     answer: []const u8,
 ) Error!ChoiceAnswer {
-    const parsed = json_decode.parseFromSlice(struct {
-        option: usize,
-    }, alloc, answer, .{}) catch |err| {
+    const parsed = json_decode.parseFromSlice(ChoiceWire, alloc, answer, .{}) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return labelMatch(options, answer);
+        return error.InvalidAnswer;
     };
     defer parsed.deinit();
-    if (parsed.value.option >= options.len) return .none;
-    return .{ .one = parsed.value.option };
+    if (parsed.value.option) |index| {
+        if (parsed.value.value != null) return error.InvalidAnswer;
+        return if (index < options.len) .{ .one = index } else .none;
+    }
+    const text = parsed.value.value orelse return error.InvalidAnswer;
+    return labelMatch(options, text);
 }
 
 fn labelMatch(options: []const types.QuestionOption, answer: []const u8) ChoiceAnswer {
@@ -1261,16 +1306,16 @@ test "interaction review shows every validated current value before submission" 
     const alloc = std.testing.allocator;
     var fixture = Fixture{
         .answers = &.{
-            "A1",           "Edit",
-            "Ada",          "0.5",
-            "42",           "True",
-            "Red",          "Include",
-            "Exclude",      "Edit",
-            "Edit value",   "Bea",
-            "Keep current", "Keep current",
-            "Keep current", "Keep current",
-            "Edit value",   "Exclude",
-            "Include",      "Submit",
+            "A1",                  "Edit",
+            "Ada",                 "0.5",
+            "42",                  "True",
+            "{\"value\":\"Red\"}", "Include",
+            "Exclude",             "Edit",
+            "Edit value",          "Bea",
+            "Keep current",        "Keep current",
+            "Keep current",        "Keep current",
+            "Edit value",          "Exclude",
+            "Include",             "Submit",
         },
         .expected_review_values = &.{
             "- name: \"Bea\"",
@@ -1303,7 +1348,7 @@ test "interaction review shows every validated current value before submission" 
 test "interaction review shows the enumNames title of an enum choice" {
     const alloc = std.testing.allocator;
     var fixture = Fixture{
-        .answers = &.{ "Small", "Submit" },
+        .answers = &.{ "{\"value\":\"Small\"}", "Submit" },
         .expected_review_values = &.{"- Size: Small"},
     };
     const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
@@ -1327,7 +1372,7 @@ test "interaction review shows the enumNames title of an enum choice" {
 test "titled choices have no number and answer by title, and a repeated title keeps its value" {
     const alloc = std.testing.allocator;
     var fixture = Fixture{
-        .answers = &.{ "Decline (c)", "Submit" },
+        .answers = &.{ "{\"value\":\"Decline (c)\"}", "Submit" },
         .require_terminal_safe = true,
         .expected_display_fragments = &.{ "Decline (a)", "Cancel", "Decline (c)" },
     };
@@ -1352,7 +1397,7 @@ test "titled choices have no number and answer by title, and a repeated title ke
 test "a typed label that matches two choices asks again, and a chosen index names its own choice" {
     const alloc = std.testing.allocator;
     var fixture = Fixture{
-        .answers = &.{ "Decline (c)", "{\"option\":2}", "Submit" },
+        .answers = &.{ "{\"value\":\"Decline (c)\"}", "{\"option\":2}", "Submit" },
         .require_terminal_safe = true,
         .expected_display_fragments = &.{"That matches more than one choice. Type its number."},
     };
@@ -1372,6 +1417,42 @@ test "a typed label that matches two choices asks again, and a chosen index name
         response,
     );
     try std.testing.expect(fixture.saw_all_expected_display_fragments);
+}
+
+test "a typed title that looks like an option index names its own choice" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{
+        .answers = &.{ "{\"value\":\"{\\\"option\\\":1}\"}", "Submit" },
+    };
+    const required = @import("../tooling/tool_mcp_runtime.zig").InputRequired{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"{\"option\":1}"},{"const":"b","title":"Beta"}]}},"required":["choice"]}}}}
+        ,
+    };
+    const response = try respond(alloc, Fixture.origin(), required, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings(
+        "{\"form\":{\"action\":\"accept\",\"content\":{\"choice\":\"a\"}}}",
+        response,
+    );
+}
+
+test "a titled choice list refuses a repeated value, so no two options share one" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{} };
+    try std.testing.expectError(error.InvalidInputRequired, respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Reply","requestedSchema":{"type":"object","properties":{"choice":{"type":"string","title":"Reply","oneOf":[{"const":"a","title":"One"},{"const":"a","title":"Two"}]}},"required":["choice"]}}}}
+        ,
+    }, .{
+        .questioner = fixture.questioner(),
+        .browser = fixture.browser(),
+        .capabilities = .{ .form = true },
+    }));
 }
 
 test "compact menu label for a choice titled like a control keeps its value" {
@@ -1637,7 +1718,7 @@ test "elicitation presentation terminal-safes every untrusted display value" {
     var fixture = Fixture{
         .answers = &.{
             "value\x1b]52;c;answer\x07\nnext",
-            "Choice\\x1b]52;c;option\\x07",
+            "{\"value\":\"Choice\\\\x1b]52;c;option\\\\x07\"}",
             "Submit",
         },
         .require_terminal_safe = true,
@@ -1830,7 +1911,7 @@ test "compact form keeps review for short text numbers and booleans" {
 
 test "compact form keeps review for four choices" {
     const alloc = std.testing.allocator;
-    var fixture = Fixture{ .answers = &.{ "a", "Submit" } };
+    var fixture = Fixture{ .answers = &.{ "{\"value\":\"a\"}", "Submit" } };
     const response = try respond(alloc, Fixture.origin(), .{
         .input_requests_json =
         \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","enum":["a","b","c","d"]}},"required":["name"]}}}}

@@ -1496,12 +1496,19 @@ describe("fx ask presentation", () => {
         fakeGatewayFinalText("Team saved.\n"),
       ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
       gateways.push(gateway);
+      const tracePath = join(root.root, "fx-trace.log");
 
       const session = await TmuxSession.create({
         isolated: true,
         cmd: terminalCommand(["ask", "--auto", "--no-save", "Choose the team."]),
         cwd: root.workspace,
-        env: { ...gatewayEnv(root.home, gateway), FX_MODEL: MCP_MODEL, NO_COLOR: undefined },
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_MODEL: MCP_MODEL,
+          NO_COLOR: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "mcp",
+        },
         width: 100,
         height: 40,
         minimumHistoryLines: 200,
@@ -1521,8 +1528,94 @@ describe("fx ask presentation", () => {
       await session.waitForText("Team saved.", TIMEOUT);
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain('"answer":"d"');
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("dropped an ambiguous typed choice answer");
+      expect(trace).not.toContain("Decline (c)");
     },
     90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "a typed title shaped like an option index names its own choice",
+    async () => {
+      const root = createRoot();
+      writeMcpFormProfile(root, {
+        type: "string",
+        title: "Team",
+        oneOf: [
+          { const: "a", title: '{"option":1}' },
+          { const: "b", title: "Beta" },
+        ],
+      });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: MCP_TOOL }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: MCP_TOOL, arguments: { text: "hello" } }),
+        fakeGatewayFinalText("Team saved.\n"),
+      ], { models: [{ id: MCP_MODEL, type: "language", tags: ["tool-use"] }] });
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Choose the team."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_MODEL: MCP_MODEL, NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Choose a number or enter a value:", 60_000);
+      await session.sendText('{"option":1}');
+      await session.waitForText("Current values:", TIMEOUT);
+      const review = await session.captureFullScrollback();
+      expect(review).toContain('- Team: {"option":1}');
+      expect(review).not.toContain("- Team: Beta");
+
+      await session.sendText("1");
+      await session.waitForText("Team saved.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      expect(readFileSync(join(root.root, "mcp-wire.jsonl"), "utf8")).toContain('"answer":"a"');
+    },
+    90_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "fx ask in a terminal answers ask_user_question as unavailable and opens no choice prompt",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("question", "ask_user_question", {
+          questions: [{
+            question: "Pick one",
+            options: [{ label: "Alpha", description: "First" }, { label: "Beta", description: "Second" }],
+          }],
+        }),
+        fakeGatewayFinalText("Question unavailable handled.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Ask me a question."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 100,
+        height: 40,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+      });
+      sessions.push(session);
+
+      await session.waitForText("Question unavailable handled.", TIMEOUT);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const screen = await session.captureFullScrollback();
+      expect(screen).not.toContain("Choose a number or enter a value:");
+      expect(screen).not.toContain("Pick one");
+      expect(gateway.requests[1]?.body).toContain("only available in the interactive shell");
+    },
+    TIMEOUT,
   );
 });
 

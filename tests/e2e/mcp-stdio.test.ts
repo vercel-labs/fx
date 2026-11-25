@@ -4307,7 +4307,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       expect(review).toContain("- age: 42");
       expect(review).toContain("- ratio: 0.5");
       expect(review).toContain("- enabled: true");
-      expect(review).toContain('- color: "blue"');
+      expect(review).toContain("- color: Blue");
       expect(review).toContain('- tags: ["a"]');
       await tui.sendText("2");
 
@@ -4327,7 +4327,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.sendText("2");
       await tui.waitForText("MCP server fixture requests enabled", 20_000);
       await tui.sendText("2");
-      await tui.waitForText('current value for color is "blue"', 20_000);
+      await tui.waitForText("current value for color is Blue", 20_000);
       await tui.sendText("2");
       await tui.waitForText("MCP server fixture requests color", 20_000);
       await tui.sendText("1");
@@ -4343,7 +4343,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       expect(review).toContain("- age: 43");
       expect(review).toContain("- ratio: 0.75");
       expect(review).toContain("- enabled: false");
-      expect(review).toContain('- color: "red"');
+      expect(review).toContain("- color: Red");
       expect(review).toContain('- tags: ["b"]');
       await tui.sendText("1");
       await tui.waitForText("Interactive Ask full form complete.", 20_000);
