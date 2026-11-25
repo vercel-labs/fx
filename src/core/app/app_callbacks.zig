@@ -93,6 +93,42 @@ fn preparedDiffPayloadWithFullAllocator(
     );
 }
 
+const out_of_credits_options = [_]types.QuestionOption{
+    .{ .label = "I added credits, retry", .description = "Send the request again." },
+    .{ .label = "Switch to another model", .description = "Open the model picker with your message back in the composer." },
+    .{ .label = "Cancel this turn", .description = "Stop this request." },
+};
+
+/// The out-of-credits picker's choice for `label`, the option picked. Only a
+/// retry goes on with the turn, so only it marks `worker`'s work for Herdr.
+fn outOfCreditsChoice(worker: *worker_runtime.WorkerRuntime, label: []const u8) agent_runtime.OutOfCreditsChoice {
+    if (std.mem.eql(u8, label, out_of_credits_options[0].label)) {
+        worker.markBeganWork();
+        return .retry;
+    }
+    if (std.mem.eql(u8, label, out_of_credits_options[1].label)) return .switch_model;
+    return .cancel;
+}
+
+test "only the out-of-credits retry marks the turn as working" {
+    const alloc = std.testing.allocator;
+    // The user's answer to the picker marks nothing by itself (the worker's
+    // test "a turn's start, an accepted answer or approval, and a continued
+    // request mark began work until it is taken"); the choice does.
+    const expected = [_]agent_runtime.OutOfCreditsChoice{ .retry, .switch_model, .cancel };
+    for (out_of_credits_options, expected) |option, choice| {
+        var worker = worker_runtime.WorkerRuntime{};
+        defer worker.deinit(alloc);
+        try std.testing.expectEqual(choice, outOfCreditsChoice(&worker, option.label));
+        try std.testing.expectEqual(choice == .retry, worker.takeBeganWork());
+    }
+    // Esc on the picker answers nothing, which cancels.
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try std.testing.expectEqual(agent_runtime.OutOfCreditsChoice.cancel, outOfCreditsChoice(&worker, ""));
+    try std.testing.expect(!worker.takeBeganWork());
+}
+
 test "prepared preview formatter preserves context and informative elision" {
     const preview: diff_mod.FileChangePreview = .{
         .path = "note.txt",
@@ -345,7 +381,12 @@ pub fn Bindings(comptime App: type) type {
                     .asked = if (comptime @hasDecl(@TypeOf(agent.worker), "askedCompactionActivity")) askedCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
-                    if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
+                    if (agent.session_persistence.v2 != null)
+                        agentAppendTurnPiece
+                    else if (comptime runtime_profile.allows(App, .js_host_sessions))
+                        agentSaveJsHostTurnPiece
+                    else
+                        null
                 else
                     null,
                 .record_usage = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -366,6 +407,10 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .save_recovery_record = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentSaveRecoveryRecord else null
+                else
+                    null,
+                .mark_turn_yielded = if (comptime agents.hasAgentField(App, "session_persistence"))
+                    if (agent.session_persistence.v2 != null) agentMarkTurnYielded else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -392,6 +437,10 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .ask_out_of_credits = if (comptime @hasDecl(@TypeOf(agent.worker), "requestRouteRecoveryAnswerBlocking"))
                     agentAskOutOfCredits
+                else
+                    null,
+                .stored_sign_in_resumed = if (comptime @hasDecl(@TypeOf(agent.worker), "markBeganWork"))
+                    agentStoredSignInResumed
                 else
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
@@ -1317,9 +1366,19 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).appendTurnPiece(agent, progress);
         }
 
+        fn agentSaveJsHostTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).saveJsHostTurnPiece(appOf(agent), agent, progress);
+        }
+
         fn agentSaveRecoveryRecord(ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             return app_session_runtime.Runtime(App).saveRecoveryRecord(agent, record);
+        }
+
+        fn agentMarkTurnYielded(ctx: *anyopaque) anyerror!void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).markTurnYielded(agent);
         }
 
         fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
@@ -1552,14 +1611,9 @@ pub fn Bindings(comptime App: type) type {
         /// picker cancels.
         fn agentAskOutOfCredits(ctx: *anyopaque) !agent_runtime.OutOfCreditsChoice {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const options = [_]types.QuestionOption{
-                .{ .label = "I added credits, retry", .description = "Send the request again." },
-                .{ .label = "Switch to another model", .description = "Open the model picker with your message back in the composer." },
-                .{ .label = "Cancel this turn", .description = "Stop this request." },
-            };
             const entry = types.QuestionBatchEntry{
                 .question = "Out of credits. What should fx do?",
-                .options = &options,
+                .options = &out_of_credits_options,
             };
             const answers = try agent.worker.requestRouteRecoveryAnswerBlocking(std.heap.c_allocator, &.{entry});
             defer if (answers) |owned| {
@@ -1567,9 +1621,12 @@ pub fn Bindings(comptime App: type) type {
                 std.heap.c_allocator.free(owned);
             };
             const label = if (answers) |owned| (if (owned.len > 0) owned[0] else "") else "";
-            if (std.mem.eql(u8, label, options[0].label)) return .retry;
-            if (std.mem.eql(u8, label, options[1].label)) return .switch_model;
-            return .cancel;
+            return outOfCreditsChoice(&agent.worker, label);
+        }
+
+        fn agentStoredSignInResumed(ctx: *anyopaque) void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            agent.worker.markBeganWork();
         }
 
         fn agentFormatToolExecutionError(ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {

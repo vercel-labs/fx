@@ -184,6 +184,11 @@ pub const QueuedPrompt = struct {
     /// The request a previous fx process left unfinished, which this turn's
     /// first model request resumes.
     recovery_resume: ?types.RecoveryResume = null,
+    /// Continues a turn that yielded for an upgrade's restart, from
+    /// `recovery_checkpoint`. `recovery_resume` still decides whether the
+    /// first request goes at once or asks first; this keeps the user's own
+    /// message and the turn's pieces, with no resume note.
+    continues_yielded_turn: bool = false,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -548,6 +553,10 @@ pub const WorkerEvent = union(enum) {
     /// A turn that resumes a request a previous fx process left unfinished.
     /// Its prompt is fx's note to the model, so no user card is written.
     begin_resumed_prompt: u64,
+    /// A turn that continues one which stopped between steps for an
+    /// upgrade's restart. Its prompt is the user's own, which the replayed
+    /// transcript already shows, so no user card is written.
+    begin_continued_prompt: u64,
     append_user_feedback: []u8,
     /// A subagent's report or message a boundary took into the running
     /// turn. The screen shows it as the subagent's card, never as the user's.
@@ -626,6 +635,12 @@ pub const WorkerRuntime = struct {
     /// iteration without waiting; read once. Guarded by `worker_mutex`.
     drain_continuation_due: bool = false,
     worker_processing: bool = false,
+    /// Set when a turn begins, or goes on after the user answers its
+    /// question, its approval, or a request that waits for them;
+    /// `takeBeganWork` clears it. A turn can begin
+    /// and end between two looks at its state, as one that ends at once
+    /// after an answer does. Guarded by `worker_mutex`.
+    began_work: bool = false,
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
     /// Allocator used for active call IDs. Allocator handles are capabilities,
@@ -717,6 +732,11 @@ pub const WorkerRuntime = struct {
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
     accepted_input_hooks: ?AcceptedInputHooks = null,
+    /// Set on the main loop when an upgrade's restart waits for this agent
+    /// (Ctrl+G). The running turn reads it at each step boundary and stops
+    /// there (`Config.yield_flag`), and no other work starts while it is set,
+    /// since fx exits once every turn has stopped.
+    yield_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -1036,17 +1056,34 @@ pub const WorkerRuntime = struct {
     }
 
     /// The user answered a request that waits for them, for example with
-    /// Enter. A request that is not waiting ignores it.
+    /// Enter. A request that is not waiting ignores it. Each caller asks only
+    /// while one waits, so the turn goes on (`began_work`).
     pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_continue_requested.store(true, .seq_cst);
     }
 
     /// The sign-in fx opened for a request that waits for one closed without
     /// a new login, for example because its code expired. The request tries
     /// its saved login once more; a request that does not wait for a sign-in
-    /// ignores it.
+    /// ignores it. Its caller asks only while one waits, so the turn goes on
+    /// (`began_work`).
     pub fn requestRecoverySignInClosed(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_sign_in_closed.store(true, .seq_cst);
+    }
+
+    /// A request that waited for the user goes on without a call above, as
+    /// after the out-of-credits picker's retry, or a sign-in another fx
+    /// process stored (`began_work`).
+    pub fn markBeganWork(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
     }
 
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
@@ -1281,6 +1318,11 @@ pub const WorkerRuntime = struct {
         if (reserved and self.reserved_agent_messages > 0) self.reserved_agent_messages -= 1;
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
+        // An agent that stops its turn for fx's restart takes no message
+        // before fx exits, and nothing saves a message across the restart
+        // (a report stays owed in its child's log), so the caller tells
+        // the user what was dropped.
+        if (queued.mail == .message and self.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
         if (!reserved and queued.mail == .message and self.agentMessageCountLocked() >= agent_frame.queue_cap) {
             return error.QueueFull;
         }
@@ -1446,6 +1488,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -2260,6 +2303,20 @@ pub const WorkerRuntime = struct {
         return true;
     }
 
+    /// Asks the running turn to stop at its next step boundary and holds
+    /// every queued work, for an upgrade's restart. There is no release: the
+    /// process exits once every turn has stopped.
+    pub fn requestYield(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.yield_requested.store(true, .seq_cst);
+        // A turn blocked in the subagent `wait` tool returns, so it reaches
+        // its step boundary without waiting for the subagent's report.
+        self.mail_nudged = true;
+        self.worker_cond.broadcast(io_mod.getIo());
+        debug_trace.logf("worker", "event=yield_requested processing={} queued={d}", .{ self.worker_processing, self.queuedWorkCountLocked() });
+    }
+
     /// Whether the queued prompt for `turn_id` carries the stale shell
     /// handles note, so a caller that removes it can give the note back.
     pub fn queuedPromptCarriesStaleShellHandles(self: *WorkerRuntime, turn_id: u64) bool {
@@ -2523,7 +2580,8 @@ pub const WorkerRuntime = struct {
             // Leftover steering is not work: with only that queued, wait on.
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
             const gate_ms = self.commitGateRemainingMsLocked();
-            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or gate_ms != null) and
+            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or
+                gate_ms != null or self.yield_requested.load(.seq_cst)) and
                 !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -2547,7 +2605,8 @@ pub const WorkerRuntime = struct {
             const gate_ms = self.commitGateRemainingMsLocked();
             if (!(((self.queued_prompts.items.len == 0 and
                 self.queued_context_compaction == null) or self.turn_start_held or
-                self.session_transition_held or gate_ms != null) and !self.worker_stop_requested)) break;
+                self.session_transition_held or gate_ms != null or self.yield_requested.load(.seq_cst)) and
+                !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
             self.tool_phase_step_id = null;
@@ -2603,7 +2662,8 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if (self.queued_prompts.items.len == 0 or
             self.turn_start_held or self.session_transition_held or
-            self.worker_stop_requested or self.commitGateRemainingMsLocked() != null)
+            self.worker_stop_requested or self.commitGateRemainingMsLocked() != null or
+            self.yield_requested.load(.seq_cst))
         {
             return null;
         }
@@ -2617,7 +2677,7 @@ pub const WorkerRuntime = struct {
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
             self.session_transition_held or self.worker_stop_requested or
-            self.commitGateRemainingMsLocked() != null)
+            self.commitGateRemainingMsLocked() != null or self.yield_requested.load(.seq_cst))
         {
             return null;
         }
@@ -2631,6 +2691,7 @@ pub const WorkerRuntime = struct {
             self.turn_cancel_requested.store(false, .seq_cst);
             self.worker_cancel_requested.store(false, .seq_cst);
             self.worker_processing = true;
+            self.began_work = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
             self.clearToolYieldLocked();
@@ -2666,7 +2727,11 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_resume != null) {
+        if (queued.continues_yielded_turn) {
+            try self.worker_events.append(alloc, .{
+                .begin_continued_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_resume != null) {
             try self.worker_events.append(alloc, .{
                 .begin_resumed_prompt = queued.turn_id,
             });
@@ -2701,6 +2766,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -2771,6 +2837,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -2904,6 +2971,15 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.worker_processing;
+    }
+
+    /// Whether a turn began or went on since the last call (`began_work`).
+    /// The main loop's Herdr reconcile is its one reader.
+    pub fn takeBeganWork(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        defer self.began_work = false;
+        return self.began_work;
     }
 
     pub fn snapshotState(
@@ -3622,6 +3698,7 @@ pub const WorkerRuntime = struct {
             return blocked;
         }
         std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.began_work = true;
         return .accepted;
     }
 
@@ -3657,6 +3734,7 @@ pub const WorkerRuntime = struct {
             return err;
         };
         std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.began_work = true;
         return .accepted;
     }
 
@@ -3820,6 +3898,9 @@ pub const WorkerRuntime = struct {
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = new_response;
         if (answers != null) {
+            // A route-recovery picker's answer can end the turn; its asker
+            // marks the one that goes on (`markBeganWork`).
+            if (self.pending_question_shared.?.source != .route_recovery) self.began_work = true;
             if (on_resume) |observer| observer.run(observer.ctx);
         }
         self.worker_cond.broadcast(io_mod.getIo());
@@ -5268,6 +5349,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
+        .begin_continued_prompt => |turn_id| .{ .begin_continued_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .append_agent_message => |text| .{ .append_agent_message = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
@@ -5363,7 +5445,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt, .begin_resumed_prompt => {},
+        .begin_presented_prompt, .begin_resumed_prompt, .begin_continued_prompt => {},
         .append_user_feedback, .append_agent_message => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -6076,6 +6158,22 @@ test "interactive prompt after explicit cancellation starts a new visible turn" 
         }
         runtime.finishProcessing();
     }
+}
+
+test "a turn that continues a yielded one begins as continued, not resumed" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var prompt = try makePrompt(alloc, "ok", "model");
+    prompt.turn_id = 42;
+    prompt.recovery_resume = .{};
+    prompt.continues_yielded_turn = true;
+    try runtime.enqueuePrompt(alloc, prompt);
+    const next = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, next);
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expectEqual(@as(u64, 42), runtime.worker_events.items[0].begin_continued_prompt);
+    runtime.finishProcessing();
 }
 
 test "sequential tool lifecycle does not inspect compatible allocator context identities" {
@@ -7226,6 +7324,30 @@ test "another agent's messages past the cap are refused, and reports never are" 
     runtime.releaseAgentMessage();
     try std.testing.expect(runtime.reserveAgentMessage());
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a message to an agent that stops for fx's restart is refused, and a report still waits" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    runtime.requestYield();
+    // The message's place was held before the yield.
+    try std.testing.expect(runtime.reserveAgentMessage());
+    var message = try makePrompt(alloc, "a message", "model");
+    message.mail = .message;
+    try std.testing.expectError(error.ReceiverRestarting, runtime.postReservedMail(alloc, message));
+    freeQueuedPrompt(alloc, message);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), runtime.reserved_agent_messages);
+
+    // A report still queues: it stays owed in its child's log and comes again after the restart.
+    var report = try makePrompt(alloc, "a report", "model");
+    report.mail = .report;
+    try runtime.postMail(alloc, report);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "a user's stop drops other agents' messages waiting in the queue, and keeps reports and the user's prompts" {
@@ -9712,6 +9834,64 @@ test "question resume observer runs only for accepted answers before releasing t
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
+test "a turn's start, an accepted answer or approval, and a continued request mark began work until it is taken" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(!runtime.takeBeganWork());
+
+    try std.testing.expect(runtime.beginDirectProcessing(1));
+    try std.testing.expect(runtime.takeBeganWork());
+    try std.testing.expect(!runtime.takeBeganWork());
+
+    runtime.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    try std.testing.expect(runtime.takeBeganWork());
+
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+    const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.accepted,
+        submitPermissionDecisionForTest(&runtime, request_id, .once),
+    );
+    thread.join();
+    try std.testing.expect(runtime.takeBeganWork());
+
+    // Enter, a sign-in, or the parent's message continues a request that
+    // waits for the user.
+    runtime.requestRecoveryContinue();
+    try std.testing.expect(runtime.recovery_continue_requested.load(.seq_cst));
+    try std.testing.expect(runtime.takeBeganWork());
+
+    // A sign-in that closed without a login tries the saved one again.
+    runtime.requestRecoverySignInClosed();
+    try std.testing.expect(runtime.recovery_sign_in_closed.load(.seq_cst));
+    try std.testing.expect(runtime.takeBeganWork());
+
+    runtime.finishProcessing();
+
+    // An answer to a route-recovery picker marks nothing by itself: only the
+    // choice that goes on does.
+    var picker = WorkerRuntime{};
+    defer picker.deinit(alloc);
+    picker.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .route_recovery);
+    try picker.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    try std.testing.expect(picker.pending_question_response == .answered);
+    try std.testing.expect(!picker.takeBeganWork());
+    picker.markBeganWork();
+    try std.testing.expect(picker.takeBeganWork());
+
+    // A cancelled question ends its turn: no work goes on.
+    var cancelled = WorkerRuntime{};
+    defer cancelled.deinit(alloc);
+    cancelled.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+    try cancelled.submitQuestionBatchAnswer(alloc, null, null);
+    try std.testing.expect(!cancelled.takeBeganWork());
+}
+
 test "question batch source distinguishes route recovery from agent questions" {
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Try again later", .description = null }};
@@ -9858,6 +10038,26 @@ test "session transition hold keeps an existing queued prompt until released" {
     defer freeQueuedPrompt(alloc, prompt);
     try std.testing.expectEqualStrings("queued", prompt.prompt);
     try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+}
+
+test "a yield request holds queued work and stays held" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "test/model"));
+    runtime.requestYield();
+    try std.testing.expect(runtime.yield_requested.load(.seq_cst));
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    // The held prompt stays queued for the process to drop when it exits.
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "a yield request ends a wait for subagent mail" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.nudged, runtime.waitForPostOrNudge());
 }
 
 test "a time-bounded put-back hands its segment scan to the next take only" {

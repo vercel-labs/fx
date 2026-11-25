@@ -2743,6 +2743,42 @@ test "a provisional tail continues the committed text of its turn without a seco
     try expectRowTrimmedEquals(&h, second_row + 1, "  third words");
 }
 
+test "a provisional tail keeps the blank rows its committed text ends with" {
+    const cases = [_]struct { gap: []const u8, blank_rows: u16 }{
+        .{ .gap = "\n", .blank_rows = 0 },
+        .{ .gap = "\n\n", .blank_rows = 1 },
+        .{ .gap = "\n\n\n", .blank_rows = 2 },
+    };
+    for (cases) |case| {
+        var h = try Harness.init(std.testing.allocator, 40, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        var processor = assistant_presentation.MarkdownProcessor{};
+        defer processor.deinit(h.alloc);
+        var committed: std.ArrayList(u8) = .empty;
+        defer committed.deinit(h.alloc);
+        try processor.push(h.alloc, "First paragraph", &committed);
+        try processor.push(h.alloc, case.gap, &committed);
+        try processor.push(h.alloc, "Second", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        committed.clearRetainingCapacity();
+
+        try applyProvisionalTail(&h, &processor);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        const first_row = try findRowContaining(&h, "First paragraph");
+        const open_row = try findRowContaining(&h, "Second");
+        try std.testing.expectEqual(first_row + 1 + case.blank_rows, open_row);
+
+        try processor.push(h.alloc, " paragraph\n", &committed);
+        _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, committed.items);
+        try h.renderTranscriptFrame();
+        try h.flush();
+        try std.testing.expectEqual(open_row, try findRowContaining(&h, "Second paragraph"));
+    }
+}
+
 test "a provisional tail after a user prompt keeps the footer gap of its committed text" {
     var h = try Harness.init(std.testing.allocator, 96, 10, 4);
     defer h.deinit();

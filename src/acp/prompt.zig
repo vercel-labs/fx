@@ -3720,9 +3720,13 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
-        if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
-            journal.yieldsAt(io_mod.milliTimestamp()))
-        {
+        const kind: libfx_journal.QuiesceKind = if (!checkpoint.outstanding_reservation)
+            .other
+        else if (checkpoint.cause == .compaction_prepared)
+            .compaction
+        else
+            .request;
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
