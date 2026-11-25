@@ -10937,18 +10937,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
 const LIST_HINT = "enter switch";
 
-// The agent list's rows, top to bottom, from a capture with its escapes: each
-// one's name, "main" or a subagent's own, and whether it is the selected row,
-// which the list draws bold and the others dim. A subagent's own subagents sit
-// one branch further in.
-function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean }> {
-  const rows: Array<{ name: string; selected: boolean }> = [];
-  for (const line of paneEscapes.split("\n")) {
-    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-    const row = /^ {2}(?:(main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
-    if (row) rows.push({ name: (row[1] ?? row[2])!, selected: line.includes("\x1b[1m") });
-  }
-  return rows;
+// A promise the fake resolves when it records a value, so a test waits on the
+// record itself instead of sampling for it.
+function heldValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
+
+// Awaits `promise`, failing with `what` when it is not settled within `ms`. The
+// race only bounds the wait: what the test waits on is the signal the fake sends.
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  const expired = new Promise<never>((_, reject) => {
+    AbortSignal.timeout(ms).addEventListener("abort", () => reject(new Error(`timed out waiting for ${what}`)), { once: true });
+  });
+  return await Promise.race([promise, expired]);
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
@@ -10959,28 +10962,18 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
-  await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+  // The list's header is gone once Enter kept the highlighted agent.
+  await session.waitForPane((pane) => !pane.includes("Agents 1"), 10_000);
 }
 
-// Opens the agent list and moves its highlight to `agent`'s row.
+// Opens the agent list and highlights `agent`'s row: the list's search box
+// narrows the rows to that agent's own, and it reports how many it kept, so the
+// state to wait for is its one-row header.
 async function selectAgent(session: TmuxSession, agent: string) {
   await session.sendKeys("C-x");
   await session.waitForText(LIST_HINT, 10_000);
-  const deadline = Date.now() + 15_000;
-  let rows = agentRows(await session.capturePaneEscapes());
-  for (;;) {
-    const target = rows.findIndex((row) => row.name === agent);
-    const selected = rows.findIndex((row) => row.selected);
-    if (target !== -1 && target === selected) break;
-    if (Date.now() > deadline) throw new Error(`the agent list never selected ${agent}: ${JSON.stringify(rows)}`);
-    const before = JSON.stringify(rows);
-    if (target !== -1 && selected !== -1) await session.sendKeys(target > selected ? "Down" : "Up");
-    const step = Math.min(deadline, Date.now() + 2_000);
-    do {
-      await Bun.sleep(25);
-      rows = agentRows(await session.capturePaneEscapes());
-    } while (JSON.stringify(rows) === before && Date.now() < step);
-  }
+  await session.sendLiteral(agent);
+  await session.waitForPane((pane) => pane.includes("Agents 1"), 15_000);
 }
 
 // The person opens the subagent's own screen and types a task there, so its turn
@@ -11010,7 +11003,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
     // main's side.
     let releaseTask!: () => void;
     const backOnMain = new Promise<void>((resolve) => (releaseTask = resolve));
-    let childReadBack = false;
+    const childReadBack = heldValue<void>();
     const gateway = startDynamicFakeGateway(async (body) => {
       // The child's report starts main's next turn.
       // A typed turn owes no report; only the ready turn's report reaches main.
@@ -11031,7 +11024,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         childRequests++;
         if (hasCurrentToolResult(body, "after-approval")) {
           expect(toolResultOutput(body, "after-approval")).toContain("AFTER_APPROVAL");
-          childReadBack = true;
+          childReadBack.resolve();
           return fakeGatewayFinalText("CHILD_RECOVERED");
         }
         if (hasCurrentToolResult(body, "approval-search")) {
@@ -11061,9 +11054,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");
-      const deadline = Date.now() + 15_000;
-      while (!childReadBack && Date.now() < deadline) await Bun.sleep(25);
-      expect(childReadBack).toBe(true);
+      await within(childReadBack.promise, 15_000, "the child to read notes.txt back");
       await session.waitForStableComposer(15_000);
       expect(childRequests).toBe(3);
       const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));

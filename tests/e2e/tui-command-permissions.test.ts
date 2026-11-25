@@ -4022,18 +4022,21 @@ describe("effect-aware command permissions", () => {
 
 const LIST_HINT = "enter switch";
 
-// The agent list's rows, top to bottom, from a capture with its escapes: each
-// one's name, "main" or a subagent's own, and whether it is the selected row,
-// which the list draws bold and the others dim. A subagent's own subagents sit
-// one branch further in.
-function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean }> {
-  const rows: Array<{ name: string; selected: boolean }> = [];
-  for (const line of paneEscapes.split("\n")) {
-    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-    const row = /^ {2}(?:(main)|(?:[\u2502 ] )?[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
-    if (row) rows.push({ name: (row[1] ?? row[2])!, selected: line.includes("\x1b[1m") });
-  }
-  return rows;
+// A promise the fake resolves when it records a value, so a test waits on the
+// record itself instead of sampling for it.
+function heldValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
+
+// Awaits `promise`, failing with `what` when it is not settled within `ms`. The
+// race only bounds the wait: what the test waits on is the signal the fake sends.
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  const expired = new Promise<never>((_, reject) => {
+    AbortSignal.timeout(ms).addEventListener("abort", () => reject(new Error(`timed out waiting for ${what}`)), { once: true });
+  });
+  return await Promise.race([promise, expired]);
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
@@ -4044,28 +4047,18 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
-  await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+  // The list's header is gone once Enter kept the highlighted agent.
+  await session.waitForPane((pane) => !pane.includes("Agents 1"), 10_000);
 }
 
-// Opens the agent list and moves its highlight to `agent`'s row.
+// Opens the agent list and highlights `agent`'s row: the list's search box
+// narrows the rows to that agent's own, and it reports how many it kept, so the
+// state to wait for is its one-row header.
 async function selectAgent(session: TmuxSession, agent: string) {
   await session.sendKeys("C-x");
   await session.waitForText(LIST_HINT, 10_000);
-  const deadline = Date.now() + 15_000;
-  let rows = agentRows(await session.capturePaneEscapes());
-  for (;;) {
-    const target = rows.findIndex((row) => row.name === agent);
-    const selected = rows.findIndex((row) => row.selected);
-    if (target !== -1 && target === selected) break;
-    if (Date.now() > deadline) throw new Error(`the agent list never selected ${agent}: ${JSON.stringify(rows)}`);
-    const before = JSON.stringify(rows);
-    if (target !== -1 && selected !== -1) await session.sendKeys(target > selected ? "Down" : "Up");
-    const step = Math.min(deadline, Date.now() + 2_000);
-    do {
-      await Bun.sleep(25);
-      rows = agentRows(await session.capturePaneEscapes());
-    } while (JSON.stringify(rows) === before && Date.now() < step);
-  }
+  await session.sendLiteral(agent);
+  await session.waitForPane((pane) => pane.includes("Agents 1"), 15_000);
 }
 
 // The person opens the subagent's own screen and types a task there, so its turn
@@ -4094,7 +4087,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       // beside this one covers main's side.
       let releaseTask!: () => void;
       const backOnMain = new Promise<void>((resolve) => (releaseTask = resolve));
-      let childDenial: string | null = null;
+      const childDenial = heldValue<string>();
       const createId = "direct_child_create";
       const commandId = "direct_child_command";
       writeFileSync(stderrPath, "");
@@ -4106,7 +4099,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         }
         if (body.includes(`\\\"toolCallId\\\":\\\"${commandId}\\\"`) || body.includes(`"toolCallId":"${commandId}"`)) {
           // The person's denial is this call's result, which the child reads.
-          childDenial = body;
+          childDenial.resolve(body);
           return finalText("CHILD_PERMISSION_DENIED");
         }
         // The child's first turn only makes it ready: the person then types the
@@ -4162,10 +4155,9 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       expect(approvalPane).toContain("touch");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendKeys("3");
-      const deadline = Date.now() + TIMEOUT;
-      while (childDenial === null && Date.now() < deadline) await Bun.sleep(25);
       // The child read the denial, and the marker never exists.
-      expect(childDenial ?? "").toContain("Permission denied by user");
+      const denial = await within(childDenial.promise, TIMEOUT, "the child to read the person's denial");
+      expect(denial).toContain("Permission denied by user");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
@@ -4190,7 +4182,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       // The child's request starts in the parent's turn, so the parent hears it
       // as one note and answers it with the subagent tool. The note waits until
       // the test has looked at the screen.
-      let note: string | null = null;
+      const note = heldValue<string>();
       let releaseDeny!: () => void;
       const denyMayGo = new Promise<void>((resolve) => (releaseDeny = resolve));
 
@@ -4202,7 +4194,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
         }
         // The note names the command the child asks for and the child itself.
         if (currentUserText(body).includes("I wait for your approval to run") && !body.includes(denyId)) {
-          note = currentUserText(body);
+          note.resolve(currentUserText(body));
           await denyMayGo;
           return gatewayToolCall("subagent", {
             request: { action: "deny", agent: "helper", message: "Not in this workspace." },
@@ -4248,12 +4240,9 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      const deadline = Date.now() + TIMEOUT;
-      while (note === null && Date.now() < deadline) await Bun.sleep(25);
-      expect(note).not.toBeNull();
       // The note names the exact command and the child that asks, and no screen
       // offers the request to the person.
-      const noteText = note!;
+      const noteText = await within(note.promise, TIMEOUT, "the note to reach the parent");
       expect(noteText).toContain("touch");
       expect(noteText).toContain("child-approval-must-not-exist");
       expect(noteText).toContain("helper");
