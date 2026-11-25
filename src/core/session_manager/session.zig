@@ -30,6 +30,14 @@ const Log = log_mod.Log;
 /// log bytes when the folded state (settings, children) is large.
 pub const default_snapshot_every_bytes: u64 = 64 << 10;
 
+/// Runs right after this process wins a session's lock, with the bytes the
+/// previous holder left in it (empty when none). It runs before this process
+/// writes its own record.
+pub const LockWon = *const fn (io: std.Io, old_line: []const u8) void;
+
+/// The most bytes of a lock that a `LockWon` hook receives.
+const max_lock_line_bytes = 1024;
+
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
     lock_wait_ms: u64 = 2000,
@@ -44,6 +52,9 @@ pub const Options = struct {
     /// the holder. The owner keeps them alive while the env lives. Null clears
     /// any record a holder that died left behind.
     leader_record: ?[]const u8 = null,
+    /// Runs once for each lock this process wins, see `LockWon`. Null when the
+    /// process keeps no leader.
+    lock_won: ?LockWon = null,
 };
 
 /// What every Session of one manager shares. Owned by L4; outlives them.
@@ -1369,6 +1380,7 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     };
     errdefer s.closeFile(lock);
     if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
+    notifyLockWon(env, lock);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1415,6 +1427,15 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         if (!std.mem.eql(u8, parent, own)) return error.ChildSession;
     }
     return .{ .dir = dir, .lock = lock, .log = opened.log, .loaded = loaded };
+}
+
+/// Hands the bytes that a previous holder left in the lock to the hook, when
+/// this process has one.
+fn notifyLockWon(env: *const Env, lock: storage.File) void {
+    const won = env.options.lock_won orelse return;
+    var old_line: [max_lock_line_bytes]u8 = undefined;
+    const read = env.s.readAt(lock, &old_line, 0) catch 0;
+    won(env.s.io, old_line[0..read]);
 }
 
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {

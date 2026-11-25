@@ -17951,6 +17951,56 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "a permission question open at a leader's death is not asked again by the next fx acp, and its tool does not run without a new answer",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-question-");
+      const target = join(root.external, "question.txt");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission: { edit: { [`${root.external}/**`]: "ask" } } }),
+      );
+      const gateway = startFakeGateway([finalText("TURN_ONE"), fileToolCall("question_call_1", target, "held\n")]);
+      const gatewayAfter = startFakeGateway([finalText("AFTER_DEATH_REPLY")]);
+      let owner: AcpClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(owner, "TURN_ONE_PROMPT");
+        owner.holdPermissionRequests();
+        sendPrompt(owner, 10, "QUESTION_PROMPT");
+        await waitForCondition(
+          "the permission question on the owner",
+          () => owner!.rawLines.some((line) => JSON.parse(line).method === "session/request_permission"),
+          TIMEOUT,
+        );
+        await killLeader(owner);
+
+        second = await startSecondLeader(root, gatewayAfter, sessionId);
+        await waitForCondition(
+          "the running turn saved as interrupted",
+          () => logLines(root.home, sessionId).some((line) => line.kind === "turn_interrupted"),
+          TIMEOUT,
+        );
+        const asksAgain = () => second!.rawLines.some((line) => JSON.parse(line).method === "session/request_permission");
+        expect(asksAgain()).toBe(false);
+        expect(existsSync(target)).toBe(false);
+
+        const after = await runPrompt(second, "AFTER_DEATH_PROMPT");
+        expect(after.promptResult.result.stopReason).toBe("end_turn");
+        expect(asksAgain()).toBe(false);
+        expect(existsSync(target)).toBe(false);
+      } finally {
+        await second?.close();
+        await owner?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session modes are the CLI permission modes and start in the saved mode",
     async () => {
       for (const [saved, expected] of [[undefined, "auto"], ["ask", "ask"], ["auto", "auto"], ["yolo", "full-access"], ["full-access", "full-access"]] as const) {

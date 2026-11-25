@@ -2933,6 +2933,7 @@ fn startLeader(state: *ServerState) void {
         leader.stop(io);
         return;
     };
+    store.manager.setLockWon(leader_mod.takeOverDeadLeader);
     host.leader = leader;
 }
 

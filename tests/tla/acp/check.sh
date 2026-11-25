@@ -27,7 +27,7 @@
 # while a turn runs: answered at once, and the running turn keeps its own
 # settings.
 # AcpTakeover: a session after its holder dies: the next holder repairs the turn,
-# removes the dead holder's folder (not built yet; `today` is the code now), and
+# removes the dead holder's folder (built with the takeover; `today` is the code before it), and
 # restores nothing. AcpDisconnect: a client that disconnects: a client that lists
 # sh.fx/keepTurnOnDisconnect keeps its turns, any other's running turn stops,
 # and fx never waits for the gone client.

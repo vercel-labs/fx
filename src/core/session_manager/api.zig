@@ -225,6 +225,13 @@ pub const Manager = struct {
         m.env.options.leader_record = owned;
     }
 
+    /// Sets the hook that each lock this manager wins calls, with the bytes the
+    /// previous holder left (see `session_mod.LockWon`). Call it before any
+    /// session opens.
+    pub fn setLockWon(m: *Manager, hook: session_mod.LockWon) void {
+        m.env.options.lock_won = hook;
+    }
+
     /// The ids of the sessions this manager leads, copied under the lock. The
     /// caller frees each id and the slice.
     pub fn leadingIds(m: *Manager, alloc: std.mem.Allocator) error{OutOfMemory}![][]u8 {
