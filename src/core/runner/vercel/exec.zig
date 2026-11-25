@@ -291,7 +291,24 @@ fn sendKill(shared: *Shared, id: []const u8, signal: u8, total_ms: i64) void {
     var never = std.atomic.Value(bool).init(false);
     // A kill that fails is not retried here. The stop stays unconfirmed until the command's exit is
     // seen, and the run reports that (V10).
-    _ = sandbox.killCommand(arena.allocator(), &never, shared.base, shared.token, shared.trace, shared.team_id, shared.session_id, id, signal, .{ .total_ms = total_ms }) catch {};
+    const status = sandbox.killCommand(
+        arena.allocator(),
+        &never,
+        shared.base,
+        shared.token,
+        shared.trace,
+        shared.team_id,
+        shared.session_id,
+        id,
+        signal,
+        .{ .total_ms = total_ms },
+    ) catch |err| {
+        debug_trace.logf("remote run", "event=kill_failed signal={d} reason={s}", .{ signal, @errorName(err) });
+        return;
+    };
+    if (status < 200 or status > 299) {
+        debug_trace.logf("remote run", "event=kill_refused signal={d} status={d}", .{ signal, status });
+    }
 }
 
 /// One extend call (V12) on the watch thread. A failure is counted, and the run reports the count.

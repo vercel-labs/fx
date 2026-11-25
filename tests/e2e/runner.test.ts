@@ -21,7 +21,6 @@ import {
   fakeLoginToken,
   fakeOtherUser,
   fakeSecondTeam,
-  fakeApiToken,
   fakeTeam,
   fakeUser,
   type RemoteSetupFixture,
@@ -32,7 +31,7 @@ import {
 
 // The `runner` field of `shell`. With the sandbox policy on, the shell schema
 // advertises it, and a run that names it goes to its placement. The sandbox
-// cases use #2153's fake sandbox CLI, so a refused run shows no exec in its log.
+// cases use the fake Vercel API, so a refused run shows no exec request in its log.
 const TIMEOUT = 60_000;
 const HAS_TMUX = tmuxAvailable();
 

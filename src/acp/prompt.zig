@@ -2958,7 +2958,8 @@ fn executeToolCall(
         .operation_cancel_flag = tool_ctx.cancel_flag,
     };
     defer elicitation_responder.deinit();
-    tool_ctx.mcp_input_responder = elicitation_responder.responder();
+    // WASM runs no MCP servers (allow_acp_mcp is false) and no remote setup (A4), so nothing asks it.
+    if (comptime !host_target.is_wasm) tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
     tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;

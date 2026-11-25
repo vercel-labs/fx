@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const host_target = @import("../../core/hosts/target.zig");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const command_contract = @import("../../core/execution/command_contract.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
@@ -1440,6 +1441,7 @@ fn placementFailure(
     err: tool_admission.PlaceError,
     refusal: sandbox_runner.Refusal,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (comptime host_target.is_wasm) return unavailable(ctx);
     const sandbox = ctx.sandbox_policy orelse return unavailable(ctx);
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);
@@ -1497,6 +1499,7 @@ fn remoteSetupRefusal(
     command: []const u8,
     runner: ?sandbox_runner.Request,
 ) tool_dispatch.DispatchError!?[]const u8 {
+    if (comptime host_target.is_wasm) return null;
     const policy = ctx.sandbox_policy orelse return null;
     if (!policy.needsVercelDestination(ctx.workspace_root, command, runner)) return null;
     var no_cancel = std.atomic.Value(bool).init(false);
@@ -1521,6 +1524,7 @@ fn sandboxRefusal(
     ctx: tool_dispatch.DispatchContext,
     command: []const u8,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    if (comptime host_target.is_wasm) return null;
     const sandbox = ctx.sandbox_policy orelse return null;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer mem_utils.deinit_arena(arena_state);

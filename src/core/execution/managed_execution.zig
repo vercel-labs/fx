@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
@@ -1901,7 +1902,9 @@ fn entryCommandContext(
     if (approved.placement_profile) |name| {
         command_ctx.placement_profile = try owned.dupe(u8, name);
     }
-    if (input.sandbox) |source| command_ctx.sandbox = try dupeLaunch(owned, source);
+    if (comptime !host_target.is_wasm) {
+        if (input.sandbox) |source| command_ctx.sandbox = try dupeLaunch(owned, source);
+    }
     return command_ctx;
 }
 

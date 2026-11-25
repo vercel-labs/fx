@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_environment = @import("command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
@@ -113,6 +114,8 @@ fn placedRoute(
     source: ?command_admission.ShellAuthorizationSource,
     grant_epoch: ?u64,
 ) !PreparedCommandRoute {
+    // WASM hosts never place a command (A4), so no launch exists there.
+    if (comptime host_target.is_wasm) return error.SandboxUnavailable;
     const sandbox = command_ctx.sandbox orelse return error.SandboxUnavailable;
     const run_command = try launch.invocation(
         alloc,

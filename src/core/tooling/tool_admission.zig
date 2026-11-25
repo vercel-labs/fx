@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -2389,6 +2390,8 @@ pub fn placeShellCommand(
     runner: ?sandbox_policy.Request,
     refusal: *sandbox_policy.Refusal,
 ) sandbox_policy.PlaceError!sandbox_policy.Placed {
+    // WASM hosts never load the policy (A4), so every command stays local. The early return keeps the placement code out of the WASM builds.
+    if (comptime host_target.is_wasm) return .{ .placement = .local };
     if (!native) {
         // E11: a host without native tools never sends a command away, so a remote request is refused.
         const remote = if (runner) |request| request == .remote else false;
@@ -2422,6 +2425,7 @@ pub fn shellRunRefusal(
     fields: RunFields,
     native: bool,
 ) Allocator.Error!?[]const u8 {
+    if (comptime host_target.is_wasm) return null;
     const active = sandbox orelse return null;
     var refusal: sandbox_policy.Refusal = .{};
     const placed = placeShellCommand(sandbox, arena, workspace_root, command, native, fields.runner, &refusal) catch |err| {
@@ -2542,6 +2546,7 @@ pub fn placementAsApproved(
 /// fields make impossible away from this machine, or any run while the sandbox
 /// config is invalid or its provider cannot run.
 fn commandCallRefusal(input: Input, arena: Allocator, call: ToolCall) !?[]const u8 {
+    if (comptime host_target.is_wasm) return null;
     const active = input.sandbox_policy orelse return null;
     const tool = registeredTool(input, call.name) orelse return null;
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);

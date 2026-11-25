@@ -101,6 +101,7 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const sandbox_policy = @import("../runner/runner.zig");
+const host_target = @import("../hosts/target.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
@@ -1747,7 +1748,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.notification_attention_required,
     );
     ctx.workspace_capture = startup.workspace_capture;
-    if (startup.sandbox_execution) ctx.sandbox_policy = sandbox_policy.loadForProcess(alloc);
+    if (comptime !host_target.is_wasm) {
+        if (startup.sandbox_execution) ctx.sandbox_policy = sandbox_policy.loadForProcess(alloc);
+    }
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
