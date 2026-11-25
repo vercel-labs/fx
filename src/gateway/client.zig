@@ -4358,14 +4358,7 @@ const FailureDetail = struct {
 /// `text` with every copy of `credential` masked, as sent and as JSON
 /// escapes it. The caller owns the result.
 fn maskedCredentialCopy(alloc: std.mem.Allocator, text: []const u8, credential: []const u8) ![]u8 {
-    const masked = try alloc.dupe(u8, text);
-    errdefer alloc.free(masked);
-    if (credential.len == 0) return masked;
-    text_utils.maskLiteral(masked, credential);
-    const escaped = try std.json.Stringify.valueAlloc(alloc, credential, .{});
-    defer alloc.free(escaped);
-    text_utils.maskLiteral(masked, escaped[1 .. escaped.len - 1]);
-    return masked;
+    return text_utils.maskSecretValues(alloc, text, &.{credential});
 }
 
 fn replaceProviderFailureDetail(alloc: std.mem.Allocator, current: *FailureDetail, text: []const u8) !void {

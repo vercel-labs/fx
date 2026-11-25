@@ -636,6 +636,37 @@ pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8
 
 /// Overwrites every occurrence of `secret` in `text` with `*`, in place, so
 /// the text keeps its length. An empty secret masks nothing.
+/// A copy of `text` with every copy of each of `secrets` masked, as written
+/// and as JSON escapes it. Every span is found on the original text before any
+/// is masked, so a secret inside another never leaves part of the longer one
+/// showing. The caller owns the result.
+pub fn maskSecretValues(alloc: std.mem.Allocator, text: []const u8, secrets: []const []const u8) ![]u8 {
+    const masked = try alloc.dupe(u8, text);
+    errdefer alloc.free(masked);
+    const covered = try alloc.alloc(bool, text.len);
+    defer alloc.free(covered);
+    @memset(covered, false);
+    for (secrets) |value| {
+        if (value.len == 0) continue;
+        markSpans(text, value, covered);
+        const escaped = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(escaped);
+        markSpans(text, escaped[1 .. escaped.len - 1], covered);
+    }
+    for (masked, covered) |*byte, hit| {
+        if (hit) byte.* = '*';
+    }
+    return masked;
+}
+
+fn markSpans(text: []const u8, value: []const u8, covered: []bool) void {
+    var start: usize = 0;
+    while (std.mem.findPos(u8, text, start, value)) |at| {
+        @memset(covered[at..][0..value.len], true);
+        start = at + 1;
+    }
+}
+
 pub fn maskLiteral(text: []u8, secret: []const u8) void {
     if (secret.len == 0) return;
     var rest = text;

@@ -1213,9 +1213,7 @@ pub const Reducer = struct {
     /// `text` with every secret the request sent masked. The caller owns the
     /// result.
     fn maskedCopy(self: *const Reducer, alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-        const copy = try alloc.dupe(u8, text);
-        for (self.secrets) |secret| text_utils.maskLiteral(copy, secret);
-        return copy;
+        return text_utils.maskSecretValues(alloc, text, self.secrets);
     }
 
     fn accept_text(
@@ -2030,6 +2028,31 @@ test "Responses masks every secret in a failure before it cuts it short, and cla
         try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
         try std.testing.expect(detail.len <= types.ModelFailureDiagnostic.max_bytes);
         for (case.secrets) |secret| try std.testing.expect(std.mem.find(u8, detail, secret[0..4]) == null);
+    }
+}
+
+test "Responses masks overlapping and JSON-escaped secrets in a failure whole" {
+    const Case = struct { message: []const u8, secrets: []const []const u8, shown: []const u8 };
+    const cases = [_]Case{
+        // A shorter secret that is part of a longer one, in either order.
+        .{ .message = "key abc-def-ghi refused", .secrets = &.{ "abc", "abc-def-ghi" }, .shown = "invalid_prompt: key *********** refused" },
+        .{ .message = "key abc-def-ghi refused", .secrets = &.{ "abc-def-ghi", "abc" }, .shown = "invalid_prompt: key *********** refused" },
+        // A message that quotes a secret in its JSON-escaped form.
+        .{ .message = "body {\"key\":\"se\\\"cret\"} refused", .secrets = &.{"se\"cret"}, .shown = "invalid_prompt: body {\"key\":\"********\"} refused" },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.reducer.secrets = case.secrets;
+        const event = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+            .type = "response.failed",
+            .response = .{ .@"error" = .{ .code = "invalid_prompt", .message = case.message } },
+        }, .{});
+        defer std.testing.allocator.free(event);
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings(case.shown, completion.provider_failure_detail.?);
     }
 }
 

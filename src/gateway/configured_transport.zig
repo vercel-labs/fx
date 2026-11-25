@@ -5,6 +5,7 @@
 //! and the request for the server's model list. Each protocol's adapter
 //! builds the body and reads the reply.
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const client_mod = @import("client.zig");
 const chat_codec = @import("chat_completions_protocol.zig");
 const definitions = @import("../core/config/configured_provider.zig");
@@ -14,6 +15,7 @@ const secret = @import("../core/auth/secret.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// fx's own bounds, for a connection whose settings name none.
@@ -81,28 +83,33 @@ pub const Headers = struct {
         self.* = .{};
     }
 
-    /// The bearer token and every header value, in a list the caller frees.
+    /// The bearer token and every header value, longest first, in a list
+    /// the caller frees.
     fn secrets(self: *const Headers, alloc: Allocator, token: ?[]const u8) Allocator.Error![]const []const u8 {
-        const list = try alloc.alloc([]const u8, self.owned + 1);
-        var count: usize = 0;
-        if (token) |value| {
-            list[count] = value;
-            count += 1;
-        }
-        for (self.list[0..self.owned]) |header| {
-            list[count] = header.value;
-            count += 1;
-        }
-        return list[0..count];
+        const token_count: usize = if (token != null) 1 else 0;
+        const list = try alloc.alloc([]const u8, token_count + self.owned);
+        if (token) |value| list[0] = value;
+        for (self.list[0..self.owned], list[token_count..]) |header, *slot| slot.* = header.value;
+        sort_utils.sort([]const u8, list, {}, longerFirst);
+        return list;
+    }
+
+    fn longerFirst(_: void, a: []const u8, b: []const u8) bool {
+        return a.len > b.len;
     }
 
     /// `detail` with the bearer token and every header value replaced by
     /// asterisks, in the forms a server may quote them. Takes `detail` and
     /// returns owned text.
     fn mask(self: *const Headers, alloc: Allocator, detail: []u8, token: ?[]const u8) Allocator.Error![]u8 {
+        // Longest first, so a secret inside another never splits the longer one.
+        const values = self.secrets(alloc, token) catch |err| {
+            alloc.free(detail);
+            return err;
+        };
+        defer alloc.free(values);
         var masked = detail;
-        if (token) |value| masked = try maskOne(alloc, masked, value);
-        for (self.list[0..self.owned]) |header| masked = try maskOne(alloc, masked, header.value);
+        for (values) |value| masked = try maskOne(alloc, masked, value);
         return masked;
     }
 };
@@ -422,6 +429,45 @@ pub fn parseModelIds(alloc: Allocator, body: []const u8) Allocator.Error!ModelsR
         slot.key_ptr.* = owned;
     }
     return .{ .ids = ids };
+}
+
+test "Headers lists exactly the secrets the request sent, longest first, on every allocation failure" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var storage = [_]std.http.Header{
+                .{ .name = "X-Short", .value = "abc" },
+                .{ .name = "X-Long", .value = "abc-def-ghi" },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+            };
+            const Case = struct { token: ?[]const u8, owned: usize, expected: []const []const u8 };
+            const cases = [_]Case{
+                .{ .token = "token-1234", .owned = 2, .expected = &.{ "abc-def-ghi", "token-1234", "abc" } },
+                .{ .token = null, .owned = 2, .expected = &.{ "abc-def-ghi", "abc" } },
+                .{ .token = "token-1234", .owned = 0, .expected = &.{"token-1234"} },
+                .{ .token = null, .owned = 0, .expected = &.{} },
+            };
+            for (cases) |case| {
+                const headers = Headers{ .list = storage[0..], .owned = case.owned };
+                const list = try headers.secrets(alloc, case.token);
+                defer alloc.free(list);
+                try std.testing.expectEqual(case.expected.len, list.len);
+                for (case.expected, list) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
+}
+
+test "Headers masks a secret whole when a shorter one is part of it" {
+    const alloc = std.testing.allocator;
+    var storage = [_]std.http.Header{
+        .{ .name = "X-Short", .value = "abc" },
+        .{ .name = "X-Long", .value = "abc-def-ghi" },
+    };
+    const headers = Headers{ .list = storage[0..], .owned = 2 };
+    const masked = try headers.mask(alloc, try alloc.dupe(u8, "key abc-def-ghi and abc"), null);
+    defer alloc.free(masked);
+    try std.testing.expectEqualStrings("key *********** and ***", masked);
 }
 
 test "model list ids keep the server's order, drop repeats, and skip entries with no usable id" {
