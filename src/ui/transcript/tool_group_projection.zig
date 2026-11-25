@@ -8367,7 +8367,7 @@ test "a notice the main screen shows in the middle of a turn starts a new row fo
     const cases = [_]Case{
         .{ .name = "compaction", .middle = shownNoticeForTest("", .success, "Context compacted (10s)") },
         .{ .name = "provider reason while fx waits", .middle = shownNoticeForTest("system", .warning, "API access denied · HTTP 403") },
-        .{ .name = "effort chosen during the turn", .middle = shownNoticeForTest("", .neutral, "Next turn will use reasoning effort high for openai/gpt-5") },
+        .{ .name = "effort chosen during the turn", .middle = shownNoticeForTest("", .neutral, "Next turn will use reasoning effort high for acme/thinker") },
         .{ .name = "Vision outage", .middle = shownNoticeForTest("vision", .@"error", "Tip: Vision is unavailable right now.") },
         .{ .name = "message the user sent", .middle = .{ .user_turn = .{ .id = 2, .turn = .{ .text = @constCast("Read the rest too.") } } } },
     };
@@ -8391,7 +8391,7 @@ test "a notice the main screen hides keeps the calls around it in one row" {
     const alloc = std.testing.allocator;
     const Case = struct { name: []const u8, middle: TranscriptEntry };
     const cases = [_]Case{
-        .{ .name = "Ctrl+O only", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "model call", .tone = .neutral, .body = "21:25:41 · gpt-5 · 0.0 s", .visibility = .full_only } } },
+        .{ .name = "Ctrl+O only", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "model call", .tone = .neutral, .body = "21:25:41 · thinker · 0.0 s", .visibility = .full_only } } },
         .{ .name = "hidden by a display clear", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "", .tone = .success, .body = "Context compacted (10s)", .visibility = .compact_and_full, .inline_hidden = true } } },
     };
     for (cases) |case| {

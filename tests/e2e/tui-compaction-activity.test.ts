@@ -1294,7 +1294,7 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
     expect(liveRows).toEqual([
       `┃ ${NOTICE_PROMPT}`,
       "● Read a.txt",
-      "* Next turn will use reasoning effort high for openai/gpt-5",
+      `* Next turn will use reasoning effort high for ${FAKE_GATEWAY_MODEL}`,
       "● Read b.txt, c.txt",
       `  ${NOTICE_DONE}`,
     ]);
