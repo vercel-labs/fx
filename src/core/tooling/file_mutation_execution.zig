@@ -580,10 +580,14 @@ test "file executor kinds semantic failures preflight and missing authority deni
         .name = "edit_file",
         .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
     };
-    const mutation_input: file_mutation_contract.FileMutationInput = .{ .edit = .{
-        .path = try call_alloc.dupe(u8, "strategy.ts"),
+    const edits = try call_alloc.alloc(file_mutation_contract.Replacement, 1);
+    edits[0] = .{
         .old_string = try call_alloc.dupe(u8, "  trajectory?: Trajectory;\n}"),
         .new_string = try call_alloc.dupe(u8, "}"),
+    };
+    const mutation_input: file_mutation_contract.FileMutationInput = .{ .edit = .{
+        .path = try call_alloc.dupe(u8, "strategy.ts"),
+        .edits = edits,
     } };
     var allow_rules = [_]types.PermissionRule{.{
         .permission = @constCast("edit"),

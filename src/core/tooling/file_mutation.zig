@@ -136,19 +136,13 @@ const preview_too_large_message =
     "file mutation preparation failed: diff preview exceeds preparation limits";
 // Limit messages name the limit and the way around it, so the model can
 // still make the change.
-const file_too_large_message = std.fmt.comptimePrint(
-    "file mutation preparation failed: the file is larger than the {d} MiB limit for edit_file and write_file; make the change with a shell command instead",
-    .{max_content_bytes / mib},
-);
-const edited_file_too_large_message = std.fmt.comptimePrint(
-    "edit_file failed: the edit would make the file larger than the {d} MiB limit for edit_file; make the change with a shell command instead",
-    .{max_content_bytes / mib},
-);
-const total_content_too_large_message = std.fmt.comptimePrint(
-    "file mutation preparation failed: the old and new file together are larger than the {d} MiB limit for edit_file and write_file; make the change with a shell command instead",
-    .{max_total_content_bytes / mib},
-);
 const mib = 1024 * 1024;
+const file_too_large_template = "file mutation preparation failed: the file is larger than the {d} MiB limit for {s}; make the change with a shell command instead";
+const edited_file_too_large_template = "{s}the edit would make the file larger than the {d} MiB limit for {s}; make the change with a shell command instead";
+const total_content_too_large_template = "file mutation preparation failed: the old and new file together are larger than the {d} MiB limit for {s}; make the change with a shell command instead";
+/// The edit_file texts, as the tests and the file tool's own callers expect them.
+const file_too_large_message = std.fmt.comptimePrint(file_too_large_template, .{ max_content_bytes / mib, edit_file_words.limit_for });
+const edited_file_too_large_message = std.fmt.comptimePrint(edited_file_too_large_template, .{ edit_file_prefix, max_content_bytes / mib, edit_file_words.tool });
 
 const FileMutationPrepareError = error{
     OutOfMemory,
@@ -253,9 +247,9 @@ fn prepareInternal(
         usize,
         before_content.len,
         after_content.len,
-    ) catch return .{ .semantic_failure = total_content_too_large_message };
+    ) catch return .{ .semantic_failure = try totalContentTooLargeFor(call_alloc, wordsOf(input)) };
     if (total_content_bytes > max_total_content_bytes) {
-        return .{ .semantic_failure = total_content_too_large_message };
+        return .{ .semantic_failure = try totalContentTooLargeFor(call_alloc, wordsOf(input)) };
     }
 
     // External anchors show the resolved target so a symlink redirect cannot look local.
@@ -1421,7 +1415,7 @@ fn verifyAndReadPreimage(
         .limited(max_content_bytes + 1),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return .{ .semantic_failure = file_too_large_message },
+        error.StreamTooLong => return .{ .semantic_failure = try fileTooLargeFor(alloc, wordsOf(input)) },
         error.ReadFailed => {
             const root = reader.err orelse return error.Unexpected;
             if (operationalError(root)) |operational| return operational;
@@ -1429,7 +1423,7 @@ fn verifyAndReadPreimage(
         },
     };
     if (content.len > max_content_bytes) {
-        return .{ .semantic_failure = file_too_large_message };
+        return .{ .semantic_failure = try fileTooLargeFor(alloc, wordsOf(input)) };
     }
 
     var content_hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1450,69 +1444,90 @@ fn derivePostimage(
         .write => |write| .{
             .content = try alloc.dupe(u8, write.content),
         },
-        .edit => |edit| blk: {
-            if (std.mem.eql(u8, edit.old_string, edit.new_string)) {
-                break :blk .{ .semantic_failure = "edit_file failed: old_string and new_string are identical" };
-            }
-            const before = switch (preimage) {
-                .absent => break :blk .{ .semantic_failure = identity_changed_message },
-                .present => |present| present.content,
-            };
-            var old_string = edit.old_string;
-            var new_string = edit.new_string;
-            var occurrence_count = countOccurrences(before, old_string);
-            // Tool output shows a file's carried tags starting `&lt;` (D93), so an
-            // edit copied from it that matches only as the file has them
-            // means the file's `<`, in the old and the new text alike.
-            var shown_old: ?[]u8 = null;
-            defer if (shown_old) |text| alloc.free(text);
-            var shown_new: ?[]u8 = null;
-            defer if (shown_new) |text| alloc.free(text);
-            if (occurrence_count == 0) {
-                shown_old = try model_context_encoding.unescapeCarried(alloc, old_string);
-                if (shown_old) |shown| {
-                    const shown_count = countOccurrences(before, shown);
-                    if (shown_count > 0) {
-                        shown_new = try model_context_encoding.unescapeCarried(alloc, new_string);
-                        old_string = shown;
-                        new_string = shown_new orelse new_string;
-                        occurrence_count = shown_count;
-                    }
-                }
-            }
-            if (occurrence_count != 1) {
-                break :blk .{ .semantic_failure = try matchFailureMessage(alloc, failure_detail, before, old_string, occurrence_count) };
-            }
-
-            const match_start = std.mem.find(
-                u8,
-                before,
-                old_string,
-            ).?;
-            const prefix_len = match_start;
-            const suffix_start = match_start + old_string.len;
-            var after_len = std.math.add(
-                usize,
-                prefix_len,
-                new_string.len,
-            ) catch break :blk .{ .semantic_failure = edited_file_too_large_message };
-            after_len = std.math.add(
-                usize,
-                after_len,
-                before.len - suffix_start,
-            ) catch break :blk .{ .semantic_failure = edited_file_too_large_message };
-            if (after_len > max_content_bytes) {
-                break :blk .{ .semantic_failure = edited_file_too_large_message };
-            }
-
-            const after = try alloc.alloc(u8, after_len);
-            @memcpy(after[0..prefix_len], before[0..prefix_len]);
-            const replacement_end = prefix_len + new_string.len;
-            @memcpy(after[prefix_len..replacement_end], new_string);
-            @memcpy(after[replacement_end..], before[suffix_start..]);
-            break :blk .{ .content = after };
-        },
+        .edit => |edit| deriveEditPostimage(alloc, edit, preimage, failure_detail),
     };
+}
+
+/// Applies the edit's blocks in order. Each block matches the text the blocks
+/// before it left, so a later block may match an earlier block's new text. One
+/// failing block fails the whole edit, and the file is written only when all apply.
+fn deriveEditPostimage(
+    alloc: Allocator,
+    edit: file_mutation_contract.EditInput,
+    preimage: file_mutation_contract.Preimage,
+    failure_detail: file_mutation_contract.EditFailureDetail,
+) error{OutOfMemory}!PostimageResult {
+    std.debug.assert(edit.edits.len > 0);
+    const before = switch (preimage) {
+        .absent => return .{ .semantic_failure = identity_changed_message },
+        .present => |present| present.content,
+    };
+    const words = wordsFor(edit.wording);
+    var working: std.ArrayList(u8) = .empty;
+    defer working.deinit(alloc);
+    try working.appendSlice(alloc, before);
+    for (edit.edits, 1..) |replacement, index| {
+        const block: BlockPosition = .{ .index = index, .count = edit.edits.len };
+        if (try applyBlock(alloc, &working, replacement, failure_detail, words, block)) |message| {
+            return .{ .semantic_failure = message };
+        }
+    }
+    return .{ .content = try working.toOwnedSlice(alloc) };
+}
+
+/// Applies one block to `working` in place. Returns the failure text, or null
+/// when the block applied.
+fn applyBlock(
+    alloc: Allocator,
+    working: *std.ArrayList(u8),
+    replacement: file_mutation_contract.Replacement,
+    failure_detail: file_mutation_contract.EditFailureDetail,
+    words: EditWords,
+    block: BlockPosition,
+) error{OutOfMemory}!?[]const u8 {
+    if (std.mem.eql(u8, replacement.old_string, replacement.new_string)) {
+        const prefix = try failurePrefix(alloc, words, block);
+        return try alloc.print("{s}{s} and {s} are identical", .{ prefix, words.search, words.replace });
+    }
+    var old_string = replacement.old_string;
+    var new_string = replacement.new_string;
+    var occurrence_count = countOccurrences(working.items, old_string);
+    // Tool output shows a file's carried tags starting `&lt;` (D93), so an
+    // edit copied from it that matches only as the file has them
+    // means the file's `<`, in the old and the new text alike.
+    var shown_old: ?[]u8 = null;
+    defer if (shown_old) |text| alloc.free(text);
+    var shown_new: ?[]u8 = null;
+    defer if (shown_new) |text| alloc.free(text);
+    if (occurrence_count == 0) {
+        shown_old = try model_context_encoding.unescapeCarried(alloc, old_string);
+        if (shown_old) |shown| {
+            const shown_count = countOccurrences(working.items, shown);
+            if (shown_count > 0) {
+                shown_new = try model_context_encoding.unescapeCarried(alloc, new_string);
+                old_string = shown;
+                new_string = shown_new orelse new_string;
+                occurrence_count = shown_count;
+            }
+        }
+    }
+    if (occurrence_count != 1) {
+        return try matchFailureIn(alloc, failure_detail, words, block, working.items, old_string, occurrence_count);
+    }
+
+    // The match is in `working`, so the new size is the old size less the old
+    // text and plus the new text; `occurrence_count` proves the old text fits.
+    const after_len = std.math.add(
+        usize,
+        working.items.len - old_string.len,
+        new_string.len,
+    ) catch return try editedFileTooLargeFor(alloc, words, block);
+    if (after_len > max_content_bytes) {
+        return try editedFileTooLargeFor(alloc, words, block);
+    }
+    const match_start = std.mem.find(u8, working.items, old_string).?;
+    try working.replaceRange(alloc, match_start, old_string.len, new_string);
+    return null;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -1526,7 +1541,85 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-const not_found_message = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.";
+const not_found_template = "{s}{s} not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.";
+
+/// The words one failure text uses. `edit_file` names `old_string` and
+/// `new_string`; the bridge caller's `edit` names the search and replace text.
+/// Only these words differ between the two.
+const EditWords = struct {
+    tool: []const u8,
+    search: []const u8,
+    replace: []const u8,
+    /// Names the tool in the file-size texts.
+    limit_for: []const u8,
+};
+
+const edit_file_words: EditWords = .{
+    .tool = "edit_file",
+    .search = "old_string",
+    .replace = "new_string",
+    .limit_for = "edit_file and write_file",
+};
+
+const edit_words: EditWords = .{
+    .tool = "edit",
+    .search = "search text",
+    .replace = "replace text",
+    .limit_for = "edit",
+};
+
+const edit_file_prefix = std.fmt.comptimePrint("{s} failed: ", .{edit_file_words.tool});
+const not_found_message = std.fmt.comptimePrint(not_found_template, .{ edit_file_prefix, edit_file_words.search });
+
+/// Which block of an edit a failure is about. `index` is 1-based.
+const BlockPosition = struct {
+    index: usize,
+    count: usize,
+};
+
+const single_block: BlockPosition = .{ .index = 1, .count = 1 };
+
+fn wordsFor(wording: file_mutation_contract.Wording) EditWords {
+    return switch (wording) {
+        .edit_file => edit_file_words,
+        .edit => edit_words,
+    };
+}
+
+fn wordsOf(input: file_mutation_contract.FileMutationInput) EditWords {
+    return switch (input) {
+        .write => edit_file_words,
+        .edit => |edit| wordsFor(edit.wording),
+    };
+}
+
+/// `edit_file failed: ` for a one-block edit, and `edit failed: block 2 of 3: `
+/// when the edit has several blocks.
+fn failurePrefix(alloc: Allocator, words: EditWords, block: BlockPosition) error{OutOfMemory}![]const u8 {
+    if (block.count == 1) return alloc.print("{s} failed: ", .{words.tool});
+    return alloc.print("{s} failed: block {d} of {d}: ", .{ words.tool, block.index, block.count });
+}
+
+/// Names the text a hint quotes. Block 1 quotes the file as read; a later block
+/// quotes the text that the blocks before it left.
+fn hintSource(alloc: Allocator, block: BlockPosition) error{OutOfMemory}![]const u8 {
+    if (block.index == 1) return "";
+    if (block.index == 2) return " in the text after block 1";
+    return alloc.print(" in the text after blocks 1 to {d}", .{block.index - 1});
+}
+
+fn fileTooLargeFor(alloc: Allocator, words: EditWords) error{OutOfMemory}![]const u8 {
+    return alloc.print(file_too_large_template, .{ max_content_bytes / mib, words.limit_for });
+}
+
+fn totalContentTooLargeFor(alloc: Allocator, words: EditWords) error{OutOfMemory}![]const u8 {
+    return alloc.print(total_content_too_large_template, .{ max_total_content_bytes / mib, words.limit_for });
+}
+
+fn editedFileTooLargeFor(alloc: Allocator, words: EditWords, block: BlockPosition) error{OutOfMemory}![]const u8 {
+    const prefix = try failurePrefix(alloc, words, block);
+    return alloc.print(edited_file_too_large_template, .{ prefix, max_content_bytes / mib, words.tool });
+}
 /// The closest match is shown only while it stays short enough to copy.
 const max_hint_lines = 40;
 const max_hint_bytes = 4096;
@@ -1555,6 +1648,26 @@ const max_hint_file_lines = 100_000;
 /// The failure for an old_string found zero or several times. `.file_lines`
 /// quotes the lines the edit most likely meant; `.plain` keeps the recovery
 /// advice alone, for a file the model may not read without approval.
+fn matchFailureIn(
+    alloc: Allocator,
+    detail: file_mutation_contract.EditFailureDetail,
+    words: EditWords,
+    block: BlockPosition,
+    content: []const u8,
+    old_string: []const u8,
+    occurrence_count: usize,
+) error{OutOfMemory}![]const u8 {
+    if (occurrence_count == 0) return switch (detail) {
+        .plain => notFoundPlainIn(alloc, words, block),
+        .file_lines => notFoundIn(alloc, words, block, content, old_string),
+    };
+    return switch (detail) {
+        .plain => notUniquePlainIn(alloc, words, block, occurrence_count),
+        .file_lines => notUniqueIn(alloc, words, block, content, old_string, occurrence_count),
+    };
+}
+
+/// The edit_file failure for one block, as the file tool names it.
 fn matchFailureMessage(
     alloc: Allocator,
     detail: file_mutation_contract.EditFailureDetail,
@@ -1562,52 +1675,78 @@ fn matchFailureMessage(
     old_string: []const u8,
     occurrence_count: usize,
 ) error{OutOfMemory}![]const u8 {
-    if (occurrence_count == 0) return switch (detail) {
-        .plain => not_found_message,
-        .file_lines => try notFoundMessage(alloc, content, old_string),
-    };
-    return switch (detail) {
-        .plain => try alloc.print(
-            "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
-            .{occurrence_count},
-        ),
-        .file_lines => try notUniqueMessage(alloc, content, old_string, occurrence_count),
-    };
+    return matchFailureIn(alloc, detail, edit_file_words, single_block, content, old_string, occurrence_count);
+}
+
+fn notUniquePlainIn(alloc: Allocator, words: EditWords, block: BlockPosition, occurrence_count: usize) error{OutOfMemory}![]const u8 {
+    const prefix = try failurePrefix(alloc, words, block);
+    return alloc.print("{s}{s} is not unique (found {d} occurrences), provide more context", .{ prefix, words.search, occurrence_count });
+}
+
+fn notFoundPlainIn(alloc: Allocator, words: EditWords, block: BlockPosition) error{OutOfMemory}![]const u8 {
+    const prefix = try failurePrefix(alloc, words, block);
+    return alloc.print(not_found_template, .{ prefix, words.search });
 }
 
 /// A failed edit usually copies text the model remembers rather than text the
 /// file holds now. Showing the lines it most likely meant lets the next call
 /// copy them instead of reading the whole file again. Without a close match
 /// the message stays the plain recovery advice.
-fn notFoundMessage(alloc: Allocator, content: []const u8, old_string: []const u8) error{OutOfMemory}![]const u8 {
-    const span = (try closestLines(alloc, content, old_string)) orelse return not_found_message;
+fn notFoundIn(
+    alloc: Allocator,
+    words: EditWords,
+    block: BlockPosition,
+    content: []const u8,
+    old_string: []const u8,
+) error{OutOfMemory}![]const u8 {
+    const span = (try closestLines(alloc, content, old_string)) orelse return notFoundPlainIn(alloc, words, block);
+    const prefix = try failurePrefix(alloc, words, block);
+    const source = try hintSource(alloc, block);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     if (span.first == span.last) {
-        try out.print(alloc, "edit_file failed: old_string not found in file; the closest match is line {d}.\nIt currently reads:\n", .{span.first + 1});
+        try out.print(alloc, "{s}{s} not found in file; the closest match is line {d}{s}.\nIt currently reads:\n", .{ prefix, words.search, span.first + 1, source });
     } else {
-        try out.print(alloc, "edit_file failed: old_string not found in file; the closest match is lines {d}-{d}.\nThey currently read:\n", .{ span.first + 1, span.last + 1 });
+        try out.print(alloc, "{s}{s} not found in file; the closest match is lines {d}-{d}{s}.\nThey currently read:\n", .{ prefix, words.search, span.first + 1, span.last + 1, source });
     }
     try out.appendSlice(alloc, content[span.start..span.end]);
     try out.appendSlice(alloc, "\nIf the change is already applied, do not retry this edit.");
     return out.toOwnedSlice(alloc);
 }
 
+/// The edit_file failure for a block that is not found, as the file tool names it.
+fn notFoundMessage(alloc: Allocator, content: []const u8, old_string: []const u8) error{OutOfMemory}![]const u8 {
+    return notFoundIn(alloc, edit_file_words, single_block, content, old_string);
+}
+
 /// Names the lines of the first occurrences and shows each with the lines
 /// before it, so the next call can add the context that picks one without
 /// reading the file again.
-fn notUniqueMessage(alloc: Allocator, content: []const u8, old_string: []const u8, occurrence_count: usize) error{OutOfMemory}![]const u8 {
+fn notUniqueIn(
+    alloc: Allocator,
+    words: EditWords,
+    block: BlockPosition,
+    content: []const u8,
+    old_string: []const u8,
+    occurrence_count: usize,
+) error{OutOfMemory}![]const u8 {
     const found = occurrenceLines(content, old_string);
+    const prefix = try failurePrefix(alloc, words, block);
+    const source = try hintSource(alloc, block);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.print(alloc, "edit_file failed: old_string is not unique (found {d} occurrences, on line{s} ", .{ occurrence_count, if (found.count == 1) "" else "s" });
+    try out.print(alloc, "{s}{s} is not unique (found {d} occurrences, on line{s} ", .{ prefix, words.search, occurrence_count, if (found.count == 1) "" else "s" });
     for (found.numbers[0..found.count], 0..) |number, i| {
         try out.print(alloc, "{s}{d}", .{ if (i == 0) "" else ", ", number });
     }
     if (found.more) try out.appendSlice(alloc, ", ...");
-    try out.appendSlice(alloc, "), provide more context");
+    try out.print(alloc, "{s}), provide more context", .{source});
     try appendOccurrenceSnippets(alloc, &out, content, old_string);
     return out.toOwnedSlice(alloc);
+}
+
+fn notUniqueMessage(alloc: Allocator, content: []const u8, old_string: []const u8, occurrence_count: usize) error{OutOfMemory}![]const u8 {
+    return notUniqueIn(alloc, edit_file_words, single_block, content, old_string, occurrence_count);
 }
 
 const OccurrenceLines = struct {
@@ -2063,11 +2202,11 @@ fn decodeTestMutationInput(
         .failure => error.InvalidToolArguments,
         .input => |tool_input| blk: {
             break :blk switch (kind) {
-                .write => testing_write_file.takeFileMutationInput(
+                .write => try testing_write_file.takeFileMutationInput(
                     tool_input,
                     alloc,
                 ),
-                .edit => testing_edit_file.takeFileMutationInput(
+                .edit => try testing_edit_file.takeFileMutationInput(
                     tool_input,
                     alloc,
                 ),
@@ -2261,6 +2400,284 @@ test "prepare computes one exact edit occurrence" {
     try std.testing.expectEqualStrings("alpha\nBETA\ngamma\n", prepared.after_content);
     try std.testing.expectEqual(@as(usize, 1), prepared.preview.additions);
     try std.testing.expectEqual(@as(usize, 1), prepared.preview.deletions);
+}
+
+const TestBlock = struct { old: []const u8, new: []const u8 };
+
+fn editBlocksInput(
+    alloc: Allocator,
+    path: []const u8,
+    wording: file_mutation_contract.Wording,
+    blocks: []const TestBlock,
+) !file_mutation_contract.FileMutationInput {
+    const edits = try alloc.alloc(file_mutation_contract.Replacement, blocks.len);
+    for (blocks, edits) |block, *edit| {
+        edit.* = .{
+            .old_string = try alloc.dupe(u8, block.old),
+            .new_string = try alloc.dupe(u8, block.new),
+        };
+    }
+    return .{ .edit = .{
+        .path = try alloc.dupe(u8, path),
+        .edits = edits,
+        .wording = wording,
+    } };
+}
+
+fn expectBlocksPrepared(
+    alloc: Allocator,
+    call: types.ToolCall,
+    input: file_mutation_contract.FileMutationInput,
+    policy: PolicyEvaluatedFileTargets,
+) !PreparedFileMutation {
+    return switch (try prepare(alloc, call, input, policy, .plain)) {
+        .prepared => |prepared| prepared,
+        .semantic_failure => |message| {
+            try std.testing.expectEqualStrings("a prepared mutation", message);
+            return error.UnexpectedSemanticFailure;
+        },
+    };
+}
+
+fn expectBlocksFailure(
+    alloc: Allocator,
+    call: types.ToolCall,
+    input: file_mutation_contract.FileMutationInput,
+    policy: PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
+) ![]const u8 {
+    return switch (try prepare(alloc, call, input, policy, failure_detail)) {
+        .prepared => {
+            try std.testing.expectEqualStrings("a semantic failure", "a prepared mutation");
+            return error.UnexpectedPreparedMutation;
+        },
+        .semantic_failure => |message| message,
+    };
+}
+
+test "three edit blocks apply in order into one postimage and one review" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nbeta\ngamma\ndelta\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-three-blocks",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit_file, &.{
+        .{ .old = "beta\n", .new = "BETA\n" },
+        .{ .old = "gamma\n", .new = "GAMMA\n" },
+        .{ .old = "delta\n", .new = "DELTA\n" },
+    });
+
+    const prepared = try expectBlocksPrepared(arena, call, input, policy);
+
+    try std.testing.expectEqualStrings("alpha\nbeta\ngamma\ndelta\n", prepared.preimage.present.content);
+    try std.testing.expectEqualStrings("alpha\nBETA\nGAMMA\nDELTA\n", prepared.after_content);
+    try std.testing.expectEqual(@as(usize, 3), prepared.preview.additions);
+    try std.testing.expectEqual(@as(usize, 3), prepared.preview.deletions);
+    try std.testing.expectEqual(@as(usize, 3), prepared.review.additions);
+    try std.testing.expectEqual(@as(usize, 3), prepared.review.deletions);
+}
+
+test "a block that is not found names its block number in the edit wording" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nbeta\ngamma\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-block-missing",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "alpha\n", .new = "ALPHA\n" },
+        .{ .old = "missing\n", .new = "x\n" },
+        .{ .old = "gamma\n", .new = "GAMMA\n" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "edit failed: block 2 of 3: search text not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
+        try expectBlocksFailure(arena, call, input, policy, .plain),
+    );
+}
+
+test "a not-found block quotes the text after the earlier blocks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nthe quick brown fox jumps\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-block-closest",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "alpha\n", .new = "ALPHA\n" },
+        .{ .old = "the quick brown fox leaps\n", .new = "x\n" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "edit failed: block 2 of 2: search text not found in file; the closest match is line 2 in the text after block 1.\nIt currently reads:\nthe quick brown fox jumps\nIf the change is already applied, do not retry this edit.",
+        try expectBlocksFailure(arena, call, input, policy, .file_lines),
+    );
+}
+
+test "a later block may match text that an earlier block wrote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-sequential",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit_file, &.{
+        .{ .old = "alpha\n", .new = "beta\n" },
+        .{ .old = "beta\n", .new = "gamma\n" },
+    });
+
+    const prepared = try expectBlocksPrepared(arena, call, input, policy);
+
+    try std.testing.expectEqualStrings("gamma\n", prepared.after_content);
+}
+
+test "a block that matches twice is refused as not unique and names its block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "red\nblue\nred\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-block-duplicate",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "blue\n", .new = "BLUE\n" },
+        .{ .old = "BLUE\n", .new = "green\n" },
+        .{ .old = "red\n", .new = "RED\n" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "edit failed: block 3 of 3: search text is not unique (found 2 occurrences), provide more context",
+        try expectBlocksFailure(arena, call, input, policy, .plain),
+    );
+}
+
+test "identical search and replace text in one block fails that block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nbeta\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-block-identical",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "alpha\n", .new = "ALPHA\n" },
+        .{ .old = "beta\n", .new = "beta\n" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "edit failed: block 2 of 2: search text and replace text are identical",
+        try expectBlocksFailure(arena, call, input, policy, .plain),
+    );
+}
+
+test "a single block in the bridge wording has no block prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-one-bridge",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "missing\n", .new = "x\n" },
+    });
+
+    try std.testing.expectEqualStrings(
+        "edit failed: search text not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
+        try expectBlocksFailure(arena, call, input, policy, .plain),
+    );
+}
+
+test "a multi-block edit refused at apply leaves the file as the program left it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nbeta\ngamma\n");
+    var call_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer call_arena_state.deinit();
+    var result_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena_state.deinit();
+    const call_alloc = call_arena_state.allocator();
+    const result_alloc = result_arena_state.allocator();
+    const root = try workspaceRoot(call_alloc, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-three-stale",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(call_alloc, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(call_alloc, root, call);
+    const input = try editBlocksInput(call_alloc, "note.txt", .edit_file, &.{
+        .{ .old = "alpha\n", .new = "ALPHA\n" },
+        .{ .old = "beta\n", .new = "BETA\n" },
+        .{ .old = "gamma\n", .new = "GAMMA\n" },
+    });
+    const prepared = try expectBlocksPrepared(call_alloc, call, input, policy);
+    try std.testing.expectEqualStrings("ALPHA\nBETA\nGAMMA\n", prepared.after_content);
+
+    {
+        var file = try tmp.dir.openFile(std.testing.io, "note.txt", .{ .mode = .write_only });
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, 0);
+        try file.writeStreamingAll(std.testing.io, "changed\n");
+    }
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    _ = try expectApplyRejected(
+        try apply(
+            call_alloc,
+            result_alloc,
+            call,
+            .{ .input = input, .policy_targets = policy, .prepared = prepared },
+            &cancel_flag,
+        ),
+        .stale_preimage,
+    );
+    try std.testing.expectEqualStrings("changed\n", try readTestFile(call_alloc, &tmp, "note.txt"));
 }
 
 test "prepare preserves exact edit semantic failures" {

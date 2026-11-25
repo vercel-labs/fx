@@ -316,8 +316,9 @@ pub const FileMutationActionIdentity = struct {
                 );
             },
             .edit => |edit| {
-                identity.first_argument_hash = hashIdentityField(edit.old_string);
-                identity.second_argument_hash = hashIdentityField(edit.new_string);
+                const hashes = editIdentityHashes(edit.edits);
+                identity.first_argument_hash = hashes.first;
+                identity.second_argument_hash = hashes.second;
             },
         }
         return identity;
@@ -330,6 +331,86 @@ pub const FileMutationActionIdentity = struct {
         return std.meta.eql(a, b);
     }
 };
+
+const EditIdentityHashes = struct {
+    first: types.ContentHash,
+    second: types.ContentHash,
+};
+
+/// One replacement hashes its two strings, as a single edit always has. Several
+/// replacements hash their count and every block in order, so a changed or
+/// reordered block is a different action.
+fn editIdentityHashes(replacements: []const file_mutation_contract.Replacement) EditIdentityHashes {
+    if (replacements.len == 1) return .{
+        .first = hashIdentityField(replacements[0].old_string),
+        .second = hashIdentityField(replacements[0].new_string),
+    };
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const count: u64 = replacements.len;
+    hasher.update(std.mem.asBytes(&count));
+    for (replacements) |replacement| {
+        hashLengthPrefixed(&hasher, replacement.old_string);
+        hashLengthPrefixed(&hasher, replacement.new_string);
+    }
+    return .{ .first = hasher.finalResult(), .second = hashIdentityField("edit blocks") };
+}
+
+fn hashLengthPrefixed(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    const length: u64 = value.len;
+    hasher.update(std.mem.asBytes(&length));
+    hasher.update(value);
+}
+
+fn editInputOf(replacements: []file_mutation_contract.Replacement) file_mutation_contract.FileMutationInput {
+    return .{ .edit = .{
+        .path = @constCast("note.txt"),
+        .edits = replacements,
+    } };
+}
+
+test "one replacement keeps the single-edit identity hashes" {
+    var replacements = [_]file_mutation_contract.Replacement{.{
+        .old_string = @constCast("old text"),
+        .new_string = @constCast("new text"),
+    }};
+    const identity = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&replacements));
+    const old_hash = hashIdentityField("old text");
+    const new_hash = hashIdentityField("new text");
+    try std.testing.expectEqualSlices(u8, &old_hash, &identity.first_argument_hash);
+    try std.testing.expectEqualSlices(u8, &new_hash, &identity.second_argument_hash);
+}
+
+test "a changed block changes a multi-block edit identity" {
+    var first_blocks = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+    };
+    var second_blocks = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("e\n") },
+    };
+    const first = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&first_blocks));
+    const second = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&second_blocks));
+    if (first.eql(second)) return error.IdentityIgnoredChangedBlock;
+}
+
+test "the order of blocks changes a multi-block edit identity" {
+    // Both lists start with the same block, so only the order of the later
+    // blocks differs.
+    var forward = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+        .{ .old_string = @constCast("e\n"), .new_string = @constCast("f\n") },
+    };
+    var reordered = [_]file_mutation_contract.Replacement{
+        .{ .old_string = @constCast("a\n"), .new_string = @constCast("b\n") },
+        .{ .old_string = @constCast("e\n"), .new_string = @constCast("f\n") },
+        .{ .old_string = @constCast("c\n"), .new_string = @constCast("d\n") },
+    };
+    const first = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&forward));
+    const second = FileMutationActionIdentity.init("/w/note.txt", editInputOf(&reordered));
+    if (first.eql(second)) return error.IdentityIgnoredBlockOrder;
+}
 
 fn hashIdentityField(value: []const u8) types.ContentHash {
     var digest: types.ContentHash = undefined;
@@ -400,7 +481,7 @@ fn decodeFileMutationInput(
                     break :blk .{ .failure = reason };
                 }
             }
-            var input = take_input(tool_input, arena);
+            var input = try take_input(tool_input, arena);
             tool_input_owned = false;
             if (std.meta.activeTag(input) != kind) {
                 input.deinit(arena);

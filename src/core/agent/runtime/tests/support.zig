@@ -1446,11 +1446,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .failure => return error.InvalidToolArguments,
             .input => |tool_input| blk: {
                 break :blk switch (kind) {
-                    .write => testing_write_file.takeFileMutationInput(
+                    .write => try testing_write_file.takeFileMutationInput(
                         tool_input,
                         arena,
                     ),
-                    .edit => testing_edit_file.takeFileMutationInput(
+                    .edit => try testing_edit_file.takeFileMutationInput(
                         tool_input,
                         arena,
                     ),

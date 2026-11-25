@@ -57,12 +57,16 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 pub fn takeFileMutationInput(
     tool_input: tool_dispatch.ToolInput,
     alloc: Allocator,
-) file_mutation_contract.FileMutationInput {
+) Allocator.Error!file_mutation_contract.FileMutationInput {
     const input = tool_input.as(Input);
-    const moved = file_mutation_contract.EditInput{
-        .path = input.path,
+    const edits = try alloc.alloc(file_mutation_contract.Replacement, 1);
+    edits[0] = .{
         .old_string = input.old_string,
         .new_string = input.new_string,
+    };
+    const moved = file_mutation_contract.EditInput{
+        .path = input.path,
+        .edits = edits,
     };
     alloc.destroy(input);
     return .{ .edit = moved };
