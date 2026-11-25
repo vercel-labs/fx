@@ -1,0 +1,10 @@
+{
+  "permission": {
+    "*": "deny",
+    "shell": "allow",
+    "bash": {
+      "./fx mcp call mcp_viberaven_race_two_users - < request.json > result.json": "allow"
+    },
+    "mcp_viberaven_race_two_users": "allow"
+  }
+}
