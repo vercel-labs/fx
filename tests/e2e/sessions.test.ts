@@ -5647,10 +5647,15 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     // Steering continues the turn it interrupts: one committed turn that
     // holds the steering, and nothing interrupted.
     const id = onlySessionId(fixture.home);
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
+    const lines = logLines(fixture.home, id);
+    const kinds = lines.map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(1);
     expect(kinds).not.toContain("turn_interrupted");
-    expect(countIn(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8"), steering)).toBe(1);
+    expect(
+      lines.filter(
+        (line) => line.kind === "item" && JSON.stringify(line).includes(steering),
+      ),
+    ).toHaveLength(1);
 
     const resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "STEERED_ANSWER");
