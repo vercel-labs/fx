@@ -1806,7 +1806,9 @@ fn handleRequestCancellation(
     var response: std.Io.Writer.Allocating = .init(alloc);
     defer response.deinit();
     acp_types.writeSteeringPromptResponse(&response.writer, .cancelled, .dropped) catch return;
-    state.writer.writeResponse(alloc, requested, response.written()) catch {};
+    state.writer.writeResponse(alloc, requested, response.written()) catch |err| {
+        debug_trace.logf("acp", "event=cancel_steering_response_failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn libfxSessionId(alloc: Allocator, msg: *const jsonrpc.Message) !std.json.Parsed(std.json.Value) {
