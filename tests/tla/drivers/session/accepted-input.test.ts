@@ -351,9 +351,29 @@ interface PromptSpec {
 
 function readLogSnapshot(home: string, sessionId: string) {
   const lines = logLines(home, sessionId) as any[];
-  const acceptedIds = lines.filter((l) => l.kind === "input_accepted").map((l) => l.id as number);
-  const deliveredIds = [...new Set(lines.filter((l) => l.kind === "input_delivered").map((l) => l.id as number))];
-  const withdrawnIds = [...new Set(lines.filter((l) => l.kind === "input_withdrawn").map((l) => l.id as number))];
+  const rawToModelId = new Map<number, number>();
+  const acceptedIds: number[] = [];
+  let prevRawId = 0;
+  for (const line of lines) {
+    if (line.kind !== "input_accepted") continue;
+    const rawId = line.id as number;
+    if (rawId <= prevRawId) {
+      throw new Error(`Expected strictly increasing input_accepted id, got ${rawId} after ${prevRawId}`);
+    }
+    prevRawId = rawId;
+    const modelId = acceptedIds.length + 1;
+    rawToModelId.set(rawId, modelId);
+    acceptedIds.push(modelId);
+  }
+  const mapIds = (kind: string) => [
+    ...new Set(
+      lines
+        .filter((l) => l.kind === kind)
+        .map((l) => rawToModelId.get(l.id as number) ?? (l.id as number)),
+    ),
+  ];
+  const deliveredIds = mapIds("input_delivered");
+  const withdrawnIds = mapIds("input_withdrawn");
   const userLines = lines.filter((l) => l.kind === "item" && l.type === "user");
   const userItems = userLines.length;
   const recoveryTurns = userLines.filter((l) => JSON.stringify(l.data ?? "").includes("<session_resumed>")).length;
