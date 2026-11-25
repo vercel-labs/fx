@@ -8132,7 +8132,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "fetch rows name the page and its host, and a search of web search results names them, live, after a resume, and in a narrow terminal",
+    "fetch rows name the page and its host or the redacted URL, and a search of web search results names them, live, after a resume, and in a narrow terminal",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-fetch-rows-")));
       const home = join(root, "home");
@@ -8148,6 +8148,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       const refusedUrl = "http://127.0.0.1/protocol/v1/prompt-turn";
       const deniedUrl = "https://agentclientprotocol.com/protocol/v1/slash-commands";
+      // URLs whose host a row cannot name, which web_fetch refuses too. Each
+      // row shows the URL redacted, never its user name or password.
+      const unnamedHosts = [
+        { url: "https://user:secret@/docs", row: "Couldn't fetch https://[redacted]@/docs" },
+        { url: "https://user:pa/ss@127.0.0.1/x", row: "Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        { url: "user:secret@agentclientprotocol.com/docs", row: "Couldn't fetch [redacted]@agentclientprotocol.com/docs" },
+        { url: "https://evil.test\\@example.com/spoof", row: "Couldn't fetch https://[redacted]@example.com/spoof" },
+        { url: "file://srv/share/x", row: "Couldn't fetch file://srv/share/x" },
+      ];
       // The search of the user's session, which starts with a straight quote.
       const query = '"url":"https://agentclientprotocol.com';
       // Large enough that fx saves the provider's search results behind a
@@ -8184,6 +8193,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             { type: "tool-result", toolCallId: "provider_search", result: { requestId: "fetch-rows", results } },
             { type: "tool-call", toolCallId: "fetch_refused", toolName: "web_fetch", input: { url: refusedUrl } },
             { type: "tool-call", toolCallId: "fetch_denied", toolName: "web_fetch", input: { url: deniedUrl } },
+            ...unnamedHosts.map(({ url }, index) => ({ type: "tool-call", toolCallId: `fetch_unnamed_${index}`, toolName: "web_fetch", input: { url } })),
             { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
           ]);
         }
@@ -8215,12 +8225,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const searchRow = "Searched web results for “\"url\":\"https://agentclientprotocol.com”";
       const expectRows = (rows: string[], cols = Infinity) => {
         const clip = (row: string) => (row.length + 2 <= cols ? row : `${row.slice(0, cols - 3)}…`);
-        for (const row of [refusedRow, deniedRow, searchRow]) {
+        for (const row of [refusedRow, deniedRow, searchRow, ...unnamedHosts.map((unnamed) => unnamed.row)]) {
           expect(rows.some((line) => line.slice(2) === clip(row))).toBe(true);
         }
-        // No fetch row names a URL, and no row repeats the search's own quotes
-        // in straight quotes or names the search tool.
-        expect(rows.filter((line) => /fetch|Denied/.test(line) && line.includes("://"))).toEqual([]);
+        expect(rows.filter((line) => /secret|user:|pa\/ss/.test(line))).toEqual([]);
+        // No row repeats the search's own quotes in straight quotes or names
+        // the search tool.
         expect(rows.filter((line) => line.includes('""') || line.includes("exa_search") || line.includes("saved output"))).toEqual([]);
       };
 

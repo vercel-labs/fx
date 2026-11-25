@@ -1397,7 +1397,7 @@ const StoryTally = struct {
                     } else {
                         self.tool_opens += 1;
                     }
-                } else if (std.mem.eql(u8, name, "web_search") or isProviderSearchName(name)) {
+                } else if (isWebSearchName(name)) {
                     self.web_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_fetch")) {
                     self.web_reads += 1;
@@ -1775,6 +1775,11 @@ test "a command check row keeps one verb while its command runs" {
 
 fn isProviderSearchName(name: []const u8) bool {
     return std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
+}
+
+/// Whether a call searches the web: fx's own search, or one a provider runs.
+fn isWebSearchName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "web_search") or isProviderSearchName(name) or tooling_presentation.isProviderSearchAlias(name);
 }
 
 fn pluralWord(count: usize, singular: []const u8, plural_form: []const u8) []const u8 {
@@ -2805,37 +2810,41 @@ fn moreOutputSource(phrase: []const u8) ?[]const u8 {
     return if (source.len == 0) null else source;
 }
 
-/// A web address's host, without the user name and password a URL may put
-/// before it, and its path, without the query and fragment after it.
+/// An http or https URL's host and port, after its user name and password,
+/// and its path, without its query and fragment.
 const UrlParts = struct { host: []const u8, path: []const u8 };
 
+/// Null when a row cannot name the host: another scheme, no host, a port
+/// that is not a number, or a control byte or a backslash in the authority,
+/// where a browser and fx's fetch read the host differently.
 fn urlParts(url: []const u8) ?UrlParts {
-    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
-    const rest = url[scheme_end + 3 ..];
-    const authority_end = std.mem.findAny(u8, rest, "/?#") orelse rest.len;
-    const authority = rest[0..authority_end];
-    const host = if (std.mem.findScalarLast(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
-    if (host.len == 0) return null;
-    const after_host = rest[authority_end..];
+    const authority = text_utils.urlAuthority(url) orelse return null;
+    const scheme = url[0 .. authority.start - "://".len];
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return null;
+    for (url[authority.start..authority.end]) |byte| if (byte < 0x20 or byte == 0x7f or byte == '\\') return null;
+    const host = url[authority.host_start..authority.end];
+    if (!hostHasNumericPort(host)) return null;
+    const after_host = url[authority.end..];
     return .{ .host = host, .path = after_host[0 .. std.mem.findAny(u8, after_host, "?#") orelse after_host.len] };
+}
+
+/// "example.com", "example.com:8443", or "[::1]:8080".
+fn hostHasNumericPort(host: []const u8) bool {
+    const name_end = if (std.mem.startsWith(u8, host, "["))
+        (std.mem.findScalar(u8, host, ']') orelse return false) + 1
+    else
+        std.mem.findScalar(u8, host, ':') orelse host.len;
+    if (name_end == 0 or std.mem.eql(u8, host[0..name_end], "[]")) return false;
+    const port = host[name_end..];
+    if (port.len == 0) return true;
+    if (port.len == 1 or port[0] != ':') return false;
+    for (port[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
 }
 
 /// A web page's host, such as "example.com" for "https://example.com/a".
 fn urlHost(url: []const u8) ?[]const u8 {
     return (urlParts(url) orelse return null).host;
-}
-
-/// The last part of a URL's path that is not empty, such as "prompt-turn"
-/// for "/protocol/v1/prompt-turn/". Empty for a path with no such part.
-fn urlPathPage(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/");
-    const start = if (std.mem.findScalarLast(u8, trimmed, '/')) |slash| slash + 1 else 0;
-    return trimmed[start..];
-}
-
-/// Whether core cut `text` short, which it marks with an ellipsis.
-fn endsCutShort(text: []const u8) bool {
-    return std.mem.endsWith(u8, text, "...") or std.mem.endsWith(u8, text, "\u{2026}");
 }
 
 /// A file's name, without the folders before it.
@@ -2864,7 +2873,7 @@ fn outputSourceName(scratch: std.mem.Allocator, source: *const ToolDetailRecord)
 /// call in the transcript saved the output. Null when core cut the source
 /// short, since the end it cut off is what tells sources apart.
 fn phraseSourceName(scratch: std.mem.Allocator, source: []const u8, handle: []const u8) !?OutputSourceName {
-    if (endsCutShort(source)) return null;
+    if (std.mem.endsWith(u8, source, "...") or std.mem.endsWith(u8, source, "\u{2026}")) return null;
     if (command_replay_store.isReplayHandle(handle)) return .{ .full = source, .short = try shortCommand(scratch, source) orelse source };
     if (urlHost(source)) |host| return .{ .full = source, .short = host };
     return .{ .full = source, .short = pathFileName(source) orelse source };
@@ -2948,27 +2957,14 @@ fn sharedSavedOutputIdentity(
     return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ output.full, "\x00", output.short, "\x00", try rowQuotedQuery(scratch, search.quoted_query) }) };
 }
 
-/// What a row of searches of one saved output calls a web search's results.
-/// The search tool's name is fx's own, and the row's verb already says
-/// "Searched".
+/// A web search's saved results, since the search tool's name is fx's own.
 const web_results_label = "web results";
 
-/// What a row of searches of one saved output puts between the output and
-/// the searches.
 const output_search_marker = " for ";
 
-/// Whether a call searches the web: fx's own search, or one the provider
-/// runs.
-fn isWebSearchName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "web_search") or isProviderSearchName(name) or tooling_presentation.isProviderSearchAlias(name);
-}
-
-/// The saved output a row of searches looks in, in full and as the row names
-/// it before `output_search_marker`: its source's short name and "output",
-/// such as "github.com output", "web results" for a web search's results,
-/// or core's noun for an output no call names, such as "saved output". An
-/// output named by a noun goes by its handle in full, so two such outputs
-/// stay apart.
+/// The output a row of searches looks in, in full and as the row names it,
+/// such as "github.com output" or "web results". An output no call names
+/// goes by its handle in full, so two such outputs stay apart.
 fn searchedOutputName(
     scratch: std.mem.Allocator,
     handle: []const u8,
@@ -2984,10 +2980,10 @@ fn searchedOutputName(
     return .{ .full = name.full, .short = try std.mem.concat(scratch, u8, &.{ name.short, " output" }) };
 }
 
-/// A search as its compact row repeats it. Core puts it in straight quotes
-/// (`quotedQuery` in src/core/tooling/read_tool_result_presentation.zig); a
-/// search that holds a straight quote goes in curly quotes instead, so its
-/// own quotes do not run into the row's, as in “"url":"https://…”.
+/// Core quotes a search in straight quotes (`quotedQuery` in
+/// src/core/tooling/read_tool_result_presentation.zig). One that holds a
+/// straight quote goes in curly quotes, so its own quotes stay apart from
+/// the row's.
 fn rowQuotedQuery(scratch: std.mem.Allocator, quoted_query: []const u8) ![]const u8 {
     if (quoted_query.len < 2) return quoted_query;
     const query = quoted_query[1 .. quoted_query.len - 1];
@@ -3362,12 +3358,10 @@ test "a cancelled look into saved output names what it read as its running row d
     }
 }
 
-/// What a fetch row puts between its pages and their host.
 const fetch_host_separator = " · ";
 
-/// The verb a row's phrase opens with, such as "Fetched" or "Failed": its
-/// letters before the first space, when more text follows. Null for any
-/// other phrase, such as a bare "Fetching" or `fx ask`'s "Failed: …".
+/// The verb a row's phrase opens with, such as "Fetched" or "Failed". Null
+/// for a phrase with nothing after its verb, or `fx ask`'s "Failed: …".
 fn phraseVerb(phrase: []const u8) ?[]const u8 {
     const space = findByte(phrase, ' ') orelse return null;
     if (space == 0 or space + 1 == phrase.len) return null;
@@ -3375,12 +3369,9 @@ fn phraseVerb(phrase: []const u8) ?[]const u8 {
     return phrase[0..space];
 }
 
-/// The URL a `web_fetch` call reads: its `url`, or, for a call without one,
-/// such as a toolbox run still streaming its arguments in or one that failed
-/// before it started, the URL core's row names after its verb. Core names it
-/// only once that whole value has streamed in (`streamedLabelValue` in
-/// src/core/tooling/tool_presentation.zig). Null for any other call and for
-/// a URL core cut short.
+/// A `web_fetch` call's `url`, or for a call without one, such as a toolbox
+/// run whose arguments still stream in or one that failed before it started,
+/// the URL core's row names after its verb.
 fn fetchedUrl(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !?[]const u8 {
     if (!std.mem.eql(u8, record.tool_name, "web_fetch")) return null;
     if (storyArgString(scratch, record, "url")) |url| return std.mem.trim(u8, url, " \t\r\n");
@@ -3388,38 +3379,74 @@ fn fetchedUrl(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const
     const phrase = if (splitFailedPhrase(status, record)) |split| split.row else status;
     const verb = phraseVerb(phrase) orelse return null;
     const after_verb = phrase[verb.len + 1 ..];
-    const url = after_verb[0 .. findByte(after_verb, ' ') orelse after_verb.len];
-    return if (endsCutShort(url)) null else url;
+    return after_verb[0 .. findByte(after_verb, ' ') orelse after_verb.len];
 }
 
-/// A fetched page's name in a row's list: the last part of its URL's path,
-/// such as "prompt-turn", or the host for a URL with no path.
-fn fetchedPageName(url: []const u8) []const u8 {
-    const parts = urlParts(url) orelse return url;
-    const page = urlPathPage(parts.path);
-    return if (page.len > 0) page else parts.host;
+/// A fetched page's name: the last part of its URL's path, or the host when
+/// the path has none.
+fn fetchPageName(parts: UrlParts) []const u8 {
+    return pathFileName(parts.path) orelse parts.host;
 }
 
-/// The page and host a fetch row names, such as "prompt-turn ·
-/// agentclientprotocol.com", or the host alone for a URL with no path.
-/// Terminal-safe. Null for a URL with no host.
-fn fetchTargetText(scratch: std.mem.Allocator, url: []const u8) !?[]const u8 {
-    const parts = urlParts(url) orelse return null;
+/// Null for a path of one part or none.
+fn pathLastTwoParts(path: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    const last_slash = std.mem.findScalarLast(u8, trimmed, '/') orelse return null;
+    const parent_slash = std.mem.findScalarLast(u8, trimmed[0..last_slash], '/') orelse return null;
+    return trimmed[parent_slash + 1 ..];
+}
+
+/// The names a row gives its pages, in order. Pages whose names are the same
+/// add the part of the path before it, as in "v1/prompt-turn,
+/// v2/prompt-turn".
+fn fetchPageNames(scratch: std.mem.Allocator, urls: []const []const u8) ![]const []const u8 {
+    const names = try scratch.alloc([]const u8, urls.len);
+    for (urls, names) |url, *name| {
+        name.* = if (urlParts(url)) |parts| fetchPageName(parts) else try redactedFetchUrl(scratch, url);
+    }
+    const shown = try scratch.dupe([]const u8, names);
+    for (urls, names, shown, 0..) |url, name, *show, index| {
+        const clashes = for (names, 0..) |other, other_index| {
+            if (other_index != index and std.mem.eql(u8, other, name)) break true;
+        } else false;
+        if (!clashes) continue;
+        const parts = urlParts(url) orelse continue;
+        show.* = pathLastTwoParts(parts.path) orelse name;
+    }
+    return shown;
+}
+
+/// A fetch URL with no usable host as its row shows it: core's redacted form
+/// (`redactUrlForDisplay`), with everything before the last '@' ahead of the
+/// query redacted too, since a '/' in a password or a URL with no "://"
+/// keeps a user name and password out of that form's authority.
+fn redactedFetchUrl(scratch: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const redacted = try text_utils.redactUrlForDisplay(scratch, url);
+    const start = if (text_utils.urlAuthority(redacted)) |authority| authority.start else 0;
+    const end = start + (std.mem.findAny(u8, redacted[start..], "?#") orelse redacted.len - start);
+    const at = std.mem.findScalarLast(u8, redacted[start..end], '@') orelse return redacted;
+    return std.mem.concat(scratch, u8, &.{ redacted[0..start], text_utils.redacted_marker, redacted[start + at ..] });
+}
+
+/// What a fetch row names after its verb, terminal-safe: the page and its
+/// host, the host alone for a URL with no path, or the redacted URL when the
+/// row cannot name its host.
+fn fetchTargetText(scratch: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const parts = urlParts(url) orelse return terminalSafeText(scratch, try redactedFetchUrl(scratch, url));
     const host = try terminalSafeText(scratch, parts.host);
-    const page = urlPathPage(parts.path);
-    if (page.len == 0) return host;
+    const page = fetchPageName(parts);
+    if (std.mem.eql(u8, page, parts.host)) return host;
     return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, page), fetch_host_separator, host });
 }
 
-/// The host a `.fetch` key names, before its first 0 byte.
 fn fetchKeyHost(key: []const u8) []const u8 {
     return key[0 .. findByte(key, 0) orelse key.len];
 }
 
-/// A fetch that ran or still runs joins the group's row for its host, which
-/// names each page once. One that failed, was denied, or was cancelled keeps
-/// its own row, as a file read does. The key is the host, a 0 byte, and the
-/// URL. Any other call keeps `identity`.
+/// A fetch that ran or still runs joins its host's row. One that failed, was
+/// denied, or was cancelled keeps its own, as a file read does, and so does
+/// one whose host the row cannot name. The key is the host, a 0 byte, and
+/// the URL.
 fn fetchIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
     const record = detail orelse return identity;
     if (storyCallFailed(detail)) return identity;
@@ -3429,19 +3456,14 @@ fn fetchIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*c
     return .{ .kind = .fetch, .key = try std.mem.concat(scratch, u8, &.{ parts.host, "\x00", url }) };
 }
 
-/// A fetch row by its page and host, such as "Fetched prompt-turn ·
-/// agentclientprotocol.com", in place of the URL core's row names. Core's
-/// live row adds the final URL, size, status, time, and cache state, which a
-/// resumed row does not have, so the compact row names only what the call
-/// asked for, and reads the same live and after a resume. The verb is core's,
-/// so a failed fetch reads "Failed …" until `couldNotPhrase` words it. Null
-/// for any other row and for a phrase with no verb.
+/// A fetch row in place of core's URL. Core's live row adds the final URL,
+/// size, status, time, and cache state, which a resumed row lacks, so this
+/// row reads the same both ways. The verb is core's.
 fn fetchRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     const url = try fetchedUrl(scratch, row.entry, record) orelse return null;
     const verb = phraseVerb(phrase) orelse return null;
-    const target = try fetchTargetText(scratch, url) orelse return null;
-    return try std.mem.concat(scratch, u8, &.{ verb, " ", target });
+    return try std.mem.concat(scratch, u8, &.{ verb, " ", try fetchTargetText(scratch, url) });
 }
 
 /// Core's live row of a completed fetch of `url`: the final URL, size,
@@ -3514,7 +3536,7 @@ test "a fetch row names the last part of the URL's path, or the host for a URL w
         .{ .url = " https://agentclientprotocol.com/docs\n", .row = "● Fetched docs · agentclientprotocol.com" },
         // An escape sequence in the URL shows as text.
         .{ .url = "https://agentclientprotocol.com/a\x1b[31mred", .row = "● Fetched a\\x1b[31mred · agentclientprotocol.com" },
-        // A URL with no host keeps core's row.
+        .{ .url = "https://bücher.example/katalog", .row = "● Fetched katalog · bücher.example" },
         .{ .url = "agentclientprotocol.com/docs", .row = "● Fetched agentclientprotocol.com/docs" },
     };
     for (cases) |case| {
@@ -3530,11 +3552,59 @@ test "a fetch row names the last part of the URL's path, or the host for a URL w
     }
 }
 
+test "a fetch row never shows a user name or password, with or without the call's arguments" {
+    const alloc = std.testing.allocator;
+    const Case = struct { url: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .url = "https://user:secret@/docs", .row = "● Couldn't fetch https://[redacted]@/docs" },
+        .{ .url = "user:secret@agentclientprotocol.com/docs", .row = "● Couldn't fetch [redacted]@agentclientprotocol.com/docs" },
+        // The '/' ends the authority before the '@', so "user" reads as a
+        // host and "pa" as its port.
+        .{ .url = "https://user:pa/ss@127.0.0.1/x", .row = "● Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:p@ss@127.0.0.1/x", .row = "● Couldn't fetch x · 127.0.0.1" },
+        .{ .url = "https://user:secret@agentclientprotocol.com/docs?token=abc", .row = "● Couldn't fetch docs · agentclientprotocol.com" },
+        .{ .url = "ftp://user:secret@agentclientprotocol.com/x", .row = "● Couldn't fetch ftp://[redacted]@agentclientprotocol.com/x" },
+        // A browser reads this host as evil.test, and fx's fetch as
+        // example.com.
+        .{ .url = "https://evil.test\\@example.com/spoof", .row = "● Couldn't fetch https://[redacted]@example.com/spoof" },
+        .{ .url = "https://agentclientprotocol.com:abc/x", .row = "● Couldn't fetch https://agentclientprotocol.com:abc/x" },
+        .{ .url = "https://agent\x00client.com/x", .row = "● Couldn't fetch https://agent\\x00client.com/x" },
+        .{ .url = "file://srv/share/x", .row = "● Couldn't fetch file://srv/share/x" },
+        .{ .url = "javascript://agentclientprotocol.com/%0aalert(1)", .row = "● Couldn't fetch javascript://agentclientprotocol.com/%0aalert(1)" },
+    };
+    const credentials = [_][]const u8{ "secret", "user:", "pa/ss", "p@ss" };
+    for (cases) |case| {
+        const arguments = try alloc.print("{{\"url\":{f}}}", .{std.json.fmt(case.url, .{})});
+        defer alloc.free(arguments);
+        const status = try alloc.print("● Failed {f}: web_fetch refuses credential-bearing URLs\n", .{text_utils.terminalSafe(case.url)});
+        defer alloc.free(status);
+        // A call that failed before it started has no arguments, so its row
+        // reads the URL core names.
+        for ([_]?[]u8{ arguments, null }) |arguments_json| {
+            const detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = arguments_json, .outcome = .failed };
+            const text = try groupTextForTest(alloc, &.{fetchEntryForTest(1, status)}, &.{detail});
+            defer alloc.free(text);
+            errdefer std.debug.print("{s} =>\n{s}\n", .{ case.url, text });
+            try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+            for (credentials) |credential| try std.testing.expect(std.mem.find(u8, text, credential) == null);
+        }
+    }
+
+    // A cancelled fetch's notice hides them too.
+    const cancelled = try groupTextForTest(alloc, &.{fetchEntryForTest(1, "▪ Cancelled https://user:secret@/docs" ++ cancellation_follow_up ++ "\n")}, &.{fetchDetailForTest(1, "https://user:secret@/docs", .cancelled)});
+    defer alloc.free(cancelled);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{cancelled});
+    try std.testing.expectEqualStrings("● Cancelled https://[redacted]@/docs", firstLineForTest(cancelled));
+    try std.testing.expect(std.mem.find(u8, cancelled, "▪ Cancelled https://[redacted]@/docs" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "secret") == null);
+}
+
 test "fetches from one host share a row that names each page once, and another host keeps its own" {
     const alloc = std.testing.allocator;
     const site = "https://agentclientprotocol.com/protocol/v1/";
     const prompt_turn = site ++ "prompt-turn";
     const slash = site ++ "slash-commands";
+    const prompt_turn_v2 = "https://agentclientprotocol.com/protocol/v2/prompt-turn";
     const other = "https://docs.example.dev/guide/install";
     const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, rows: []const u8 };
     var streaming = fetchDetailForTest(2, slash, null);
@@ -3551,6 +3621,12 @@ test "fetches from one host share a row that names each page once, and another h
             .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(other)), fetchEntryForTest(3, liveFetchStatusForTest(slash)), fetchEntryForTest(4, liveFetchStatusForTest(prompt_turn)) },
             .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, other, .completed), fetchDetailForTest(3, slash, .completed), fetchDetailForTest(4, prompt_turn, .completed) },
             .rows = "● Read web pages\n├ Fetched slash-commands, prompt-turn · agentclientprotocol.com\n└ Fetched install · docs.example.dev",
+        },
+        // Two pages with one name add the part of the path before it.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(prompt_turn_v2)), fetchEntryForTest(3, liveFetchStatusForTest(slash)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, prompt_turn_v2, .completed), fetchDetailForTest(3, slash, .completed) },
+            .rows = "● Fetched v1/prompt-turn, v2/prompt-turn, slash-commands · agentclientprotocol.com",
         },
         // One page fetched twice counts its calls, as a joined row does.
         .{
@@ -3578,7 +3654,7 @@ test "fetches from one host share a row that names each page once, and another h
     }
 }
 
-test "a narrow row of fetched pages leaves out the oldest pages first and keeps the host" {
+test "a narrow row of fetched pages leaves out the oldest pages first, and one too narrow for a page clips at its end" {
     const alloc = std.testing.allocator;
     const site = "https://agentclientprotocol.com/protocol/v1/";
     const pages = [_][]const u8{ "overview", "initialization", "prompt-turn", "slash-commands" };
@@ -3934,15 +4010,16 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     const names = row.names.items;
+    const page_names = if (kind == .fetch) try fetchPageNames(scratch, names) else names;
     const pieces = try scratch.alloc([]const u8, names.len);
-    for (names, pieces) |name, *piece| {
+    for (names, page_names, pieces) |name, page_name, *piece| {
         var text: std.Io.Writer.Allocating = .init(scratch);
         switch (kind) {
             .read => try writeFileName(&text.writer, name, .{ .resolved = readLink(row, name) }),
             .more_output => try writeTerminalSafe(&text.writer, moreOutputShortName(name)),
             // Core quotes a search terminal-safe.
             .output_search => try text.writer.writeAll(name),
-            .fetch => try writeTerminalSafe(&text.writer, fetchedPageName(name)),
+            .fetch => try writeTerminalSafe(&text.writer, page_name),
             else => try writeTerminalSafe(&text.writer, name),
         }
         piece.* = text.written();
