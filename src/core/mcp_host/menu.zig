@@ -450,6 +450,9 @@ pub const news_ms: i64 = 5000;
 /// transcript and on the server's screen alike.
 pub const sign_in_link_label = "Open the sign-in page";
 
+/// The hint a waiting sign-in offers when fx can't open a browser: paste its return.
+pub const paste_hint = "Browser on another computer? Paste the address it ends on.";
+
 /// The longest the status line waits for servers to finish starting.
 pub const startup_quiet_ms: i64 = 10_000;
 

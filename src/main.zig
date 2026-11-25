@@ -5494,6 +5494,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/app_mcp_runtime.zig");
     _ = @import("core/app/usage_host.zig");
     _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
@@ -5540,6 +5541,7 @@ test {
     _ = @import("core/config/settings_store.zig");
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/agents_menu_presentation.zig");
+    _ = @import("ui/footer/mcp_host_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");

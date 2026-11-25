@@ -815,6 +815,7 @@ pub fn Runtime(comptime App: type) type {
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
                     .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                    .paste_hint = app.mcp.hostMenuOffersPaste(),
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,

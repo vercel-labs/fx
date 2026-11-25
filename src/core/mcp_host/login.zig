@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const browser_callback = @import("../auth/browser_callback.zig");
+const oauth = @import("../auth/oauth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -63,8 +64,8 @@ pub const Listener = struct {
     /// Takes the sign-in's state from `authorize`, its authorization address.
     /// Safe while `accept` waits on another thread.
     pub fn expect(l: *Listener, io: std.Io, authorize: []const u8) void {
-        const query_at = std.mem.findScalar(u8, authorize, '?') orelse return;
-        const state = param(authorize[query_at + 1 ..], "state") orelse return;
+        const query = queryOf(authorize) orelse return;
+        const state = param(query, "state") orelse return;
         if (state.len > l.state.buf.len) return;
         l.state.mutex.lockUncancelable(io);
         defer l.state.mutex.unlock(io);
@@ -125,6 +126,87 @@ fn param(query: []const u8, name: []const u8) ?[]const u8 {
 
 fn hasParam(query: []const u8, name: []const u8) bool {
     return param(query, name) != null;
+}
+
+/// The longest pasted return that is read; a browser's return is far shorter.
+const max_pasted_return_bytes = 8 * 1024;
+const scheme_prefix = "http://";
+const first_printing_byte = '!';
+const delete_byte = 0x7f;
+
+/// What text pasted while a sign-in waits is to that sign-in.
+pub const Pasted = union(enum) {
+    /// Not a return to this sign-in's redirect: the text is handled as usual.
+    unrelated,
+    /// A return to this sign-in's redirect with another state.
+    other_sign_in,
+    /// This sign-in's return, as the address to finish it with. Owned by the arena.
+    this_sign_in: []const u8,
+};
+
+/// The query of a pasted return after its `?`, and whether it had the scheme.
+const PastedHead = struct { query: []const u8, has_scheme: bool };
+
+pub fn classifyPasted(arena: Allocator, authorize: []const u8, pasted: []const u8) Allocator.Error!Pasted {
+    const authorize_query = queryOf(authorize) orelse return .unrelated;
+    const redirect = (try redirectOf(arena, authorize_query)) orelse return .unrelated;
+    const text = std.mem.trim(u8, pasted, " \t\r\n");
+    if (!isPlainPaste(text)) return .unrelated;
+    const head = pastedHead(text, redirect) orelse return .unrelated;
+    if (!sameState(authorize_query, head.query)) return .other_sign_in;
+    return .{ .this_sign_in = try fullAddress(arena, text, head.has_scheme) };
+}
+
+fn queryOf(address: []const u8) ?[]const u8 {
+    const query_at = std.mem.findScalar(u8, address, '?') orelse return null;
+    return address[query_at + 1 ..];
+}
+
+fn redirectOf(arena: Allocator, query: []const u8) Allocator.Error!?[]const u8 {
+    const encoded = param(query, "redirect_uri") orelse return null;
+    const decoded = oauth.percentDecodeAlloc(arena, encoded) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (decoded.len == 0) return null;
+    return decoded;
+}
+
+fn isPlainPaste(text: []const u8) bool {
+    if (text.len == 0 or text.len > max_pasted_return_bytes) return false;
+    for (text) |byte| {
+        if (byte < first_printing_byte or byte == delete_byte) return false;
+    }
+    return true;
+}
+
+fn pastedHead(text: []const u8, redirect: []const u8) ?PastedHead {
+    if (std.mem.startsWith(u8, text, redirect)) return afterRedirect(text[redirect.len..], true);
+    const bare = bareRedirect(redirect) orelse return null;
+    if (!std.mem.startsWith(u8, text, bare)) return null;
+    return afterRedirect(text[bare.len..], false);
+}
+
+fn afterRedirect(rest: []const u8, has_scheme: bool) ?PastedHead {
+    if (!std.mem.startsWith(u8, rest, "?")) return null;
+    return .{ .query = rest[1..], .has_scheme = has_scheme };
+}
+
+fn bareRedirect(redirect: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, redirect, scheme_prefix)) return null;
+    return redirect[scheme_prefix.len..];
+}
+
+fn sameState(authorize_query: []const u8, pasted_query: []const u8) bool {
+    const own = param(authorize_query, "state") orelse return false;
+    if (own.len == 0) return false;
+    const got = param(pasted_query, "state") orelse return false;
+    return std.mem.eql(u8, own, got);
+}
+
+fn fullAddress(arena: Allocator, text: []const u8, has_scheme: bool) Allocator.Error![]const u8 {
+    if (has_scheme) return arena.dupe(u8, text);
+    return arena.print("{s}{s}", .{ scheme_prefix, text });
 }
 
 const testing = std.testing;
@@ -333,4 +415,204 @@ test "the redirect URI spells out every port in full" {
     }
     const slack_app: Listener = .{ .server = undefined, .port = 65535, .localhost = true };
     try testing.expectEqualStrings("http://localhost:65535/callback", slack_app.redirectUri(&buffer));
+}
+
+/// The authorization address of a sign-in whose redirect is the loopback
+/// listener on port 41723 and whose state is `s1`.
+const authorize_with_redirect = "https://as.example/authorize?response_type=code&client_id=c&redirect_uri=http%3A%2F%2F127.0.0.1%3A41723%2Fcallback&state=s1&code_challenge=x";
+const authorize_slack = "https://slack.example/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3118%2Fcallback&state=s1";
+const authorize_empty_state = "https://as.example/authorize?response_type=code&client_id=c&redirect_uri=http%3A%2F%2F127.0.0.1%3A41723%2Fcallback&state=&code_challenge=x";
+
+fn pastedTag(arena: Allocator, authorize: []const u8, pasted: []const u8) !std.meta.Tag(Pasted) {
+    return std.meta.activeTag(try classifyPasted(arena, authorize, pasted));
+}
+
+fn pastedAddress(arena: Allocator, authorize: []const u8, pasted: []const u8) ![]const u8 {
+    return switch (try classifyPasted(arena, authorize, pasted)) {
+        .this_sign_in => |address| address,
+        else => error.NotThisSignIn,
+    };
+}
+
+test "a pasted return of this sign-in gives its full address" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const address = try pastedAddress(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback?code=c1&state=s1");
+    try testing.expectEqualStrings("http://127.0.0.1:41723/callback?code=c1&state=s1", address);
+}
+
+test "a pasted return with spaces and a line end around it gives the trimmed address" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const address = try pastedAddress(arena.allocator(), authorize_with_redirect, "  http://127.0.0.1:41723/callback?code=c1&state=s1\r\n");
+    try testing.expectEqualStrings("http://127.0.0.1:41723/callback?code=c1&state=s1", address);
+}
+
+test "a pasted return without its scheme gets http added" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const address = try pastedAddress(arena.allocator(), authorize_with_redirect, "127.0.0.1:41723/callback?code=c1&state=s1");
+    try testing.expectEqualStrings("http://127.0.0.1:41723/callback?code=c1&state=s1", address);
+}
+
+test "a pasted return with another state is another sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).other_sign_in, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback?code=c1&state=s2"));
+}
+
+test "a pasted return with no state is another sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).other_sign_in, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback?code=c1"));
+}
+
+test "a pasted return on another port is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41724/callback?code=c1&state=s1"));
+}
+
+test "a pasted return on another path is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback2?code=c1&state=s1"));
+}
+
+test "a pasted redirect with no query is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback"));
+}
+
+test "a pasted ordinary prompt is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "fix the build"));
+}
+
+test "an empty pasted text is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, ""));
+}
+
+test "a pasted two-line text is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback?code=c1&state=s1\nmore"));
+}
+
+test "a pasted text over the length limit is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var long: [max_pasted_return_bytes + 1]u8 = @splat('a');
+    const head = "http://127.0.0.1:41723/callback?code=c1&state=s1";
+    @memcpy(long[0..head.len], head);
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, long[0..]));
+}
+
+test "a pasted return with an escape byte inside is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, "http://127.0.0.1:41723/callback?code=c1&state=s1\x1b[2J"));
+}
+
+test "a pasted text is unrelated when the sign-in has no redirect_uri" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_s1, "http://127.0.0.1:41723/callback?code=c1&state=s1"));
+}
+
+test "a pasted text is unrelated when the redirect_uri has a bad percent escape" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const authorize = "https://as.example/authorize?response_type=code&redirect_uri=http%3&state=s1";
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize, "http://127.0.0.1:41723/callback?code=c1&state=s1"));
+}
+
+test "a pasted return with an empty state is another sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(std.meta.Tag(Pasted).other_sign_in, try pastedTag(arena.allocator(), authorize_empty_state, "http://127.0.0.1:41723/callback?code=c1&state="));
+}
+
+test "a pasted Slack-style localhost return is this sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const address = try pastedAddress(arena.allocator(), authorize_slack, "http://localhost:3118/callback?code=c&state=s1");
+    try testing.expectEqualStrings("http://localhost:3118/callback?code=c&state=s1", address);
+}
+
+const long_return = blk: {
+    const head = "http://127.0.0.1:41723/callback?code=";
+    const tail = "&state=s1";
+    const padding = 1001 - head.len - tail.len;
+    var bytes: [1001]u8 = undefined;
+    @memcpy(bytes[0..head.len], head);
+    @memset(bytes[head.len..][0..padding], 'a');
+    @memcpy(bytes[head.len + padding ..], tail);
+    break :blk bytes;
+};
+
+fn fuzzPastedReturn(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [9000]u8 = undefined;
+    const pasted = buffer[0..smith.slice(&buffer)];
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    switch (try classifyPasted(arena.allocator(), authorize_with_redirect, pasted)) {
+        .unrelated => {},
+        .other_sign_in => {
+            const trimmed = std.mem.trim(u8, pasted, " \t\r\n");
+            try testing.expect(std.mem.startsWith(u8, trimmed, "http://127.0.0.1:41723/callback?") or
+                std.mem.startsWith(u8, trimmed, "127.0.0.1:41723/callback?"));
+        },
+        .this_sign_in => |address| {
+            try testing.expect(std.mem.startsWith(u8, address, "http://127.0.0.1:41723/callback?"));
+            for (address) |byte| try testing.expect(byte >= 0x21 and byte != 0x7f);
+            try testing.expect(address.len <= max_pasted_return_bytes + scheme_prefix.len);
+            switch (try classifyPasted(arena.allocator(), authorize_with_redirect, address)) {
+                .this_sign_in => |again| try testing.expectEqualStrings(address, again),
+                else => return error.NotIdempotent,
+            }
+        },
+    }
+}
+
+test "a pasted sign-in return is classified on fuzzed bytes, and only a return to this sign-in's redirect with its state is taken" {
+    try std.testing.fuzz({}, fuzzPastedReturn, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "http://127.0.0.1:41723/callback?code=c1&state=s1",
+            "127.0.0.1:41723/callback?code=c1&state=s1",
+            "http://127.0.0.1:41723/callback?code=c1&state=s2",
+            "http://127.0.0.1:41723/callback?code=c1&state=s1\x1b[2J",
+            long_return[0..],
+        }) ++ @import("fuzz_corpus").mcp_pasted_return.*),
+    });
+}
+
+/// A return to this sign-in's redirect and state, padded with `a` to `len` bytes.
+fn paddedPastedReturn(arena: Allocator, len: usize) Allocator.Error![]u8 {
+    const head = "http://127.0.0.1:41723/callback?code=";
+    const tail = "&state=s1";
+    const text = try arena.alloc(u8, len);
+    @memcpy(text[0..head.len], head);
+    @memset(text[head.len .. len - tail.len], 'a');
+    @memcpy(text[len - tail.len ..], tail);
+    return text;
+}
+
+test "a pasted return of exactly the length limit is this sign-in's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const text = try paddedPastedReturn(arena.allocator(), max_pasted_return_bytes);
+    try testing.expectEqual(std.meta.Tag(Pasted).this_sign_in, try pastedTag(arena.allocator(), authorize_with_redirect, text));
+}
+
+test "a pasted return one byte over the length limit is unrelated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const text = try paddedPastedReturn(arena.allocator(), max_pasted_return_bytes + 1);
+    try testing.expectEqual(std.meta.Tag(Pasted).unrelated, try pastedTag(arena.allocator(), authorize_with_redirect, text));
 }

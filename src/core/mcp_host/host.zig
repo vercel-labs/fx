@@ -24,6 +24,8 @@ pub const Status = runtime_mod.Status;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
 pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
+pub const Pasted = @import("login.zig").Pasted;
+pub const classifyPasted = @import("login.zig").classifyPasted;
 
 pub const Extras = struct {
     /// The questions fx's UI on this surface can ask.
