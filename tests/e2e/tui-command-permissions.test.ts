@@ -37,6 +37,7 @@ import {
   TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -844,7 +845,7 @@ describe("effect-aware command permissions", () => {
         10_000,
       );
       await activeSession.sendKeys("1");
-      await activeSession.waitForText("history feedback live complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback live complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The two commands share one row by their steps, which is the group's
@@ -904,7 +905,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("/resume");
       await activeSession.waitForText("Run the prepared two-command history fixture.", TIMEOUT);
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("history feedback cli resume complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("history feedback cli resume complete") && turnSettled(pane), TIMEOUT);
       const pickerScrollback = await activeSession.captureFullScrollback();
       const pickerCommandsRow = pickerScrollback.indexOf("Ran touch, printf");
       expect(pickerCommandsRow).toBeGreaterThanOrEqual(0);
@@ -1092,7 +1093,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run pwd once in auto mode.");
-      await activeSession.waitForText("direct auto complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("direct auto complete") && turnSettled(pane), TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
       // The group's only call is its header.
@@ -1379,7 +1380,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the prepared command.");
-      await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
       // The command is long, so its row shows its steps in short form at every
@@ -1395,7 +1396,7 @@ describe("effect-aware command permissions", () => {
       expect(wideRow).toBe("● Ran printf ✓");
 
       await activeSession.sendText("Run the next prepared command.");
-      await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE") && turnSettled(pane), TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
       // The second command is long too, and its row never shows the
       // workspace path.
@@ -1479,7 +1480,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossless direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSLESS_DONE") && turnSettled(pane),
         TIMEOUT,
       );
 
@@ -1509,7 +1510,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the lossy direct printf fixture.");
       await activeSession.waitForText("DIRECT_LOSSY_DONE", TIMEOUT);
       await activeSession.waitForPane(
-        (pane) => pane.includes("DIRECT_LOSSY_DONE") && !pane.includes("Streaming ("),
+        (pane) => pane.includes("DIRECT_LOSSY_DONE") && turnSettled(pane),
         TIMEOUT,
       );
       const lossyCompact = await activeSession.captureFullScrollback();
@@ -1551,6 +1552,10 @@ describe("effect-aware command permissions", () => {
       expect(lossyModelResult).toContain("  DIRECT_PADDED  ");
       expect(lossyModelResult).toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
+      // Both results hold their exact output, so neither repeats the replay
+      // handle that Ctrl-O reads.
+      expect(JSON.parse(losslessModelResult)).not.toHaveProperty("full_output_handle");
+      expect(JSON.parse(lossyModelResult)).not.toHaveProperty("full_output_handle");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -1567,8 +1572,8 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).toContain("full_output_handle");
-      expect(publicSession.stdout).toContain("fx-command-replay-");
+      expect(publicSession.stdout).not.toContain("full_output_handle");
+      expect(publicSession.stdout).not.toContain("fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -1650,7 +1655,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/output quiet");
-      await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes(responseRows.at(-1)!) && turnSettled(pane), TIMEOUT);
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
@@ -1810,7 +1815,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("diagnostic fixture complete") && turnSettled(pane), TIMEOUT);
       expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
 
       await activeSession.sendText("/trace");
@@ -1937,10 +1942,10 @@ describe("effect-aware command permissions", () => {
     await activeSession.waitForComposer(TIMEOUT);
     await activeSession.sendText(rootPrompt);
     if (shipFails) {
-      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 1") && turnSettled(pane), TIMEOUT * 2);
       await activeSession.waitForText("ship needs you", TIMEOUT);
     } else {
-      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+      await activeSession.waitForPane((pane) => pane.includes("report noted 2") && turnSettled(pane), TIMEOUT * 2);
     }
     await activeSession.waitForComposer(TIMEOUT);
 
@@ -2047,7 +2052,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("nothing to delegate", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("nothing to delegate") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
@@ -2126,7 +2131,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2247,7 +2252,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("cuts done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("cuts done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2343,7 +2348,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("wrapped secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("wrapped secrets done") && turnSettled(pane), 120_000);
       // The prose and the table are on screen in pieces: no row holds a whole
       // secret. The command output is folded once the turn ends, and its
       // entries keep the rows it was wrapped into.
@@ -2427,7 +2432,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("many secrets done", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("many secrets done") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2497,7 +2502,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("AAAAAA", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("AAAAAA") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2577,7 +2582,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("probe done", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("probe done") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2731,7 +2736,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText(failPrompt);
       await activeSession.waitForText("HTTP 400", TIMEOUT);
       await activeSession.sendText(fillPrompt);
-      await activeSession.waitForText("network window filled", 120_000);
+      await activeSession.waitForPane((pane) => pane.includes("network window filled") && turnSettled(pane), 120_000);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
@@ -2809,7 +2814,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Render the trace fixture.");
-      await activeSession.waitForText("TRACE_RENDER_DONE", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_RENDER_DONE") && turnSettled(pane), TIMEOUT);
       await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.resizeWindow(100, 32);
       await activeSession.waitForStableComposer(TIMEOUT);
@@ -2898,7 +2903,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say ready.");
-      await activeSession.waitForText("TRACE_FAULT_READY", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("TRACE_FAULT_READY") && turnSettled(pane), TIMEOUT);
 
       await activeSession.sendText("/trace");
       await activeSession.waitForText("Could not create trace.", TIMEOUT);
@@ -2926,6 +2931,151 @@ describe("effect-aware command permissions", () => {
       expect(farShutdown.recorded_at_ms).toBeUndefined();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace carries the crash report fx saved when it last ended on an error",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "trace-crash-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      // The file `writeCrashReport` saves when fx ends on an error: the trace
+      // header, the fatal error, and one record from the session. It is dated an
+      // hour ago, because `/trace` shows a crash report only within 24 hours of it.
+      const crashAtMs = Date.now() - 60 * 60 * 1000;
+      const crashAt = new Date(crashAtMs).toISOString();
+      mkdirSync(join(root.home, ".fx", "diagnostics"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "diagnostics", "last-crash.jsonl"),
+        [
+          JSON.stringify({
+            type: "fx_trace",
+            format_version: 1,
+            fx_version: "9.9.9",
+            git_commit: "abc1234",
+            written_at: crashAt,
+            written_at_ms: crashAtMs,
+            notice: "private",
+          }),
+          JSON.stringify({
+            type: "fatal_error",
+            error: "InvalidTranscriptTransition",
+            message: "invalid transcript transition",
+            at: crashAt,
+            at_ms: crashAtMs,
+          }),
+          JSON.stringify({ type: "renderer_event", sequence: 1, kind: "commit", detail: "ok" }),
+        ].map((line) => `${line}\n`).join(""),
+      );
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: tmpDir,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "InvalidTranscriptTransition",
+        message: "invalid transcript transition",
+        fx_version: "9.9.9",
+        git_commit: "abc1234",
+        records: 3,
+        skipped: 0,
+      });
+      expect(
+        report.all("last_crash_record").map((record) => (record.record as { type: string }).type),
+      ).toEqual(["fx_trace", "fatal_error", "renderer_event"]);
+      // The live report is not a crash report, so it has no fatal_error record of its own.
+      expect(report.all("fatal_error")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a segfault as a crash report that the next /trace shows",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "segfault-stderr.log");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      writeFileSync(stderrPath, "");
+      const tmpDir = join(root.root, "trace-tmp");
+      mkdirSync(tmpDir);
+      const start = () =>
+        TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root), TMPDIR: tmpDir }),
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+      // The signal goes to the one process the tmux pane runs, found the way the
+      // other terminal tests find it. The check first confirms that process is fx.
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      const fxPid = activeSession.processPid();
+      expect(
+        execFileSync("ps", ["-ww", "-o", "args=", "-p", String(fxPid)], { encoding: "utf8" }),
+      ).toContain(FX_BIN);
+      process.kill(fxPid, "SIGSEGV");
+      expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
+      // Zig's handler ends in abort(), so fx exits with 128 + SIGABRT (6).
+      expect(activeSession.recordedExitStatus()).toBe(134);
+      await activeSession.kill();
+      activeSession = null;
+
+      // Zig's default output still names the signal before the process aborts.
+      expect(readFileSync(stderrPath, "utf8")).toContain("Segmentation fault");
+      const crashPath = join(root.home, ".fx", "diagnostics", "last-crash.jsonl");
+      expect(statSync(crashPath).mode & 0o777).toBe(0o600);
+      const lines = readFileSync(crashPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines[0]).toMatchObject({ type: "fx_trace" });
+      expect(lines[1]).toMatchObject({
+        type: "fatal_error",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
+
+      activeSession = await start();
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/trace");
+      const report = await waitForNewTraceReport(tmpDir);
+      expect(report.one("last_crash")).toMatchObject({
+        status: "recorded",
+        error: "signal",
+        message: expect.stringMatching(/^Segmentation fault/),
+      });
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
@@ -3018,7 +3168,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForPane(
         (pane) =>
           pane.includes("classifier approved complete") &&
-          !pane.includes("Streaming ("),
+          turnSettled(pane),
         TIMEOUT,
       );
 
@@ -3307,7 +3457,10 @@ describe("effect-aware command permissions", () => {
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
-        expect(commandSnapshot.full_output_handle).toMatch(/^fx-command-replay-.+\.bin$/);
+        // The output is exact text, so the result needs no replay handle.
+        expect(commandSnapshot).not.toHaveProperty("output_terminal_safe");
+        expect(commandSnapshot).not.toHaveProperty("output_truncated");
+        expect(commandSnapshot).not.toHaveProperty("full_output_handle");
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
         expect(gateway.requests[1]!.body).not.toContain("\\u0000");
@@ -3427,9 +3580,10 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
-      // The held call is its group's header, which names the caution.
-      expect(pane).toContain(`● Safety caution ${command}`);
-      expect(pane).toContain(`Safety caution ${command}`);
+      // The held call is its group's header: it says the command was held,
+      // then why.
+      expect(pane).toContain(`● Held ${command} · safety caution`);
+      expect(pane).not.toContain("Safety caution");
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
@@ -3461,10 +3615,11 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Safety caution ${command}`),
+        (value) => value.includes(`Held ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain(`● Safety caution ${command}`);
+      expect(resumedPane).toContain(`● Held ${command} · safety caution`);
+      expect(resumedPane).not.toContain("Safety caution");
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
@@ -3953,7 +4108,7 @@ describe("effect-aware command permissions", () => {
 
       await harness.initialSession.waitForText("auto · gpt-5", TIMEOUT);
       await harness.initialSession.sendText("Save a turn before changing permission mode.");
-      await harness.initialSession.waitForText("permission resume seed complete", TIMEOUT);
+      await harness.initialSession.waitForPane((pane) => pane.includes("permission resume seed complete") && turnSettled(pane), TIMEOUT);
       expect(harness.initialGateway.requests).toHaveLength(1);
 
       await harness.initialSession.sendText("/permissions ask");
@@ -4164,12 +4319,12 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendKeys("2");
       await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("first always approval complete", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("first always approval complete") && turnSettled(pane), TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       rmSync(marker);
       await activeSession.sendText("Create the reusable marker again.");
-      const finalPane = await activeSession.waitForText("second always approval complete", TIMEOUT);
+      const finalPane = await activeSession.waitForPane((pane) => pane.includes("second always approval complete") && turnSettled(pane), TIMEOUT);
 
       expect(finalPane).toContain("second always approval complete");
       expect(existsSync(marker)).toBe(true);
@@ -5113,7 +5268,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Say hello.");
-      await activeSession.waitForText("setup traced", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("setup traced") && turnSettled(pane), TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",

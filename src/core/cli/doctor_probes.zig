@@ -287,6 +287,13 @@ fn stopTrees(probes: []const *ProcessProbe) void {
     }
 }
 
+/// Test builds only. The test "stopping a check that keeps starting processes
+/// in groups of their own leaves none of them" sets it to run, with the pid of
+/// the check, once `killTree` has listed what the check started and before it
+/// stops them: the moment a stop path that left the check running loses what
+/// the check starts next.
+var test_after_listing: if (builtin.is_test) ?*const fn (root: std.posix.pid_t) void else void = if (builtin.is_test) null else {};
+
 /// Kills the process group of `pid`, which `stopTrees` has stopped, and
 /// every process `pid` started outside it, such as the stdio MCP servers an
 /// `fx mcp show` child starts in groups of their own, and their helper. A
@@ -299,6 +306,7 @@ fn killTree(pid: std.posix.pid_t) void {
     var tree = process_tree.Tracker.init(std.heap.c_allocator) catch return killGroup(pid);
     defer tree.deinit();
     tree.refresh(pid) catch |err| debug_trace.logf("doctor", "check {d}: could not list the processes it started err={s}", .{ pid, @errorName(err) });
+    if (builtin.is_test) if (test_after_listing) |hook| hook(pid);
     const outside_group = tree.processes.items.len > 0;
     if (outside_group) {
         tree.stopAll();
@@ -1170,6 +1178,68 @@ test "a check killed at the deadline takes with it what it started in a group of
     try std.testing.expect(gone);
 }
 
+/// How long a test waits for a stop path that may block before its watchdog
+/// kills what the test started. A stop that works returns in about a second.
+const stop_bound_ms: i64 = 10_000;
+
+/// Kills `pids` and their groups if `disarm` has not been called `stop_bound_ms`
+/// after `arm`. A check that nothing kills stays stopped by `stopTrees`, and
+/// the waiter that `wait` cancels can only end when the check does, so a
+/// missing kill would hang the test. It kills with `std.posix.kill` itself, so
+/// a bug planted in the stop path cannot disable it.
+const StopWatchdog = struct {
+    pids: []const std.posix.pid_t,
+    over: std.Io.Event = .unset,
+    /// Written by the watchdog's thread, read after `disarm` joins it.
+    fired: bool = false,
+    thread: ?std.Thread = null,
+
+    fn arm(self: *StopWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Ends the watchdog and returns whether it had to kill. Calling it again
+    /// returns the same answer.
+    fn disarm(self: *StopWatchdog) bool {
+        self.over.set(io_mod.getIo());
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        return self.fired;
+    }
+
+    fn run(self: *StopWatchdog) void {
+        const limit = io_mod.milliTimestamp() + stop_bound_ms;
+        while (!self.over.isSet()) {
+            const left = limit - io_mod.milliTimestamp();
+            if (left <= 0) {
+                self.fired = true;
+                killStarted(self.pids);
+                return;
+            }
+            // A timeout or a wake-up with no signal sends the loop back to the clock and the flag.
+            self.over.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(left) } }) catch {};
+        }
+    }
+};
+
+/// What a test prints, with the call that was blocked and `stop_bound_ms`,
+/// when its watchdog had to kill. The test prints it itself: the direct-write
+/// audit lists the `std.debug.print` sites outside test blocks one by one
+/// (`tests/e2e/render-lab/audit-direct-writes.ts`).
+const stop_path_hung_fmt = "{s} had not returned after {d} ms, so the watchdog killed the processes it waited on: the stop path did not end them\n";
+
+/// Kills each of `pids` and its group. A pid of 0 or 1 would signal the test's
+/// own group or every process, so it is skipped.
+fn killStarted(pids: []const std.posix.pid_t) void {
+    for (pids) |pid| {
+        if (pid <= 1) continue;
+        // A group that has already ended is what the kill is for.
+        std.posix.kill(-pid, .KILL) catch {};
+        // So is a process that has.
+        std.posix.kill(pid, .KILL) catch {};
+    }
+}
+
 test "an ending signal during the fan-out stops what started, starts nothing more, and is returned" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.heap.c_allocator;
@@ -1178,6 +1248,8 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     var processes: std.ArrayList(*ProcessProbe) = .empty;
     const first = try ProcessProbe.create(alloc, "first", &.{ "/bin/sh", "-c", "sleep 30" }, null);
     first.spawn(&waiters, null);
+    // A test that fails before `wait` ends it leaves no `sleep` behind.
+    defer if (!first.done.load(.acquire)) killStarted(&.{first.pid});
     try processes.append(alloc, first);
     // The handler's whole work, as if the signal reached it now.
     recordStopSignal(.TERM);
@@ -1186,7 +1258,15 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     try std.testing.expectEqual(@as(usize, 0), servers.next);
     try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
     const started = io_mod.milliTimestamp();
+    const first_pids = [_]std.posix.pid_t{first.pid};
+    var watchdog: StopWatchdog = .{ .pids = &first_pids };
+    try watchdog.arm();
+    defer _ = watchdog.disarm();
     try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters, &servers).?);
+    if (watchdog.disarm()) {
+        std.debug.print(stop_path_hung_fmt, .{ "wait", stop_bound_ms });
+        return error.StopPathHung;
+    }
     // It stopped at the signal, not at the deadline, and never started the
     // check that waited in the queue.
     try std.testing.expect(io_mod.milliTimestamp() - started < reap_grace_ms);
@@ -1419,6 +1499,79 @@ fn entryCount(dir: std.Io.Dir) !usize {
     return count;
 }
 
+/// The most processes one forker starts, after which it only waits for them.
+/// A stop that works ends it after a few dozen; the cap bounds what a stop
+/// path that never ends it, and a runner that starts the test again, can start.
+const forker_start_cap: usize = 200;
+const forker_start_cap_arg = std.fmt.comptimePrint("{d}", .{forker_start_cap});
+const forker_rounds: usize = 5;
+/// How long, all together, the processes the forkers started have to be
+/// gone after the last stop. The test once gave each one this long, one
+/// after the other, so no process may take longer than before.
+const forker_reap_ms: i64 = 1_000;
+
+/// Ends the forkers still running and every process still alive that one of
+/// them recorded in `dir`, so a test that fails leaves none of them sleeping
+/// on. A forker whose waiter has reaped it is left alone: its pid may be reused.
+fn killForkerLeftovers(dir: std.Io.Dir, forkers: []const ?*ProcessProbe) void {
+    for (forkers) |forker| {
+        const probe = forker orelse continue;
+        if (!probe.done.load(.acquire)) killStarted(&.{probe.pid});
+    }
+    var it = dir.iterate();
+    while (it.next(io_mod.getIo()) catch null) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        // A check that cannot be read is killed too: it may be alive.
+        if (process_tree.processIsAlive(std.heap.c_allocator, pid) catch true) killStarted(&.{pid});
+    }
+}
+
+/// What `holdUntilForkerMovesMore` waits on: the forker of the round that is
+/// stopping, and the read end of the named pipe it writes a byte to for each
+/// process it has moved to a group of its own. Doctor's own thread only, like
+/// `ProcessProbe.stop_landed`.
+var holding_forker: ?*ProcessProbe = null;
+var moved_fd: std.posix.fd_t = -1;
+const fifo_c = struct {
+    extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+};
+/// A byte written after the listing ended says a process was started after it
+/// and has moved; the forker starts the next one only after writing it, so the
+/// second byte proves the first of those.
+const moves_to_wait_for: usize = 2;
+/// The most the hook waits for them, far longer than a forker that runs needs.
+const moves_wait_ms: i64 = 5_000;
+
+fn movedBytesWithin(timeout_ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = moved_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    return (std.posix.poll(&fds, timeout_ms) catch 0) > 0;
+}
+
+/// The `test_after_listing` hook of the forker test. It returns at once when
+/// the forker is not running, as the real stop path leaves it. A stop path
+/// that left it running waits here until the forker has moved two more
+/// processes out of its group, so the first of them is one the listing missed.
+fn holdUntilForkerMovesMore(root: std.posix.pid_t) void {
+    const forker = holding_forker orelse return;
+    if (forker.pid != root or forker.stop_landed) return;
+    var chunk: [64]u8 = undefined;
+    // Bytes from before the listing ended say nothing about what it missed.
+    while (movedBytesWithin(0)) {
+        const n = std.posix.read(moved_fd, &chunk) catch return;
+        if (n == 0) return;
+    }
+    const limit = io_mod.milliTimestamp() + moves_wait_ms;
+    var moved: usize = 0;
+    while (moved < moves_to_wait_for) {
+        const left = limit - io_mod.milliTimestamp();
+        if (left <= 0 or !movedBytesWithin(@intCast(left))) return;
+        const n = std.posix.read(moved_fd, &chunk) catch return;
+        // The forker and every process it started are gone.
+        if (n == 0) return;
+        moved += n;
+    }
+}
+
 test "stopping a check that keeps starting processes in groups of their own leaves none of them" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.heap.c_allocator;
@@ -1426,23 +1579,79 @@ test "stopping a check that keeps starting processes in groups of their own leav
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    // Each process it starts moves to a group of its own and writes its pid,
-    // like a stdio server an `fx mcp show` child starts. It starts one about
-    // every millisecond. The pause bounds the storm: started as fast as the
-    // machine allows, a stop that is slow to land lets thousands start, and the
-    // load they add slows the stop and the exit of what it killed further,
-    // until the processes fill the machine's memory. A longer pause leaves too
-    // few starting at the stop to fail a stop path that lists them before it
-    // stops the forker. Each ignores SIGHUP before it moves: the kernel hangs
+    var forkers: [forker_rounds]?*ProcessProbe = @splat(null);
+    defer killForkerLeftovers(tmp.dir, &forkers);
+    test_after_listing = &holdUntilForkerMovesMore;
+    defer test_after_listing = null;
+    defer holding_forker = null;
+    // The forker starts a process about every millisecond, records its pid,
+    // moves it to a group of its own, like a stdio server an `fx mcp show`
+    // child starts, and writes a byte to a named pipe. It does all of that
+    // itself, right after the fork, so that a byte says the process is out of
+    // the group, and the pid is written first, so a process that is out of the
+    // group is always one the test knows.
+    //
+    // The pipe is named, and the forker opens it by its path, because a child
+    // cannot be handed an open descriptor: on macOS `std.process.spawn` leaves
+    // it only stdin, stdout and stderr, even for a descriptor that is not
+    // close-on-exec. The forker opens it without blocking, because the test
+    // may die before the forker gets that far, and a blocking open would then
+    // wait for a reader that never comes: with no reader the open fails, and
+    // the forker ends. It clears the flag again, so its writes block as before.
+    //
+    // The pause bounds the storm: started as fast as the machine allows, a
+    // stop that is slow to land lets thousands start, and the load they add
+    // slows the stop and the exit of what it killed further, until the
+    // processes fill the machine's memory. A longer pause leaves too few
+    // starting at the stop to fail a stop path that lists them before it
+    // stops the forker. Each ignores SIGHUP from its birth: the kernel hangs
     // up a stopped process in a group that its parent's death orphans, which
-    // would end them without fx's own kill of what a check started outside its
-    // group, and this test must prove that kill.
-    const script = "while :; do /usr/bin/perl -e '$SIG{HUP} = \"IGNORE\"; setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.001; done";
-    for (0..5) |round| {
+    // would end them without fx's own kill of what a check started outside
+    // its group, and this test must prove that kill. The forker starts no
+    // more than `$ARGV[1]` and then waits for them, so a stop path that never
+    // ends it cannot start thousands, and a stop that lands late still finds a
+    // check to stop.
+    //
+    // A stop path that does not stop the forker first loses only what the
+    // forker starts between the listing and the forker's own stop, a few
+    // milliseconds that a loaded machine may never give it. The hook closes
+    // that gap: it holds `killTree` after the listing until the forker has
+    // moved two more processes.
+    const script =
+        \\use Fcntl;
+        \\$SIG{HUP} = "IGNORE";
+        \\sysopen(W, $ARGV[2], O_WRONLY | O_NONBLOCK) or exit 1;
+        \\my $flags = fcntl(W, F_GETFL, 0);
+        \\defined $flags and fcntl(W, F_SETFL, $flags & ~O_NONBLOCK) or exit 1;
+        \\for (1 .. $ARGV[1]) {
+        \\    my $pid = fork();
+        \\    exit 1 unless defined $pid;
+        \\    if (!$pid) { close W; sleep 30; exit 0 }
+        \\    open(F, ">", "$ARGV[0]/$pid") or exit 1;
+        \\    close F;
+        \\    setpgrp($pid, $pid);
+        \\    syswrite(W, "x", 1);
+        \\    select(undef, undef, undef, 0.001);
+        \\}
+        \\1 while wait() != -1;
+    ;
+    for (&forkers, 0..) |*forker, round| {
         var waiters: std.Io.Group = .init;
+        // Made before `before` is read, so its entry is not counted as a
+        // process the forker started. The read end is open, and never blocks,
+        // before the forker opens the write end.
+        var moved_path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const moved_path = try std.mem.printSentinel(&moved_path_buf, "{s}/moved-{d}", .{ dir, round }, 0);
+        if (fifo_c.mkfifo(moved_path, 0o600) != 0) return error.PipeFailed;
+        defer _ = std.c.unlink(moved_path);
+        const moved_read = std.c.open(moved_path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (moved_read < 0) return error.PipeFailed;
+        defer _ = std.c.close(moved_read);
         const before = try entryCount(tmp.dir);
-        const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
+        const argv = [_][]const u8{ "/usr/bin/perl", "-e", script, dir, forker_start_cap_arg, moved_path };
+        const probe = try ProcessProbe.create(alloc, "forker", &argv, null);
         probe.spawn(&waiters, null);
+        forker.* = probe;
         // Once it has started one, so the stop meets it while it starts more.
         // On a loaded machine that takes longer than any fixed wait.
         const started_one = for (0..1_000) |_| {
@@ -1451,10 +1660,20 @@ test "stopping a check that keeps starting processes in groups of their own leav
         } else false;
         io_mod.sleep((5 * round) * std.time.ns_per_ms);
         probe.stopped.store(true, .release);
+        holding_forker = probe;
+        moved_fd = moved_read;
         // Under load the stop can take longer than `stop_land_ms` to land,
         // which `stopTrees` allows; what it started must be gone either way.
         stopTrees(&.{probe});
+        const forker_pids = [_]std.posix.pid_t{probe.pid};
+        var watchdog: StopWatchdog = .{ .pids = &forker_pids };
+        try watchdog.arm();
+        defer _ = watchdog.disarm();
         waiters.cancel(io_mod.getIo());
+        if (watchdog.disarm()) {
+            std.debug.print(stop_path_hung_fmt, .{ "cancelling the forker's waiter", stop_bound_ms });
+            return error.StopPathHung;
+        }
         // Only after the stop, so a test that fails here does not leave the
         // forker starting processes.
         try std.testing.expect(started_one);
@@ -1462,17 +1681,23 @@ test "stopping a check that keeps starting processes in groups of their own leav
     }
     // Every process any round started is gone, once the system reaps it.
     var started: usize = 0;
+    var alive: usize = 0;
+    const reap_limit = io_mod.milliTimestamp() + forker_reap_ms;
     var it = tmp.dir.iterate();
     while (try it.next(io_mod.getIo())) |entry| {
         const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
         started += 1;
-        const gone = for (0..200) |_| {
-            if (!try process_tree.processIsAlive(alloc, pid)) break true;
+        while (try process_tree.processIsAlive(alloc, pid)) {
+            if (io_mod.milliTimestamp() >= reap_limit) {
+                alive += 1;
+                break;
+            }
             io_mod.sleep(5 * std.time.ns_per_ms);
-        } else false;
-        if (!gone) std.posix.kill(pid, .KILL) catch {};
-        try std.testing.expect(gone);
+        }
     }
+    const gone = alive == 0;
+    if (!gone) std.debug.print("{d} of the {d} processes the forkers started were still alive {d} ms after the stops\n", .{ alive, started, forker_reap_ms });
+    try std.testing.expect(gone);
     try std.testing.expect(started > 0);
 }
 

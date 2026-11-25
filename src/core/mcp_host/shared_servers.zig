@@ -1,0 +1,1203 @@
+//! Shared MCP servers as the session sees them (8b of the plan,
+//! `tests/tla/mcp_host/SharedServers.tla`): an adapter that speaks the owner's
+//! wire and gives the runtime the same `engine.Event` values it gets from its
+//! own engine. The runtime only routes by server name, so a shared server
+//! needs no second event path.
+//!
+//! A shared server's calls get handles from `0x8000_0000 | n`: the engine's
+//! handles count up from 1 and stay far below 2^31 in one process, so the two
+//! never meet in the runtime's `calls` map.
+const std = @import("std");
+const mcp = @import("../../mcp/mcp.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const owner_client = @import("owner_client.zig");
+const owner_wire = @import("owner_wire.zig");
+const share_key = @import("share_key.zig");
+const json_decode = @import("../shared/json_decode.zig");
+
+const Allocator = std.mem.Allocator;
+const engine = mcp.engine;
+const tools = mcp.tools;
+const wire = owner_wire;
+
+/// The list for a server this adapter does not have, as `Engine.toolList` returns.
+const empty_list: tools.List = .{};
+
+/// How long a session waits for an owner to start and accept it. The owner's
+/// own start is all this covers; the server's start is the engine's later wait.
+const owner_start_wait_ms: u32 = 3_000;
+
+/// The bit that keeps a shared call's handle away from the engine's.
+const handle_base: engine.Handle = 0x8000_0000;
+
+pub const Error = Allocator.Error || error{
+    /// No owner answered, or it answered with another wire version.
+    SharingUnavailable,
+};
+
+pub const Options = struct {
+    io: std.Io,
+    gpa: Allocator,
+    /// The profile's folder, `~/.fx` or `$FX_HOME`.
+    fx_home: []const u8,
+    /// Whether this session may start an owner; a test serves one instead.
+    spawn_owner: bool = true,
+    /// What this session can show a 2025 question, told to the owner so a
+    /// server never asks a session that cannot answer.
+    ask_form: bool = true,
+    ask_url: bool = true,
+    /// Wakes the runtime's owner thread when a frame arrives.
+    wake: owner_client.Wake,
+};
+
+/// One shared server: its key, the config the owner runs, and what the owner
+/// last said about it.
+pub const Slot = struct {
+    name: []const u8,
+    key: share_key.Key,
+    config: engine.Config,
+    registered: bool = false,
+    phase: engine.Phase = .idle,
+    version: ?[]u8 = null,
+    last_error: ?[]u8 = null,
+    stderr_tail: ?[]u8 = null,
+    instructions: ?[]u8 = null,
+    /// Why the owner refused this server's last tool list, in its words; null
+    /// while it refused none. A list it accepted clears them.
+    list_refusal: ?[]u8 = null,
+    /// How the last process ended, and the stdout line that answered
+    /// nothing, as the engine keeps them for a failure's text.
+    exit: ?mcp.stdio.Exit = null,
+    stray_line: ?[]u8 = null,
+    tools_store: tools.Store = .{},
+    needing: bool = false,
+    /// The owner refused this key, so the session runs the server itself and
+    /// never registers it again.
+    refused: bool = false,
+};
+
+pub const Shared = struct {
+    io: std.Io,
+    gpa: Allocator,
+    options: Options,
+    client: owner_client.Client,
+    slots: std.ArrayList(Slot) = .empty,
+    /// The owner's id for a call, to its server.
+    calls: std.array_hash_map.Auto(u32, usize) = .empty,
+    next_id: u32 = 1,
+    /// Events built from the frame being taken; they share `arena`.
+    pending: std.ArrayList(engine.Event) = .empty,
+    arena: std.heap.ArenaAllocator,
+    disconnected: bool = false,
+    /// Keys the owner refused, as their server names, owned here: the runtime
+    /// takes each one and runs that server in the session.
+    refused: std.ArrayList([]u8) = .empty,
+
+    pub fn init(options: Options) Error!Shared {
+        var client = owner_client.Client.init(options.io, options.gpa, options.fx_home, options.spawn_owner, options.wake) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.SharingUnavailable,
+        };
+        errdefer client.deinit();
+        return .{
+            .io = options.io,
+            .gpa = options.gpa,
+            .options = options,
+            .client = client,
+            .arena = .init(options.gpa),
+        };
+    }
+
+    /// Starts a slot for one shared server. The config is the engine config
+    /// `config.resolve` built, so the owner runs exactly what this session
+    /// would have run.
+    pub fn add(s: *Shared, name: []const u8, config: engine.Config) Allocator.Error!void {
+        try s.slots.append(s.gpa, .{ .name = name, .key = share_key.of(config), .config = config });
+    }
+
+    pub fn has(s: *const Shared, name: []const u8) bool {
+        return s.index(name) != null;
+    }
+
+    /// Whether `handle` is a call this adapter sent to the owner.
+    pub fn owns(s: *Shared, handle: engine.Handle) bool {
+        return s.slotOfHandle(handle) != null;
+    }
+
+    /// The key the server registered under: its launch config's.
+    pub fn keyOf(s: *const Shared, name: []const u8) ?share_key.Key {
+        for (s.slots.items) |slot| if (std.mem.eql(u8, slot.name, name)) return slot.key;
+        return null;
+    }
+
+    /// The config the server registered, which runs in this session when the
+    /// owner cannot.
+    pub fn configOf(s: *const Shared, name: []const u8) ?engine.Config {
+        for (s.slots.items) |slot| if (std.mem.eql(u8, slot.name, name)) return slot.config;
+        return null;
+    }
+
+    /// Drops the server's slot: this session's calls on it end as cancelled,
+    /// for `take`, and the owner keeps the server for every other session
+    /// until this one says goodbye.
+    pub fn remove(s: *Shared, name: []const u8) void {
+        const i = s.index(name) orelse return;
+        const slot = &s.slots.items[i];
+        // It stops using the key: the owner cancels this session's calls there
+        // and stops the server once no session is left on it.
+        if (slot.registered and !s.disconnected) s.client.send(.{ .unregister = .{ .key = slot.key } }) catch |err| {
+            // The owner stops the server when this connection closes; say the
+            // unregister that would have stopped it sooner didn't go.
+            debug_trace.logf("mcp", "shared unregister not sent server={s} err={s}", .{ name, @errorName(err) });
+        };
+        // A call that still waits ends as cancelled for `take`, and any late
+        // answer from the owner names a call the adapter no longer has.
+        while (true) {
+            var found: ?u32 = null;
+            var it = s.calls.iterator();
+            while (it.next()) |entry| if (entry.value_ptr.* == i) {
+                found = entry.key_ptr.*;
+                break;
+            };
+            const id = found orelse break;
+            _ = s.calls.swapRemove(id);
+            // This session's call on the slot ends here; a dropped end leaves
+            // its caller waiting out the deadline, and the queue's line says so.
+            s.appendPending(.{ .server = slot.name, .kind = .{ .called = .{
+                .call = handle_base | id,
+                .outcome = .cancelled,
+                .maybe_ran = true,
+                .timed_out = false,
+                .answer = null,
+            } } });
+        }
+        slot.tools_store.deinit(s.gpa);
+        if (slot.version) |v| s.gpa.free(v);
+        if (slot.last_error) |v| s.gpa.free(v);
+        if (slot.stderr_tail) |v| s.gpa.free(v);
+        if (slot.instructions) |v| s.gpa.free(v);
+        if (slot.list_refusal) |v| s.gpa.free(v);
+        if (slot.stray_line) |v| s.gpa.free(v);
+        _ = s.slots.orderedRemove(i);
+        // The calls left point at slots after this one, which moved back.
+        for (s.calls.values()) |*v| if (v.* > i) {
+            v.* -= 1;
+        };
+    }
+
+    fn index(s: *const Shared, name: []const u8) ?usize {
+        for (s.slots.items, 0..) |slot, i| if (std.mem.eql(u8, slot.name, name)) return i;
+        return null;
+    }
+
+    fn slotOf(s: *Shared, name: []const u8) ?*Slot {
+        const i = s.index(name) orelse return null;
+        return &s.slots.items[i];
+    }
+
+    fn slotOfHandle(s: *Shared, handle: engine.Handle) ?*Slot {
+        if (handle & handle_base == 0) return null;
+        const id: u32 = @intCast(handle & (handle_base - 1));
+        const i = s.calls.get(id) orelse return null;
+        return &s.slots.items[i];
+    }
+
+    /// Connects and registers the server, on the caller's thread.
+    fn ensure(s: *Shared, name: []const u8) Error!*Slot {
+        const i = s.index(name) orelse return error.SharingUnavailable;
+        const slot = &s.slots.items[i];
+        if (slot.refused) return error.SharingUnavailable;
+        // A connection that closed since the last `take` is taken in first: its
+        // calls end, every slot registers again, and the register below goes to
+        // the next owner rather than a connection that is gone.
+        s.handleDisconnect();
+        if (slot.registered and !s.disconnected) return slot;
+        s.client.ensureReady(owner_start_wait_ms) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "shared server unavailable server={s} reason={s}", .{ name, @errorName(err) });
+                return error.SharingUnavailable;
+            },
+        };
+        s.disconnected = false;
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const config = try wireConfig(arena.allocator(), slot.config);
+        s.client.send(.{ .register = .{
+            .key = slot.key,
+            .config = config,
+            .ask_form = s.options.ask_form,
+            .ask_url = s.options.ask_url,
+        } }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.SharingUnavailable,
+        };
+        slot.registered = true;
+        return slot;
+    }
+
+    pub fn needTools(s: *Shared, name: []const u8) Error!void {
+        const slot = try s.ensure(name);
+        slot.needing = true;
+        s.client.send(.{ .need = .{ .key = slot.key } }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.SharingUnavailable,
+        };
+    }
+
+    /// The server must list again after a new login: the owner's `need` asks
+    /// for a fresh list, and registers again when the connection went away
+    /// first.
+    pub fn reconnect(s: *Shared, name: []const u8) Error!void {
+        return s.needTools(name);
+    }
+
+    /// The tools the owner last published for this server.
+    pub fn toolList(s: *Shared, name: []const u8) *const tools.List {
+        const slot = s.slotOf(name) orelse return &empty_list;
+        return &slot.tools_store.current;
+    }
+
+    pub fn call(s: *Shared, name: []const u8, tool: []const u8, arguments: ?[]const u8) Error!engine.Handle {
+        const slot = try s.ensure(name);
+        const id = s.next_id;
+        s.next_id += 1;
+        try s.calls.put(s.gpa, id, s.index(name).?);
+        errdefer _ = s.calls.swapRemove(id);
+        s.client.send(.{ .call = .{ .key = slot.key, .id = id, .tool = tool, .arguments = arguments } }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                _ = s.calls.swapRemove(id);
+                return error.SharingUnavailable;
+            },
+        };
+        return handle_base | id;
+    }
+
+    /// True at once: the owner keeps the call, and the host may answer its
+    /// input request or cancel it from the moment it is sent, so waiting for
+    /// a second round trip would only drop answers.
+    pub fn callSent(_: *const Shared, _: engine.Handle) bool {
+        return true;
+    }
+
+    pub fn cancel(s: *Shared, handle: engine.Handle) void {
+        const id = sharedId(handle) orelse return;
+        // The session asked to end this call: say when the owner didn't hear,
+        // since the call then runs on for its deadline.
+        s.client.send(.{ .cancel = .{ .id = id } }) catch |err| {
+            debug_trace.logf("mcp", "shared cancel not sent id={d} err={s}", .{ id, @errorName(err) });
+        };
+    }
+
+    pub fn respond(s: *Shared, alloc: Allocator, handle: engine.Handle, values: []const []const u8) Allocator.Error!void {
+        const id = sharedId(handle) orelse return;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        std.json.Stringify.value(values, .{}, &out.writer) catch return error.OutOfMemory;
+        // The session's answer to a 2026 input request: say when the owner
+        // didn't hear, since the call then ends as unsupported input.
+        s.client.send(.{ .respond = .{ .id = id, .values = out.written() } }) catch |err| {
+            debug_trace.logf("mcp", "shared respond not sent id={d} err={s}", .{ id, @errorName(err) });
+        };
+    }
+
+    pub fn answerElicitation(s: *Shared, name: []const u8, id: mcp.core.elicitation.Id, answer: mcp.elicitation.Answer) void {
+        const slot = s.slotOf(name) orelse return;
+        // The user's answer to a 2025 question: say when the owner didn't hear,
+        // since the server waits for it until the question is withdrawn.
+        s.client.send(.{ .answer = .{ .key = slot.key, .slot = id.slot, .n = id.n, .action = answer.action, .content = answer.content } }) catch |err| {
+            debug_trace.logf("mcp", "shared answer not sent server={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    pub fn status(s: *Shared, name: []const u8) engine.Status {
+        const slot = s.slotOf(name) orelse unreachable;
+        return .{
+            .name = name,
+            .transport = .stdio,
+            .phase = slot.phase,
+            .version = slot.version,
+            .tools = slot.tools_store.current.len(),
+            .last_error = slot.last_error,
+            .list_refusal = slot.list_refusal,
+            .exit = slot.exit,
+            .stray_line = slot.stray_line,
+        };
+    }
+
+    pub fn stderrTail(s: *Shared, name: []const u8, out: *[mcp.stdio.tail_max]u8) ?[]const u8 {
+        _ = out;
+        const slot = s.slotOf(name) orelse return null;
+        return slot.stderr_tail;
+    }
+
+    pub fn instructions(s: *Shared, name: []const u8) ?[]const u8 {
+        const slot = s.slotOf(name) orelse return null;
+        return slot.instructions;
+    }
+
+    /// The next server the owner refused, owned by the caller: the runtime
+    /// runs it in the session from then on.
+    pub fn nextRefused(s: *Shared) ?[]u8 {
+        if (s.refused.items.len == 0) return null;
+        return s.refused.orderedRemove(0);
+    }
+
+    /// The next event, or null. Event slices stay valid until the next take,
+    /// like the engine's `next`.
+    pub fn take(s: *Shared) ?engine.Event {
+        while (true) {
+            if (s.pending.items.len > 0) return s.pending.orderedRemove(0);
+            _ = s.arena.reset(.retain_capacity);
+            s.pending.clearRetainingCapacity();
+            var frames: std.ArrayList([]u8) = .empty;
+            s.client.takeFrames(&frames);
+            defer frames.deinit(s.gpa);
+            if (frames.items.len == 0) {
+                s.handleDisconnect();
+                if (s.pending.items.len > 0) continue;
+                return null;
+            }
+            for (frames.items) |payload| {
+                defer s.gpa.free(payload);
+                s.frame(payload);
+            }
+        }
+    }
+
+    /// The connection ended and the adapter has not taken it in yet: every
+    /// slot registers again on the next owner, each call in flight may have
+    /// run, and each listing in flight failed. Both `take` and `ensure` run
+    /// it, so a server asked for before the next `take` never leaves another
+    /// slot's call waiting on a connection that is gone.
+    fn handleDisconnect(s: *Shared) void {
+        if (!s.client.isClosed() or s.disconnected) return;
+        s.disconnected = true;
+        for (s.slots.items) |*slot| slot.registered = false;
+        s.buildSlackEvents();
+        // The lost calls are the runtime's to end: it hears now, not at its
+        // next timer.
+        s.options.wake.wake(s.options.wake.context);
+    }
+
+    /// A dropped connection: each call in flight may have run, and each
+    /// listing in flight failed.
+    fn buildSlackEvents(s: *Shared) void {
+        var it = s.calls.iterator();
+        while (it.next()) |entry| {
+            s.appendPending(.{
+                .server = s.slots.items[entry.value_ptr.*].name,
+                .kind = .{
+                    .called = .{
+                        .call = handle_base | entry.key_ptr.*,
+                        .outcome = .lost,
+                        .maybe_ran = true,
+                        .timed_out = false,
+                        .answer = null,
+                        // The link the call was on went away with the owner.
+                        .lost_why = .link_down,
+                    },
+                },
+            });
+        }
+        s.calls.clearRetainingCapacity();
+        for (s.slots.items) |*slot| {
+            if (!slot.needing) continue;
+            slot.needing = false;
+            // The failed listing never reaches the session, so its request for
+            // tools waits for the next list instead.
+            s.appendPending(.{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = false, .fresh = false } } } });
+        }
+    }
+
+    /// Queues one event for the runtime. A queue that cannot grow drops it,
+    /// and the line names what was lost and why: the session hears nothing
+    /// more for that step, so the trace is the only record of it.
+    fn appendPending(s: *Shared, event: engine.Event) void {
+        s.pending.append(s.gpa, event) catch |err| {
+            debug_trace.logf("mcp", "shared event dropped server={s} kind={s} reason=out of memory err={s}", .{ event.server, @tagName(event.kind), @errorName(err) });
+        };
+    }
+
+    fn frame(s: *Shared, payload: []const u8) void {
+        const a = s.arena.allocator();
+        const message = wire.decode(a, payload) catch {
+            debug_trace.logf("mcp", "shared server frame dropped kind=unknown reason=malformed", .{});
+            return;
+        };
+        const said = switch (message) {
+            .owner => |from_owner| from_owner,
+            .client => {
+                debug_trace.logf("mcp", "shared server frame dropped kind=client reason=wrong direction", .{});
+                return;
+            },
+        };
+        switch (said) {
+            .welcome => {},
+            .phase => |update| {
+                const i = s.indexByKey(update.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=phase reason=unknown key", .{});
+                    return;
+                };
+                const slot = &s.slots.items[i];
+                slot.phase = update.phase;
+                // The runtime ends tool waiters and checks logins on a phase
+                // event, so a failed start must reach it, not just the slot.
+                s.appendPending(.{ .server = slot.name, .kind = .{ .phase = update.phase } });
+            },
+            .status => |update| {
+                const i = s.indexByKey(update.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=status reason=unknown key", .{});
+                    return;
+                };
+                const slot = &s.slots.items[i];
+                slot.phase = update.phase;
+                replace(s.gpa, &slot.version, update.version);
+                replace(s.gpa, &slot.last_error, update.last_error);
+                replace(s.gpa, &slot.stderr_tail, update.stderr_tail);
+                replace(s.gpa, &slot.instructions, update.instructions);
+                slot.exit = if (update.exit_code) |code| .{ .code = code } else if (update.exit_signal) |signal| .{ .signal = signal } else null;
+                replace(s.gpa, &slot.stray_line, update.stray_line);
+                // The words of a refused list stand until an accepted one
+                // clears them, in a status as in a listing frame.
+                replace(s.gpa, &slot.list_refusal, update.list_refusal);
+            },
+            .tools => |page| {
+                const i = s.indexByKey(page.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=tools reason=unknown key", .{});
+                    return;
+                };
+                const slot = &s.slots.items[i];
+                // Why the owner refused the list comes with the list it
+                // answered: a refusal replaces the words, an accepted list
+                // clears them, as the owner's status does.
+                replace(s.gpa, &slot.list_refusal, page.list_refusal);
+                // A listing replaces the list, even with none: an old list
+                // must not outlive the server saying it has no tools. A
+                // listing fx could not read, or could not keep, changes
+                // nothing: the last accepted list stays in place.
+                if (page.ok) {
+                    slot.tools_store.discard();
+                    // The wire carries the raw tool objects; a page is a
+                    // `tools/list` result, so wrap them as one.
+                    const result = a.print("{{\"tools\":{s}}}", .{page.tools}) catch null;
+                    const parsed = if (result) |text| tools.parsePage(text) catch null else null;
+                    if (parsed) |parsed_page| {
+                        if (slot.tools_store.addPage(s.gpa, parsed_page)) |_| {
+                            slot.tools_store.publish();
+                        } else |err| {
+                            // Only out of memory fails here; the session keeps
+                            // the list it had.
+                            debug_trace.logf("mcp", "shared tool list dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                        }
+                    } else {
+                        debug_trace.logf("mcp", "shared tool list dropped server={s} reason=unreadable page", .{slot.name});
+                    }
+                }
+                slot.needing = false;
+                s.appendPending(.{ .server = slot.name, .kind = .{ .server = .{ .tools = .{ .ok = page.ok, .fresh = page.fresh, .needs_auth = page.needs_auth } } } });
+            },
+            .called => |called| {
+                const i = s.calls.get(called.id) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=called reason=unknown call id={d}", .{called.id});
+                    return;
+                };
+                _ = s.calls.swapRemove(called.id);
+                const slot = &s.slots.items[i];
+                var answer: ?tools.Call = null;
+                var unreadable = false;
+                if (called.answer) |text| {
+                    if (json_decode.parseFromSlice(tools.Call, a, text, .{})) |parsed| {
+                        answer = parsed.value;
+                    } else |err| {
+                        // The owner's answer is this build's own JSON, so this
+                        // is a broken frame: the call ends as malformed now
+                        // rather than waiting out its deadline.
+                        debug_trace.logf("mcp", "shared call answer dropped server={s} reason=malformed answer err={s}", .{ slot.name, @errorName(err) });
+                        unreadable = true;
+                    }
+                }
+                s.appendPending(.{
+                    .server = slot.name,
+                    .kind = .{
+                        .called = .{
+                            .call = handle_base | called.id,
+                            .outcome = if (unreadable) .malformed else called.outcome,
+                            .maybe_ran = if (unreadable) true else called.maybe_ran,
+                            .timed_out = called.timed_out,
+                            .answer = answer,
+                            .oversized = called.oversized,
+                            .refused_bytes = called.refused_bytes,
+                            .refused_body = called.refused_body,
+                            // Why the owner's engine lost it, when it did.
+                            .lost_why = called.lost_why,
+                        },
+                    },
+                });
+            },
+            .progress => |progress| {
+                const i = s.calls.get(progress.id) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=progress reason=unknown call id={d}", .{progress.id});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .progress = .{
+                    .call = handle_base | progress.id,
+                    .progress = progress.progress,
+                    .total = progress.total,
+                    .message = progress.message,
+                } } });
+            },
+            .input => |input| {
+                const i = s.calls.get(input.id) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=input reason=unknown call id={d}", .{input.id});
+                    return;
+                };
+                const parsed = json_decode.parseFromSlice([]mcp.mrtr.Request, a, input.requests, .{}) catch {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=input reason=malformed requests", .{});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .input = .{
+                    .call = handle_base | input.id,
+                    .requests = parsed.value,
+                } } });
+            },
+            .question => |question| {
+                const i = s.indexByKey(question.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=question reason=unknown key", .{});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit = .{
+                    .id = .{ .slot = question.slot, .n = question.n },
+                    .params = question.params,
+                    .required = question.required,
+                } } } });
+            },
+            .elicitation_complete => |done| {
+                const i = s.indexByKey(done.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=elicitation_complete reason=unknown key", .{});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicitation_complete = done.slot } } });
+            },
+            .elicit_withdrawn => |gone| {
+                const i = s.indexByKey(gone.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=elicit_withdrawn reason=unknown key", .{});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .{ .server = .{ .elicit_withdrawn = gone.slot } } });
+            },
+            .stopped_idle => |stopped| {
+                const i = s.indexByKey(stopped.key) orelse {
+                    debug_trace.logf("mcp", "shared server frame dropped kind=stopped_idle reason=unknown key", .{});
+                    return;
+                };
+                s.appendPending(.{ .server = s.slots.items[i].name, .kind = .stopped_idle });
+            },
+            .refused => |refused| {
+                // One request refused: a call ends as one the server never
+                // got, and a key stops sharing, so the session runs that one
+                // server itself and every other key keeps working.
+                if (refused.call) |id| {
+                    const i = s.calls.get(id) orelse {
+                        debug_trace.logf("mcp", "shared refusal dropped reason=unknown call id={d}", .{id});
+                        return;
+                    };
+                    _ = s.calls.swapRemove(id);
+                    const slot = &s.slots.items[i];
+                    s.appendPending(.{ .server = slot.name, .kind = .{ .called = .{
+                        .call = handle_base | id,
+                        .outcome = .transport_failed,
+                        .maybe_ran = false,
+                        .timed_out = false,
+                        .answer = null,
+                    } } });
+                    return;
+                }
+                const key = refused.key orelse {
+                    debug_trace.logf("mcp", "shared refusal dropped reason=unknown key reason={s}", .{@tagName(refused.reason)});
+                    return;
+                };
+                const i = s.indexByKey(key) orelse {
+                    debug_trace.logf("mcp", "shared refusal dropped reason=unknown key", .{});
+                    return;
+                };
+                const slot = &s.slots.items[i];
+                slot.refused = true;
+                slot.registered = false;
+                slot.needing = false;
+                const name = s.gpa.dupe(u8, slot.name) catch |err| {
+                    debug_trace.logf("mcp", "shared refusal dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                    return;
+                };
+                s.refused.append(s.gpa, name) catch |err| {
+                    s.gpa.free(name);
+                    debug_trace.logf("mcp", "shared refusal dropped server={s} reason=out of memory err={s}", .{ slot.name, @errorName(err) });
+                };
+            },
+        }
+    }
+
+    fn indexByKey(s: *Shared, key: share_key.Key) ?usize {
+        for (s.slots.items, 0..) |slot, i| if (std.mem.eql(u8, &slot.key, &key)) return i;
+        return null;
+    }
+
+    pub fn deinit(s: *Shared) void {
+        s.client.deinit();
+        for (s.refused.items) |name| s.gpa.free(name);
+        s.refused.deinit(s.gpa);
+        for (s.slots.items) |*slot| {
+            slot.tools_store.deinit(s.gpa);
+            if (slot.version) |v| s.gpa.free(v);
+            if (slot.last_error) |v| s.gpa.free(v);
+            if (slot.stderr_tail) |v| s.gpa.free(v);
+            if (slot.instructions) |v| s.gpa.free(v);
+            if (slot.list_refusal) |v| s.gpa.free(v);
+            if (slot.stray_line) |v| s.gpa.free(v);
+        }
+        s.slots.deinit(s.gpa);
+        s.calls.deinit(s.gpa);
+        s.pending.deinit(s.gpa);
+        s.arena.deinit();
+    }
+};
+
+fn sharedId(handle: engine.Handle) ?u32 {
+    if (handle & handle_base == 0) return null;
+    return @intCast(handle & (handle_base - 1));
+}
+
+/// Replaces a slot's text, freeing what it held: a status frame may come
+/// many times for one server.
+fn replace(gpa: Allocator, field: *?[]u8, text: ?[]const u8) void {
+    const next = dupOrNull(gpa, text);
+    if (field.*) |old| gpa.free(old);
+    field.* = next;
+}
+
+fn dupOrNull(gpa: Allocator, text: ?[]const u8) ?[]u8 {
+    const value = text orelse return null;
+    return gpa.dupe(u8, value) catch null;
+}
+
+/// The engine config as the owner's register message carries it.
+fn wireConfig(a: Allocator, config: engine.Config) Allocator.Error!wire.ServerConfig {
+    const stdio = config.transport.stdio;
+    var env: std.ArrayList(wire.ServerConfig.Entry) = .empty;
+    if (stdio.environ_map) |map| {
+        var it = map.iterator();
+        while (it.next()) |entry| try env.append(a, .{ .name = try a.dupe(u8, entry.key_ptr.*), .value = try a.dupe(u8, entry.value_ptr.*) });
+    }
+    return .{
+        .argv = try a.dupe([]const u8, stdio.argv),
+        .env = env.items,
+        .cwd = if (stdio.cwd) |cwd| try a.dupe(u8, cwd) else null,
+        .timeouts = if (config.timeouts) |t| .{
+            .start_ms = t.start_ms,
+            .idle_ms = t.idle_ms,
+            .hard_ms = t.hard_ms,
+            .reset_idle_on_progress = t.reset_idle_on_progress,
+            .refresh_ms = t.refresh_ms,
+            .refused_ms = t.refused_ms,
+        } else null,
+        .auth = .{
+            .client_id = if (config.auth.client_id) |v| try a.dupe(u8, v) else null,
+            .client_secret = if (config.auth.client_secret) |v| try a.dupe(u8, v) else null,
+            .client_metadata_url = if (config.auth.client_metadata_url) |v| try a.dupe(u8, v) else null,
+            .resource = if (config.auth.resource) |v| try a.dupe(u8, v) else null,
+            .scopes = if (config.auth.scopes) |v| try a.dupe(u8, v) else null,
+            .client_name = try a.dupe(u8, config.auth.client_name),
+        },
+    };
+}
+
+const testing = std.testing;
+const owner = @import("owner.zig");
+const fake_server = @import("fake_server.zig");
+
+/// Removes a test's folder. Cleanup only: a folder that won't go leaves
+/// nothing the test asserts on, and the system clears /tmp.
+fn removeTestDir(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(testing.io, path) catch {}; // Cleanup only: nothing the test asserts on depends on the folder.
+}
+
+fn shortHome(alloc: Allocator, tag: []const u8) ![]u8 {
+    const path = try alloc.print("/tmp/fx-shared-{s}-{d}", .{ tag, std.c.getpid() });
+    removeTestDir(path);
+    try std.Io.Dir.cwd().createDir(testing.io, path, .fromMode(0o700));
+    return path;
+}
+
+fn serveOnThread(io: std.Io, gpa: Allocator, home: []const u8, stop: *std.atomic.Value(bool)) void {
+    // An owner that ends with an error is what a test's stop asks for; the
+    // test fails on the state it checks, not on this thread.
+    owner.serve(io, gpa, home, stop, owner.test_client_version) catch {};
+}
+
+fn waitForSocket(alloc: Allocator, home: []const u8) ![]u8 {
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const address = std.Io.net.UnixAddress.init(path) catch return error.NameTooLong;
+        if (address.connect(testing.io)) |stream| {
+            stream.close(testing.io);
+            return path;
+        } else |_| {
+            // Polls for the socket the test's owner thread is opening.
+            testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
+    return error.SocketNeverAppeared;
+}
+
+/// Welcomes one client and holds the connection: the test feeds the frames
+/// after the welcome and sets `stop` when it is done with it, so no owner or
+/// server process runs for it.
+fn welcomingOwner(io: std.Io, path: []const u8, stop: *std.Io.Event) void {
+    const address = std.Io.net.UnixAddress.init(path) catch return;
+    var server = address.listen(io, .{}) catch return;
+    defer server.deinit(io);
+    // The first connection is `waitForSocket`'s probe for the socket: it sends
+    // nothing and is closed here, so the next one is the client's.
+    const probe = server.accept(io) catch return;
+    probe.close(io);
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var storage: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&storage);
+    const welcome: wire.OwnerMessage = .{ .welcome = .{ .owner = 1 } };
+    const frame = wire.encode(fixed.allocator(), welcome) catch return;
+    var buffer: [4096]u8 = undefined;
+    var writer = stream.writer(io, &buffer);
+    writer.interface.writeAll(frame) catch return;
+    writer.interface.flush() catch return;
+    stop.waitUncancelable(io);
+}
+
+fn wakeNothing(_: *anyopaque) void {}
+
+fn sharedFor(alloc: Allocator, home: []const u8, woken: *u8) !Shared {
+    return Shared.init(.{
+        .io = testing.io,
+        .gpa = alloc,
+        .fx_home = home,
+        .spawn_owner = false,
+        .wake = .{ .context = woken, .wake = wakeNothing },
+    });
+}
+
+/// The next event for `name`, whatever it is, or null at the deadline.
+fn takeFor(s: *Shared, name: []const u8, deadline_ms: i64) ?engine.Event {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + deadline_ms;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        if (s.take()) |event| {
+            if (std.mem.eql(u8, event.server, name)) return event;
+        } else {
+            // Polls for the next event from the owner, bounded above.
+            testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+    return null;
+}
+
+fn takeTools(s: *Shared, name: []const u8) !bool {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const event = takeFor(s, name, 200) orelse continue;
+        switch (event.kind) {
+            .server => |server| switch (server) {
+                .tools => |tools_event| return tools_event.ok,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return error.NoToolsEvent;
+}
+
+fn takeCalled(s: *Shared, name: []const u8, handle: engine.Handle) !engine.Event {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        const event = takeFor(s, name, 200) orelse continue;
+        switch (event.kind) {
+            .called => |called| if (called.call == handle) return event,
+            else => {},
+        }
+    }
+    return error.NoCalledEvent;
+}
+
+fn resultContent(event: engine.Event) ![]const u8 {
+    return switch (event.kind.called.answer.?) {
+        .result => |result| result.content,
+        else => error.NotAResult,
+    };
+}
+
+fn pidOf(content: []const u8) ![]const u8 {
+    const at = std.mem.find(u8, content, "pid=") orelse return error.NoPid;
+    const rest = content[at + 4 ..];
+    const end = std.mem.findNone(u8, rest, "0123456789") orelse rest.len;
+    return rest[0..end];
+}
+
+test "a shared server lists its tools through the owner" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "tools");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try waitForSocket(alloc, home);
+    defer alloc.free(path);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{fixture.server};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try shared.needTools("fake");
+    try testing.expect(try takeTools(&shared, "fake"));
+    try testing.expect(shared.toolList("fake").find("echo") != null);
+    // Every pending event is taken before the phase is read: a status frame
+    // can arrive after the tool list.
+    while (shared.take()) |_| {}
+    try testing.expectEqual(engine.Phase.ready, shared.status("fake").phase);
+
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+/// Feeds one owner message to a shared adapter as the frame the owner writes.
+fn feedOwner(s: *Shared, a: Allocator, message: wire.OwnerMessage) !void {
+    const encoded = try wire.encode(a, message);
+    s.frame(encoded[wire.header_bytes..]);
+}
+
+test "a refused tool list's words reach this session's status, and an accepted list clears them" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "refusal");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The owner answers a list it refused: the words come with the list, so a
+    // session says why fx refused it, as one that runs the server itself does.
+    const refused: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = false, .fresh = false, .needs_auth = false, .list_refusal = "\"tools\" is not a list" } };
+    try feedOwner(&shared, a, refused);
+    try testing.expectEqualStrings("\"tools\" is not a list", shared.status("fake").list_refusal.?);
+
+    // A status carries them too, for a session that never asked for the list.
+    const refusing: wire.OwnerMessage = .{ .status = .{ .key = key, .phase = .ready, .list_refusal = "a field is written twice" } };
+    try feedOwner(&shared, a, refusing);
+    try testing.expectEqualStrings("a field is written twice", shared.status("fake").list_refusal.?);
+
+    // A list it accepted clears them.
+    const accepted: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
+    try feedOwner(&shared, a, accepted);
+    try testing.expectEqual(@as(?[]const u8, null), shared.status("fake").list_refusal);
+}
+
+test "a tools page fx cannot read leaves the last good list in place" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "badpage");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A list the owner accepted.
+    const good: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]" } };
+    try feedOwner(&shared, a, good);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // A page that is no tool list at all: the list it had stays.
+    const bad: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "7" } };
+    try feedOwner(&shared, a, bad);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // So does a page whose tools are not listed as one.
+    const worse: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "{\"name\":\"echo\"}" } };
+    try feedOwner(&shared, a, worse);
+    try testing.expectEqual(@as(usize, 1), shared.toolList("fake").len());
+
+    // An accepted empty list does replace it: the server said it has none.
+    const empty: wire.OwnerMessage = .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[]" } };
+    try feedOwner(&shared, a, empty);
+    try testing.expectEqual(@as(usize, 0), shared.toolList("fake").len());
+}
+
+test "a call in flight when the connection closes ends as lost, and its server registers again on the next owner" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "redial");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const first_owner = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop });
+    var first_joined = false;
+    defer if (!first_joined) {
+        stop.store(true, .release);
+        first_owner.join();
+    };
+    const path = try waitForSocket(alloc, home);
+    defer alloc.free(path);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{fixture.server};
+    // Two servers with two keys, so the second one's registration can come
+    // after the connection that carried the first one's call is gone.
+    try shared.add("a", .{ .name = "a", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try shared.add("b", .{ .name = "b", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try shared.needTools("a");
+    try testing.expect(try takeTools(&shared, "a"));
+
+    // A call that never answers, so it is in flight when the owner goes.
+    const handle = try shared.call("a", "slow", "{}");
+    const slow_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    while (fixture.slowCalls() == 0) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > slow_deadline) return error.CallNeverReachedServer;
+        // Polls for the fake server to note the call, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+
+    // The owner goes away with the call in flight.
+    stop.store(true, .release);
+    first_owner.join();
+    first_joined = true;
+    const closed_deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (!shared.client.isClosed()) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > closed_deadline) return error.ClientNeverClosed;
+        // Polls for the reader to see the socket end, a bounded wait.
+        testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+
+    // A new owner serves the same fx home.
+    var stop_next = std.atomic.Value(bool).init(false);
+    const next_owner = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop_next });
+    defer {
+        stop_next.store(true, .release);
+        next_owner.join();
+    }
+    const next_path = try waitForSocket(alloc, home);
+    alloc.free(next_path);
+
+    // The session asks for the other server first: the closed connection is
+    // taken in before it registers, so this slot's call ends now.
+    try shared.needTools("b");
+    var ended = false;
+    for (0..100) |_| {
+        const event = takeFor(&shared, "a", 200) orelse continue;
+        if (event.kind != .called) continue;
+        if (event.kind.called.call != handle) continue;
+        ended = event.kind.called.outcome == .lost;
+        break;
+    }
+    try testing.expect(ended);
+
+    // The first server registers again on the new owner, which lists it.
+    try shared.needTools("a");
+    try testing.expect(try takeTools(&shared, "a"));
+}
+
+test "a call through the owner answers, and two sessions get one process" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "call");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .release);
+        thread.join();
+    };
+    const path = try waitForSocket(alloc, home);
+    defer alloc.free(path);
+
+    var woken_a: u8 = 0;
+    var woken_b: u8 = 0;
+    var first = try sharedFor(alloc, home, &woken_a);
+    var second = try sharedFor(alloc, home, &woken_b);
+    const argv = [_][]const u8{fixture.server};
+    try first.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    try second.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    const first_call = try first.call("fake", "echo", "{\"text\":\"pid\"}");
+    const first_event = try takeCalled(&first, "fake", first_call);
+    const second_call = try second.call("fake", "echo", "{\"text\":\"pid\"}");
+    const second_event = try takeCalled(&second, "fake", second_call);
+    try testing.expectEqualStrings(try pidOf(try resultContent(first_event)), try pidOf(try resultContent(second_event)));
+
+    first.deinit();
+    second.deinit();
+    stop.store(true, .release);
+    thread.join();
+    joined = true;
+}
+
+test "an owner that goes away ends a call in flight as lost" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "lost");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    var fixture: fake_server.Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, serveOnThread, .{ testing.io, alloc, home, &stop });
+    const path = try waitForSocket(alloc, home);
+    defer alloc.free(path);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{fixture.server};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } }, .timeouts = .{ .start_ms = 15_000 } });
+    const handle = try shared.call("fake", "echo", "{\"text\":\"slow\"}");
+    // The call must be in flight when the owner stops, and the owner tells the
+    // session nothing when it takes the call.
+    testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    stop.store(true, .release);
+    thread.join();
+
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 10_000;
+    var lost = false;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        if (shared.take()) |event| {
+            switch (event.kind) {
+                .called => |called| if (called.call == handle) {
+                    try testing.expectEqual(engine.Outcome.lost, called.outcome);
+                    lost = called.maybe_ran;
+                },
+                else => {},
+            }
+            if (lost) break;
+        } else {
+            // Polls for the lost call's event, bounded by the deadline above.
+            testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+    try testing.expect(lost);
+}
+
+test "a refused call ends as never run, and the other calls stay in flight" {
+    const alloc = testing.allocator;
+    const home = try shortHome(alloc, "refcall");
+    defer {
+        removeTestDir(home);
+        alloc.free(home);
+    }
+    const run = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name });
+    defer alloc.free(run);
+    try std.Io.Dir.cwd().createDir(testing.io, run, .fromMode(0o700));
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, owner.run_dir_name, owner.socket_name });
+    defer alloc.free(path);
+    var stop: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, welcomingOwner, .{ testing.io, path, &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.set(testing.io);
+        thread.join();
+    };
+    const socket = try waitForSocket(alloc, home);
+    alloc.free(socket);
+
+    var woken: u8 = 0;
+    var shared = try sharedFor(alloc, home, &woken);
+    defer shared.deinit();
+    const argv = [_][]const u8{"true"};
+    try shared.add("fake", .{ .name = "fake", .transport = .{ .stdio = .{ .argv = &argv } } });
+    const key = shared.slots.items[0].key;
+
+    // Two calls are in flight on the one shared server.
+    const first = try shared.call("fake", "slow", "{}");
+    const second = try shared.call("fake", "slow", "{}");
+    try testing.expectEqual(@as(usize, 2), shared.calls.count());
+
+    // The owner refuses the first: it ends as a call that never went out.
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const refused: wire.OwnerMessage = .{ .refused = .{ .reason = .too_many_calls, .key = key, .call = sharedId(first).? } };
+    try feedOwner(&shared, a, refused);
+    const ended = try takeCalled(&shared, "fake", first);
+    try testing.expectEqual(engine.Outcome.transport_failed, ended.kind.called.outcome);
+    try testing.expect(!ended.kind.called.maybe_ran);
+    try testing.expect(!ended.kind.called.timed_out);
+    try testing.expect(ended.kind.called.answer == null);
+
+    // The other call is still in flight, and ends normally when its frame comes.
+    try testing.expectEqual(@as(usize, 1), shared.calls.count());
+    try testing.expect(shared.calls.get(sharedId(second).?) != null);
+    const answered: wire.OwnerMessage = .{ .called = .{
+        .id = sharedId(second).?,
+        .outcome = .result,
+        .maybe_ran = true,
+        .timed_out = false,
+    } };
+    try feedOwner(&shared, a, answered);
+    const done = try takeCalled(&shared, "fake", second);
+    try testing.expectEqual(engine.Outcome.result, done.kind.called.outcome);
+    try testing.expectEqual(@as(usize, 0), shared.calls.count());
+
+    // A refused call is not a refused key: this server stays the shared one.
+    try testing.expect(shared.slots.items[0].registered);
+    try testing.expect(!shared.slots.items[0].refused);
+    try testing.expect(shared.nextRefused() == null);
+
+    stop.set(testing.io);
+    thread.join();
+    joined = true;
+}
+
+test "an fx home whose socket path is too long cannot share" {
+    // The adapter refuses it at start, so the session runs every server
+    // itself rather than failing.
+    const long = "/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/home";
+    var woken: u8 = 0;
+    try testing.expectError(error.SharingUnavailable, sharedFor(testing.allocator, long, &woken));
+}

@@ -20,6 +20,21 @@
 \* there is one, still stale, so the next need lists again. Tool
 \* contents (validity, duplicate names) are data, checked by the Zig tests,
 \* not here.
+\*
+\* A page that the server answered but fx could not use (an error, input_required,
+\* a malformed page, over HTTP a status with no JSON-RPC message or a body that is
+\* no JSON) is refused, and `refused` says so until a list is published or a new
+\* process starts: `fx mcp show` tells the person fx refused the list.
+\* A page the server never answered (a timeout, a lost connection, a cancel, a
+\* sign-in needed first) says nothing about the list, so it leaves `refused` as it was. `lastAnswer` is a ghost: how
+\* the last listing that the server answered ended since the last process.
+\*
+\* A server's line that fx cannot read and that names no request (its id comes after the bad part, or the line is too
+\* deep to reach it) is an answer fx could not use as well, but no id says whose it is: the page waits out the grace
+\* (src/mcp/core/request.zig `refused_ms`), and then it is refused (`PageUnreadable`), as a page answered with a malformed
+\* result is. It is not a page that ended with no answer. But only when the line can be the page's alone: on its own
+\* stream, or while it is the one request in flight. A line that another request could have written gives the page a
+\* grace too, and when that runs out the page ends with no answer and no reason (`PageSharedGrace`).
 EXTENDS Naturals
 
 CONSTANTS
@@ -49,12 +64,17 @@ VARIABLES
                    \* yet, a "list", the "lastGood" list after a failure, or
                    \* a "failure"
     \* Ghost variables for the safety properties.
+    refused,       \* the last listing the server answered was refused
     servedStale,   \* a need was served from a list that wasn't fresh and current
-    extraFetch     \* a listing started while one was running
+    extraFetch,    \* a listing started while one was running
+    lastAnswer,    \* ghost: how the last answered listing ended: "none", "list", "refused", "unreadable"
+    graceLine      \* ghost: how the last page that a grace ended was refused or not: "none", "own", "shared", "shared-refused"
 
 vars == <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, listing,
           startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer,
-          servedStale, extraFetch>>
+          refused, servedStale, extraFetch, lastAnswer, graceLine>>
+
+refusedVars == <<refused, lastAnswer, graceLine>>
 
 listingVars == <<listing, startGen, page, restarts, zeroTtl, lapsed, pending, waiting, answer>>
 
@@ -75,8 +95,11 @@ Init ==
     /\ pending = "none"
     /\ waiting = FALSE
     /\ answer = "none"
+    /\ refused = FALSE
     /\ servedStale = FALSE
     /\ extraFetch = FALSE
+    /\ lastAnswer = "none"
+    /\ graceLine = "none"
 
 \* Mark the current list stale and move to a new generation.
 Invalidated ==
@@ -93,6 +116,9 @@ ProcessStarted(e) ==
     /\ process' = process + 1
     /\ era' = e
     /\ Invalidated
+    /\ refused' = FALSE
+    /\ lastAnswer' = "none"
+    /\ graceLine' = "none"
     /\ UNCHANGED <<cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
 
 StartListing ==
@@ -119,6 +145,7 @@ Need ==
             /\ extraFetch' = (extraFetch \/ listing = "fetching")
             /\ UNCHANGED servedStale
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed>>
+    /\ UNCHANGED refusedVars
 
 \* The listing ends with a list, delivered to everyone waiting. It is cached
 \* as fresh only if nothing was invalidated since it started and, on a
@@ -133,6 +160,9 @@ Finish(z, l) ==
     /\ cacheGen' = startGen
     /\ cachedZero' = z
     /\ cachedLapsed' = l
+    /\ refused' = FALSE
+    /\ lastAnswer' = "list"
+    /\ graceLine' = "none"
     /\ UNCHANGED <<startGen, restarts>>
 
 \* A complete page. `more`: it has a nextCursor (an empty string is a
@@ -149,6 +179,7 @@ PageReceived(more, ttlZero, lapse) ==
              THEN /\ page' = p /\ zeroTtl' = z /\ lapsed' = l /\ pending' = "next"
                   /\ UNCHANGED <<listing, startGen, restarts, waiting, answer, cache, cacheGen,
                                  cachedZero, cachedLapsed>>
+                  /\ UNCHANGED refusedVars
           ELSE /\ page' = p /\ zeroTtl' = z /\ lapsed' = l
                /\ Finish(z, l)
     /\ UNCHANGED <<era, process, gen, servedStale, extraFetch>>
@@ -174,17 +205,37 @@ InvalidCursor ==
                /\ lapsed' = FALSE
                /\ pending' = "first"
                /\ UNCHANGED <<listing, waiting, answer>>
+               /\ UNCHANGED refusedVars
           ELSE /\ Failed
+               /\ graceLine' = "none"
+               /\ refused' = TRUE
+               /\ lastAnswer' = "refused"
                /\ UNCHANGED <<startGen, page, restarts, zeroTtl, lapsed>>
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, servedStale, extraFetch>>
 
-\* Any other end of a page request: an error (including -32602 on the first
-\* page), input_required (MRTR-07: never cached), a malformed result, a
-\* timeout, or a lost connection. The listing fails: an answer that failed
-\* is never cached, and its waiters may get the last list.
+\* The server answered a page request, and fx could not use the answer: an
+\* error (including -32602 on the first page), input_required (MRTR-07: never
+\* cached), or a malformed result. The listing fails: an answer that failed is
+\* never cached, and its waiters may get the last list. The refusal is kept.
+PageRefused ==
+    /\ pending # "none"
+    /\ Failed
+    /\ graceLine' = "none"
+    /\ refused' = TRUE
+    /\ lastAnswer' = "refused"
+    /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
+                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
+
+\* A page request that ended with no answer: a timeout, a lost connection, a cancel,
+\* or a sign-in needed first.
+\* The listing fails as above, and says nothing about whether the server would
+\* refuse the list, so what was known stays.
 PageFailed ==
     /\ pending # "none"
     /\ Failed
+    /\ graceLine' = "none"
+    /\ refused' = refused
+    /\ lastAnswer' = lastAnswer
     /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
                    page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
 
@@ -194,6 +245,7 @@ Invalidate ==
     /\ gen < MaxGen
     /\ Invalidated
     /\ UNCHANGED <<era, process, cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
+    /\ UNCHANGED refusedVars
 
 \* A modern list's TTL ran out (CAT-04). Legacy lists have no TTL.
 Expired ==
@@ -201,8 +253,32 @@ Expired ==
     /\ era = "modern"
     /\ cache' = "stale"
     /\ UNCHANGED <<era, process, gen, cacheGen, cachedZero, cachedLapsed, listingVars, servedStale, extraFetch>>
+    /\ UNCHANGED refusedVars
 
-Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageFailed
+\* The page's server wrote a line fx could not read that named no request, and the grace ran out: no answer fx could use,
+\* as with PageRefused, and the refusal is kept. `lastAnswer` tells the two apart.
+PageUnreadable ==
+    /\ pending # "none"
+    /\ Failed
+    /\ refused' = TRUE
+    /\ lastAnswer' = "unreadable"
+    /\ graceLine' = "own"
+    /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
+                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
+
+\* The page's server wrote a line that names no request while another request was in flight, so the line is that
+\* request's reply as much as the page's: the grace ends the page with no answer, as PageFailed does, and the
+\* refusal stays as it was. `graceLine` says "shared-refused" if a page were refused on such a line.
+PageSharedGrace ==
+    /\ pending # "none"
+    /\ Failed
+    /\ lastAnswer' = lastAnswer
+    /\ refused' = refused
+    /\ graceLine' = IF refused' /\ ~refused THEN "shared-refused" ELSE "shared"
+    /\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,
+                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>
+
+Answer == (\E m, z, l \in BOOLEAN : PageReceived(m, z, l)) \/ InvalidCursor \/ PageRefused \/ PageUnreadable \/ PageSharedGrace \/ PageFailed
 
 Next ==
     \/ \E e \in {"modern", "legacy"} : ProcessStarted(e)
@@ -232,8 +308,11 @@ TypeOK ==
     /\ pending \in {"none", "first", "next"}
     /\ waiting \in BOOLEAN
     /\ answer \in {"none", "list", "lastGood", "failure"}
+    /\ refused \in BOOLEAN
     /\ servedStale \in BOOLEAN
     /\ extraFetch \in BOOLEAN
+    /\ lastAnswer \in {"none", "list", "refused", "unreadable"}
+    /\ graceLine \in {"none", "own", "shared", "shared-refused"}
 
 \* A fresh list was listed in the current generation: no answer from before
 \* an invalidation is ever cached as fresh.
@@ -265,6 +344,22 @@ PagesBounded == page <= MaxPages /\ (pending # "none" => page < MaxPages)
 
 \* A listing runs only while someone waits for it, and waiting implies a listing.
 WaitingMeansListing == waiting <=> listing = "fetching"
+
+\* fx says it refused the list exactly when the last listing the server answered
+\* was refused: a published list and a new process clear it, and a listing the
+\* server never answered leaves it.
+RefusedIffLastAnswerRefused == refused <=> lastAnswer \in {"refused", "unreadable"}
+
+\* A page is refused as unreadable only on a line nobody else could have written: when a call was in flight too, the
+\* line may be the call's reply, and the page's own answer is only late.
+NoReasonFromAnotherRequestsLine == graceLine # "shared-refused"
+
+\* A refused list was never cached, so no list is fresh while fx says it refused one.
+RefusedListIsNotFresh == refused => cache # "fresh"
+
+\* A refusal ended a listing, so its waiters got the failure, or the last list
+\* listed, which fx still serves: the status says both.
+RefusedMeansFailureAnswer == refused => answer \in {"failure", "lastGood"}
 
 \* Everyone who needs the list gets an answer.
 EveryNeedAnswered == waiting ~> ~waiting

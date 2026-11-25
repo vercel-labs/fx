@@ -34,6 +34,7 @@ const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
+const tooling_presentation = @import("../../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -107,6 +108,26 @@ const empty_reply_nudge_prompt =
 // the turn has failed and the next step is the user's.
 const empty_reply_asking = "Asking it to continue.";
 const empty_reply_follow_up = "Continue with a follow-up prompt if needed.";
+
+/// The longest an empty reply waits for mail that still sits in the host's
+/// hand-off before the nudge goes out.
+const handoff_mail_wait_ms: i64 = 1000;
+
+/// An empty reply's step has ended. A subagent's report or message for this
+/// agent may still sit in the host's hand-off, a moment from the worker's queue,
+/// where the check for mail that follows cannot see it. Waits for it, at most
+/// `handoff_mail_wait_ms`, so the mail takes the nudge's place. A host with no
+/// hand-off waits for nothing
+/// (`tests/tla/subagent/MainMail.tla` NoNudgeWithMail, WaitBounded).
+fn awaitHandoffMail(deps: *const AgentRuntimeDeps, turn_id: u64, step_ctx: TraceContext) void {
+    const wait = deps.wait_for_handoff_mail orelse return;
+    const outcome = wait(deps.ctx, turn_id, handoff_mail_wait_ms);
+    if (outcome == .none) return;
+    debug_trace.eventf("agent", "empty_reply_mail_wait", step_ctx, "outcome={s}", .{@tagName(outcome)});
+    if (outcome == .timed_out) {
+        debug_trace.logf("agent", "empty reply: mail for this agent did not land in the worker within {d} ms, so the nudge goes out", .{handoff_mail_wait_ms});
+    }
+}
 
 /// What fx shows for a reply that stopped for `other` with no text and no tool
 /// call: the provider's own reason when it sent one, then `next_step`.
@@ -220,7 +241,11 @@ fn appendContinuationPrompt(
 }
 
 const ignored_effort_notice =
-    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+    "Effort {s} is not available for {s}, so it is not sent.";
+/// Only a custom connection offers a level through its settings, so only its
+/// notice says where to add one.
+const custom_effort_hint =
+    " To offer it, add it to the model's reasoning_efforts in settings.json.";
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -2979,15 +3004,42 @@ fn preparedCallApplicableTargetsFresh(
     };
 }
 
+const LateTargetResolution = enum {
+    may_run,
+    scoped_instructions_pending,
+    stale,
+};
+
+const NotExecutedReason = struct {
+    result_kind: []const u8,
+    model_output: []const u8,
+};
+
+fn lateTargetNotExecutedReason(resolution: LateTargetResolution) ?NotExecutedReason {
+    return switch (resolution) {
+        .may_run => null,
+        .scoped_instructions_pending => .{
+            .result_kind = "scoped_instructions_pending",
+            .model_output = types.scoped_instructions_pending_tool_result_output,
+        },
+        .stale => .{
+            .result_kind = "applicable_targets_changed",
+            .model_output = types.deferred_tool_result_output,
+        },
+    };
+}
+
 /// A target that did not exist when the step was prepared and that brings no
 /// new scoped instructions is safe to run, so a read after an earlier write in
 /// the same step is not skipped (test "same-batch read of a file an earlier
 /// call created runs when no scoped instructions apply" in
-/// src/core/agent/runtime/tests/tool_flow.zig). Returns true only when the
-/// call prepared as `.legacy_target_resolution` resolves now and the registry
-/// has nothing new to deliver for it. The call keeps its legacy preparation,
-/// so execution still classifies it.
-fn lateResolvedCallMayRun(
+/// src/core/agent/runtime/tests/tool_flow.zig). Returns `.may_run` only when
+/// the call prepared as `.legacy_target_resolution` resolves now and the
+/// registry has nothing new to deliver for it, and
+/// `.scoped_instructions_pending` when it resolves but the registry would
+/// deliver new rules, which only a reissue loads. The call keeps its legacy
+/// preparation, so execution still classifies it.
+fn lateTargetResolution(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     config: Config,
@@ -2995,11 +3047,11 @@ fn lateResolvedCallMayRun(
     step_ctx: TraceContext,
     tool_call: ToolCall,
     maybe_preparation: ?tool_preparation.Result,
-) !bool {
-    const context_registry = deps.context_registry orelse return false;
-    const preparation = maybe_preparation orelse return false;
+) !LateTargetResolution {
+    const context_registry = deps.context_registry orelse return .stale;
+    const preparation = maybe_preparation orelse return .stale;
     const stale_candidate = switch (preparation) {
-        .terminal => return false,
+        .terminal => return .stale,
         .candidate => |*candidate| candidate,
     };
     const late_targets = (try tool_preparation.lateResolvedApplicableTargets(
@@ -3009,7 +3061,7 @@ fn lateResolvedCallMayRun(
         config.workspace_root,
         config.access_scope,
         stale_candidate,
-    )) orelse return false;
+    )) orelse return .stale;
     // The probe is only a question to the registry.
     var resolved_candidate: tool_preparation.Candidate = .{
         .kind = .registered,
@@ -3030,7 +3082,7 @@ fn lateResolvedCallMayRun(
             "call_id={s} name={s} targets={d}",
             .{ tool_call.id, tool_call.name, late_targets.len },
         );
-        return false;
+        return .scoped_instructions_pending;
     }
     debug_trace.eventf(
         "tool",
@@ -3039,7 +3091,7 @@ fn lateResolvedCallMayRun(
         "call_id={s} name={s} targets={d}",
         .{ tool_call.id, tool_call.name, late_targets.len },
     );
-    return true;
+    return .may_run;
 }
 
 fn parallelApplicableTargetsFresh(
@@ -3300,6 +3352,7 @@ fn appendNotExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
     result_kind: []const u8,
+    model_output: []const u8,
 ) !void {
     _ = try provisional_statuses.settleAdmittedCall(
         deps,
@@ -3315,7 +3368,7 @@ fn appendNotExecutedToolResult(
         "execution_result",
         step_ctx,
         "call_id={s} name={s} result_kind={s} model_output_bytes={d}",
-        .{ call.id, call.name, result_kind, types.deferred_tool_result_output.len },
+        .{ call.id, call.name, result_kind, model_output.len },
     );
     try runtime_tool_batch.appendToolResultContent(
         arena,
@@ -3323,7 +3376,7 @@ fn appendNotExecutedToolResult(
         completed_tool_names,
         batch,
         call,
-        types.deferred_tool_result_output,
+        model_output,
         null,
         .{
             .increment_total = false,
@@ -3922,7 +3975,7 @@ fn build_provider_prompt_with_response_language_control(
     origin: runtime_config.TurnOrigin,
     enforce_response_language: bool,
     correction_attempted: bool,
-    compaction_handoff: ?[]const u8,
+    compaction_handoff: ?ChatMessage,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !ProviderPromptProjection {
@@ -3977,7 +4030,7 @@ test "compacted request keeps the pending user prompt after the handoff" {
         .subagent,
         false,
         false,
-        "handoff",
+        .{ .role = .user, .content = "handoff", .context_origin = .handoff },
         &.{.{ .role = .assistant, .content = "retained tail" }},
         1,
     );
@@ -5068,8 +5121,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
     // A saved login's slug is not checked when it loads, so only a valid team
     // name reaches the terminal.
     const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
+        try arena.print(
             "fx sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /login, choose another team, and send it again.",
             .{team},
         )
@@ -6811,9 +6863,10 @@ fn processQueuedPromptInner(
             job.images = images;
         }
     }
-    // The repository as the turn found it, before any request or tool
-    // (D98). The prompt reaches the session first: the capture can take
-    // seconds, and a process killed during it must keep the prompt.
+    // The repository as the turn found it, before any tool (D98). The
+    // prompt reaches the session first, so a process killed during the
+    // capture keeps it; the capture then runs beside the first request, and
+    // `executeToolCall` waits for it before any tool acts.
     if (deps.start_workspace_capture) |start| {
         const fresh = !job.delivery.isSteering();
         start(deps.ctx, fresh, .begin);
@@ -6822,6 +6875,11 @@ fn processQueuedPromptInner(
         }
         start(deps.ctx, fresh, .capture);
     }
+    // The turn owns the start capture's task: however it ends, failed or
+    // paused before any tool and before any end capture included, the
+    // capture is saved before the turn returns, never after its session
+    // closes.
+    defer if (deps.start_workspace_capture) |start| start(deps.ctx, false, .settle);
 
     const current_user_message: ChatMessage = .{
         .role = .user,
@@ -7313,7 +7371,7 @@ fn buildProviderPromptForCompactionWindow(
     durable_history: []const ChatMessage,
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
-    handoff: ?[]const u8,
+    handoff: ?ChatMessage,
     retained_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !runtime_prompt_context.ProviderPrompt {
@@ -7327,10 +7385,7 @@ fn buildProviderPromptForCompactionWindow(
     );
     var compacted_history: std.ArrayList(ChatMessage) = .empty;
     defer compacted_history.deinit(alloc);
-    try compacted_history.append(alloc, .{
-        .role = .user,
-        .content = handoff.?,
-    });
+    try compacted_history.append(alloc, handoff.?);
     try compacted_history.appendSlice(alloc, retained_history_tail);
     return runtime_prompt_context.buildProviderPrompt(
         alloc,
@@ -7340,6 +7395,14 @@ fn buildProviderPromptForCompactionWindow(
         current_user_message,
         within_turn_suffix[@min(compacted_suffix_len, within_turn_suffix.len)..],
     );
+}
+
+/// The runtime context's texts, which a provider's compaction block keeps
+/// (`compactor.Request.runtime_context`).
+fn runtimeContextTexts(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const []const u8 {
+    const texts = try arena.alloc([]const u8, messages.len);
+    for (messages, texts) |message, *text| text.* = message.content orelse "";
+    return texts;
 }
 
 fn commitContextCompaction(
@@ -7974,7 +8037,7 @@ fn processQueuedPromptLoop(
     var identical_failure_escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
     defer identical_failure_escalation.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
-    var active_compaction_handoff: ?[]const u8 = null;
+    var active_compaction_handoff: ?ChatMessage = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
     // The provider's count of the first request after a compaction is traced,
     // so its size can be checked against the room compaction had.
@@ -8637,14 +8700,28 @@ fn processQueuedPromptLoop(
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
-            // settings declare it. One the person set and the model does not
-            // declare is left out, and the session says so once
+            // settings declare it, and the Gateway only when its catalog lists
+            // it. One the person set and the model does not declare is left
+            // out, and the session says so once
             // (`tests/tla/configured_provider/ConfiguredRequest.tla`
-            // IgnoredEffortNoticed, NoticeOncePerSession).
-            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+            // IgnoredEffortNoticed, NoticeOncePerSession). A Gateway catalog
+            // that failed cannot say what it lists, so its drop stays quiet
+            // (`deps.zig` model_catalog_failure).
+            const effort_catalog_known = job.provider == .configured or
+                (job.provider == .gateway and deps.model_catalog_failure != null and request_catalog_failure == null);
+            if (effort_catalog_known and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
                 ignored_effort_notified = true;
                 if (deps.push_session_notice) |push| {
-                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                    // The model name comes from the command line, so it shows its
+                    // control bytes as escapes, as other terminal lines do (RULES.md R4.6).
+                    const shown_effort = try overlay_arena.print("{f}", .{text_utils.terminalSafe(step_effort.label())});
+                    const shown_model = try overlay_arena.print("{f}", .{text_utils.terminalSafe(gateway_model)});
+                    const sentence = try overlay_arena.print(ignored_effort_notice, .{ shown_effort, shown_model });
+                    const notice = if (job.provider == .configured)
+                        try overlay_arena.print("{s}{s}", .{ sentence, custom_effort_hint })
+                    else
+                        sentence;
+                    try push(deps.ctx, notice);
                 }
             }
             // Fast drops silently when the catalog cannot confirm support.
@@ -8686,6 +8763,7 @@ fn processQueuedPromptLoop(
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
+                .current_turn_messages = within_turn_suffix.items,
                 .tools = .{
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
@@ -8776,7 +8854,7 @@ fn processQueuedPromptLoop(
                 if (just_rebuilt_request) compactor.traceLog(false, "request after compaction estimated_tokens={d} fixed_tokens={any} usable_tokens={any} after_tokens={d}", .{ request_cost.estimated_input_tokens, size.fixed_tokens, size.usable_tokens, size.afterTokens() });
                 const usable_tokens = size.usable_tokens;
                 const compact_at_tokens = size.compact_at_tokens;
-                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due());
+                const wants_compaction = has_new_compactable_context and (overflow_pending or size.due() or agent.compaction_requested);
                 compactor.traceEventIf(
                     wants_compaction,
                     step_ctx,
@@ -8807,6 +8885,7 @@ fn processQueuedPromptLoop(
                         return error.ContextCapacityExceeded;
                     };
                 } else {
+                    agent.compaction_requested = false;
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
                         .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
@@ -8866,6 +8945,7 @@ fn processQueuedPromptLoop(
                             .records = if (config.session_child_capability) |capability| result_store.compactorStore(capability) else null,
                             .cancel_flag = config.cancel_flag,
                             .trace_ctx = step_ctx,
+                            .runtime_context = try runtimeContextTexts(arena, runtime_context.messages()),
                         },
                     });
                     // The turn's duration leaves out the compaction, as its
@@ -8913,15 +8993,18 @@ fn processQueuedPromptLoop(
                         } else .{};
                         compacted_suffix_len += try runtime_execution_memory.retainedMessageOffset(within_turn_suffix.items[compacted_suffix_len..], active_cut);
                         explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
-                        var retained_messages: std.ArrayList(ChatMessage) = .empty;
-                        try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
-                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
-                        active_compaction_handoff = outcome.model_text;
-                        trace_count_after_compaction = true;
-                        active_compaction_history_tail = retained_messages.items;
                         const next_history = try arena.alloc(HistoryTurn, outcome.retained_history.len + 1);
                         next_history[0] = .{ .compacted_summary = outcome.checkpoint };
                         @memcpy(next_history[1..], outcome.retained_history);
+                        // The rest of the turn sends the checkpoint as every
+                        // later turn will: a provider's block to the model that
+                        // wrote it, fx's text otherwise, then the kept turns.
+                        var compacted_messages: std.ArrayList(ChatMessage) = .empty;
+                        try session_runtime.appendHistoryChatMessages(arena, &compacted_messages, next_history);
+                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, compacted_messages.items);
+                        active_compaction_handoff = compacted_messages.items[0];
+                        trace_count_after_compaction = true;
+                        active_compaction_history_tail = compacted_messages.items[1..];
                         compaction_history = next_history;
                         finalization.compacted_execution = .{
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
@@ -9030,6 +9113,7 @@ fn processQueuedPromptLoop(
                 .retry_count = config.gateway_retry_count,
                 .instructions = request_data.instructions,
                 .messages = request_data.messages,
+                .current_turn_messages = request_data.current_turn_messages,
                 .tools = request_data.tools,
                 .tool_choice = request_data.tool_choice,
                 .vision_mode = request_data.vision_mode,
@@ -9786,6 +9870,7 @@ fn processQueuedPromptLoop(
             }
 
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+            try runtime_assistant_stream.finishAssistantTail(&stream_ctx);
 
             const partial_assistant = if (attempt_disposition == .completed)
                 stream_ctx.accepted_source_or(attempt_completion.content orelse "")
@@ -10349,10 +10434,13 @@ fn processQueuedPromptLoop(
         }
         if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
+        var step_asked_question = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
-            step_has_visible_tool_calls = true;
-            break;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) {
+                step_asked_question = true;
+            } else {
+                step_has_visible_tool_calls = true;
+            }
         }
         const step_has_visible_text =
             stream_ctx.saw_visible_text or
@@ -10369,6 +10457,9 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
+                    // A length-limited reply's calls never run: they are
+                    // dropped for a resend or blocked below.
+                    .asked_question = step_asked_question and disposition == .completed,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =
@@ -10379,13 +10470,14 @@ fn processQueuedPromptLoop(
             "agent",
             "tool_presentation_group",
             step_ctx,
-            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s}",
+            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s} asked_question={s}",
             .{
                 if (active_presentation_group_id) |group| group.anchor_step_id else 0,
                 if (step_has_visible_tool_calls) "true" else "false",
                 if (stream_ctx.saw_tool_start) "true" else "false",
                 if (step_has_visible_text) "true" else "false",
                 if (stream_ctx.saw_visible_text_after_tool_start) "true" else "false",
+                if (step_asked_question) "true" else "false",
             },
         );
 
@@ -10545,6 +10637,11 @@ fn processQueuedPromptLoop(
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
+            // After the nudge the check below has closed the turn to mail, so a
+            // second empty reply waits for nothing.
+            if (empty_other and !empty_reply_nudged and !lifecycle.view.hasStop() and agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
+                awaitHandoffMail(deps, turn_id, step_ctx);
+            }
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
@@ -12123,10 +12220,10 @@ fn processQueuedPromptLoop(
                 }
             else
                 true;
-            const applicable_targets_resolved_late = if (applicable_targets_fresh)
-                false
+            const late_resolution: LateTargetResolution = if (applicable_targets_fresh)
+                .may_run
             else
-                lateResolvedCallMayRun(
+                lateTargetResolution(
                     arena,
                     deps,
                     config,
@@ -12145,7 +12242,7 @@ fn processQueuedPromptLoop(
                         err,
                     );
                 };
-            if (!applicable_targets_fresh and !applicable_targets_resolved_late) {
+            if (lateTargetNotExecutedReason(late_resolution)) |not_executed| {
                 try appendNotExecutedToolResult(
                     deps,
                     &stream_ctx.provisional_statuses,
@@ -12158,7 +12255,8 @@ fn processQueuedPromptLoop(
                     &within_turn_suffix,
                     &completed_tool_names,
                     &step_batch,
-                    "applicable_targets_changed",
+                    not_executed.result_kind,
+                    not_executed.model_output,
                 );
                 continue;
             }
@@ -12228,6 +12326,7 @@ fn processQueuedPromptLoop(
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
+                        types.deferred_tool_result_output,
                     );
                     continue;
                 }
@@ -12902,6 +13001,13 @@ fn processQueuedPromptLoop(
                     try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
                 }
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
+                // A wait has no result to name whom it waited for, so the turn
+                // keeps the names its row showed (D102).
+                const cancelled_wait: ?types.CancelledWaitPresentation = if (!execution_is_command and
+                    try tooling_presentation.subagentRoster(arena, identity_call) == .working)
+                    .{ .waited_for = tool_display_target }
+                else
+                    null;
                 const persist_error = if (execution_is_command)
                     runtime_interruption.persistInterruptedCommandTurnOnce(
                         deps,
@@ -12916,6 +13022,21 @@ fn processQueuedPromptLoop(
                         stop_state.retained_candidate,
                         &stop_state.terminal_materializing,
                         cancelled_command,
+                    )
+                else if (cancelled_wait) |wait|
+                    runtime_interruption.persistInterruptedWaitTurnOnce(
+                        deps,
+                        finalization,
+                        job,
+                        partial_assistant,
+                        identity_call,
+                        completed_tool_names.items,
+                        &interrupted_persisted,
+                        step_ctx,
+                        within_turn_suffix.items,
+                        stop_state.retained_candidate,
+                        &stop_state.terminal_materializing,
+                        wait,
                     )
                 else
                     runtime_interruption.persistInterruptedTurnOnce(

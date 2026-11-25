@@ -155,6 +155,11 @@ export function hasEmptyComposer(pane: string): boolean {
   return pane.split("\n").some(isEmptyComposerLine);
 }
 
+/** The pane shows no running turn: its live "Generating (" status row is gone. A reply's last line can show before its turn ends, so a reply marker alone does not mean the turn is over or saved. */
+export function turnSettled(pane: string): boolean {
+  return !pane.includes("Generating (");
+}
+
 export function fakeGatewaySse(events: object[]) {
   return new Response(
     `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,

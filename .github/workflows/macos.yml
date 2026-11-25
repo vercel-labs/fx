@@ -15,9 +15,12 @@ on:
         type: boolean
         default: false
 
+# A run started by a label waits for the run in progress instead of
+# cancelling it. A cancelled run still reports its macOS arm64 check, as a
+# failure, which reads as a broken pull request.
 concurrency:
   group: macos-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action != 'labeled' }}
 
 permissions:
   contents: read

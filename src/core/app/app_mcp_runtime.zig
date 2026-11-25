@@ -9,6 +9,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const catalog_state = @import("../mcp/catalog_state.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
 const login_words = @import("../mcp_host/login_words.zig");
@@ -317,6 +318,14 @@ pub const State = struct {
         return .{ .state = self, .host = h };
     }
 
+    /// Who serves the MCP tool `name` (`Catalog.toolIdentity`), copied into
+    /// `alloc`; null when there is no host or no loaded list has it.
+    pub fn toolIdentity(self: *State, alloc: Allocator, name: []const u8) Allocator.Error!?catalog_state.ToolIdentity {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return lease.host.catalog.toolIdentity(alloc, name);
+    }
+
     /// Every configured server's status, copied into `alloc`; null when
     /// there is no host.
     pub fn hostStatuses(self: *State, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
@@ -559,6 +568,19 @@ pub const State = struct {
             return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
+
+    /// From any thread: a warning for the UI's notice row. Copies `text`.
+    pub fn addHostWarning(self: *State, text: []const u8) void {
+        const sink = self.host_sink orelse {
+            debug_trace.logf("mcp", "MCP warning dropped: no host sink", .{});
+            return;
+        };
+        const copy = std.heap.c_allocator.dupe(u8, text) catch {
+            debug_trace.logf("mcp", "MCP warning dropped: out of memory", .{});
+            return;
+        };
+        sink.push(copy, true);
+    }
 
     /// The notices waiting for the UI, owned by `std.heap.c_allocator`.
     pub fn takeHostNotices(self: *State) []HostNotice {

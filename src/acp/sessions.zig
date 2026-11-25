@@ -11,7 +11,7 @@ const libfx_hooks = @import("libfx_hooks.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
@@ -428,8 +428,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         });
     }
     if (state.cfg.allow_acp_mcp) {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -817,8 +816,7 @@ fn handleRestoreSession(
             });
         }
     } else {
-        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
-        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try appendMcpConfigs(state, alloc, msg.params_raw, workspace_root, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -970,34 +968,53 @@ fn handleRestoreSession(
     );
 }
 
-/// Adds the user's profile MCP servers after the request's own servers when
-/// the client sets `_meta.fx.profileMcpServers`. ACP sessions otherwise use
-/// only client-supplied and approved project servers. Request entries win
-/// name collisions, and profile entries win over project entries.
-fn appendProfileMcpConfigsIfRequested(
+/// Adds the project's MCP servers after the request's own, and the user's profile servers too when the client sets
+/// `_meta.fx.profileMcpServers`. ACP sessions otherwise use only client-supplied and approved project servers. With the
+/// profile, the servers are the ones the terminal app runs: an entry fx can't read is skipped, `${VAR}` is expanded, a
+/// name a terminal can't print is skipped, and the host keeps a note for each skip (`builtin_mcp.composeHostConfigs`).
+/// Request entries win name collisions, and profile entries win over project entries.
+fn appendMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     params_raw: ?[]const u8,
+    workspace_root: []const u8,
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
-    if (!profileMcpRequested(alloc, params_raw)) return;
+    var project = try loadProjectMcpConfigs(state, alloc, workspace_root);
+    defer project.deinit(alloc);
+    if (!profileMcpRequested(alloc, params_raw)) {
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
+        return;
+    }
     const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
         debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     const config_path = try builtin_mcp.configPathFromHome(alloc, home);
     defer alloc.free(config_path);
-    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path) catch |err| {
+    var loaded: builtin_mcp.NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    var profile = builtin_mcp.readProfile(alloc, config_path, &loaded.diagnostics) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "ACP profile MCP servers unavailable err={s}", .{@errorName(err)});
+        try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &project.configs);
         return;
     };
     defer {
         for (profile.items) |*config| config.deinit(alloc);
         profile.deinit(alloc);
     }
-    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
-    try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);
+    try builtin_mcp.mergeNativeConfigs(alloc, &loaded, &profile, &project);
+    // Read only while the servers are composed.
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    try builtin_mcp.composeHostConfigs(alloc, &loaded, configs.items.items, &inherited);
+    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d} notes={d}", .{ loaded.configs.items.len, loaded.diagnostics.items.len });
+    const notes = try builtin_mcp.renderNotes(alloc, loaded.diagnostics.items);
+    configs.setNotes(alloc, notes);
+    try configs.items.appendSlice(alloc, loaded.configs.items);
+    loaded.configs.clearRetainingCapacity();
 }
 
 fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
@@ -1008,23 +1025,24 @@ fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
     return acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false;
 }
 
-fn appendProjectMcpConfigs(
+/// The session's project servers, which run in its workspace, and the notes for the entries fx skipped. Empty when the
+/// project's choices can't be read.
+fn loadProjectMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
     workspace_root: []const u8,
-    configs: *mcp_servers.OwnedServerConfigs,
-) !void {
+) !project_config.WorkspaceParseResult {
     var choices = if (state.cfg.home_override) |home|
         config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         }
     else
         config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            return;
+            return .{};
         };
     defer choices.deinit(alloc);
 
@@ -1034,7 +1052,7 @@ fn appendProjectMcpConfigs(
         .workspace,
         choices.choices,
     );
-    defer workspace.deinit(alloc);
+    errdefer workspace.deinit(alloc);
     for (workspace.diagnostics.items) |diagnostic| {
         var name_buf: [256]u8 = undefined;
         var variable_buf: [160]u8 = undefined;
@@ -1061,11 +1079,7 @@ fn appendProjectMcpConfigs(
         if (config.transport != .stdio or config.cwd != null) continue;
         config.cwd = try alloc.dupe(u8, workspace_root);
     }
-    try project_config.appendWorkspaceAfterAcpPrimary(
-        alloc,
-        &configs.items,
-        &workspace.configs,
-    );
+    return workspace;
 }
 
 fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8) bool {
@@ -1300,29 +1314,13 @@ fn restoredClientSystemPrompt(
     return text orelse &.{};
 }
 
-/// Returns the tool identity record of a restored session. A record that
-/// cannot be read is reported in the trace and replaced by an empty one.
+/// Returns the tool identity record of a restored session
+/// (`tool_call_identities.restore`).
 fn restoredToolIdentities(
     alloc: Allocator,
     session: *session_adapter.Session,
 ) Allocator.Error!tool_call_identities.Record {
-    const record = blk: {
-        const stored = session.toolIdentities(alloc) catch |err| break :blk err;
-        const bytes = stored orelse return .{};
-        defer alloc.free(bytes);
-        break :blk tool_call_identities.parse(alloc, bytes);
-    };
-    return record catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            debug_trace.logf(
-                "acp",
-                "dropped unreadable tool identity record session={s} err={s}",
-                .{ session.id(), @errorName(err) },
-            );
-            return .{};
-        },
-    };
+    return tool_call_identities.restore(alloc, session);
 }
 
 fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {

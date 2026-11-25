@@ -33,6 +33,12 @@ const catalogDelayMs = Math.max(
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
 const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+// FX_MCP_LIST_REPLY is raw JSON text that goes out as written after the id of every tools/list reply: `"result":{...}`
+// or `"error":{...}`. A test gives fx a list it refuses, with a repeated or escaped key that JSON.stringify cannot write.
+const rawListReply = process.env.FX_MCP_LIST_REPLY;
+// FX_MCP_LIST_LINE is a whole tools/list reply line as written, with `{id}` standing for the request's id: a test puts the
+// id after a part fx cannot read, so that the line names no request.
+const rawListLine = process.env.FX_MCP_LIST_LINE;
 const rawFormSchemaMark = "raw-form-schema-mark";
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 // FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
@@ -42,6 +48,10 @@ const callDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
 );
+// In mode subscription_cache the tool is renamed 50 ms after fx listens, unless
+// FX_MCP_LIST_CHANGE_RELEASE_PATH is set: then the rename waits until that file
+// exists, so a test can change the list at a moment it picks.
+const listChangeReleasePath = process.env.FX_MCP_LIST_CHANGE_RELEASE_PATH;
 // FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
 // FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
 // test can act while a call is out and then let it end.
@@ -177,13 +187,23 @@ function elicitationCapabilities() {
 
 function hasModernMetadata(message) {
   const meta = message.params?._meta;
-  const capabilities = JSON.stringify(meta?.["io.modelcontextprotocol/clientCapabilities"]);
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const declared = JSON.stringify(elicitationCapabilities());
-  const capabilitiesMatch = advertiseElicitation
-    ? capabilities === declared
-    : capabilities === "{}" || capabilities === declared;
+  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
+  const capabilityNames = capabilities && typeof capabilities === "object"
+    ? Object.keys(capabilities)
+    : [];
+  const elicitation = capabilityNames.includes("elicitation") ? capabilities.elicitation : null;
+  const declaredModes = elicitation && typeof elicitation === "object"
+    ? Object.keys(elicitation)
+    : [];
+  const neededModes = Object.keys(elicitationCapabilities().elicitation ?? {});
+  // A session that shares its server runs it in one owner for every session
+  // that wants it, so the server hears the union of their question UIs: a
+  // session can ask for less than what reached the wire, never more. The
+  // fixture still refuses a client that leaves out a mode it needs, and one
+  // that declares anything besides form and url.
+  const capabilitiesMatch = capabilityNames.every((name) => name === "elicitation") &&
+    neededModes.every((mode) => declaredModes.includes(mode)) &&
+    declaredModes.every((mode) => mode === "form" || mode === "url");
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
@@ -341,7 +361,7 @@ function handle(message) {
       },
     });
     if (mode === "subscription_cache") {
-      setTimeout(() => {
+      const changeList = () => {
         currentToolName = recoveredToolName;
         for (let index = 0; index < 10; index += 1) {
           send({
@@ -354,8 +374,25 @@ function handle(message) {
             },
           });
         }
-      }, 50);
+      };
+      if (listChangeReleasePath) {
+        const releasePoll = setInterval(() => {
+          if (!existsSync(listChangeReleasePath)) return;
+          clearInterval(releasePoll);
+          changeList();
+        }, 10);
+      } else {
+        setTimeout(changeList, 50);
+      }
     }
+    return;
+  }
+  if (message.method === "tools/list" && rawListLine !== undefined) {
+    process.stdout.write(`${rawListLine.replaceAll("{id}", JSON.stringify(message.id))}\n`);
+    return;
+  }
+  if (message.method === "tools/list" && rawListReply !== undefined) {
+    process.stdout.write(`{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},${rawListReply}}\n`);
     return;
   }
   if (message.method === "tools/list") {

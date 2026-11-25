@@ -6,7 +6,9 @@ const Allocator = std.mem.Allocator;
 pub const max_manifest_bytes: usize = 4096;
 pub const max_version_bytes: usize = 32;
 pub const max_revision_bytes: usize = 64;
-const min_revision_bytes: usize = 7;
+pub const display_revision_bytes: usize = 7;
+const min_revision_bytes: usize = display_revision_bytes;
+pub const max_version_label_bytes: usize = max_version_bytes + 1 + display_revision_bytes + " (dev)".len;
 
 pub const Channel = enum {
     stable,
@@ -27,6 +29,14 @@ pub const CurrentBuild = struct {
     channel: Channel,
     version: []const u8,
     revision: []const u8,
+
+    pub fn writeVersionLabel(self: CurrentBuild, out: []u8) ![]const u8 {
+        if (self.channel != .dev) return std.mem.print(out, "{s}", .{self.version});
+        if (displayRevision(self.revision)) |rev| {
+            return std.mem.print(out, "{s}-{s} (dev)", .{ self.version, rev });
+        }
+        return std.mem.print(out, "{s} (dev)", .{self.version});
+    }
 };
 
 pub const Target = union(Channel) {
@@ -180,6 +190,11 @@ pub fn isValidRevision(raw: []const u8) bool {
     return true;
 }
 
+pub fn displayRevision(revision: []const u8) ?[]const u8 {
+    if (!isValidRevision(revision)) return null;
+    return revision[0..display_revision_bytes];
+}
+
 fn parseVersionParts(raw: []const u8) [3]u32 {
     var values = [_]u32{ 0, 0, 0 };
     var parts = std.mem.splitScalar(u8, normalizeVersion(raw), '.');
@@ -199,6 +214,27 @@ pub fn revisionsEqual(full: []const u8, current: []const u8) bool {
 
 fn shortRevision(revision: []const u8) []const u8 {
     return revision[0..@min(revision.len, 12)];
+}
+
+test "CurrentBuild.writeVersionLabel formats stable and dev labels" {
+    var buf: [max_version_label_bytes]u8 = undefined;
+
+    const stable: CurrentBuild = .{ .channel = .stable, .version = "0.0.17", .revision = "f1862c5061f5" };
+    try std.testing.expectEqualStrings("0.0.17", try stable.writeVersionLabel(&buf));
+
+    const dev_full: CurrentBuild = .{ .channel = .dev, .version = "0.0.17", .revision = "f1862c5061f5" };
+    try std.testing.expectEqualStrings("0.0.17-f1862c5 (dev)", try dev_full.writeVersionLabel(&buf));
+
+    const dev_short: CurrentBuild = .{ .channel = .dev, .version = "0.0.17", .revision = "f1862c5" };
+    try std.testing.expectEqualStrings("0.0.17-f1862c5 (dev)", try dev_short.writeVersionLabel(&buf));
+
+    for ([_][]const u8{ "unknown", "", "abc123", "123456g" }) |revision| {
+        const dev_unresolved: CurrentBuild = .{ .channel = .dev, .version = "0.0.17", .revision = revision };
+        try std.testing.expectEqualStrings("0.0.17 (dev)", try dev_unresolved.writeVersionLabel(&buf));
+    }
+
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, stable.writeVersionLabel(&tiny));
 }
 
 test "channel parsing accepts only stable and dev" {

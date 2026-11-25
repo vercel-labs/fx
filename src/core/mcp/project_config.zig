@@ -112,6 +112,7 @@ pub const EntryProblem = enum {
     env,
     bearer_token_env,
     enabled,
+    shared,
     required,
     startup_timeout_ms,
     operation_timeout_ms,
@@ -167,6 +168,7 @@ fn entryProblem(err: anyerror) EntryProblem {
         error.McpConfigInvalidEnvironment => .env,
         error.McpConfigInvalidBearerEnvironment => .bearer_token_env,
         error.McpConfigInvalidEnabled => .enabled,
+        error.McpConfigInvalidShared => .shared,
         error.McpConfigInvalidRequired => .required,
         error.McpConfigInvalidStartupTimeout => .startup_timeout_ms,
         error.McpConfigInvalidOperationTimeout => .operation_timeout_ms,
@@ -399,7 +401,7 @@ pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(
 /// The profile's servers. With `skipped`, an entry fx can't read is left out
 /// and noted there instead of failing the file.
 pub fn parseProfileServers(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
-    var result = try parseProfileDocumentInto(alloc, json_text, skipped);
+    var result = try parseProfileDocument(alloc, json_text, skipped);
     defer result.deinit(alloc);
     const configs = result.configs;
     result.configs = .empty;
@@ -414,11 +416,10 @@ noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
     return err;
 }
 
-pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
-    return parseProfileDocumentInto(alloc, json_text, null);
-}
-
-fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
+/// The profile's document. With `skipped`, an entry fx can't read is left out and noted there, with the notes about
+/// a misspelled or ignored key, as the runtime reads it (`parseProfileServers`); `diagnostic` holds the warning either
+/// way. Without it, the first entry fx can't read fails the file.
+pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),
         else => return failProfileParse(error.McpConfigInvalidJson),
@@ -1330,7 +1331,7 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
     for (0..64) |i| try wide.print(alloc, "\"n{d}\":{d},", .{ i, i });
     try wide.appendSlice(alloc, "\"real\":{\"command\":\"y\"}}}");
     try std.testing.expectEqualStrings("servers", (try foundKey(alloc, wide.items)).key());
-    var scanned = try parseProfileDocument(alloc, wide.items);
+    var scanned = try parseProfileDocument(alloc, wide.items, null);
     defer scanned.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, scanned.diagnostic.?.cause);
 
@@ -1360,7 +1361,7 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
         "~/.fx/mcp.json: the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\".",
         said,
     );
-    var strict = try parseProfileDocument(alloc, typo);
+    var strict = try parseProfileDocument(alloc, typo, null);
     defer strict.deinit(alloc);
     try std.testing.expect(!strict.mutation_allowed);
 }
@@ -1481,6 +1482,12 @@ fn parseServerEntry(
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
+    // One copy of a stdio server for every session whose config matches;
+    // a server that keeps state per client says false.
+    const shared = if (object.get("shared")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidShared)
+    else
+        true;
     const configured_required = if (object.get("required")) |field|
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
@@ -1527,6 +1534,7 @@ fn parseServerEntry(
             .auth = auth,
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
+            .shared = shared,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,
             .operation_timeout_ms = timeouts.operation_ms,
@@ -1560,6 +1568,7 @@ fn parseServerEntry(
         .args = command.args,
         .env = env,
         .enabled = enabled,
+        .shared = shared,
         .workspace_admission = policy.workspace_admission,
         .startup_timeout_ms = timeouts.startup_ms,
         .operation_timeout_ms = timeouts.operation_ms,
@@ -1844,7 +1853,9 @@ fn containsName(values: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
+/// Whether a server of `configs` has this name: the one rule for which of two servers keeps a name, in `mergeNative`,
+/// `appendWorkspaceAfterAcpPrimary`, and the host's compose (`builtins/mcp.zig`).
+pub fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
     for (configs) |config| if (std.mem.eql(u8, config.name, name)) return true;
     return false;
 }
@@ -1925,6 +1936,7 @@ test "profile document accepts mcpServers alias and preserves strict entry parsi
     var result = try parseProfileDocument(
         alloc,
         "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1940,6 +1952,7 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1981,6 +1994,7 @@ test "profile document blocks suspicious sibling keys beside canonical mcp" {
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1997,6 +2011,7 @@ test "profile document reports the first exact server-like unsupported key" {
     var result = try parseProfileDocument(
         alloc,
         "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -2020,7 +2035,7 @@ test "profile document bounds suspicious-key scans" {
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
-    var result = try parseProfileDocument(alloc, json);
+    var result = try parseProfileDocument(alloc, json, null);
     defer result.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
     try std.testing.expect(!result.mutation_allowed);
@@ -2165,6 +2180,7 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     var profile = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+        null,
     );
     defer profile.deinit(alloc);
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
@@ -2538,4 +2554,32 @@ test "a project entry fx can't read says why in words" {
         defer alloc.free(said);
         try std.testing.expectEqualStrings(words, said);
     }
+}
+
+test "a server reads \"shared\": false, and a value that isn't a bool says so" {
+    const alloc = std.testing.allocator;
+    var result = try parseWorkspaceJson(alloc,
+        \\{"mcpServers":{"own":{"command":"node","shared":false},"odd":{"command":"node","shared":"no"}}}
+    , .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expect(!result.configs.items[0].shared);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    const said = try renderWorkspaceDiagnostic(alloc, result.diagnostics.items[0]);
+    defer alloc.free(said);
+    try std.testing.expectEqualStrings(".mcp.json server 'odd' was skipped: its \"shared\" isn't valid.", said);
+    // A profile server with the same value fails outright, as its other fields do.
+    try std.testing.expectError(
+        error.McpConfigInvalidShared,
+        parseProfileJson(alloc, "{\"mcp\":{\"odd\":{\"command\":[\"node\"],\"shared\":\"no\"}}}"),
+    );
+}
+
+test "a profile server defaults to shared" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(alloc, "{\"mcp\":{\"default\":{\"command\":[\"node\"]},\"own\":{\"command\":[\"node\"],\"shared\":false}}}", null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    try std.testing.expect(result.configs.items[0].shared);
+    try std.testing.expect(!result.configs.items[1].shared);
 }

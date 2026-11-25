@@ -595,8 +595,8 @@ test "the core imports only std" {
     const source = @embedFile("transcript_window.zig");
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
-        const at = std.mem.indexOf(u8, line, "@import(\"") orelse continue;
-        if (std.mem.indexOf(u8, line, "@embedFile") != null) continue;
+        const at = std.mem.find(u8, line, "@import(\"") orelse continue;
+        if (std.mem.find(u8, line, "@embedFile") != null) continue;
         try testing.expect(std.mem.startsWith(u8, line[at..], "@import(\"std\")"));
     }
 }

@@ -89,6 +89,30 @@ const Speaker = struct {
     }
 };
 
+/// What the user hears when fx declines a server's question because it could not take it: fx's reason only,
+/// never the form's fields or values. The server's name is made safe for a terminal, so every surface may
+/// print the text as it is. Null when the user ended the question, which is no refusal. Owned by `alloc`.
+pub fn declinedText(alloc: Allocator, server: []const u8, err: anyerror) Allocator.Error!?[]u8 {
+    const reason: []const u8 = switch (err) {
+        error.Cancelled => return null,
+        error.LimitExceeded, error.MetadataLimitExceeded, error.PresentationLimitExceeded => "the form is larger than fx can show",
+        error.RetryLimitExceeded => "the answers did not fit the form after several tries",
+        error.SecretField => "the form asks for a secret, which fx never takes in a form",
+        // A form that does not parse is one error to the caller, so the words name each way it can fail.
+        error.InvalidInputRequired, error.InvalidRequest, error.InvalidSchema, error.UnsupportedSchema => "fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret",
+        error.InvalidInputResponses, error.InvalidResponse, error.InvalidAnswer => "the answers did not fit the form",
+        error.InvalidUrl, error.InsecureUrl => "the link in it is not a safe web address",
+        error.UnsupportedMode, error.UnsupportedAction, error.UnsupportedInputRequest, error.McpInputRequired => "it asks for input that fx can't take here",
+        error.McpInputTimedOut, error.Timeout, error.McpOperationTimedOut => "no answer came in time",
+        error.BrowserOpenFailed => "fx couldn't open the browser",
+        error.QuestionFailed => "fx couldn't show the question",
+        error.OutOfMemory => "fx ran out of memory",
+        else => "something went wrong",
+    };
+    const name = (try text_utils.encodeTerminalSafeInline(alloc, server, 160)).bytes;
+    return try alloc.print("MCP server '{s}' asked for input, and fx declined it: {s}.", .{ name, reason });
+}
+
 pub fn respond(
     alloc: Allocator,
     origin: tool_mcp_runtime.InputOrigin,
@@ -1742,6 +1766,41 @@ test "compact form submits a choice or declines without a review" {
         try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
         try std.testing.expect(!fixture.review_contained_values);
     }
+}
+
+test "a refused form is told to the user in fx's reason, never in the form's words, and a cancel is told to no one" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { err: anyerror, reason: []const u8 }{
+        .{ .err = error.LimitExceeded, .reason = "the form is larger than fx can show" },
+        .{ .err = error.PresentationLimitExceeded, .reason = "the form is larger than fx can show" },
+        .{ .err = error.MetadataLimitExceeded, .reason = "the form is larger than fx can show" },
+        .{ .err = error.RetryLimitExceeded, .reason = "the answers did not fit the form after several tries" },
+        .{ .err = error.SecretField, .reason = "the form asks for a secret, which fx never takes in a form" },
+        .{ .err = error.UnsupportedSchema, .reason = "fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret" },
+        .{ .err = error.InvalidInputRequired, .reason = "fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret" },
+        .{ .err = error.InvalidAnswer, .reason = "the answers did not fit the form" },
+        .{ .err = error.InsecureUrl, .reason = "the link in it is not a safe web address" },
+        .{ .err = error.UnsupportedMode, .reason = "it asks for input that fx can't take here" },
+        .{ .err = error.McpInputRequired, .reason = "it asks for input that fx can't take here" },
+        .{ .err = error.McpInputTimedOut, .reason = "no answer came in time" },
+        .{ .err = error.BrowserOpenFailed, .reason = "fx couldn't open the browser" },
+        .{ .err = error.QuestionFailed, .reason = "fx couldn't show the question" },
+        .{ .err = error.OutOfMemory, .reason = "fx ran out of memory" },
+        .{ .err = error.SomethingNobodyListed, .reason = "something went wrong" },
+    };
+    for (cases) |case| {
+        const text = (try declinedText(a, "docs", case.err)).?;
+        try std.testing.expectEqualStrings(try a.print("MCP server 'docs' asked for input, and fx declined it: {s}.", .{case.reason}), text);
+        // The error's name is for the trace, never for the user.
+        try std.testing.expect(std.mem.find(u8, text, @errorName(case.err)) == null);
+    }
+    try std.testing.expect((try declinedText(a, "docs", error.Cancelled)) == null);
+    // A hostile server name stays inside the text, with no control byte.
+    const hostile = (try declinedText(a, "evil\x1b]52;c;X\x07\n[2J", error.LimitExceeded)).?;
+    for (hostile) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+    try std.testing.expect(std.mem.startsWith(u8, hostile, "MCP server 'evil\\x1b]52;c;X\\x07"));
 }
 
 test "compact form defaults skip and choice labels preserve exact values" {

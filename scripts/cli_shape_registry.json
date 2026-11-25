@@ -237,6 +237,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_MCP_IDLE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"
@@ -246,6 +250,14 @@
       "stability": "internal"
     },
     "FX_TEST_OPENAI_CODEX_RESPONSES_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_REPORT_DELIVERY_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_REPORT_DELIVERY_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
@@ -362,6 +374,14 @@
       "stability": "internal"
     },
     "FX_TEST_VERCEL_API_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE": {
       "job": "test",
       "stability": "internal"
     },
@@ -522,9 +542,7 @@
     "flag_names": {
       "--resume-": "Prefix of the removed --resume-<id> alias, kept so the removed spelling fails with a hint."
     },
-    "setting_keys": {
-      "statusLine": "Older spelling of status_line, still read so existing settings files keep working; fx writes only status_line."
-    }
+    "setting_keys": {}
   },
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",

@@ -57,8 +57,9 @@ const substitutions: Record<string, string[]> = {
   RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
   ErrorData: ["Cap", "MaxSize", "MaxChar", "Carry"],
   Connect: ["Std"],
-  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic"],
+  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic", "Deep"],
   McpRules: ["Tools", "OwnRules"],
+  SubagentAccess: ["Servers", "MaxRuns", "MaxViews", "Bridge", "DeniedFirst"],
   WireDepth: ["Limit", "Capacity", "EngineLimit", "MaxDepth"],
 };
 

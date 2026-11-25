@@ -64,7 +64,9 @@ pub const Event = struct {
         /// `oversized`: a lost call's answer was over the message limit.
         /// `refused_bytes`, `refused_body`: the length of what fx could not read, for a `malformed`
         /// call, and whether it was an HTTP body (else a line); see `server.Event.called`.
-        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false },
+        /// `lost_why` and `status` are as there. `restarted`: the call's step took the link from ready to idle.
+        /// The protocol version the call used, read before a restart clears it.
+        called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false, refused_bytes: u32 = 0, refused_body: bool = false, lost_why: ?server_mod.LostWhy = null, status: u16 = 0, restarted: bool = false, protocol: ?[]const u8 = null },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.
         progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
@@ -74,6 +76,9 @@ pub const Event = struct {
         /// The rest as the server says it: tool lists, sign-in,
         /// subscriptions, detection failures, and 2025 elicitations.
         server: server_mod.Event,
+        /// It held nothing for its idle limit, so its process stopped. It
+        /// starts again when something next needs it.
+        stopped_idle,
     },
 };
 
@@ -84,6 +89,11 @@ pub const Status = struct {
     version: ?[]const u8,
     tools: usize,
     last_error: ?[]const u8,
+    /// Why fx refused the last list the server answered (`Server.listRefusal`), in the words of `tools.Refusal`,
+    /// which may name the HTTP status fx read; null when it did not. It is no failure of the server: `phase` and
+    /// `last_error` do not change. The words are lent from the server's buffer until its next refused page, so a
+    /// reader that keeps them copies them.
+    list_refusal: ?[]const u8 = null,
     /// How the last process ended, and the last stdout line that answered
     /// nothing since the server was last ready, until it starts again.
     exit: ?process.Exit,
@@ -113,6 +123,8 @@ const Slot = struct {
     backoff_due: ?i64 = null,
     /// When a ready server's tries start over.
     stable_due: ?i64 = null,
+    /// When a server that holds nothing stops.
+    idle_due: ?i64 = null,
     last_error: ?[]const u8 = null,
     /// Dropped by `reload`: freed once it is down and the host read its events.
     retired_at: i64 = 0,
@@ -213,6 +225,7 @@ pub const Engine = struct {
             .version = if (slot.server) |s| s.protocolVersion() else null,
             .tools = if (slot.server) |s| s.toolList().len() else 0,
             .last_error = slot.last_error,
+            .list_refusal = if (slot.server) |s| s.listRefusal() else null,
             .exit = if (slot.server) |s| s.exitStatus() else null,
             .stray_line = if (slot.server) |s| s.strayLine() else null,
         };
@@ -430,6 +443,10 @@ pub const Engine = struct {
                     slot.stable_due = null;
                     try e.step(slot, .stable);
                 };
+                if (slot.idle_due) |due| if (due <= e.now()) {
+                    slot.idle_due = null;
+                    try e.step(slot, .idle_over);
+                };
                 // What the host should see goes out before that server is
                 // read again, so the slices in it stay valid. What the same
                 // read queued is taken with it, so the gate is current when
@@ -451,6 +468,7 @@ pub const Engine = struct {
             for (e.slots.items) |slot| {
                 if (slot.backoff_due) |due| wait = @min(wait, due);
                 if (slot.stable_due) |due| wait = @min(wait, due);
+                if (slot.idle_due) |due| wait = @min(wait, due);
                 if (slot.server) |s| {
                     if (s.dueMs()) |due| wait = @min(wait, due);
                 }
@@ -481,6 +499,12 @@ pub const Engine = struct {
                 slot.last_error = if (slot.server.?.spawnError()) |err| @errorName(err) else "process";
                 try e.step(slot, .down);
             },
+            .tools => |result| {
+                // The gate waits for the list too: until it ends the server is
+                // busy and its idle timer stops nothing (Engine.tla).
+                try e.step(slot, .{ .listed = result.ok });
+                e.emit(slot, .{ .server = event });
+            },
             .called => |c| {
                 const i = for (slot.calls.items, 0..) |x, i| {
                     if (x.sent != null and x.sent.? == c.handle) break i;
@@ -496,7 +520,14 @@ pub const Engine = struct {
                 };
                 const done = slot.calls.orderedRemove(i);
                 free(e.gpa, done);
-                try e.step(slot, .{ .answered = done.handle });
+                // Only a broken or ended stream counts toward a restart: a stdio loss means a dead process, which down restarts,
+                // and a reply too large to read shows the link works.
+                const ended: core.Event = if (c.outcome == .lost and !c.oversized and slot.config.transport == .http) .{ .lost = done.handle } else .{ .answered = done.handle };
+                // A lost call has no answer, so a restart's reset frees nothing `c` reads.
+                const was_ready = slot.gate.phase == .ready;
+                const protocol = s.protocolVersion();
+                try e.step(slot, ended);
+                const restarted = was_ready and slot.gate.phase == .idle;
                 e.emit(slot, .{ .called = .{
                     .call = done.handle,
                     .outcome = switch (c.outcome) {
@@ -508,6 +539,10 @@ pub const Engine = struct {
                     .oversized = c.oversized,
                     .refused_bytes = c.refused_bytes,
                     .refused_body = c.refused_body,
+                    .lost_why = c.lost_why,
+                    .status = c.status,
+                    .restarted = restarted,
+                    .protocol = protocol,
                 } });
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {
@@ -553,17 +588,24 @@ pub const Engine = struct {
                     .maybe_ran = end.end == .lost,
                     .timed_out = false,
                     .answer = null,
+                    .lost_why = if (end.end == .lost) .link_down else null,
                 } });
             },
             .list => try slot.server.?.needTools(),
             .refuse_need => e.emit(slot, .{ .server = .{ .tools = .{ .ok = false, .fresh = false, .needs_auth = why == .needs_auth } } }),
             .arm_backoff => |ms| slot.backoff_due = e.now() + ms,
             .arm_stable => |ms| slot.stable_due = e.now() + ms,
+            .arm_idle => |ms| slot.idle_due = e.now() + ms,
+            .list_kept => e.emit(slot, .{ .server = .{ .tools = .{ .ok = true, .fresh = false } } }),
             .teardown => {
                 slot.backoff_due = null;
+                slot.idle_due = null;
                 if (slot.server) |s| try s.reset();
             },
         };
+        // An idle stop is not a failure: the host hears it to log, and the
+        // server starts again when something next needs it (LazyConnect).
+        if (event == .idle_over and !out.ignored) e.emit(slot, .stopped_idle);
         if (slot.gate.phase != before) e.emit(slot, .{ .phase = slot.gate.phase });
     }
 
@@ -623,7 +665,7 @@ pub const Engine = struct {
     fn newSlot(e: *Engine, c: Config) Error!*Slot {
         const slot = try e.gpa.create(Slot);
         errdefer e.gpa.destroy(slot);
-        slot.* = .{ .engine = e, .arena = .init(e.gpa), .config = undefined, .gate = .init(e.options.gate) };
+        slot.* = .{ .engine = e, .arena = .init(e.gpa), .config = undefined, .gate = .init(gateConfig(e.options.gate, c.transport)) };
         errdefer slot.arena.deinit();
         const a = slot.arena.allocator();
         slot.config = .{
@@ -692,6 +734,15 @@ fn free(gpa: std.mem.Allocator, x: Call) void {
     if (x.arguments) |a| gpa.free(a);
 }
 
+/// The gate's limits for one server. An HTTP server never stops by idle: it
+/// holds no process, and stopping it would only drop its connection
+/// (`tests/tla/mcp/Engine.tla` IdleFire covers a server with a process).
+fn gateConfig(gate: core.Config, transport: Transport) core.Config {
+    var config = gate;
+    if (transport == .http) config.idle_ms = 0;
+    return config;
+}
+
 fn dupeAll(a: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
     const copies = try a.alloc([]const u8, items.len);
     for (items, copies) |item, *copy| copy.* = try a.dupe(u8, item);
@@ -717,7 +768,12 @@ fn sameEnv(a: ?*const std.process.Environ.Map, b: ?*const std.process.Environ.Ma
     return true;
 }
 
-fn same(a: Config, b: Config) bool {
+/// Whether two servers launch the same way: the same name, transport, argv,
+/// environment, directory, auth, and limits. A reload keeps the running one
+/// when this holds (`keeps`), and `src/core/mcp_host/share_key.zig` hashes
+/// exactly those fields, the name included, so two sessions agree on what one
+/// copy is.
+pub fn same(a: Config, b: Config) bool {
     if (!std.mem.eql(u8, a.name, b.name) or std.meta.activeTag(a.transport) != std.meta.activeTag(b.transport)) return false;
     switch (a.transport) {
         .stdio => |p| {
@@ -910,6 +966,24 @@ test "the scopes are part of a server's config, so new ones restart it" {
     try std.testing.expect(!same(a, b));
 }
 
+test "an HTTP server never stops by idle, though a stdio server keeps the limit" {
+    var e: Engine = undefined;
+    const argv = [_][]const u8{"x"};
+    const servers = [_]Config{
+        .{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } },
+        .{ .name = "cli", .transport = .{ .stdio = .{ .argv = &argv } } },
+    };
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+        .gate = .{ .idle_ms = 600_000 },
+    }, &servers);
+    defer e.deinit();
+    // An idle stop saves nothing for a server with no process, and dropping
+    // its connection would only make the next call pay for it.
+    try std.testing.expectEqual(@as(u32, 0), e.slots.items[0].gate.config.idle_ms);
+    try std.testing.expectEqual(@as(u32, 600_000), e.slots.items[1].gate.config.idle_ms);
+}
+
 test "a server's own timeouts replace the engine's, and the others keep the engine's" {
     var e: Engine = undefined;
     const servers = [_]Config{
@@ -933,4 +1007,81 @@ test "a server's own timeouts replace the engine's, and the others keep the engi
     try std.testing.expect(same(servers[1], servers[1]));
     try std.testing.expect(!same(servers[1], retimed));
     try std.testing.expect(!same(servers[0], .{ .name = "plain", .transport = servers[0].transport, .timeouts = .{} }));
+}
+
+/// Sends a call on a ready slot as `stepFor` does: the gate sends it at once,
+/// and the slot keeps it in flight under the server's handle.
+fn sendCall(e: *Engine, slot: *Slot, handle: Handle, sent: server_mod.Handle) !void {
+    var out: core.Output = .{};
+    try slot.gate.step(.{ .asked = .{ .call = handle, .allowed = true } }, &out);
+    try std.testing.expectEqualSlices(core.Effect, &.{.{ .send = handle }}, out.effects());
+    try slot.calls.append(e.gpa, .{ .handle = handle, .sent = sent, .name = try e.gpa.dupe(u8, "tool"), .arguments = null });
+}
+
+test "two calls lost in a row restart an HTTP link, not a stdio one" {
+    const argv = [_][]const u8{"/bin/cat"};
+    const servers = [_]Config{
+        .{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } },
+        .{ .name = "local", .transport = .{ .stdio = .{ .argv = &argv } } },
+    };
+    var e: Engine = undefined;
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+    const web = e.slots.items[0];
+    const local = e.slots.items[1];
+    for ([_]*Slot{ web, local }) |slot| {
+        _ = try e.ensureServer(slot);
+        slot.gate.phase = .ready;
+    }
+
+    for ([_]Handle{ 1, 2 }) |handle| {
+        try sendCall(&e, web, handle, 100 + handle);
+        try e.onServer(web, .{ .called = .{ .handle = 100 + handle, .outcome = .lost, .maybe_ran = true, .timed_out = false, .answer = null, .lost_why = .stream_broken, .status = 503 } });
+        // Only the second loss restarts the link, and the host hears it on that call.
+        try expectLastLost(&e, .stream_broken, 503, handle == 2);
+    }
+    try std.testing.expectEqual(core.Phase.idle, web.gate.phase);
+    try std.testing.expectEqual(@as(u8, 0), web.gate.lost);
+
+    for ([_]Handle{ 1, 2 }) |handle| {
+        try sendCall(&e, local, handle, 200 + handle);
+        try e.onServer(local, .{ .called = .{ .handle = 200 + handle, .outcome = .lost, .maybe_ran = true, .timed_out = false, .answer = null, .lost_why = .link_down } });
+        try expectLastLost(&e, .link_down, 0, false);
+    }
+    try std.testing.expectEqual(core.Phase.ready, local.gate.phase);
+    try std.testing.expectEqual(@as(u8, 0), local.gate.lost);
+}
+
+test "oversized replies do not restart an HTTP link" {
+    const servers = [_]Config{
+        .{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } },
+    };
+    var e: Engine = undefined;
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+    const web = e.slots.items[0];
+    _ = try e.ensureServer(web);
+    web.gate.phase = .ready;
+
+    for ([_]Handle{ 1, 2 }) |handle| {
+        try sendCall(&e, web, handle, 100 + handle);
+        try e.onServer(web, .{ .called = .{ .handle = 100 + handle, .outcome = .lost, .maybe_ran = true, .timed_out = false, .answer = null, .oversized = true, .lost_why = .too_large, .status = 200 } });
+        try expectLastLost(&e, .too_large, 200, false);
+        try std.testing.expectEqual(core.Phase.ready, web.gate.phase);
+        try std.testing.expectEqual(@as(u8, 0), web.gate.lost);
+    }
+}
+
+/// Checks the host event the engine emitted last: a lost call with its reason, status, and restart flag.
+fn expectLastLost(e: *const Engine, why: server_mod.LostWhy, status: u16, restarted: bool) !void {
+    const last = e.events[e.event_count - 1];
+    try std.testing.expect(last.kind == .called);
+    const called = last.kind.called;
+    try std.testing.expectEqual(why, called.lost_why.?);
+    try std.testing.expectEqual(status, called.status);
+    try std.testing.expectEqual(restarted, called.restarted);
 }

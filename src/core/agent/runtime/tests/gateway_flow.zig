@@ -4787,6 +4787,15 @@ test "processQueuedPrompt traces why stale controls are omitted" {
     try std.testing.expect(std.mem.find(u8, trace, "reasoning=unsupported_or_missing") != null);
     try std.testing.expect(std.mem.find(u8, trace, "fast=unsupported_or_missing") != null);
 
+    // The Gateway drops an effort its catalog does not list, and says so once,
+    // through the same session notice a custom connection uses. Only a custom
+    // connection's settings can add a level, so the Gateway text has no hint.
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    try std.testing.expectEqualStrings(
+        "Effort stale-tier is not available for provider/no-live-controls, so it is not sent.",
+        hooks.session_notices.items[0],
+    );
+
     // A reachable catalog that simply lacks fast metadata stays quiet; the
     // notice is reserved for a catalog that failed outright.
     var fast_notice_count: usize = 0;
@@ -4794,6 +4803,47 @@ test "processQueuedPrompt traces why stale controls are omitted" {
         if (std.mem.find(u8, text, "Fast mode is unavailable") != null) fast_notice_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), fast_notice_count);
+}
+
+test "processQueuedPrompt shows control characters in the model name as escapes in the effort notice" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/\x1b[31mevil");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.session_notices.items.len);
+    const notice = hooks.session_notices.items[0];
+    try std.testing.expect(std.mem.find(u8, notice, "provider/\\x1b[31mevil") != null);
+    try std.testing.expect(std.mem.findScalar(u8, notice, 0x1b) == null);
+}
+
+test "processQueuedPrompt keeps an effort drop quiet when the Gateway catalog failed" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.catalog_failure = .gateway_unavailable;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.effort = types.ReasoningEffort.literal("stale-tier");
+    var job = fixture.job();
+    job.model = @constCast("provider/no-live-controls");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try expectBodyNotContains(&gateway, 0, "\"reasoning\"");
+    try std.testing.expectEqual(@as(usize, 0), hooks.session_notices.items.len);
 }
 
 test "processQueuedPrompt notifies once when fast mode drops on a failed catalog" {
@@ -10791,6 +10841,79 @@ test "tool presentation groups span silent steps and split on visible assistant 
     }
     try std.testing.expectEqual(@as(usize, 2), group_a_terminal_count);
     try std.testing.expect(group_b_start_index != null);
+}
+
+test "tool calls after a question start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var groups: [3]types.ToolPresentationGroupId = undefined;
+    var group_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        try std.testing.expect(group_count < groups.len);
+        groups[group_count] = event.authoritative_started.presentation_group_id.?;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expect(!std.meta.eql(groups[0], groups[1]));
+    try std.testing.expectEqual(groups[1], groups[2]);
+}
+
+/// The presentation group of the call `call_id` when it started.
+fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        const started = event.authoritative_started;
+        if (std.mem.eql(u8, started.id.call_id, call_id)) return started.presentation_group_id;
+    }
+    return null;
+}
+
+test "a question dropped from a length-cut reply and sent again leaves the presentation group open" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const cut_ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &cut_ask, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    for (hooks.executed_names.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ask_user_question"));
+    }
+    try std.testing.expectEqual(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    );
 }
 
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {

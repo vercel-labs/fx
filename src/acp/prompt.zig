@@ -36,7 +36,7 @@ const server = @import("server.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
-const tool_call_identities = @import("tool_call_identities.zig");
+const tool_call_identities = @import("../core/mcp/tool_call_identities.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -1045,6 +1045,7 @@ const AcpElicitationResponderContext = struct {
             .capabilities = capabilities,
             .callback = respondToAcpMcpInput,
             .continuation_terminal = finishAcpUrlElicitations,
+            .declined_notice = tellAcpMcpDeclined,
         };
     }
 };
@@ -3275,10 +3276,12 @@ test "an ACP session's workspace captures watch its turn cancel, not the flag a 
 fn startWorkspaceCapture(raw_ctx: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return;
+    if (step == .settle) return session.turn_capture.settle();
     const context = workspaceCaptureContext(session) orelse return;
     switch (step) {
         .begin => session.turn_capture.begin(context, fresh),
         .capture => session.turn_capture.start(context, &session.session_write_mutex),
+        .settle => unreachable,
     }
 }
 
@@ -3880,6 +3883,15 @@ const AcpInputResponse = struct {
         self.* = undefined;
     }
 };
+
+/// A question fx declined, said by the two paths `pushContextNotice` chooses between: an ACP v1 notice for a client that
+/// advertised them, else an operational message. A repeat is not dropped, so each refused call is told.
+fn tellAcpMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
+    const ctx = responder.acp;
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+    pushSystemNotice(@ptrCast(ctx), text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+}
 
 fn respondToAcpMcpInput(
     raw_ctx: *anyopaque,

@@ -55,6 +55,7 @@ import {
   tmuxAvailable,
   localCreditsEnv,
   tokenPassCatalog,
+  turnSettled,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -1678,6 +1679,39 @@ describe("acp: model-independent", () => {
   afterEach(async () => {
     if (client) await client.close();
   });
+
+  test(
+    "each ACP tool call has its own toolCallId when the model reuses, repeats, or leaves out ids",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-call-ids-");
+      const write = (id: string, name: string) => ({ type: "tool-call", toolCallId: id, toolName: "write_file", input: { path: name, content: name } });
+      const finish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+      const gateway = startFakeGateway([
+        fakeGatewaySse([write("dup", "a.txt"), finish]),
+        fakeGatewaySse([write("dup", "b.txt"), write("dup", "c.txt"), write("", "d.txt"), finish]),
+        finalText("ACP_CALL_IDS_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startAutoSession(client);
+        const result = await runPrompt(client, "Write a, b, c, and d.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        for (const name of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
+          expect(readFileSync(join(root.workspace, name), "utf8")).toBe(name);
+        }
+        const updates = result.messages.map((message) => message.params?.update).filter(Boolean);
+        const started = updates.filter((update) => update.sessionUpdate === "tool_call").map((update) => update.toolCallId);
+        expect(started).toEqual(["dup", "fx_call_1", "fx_call_2", "fx_call_3"]);
+        for (const update of updates.filter((update) => update.sessionUpdate === "tool_call_update")) {
+          expect(started).toContain(update.toolCallId);
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "host-managed ACP sessions stream without local credentials",
@@ -3945,10 +3979,12 @@ describe("acp: model-independent", () => {
         expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
         expect(processAlive(oldPid)).toBe(true);
 
-        // Closing straight away still stops it: fx never leaves it behind.
+        // Closing straight away still stops it: fx never leaves it behind. A
+        // shared server is stopped by its owner, which gives a server that
+        // ignores its closed stdin the usual grace before SIGTERM.
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
-        expect(processAlive(oldPid)).toBe(false);
+        await waitForCondition("the old server to stop", () => !processAlive(oldPid), 5_000);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -4672,6 +4708,141 @@ describe("acp: model-independent", () => {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  // A session that opts in reads the profile as the terminal app does: an entry fx can't read is skipped and the
+  // others load, `${VAR}` is expanded, and a name a terminal can't print is skipped, with the request's own servers
+  // first (src/builtins/mcp.zig composeHostConfigs).
+  const profileTurn = async (
+    label: string,
+    profile: Record<string, unknown>,
+    options: { mcpServers?: (root: ReturnType<typeof createIsolatedRoot>) => unknown[]; env?: Record<string, string>; project?: Record<string, unknown> } = {},
+  ) => {
+    const root = createIsolatedRoot(`fx-acp-profile-${label}-`);
+    const traceLog = join(root.root, "trace.log");
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcpServers: profile }));
+    if (options.project) {
+      // The session's own project servers, each approved, so they would run.
+      writeFileSync(join(root.workspace, ".mcp.json"), JSON.stringify({ mcpServers: options.project }));
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ workspaces: { [root.workspace]: { enabledMcpjsonServers: Object.keys(options.project) } } }),
+      );
+    }
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("call", "toolbox", { run: "mcp_good_echo", arguments: { text: "hi" } }),
+      finalText("profile turn done"),
+    ]);
+    let acp: AcpClient | undefined;
+    try {
+      acp = await AcpClient.create({ cwd: root.workspace, env: { ...fakeGatewayEnv(root, gateway), FX_TRACE_LOG: traceLog, FX_TRACE_SCOPES: "mcp", ...options.env } });
+      await acp.request("initialize", { protocolVersion: 1 }, 1);
+      const created = await acp.request("session/new", {
+        cwd: root.workspace,
+        mcpServers: options.mcpServers?.(root) ?? [],
+        _meta: { fx: { profileMcpServers: true } },
+      }, 2) as any;
+      expect(created.error).toBeUndefined();
+      await acp.readLine();
+      const prompt = await runPrompt(acp, "Use the good echo tool.", TIMEOUT);
+      expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+      const listed = acpGatewayRequest(gateway.requests[0]!.body).prompt.map((message) => acpContentText(message.content)).join("\n");
+      const notes = (existsSync(traceLog) ? readFileSync(traceLog, "utf8") : "").split("\n").filter((line) => line.includes("MCP config note: ")).map((line) => line.slice(line.indexOf("MCP config note: ") + "MCP config note: ".length));
+      return { listed, result: gateway.requests.length > 1 ? acpToolResultText(gateway.requests[1]!.body, "call") : "", stderr: acp.stderr, notes };
+    } finally {
+      await acp?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  };
+  const goodServer = (environment: Record<string, string>) => ({
+    command: process.execPath,
+    args: [MCP_STDIO_FIXTURE],
+    env: environment,
+  });
+
+  test(
+    "ACP skips only the profile entry fx can't read, and the good one still loads",
+    async () => {
+      const ran = await profileTurn("bad-entry", {
+        bad: { type: "http", url: "http://example.com/mcp" },
+        good: goodServer({ FX_MCP_RESULT_TEXT: "GOOD_PROFILE_RESULT" }),
+      });
+      expect(ran.listed).toContain("- good");
+      expect(ran.listed).not.toContain("- bad");
+      expect(ran.result).toContain("GOOD_PROFILE_RESULT");
+      // The host holds a note for the entry, and the trace shows it, as the terminal app's does.
+      expect(ran.notes).toEqual(["~/.fx/mcp.json server 'bad' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https."]);
+      expect(ran.stderr).toBe("");
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP expands ${VAR} in a profile server, and skips one whose variable is unset or whose name a terminal can't print",
+    async () => {
+      const ran = await profileTurn("variables", {
+        good: goodServer({ FX_MCP_RESULT_TEXT: "value is ${FX_ACP_PROFILE_VALUE}" }),
+        needs: goodServer({ FX_MCP_RESULT_TEXT: "${FX_ACP_PROFILE_NOT_SET}" }),
+        "evil\u001b[31m": goodServer({}),
+      }, { env: { FX_ACP_PROFILE_VALUE: "EXPANDED" } });
+      expect(ran.result).toContain("value is EXPANDED");
+      expect(ran.result).not.toContain("${FX_ACP_PROFILE_VALUE}");
+      expect(ran.listed).toContain("- good");
+      expect(ran.listed).not.toContain("- needs");
+      expect(ran.listed).not.toContain("evil");
+      expect(ran.notes.map((note) => note.replace(/ field environment requires .*$/, ""))).toEqual([
+        "~/.fx/mcp.json server 'needs'",
+        "~/.fx/mcp.json server 'evil\\x1b[31m' was skipped: its name has a character fx won't print.",
+      ]);
+      expect(ran.stderr).toBe("");
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a server the request names keeps its name over a profile server of the same name",
+    async () => {
+      const ran = await profileTurn("first", {
+        good: goodServer({ FX_MCP_RESULT_TEXT: "PROFILE_RESULT" }),
+        bad: { type: "http", url: "http://example.com/mcp" },
+      }, { mcpServers: (root) => [{ ...acpStdioServer("REQUEST_RESULT", join(root.root, "request.pid")), name: "good" }] });
+      expect(ran.result).toContain("REQUEST_RESULT");
+      expect(ran.result).not.toContain("PROFILE_RESULT");
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a profile server that fails to expand still hides an approved project server of the same name, as in the terminal app",
+    async () => {
+      const project = { shadow: goodServer({ FX_MCP_RESULT_TEXT: "PROJECT_SHADOW" }) };
+      // The project's server is there to run when the profile has none of that name.
+      const alone = await profileTurn("shadow-control", { good: goodServer({}) }, { project });
+      expect(alone.listed).toContain("- shadow");
+      // The profile's `shadow` needs a variable that is not set, so it is skipped with a note, and its name is still taken.
+      const hidden = await profileTurn(
+        "shadow",
+        { good: goodServer({}), shadow: goodServer({ FX_MCP_RESULT_TEXT: "${FX_ACP_PROFILE_NOT_SET}" }) },
+        { project },
+      );
+      expect(hidden.listed).toContain("- good");
+      expect(hidden.listed).not.toContain("- shadow");
+      expect(hidden.notes).toHaveLength(1);
+      expect(hidden.notes[0]).toStartWith("~/.fx/mcp.json server 'shadow'");
+      expect(hidden.notes[0]).toContain("FX_ACP_PROFILE_NOT_SET");
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a profile of nothing but a bad entry still gives a session that runs, with no server of the profile's",
+    async () => {
+      const ran = await profileTurn("only-bad", { bad: { type: "http", url: "http://example.com/mcp" } });
+      expect(ran.listed).not.toContain("- bad");
+      expect(ran.stderr).toBe("");
     },
     LIVE_TIMEOUT,
   );
@@ -6489,9 +6660,16 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.requestState).toBe("opaque");
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);
-        expect(calls[1]?.params?._meta?.[
+        // A shared server hears the union of its sessions' question UIs: the
+        // owner declares form and URL. A session that runs its own copy, as on
+        // a home whose owner socket path is too long, declares only what this
+        // editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.[
           "io.modelcontextprotocol/clientCapabilities"
-        ]).toEqual({ elicitation: { form: {} } });
+        ]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -6740,8 +6918,14 @@ describe("acp: model-independent", () => {
           confirm: { action: "accept", content: { confirmed: true } },
         });
         expect(calls[1]?.params?.requestState).toBe("opaque");
-        expect(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"])
-          .toEqual({ elicitation: { form: {} } });
+        // A shared server hears the union of its sessions' question UIs, which
+        // the owner declares as form and URL. A session that runs its own copy,
+        // as on a home whose owner socket path is too long, declares only what
+        // this editor did: form.
+        expect([
+          { elicitation: { form: {} } },
+          { elicitation: { form: {}, url: {} } },
+        ]).toContainEqual(calls[1]?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"]);
       } finally {
         await client?.close();
         if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
@@ -6898,6 +7082,82 @@ describe("acp: model-independent", () => {
     },
     LIVE_TIMEOUT,
   );
+
+  // The user hears that fx declined the form, on the path the client's capabilities pick, in fx's words alone.
+  for (const advertised of [true, false]) {
+    test(
+      `a form fx refuses is told to ${advertised ? "an editor that shows notices as a session notice" : "an editor with no notices as an operational message"}`,
+      async () => {
+        const sentinel = "S10_SECRET_SENTINEL_7f3c";
+        const declined = "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+        const root = createIsolatedRoot(`fx-acp-mcp-declined-${advertised ? "notice" : "message"}-`);
+        const pidPath = join(root.root, "mcp-declined.pid");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select_secret", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_secret", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "secret" } }),
+          finalText("Secret form declined"),
+        ]);
+        const directRequests: Array<Record<string, unknown>> = [];
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request(
+            "initialize",
+            {
+              protocolVersion: 1,
+              clientCapabilities: { elicitation: { form: {} }, ...(advertised ? { session: { notices: {} } } : {}) },
+            },
+            1,
+          );
+          const created = await client.request(
+            "session/new",
+            {
+              cwd: root.workspace,
+              mcpServers: [acpStdioServer("unused", pidPath, "mrtr_secret_required", { FX_MCP_EXPECT_ELICITATION: "form" })],
+            },
+            2,
+          ) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          client.setElicitationHandler((params) => {
+            directRequests.push(params);
+            return { action: "accept", content: {} };
+          });
+
+          const prompt = await runPrompt(client, "Call the MCP fixture that attempts a secret form.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(directRequests).toHaveLength(0);
+          const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+          const notices = updates.filter((update) => update.sessionUpdate === "notice");
+          const texts = updates
+            .filter((update) => update.sessionUpdate === "agent_message_chunk")
+            .map((update) => update.content?.text ?? "");
+          if (advertised) {
+            // The session notice path: one notice, and nothing in the conversation.
+            expect(notices.map((notice) => notice.title)).toEqual([declined]);
+            expect(notices[0].severity).toBe("info");
+            expect(texts.join("")).not.toContain("fx declined it");
+          } else {
+            // The operational message path: no notice update, one message.
+            expect(notices).toEqual([]);
+            expect(texts.filter((text) => text.includes(declined))).toHaveLength(1);
+          }
+          // The form was still declined: the call did not go on.
+          expect(gateway.requests.map((request) => request.body).join("\n")).not.toContain("continued after elicitation");
+          // fx's reason only: no field, value or control byte of the server's form.
+          expect(JSON.stringify(prompt.messages)).not.toContain(sentinel);
+          expect(JSON.stringify(prompt.messages)).not.toContain("accessToken");
+          expect(client.stderr).not.toContain(sentinel);
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
 
   test(
     `ACP URL consent completes only after modern MCP retry without prefetching`,
@@ -14521,8 +14781,7 @@ test.skipIf(!tmuxAvailable())(
         ["Latest ACP request", "ACP_LATEST_VISIBLE_RESPONSE"],
       ]) {
         await tui.sendText(prompt!);
-        await tui.waitForText(answer!, TIMEOUT);
-        await tui.waitForComposer(TIMEOUT);
+        await tui.waitForPane((pane) => pane.includes(answer!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       const ids = savedSessionIds(root.home);
       expect(ids).toHaveLength(1);
@@ -14535,7 +14794,11 @@ test.skipIf(!tmuxAvailable())(
       // The committed checkpoint, not the transcript line, establishes that
       // compaction finished before testing ACP replay.
       await waitForCondition("persisted compaction checkpoint", () => checkpointFrames().length === 1, TIMEOUT);
-      await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Thinking/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await tui.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Thinking/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       expect(checkpointFrames()).toHaveLength(1);
       expect(savedText(root.home, ids[0]!)).toContain("ACP_INTERNAL_HANDOFF");
       expect(readFileSync(eventsPath).subarray(0, beforeCompaction.length)).toEqual(beforeCompaction);

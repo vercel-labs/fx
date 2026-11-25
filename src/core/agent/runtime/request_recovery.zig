@@ -311,7 +311,10 @@ pub const RequestRecovery = struct {
             if (self.sign_in_renewed) |renewed| if (now_ms >= next_sign_in_check_ms) {
                 next_sign_in_check_ms = now_ms +| sign_in_check_ms;
                 if (renewed.check(renewed.ctx)) {
-                    if (try self.deliverAnswer(.user_continue, "stored_sign_in")) |send| return send;
+                    if (try self.deliverAnswer(.user_continue, "stored_sign_in")) |send| {
+                        if (self.deps.stored_sign_in_resumed) |resumed| resumed(self.deps.ctx);
+                        return send;
+                    }
                 }
             };
             if (now_ms < next_tick_ms) {
@@ -937,7 +940,16 @@ const StoredSignInProbe = struct {
 test "a request waiting for a sign-in resends once another fx process saves a login" {
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
-    const deps = fake.deps();
+    var deps = fake.deps();
+    // The host hears of the resend, which no answer of its own started.
+    const Host = struct {
+        var resumed: usize = 0;
+        fn storedSignInResumed(_: *anyopaque) void {
+            resumed += 1;
+        }
+    };
+    Host.resumed = 0;
+    deps.stored_sign_in_resumed = Host.storedSignInResumed;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var continue_flag = std.atomic.Value(bool).init(false);
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
@@ -951,6 +963,7 @@ test "a request waiting for a sign-in resends once another fx process saves a lo
     const waited_from_ms = request.nowMs();
     try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
     try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    try std.testing.expectEqual(@as(usize, 1), Host.resumed);
     try std.testing.expectEqual(@as(u16, 2), request.attempt());
     // About a second apart, and long before the wait's own next try.
     const waited_ms = request.nowMs() - waited_from_ms;

@@ -9,6 +9,8 @@ const build_options = @import("build_options");
 const http_config = @import("../core/mcp/http_config.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+const profile_paths = @import("../core/shared/profile_paths.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,13 +41,39 @@ const max_server_id_bytes: usize = 256;
 
 pub const OwnedServerConfigs = struct {
     items: std.ArrayList(mcp_contract.McpServerConfig) = .empty,
+    /// What fx skipped from the profile and the project, as a host holds it: the notes `/mcp list` shows. Owned, in
+    /// `alloc`; `prepare` and `reloadHost` give a host its own copy.
+    notes: []const []const u8 = &.{},
 
     pub fn deinit(self: *OwnedServerConfigs, alloc: Allocator) void {
         for (self.items.items) |*config| config.deinit(alloc);
         self.items.deinit(alloc);
+        for (self.notes) |note| alloc.free(note);
+        alloc.free(self.notes);
         self.* = undefined;
     }
+
+    /// Keeps `notes`, which the caller made in `alloc`, replacing any earlier ones.
+    pub fn setNotes(self: *OwnedServerConfigs, alloc: Allocator, notes: []const []const u8) void {
+        for (self.notes) |note| alloc.free(note);
+        alloc.free(self.notes);
+        self.notes = notes;
+    }
 };
+
+fn copyNotes(alloc: Allocator, notes: []const []const u8) Allocator.Error![]const []const u8 {
+    const copy = try alloc.alloc([]const u8, notes.len);
+    var made: usize = 0;
+    errdefer {
+        for (copy[0..made]) |note| alloc.free(note);
+        alloc.free(copy);
+    }
+    for (notes, copy) |note, *out| {
+        out.* = try alloc.dupe(u8, note);
+        made += 1;
+    }
+    return copy;
+}
 
 pub const Preparation = union(enum) {
     /// The session supplied no servers.
@@ -129,7 +157,8 @@ pub fn prepare(
     questions: elicitation.Capabilities,
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
 ) Allocator.Error!Preparation {
-    if (configs.items.items.len == 0) return .none;
+    // A host with no servers still carries the notes saying why, as the terminal app's does.
+    if (configs.items.items.len == 0 and configs.notes.len == 0) return .none;
     const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers: " ++ io_mod.no_home_dir_reason ++ ".") };
     // Read only while the host starts.
     var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
@@ -137,16 +166,31 @@ pub fn prepare(
         else => return .{ .failed = try alloc.print("MCP servers could not read the environment: {s}", .{@errorName(err)}) },
     };
     defer inherited.deinit();
+    // Servers shared with other fx sessions live under the profile's folder;
+    // when it can't be named, each server stays in this process.
+    const fx_home: ?[]u8 = profile_paths.rootDir(alloc, home) catch |err| blk: {
+        debug_trace.logf("mcp", "MCP servers run in this session reason=no fx home err={s}", .{@errorName(err)});
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        break :blk null;
+    };
+    defer if (fx_home) |path| alloc.free(path);
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs.items.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .{ .detect = home },
         .workspace_root = workspace_root,
         .questions = questions,
         .url_completions = url_completions,
+        .idle_ms = mcp_host.idleMs(),
+        .share = if (fx_home) |path| .{ .fx_home = path } else null,
     }, builtin_tools.registry) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try alloc.print("MCP servers could not start: {s}", .{@errorName(err)}) },
     };
+    h.notes = copyNotes(alloc, configs.notes) catch |err| {
+        h.destroy();
+        return err;
+    };
+    for (h.notes) |note| debug_trace.logf("mcp", "MCP config note: {s}", .{note});
     return .{ .host = h };
 }
 
@@ -159,7 +203,8 @@ pub fn reloadHost(alloc: Allocator, host: *mcp_host.Host, configs: *const OwnedS
     // Read only while the host reloads.
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
-    try host.reload(configs.items.items, &inherited, &.{});
+    // The host owns these from here, also when the reload fails.
+    try host.reload(configs.items.items, &inherited, try copyNotes(alloc, configs.notes));
 }
 
 pub fn parseErrorMessage(err: ParseError) []const u8 {
@@ -249,6 +294,7 @@ noinline fn parseServerInto(
         .scope = .acp_session,
         .required = true,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .command = owned_command,
         .args = owned_args,
         .env = owned_env,
@@ -260,6 +306,13 @@ noinline fn parseServerInto(
 /// `_meta.fx.alwaysLoaded` to false.
 fn alwaysLoadedPreference(object: std.json.ObjectMap) bool {
     return acp_types.fxMetaBool(object, "alwaysLoaded") orelse true;
+}
+
+/// The client's server is shared with other sessions whose launch config
+/// matches, unless it sets `_meta.fx.shared` to false because it keeps state
+/// per client.
+fn sharedPreference(object: std.json.ObjectMap) bool {
+    return acp_types.fxMetaBool(object, "shared") orelse true;
 }
 
 /// MCP over ACP, a draft ACP proposal fx doesn't speak: the server is kept,
@@ -288,6 +341,7 @@ fn parseAcpServerInto(
         .scope = .acp_session,
         .required = false,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .acp_server_id = owned_server_id,
         .transport = .http,
         .url = owned_url,
@@ -319,6 +373,7 @@ fn parseRemoteServerInto(
         .scope = .acp_session,
         .required = true,
         .always_loaded = alwaysLoadedPreference(object),
+        .shared = sharedPreference(object),
         .transport = transport,
         .url = owned_url,
         .headers = headers,
@@ -444,6 +499,24 @@ test "ACP MCP parser keeps supplied servers loaded unless meta opts out" {
     try std.testing.expect(!configs.items.items[1].always_loaded);
     try std.testing.expect(configs.items.items[2].always_loaded);
     try std.testing.expect(!configs.items.items[3].always_loaded);
+}
+
+test "ACP MCP parser shares a supplied server unless meta opts out" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(alloc,
+        \\{"mcpServers":[
+        \\{"name":"shared","command":"/bin/a","args":[],"env":[]},
+        \\{"name":"own","command":"/bin/b","args":[],"env":[],"_meta":{"fx":{"shared":false}}},
+        \\{"name":"unreadable","command":"/bin/c","args":[],"env":[],"_meta":{"fx":{"shared":"no"}}}
+        \\]}
+    );
+    defer configs.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), configs.items.items.len);
+    try std.testing.expect(configs.items.items[0].shared);
+    try std.testing.expect(!configs.items.items[1].shared);
+    // A value that isn't a bool is not an opt-out.
+    try std.testing.expect(configs.items.items[2].shared);
 }
 
 test "ACP MCP parser accepts an authoritative empty list" {
@@ -631,6 +704,54 @@ test "reloadHost gives a running host its new servers where it stands" {
     try std.testing.expectEqual(@as(usize, 2), names.len);
     try std.testing.expectEqualStrings("two", names[0]);
     try std.testing.expectEqualStrings("three", names[1]);
+}
+
+test "reloadHost gives the host the notes for the servers fx skipped, and a reload without notes clears them" {
+    const alloc = std.testing.allocator;
+    var before = try parse(alloc,
+        \\{"mcpServers":[{"name":"one","command":"/bin/one","args":[],"env":[]}]}
+    );
+    defer before.deinit(alloc);
+    var after = try parse(alloc,
+        \\{"mcpServers":[{"name":"two","command":"/bin/two","args":[],"env":[]}]}
+    );
+    defer after.deinit(alloc);
+    const notes = try alloc.alloc([]const u8, 2);
+    notes[0] = try alloc.dupe(u8, "~/.fx/mcp.json server 'bad' was skipped: its \"type\" isn't valid.");
+    notes[1] = try alloc.dupe(u8, "~/.fx/mcp.json server 'needs' field environment requires environment variable 'K'.");
+    after.setNotes(alloc, notes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    const host = try mcp_host.Host.create(alloc, io_mod.getIo(), before.items.items, &inherited, .{
+        .client_version = build_options.app_version,
+        .credentials = .{ .detect = home },
+        .workspace_root = home,
+    }, builtin_tools.registry);
+    defer host.destroy();
+
+    try reloadHost(alloc, host, &after);
+    try std.testing.expectEqual(@as(usize, 2), host.notes.len);
+    try std.testing.expectEqualStrings(after.notes[0], host.notes[0]);
+    try std.testing.expectEqualStrings(after.notes[1], host.notes[1]);
+    // The host keeps its own copy: the configs still own theirs.
+    try std.testing.expect(host.notes[0].ptr != after.notes[0].ptr);
+
+    after.setNotes(alloc, &.{});
+    try reloadHost(alloc, host, &after);
+    try std.testing.expectEqual(@as(usize, 0), host.notes.len);
+}
+
+test "a session with no servers and no notes has no host" {
+    const alloc = std.testing.allocator;
+    var configs: OwnedServerConfigs = .{};
+    defer configs.deinit(alloc);
+    var preparation = try prepare(alloc, &configs, "/tmp", .{}, null);
+    defer preparation.deinit(alloc);
+    try std.testing.expect(preparation == .none);
 }
 
 test "ACP MCP parser handles fuzzed request bytes" {
