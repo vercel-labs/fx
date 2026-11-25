@@ -56,10 +56,6 @@ jobs:
             echo "Tag ${TAG} missing, release needed"
           fi
 
-      - name: Check pinned provider client versions
-        if: steps.check.outputs.publish == 'true'
-        run: scripts/check-provider-versions.sh
-
   build-linux-aarch64:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
@@ -319,6 +315,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check pinned provider client versions
+        run: scripts/check-provider-versions.sh
 
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
