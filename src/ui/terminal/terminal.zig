@@ -9,12 +9,73 @@ pub const hangup_sign_wait_ms: i32 = 5;
 extern "c" fn tcgetpgrp(fd: std.posix.fd_t) std.posix.pid_t;
 extern "c" fn getpgrp() std.posix.pid_t;
 
+var null_device_mutex: std.Io.Mutex = .init;
+var null_device_read = false;
+var null_device: ?u64 = null;
+
+/// The device number of /dev/null, read once and kept. Null when it cannot be read.
+fn nullDevice() ?u64 {
+    const zio = io_mod.getIo();
+    null_device_mutex.lockUncancelable(zio);
+    defer null_device_mutex.unlock(zio);
+    if (!null_device_read) {
+        null_device_read = true;
+        null_device = pathDeviceNumber("/dev/null");
+    }
+    return null_device;
+}
+
+/// /dev/null is an open character device that macOS poll reports as POLLNVAL,
+/// and it never hangs up. Its device number tells it apart from a terminal: an
+/// inode number repeats across file systems, so a pty can share /dev/null's.
+fn isNullDevice(fd: std.posix.fd_t) bool {
+    const null_number = nullDevice() orelse return false;
+    const fd_number = fdDeviceNumber(fd) orelse return false;
+    return fd_number == null_number;
+}
+
+/// The device number of an open descriptor. Zig's std has no libc stat
+/// structure on Linux, so Linux asks statx for the device numbers.
+fn fdDeviceNumber(fd: std.posix.fd_t) ?u64 {
+    if (comptime builtin.target.os.tag == .linux) {
+        var buf = std.mem.zeroes(std.os.linux.Statx);
+        const flags = std.os.linux.AT.EMPTY_PATH;
+        if (std.os.linux.errno(std.os.linux.statx(fd, "", flags, std.os.linux.STATX.BASIC_STATS, &buf)) != .SUCCESS) return null;
+        return linuxDeviceNumber(buf.rdev_major, buf.rdev_minor);
+    }
+    var st = std.mem.zeroes(std.c.Stat);
+    if (std.c.fstat(fd, &st) != 0) return null;
+    return @as(u32, @bitCast(st.rdev));
+}
+
+/// The device number of a path, followed through symbolic links.
+fn pathDeviceNumber(path: [*:0]const u8) ?u64 {
+    if (comptime builtin.target.os.tag == .linux) {
+        var buf = std.mem.zeroes(std.os.linux.Statx);
+        if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, path, 0, std.os.linux.STATX.BASIC_STATS, &buf)) != .SUCCESS) return null;
+        return linuxDeviceNumber(buf.rdev_major, buf.rdev_minor);
+    }
+    var st = std.mem.zeroes(std.c.Stat);
+    if (std.c.stat(path, &st) != 0) return null;
+    return @as(u32, @bitCast(st.rdev));
+}
+
+fn linuxDeviceNumber(major: u32, minor: u32) u64 {
+    return (@as(u64, major) << 32) | minor;
+}
+
 /// Whether `err` on terminal `fd` happened because the terminal hung up, was
 /// revoked, or no longer has fx's process group in the foreground
 /// (`tests/tla/terminal_hangup/TerminalHangup.tla` `GoneIsQuiet`).
 pub fn terminalGone(fd: std.posix.fd_t, err: anyerror) bool {
     if (comptime builtin.target.os.tag == .wasi) return false;
     if (err != error.InputOutput) return false;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    // A descriptor that cannot be stat'ed is closed, so no terminal is left to hang up.
+    const stat = file.stat(io_mod.getIo()) catch return true;
+    // Only a character device hangs up like a terminal. A pipe or a file never does, even after its writer closed.
+    if (stat.kind != .character_device) return false;
+    if (isNullDevice(fd)) return false;
     // macOS XNU poll with events=0 reports no flags on a closed pty; POLL.OUT surfaces POLLHUP and POLLNVAL.
     var fds = [_]std.posix.pollfd{.{
         .fd = fd,
@@ -237,12 +298,69 @@ test "terminalInputGone returns true on a closed TestPty and false on an open Te
     master.?.close(io_mod.getIo());
     master = null;
     try std.testing.expect(terminalInputGone(slave.handle));
+    try std.testing.expect(terminalGone(slave.handle, error.InputOutput));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "regular.txt", .{ .read = true });
     defer file.close(io_mod.getIo());
     try std.testing.expect(!terminalInputGone(file.handle));
+}
+
+test "terminalGone and terminalInputGone are false for a pipe whose writer closed" {
+    const pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.c.close(pipe[0]);
+    _ = std.c.close(pipe[1]);
+
+    try std.testing.expect(!terminalGone(pipe[0], error.InputOutput));
+    try std.testing.expect(!terminalInputGone(pipe[0]));
+}
+
+test "terminalGone and terminalInputGone are false for a regular file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain.txt", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    try std.testing.expect(!terminalGone(file.handle, error.InputOutput));
+    try std.testing.expect(!terminalInputGone(file.handle));
+}
+
+test "terminalInputGone is false for /dev/null, which macOS poll reports as POLLNVAL" {
+    const null_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{});
+    defer null_file.close(io_mod.getIo());
+
+    try std.testing.expect(!terminalGone(null_file.handle, error.InputOutput));
+    try std.testing.expect(!terminalInputGone(null_file.handle));
+}
+
+test "isNullDevice matches /dev/null by device number, so no pty counts as /dev/null" {
+    const shell_runtime = @import("../shell_runtime.zig");
+    if (!shell_runtime.supports_test_pty) return error.SkipZigTest;
+
+    const null_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{});
+    defer null_file.close(io_mod.getIo());
+    try std.testing.expect(isNullDevice(null_file.handle));
+
+    // Three ptys stay open, so one may share /dev/null's inode number on Linux: only the device number may tell them apart.
+    const first = try shell_runtime.TestPty.open();
+    defer {
+        _ = std.c.close(first.master);
+        _ = std.c.close(first.slave);
+    }
+    const second = try shell_runtime.TestPty.open();
+    defer {
+        _ = std.c.close(second.master);
+        _ = std.c.close(second.slave);
+    }
+    const third = try shell_runtime.TestPty.open();
+    defer {
+        _ = std.c.close(third.master);
+        _ = std.c.close(third.slave);
+    }
+    try std.testing.expect(!isNullDevice(first.slave));
+    try std.testing.expect(!isNullDevice(second.slave));
+    try std.testing.expect(!isNullDevice(third.slave));
 }
 
 test "terminalGone returns true when a foreign foreground group owns the terminal" {

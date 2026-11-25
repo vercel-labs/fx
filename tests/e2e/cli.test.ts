@@ -800,7 +800,8 @@ describe("cli: closed output pipe", () => {
 describe("cli: closed terminal", () => {
   const PTY_HELPER = [
     "import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time",
-    "mode = sys.argv[1]",
+    "ctty = sys.argv[1].endswith('+ctty')",
+    "mode = sys.argv[1].split('+')[0]",
     "fx_bin = sys.argv[2]",
     "cwd = sys.argv[3]",
     "stderr_path = sys.argv[4]",
@@ -812,8 +813,9 @@ describe("cli: closed terminal", () => {
     "if mode == 'separate_err':",
     "    err_master, err_slave = pty.openpty()",
     "def preexec():",
-    "    # New session without TIOCSCTTY so closing master does not send SIGHUP.",
+    "    # New session. Without TIOCSCTTY closing master sends no SIGHUP; with ctty it does, as a closed window does.",
     "    os.setsid()",
+    "    if ctty: fcntl.ioctl(slave, termios.TIOCSCTTY, 0)",
     "    os.dup2(slave, 0)",
     "    os.dup2(slave, 1)",
     "    if err_slave is not None:",
@@ -895,6 +897,7 @@ describe("cli: closed terminal", () => {
     "    os.close(err_master)",
     "else:",
     "    stderr_txt = open(stderr_path, encoding='utf-8', errors='replace').read()",
+    "if ctty and rc < 0: rc = 128 - rc  # killed by a signal: the shell's 128 + signal",
     "print(json.dumps({'status': rc, 'stderr': stderr_txt}))",
   ].join("\n");
 
@@ -905,6 +908,7 @@ describe("cli: closed terminal", () => {
     env: Record<string, string | undefined>;
     needle?: string;
     onPtyClosed?: () => void;
+    controllingTerminal?: boolean;
   }): Promise<{ status: number; stderr: string }> {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-pty-")));
     const stderrPath = join(root, "stderr.log");
@@ -913,7 +917,17 @@ describe("cli: closed terminal", () => {
       if (v !== undefined) env[k] = v;
     }
     const proc = Bun.spawn(
-      ["python3", "-c", PTY_HELPER, opts.mode, FX_BIN, opts.cwd, stderrPath, opts.needle ?? "", ...opts.argv],
+      [
+        "python3",
+        "-c",
+        PTY_HELPER,
+        opts.controllingTerminal ? `${opts.mode}+ctty` : opts.mode,
+        FX_BIN,
+        opts.cwd,
+        stderrPath,
+        opts.needle ?? "",
+        ...opts.argv,
+      ],
       { cwd: opts.cwd, env, stdout: "pipe", stderr: "pipe" },
     );
     const lines: string[] = [];
@@ -1116,6 +1130,8 @@ describe("cli: closed terminal", () => {
             argv,
             cwd: home,
             needle: "input hidden",
+            // macOS gives the pty a controlling terminal, as a real window does, so the Keychain prompt stays on it; FXC-451 tracks the hang-up without SIGHUP.
+            controllingTerminal: process.platform === "darwin",
             env: { HOME: home, TERM: "xterm-256color", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
           });
           const afterPrompt = result.stderr.split("input hidden): ").slice(1).join("");

@@ -414,7 +414,8 @@ const StdinManualCodeReader = struct {
         {
             return error.TerminalHungUp;
         }
-        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        // POLLNVAL is what macOS reports for /dev/null, an open device, so read it to see end of file.
+        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.NVAL)) == 0) return null;
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
