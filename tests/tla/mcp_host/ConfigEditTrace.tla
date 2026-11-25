@@ -19,6 +19,13 @@
 \*                             or "hinted" (the same, and a line that says the
 \*                             profile's misspelled key holds the name)
 \*   list {file, loaded}       the names `fx mcp list --json` shows from the file
+\*   inspect {file, shown, noted}
+\*                             the servers `fx status --json` lists from the file, and the
+\*                             entries of the file its configuration issues note as skipped.
+\*                             The step takes only a match with InspectShown and InspectNoted:
+\*                             InspectKeepsGood and InspectNotesSkipped hold in every state, so
+\*                             the model's configs check them, and Viol, which TraceInit runs for
+\*                             every starting state, leaves them out.
 \*   tamper {kind, file, name, class}
 \*                             the harness edits a file itself, as an editor would:
 \*                             typo_appears (name: the server the key holds, or
@@ -55,6 +62,10 @@ Step(rec) ==
             /\ same' = rec.data.same
       [] rec.event = "list" ->
             /\ LoadedNames(rec.data.file) = rec.data.loaded
+            /\ UNCHANGED vars
+      [] rec.event = "inspect" ->
+            /\ InspectShown(rec.data.file) = rec.data.shown
+            /\ InspectNoted(rec.data.file) = rec.data.noted
             /\ UNCHANGED vars
       [] rec.event = "tamper" ->
             \/ rec.data.kind = "typo_appears" /\ TypoAppears(IF rec.data.name \in Names THEN rec.data.name ELSE OtherTypo)

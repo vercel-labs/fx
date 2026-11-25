@@ -6,7 +6,10 @@ import { onlySessionId, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway, tmuxAvailable } = await import("./tmux-helpers");
+const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway, tmuxAvailable,
+  turnSettled,
+  hasEmptyComposer,
+} = await import("./tmux-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const TIMEOUT = 30_000;
@@ -84,8 +87,7 @@ async function buildSession(cycles: number, replyBytes: number) {
       const before = gateway.requests.length;
       await session.sendText(text);
       await waitFor(() => gateway.requests.length > before, `the request for ${text}`);
-      await session.waitForText(`reply ${before}`, TIMEOUT);
-      await session.waitForComposer(TIMEOUT);
+      await session.waitForPane((pane) => pane.includes(`reply ${before}`) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
     }
     if (n < cycles - 1) {
       log ||= join(sessionDir(home, onlySessionId(home)), "log.jsonl");

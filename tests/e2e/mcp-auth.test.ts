@@ -30,6 +30,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { zigGlobalCacheDir } from "./zig-build";
 
@@ -2921,7 +2922,7 @@ describe("MCP login", () => {
     options.rejectRefresh = true;
     await tui.waitForComposer(5_000);
     await tui.sendText("Call it again.");
-    await tui.waitForText("Second call done.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("Second call done.") && turnSettled(pane), 20_000);
     expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
     // The trace says why the login went, and holds no token.
     const trace = readFileSync(root.trace, "utf8");
@@ -3613,7 +3614,7 @@ describe("MCP login", () => {
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("Call the MCP fixture.");
-    await tui.waitForText("First call complete.", 20_000);
+    await tui.waitForPane((pane) => pane.includes("First call complete.") && turnSettled(pane), 20_000);
     const deadline = Date.now() + 10_000;
     while (listens().length < 1 && Date.now() < deadline) await Bun.sleep(25);
     expect(listens()).toHaveLength(1);

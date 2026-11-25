@@ -742,14 +742,14 @@ fn appendMcpConfigCheck(
     }
 }
 
-/// One failure for each issue the MCP config inspection found, as for a
-/// `~/.fx/mcp.json` fx cannot read. The inspection reads `~/.fx/mcp.json`
-/// whole, so a problem there fails the file (`appendMcpConfigCheck`), and
-/// its issues all come from the project's `.mcp.json`, each one a server
-/// that does not load (`builtin_mcp.inspectLocalConfig`).
+/// One failure for each issue the MCP config inspection found: a server of
+/// `~/.fx/mcp.json` or of the project's `.mcp.json` that does not load
+/// (`builtin_mcp.inspectLocalConfig`), which reads the profile as the runtime
+/// does, so one bad entry never fails the file (`appendMcpConfigCheck`).
 fn appendMcpIssueChecks(checks: *std.ArrayList(Check), alloc: Allocator, issues: []const mcp_health.ConfigurationIssue) !void {
     for (issues) |issue| {
-        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), "fix .mcp.json, then run fx doctor again");
+        const fix = if (issue.profile) profile_paths.displayText("fix ~/.fx/mcp.json, then run fx doctor again") else "fix .mcp.json, then run fx doctor again";
+        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), fix);
     }
 }
 

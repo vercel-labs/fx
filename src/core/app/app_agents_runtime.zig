@@ -141,7 +141,7 @@ pub const ChildAgent = struct {
     /// pace out in `pacer`, the pacer that holds its text: its own slot's
     /// while it is hidden, the app's while it is on screen (`pacerOf`).
     fn hasUnapplied(self: *ChildAgent, pacer: *AssistantPacer) bool {
-        return self.agent.worker.hasPendingEvents() or pacer.hasPending();
+        return self.agent.worker.hasPendingEvents() or pacer.hasPending() or pacer.hasTail();
     }
 };
 
@@ -1019,7 +1019,7 @@ pub fn Runtime(comptime App: type) type {
             var deferred: usize = 0;
             if (app.agent_on_screen != null and
                 (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
-                    approvalOutOfDate(&app.main_agent, false)))
+                    app.main_screen.pacer.hasTail() or approvalOutOfDate(&app.main_agent, false)))
             {
                 if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
