@@ -4173,6 +4173,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
       const markerPath = join(root.workspace, "child-approval-must-not-exist");
+      const command = `/usr/bin/touch ${shellQuote(markerPath)}`;
       const rootPrompt = "DELEGATE_ONE_APPROVAL_TASK";
       const childPrompt = "Request permission to create the delegated marker.";
       const createId = "direct_child_create";
@@ -4217,7 +4218,7 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
           // fx's agent profile has every tool, so the subagent may start
           // its own.
           expect(body).toContain('"name":"subagent"');
-          return toolCall(`/usr/bin/touch ${shellQuote(markerPath)}`, {}, commandId);
+          return toolCall(command, {}, commandId);
         }
         if (currentUserText(body).includes(rootPrompt)) {
           return gatewayToolCall("subagent", {
@@ -4240,12 +4241,22 @@ async function typeTaskOnSubagent(session: TmuxSession, agent: string, ready: st
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      // The note names the exact command and the child that asks, and no screen
-      // offers the request to the person.
+      // The note names the command and the child that asks, and no screen offers
+      // the request to the person. Its action is one terminal-safe line
+      // (`live_metrics.storeLabel`'s 160 bytes around the cut command), so a long
+      // workspace path, as macOS makes, hides the marker's tail.
       const noteText = await within(note.promise, TIMEOUT, "the note to reach the parent");
-      expect(noteText).toContain("touch");
-      expect(noteText).toContain("child-approval-must-not-exist");
+      expect(noteText).toContain("/usr/bin/touch");
       expect(noteText).toContain("helper");
+      const label = `shell.run ${command}`;
+      const after = "I wait for your approval to run: ";
+      const action = noteText.slice(noteText.indexOf(after) + after.length).split(". Answer with the subagent tool")[0]!;
+      // The action is the label itself, or the label's own head cut for one line
+      // with a cut marker; a long workspace path, as macOS makes, cuts before the
+      // marker's name, so only the label held whole shows that name.
+      expect(label.startsWith(action.replace(/(?:\.\.\.|…)+$/, ""))).toBe(true);
+      if (action === label) expect(noteText).toContain("child-approval-must-not-exist");
+      else expect(action).toMatch(/(?:\.\.\.|…)+$/);
       const waiting = await activeSession.capturePane();
       expect(waiting).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(markerPath)).toBe(false);
