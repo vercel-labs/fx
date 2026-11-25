@@ -1011,26 +1011,26 @@ noinline fn findByte(text: []const u8, byte: u8) ?usize {
 /// Keeps printable text on one line: drops escape sequences and control
 /// bytes, folds whitespace runs to one space, caps the length, and writes
 /// what remains terminal-safe, so a C1 control or an invalid UTF-8 byte shows
-/// as its visible escape.
+/// as its visible escape. Text cut at the cap ends with "…".
 fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(scratch);
     var index: usize = 0;
     var pending_space = false;
-    while (index < text.len and out.written().len < max_bytes) {
+    var cut = false;
+    while (index < text.len) {
         const byte = text[index];
         if (byte == 0x1b) {
-            index += 1;
-            if (index < text.len and text[index] == '[') {
-                index += 1;
-                while (index < text.len and (text[index] < 0x40 or text[index] > 0x7e)) : (index += 1) {}
-            }
-            index += 1;
+            index = escapeEnd(text, index);
             continue;
         }
         if (byte < 0x20 or byte == 0x7f or byte == ' ') {
             pending_space = out.written().len > 0;
             index += 1;
             continue;
+        }
+        if (out.written().len >= max_bytes) {
+            cut = true;
+            break;
         }
         if (pending_space) try out.writer.writeByte(' ');
         pending_space = false;
@@ -1046,7 +1046,47 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
         const need: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else 2;
         if (written.len - (end - 1) < need) written = written[0 .. end - 1];
     }
-    return terminalSafeText(scratch, written);
+    const safe = try terminalSafeText(scratch, written);
+    return if (cut) std.mem.concat(scratch, u8, &.{ safe, "…" }) else safe;
+}
+
+/// The index right after the escape sequence that starts at `index`: a CSI
+/// sequence through its final byte, else the escape and the byte after it.
+fn escapeEnd(text: []const u8, index: usize) usize {
+    var end = index + 1;
+    if (end < text.len and text[end] == '[') {
+        end += 1;
+        while (end < text.len and (text[end] < 0x40 or text[end] > 0x7e)) : (end += 1) {}
+    }
+    return @min(end + 1, text.len);
+}
+
+test "a reason cut at its byte cap ends with an ellipsis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = 8;
+    try std.testing.expectEqualStrings("abcdefgh", try storySafeLine(a, "abcdefgh", cap));
+    try std.testing.expectEqualStrings("abcdefgh…", try storySafeLine(a, "abcdefghi", cap));
+    // Spaces and escape sequences after the cap show nothing, so the text
+    // is whole.
+    try std.testing.expectEqualStrings("abcdefgh", try storySafeLine(a, "abcdefgh  \x1b[0m\n", cap));
+    // A character the cap would split goes whole.
+    try std.testing.expectEqualStrings("abcdefg…", try storySafeLine(a, "abcdefg找到", cap));
+
+    // On a wide row, a command's message longer than the cap shows its
+    // first story_reason_max_bytes bytes, then "…".
+    const alloc = std.testing.allocator;
+    const long: [story_reason_max_bytes + 20]u8 = @splat('a');
+    const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh check.sh\n", .class = .tool_status } }};
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh check.sh\"}", 1, &long)};
+    details[0].command_display = @constCast("sh check.sh");
+    const painted = try paintedGroupForTest(alloc, &entries, &details, 250);
+    defer alloc.free(painted);
+    const text = try visibleLinesForTest(alloc, painted, 250);
+    defer alloc.free(text);
+    const want_reason: [story_reason_max_bytes]u8 = @splat('a');
+    try std.testing.expectEqualStrings("● Exited 1 sh check.sh · " ++ want_reason ++ "…", firstLineForTest(text));
 }
 
 /// A string or whole-number field of a JSON object; `.other` for any other
@@ -4844,22 +4884,16 @@ fn storyOutputLines(scratch: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// "main.c:3: error: ...", else the last line where one of `programs`, the
 /// programs the command ran, or its shell reports, such as "sed: 1: ...",
 /// else the first line that names an error or a failure, else the heading of
-/// the last list the command printed, such as "Tracked paths found" for
-/// "Tracked paths found:" and the lines under it, else the last line.
+/// the list the output ends with (lastListHeading), else the last line.
 /// "error" or "fail" inside a longer name, such as "error_code", counts as
 /// neither, so a command that prints code does not read as its own error.
 fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
     var named: ?[]const u8 = null;
     var reported: ?[]const u8 = null;
-    var heading: ?[]const u8 = null;
-    var previous_heading: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        // A heading counts only once a line follows it.
-        if (previous_heading) |words| heading = words;
-        previous_heading = listHeading(trimmed);
         switch (failureWord(trimmed)) {
             .reports => return trimmed,
             .names => if (named == null) {
@@ -4869,15 +4903,74 @@ fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
         }
         if (programReports(trimmed, programs)) reported = trimmed;
     }
-    return reported orelse named orelse heading orelse lastNonEmptyLine(text);
+    return reported orelse named orelse lastListHeading(text) orelse lastNonEmptyLine(text);
 }
 
-/// The words of a line that ends in a colon, such as "Tracked paths found"
-/// for "Tracked paths found:", which can head a list. Null for any other line.
-fn listHeading(line: []const u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, line, ":")) return null;
-    const words = std.mem.trimEnd(u8, line[0 .. line.len - 1], " \t");
-    return if (words.len == 0) null else words;
+/// The fewest lines a list has under its heading.
+const list_heading_min_lines = 2;
+
+/// The words of the heading the output's last list has, without its colon,
+/// such as "Tracked paths found" for "Tracked paths found:" and the paths
+/// under it. A heading counts when list_heading_min_lines or more lines
+/// follow it and none of them ends a sentence, so a closing summary such as
+/// "2 files need formatting." stays the reason. A line that looks like code
+/// or a key heads nothing: one that is indented, holds "(" or "=", or has the
+/// line after it indented under it, as YAML's "spec:", Python's "if x:", and
+/// a help text's "Options:" do. Escape sequences count for nothing, so a
+/// colored heading counts. Null when the output ends with no such list.
+fn lastListHeading(text: []const u8) ?[]const u8 {
+    var lines_after: usize = 0;
+    var next_indented = false;
+    var lines = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const shown = shownLine(line) orelse continue;
+        if (lines_after >= list_heading_min_lines and !next_indented) if (headingWords(line, shown)) |words| return words;
+        if (std.mem.findScalar(u8, ".!?", line[shown.last]) != null) return null;
+        lines_after += 1;
+        next_indented = shown.indented;
+    }
+    return null;
+}
+
+/// A line as the screen shows it, with its escape sequences left out.
+const ShownLine = struct {
+    /// Whether it starts with a space or a tab.
+    indented: bool,
+    /// Whether it holds "(" or "=", as code does.
+    code_like: bool,
+    /// Where its last byte that is not a space is.
+    last: usize,
+};
+
+/// Null for a line that shows nothing but spaces.
+fn shownLine(line: []const u8) ?ShownLine {
+    var shown: ShownLine = .{ .indented = false, .code_like = false, .last = 0 };
+    var shows_text = false;
+    var at_start = true;
+    var index: usize = 0;
+    while (index < line.len) {
+        const byte = line[index];
+        if (byte == 0x1b) {
+            index = escapeEnd(line, index);
+            continue;
+        }
+        if (at_start) shown.indented = byte == ' ' or byte == '\t';
+        at_start = false;
+        if (byte == '(' or byte == '=') shown.code_like = true;
+        if (byte != ' ' and byte != '\t' and byte != '\r') {
+            shown.last = index;
+            shows_text = true;
+        }
+        index += 1;
+    }
+    return if (shows_text) shown else null;
+}
+
+/// The words before a heading's colon. Null for a line that heads no list.
+fn headingWords(line: []const u8, shown: ShownLine) ?[]const u8 {
+    if (line[shown.last] != ':' or shown.indented or shown.code_like) return null;
+    const words = std.mem.trimEnd(u8, line[0..shown.last], " \t");
+    return if (shownLine(words) == null) null else words;
 }
 
 /// What a check of tracked files printed before it exited 1, in a real
@@ -4904,7 +4997,7 @@ const tracked_paths_output_for_test =
 test "a failed command that reports no error says the heading of the list it printed" {
     const programs = [_][]const u8{ "git", "echo", "check-public-surface.sh" };
     try std.testing.expectEqualStrings("Tracked personal paths found", verdictLine(tracked_paths_output_for_test, &programs).?);
-    // The last heading with lines under it, without its colon.
+    // The heading of the list the output ends with, without its colon.
     try std.testing.expectEqualStrings("Unused files", verdictLine("Missing files:\na.zig\nUnused files :\nb.zig\nc.zig", &.{}).?);
     // A last line that ends in a colon heads nothing, so it stays the
     // reason as it is, and an earlier heading stands.
@@ -4918,6 +5011,41 @@ test "an error line, a program's own line, or a named failure comes before a lis
     try std.testing.expectEqualStrings("error: expected type", verdictLine("Changed files:\nsrc/a.zig\nerror: expected type\nsrc/b.zig", &.{}).?);
     try std.testing.expectEqualStrings("sed: 1: bad command", verdictLine("Matches:\na.txt\nsed: 1: bad command\nb.txt", &.{"sed"}).?);
     try std.testing.expectEqualStrings("2 tests failed", verdictLine("Slow tests:\nparse\n2 tests failed\nrender", &.{}).?);
+}
+
+test "a failed command's reason is a list's heading only for a list the output ends with, never for code, keys, or a summary" {
+    const alloc = std.testing.allocator;
+    const Probe = struct { output: []const u8, reason: []const u8 };
+    for ([_]Probe{
+        .{ .output = tracked_paths_output_for_test, .reason = "Tracked personal paths found" },
+        // A closing summary after the list stays the reason, as before.
+        .{ .output = "Checking files:\na.zig ok\nb.zig ok\n2 files need formatting.\n", .reason = "2 files need formatting." },
+        // One line under a colon is no list.
+        .{ .output = "Downloading:\n100%\n", .reason = "100%" },
+        // A key with its values indented under it, as in YAML.
+        .{ .output = "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n  - name: app\n", .reason = "- name: app" },
+        // Code: a line with "(", and a line with its block indented under it.
+        .{ .output = "def f():\n    if x:\n        return 1\n", .reason = "return 1" },
+        // A help text's options, indented under their heading.
+        .{ .output = "Usage: tool [options]\nOptions:\n  -h, --help     Show help\n  -v, --verbose  Print more\n", .reason = "-v, --verbose Print more" },
+        // A list indented under its heading, like the options above.
+        .{ .output = "Problems:\n  src/a.zig\n  src/b.zig\n", .reason = "src/b.zig" },
+        // An indented line, or one with "(" or "=", heads nothing either.
+        .{ .output = "Report\n  Totals:\na.zig 3\nb.zig 4\n", .reason = "b.zig 4" },
+        .{ .output = "Matches (2):\nsrc/a.zig\nsrc/b.zig\n", .reason = "src/b.zig" },
+        .{ .output = "total=2 files:\nsrc/a.zig\nsrc/b.zig\n", .reason = "src/b.zig" },
+        .{ .output = "\x1b[1mProblems found:\x1b[0m\nsrc/a.zig:3: x\nsrc/b.zig:9: y\n", .reason = "Problems found" },
+        .{ .output = "Problems found:\r\nsrc/a.zig\r\nsrc/b.zig\r\n", .reason = "Problems found" },
+        .{ .output = "🚨 Problems found:\nsrc/a.zig\nsrc/b.zig\n", .reason = "🚨 Problems found" },
+    }) |probe| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh check.sh\n", .class = .tool_status } }};
+        var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh check.sh\"}", 1, probe.output)};
+        details[0].command_display = @constCast("sh check.sh");
+        const want = try std.mem.concat(alloc, u8, &.{ "● Exited 1 sh check.sh · ", probe.reason });
+        defer alloc.free(want);
+        errdefer std.debug.print("output:\n{s}\n", .{probe.output});
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, want);
+    }
 }
 
 const FailureWord = enum { none, names, reports };
@@ -5449,7 +5577,7 @@ fn clipStoryRow(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryR
         phrase = try clipStoryPhrase(scratch, lead, row, &fewer, "", phrase_cols, style);
     }
     const used = display_width.visibleWidthIgnoringAnsi(phrase) + mark_width;
-    if (used + separator.len + story_reason_min_cols > cols) return std.mem.concat(scratch, u8, &.{ all_steps, mark });
+    if (used + separator_width + story_reason_min_cols > cols) return std.mem.concat(scratch, u8, &.{ all_steps, mark });
     const reason = try clipSummary(scratch, text.reason, @intCast(cols - used - separator_width));
     return std.mem.concat(scratch, u8, &.{ phrase, style.text_style, separator, try inFailureStyle(scratch, reason, style), mark });
 }
@@ -5478,8 +5606,12 @@ test "a failed command's reason takes the row's free width, and its steps make r
         .{ .cols = 120, .row = whole },
         .{ .cols = 80, .row = "├ Exited 1 git add, echo +7 more · Tracked personal paths found" },
         .{ .cols = 50, .row = "├ Exited 1 git add +8 more · Tracked personal pat…" },
+        // The reason keeps exactly story_reason_min_cols columns, and one
+        // column less drops it.
+        .{ .cols = 37, .row = "├ Exited 1 git add +8 more · Tracked…" },
         // With no room for the reason even after one step, the row keeps
         // its steps, as it did before the reason had the free width.
+        .{ .cols = 36, .row = "├ Exited 1 git add, echo, check-pub…" },
         .{ .cols = 30, .row = "├ Exited 1 git add, echo, che…" },
     }) |width| {
         // Live, where the calls share one presentation group, and resumed,
