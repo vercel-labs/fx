@@ -1594,7 +1594,10 @@ test "stopping a check that keeps starting processes in groups of their own leav
     // The pipe is named, and the forker opens it by its path, because a child
     // cannot be handed an open descriptor: on macOS `std.process.spawn` leaves
     // it only stdin, stdout and stderr, even for a descriptor that is not
-    // close-on-exec.
+    // close-on-exec. The forker opens it without blocking, because the test
+    // may die before the forker gets that far, and a blocking open would then
+    // wait for a reader that never comes: with no reader the open fails, and
+    // the forker ends. It clears the flag again, so its writes block as before.
     //
     // The pause bounds the storm: started as fast as the machine allows, a
     // stop that is slow to land lets thousands start, and the load they add
@@ -1615,8 +1618,11 @@ test "stopping a check that keeps starting processes in groups of their own leav
     // that gap: it holds `killTree` after the listing until the forker has
     // moved two more processes.
     const script =
+        \\use Fcntl;
         \\$SIG{HUP} = "IGNORE";
-        \\open(W, ">", $ARGV[2]) or exit 1;
+        \\sysopen(W, $ARGV[2], O_WRONLY | O_NONBLOCK) or exit 1;
+        \\my $flags = fcntl(W, F_GETFL, 0);
+        \\defined $flags and fcntl(W, F_SETFL, $flags & ~O_NONBLOCK) or exit 1;
         \\for (1 .. $ARGV[1]) {
         \\    my $pid = fork();
         \\    exit 1 unless defined $pid;
