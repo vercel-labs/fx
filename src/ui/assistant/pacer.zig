@@ -536,6 +536,11 @@ pub const AssistantPacer = struct {
             if (end >= start + 4 and bytes[end - 2] == 0x1b and last == '\\') return true;
             return false;
         }
+        // ESC ( B is whole at its final byte. One that a byte cut short,
+        // with more bytes after it, cannot grow.
+        if (display_width.isEscapeIntermediate(kind)) {
+            return end < bytes.len or display_width.isEscapeFinal(bytes[end - 1]);
+        }
         return end == start + 2;
     }
 
@@ -1181,6 +1186,31 @@ test "incomplete ANSI sequence at tail is held until completion arrives" {
     try pacer.enqueue(alloc, "my");
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("x\x1b[1my", cap.emitted.items);
+}
+
+test "an escape with an intermediate byte emits whole, at once or when its final byte arrives" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    try pacer.enqueue(alloc, "a\x1b(Bb");
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try std.testing.expectEqualStrings("a\x1b(Bb", cap.emitted.items);
+
+    try pacer.enqueue(alloc, "c\x1b(");
+    try pacer.tick(alloc, 3_000_000, cap.callbacks());
+    try std.testing.expectEqualStrings("a\x1b(Bbc", cap.emitted.items);
+    try pacer.enqueue(alloc, "Bd");
+    try pacer.tick(alloc, 6_000_000, cap.callbacks());
+    try std.testing.expectEqualStrings("a\x1b(Bbc\x1b(Bd", cap.emitted.items);
+
+    // A byte that ends no escape cuts it short, and nothing waits on it.
+    try pacer.enqueue(alloc, "\x1b((\ne");
+    try pacer.tick(alloc, 9_000_000, cap.callbacks());
+    try std.testing.expectEqualStrings("a\x1b(Bbc\x1b(Bd\x1b((\ne", cap.emitted.items);
+    try std.testing.expect(!pacer.hasPending());
 }
 
 test "theme-supplied inline code color is restored across rendered blocks" {
