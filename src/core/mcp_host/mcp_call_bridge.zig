@@ -279,7 +279,7 @@ fn applyLocked(out: mcp_call.Output) void {
         .withdraw => |id| {
             bridge.withdrawn += 1;
             bridge.changed.broadcast(io_mod.getIo());
-            debug_trace.logf("mcp-call", "request={d} client or owner gone; its permission prompt stays until answered, and nothing runs", .{@backingInt(id)});
+            debug_trace.logf("mcp-call", "request={d} client or owner gone; nothing runs, and a permission prompt that is already open stays until answered", .{@backingInt(id)});
         },
         .log => |log| debug_trace.logf("mcp-call", "request={d} dropped={s}", .{ @backingInt(log.id), @tagName(log.drop) }),
         .refuse, .call, .reply => {},

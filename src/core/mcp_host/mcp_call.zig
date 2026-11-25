@@ -188,12 +188,8 @@ pub fn step(state: State, event: Event) Output {
 /// Whether request `id` still waits for its permission check. A request whose
 /// client or owner has left does not, so no prompt is opened for it. Read-only.
 pub fn awaitingPermission(state: *const State, id: RequestId) bool {
-    for (state.slots) |slot| {
-        if (slot) |entry| {
-            if (entry.id == id) return entry.stage == .authorizing;
-        }
-    }
-    return false;
+    const index = slotOf(state.*, id) orelse return false;
+    return state.slots[index].?.stage == .authorizing;
 }
 
 fn quiet(state: State) Output {
