@@ -5426,6 +5426,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const startPath = join(workspace, "started");
       const releasePath = join(workspace, "release");
       const effectPath = join(workspace, "effect");
+      const yieldHeldPath = join(root, "yield-held");
+      const yieldReleasePath = join(root, "yield-release");
       const finalText = "RETAINED_HISTORY_COMPLETE";
       const lines = [
         "RETAINED_FIRST adjust the header",
@@ -5494,12 +5496,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_TRACE_SCOPES: "agent,worker,input,tool,scroll,frame_schedule",
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
+          FX_TEST_SHELL_YIELD_HELD: yieldHeldPath,
+          FX_TEST_SHELL_YIELD_RELEASE: yieldReleasePath,
         },
       });
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Run the prepared check.");
         await waitForPath(startPath);
+        // The yield's row change must rewrite a row a frame has committed, so
+        // the yield waits for the test, and typing waits for the row: a key
+        // cancels the frame fx is building.
+        await waitForPath(yieldHeldPath);
+        await session.waitForText("● Running sh check.sh", TIMEOUT);
         for (let index = 0; index < lines.length; index++) {
           if (index > 0) await session.sendKeys("M-Enter");
           for (const character of lines[index]!) {
@@ -5507,6 +5516,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             await Bun.sleep(3);
           }
         }
+        writeFileSync(yieldReleasePath, "go");
         await waitForCondition(
           () => readFileSync(tracePath, "utf8").includes("reason=lifecycle_status_replacement"),
           "completed tool status replacement",
@@ -5540,6 +5550,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       } finally {
+        writeFileSync(yieldReleasePath, "go");
         writeFileSync(releasePath, "go");
         finalHold.release?.();
       }
