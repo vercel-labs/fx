@@ -792,7 +792,7 @@ fn callRun(
         return err;
     };
     if (!mcpCallNoticeDue(prepared.snapshot.state, commandCalledBridge(bridge_registration))) return noticed;
-    return attachMcpCallNotice(ctx.allocator, noticed) catch |err| {
+    return attachResultField(ctx.allocator, noticed, "mcp_call_notice", mcp_call_notice) catch |err| {
         noticed.deinit(ctx.allocator);
         return err;
     };
@@ -804,34 +804,33 @@ fn attachSnapshotNotice(
     alloc: Allocator,
     result: tool_dispatch.ToolResult,
 ) Allocator.Error!tool_dispatch.ToolResult {
-    const body = switch (result) {
-        .success, .failure => |value| value,
-        .rich => return result,
-    };
-    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    if (!resultTakesField(result)) return result;
     const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
     defer alloc.free(notice);
-    const updated = (try withJsonStringField(alloc, body, "notice", notice)).?;
-    alloc.free(body);
-    return switch (result) {
-        .success => .{ .success = updated },
-        .failure => .{ .failure = updated },
-        .rich => unreachable,
-    };
+    return attachResultField(alloc, result, "notice", notice);
 }
 
-/// Adds `mcp_call_notice` to a JSON run result of a command that still runs
-/// after its `fx mcp call` calls, so the model learns that later calls exit 3.
-fn attachMcpCallNotice(
+/// Whether a result is a JSON object body that `attachResultField` can extend.
+fn resultTakesField(result: tool_dispatch.ToolResult) bool {
+    const body = switch (result) {
+        .success, .failure => |bytes| bytes,
+        .rich => return false,
+    };
+    return body.len > 0 and body[body.len - 1] == '}';
+}
+
+/// Adds the string field `name` to a JSON result and frees the old body only when it adds the field.
+fn attachResultField(
     alloc: Allocator,
     result: tool_dispatch.ToolResult,
+    comptime name: []const u8,
+    value: []const u8,
 ) Allocator.Error!tool_dispatch.ToolResult {
     const body = switch (result) {
-        .success, .failure => |value| value,
+        .success, .failure => |bytes| bytes,
         .rich => return result,
     };
-    if (body.len == 0 or body[body.len - 1] != '}') return result;
-    const updated = (try withJsonStringField(alloc, body, "mcp_call_notice", mcp_call_notice)).?;
+    const updated = (try withJsonStringField(alloc, body, name, value)) orelse return result;
     alloc.free(body);
     return switch (result) {
         .success => .{ .success = updated },
@@ -3393,7 +3392,7 @@ test "a command returned for steering tells the model it still runs" {
 test "a run result tells the model a running command's fx mcp calls stop" {
     const alloc = std.testing.allocator;
     const body = try alloc.dupe(u8, "{\"state\":\"running\",\"session_id\":\"shell-2\"}");
-    const updated = try attachMcpCallNotice(alloc, .{ .success = body });
+    const updated = try attachResultField(alloc, .{ .success = body }, "mcp_call_notice", mcp_call_notice);
     defer updated.deinit(alloc);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.success, .{});
     defer parsed.deinit();

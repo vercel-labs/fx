@@ -138,7 +138,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
             try err.print("fx mcp call: the connection to fx was lost ({s}). The call may have run; check its effect before running it again.\n", .{@errorName(e)});
             return exit.failed;
         },
-        else => return shellCallReturned(err),
+        else => return shellCallReturned(err, e),
     };
     return printReply(arena, io, out, err, operation, reply);
 }
@@ -298,8 +298,8 @@ fn unavailable(err: *Writer) !u8 {
     return exit.unavailable;
 }
 
-fn shellCallReturned(err: *Writer) !u8 {
-    try err.writeAll("fx mcp call: cannot reach fx. The fx shell call that ran this command has returned, or fx has exited. " ++ capability_mod.short_checks_advice ++ "\n");
+fn shellCallReturned(err: *Writer, cause: anyerror) !u8 {
+    try err.print("fx mcp call: cannot reach fx ({s}). The fx shell call that ran this command has returned, or fx has exited. " ++ capability_mod.short_checks_advice ++ "\n", .{@errorName(cause)});
     return exit.unavailable;
 }
 

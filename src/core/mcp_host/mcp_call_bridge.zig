@@ -390,7 +390,7 @@ fn writeReply(stream: std.Io.net.Stream, status: wire.Status, reason: ?wire.Reas
 
 fn refusalMessage(reason: wire.Reason) []const u8 {
     return switch (reason) {
-        .closed => "The fx session's shell call that started this command has ended. Run fx mcp call from a command in a new shell call.",
+        .closed => "The fx session's shell call that started this command has ended. " ++ capability_mod.short_checks_advice,
         .unauthorized => "This command was not started by a running fx shell call, or that call has ended. " ++ capability_mod.short_checks_advice,
         .unsupported_version => "This fx mcp call is from another fx version than the running session. Run the fx that started the session, or restart the session with this one.",
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
@@ -756,6 +756,16 @@ test "a call after its shell call returned says why and how to check a slow job"
     try std.testing.expectEqual(wire.Reason.unauthorized, reply.header.reason.?);
     try std.testing.expect(std.mem.find(u8, reply.bytes, "that call has ended") != null);
     try std.testing.expect(std.mem.find(u8, reply.bytes, capability_mod.short_checks_advice) != null);
+}
+
+test "both refusals for an ended shell call give the short checks advice" {
+    const reasons = [_]wire.Reason{ .closed, .unauthorized };
+    var checked: usize = 0;
+    for (reasons) |reason| {
+        try std.testing.expect(std.mem.find(u8, refusalMessage(reason), capability_mod.short_checks_advice) != null);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
 }
 
 test "a command that leaves while its call waits for permission runs nothing, and holds the yield meanwhile" {
