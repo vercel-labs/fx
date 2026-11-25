@@ -192,6 +192,20 @@ const controls: { name: string; module: string; constants: Record<string, never>
     badAt: 1,
   },
   {
+    name: "config edit acp", module: "ConfigEdit",
+    constants: { ObsNames: ["a", "b"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true, ObsDeep: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "acp", data: { file: "profile", shown: ["a"] } },
+    ],
+    // The good entry hidden by the bad one, as an ACP session did before it read the profile as the terminal app does: the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: "no-typo", both: false, big: false, ent: { a: "ok", b: "bad" } }, project: { st: "absent", typo: "no-typo", both: false, big: false, ent: { a: "none", b: "none" } } } },
+      { event: "acp", data: { file: "profile", shown: [] } },
+    ],
+    badAt: 1,
+  },
+  {
     name: "MCP rules", module: "McpRules",
     constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
     good: [
