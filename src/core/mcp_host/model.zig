@@ -23,6 +23,7 @@ const tool_result = @import("../mcp/tool_result.zig");
 const tool_search = @import("../mcp/tool_search.zig");
 const tools_feature = @import("../mcp/features/tools.zig");
 const elicitation = @import("../mcp/elicitation.zig");
+const elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 
 const Allocator = std.mem.Allocator;
 const Runtime = runtime_mod.Runtime;
@@ -329,7 +330,13 @@ pub const Catalog = struct {
         try c.ensure(name, cancel);
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        const found = c.findLocked(name) orelse return c.whyUnavailableLocked(alloc, name);
+        const found = c.findLocked(name) orelse {
+            // A caller with a limited view (a subagent) hears nothing of a server it may not use: not for a name the
+            // rules hide, nor for one on a server its view leaves out. The main agent's view is not limited, and it
+            // hears why a tool can't be used, as it always has, even when a rule hides the tool.
+            if (access != .unrestricted and permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
+            return c.whyUnavailableLocked(alloc, name, access);
+        };
         if (!c.allowsLocked(access, found.server, name)) return null;
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
         const instructions = try c.runtime.instructions(alloc, c.servers[found.server].name);
@@ -750,10 +757,11 @@ pub const Catalog = struct {
     }
 
     /// Why `name` can't be selected when its server's list didn't load, so
-    /// the model hears more than "not found".
-    fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8) !?tool_mcp_runtime.ToolSchemaResult {
-        for (c.servers, c.lists) |s, l| {
+    /// the model hears more than "not found". A server outside the caller's view says nothing.
+    fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8, access: Access) !?tool_mcp_runtime.ToolSchemaResult {
+        for (c.servers, c.lists, 0..) |s, l, i| {
             if (!tool_names.matchesServer(name, s.name)) continue;
+            if (!c.allowsLocked(access, i, name)) continue;
             const text = try c.unavailableText(alloc, s, l) orelse continue;
             return .{ .rejected = .{ .model_output = text } };
         }
@@ -769,15 +777,10 @@ pub const Catalog = struct {
         for (c.servers, c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
-                const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
-                defer alloc.free(step);
-                step[0] = std.ascii.toUpper(step[0]);
+                const how = signIn(c.runtime.options.slash_commands, s.source);
                 const refused = try c.runtime.refusedLogin(alloc, s.name);
                 defer if (refused) |text| alloc.free(text);
-                const guidance = if (refused) |why|
-                    try alloc.print("{s} {s}, then search again.", .{ why, step })
-                else
-                    try alloc.print("{s}, then search again.", .{step});
+                const guidance = try loginGuidance(alloc, request.login_sentence, s.name, how, refused);
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -794,6 +797,17 @@ pub const Catalog = struct {
     }
 };
 
+/// What a search page says to do about a server that needs a login. A command prints the page's message as it is,
+/// so it gets the sentence `toolbox {open}` says; the model gets the step to take, then to search again.
+fn loginGuidance(alloc: Allocator, login_sentence: bool, server: []const u8, how: SignIn, refused: ?[]const u8) ![]u8 {
+    if (login_sentence) return needsLoginText(alloc, server, how, refused);
+    const step = try signInStep(alloc, server, how);
+    defer alloc.free(step);
+    step[0] = std.ascii.toUpper(step[0]);
+    if (refused) |why| return alloc.print("{s} {s}, then search again.", .{ why, step });
+    return alloc.print("{s}, then search again.", .{step});
+}
+
 /// How long fx's question UI waits for the user before giving up.
 const question_timeout_ms: i64 = 10 * 60 * 1000;
 
@@ -806,6 +820,8 @@ const Asking = struct {
     io: std.Io,
     /// The last question's origin, once one was asked.
     origin: ?tool_mcp_runtime.InputOrigin = null,
+    /// The user has heard that fx declined a question of this call; a server that asks again is not told again.
+    told: bool = false,
 
     fn finish(self: *const Asking, alloc: Allocator, outcome: tool_mcp_runtime.ContinuationTerminal) void {
         if (self.origin) |origin| self.responder.finish(alloc, origin, outcome);
@@ -827,18 +843,37 @@ const Asking = struct {
         };
         self.origin = origin;
         const signal = question.url_wait orelse {
-            const answer = try self.responder.callback(self.responder.context, alloc, origin, .{ .input_requests_json = question.input_requests_json });
+            const answer = try self.respond(alloc, origin, .{ .input_requests_json = question.input_requests_json }, question.server);
             return @constCast(answer);
         };
         // A surface with no Retry control (ACP) waits for the server alone.
         if (!self.responder.legacy_url_manual_completion) return self.waitForUrls(signal, origin.deadline_ms);
-        const answer = try self.responder.callback(self.responder.context, alloc, origin, .{
+        const answer = try self.respond(alloc, origin, .{
             .input_requests_json = question.input_requests_json,
             .legacy_retry_without_responses = true,
             .legacy_url_phase = .await_completion,
             .legacy_url_completion_signal = signal,
-        });
+        }, question.server);
         return @constCast(answer);
+    }
+
+    /// Puts the question to the surface's responder. When the responder refuses it, the user hears why, and the
+    /// error goes on, so the form is declined as before.
+    fn respond(self: *Asking, alloc: Allocator, origin: tool_mcp_runtime.InputOrigin, required: tool_mcp_runtime.InputRequired, server: []const u8) anyerror![]const u8 {
+        return self.responder.callback(self.responder.context, alloc, origin, required) catch |err| {
+            self.tellDeclined(alloc, server, err);
+            return err;
+        };
+    }
+
+    fn tellDeclined(self: *Asking, alloc: Allocator, server: []const u8, err: anyerror) void {
+        if (self.told) return;
+        const text = (elicitation_interaction.declinedText(alloc, server, err) catch {
+            debug_trace.logf("mcp", "MCP declined-question notice dropped: out of memory server={s}", .{server});
+            return;
+        }) orelse return;
+        self.told = true;
+        self.responder.declined(text);
     }
 
     /// Waits until the server completes every URL, the question's deadline,
@@ -990,6 +1025,7 @@ fn snapshotToolFn(raw: *anyopaque, alloc: Allocator, name: []const u8, known_bin
 const testing = std.testing;
 const Fixture = @import("fake_server.zig").Fixture;
 const login_words = @import("login_words.zig");
+const tool_lookup = @import("../mcp/tool_lookup.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 
@@ -1464,6 +1500,171 @@ test "what the model got before stays the same: an error without data, a -32042,
     const ok = (try render(a, "srv", "mcp_srv_tool", .{ .result = .{ .content = "[{\"type\":\"text\",\"text\":\"hi\"}]", .structured = null, .is_error = false } }, 4096, .terminal, null)).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, ok.status);
     try testing.expectEqualStrings("{\"server\":\"srv\",\"tool\":\"mcp_srv_tool\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"isError\":false}}", ok.model_output);
+}
+
+const RefusingSurface = struct {
+    result: anyerror![]const u8,
+    said: [4][256]u8 = undefined,
+    said_len: [4]usize = @splat(0),
+    count: usize = 0,
+
+    fn callback(context: *anyopaque, _: Allocator, _: tool_mcp_runtime.InputOrigin, _: tool_mcp_runtime.InputRequired) anyerror![]const u8 {
+        const self: *RefusingSurface = @ptrCast(@alignCast(context));
+        return self.result;
+    }
+
+    fn declined(context: *anyopaque, text: []const u8) void {
+        const self: *RefusingSurface = @ptrCast(@alignCast(context));
+        if (self.count < self.said.len) {
+            @memcpy(self.said[self.count][0..text.len], text);
+            self.said_len[self.count] = text.len;
+        }
+        self.count += 1;
+    }
+
+    fn saidAt(self: *const RefusingSurface, index: usize) []const u8 {
+        return self.said[index][0..self.said_len[index]];
+    }
+
+    fn asking(self: *RefusingSurface, with_notice: bool) Asking {
+        return .{
+            .responder = .{ .context = self, .callback = callback, .declined_notice = if (with_notice) declined else null },
+            .tool = "mcp_docs_echo",
+            .cancel = null,
+            .io = testing.io,
+        };
+    }
+};
+
+test "a question the surface refuses is told to the user once for the call, and the form is still declined" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const question: runtime_mod.Question = .{ .server = "docs", .input_requests_json = "{}", .version = null };
+
+    var surface: RefusingSurface = .{ .result = error.PresentationLimitExceeded };
+    var asking = surface.asking(true);
+    // The error still goes up, where the runtime declines the form.
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&asking, a, question));
+    try testing.expectEqual(@as(usize, 1), surface.count);
+    try testing.expectEqualStrings("MCP server 'docs' asked for input, and fx declined it: the form is larger than fx can show.", surface.saidAt(0));
+    // A server that asks again in the same call is not told again.
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&asking, a, question));
+    try testing.expectEqual(@as(usize, 1), surface.count);
+    // The next call is its own.
+    var next = surface.asking(true);
+    try testing.expectError(error.PresentationLimitExceeded, Asking.ask(&next, a, question));
+    try testing.expectEqual(@as(usize, 2), surface.count);
+
+    // A cancel is no refusal, and an answer is told to no one.
+    var cancelled: RefusingSurface = .{ .result = error.Cancelled };
+    var cancelled_asking = cancelled.asking(true);
+    try testing.expectError(error.Cancelled, Asking.ask(&cancelled_asking, a, question));
+    try testing.expectEqual(@as(usize, 0), cancelled.count);
+    var answered: RefusingSurface = .{ .result = "{}" };
+    var answered_asking = answered.asking(true);
+    try testing.expectEqualStrings("{}", (try Asking.ask(&answered_asking, a, question)).?);
+    try testing.expectEqual(@as(usize, 0), answered.count);
+
+    // A surface with nowhere to say it declines the form as before.
+    var mute: RefusingSurface = .{ .result = error.SecretField };
+    var mute_asking = mute.asking(false);
+    try testing.expectError(error.SecretField, Asking.ask(&mute_asking, a, question));
+    try testing.expectEqual(@as(usize, 0), mute.count);
+}
+
+test "a search a command makes gets toolbox open's own sentence for a server that needs a login, and the model's page keeps its guidance" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{
+        .name = "keyed",
+        .transport = .http,
+        .url = "https://example.invalid/mcp",
+    }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    c.lists[0].state = .needs_login;
+
+    const query = try lexical_relevance.prepare("keyed");
+    const sentence = try needsLoginText(a, "keyed", .terminal, null);
+    try testing.expectEqualStrings("MCP server 'keyed' needs a login. Ask the user to run fx mcp login keyed in a terminal, then try again.", sentence);
+    // The model's page keeps the guidance it always had.
+    const for_model = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed" })).?;
+    try testing.expect(std.mem.find(u8, for_model, "\"message\":\"Run fx mcp login keyed in a terminal, then search again.\"") != null);
+    // A command's page carries the sentence, which the command prints as it is.
+    const for_command = (try c.renderUnavailable(a, .{ .query = &query, .kind = .mcp, .server = "keyed", .login_sentence = true })).?;
+    var lines: std.Io.Writer.Allocating = .init(a);
+    const page = try tool_lookup.writeToolLines(a, &lines.writer, for_command);
+    try testing.expectEqualStrings(sentence, page.problem.?);
+    // And it is the very text `toolbox {open}` gives for a tool of that server.
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    const opened = (try c.whyUnavailableLocked(a, "mcp_keyed_list", .unrestricted)).?;
+    try testing.expectEqualStrings(sentence, opened.rejected.model_output);
+}
+
+test "a tool the rules or view of a caller with a limited view hide says nothing of its server's state, whatever the state" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{
+        .name = "keyed",
+        .transport = .http,
+        .url = "https://example.invalid/mcp",
+        .bearer_token_env = @constCast("FX_MCP_HOST_TEST_UNSET"),
+    }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Named = struct {
+        fn allows(raw: *const anyopaque, server: []const u8) bool {
+            const wanted: *const []const u8 = @ptrCast(@alignCast(raw));
+            return std.mem.eql(u8, wanted.*, server);
+        }
+    };
+    const keyed_name: []const u8 = "keyed";
+    const other_name: []const u8 = "other";
+    const in_view: Access = .{ .servers = .{ .context = @ptrCast(&keyed_name), .allows_fn = Named.allows } };
+    const outside: Access = .{ .servers = .{ .context = @ptrCast(&other_name), .allows_fn = Named.allows } };
+    var deny = [_]types.PermissionRule{.{ .permission = @constCast("mcp_keyed_list"), .pattern = @constCast("*"), .action = .deny }};
+    const denied: types.PermissionRuleSet = .{ .rules = deny[0..] };
+
+    // A server held for a variable that is not set: the caller who may use the tool is told why it can't.
+    const held = "MCP server 'keyed' needs FX_MCP_HOST_TEST_UNSET set before fx starts.";
+    try testing.expectEqualStrings(held, (try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, .unrestricted, null)).?.rejected.model_output);
+    try testing.expectEqualStrings(held, (try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, in_view, null)).?.rejected.model_output);
+    // The main agent's view is not limited: a rule that hides the tool does not hide why it can't be used.
+    const main_agent = try c.toolSchema(a, "mcp_keyed_list", denied, .{}, .unrestricted, null);
+    try testing.expect(main_agent != null);
+    try testing.expectEqualStrings(held, main_agent.?.rejected.model_output);
+    // A caller with a limited view: the rules hide it, or the view leaves its server out, and it is not found, as a
+    // tool that does not exist.
+    try testing.expect((try c.toolSchema(a, "mcp_keyed_list", denied, .{}, in_view, null)) == null);
+    try testing.expect((try c.toolSchema(a, "mcp_keyed_list", .{}, .{}, outside, null)) == null);
+
+    // The same for a list that failed and one that needs a login.
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    inline for (.{ .failed, .needs_login }) |state| {
+        c.lists[0].state = state;
+        try testing.expect((try c.whyUnavailableLocked(a, "mcp_keyed_list", in_view)) != null);
+        try testing.expect((try c.whyUnavailableLocked(a, "mcp_keyed_list", outside)) == null);
+    }
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {

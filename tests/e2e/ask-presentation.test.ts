@@ -647,13 +647,20 @@ describe("fx ask presentation", () => {
       const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
       const sgrBeforeBold = (row: string) =>
         row.slice(0, row.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
-      const rowsOf = (text: string) =>
-        text
+      // tmux's "Pane is dead" row is not fx's output. tmux draws it only once
+      // it has the command's exit status, which can come after it marks the
+      // pane dead, and on CI it can still be missing when the capture runs.
+      // So the rows leave it out, with the blank rows after fx's output.
+      const rowsOf = (text: string) => {
+        const rows = text
           .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
           .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
-          .replace(/Pane is dead \(status \d+, [^)]*\)/g, "Pane is dead")
           .split("\n")
-          .map((row) => row.trimEnd());
+          .map((row) => row.trimEnd())
+          .filter((row) => !row.startsWith("Pane is dead"));
+        while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+        return rows;
+      };
       const startAsk = async (
         gateway: ReturnType<typeof startFakeGateway>,
         label: string,
@@ -672,6 +679,19 @@ describe("fx ask presentation", () => {
         });
         sessions.push(session);
         return { session, stderrPath };
+      };
+      // A run is over once the shell prints its exit marker and tmux marks
+      // the pane dead, which it does after it reads the last output. A
+      // session that is gone can show no marker, so the wait fails at once
+      // then, and it gives up well before the test's own timeout, so a
+      // failure shows the pane.
+      const waitForExit = async (target: TmuxSession) => {
+        await target.waitForPane((pane) => {
+          if (pane.includes("__FX_EXIT_0__")) return true;
+          if (!target.isAlive()) throw new Error(`${target.name} ended before it showed its exit marker`);
+          return false;
+        }, 10_000);
+        await target.waitForPane(() => target.paneStatus().dead, 10_000);
       };
 
       const held = heldFakeGatewayFinalText();
@@ -705,14 +725,14 @@ describe("fx ask presentation", () => {
 
       held.send(ending);
       held.release("");
-      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      await waitForExit(session);
       const streamed = await session.captureFullScrollback();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       const onePieceGateway = startFakeGateway([fakeGatewayFinalText(fullReply)]);
       gateways.push(onePieceGateway);
       const onePiece = await startAsk(onePieceGateway, "one-piece");
-      await onePiece.session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      await waitForExit(onePiece.session);
       expect(rowsOf(streamed)).toEqual(
         rowsOf(await onePiece.session.captureFullScrollback()),
       );
