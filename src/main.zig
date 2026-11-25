@@ -2159,6 +2159,13 @@ const App = struct {
         };
     }
 
+    /// The subagent host's `ReportSink.mail_waiting_fn`: whether mail that
+    /// `postSubagentReport` queued has yet to reach the owner's worker.
+    pub fn subagentMailWaiting(raw: ?*anyopaque, waiting_host: *subagent_tool_host.Runtime) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.hostMailWaiting(self, waiting_host);
+    }
+
     /// The user stopped `agent`'s turn on its own screen.
     pub fn noteUserStop(self: *App, agent: *agents.Agent) void {
         AgentsAppRuntime.noteUserStop(self, agent);
