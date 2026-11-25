@@ -210,6 +210,16 @@ const PRINTED_CODE_THEN_FAILED: StoryStep[] = [
   { at: 1, text: "The file is missing." },
 ];
 
+// A check that prints two counts, then a heading and the lines it found
+// under it, and fails because it found them.
+const LISTED_THEN_FAILED: StoryStep[] = [
+  {
+    at: 0,
+    calls: [sh("echo 'staged: 2' && echo 'left over: 0' && echo 'Tracked personal paths found:' && ! grep -rn createWindow desktop/src && echo surface-ok && sh build.sh && echo build-ok")],
+  },
+  { at: 1, text: "The check found the paths." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -1096,15 +1106,49 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The reason is ls's own message, not a printed line that names "error",
-    // without the words that say who spoke, and at most 40 columns.
+    // without the words that say who spoke, and whole on a row with room.
     const row = lines.find((line) => /^● Exited \d+ printf, ls · /.test(line));
     expect(row).toBeDefined();
     const reason = row!.replace(/^● Exited \d+ printf, ls · /, "").replace(/ ✗$/, "");
-    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such f…)$/);
-    expect([...reason].length).toBeLessThanOrEqual(40);
+    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such file or directory)$/);
     expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed check says the heading of the list it printed, live and after resume",
+  async () => {
+    // On a narrow row the command names fewer of its steps so the reason
+    // stays in view, and the reason clips at the edge.
+    const rows: Array<[number, string]> = [
+      [110, "● Exited 1 echo, grep, echo +2 more · Tracked personal paths found"],
+      [48, "● Exited 1 echo +4 more · Tracked personal path…"],
+    ];
+    const failedRow = (pane: string) => paneLines(pane).find((line) => line.startsWith("● Exited 1 "));
+    for (const [width, want] of rows) {
+      const { root, gateway, session, pane } = await runStory(LISTED_THEN_FAILED, {
+        prompt: "check the tracked paths",
+        finalText: "The check found the paths.",
+        width,
+      });
+      expect(failedRow(pane)).toBe(want);
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The check found the paths.", TIMEOUT);
+      expect(failedRow(await resumed.waitForComposer(TIMEOUT))).toBe(want);
+    }
+  },
+  TIMEOUT * 4,
 );
 
 test.skipIf(!tmuxAvailable())(
