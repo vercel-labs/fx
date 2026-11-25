@@ -2788,6 +2788,18 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// Whether the hand-off holds mail for the agent that owns `host`
+        /// (`handoffMailWaiting`), so that agent's `wait` waits for it: the
+        /// host's `ReportSink.mail_waiting_fn`, on that agent's thread.
+        pub fn hostMailWaiting(app: *App, host: *subagent_tool_host.Runtime) bool {
+            const owner = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk ownerOf(app, host) orelse return false;
+            };
+            return handoffMailWaiting(app, owner);
+        }
+
         /// The agent a subagent's delivery from `host` goes to: the host's
         /// owner, or with `from_owner` that owner's own parent. Call with
         /// `authority_mutex` held, or on the main loop.

@@ -2159,6 +2159,13 @@ const App = struct {
         };
     }
 
+    /// The subagent host's `ReportSink.mail_waiting_fn`: whether mail that
+    /// `postSubagentReport` queued has yet to reach the owner's worker.
+    pub fn subagentMailWaiting(raw: ?*anyopaque, waiting_host: *subagent_tool_host.Runtime) bool {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        return AgentsAppRuntime.hostMailWaiting(self, waiting_host);
+    }
+
     /// The user stopped `agent`'s turn on its own screen.
     pub fn noteUserStop(self: *App, agent: *agents.Agent) void {
         AgentsAppRuntime.noteUserStop(self, agent);
@@ -3497,10 +3504,13 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
+        // Posts go first, before any agent's events, the shown one's too: a
+        // message a subagent's turn sent is delivered while that turn still
+        // counts as going (`deliverReport`).
+        AgentsAppRuntime.takePosts(self);
         try tickAgentInContext({}, self, self.screenAgent());
         // Every other agent keeps working while it is hidden, each handled in
         // its own context.
-        AgentsAppRuntime.takePosts(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);

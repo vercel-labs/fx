@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const types = @import("../../shared/types.zig");
+const compactor = @import("../../compactor/compactor.zig");
 const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
@@ -58,7 +59,14 @@ pub const State = struct {
         while (index > 0) {
             index -= 1;
             const execution = switch (history[index]) {
-                .compacted_summary => break,
+                // A provider's compaction block keeps the copy the turns after
+                // it were sent with, so nothing before them changes; fx's own
+                // summary starts a new one.
+                .compacted_summary => |entry| {
+                    const block = (try compactor.providerBlock(arena, entry.summary)) orelse break;
+                    if (block.runtime_context.len == 0) break;
+                    return .{ .frozen = try messagesFrom(arena, block.runtime_context), .known_update = known_update };
+                },
                 .assistant => |entry| entry.execution,
                 .interrupted => |entry| entry.execution,
             };

@@ -86,14 +86,50 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
     );
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
-    // The workspace's notes move over, so `workspace.deinit` frees only its list.
+    try mergeNativeConfigs(alloc, &loaded, &profile, &workspace);
+    return loaded;
+}
+
+/// Merges the profile's servers and the project's into `loaded`: the profile's first, and a project server that a
+/// profile server shadows is left out. The project's notes move over, so `workspace.deinit` frees only its list. Both
+/// lists are consumed. The terminal app and an ACP session that asks for the profile's servers merge them here.
+pub fn mergeNativeConfigs(
+    alloc: Allocator,
+    loaded: *NativeConfigs,
+    profile: *std.ArrayList(McpServerConfig),
+    workspace: *project_config.WorkspaceParseResult,
+) !void {
     try loaded.diagnostics.appendSlice(alloc, workspace.diagnostics.items);
     workspace.diagnostics.clearRetainingCapacity();
-
-    loaded.configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
+    loaded.configs = try project_config.mergeNative(alloc, profile, &workspace.configs);
     profile.deinit(alloc);
+    // Empty, not freed memory, so a caller that frees it again on a later error frees nothing.
+    profile.* = .empty;
     try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
-    return loaded;
+}
+
+/// What a host runs from the merged servers, the one place both start from: `loadHost` and an ACP session that asks
+/// for the profile's servers (`_meta.fx.profileMcpServers`) end here, so the two run the same servers (R1.4). A server
+/// whose name is in `first`, the servers an ACP client sends with its request, which come first and win a name, is left
+/// out. `${VAR}` is expanded in the profile's servers, and a server whose name a terminal can't print is skipped; each
+/// skip is noted in `loaded.diagnostics`.
+pub fn composeHostConfigs(
+    alloc: Allocator,
+    loaded: *NativeConfigs,
+    first: []const McpServerConfig,
+    inherited: *const std.process.Environ.Map,
+) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < loaded.configs.items.len) {
+        if (!project_config.configNamePresent(first, loaded.configs.items[i].name)) {
+            i += 1;
+            continue;
+        }
+        var removed = loaded.configs.orderedRemove(i);
+        removed.deinit(alloc);
+    }
+    try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, inherited);
+    try skipUnprintableNames(alloc, loaded);
 }
 
 /// A server name a terminal can't show as is, such as one with an escape
@@ -130,8 +166,7 @@ pub fn loadHost(
     // Read only while the host starts.
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
-    try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, &inherited);
-    try skipUnprintableNames(alloc, &loaded);
+    try composeHostConfigs(alloc, &loaded, &.{}, &inherited);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
     if (extras.reuse) |h| {
@@ -169,7 +204,8 @@ pub fn loadHost(
 }
 
 /// Each diagnostic in a sentence, owned by `alloc`.
-fn renderNotes(alloc: Allocator, diagnostics: []const project_config.WorkspaceDiagnostic) ![]const []const u8 {
+/// The notes as a host holds them, in `alloc`; the caller or the host frees each and the list.
+pub fn renderNotes(alloc: Allocator, diagnostics: []const project_config.WorkspaceDiagnostic) ![]const []const u8 {
     const notes = try alloc.alloc([]const u8, diagnostics.len);
     var rendered: usize = 0;
     errdefer {
@@ -367,12 +403,8 @@ fn localInspectionFromConfigs(
     };
 }
 
-pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
-    return readProfile(alloc, path, null);
-}
-
 /// With `skipped`, see `project_config.parseProfileServers`.
-fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
+pub fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
     const json_text = (config_file.read(alloc, path) catch |err| {
         logConfigFailure("read", path, err);
         // Named for this file, so a caller that has only the error, such as
@@ -534,6 +566,58 @@ test "a server whose name a terminal can't show is skipped with a note that esca
         defer alloc.free(note);
         try std.testing.expectEqualStrings(want, note);
     }
+}
+
+test "the host runs the profile's servers composed: a bad entry skipped, ${VAR} expanded, an unprintable name and an unset variable skipped, a name the request holds left out, with a note for each" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"bad":{"type":"http","url":"http://example.com/mcp"},"good":{"command":"true","env":{"K":"${FX_COMPOSE_SET}"}},
+        \\"needs":{"command":"true","env":{"K":"${FX_COMPOSE_UNSET}"}},"mine":{"command":"true"},"evil\u001b[31m":{"command":"true"}}}
+    ;
+    var loaded: NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    loaded.configs = try project_config.parseProfileServers(alloc, json, &loaded.diagnostics);
+    var inherited: std.process.Environ.Map = .init(alloc);
+    defer inherited.deinit();
+    try inherited.put("FX_COMPOSE_SET", "expanded");
+    const first = [_]McpServerConfig{.{ .name = "mine", .command = "true" }};
+
+    try composeHostConfigs(alloc, &loaded, &first, &inherited);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("good", loaded.configs.items[0].name);
+    try std.testing.expectEqualStrings("K", loaded.configs.items[0].env[0].key);
+    try std.testing.expectEqualStrings("expanded", loaded.configs.items[0].env[0].value);
+    // The read's note first, then the expansion's, then the name's; the name the request holds has none.
+    try std.testing.expectEqual(@as(usize, 3), loaded.diagnostics.items.len);
+    const notes = try renderNotes(alloc, loaded.diagnostics.items);
+    defer {
+        for (notes) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    try std.testing.expectEqualStrings("~/.fx/mcp.json server 'bad' was skipped: fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https.", notes[0]);
+    try std.testing.expect(std.mem.find(u8, notes[1], "'needs'") != null);
+    try std.testing.expect(std.mem.find(u8, notes[1], "FX_COMPOSE_UNSET") != null);
+    try std.testing.expectEqualStrings("~/.fx/mcp.json server 'evil\\x1b[31m' was skipped: its name has a character fx won't print.", notes[2]);
+}
+
+test "a profile server that fails to expand still shadows the project's server of the same name" {
+    const alloc = std.testing.allocator;
+    var loaded: NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    var profile = try project_config.parseProfileServers(alloc, "{\"mcpServers\":{\"web\":{\"command\":\"true\",\"env\":{\"K\":\"${FX_COMPOSE_UNSET}\"}}}}", &loaded.diagnostics);
+    var workspace = try project_config.parseWorkspaceJson(alloc, "{\"mcpServers\":{\"web\":{\"command\":\"false\"},\"other\":{\"command\":\"false\"}}}", .workspace, .{ .enable_all = true });
+    defer workspace.deinit(alloc);
+    try mergeNativeConfigs(alloc, &loaded, &profile, &workspace);
+    var inherited: std.process.Environ.Map = .init(alloc);
+    defer inherited.deinit();
+
+    try composeHostConfigs(alloc, &loaded, &.{}, &inherited);
+
+    // The terminal app merges before it expands, so `web` is the profile's, and gone with its note; so would an ACP session's be.
+    try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("other", loaded.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), loaded.diagnostics.items.len);
 }
 
 fn tmpDirPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
@@ -825,7 +909,7 @@ test "a profile config fx can't read fails with an error named for the file" {
     try tmp.dir.symLink(io_mod.getIo(), "loop.json", "loop.json", .{ .is_directory = false });
     const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop.json" });
     defer alloc.free(loop);
-    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop));
+    try std.testing.expectError(error.McpConfigLinkLoop, readProfile(alloc, loop, null));
 
     const big = try alloc.alloc(u8, 1024 * 1024 + 1);
     defer alloc.free(big);
@@ -833,7 +917,7 @@ test "a profile config fx can't read fails with an error named for the file" {
     try writeTempFile(&tmp, "big.json", big);
     const big_path = try std.Io.Dir.path.join(alloc, &.{ root, "big.json" });
     defer alloc.free(big_path);
-    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path));
+    try std.testing.expectError(error.McpConfigTooLarge, readProfile(alloc, big_path, null));
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {
@@ -1122,7 +1206,7 @@ test "a profile file with stdio and sse servers loads their transports, commands
         \\{"mcp":{"local":{"type":"local","command":["node","server.js"],"enabled":false},"remote":{"type":"sse","url":"https://mcp.example.com","enabled":true}}}
     );
 
-    var reloaded = try loadConfigFromPath(alloc, path);
+    var reloaded = try readProfile(alloc, path, null);
     defer freeConfigs(alloc, &reloaded);
 
     try std.testing.expectEqual(@as(usize, 2), reloaded.items.len);
@@ -1147,7 +1231,7 @@ test "a profile file with an http server loads its identity and headers" {
         \\{"mcp":{"local":{"type":"local","command":["node"]},"remote":{"type":"http","url":"https://api.example.com/mcp","headers":{"X-Workspace":"one"}}}}
     );
 
-    var reloaded = try loadConfigFromPath(alloc, path);
+    var reloaded = try readProfile(alloc, path, null);
     defer freeConfigs(alloc, &reloaded);
     try std.testing.expectEqual(@as(usize, 2), reloaded.items.len);
     try std.testing.expectEqual(McpTransport.http, reloaded.items[1].transport);
