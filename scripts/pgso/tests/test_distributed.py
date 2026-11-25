@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-import hashlib
 import json
 import os
 import subprocess
@@ -11,19 +10,19 @@ import textwrap
 import pathlib
 import dataclasses
 import re
+import types
 
 from scripts.pgso.corpus import Corpus, Scenario
 from scripts.pgso import linux, macos
 from scripts.pgso.distributed import (
     _load_documents,
+    _require_distributed_support,
     aggregate_measurement_shards,
     aggregate_scenario_shards,
-    collect_startup_profiles,
     matrix_payload,
     plan_shards,
     run_plan,
     select_corpus,
-    shard_startup_scenarios,
     validate_seed_identity,
 )
 from scripts.pgso.model import BuildIdentity, PgsoError
@@ -138,67 +137,21 @@ def scenario(name: str, timeout_seconds: float) -> Scenario:
     )
 
 
-def _job(workflow: str, job: str) -> str:
-    return re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
-
-
 class WorkflowContractTests(unittest.TestCase):
-    workflows = pathlib.Path(__file__).resolve().parents[3] / ".github/workflows"
-
     def test_producer_uploads_scope_overwrite_to_the_run_attempt(self) -> None:
-        jobs = ("seed", "train", "candidate", "behavior", "startup", "heavy", "aggregate")
-        for name, extra in (
-            ("pgso-macos-arm64.yml", ()),
-            ("pgso-linux-arm64.yml", ("unit-tests",)),
-            ("pgso-linux-x86_64.yml", ("unit-tests",)),
-        ):
-            workflow = (self.workflows / name).read_text()
-            for job in (*jobs, *extra):
-                with self.subTest(workflow=name, job=job):
-                    upload = _job(workflow, job).split("uses: actions/upload-artifact@", 1)[1]
-                    self.assertRegex(
-                        upload,
-                        r"(?m)^          name: .+-attempt-\$\{\{ github\.run_attempt \}\}$",
-                    )
-                    self.assertIn("          overwrite: true\n", upload)
-
-    def test_linux_artifacts_never_meet_another_platforms_artifacts(self) -> None:
-        # The release runs every PGSO workflow in one run, where artifact
-        # names and download patterns are shared.
-        for name, prefix in (
-            ("pgso-linux-arm64.yml", "pgso-linux-arm64-"),
-            ("pgso-linux-x86_64.yml", "pgso-linux-x86_64-"),
-        ):
-            workflow = (self.workflows / name).read_text()
-            names = re.findall(r"(?m)^          (?:name|pattern): (\S+)", workflow)
-            with self.subTest(workflow=name):
-                self.assertGreaterEqual(len(names), 12)
-                for artifact in names:
-                    self.assertTrue(artifact.startswith(prefix), artifact)
-
-    def test_linux_shards_carry_the_startup_profiles_and_the_control_link(self) -> None:
-        for name in ("pgso-linux-arm64.yml", "pgso-linux-x86_64.yml"):
-            workflow = (self.workflows / name).read_text()
-            with self.subTest(workflow=name):
-                seed = _job(workflow, "seed")
-                for path in (
-                    "fx-pgso-seed/logs\n",
-                    "fx-pgso-seed/cache/global/o/*/crt1.o\n",
-                    "fx-pgso-seed/cache/global/o/*/libc.a\n",
-                    "fx-pgso-seed/cache/global/o/*/libcompiler_rt.a\n",
-                ):
-                    self.assertIn(path, seed)
-                self.assertIn(
-                    "fx-pgso-training-${{ matrix.id }}/profiles/startup\n",
-                    _job(workflow, "train"),
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()
+        for job in ("seed", "train", "candidate", "behavior", "startup", "heavy", "aggregate"):
+            with self.subTest(job=job):
+                job_body = re.split(
+                    r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1
+                )[0]
+                upload = job_body.split("uses: actions/upload-artifact@", 1)[1]
+                self.assertRegex(
+                    upload,
+                    r"(?m)^          name: .+-attempt-\$\{\{ github\.run_attempt \}\}$",
                 )
-                # The recorded link names the seed's files by absolute path.
-                for job in ("seed", "candidate"):
-                    self.assertIn("$RUNNER_TEMP/fx-pgso-seed", _job(workflow, job))
-                self.assertIn(
-                    "path: ${{ runner.temp }}/fx-pgso-seed\n",
-                    _job(workflow, "candidate"),
-                )
+                self.assertIn("          overwrite: true\n", upload)
 
     def test_fx_jobs_upload_the_crash_reports_macos_wrote(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
@@ -738,94 +691,14 @@ class ShardAggregationTests(unittest.TestCase):
             )
 
 
-class StartupProfileShardTests(unittest.TestCase):
-    def test_each_shard_keeps_only_the_startup_scenarios_it_runs(self) -> None:
-        self.assertEqual(
-            ("direct-help", "direct-status"),
-            shard_startup_scenarios(
-                linux.STARTUP_SCENARIOS,
-                ("tui-resize", "direct-status", "direct-help"),
-            ),
-        )
-        self.assertEqual((), shard_startup_scenarios(linux.STARTUP_SCENARIOS, ("tui-resize",)))
-        self.assertEqual((), shard_startup_scenarios(macos.STARTUP_SCENARIOS, ("direct-help",)))
-
-    def write_shard(
-        self,
-        root: pathlib.Path,
-        shard: str,
-        profiles: dict[str, bytes],
-        recorded: dict[str, str] | None = None,
-    ) -> tuple[pathlib.Path, dict[str, object]]:
-        directory = root / f"pgso-linux-arm64-training-sha-{shard}-attempt-1"
-        (directory / "profiles" / "startup").mkdir(parents=True)
-        for name, content in profiles.items():
-            (directory / "profiles" / "startup" / f"{name}.profdata").write_bytes(content)
-        if recorded is None:
-            recorded = {
-                name: hashlib.sha256(content).hexdigest()
-                for name, content in profiles.items()
-            }
-        manifest = directory / "manifest.json"
-        document: dict[str, object] = {"startup_profiles": recorded}
-        manifest.write_text(json.dumps(document))
-        return manifest, document
-
-    def test_candidate_collects_every_startup_profile_from_the_shards(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            one = self.write_shard(root, "one", {"direct-help": b"help", "direct-version": b"version"})
-            two = self.write_shard(root, "two", {"direct-status": b"status"})
-            three = self.write_shard(root, "three", {})
-            destination = root / "candidate" / "profiles" / "startup"
-            hashes = collect_startup_profiles(
-                (one[0], two[0], three[0]),
-                (one[1], two[1], three[1]),
-                ("direct-help", "direct-version", "direct-status"),
-                destination,
-            )
-            self.assertEqual(
-                ["direct-help", "direct-version", "direct-status"],
-                list(hashes),
-            )
-            self.assertEqual(hashlib.sha256(b"status").hexdigest(), hashes["direct-status"])
-            self.assertEqual(b"help", (destination / "direct-help.profdata").read_bytes())
-
-    def test_macos_shards_without_startup_profiles_collect_nothing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            manifest = root / "manifest.json"
-            self.assertEqual(
-                {},
-                collect_startup_profiles((manifest,), ({},), macos.STARTUP_SCENARIOS, root / "out"),
-            )
-
-    def test_candidate_rejects_missing_duplicate_unexpected_or_changed_profiles(self) -> None:
-        cases = (
-            ("missing startup profile: direct-version", [{"direct-help": b"help"}], None),
-            ("duplicate startup profile: direct-help",
-             [{"direct-help": b"help", "direct-version": b"v"}, {"direct-help": b"help"}], None),
-            ("unexpected startup profile: direct-doctor",
-             [{"direct-help": b"help", "direct-version": b"v", "direct-doctor": b"d"}], None),
-            ("direct-help startup profile hash mismatch",
-             [{"direct-help": b"changed", "direct-version": b"v"}],
-             {"direct-help": hashlib.sha256(b"help").hexdigest(),
-              "direct-version": hashlib.sha256(b"v").hexdigest()}),
-        )
-        for message, shards, recorded in cases:
-            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
-                root = pathlib.Path(temporary)
-                written = [
-                    self.write_shard(root, f"shard-{index}", profiles, recorded)
-                    for index, profiles in enumerate(shards)
-                ]
-                with self.assertRaisesRegex(PgsoError, message):
-                    collect_startup_profiles(
-                        [manifest for manifest, _ in written],
-                        [document for _, document in written],
-                        ("direct-help", "direct-version"),
-                        root / "out",
-                    )
+class DistributedSupportTests(unittest.TestCase):
+    def test_platforms_with_a_startup_exemption_cannot_build_distributed(self) -> None:
+        _require_distributed_support(types.SimpleNamespace(platform=macos))
+        for platform in (linux.ARM64, linux.X86_64):
+            with self.subTest(target=platform.TARGET), self.assertRaisesRegex(
+                PgsoError, f"startup profiles that {platform.DISPLAY_NAME} candidates need"
+            ):
+                _require_distributed_support(types.SimpleNamespace(platform=platform))
 
 
 if __name__ == "__main__":

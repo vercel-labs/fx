@@ -731,7 +731,7 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
                 workflow = workflow_path.read_text(encoding="utf-8")
                 triggers = workflow.split("\njobs:\n", 1)[0]
                 self.assertIn("  workflow_call:\n", triggers)
-                self.assertIn("value: ${{ jobs.aggregate.outputs.artifact-id }}", triggers)
+                self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
                 self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
                 self.assertIn(
                     "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
@@ -766,24 +766,28 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("          name: fx-${{ matrix.name }}\n", package)
 
     def test_the_evidence_artifact_keeps_the_candidate_at_its_root(self) -> None:
-        # package-linux reads candidate/fx and manifest.json from the root of
-        # the evidence artifact, which is the folder `distributed aggregate`
-        # writes them to.
+        # upload-artifact roots an artifact at the deepest directory its paths
+        # share, and package-linux reads candidate/fx and manifest.json from
+        # that root, so every evidence path stays under fx-pgso/.
         for workflow_path in (PGSO_LINUX_WORKFLOW_PATH, PGSO_LINUX_X86_64_WORKFLOW_PATH):
             with self.subTest(workflow=workflow_path.name):
                 workflow = workflow_path.read_text(encoding="utf-8")
-                aggregate = workflow.split("\n  aggregate:\n", 1)[1]
-                self.assertIn('--output-dir "$RUNNER_TEMP/fx-pgso-aggregate"', aggregate)
-                evidence = aggregate.split("      - name: Upload evidence\n", 1)[1]
-                self.assertIn("        id: upload\n", evidence)
-                self.assertIn("          path: ${{ runner.temp }}/fx-pgso-aggregate\n", evidence)
+                evidence = workflow.split("      - name: Upload evidence\n", 1)[1].split(
+                    "\n      - name:", 1
+                )[0]
+                block = evidence.split("          path: |\n", 1)[1].split(
+                    "\n          if-no-files-found:", 1
+                )[0]
+                paths = [line.strip() for line in block.splitlines()]
+                self.assertIn("${{ runner.temp }}/fx-pgso/candidate/fx", paths)
+                self.assertIn("${{ runner.temp }}/fx-pgso/manifest.json", paths)
+                self.assertEqual("${{ runner.temp }}/fx-pgso", os.path.commonpath(paths))
                 logs = workflow.split("      - name: Upload unit test logs\n", 1)[1].split(
-                    "\n  seed:\n", 1
+                    "\n      - name:", 1
                 )[0]
                 self.assertIn("if: always()", logs)
                 self.assertIn("path: ${{ runner.temp }}/fx-pgso-unit-tests/logs\n", logs)
                 self.assertNotIn("id: upload", logs)
-                self.assertIn("needs: [unit-tests, candidate, behavior, startup, heavy]", aggregate)
 
     def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
         package = self.release_job("package-linux")

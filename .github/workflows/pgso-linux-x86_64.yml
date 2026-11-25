@@ -2,19 +2,20 @@ name: Linux x86_64 PGSO candidate
 
 # Pull requests run PGSO only when the PGSO pipeline itself changes. Dispatch
 # this workflow on any branch to qualify other changes; the stable release
-# always runs it. The release runs every PGSO workflow in one run, so each
-# artifact name starts with pgso-linux-x86_64 to keep the platforms apart.
+# always runs it. One job builds and qualifies the candidate, because
+# distributed builds don't carry the startup profiles that Linux candidates
+# need.
 on:
   workflow_call:
     inputs:
       evidence-retention-days:
-        description: Days to keep the qualified aggregate evidence
+        description: Days to keep the qualified evidence
         type: number
         default: 14
     outputs:
       artifact-id:
         description: Qualified PGSO evidence artifact ID
-        value: ${{ jobs.aggregate.outputs.artifact-id }}
+        value: ${{ jobs.candidate.outputs.artifact-id }}
   workflow_dispatch:
   pull_request:
     paths:
@@ -28,7 +29,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  actions: read
   contents: read
 
 env:
@@ -37,12 +37,12 @@ env:
   FX_SOUND: "0"
 
 jobs:
-  # The driver tests and the unit tests on transformed code don't feed the
-  # candidate, so they run beside it, and aggregate waits for them.
-  unit-tests:
-    name: Unit tests on transformed code
+  candidate:
+    name: Linux x86_64 PGSO candidate
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 345
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -56,6 +56,8 @@ jobs:
         uses: ./.github/actions/setup-pgso
         with:
           llvm: "true"
+          bun: "true"
+          hyperfine: "true"
 
       - name: Test the PGSO driver
         env:
@@ -76,490 +78,43 @@ jobs:
             --output-dir "$RUNNER_TEMP/fx-pgso-unit-tests" \
             --target x86_64-linux
 
-      - name: Upload unit test logs
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-unit-tests-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: ${{ runner.temp }}/fx-pgso-unit-tests/logs
-          if-no-files-found: warn
-          retention-days: ${{ inputs.evidence-retention-days || 14 }}
+      - name: Install E2E dependencies
+        run: bun install --frozen-lockfile
+        working-directory: tests/e2e
 
-  seed:
-    name: Build seed and plan shards
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    outputs:
-      artifact-id: ${{ steps.upload.outputs.artifact-id }}
-      training: ${{ steps.plan.outputs.training }}
-      behavior: ${{ steps.plan.outputs.behavior }}
-      startup: ${{ steps.plan.outputs.startup }}
-      heavy: ${{ steps.plan.outputs.heavy }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Setup pinned tools
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          llvm: "true"
-          bun: "true"
-          hyperfine: "true"
-
-      - name: Build immutable seed artifacts
+      - name: Build and qualify the candidate
         run: |
-          python3 -m scripts.pgso build \
+          python3 -m scripts.pgso all \
             --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-seed" \
+            --output-dir "$RUNNER_TEMP/fx-pgso" \
             --target x86_64-linux \
             --update-channel stable \
+            --samples 50 \
             --bun "${{ steps.setup.outputs.bun-bin }}" \
             --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}"
 
-      - name: Plan non-empty shards
-        id: plan
-        run: |
-          training="$(python3 -m scripts.pgso.distributed plan --phase training --maximum-shards 20)"
-          behavior="$(python3 -m scripts.pgso.distributed plan --phase behavior --maximum-shards 20)"
-          startup="$(python3 -m scripts.pgso.distributed plan --phase startup)"
-          heavy="$(python3 -m scripts.pgso.distributed plan --phase heavy)"
-          {
-            echo "training=$training"
-            echo "behavior=$behavior"
-            echo "startup=$startup"
-            echo "heavy=$heavy"
-          } >> "$GITHUB_OUTPUT"
-          echo "Training matrix: $training"
-          echo "Behavior matrix: $behavior"
-          echo "Startup matrix: $startup"
-          echo "Heavy matrix: $heavy"
-
-      # The candidate link replays the control's link from
-      # logs/control-link.json, which names the C runtime, libc, and compiler
-      # runtime in the seed's cache. The candidate job downloads the seed to
-      # this same path, and the link checks each file's hash.
-      - name: Upload immutable seed
-        id: upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-seed-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-seed/manifest.json
-            ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
-            ${{ runner.temp }}/fx-pgso-seed/ir/pgso/fx.bc
-            ${{ runner.temp }}/fx-pgso-seed/instrumented/fx
-            ${{ runner.temp }}/fx-pgso-seed/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-seed/logs
-            ${{ runner.temp }}/fx-pgso-seed/cache/global/o/*/crt1.o
-            ${{ runner.temp }}/fx-pgso-seed/cache/global/o/*/libc.a
-            ${{ runner.temp }}/fx-pgso-seed/cache/global/o/*/libcompiler_rt.a
-          if-no-files-found: error
-          retention-days: 14
-
-  train:
-    name: Train ${{ matrix.id }}
-    needs: seed
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      max-parallel: 20
-      matrix: ${{ fromJSON(needs.seed.outputs.training) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Setup pinned tools
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          llvm: "true"
-          bun: "true"
-
-      - name: Install zsh
-        run: |
-          command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
-          echo 'skip_global_compinit=1' | sudo tee -a /etc/zsh/zshenv >/dev/null
-
-      - name: Install E2E dependencies
-        run: bun install --frozen-lockfile
-        working-directory: tests/e2e
-
-      - name: Download immutable seed
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.seed.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-seed
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
-
-      - name: Run assigned training scenarios
-        run: |
-          python3 -m scripts.pgso.distributed train-shard \
-            --seed-dir "$RUNNER_TEMP/fx-pgso-seed" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-training-${{ matrix.id }}" \
-            --shard-id "${{ matrix.id }}" \
-            --scenarios "${{ matrix.scenarios }}" \
-            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
-            --bun "${{ steps.setup.outputs.bun-bin }}"
-
-      - name: Upload training evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-training-${{ github.sha }}-${{ matrix.id }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/manifest.json
-            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/failure.json
-            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/profile.profdata
-            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/profiles/startup
-            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/logs
-          if-no-files-found: error
-          retention-days: 14
-
-  candidate:
-    name: Merge profiles and build candidate
-    needs: [seed, train]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    outputs:
-      artifact-id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Setup pinned tools
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          llvm: "true"
-
-      - name: Download immutable seed
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.seed.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-seed
-
-      - name: Download all training shards
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: pgso-linux-x86_64-training-${{ github.sha }}-*
-          path: ${{ runner.temp }}/fx-pgso-training
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
-
-      - name: Build the one production candidate
-        run: |
-          python3 -m scripts.pgso.distributed candidate \
-            --seed-dir "$RUNNER_TEMP/fx-pgso-seed" \
-            --shards-dir "$RUNNER_TEMP/fx-pgso-training" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}"
-
-      - name: Upload candidate and build evidence
-        id: upload
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-candidate-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-candidate/manifest.json
-            ${{ runner.temp }}/fx-pgso-candidate/failure.json
-            ${{ runner.temp }}/fx-pgso-candidate/control/bin/fx
-            ${{ runner.temp }}/fx-pgso-candidate/candidate/fx
-            ${{ runner.temp }}/fx-pgso-candidate/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/profiles/supplements
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/candidate/file-index-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/file_index/profiles/production.proftext
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/external-control/ui-activity-progress-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/candidate/ui-activity-progress-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/ui_activity/profiles/production.proftext
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/merged.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/production.profdata
-            ${{ runner.temp }}/fx-pgso-candidate/heavy/approval_review/profiles/production.proftext
-            ${{ runner.temp }}/fx-pgso-candidate/logs
-          if-no-files-found: error
-          retention-days: 14
-
-  behavior:
-    name: Verify ${{ matrix.id }}
-    needs: [seed, candidate]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      max-parallel: 20
-      matrix: ${{ fromJSON(needs.seed.outputs.behavior) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Setup pinned tools
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          zig: "true"
-          bun: "true"
-
-      - name: Install zsh
-        run: |
-          command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
-          echo 'skip_global_compinit=1' | sudo tee -a /etc/zsh/zshenv >/dev/null
-
-      - name: Install E2E dependencies
-        run: bun install --frozen-lockfile
-        working-directory: tests/e2e
-
-      - name: Download candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-candidate
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
-
-      - name: Run assigned behavior scenarios
-        run: |
-          python3 -m scripts.pgso.distributed behavior-shard \
-            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-behavior-${{ matrix.id }}" \
-            --shard-id "${{ matrix.id }}" \
-            --scenarios "${{ matrix.scenarios }}" \
-            --bun "${{ steps.setup.outputs.bun-bin }}"
-
-      - name: Upload behavior evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-behavior-${{ github.sha }}-${{ matrix.id }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/manifest.json
-            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/failure.json
-            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/logs
-            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/traces
-            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/driver-logs
-          if-no-files-found: error
-          retention-days: 14
-
-  startup:
-    name: Startup ${{ matrix.name }}
-    needs: [seed, candidate]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix: ${{ fromJSON(needs.seed.outputs.startup) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Setup pinned Hyperfine
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          hyperfine: "true"
-
-      - name: Download candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-candidate
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
-
-      - name: Measure same-runner control and candidate
-        run: |
-          python3 -m scripts.pgso.distributed measure \
-            --kind startup \
-            --name "${{ matrix.name }}" \
-            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-startup-${{ matrix.name }}" \
-            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
-            --samples 50
-
-      - name: Upload startup evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-startup-${{ github.sha }}-${{ matrix.name }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/manifest.json
-            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/failure.json
-            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/measurements/logs
-            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/driver-logs
-          if-no-files-found: error
-          retention-days: 14
-
-  heavy:
-    name: Heavy ${{ matrix.name }}
-    needs: [seed, candidate]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix: ${{ fromJSON(needs.seed.outputs.heavy) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Download candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-candidate
-
-      - name: Restore executable mode
-        run: |
-          chmod +x \
-            "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" \
-            "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/external-control/file-index-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/file_index/candidate/file-index-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/ui_activity/external-control/ui-activity-progress-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/ui_activity/candidate/ui-activity-progress-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/external-control/approval-review-bench" \
-            "$RUNNER_TEMP/fx-pgso-candidate/heavy/approval_review/candidate/approval-review-bench"
-
-      - name: Setup pinned Hyperfine
-        id: setup
-        uses: ./.github/actions/setup-pgso
-        with:
-          hyperfine: "true"
-
-      - name: Measure immutable profile-linked benchmark pair
-        run: |
-          python3 -m scripts.pgso.distributed measure \
-            --kind heavy \
-            --name "${{ matrix.name }}" \
-            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-heavy-${{ matrix.name }}" \
-            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
-            --samples 50
-
-      - name: Upload heavy-workload evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pgso-linux-x86_64-heavy-${{ github.sha }}-${{ matrix.name }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/manifest.json
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/failure.json
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/measurements/logs
-            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/driver-logs
-          if-no-files-found: error
-          retention-days: 14
-
-  aggregate:
-    name: Aggregate release eligibility
-    needs: [unit-tests, candidate, behavior, startup, heavy]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    outputs:
-      artifact-id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Require native x86_64 host
-        run: test "$(uname -m)" = x86_64
-
-      - name: Download candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.candidate.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/fx-pgso-candidate
-
-      - name: Download behavior evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: pgso-linux-x86_64-behavior-${{ github.sha }}-*
-          path: ${{ runner.temp }}/fx-pgso-behavior
-
-      - name: Download startup evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: pgso-linux-x86_64-startup-${{ github.sha }}-*
-          path: ${{ runner.temp }}/fx-pgso-startup
-
-      - name: Download heavy-workload evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: pgso-linux-x86_64-heavy-${{ github.sha }}-*
-          path: ${{ runner.temp }}/fx-pgso-heavy
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
-
-      - name: Aggregate fail-closed evidence
-        run: |
-          python3 -m scripts.pgso.distributed aggregate \
-            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
-            --behavior-dir "$RUNNER_TEMP/fx-pgso-behavior" \
-            --startup-dir "$RUNNER_TEMP/fx-pgso-startup" \
-            --heavy-dir "$RUNNER_TEMP/fx-pgso-heavy" \
-            --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
-
-      # The release reads candidate/fx and manifest.json from the root of
-      # this artifact.
       - name: Upload evidence
         id: upload
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-linux-x86_64-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          overwrite: true
-          path: ${{ runner.temp }}/fx-pgso-aggregate
-          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/fx-pgso/manifest.json
+            ${{ runner.temp }}/fx-pgso/logs
+            ${{ runner.temp }}/fx-pgso/measurements
+            ${{ runner.temp }}/fx-pgso/candidate/fx
+          if-no-files-found: warn
+          retention-days: ${{ inputs.evidence-retention-days || 14 }}
+
+      # Its own artifact: upload-artifact roots an artifact at the deepest
+      # directory its paths share, and the release reads candidate/fx and
+      # manifest.json from the root of the evidence above.
+      - name: Upload unit test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pgso-linux-x86_64-unit-tests-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fx-pgso-unit-tests/logs
+          if-no-files-found: warn
           retention-days: ${{ inputs.evidence-retention-days || 14 }}
