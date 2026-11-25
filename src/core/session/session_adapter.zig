@@ -2004,9 +2004,10 @@ pub const Session = struct {
     /// The session's token totals as its newest `set usage` holds them
     /// (D92), read from the log on the first reply this process records.
     usage: ?types.Usage = null,
-    /// Highest accepted/delivered/withdrawn input id seen in this session's
-    /// log, or null when a resumed session has not scanned the log yet.
-    max_seen_input_id: ?u64 = null,
+    /// Next accepted-input id candidate on this session handle.
+    next_input_id: u64 = 1,
+    /// Highest log seq known on this session, guarded by `host.write_lock`.
+    last_seq: u64 = 0,
     /// Highest log seq present when this resumed session opened, so background
     /// restore ignores inputs accepted after resume.
     opened_last_seq: u64 = 0,
@@ -2020,7 +2021,6 @@ pub const Session = struct {
         errdefer handle.release();
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
-        self.max_seen_input_id = 0;
         try self.appendSeed(seed);
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
@@ -2091,7 +2091,6 @@ pub const Session = struct {
         const self = try init(alloc, store, handle, false);
         errdefer self.destroyInner();
         self.root = false;
-        self.max_seen_input_id = 0;
         if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
         try self.appendSeed(seed);
         return self;
@@ -2198,6 +2197,7 @@ pub const Session = struct {
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
         self.opened_last_seq = state.last_seq;
+        self.last_seq = state.last_seq;
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
@@ -2237,6 +2237,7 @@ pub const Session = struct {
         const batch = try listPending(a, with_records, pending);
         write_test_controls.recordWriteBatch(batch.events);
         const seq = if (self.import_ts) |ts| try self.handle.appendAt(batch.events, ts) else try self.handle.append(batch.events);
+        if (self.saved()) self.last_seq = @max(self.last_seq, seq);
         if (batch.listed) self.host.listed(pending);
         if (due) |records| self.host.recordsWritten(records);
         if (self.root) for (events) |event| switch (event) {
@@ -2979,11 +2980,12 @@ pub const Session = struct {
     };
 
     /// Accepted prompts read from the session log. Caller owns `ids`, `texts`,
-    /// and `images`, and frees them with `deinit(alloc)`.
+    /// `images`, and `unreadable_ids`, and frees them with `deinit(alloc)`.
     pub const PendingAcceptedInputs = struct {
         ids: []u64,
         texts: [][]u8,
         images: [][]PendingAcceptedImage,
+        unreadable_ids: []u64 = &.{},
 
         pub fn deinit(self: *PendingAcceptedInputs, alloc: Allocator) void {
             for (self.texts) |t| alloc.free(t);
@@ -2994,12 +2996,13 @@ pub const Session = struct {
             }
             alloc.free(self.images);
             alloc.free(self.ids);
+            alloc.free(self.unreadable_ids);
             self.* = undefined;
         }
     };
 
     /// Records `input_accepted` without fsync and returns the assigned id,
-    /// strictly above any id previously seen in this session's log. Texts larger
+    /// strictly above `last_seq` and any earlier id on this handle. Texts larger
     /// than `max_inline_piece_bytes` are stored as a session blob like `itemAs`
     /// when the session is live on disk. Allocates no returned memory.
     pub fn recordInputAccepted(self: *Session, text: []const u8) !u64 {
@@ -3015,12 +3018,13 @@ pub const Session = struct {
     ) !u64 {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        const prev_max = self.max_seen_input_id orelse blk: {
-            const scanned = try self.scanMaxInputIdLocked();
-            self.max_seen_input_id = scanned;
-            break :blk scanned;
+        const known_last_seq = blk: {
+            self.host.write_lock.lockUncancelable(io_mod.getIo());
+            defer self.host.write_lock.unlock(io_mod.getIo());
+            break :blk self.last_seq;
         };
-        const input_id = std.math.add(u64, prev_max, 1) catch return error.InvalidArgument;
+        const next_from_seq = std.math.add(u64, known_last_seq, 1) catch return error.InvalidArgument;
+        const input_id = @max(self.next_input_id, next_from_seq);
 
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -3040,7 +3044,7 @@ pub const Session = struct {
                     .blobs = &refs,
                     .images = image_refs,
                 } }});
-                self.max_seen_input_id = input_id;
+                self.next_input_id = input_id +| 1;
                 return input_id;
             } else |err| switch (err) {
                 // Before turn 1, the session is held in memory without a blobs directory.
@@ -3053,7 +3057,7 @@ pub const Session = struct {
             .text = text,
             .images = image_refs,
         } }});
-        self.max_seen_input_id = input_id;
+        self.next_input_id = input_id +| 1;
         return input_id;
     }
 
@@ -3104,24 +3108,6 @@ pub const Session = struct {
         _ = try self.write(events);
     }
 
-    /// Result of scanning a session log for pending accepted inputs.
-    pub const PendingInputsScan = struct {
-        pending: PendingAcceptedInputs,
-        max_seen_input_id: u64,
-
-        pub fn deinit(self: *PendingInputsScan, alloc: Allocator) void {
-            self.pending.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    /// Records `max_id` if higher than any input id already observed on `self`.
-    pub fn observeMaxInputId(self: *Session, max_id: u64) void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        self.max_seen_input_id = if (self.max_seen_input_id) |seen| @max(seen, max_id) else max_id;
-    }
-
     /// A reader of this session's log for background pending-input restore.
     /// Retains the session's `BlobHost` and never touches `*Session`, so the
     /// session can close while the background scan runs.
@@ -3141,12 +3127,7 @@ pub const Session = struct {
     pub fn pendingAcceptedInputs(self: *Session, alloc: Allocator) !PendingAcceptedInputs {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        const scan = try scanPendingAcceptedInputs(self.source(), alloc, null, null);
-        self.max_seen_input_id = if (self.max_seen_input_id) |seen|
-            @max(seen, scan.max_seen_input_id)
-        else
-            scan.max_seen_input_id;
-        return scan.pending;
+        return scanPendingAcceptedInputs(self.source(), alloc, null, null);
     }
 
     fn scanPendingAcceptedInputs(
@@ -3154,13 +3135,18 @@ pub const Session = struct {
         alloc: Allocator,
         up_to_seq: ?u64,
         cancel_requested: ?*const std.atomic.Value(bool),
-    ) !PendingInputsScan {
-        const AcceptedItem = struct { id: u64, text: []u8, images: []PendingAcceptedImage };
+    ) !PendingAcceptedInputs {
+        const AcceptedItem = struct {
+            id: u64,
+            text: ?[]u8 = null,
+            images: []PendingAcceptedImage = &.{},
+            unreadable_err: ?anyerror = null,
+        };
         var accepted: std.ArrayList(AcceptedItem) = .empty;
         var moved = false;
         errdefer if (!moved) {
             for (accepted.items) |item_entry| {
-                alloc.free(item_entry.text);
+                if (item_entry.text) |t| alloc.free(t);
                 for (item_entry.images) |img| img.deinit(alloc);
                 alloc.free(item_entry.images);
             }
@@ -3169,7 +3155,6 @@ pub const Session = struct {
         var settled: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer settled.deinit(alloc);
 
-        var max_id: u64 = 0;
         var from: sm.From = .start;
         while (true) {
             if (cancel_requested) |flag| {
@@ -3188,55 +3173,81 @@ pub const Session = struct {
                 const body = entry.body orelse continue;
                 switch (body) {
                     .input_accepted => |a| {
-                        max_id = @max(max_id, a.id);
-                        const copy = try acceptedInputText(src, alloc, a);
-                        errdefer alloc.free(copy);
-                        const imgs = try dupePendingAcceptedImages(alloc, a.images);
-                        errdefer {
-                            for (imgs) |img| img.deinit(alloc);
-                            alloc.free(imgs);
+                        if (acceptedInputText(src, alloc, a)) |copy| {
+                            if (dupePendingAcceptedImages(alloc, a.images)) |imgs| {
+                                accepted.append(alloc, .{ .id = a.id, .text = copy, .images = imgs }) catch |append_err| {
+                                    alloc.free(copy);
+                                    for (imgs) |img| img.deinit(alloc);
+                                    alloc.free(imgs);
+                                    return append_err;
+                                };
+                            } else |err| {
+                                alloc.free(copy);
+                                switch (err) {
+                                    error.InvalidSessionFormat => try accepted.append(alloc, .{ .id = a.id, .unreadable_err = err }),
+                                    else => return err,
+                                }
+                            }
+                        } else |err| switch (err) {
+                            error.InvalidSessionFormat => try accepted.append(alloc, .{ .id = a.id, .unreadable_err = err }),
+                            else => return err,
                         }
-                        try accepted.append(alloc, .{ .id = a.id, .text = copy, .images = imgs });
                     },
                     .input_delivered, .input_withdrawn => |r| {
-                        max_id = @max(max_id, r.id);
                         try settled.put(alloc, r.id, {});
                     },
                     else => {},
                 }
             }
             if (reached_limit) break;
+            if (page.damaged) return error.Corrupt;
             from = .{ .at = page.next orelse break };
         }
 
         var pending_count: usize = 0;
+        var unreadable_count: usize = 0;
         for (accepted.items) |item_entry| {
-            if (!settled.contains(item_entry.id)) pending_count += 1;
+            if (settled.contains(item_entry.id)) continue;
+            if (item_entry.text != null) {
+                pending_count += 1;
+            } else {
+                unreadable_count += 1;
+            }
         }
         const ids = try alloc.alloc(u64, pending_count);
         errdefer alloc.free(ids);
         const texts = try alloc.alloc([]u8, pending_count);
         errdefer alloc.free(texts);
         const images_out = try alloc.alloc([]PendingAcceptedImage, pending_count);
+        errdefer alloc.free(images_out);
+        const unreadable_ids = try alloc.alloc(u64, unreadable_count);
         moved = true;
 
         var out: usize = 0;
+        var bad_out: usize = 0;
         for (accepted.items) |item_entry| {
             if (settled.contains(item_entry.id)) {
-                alloc.free(item_entry.text);
+                if (item_entry.text) |t| alloc.free(t);
                 for (item_entry.images) |img| img.deinit(alloc);
                 alloc.free(item_entry.images);
-            } else {
+            } else if (item_entry.text) |t| {
                 ids[out] = item_entry.id;
-                texts[out] = item_entry.text;
+                texts[out] = t;
                 images_out[out] = item_entry.images;
                 out += 1;
+            } else {
+                const err = item_entry.unreadable_err orelse error.InvalidSessionFormat;
+                debug_trace.logf("session", "event=accepted_input_unreadable id={d} err={s}", .{ item_entry.id, @errorName(err) });
+                unreadable_ids[bad_out] = item_entry.id;
+                bad_out += 1;
             }
         }
         accepted.deinit(alloc);
         return .{
-            .pending = .{ .ids = ids, .texts = texts, .images = images_out },
-            .max_seen_input_id = max_id,
+            .ids = ids,
+            .texts = texts,
+            .images = images_out,
+            .unreadable_ids = unreadable_ids,
         };
     }
 
@@ -3288,28 +3299,6 @@ pub const Session = struct {
             }
         }
         return alloc.dupe(u8, accepted.text);
-    }
-
-    fn scanMaxInputIdLocked(self: *Session) !u64 {
-        var scratch = std.heap.ArenaAllocator.init(self.alloc);
-        defer scratch.deinit();
-        var max_id: u64 = 0;
-        var from: sm.From = .start;
-        while (true) {
-            _ = scratch.reset(.retain_capacity);
-            var page = try self.source().readTo(scratch.allocator(), from, .forward, replay_page_lines);
-            defer page.deinit();
-            for (page.entries) |entry| {
-                const body = entry.body orelse continue;
-                switch (body) {
-                    .input_accepted => |a| max_id = @max(max_id, a.id),
-                    .input_delivered, .input_withdrawn => |r| max_id = @max(max_id, r.id),
-                    else => {},
-                }
-            }
-            from = .{ .at = page.next orelse break };
-        }
-        return max_id;
     }
 
     pub fn interruptedRequest(self: *Session) !?InterruptedRequest {
@@ -4175,6 +4164,8 @@ pub const Session = struct {
         defer arena.deinit();
         const state = try handle.state(arena.allocator());
         copy.last_turn = state.last_turn;
+        copy.opened_last_seq = state.last_seq;
+        copy.last_seq = state.last_seq;
         if (options.title) |title| try copy.rename(try forkTitle(arena.allocator(), title));
         traceWiring("Fork", copy.id(), "", copy.store.pid);
         return copy;
@@ -4542,6 +4533,7 @@ const Source = struct {
     }
 
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
+        if (builtin.is_test) _ = test_read_to_count.fetchAdd(1, .monotonic);
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
         // A `CycleReader` on another thread: through the host, which knows
         // whether the session is still open.
@@ -4720,15 +4712,24 @@ pub const PendingInputsReader = struct {
         return .{ .store = self.store, .id = self.host.id, .host = self.host };
     }
 
-    /// Caller owns the returned `PendingInputsScan` and frees it with `deinit(alloc)`.
+    /// Caller owns the returned `PendingAcceptedInputs` and frees it with `deinit(alloc)`.
     pub fn read(
         self: *const PendingInputsReader,
         alloc: Allocator,
         cancel_requested: ?*const std.atomic.Value(bool),
-    ) !Session.PendingInputsScan {
+    ) !Session.PendingAcceptedInputs {
         return Session.scanPendingAcceptedInputs(self.source(), alloc, self.up_to_seq, cancel_requested);
     }
 };
+
+/// Writes the shared count phrase used by TUI and ACP restore notices.
+pub fn writeUndeliveredPromptPrefix(writer: *std.Io.Writer, prompt_count: usize) !void {
+    if (prompt_count == 1) {
+        try writer.writeAll("1 prompt you sent before fx stopped was not delivered");
+    } else {
+        try writer.print("{d} prompts you sent before fx stopped were not delivered", .{prompt_count});
+    }
+}
 
 /// The turns of one compaction cycle from `src`, each handed to
 /// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
@@ -15406,7 +15407,8 @@ test "accepted input ids continue after session reopen" {
     const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = sid }, "/w", .app);
     defer reopened.close();
     const id3 = try reopened.recordInputAccepted("third");
-    try testing.expectEqual(@as(u64, 3), id3);
+    try testing.expect(id3 > id2);
+    try testing.expectEqual(reopened.opened_last_seq + 1, id3);
 
     var pending = try reopened.pendingAcceptedInputs(testing.allocator);
     defer pending.deinit(testing.allocator);
@@ -15446,6 +15448,41 @@ test "input records held before turn 1 publish with turn 1" {
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("turn one", restored.history[0].assistant.user.text);
+}
+
+var test_read_to_count: if (builtin.is_test) std.atomic.Value(usize) else void = if (builtin.is_test) .init(0) else {};
+
+test "eb03: recordInputAccepted assigns ids across reopen without reading old records and stays unique before turn 1" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+
+    const id1 = try s.recordInputAccepted("held one");
+    const id2 = try s.recordInputAccepted("held two");
+    try testing.expect(id1 >= 1);
+    try testing.expect(id2 > id1);
+    try s.recordInputWithdrawn(id2);
+
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    s.close();
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = sid }, "/w", .app);
+    defer reopened.close();
+    const reads_before = test_read_to_count.load(.acquire);
+    const id3 = try reopened.recordInputAccepted("after reopen");
+    try testing.expectEqual(reads_before, test_read_to_count.load(.acquire));
+    try testing.expect(id3 > id2);
+
+    var pending = try reopened.pendingAcceptedInputs(testing.allocator);
+    defer pending.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{ id1, id3 }, pending.ids);
 }
 
 test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and has empty pendingAcceptedInputs" {

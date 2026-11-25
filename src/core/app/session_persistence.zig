@@ -1050,29 +1050,29 @@ pub const PendingInputRestore = struct {
         cancel_requested: std.atomic.Value(bool) = .init(false),
         session_id: []u8,
         reader: session_adapter.PendingInputsReader,
-        scan: ?session_adapter.Session.PendingInputsScan = null,
+        pending: ?session_adapter.Session.PendingAcceptedInputs = null,
         image_verified: [][]bool = &.{},
         failure: ?anyerror = null,
         next: ?*Task = null,
 
         fn run(self: *Task) void {
             defer self.done.store(true, .release);
-            var scan = self.reader.read(alloc, &self.cancel_requested) catch |err| {
+            var pending = self.reader.read(alloc, &self.cancel_requested) catch |err| {
                 self.failure = err;
                 return;
             };
-            errdefer scan.deinit(alloc);
-            const verified = verifyAcceptedImages(scan.pending.images, &self.cancel_requested) catch |err| {
+            errdefer pending.deinit(alloc);
+            const verified = verifyAcceptedImages(pending.images, &self.cancel_requested) catch |err| {
                 self.failure = err;
                 return;
             };
             self.image_verified = verified;
-            self.scan = scan;
+            self.pending = pending;
         }
 
         pub fn deinit(self: *Task) void {
             freeVerifiedImages(self.image_verified);
-            if (self.scan) |*scan| scan.deinit(alloc);
+            if (self.pending) |*pending| pending.deinit(alloc);
             self.reader.deinit();
             alloc.free(self.session_id);
             alloc.destroy(self);
@@ -1170,18 +1170,6 @@ pub const PendingInputRestore = struct {
                 prev = task;
             }
             curr = next;
-        }
-    }
-
-    /// Waits directly for the running background task's `Future` without polling.
-    pub fn awaitRunning(self: *PendingInputRestore) void {
-        const task = switch (self.state) {
-            .running => |t| t,
-            .idle, .queued => return,
-        };
-        if (task.future) |*future| {
-            future.await(io_mod.getIo());
-            task.future = null;
         }
     }
 

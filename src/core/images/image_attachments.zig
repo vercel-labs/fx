@@ -1251,11 +1251,42 @@ fn openSnapshotFileNoFollow(path: []const u8) !std.Io.File {
 
     var parent = try openDirectoryNoFollow(parent_path);
     defer parent.close(io_mod.getIo());
-    return parent.openFile(io_mod.getIo(), name, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| return unsafeSnapshotPathError(err);
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return parent.openFile(io_mod.getIo(), name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| return unsafeSnapshotPathError(err);
+    }
+
+    var name_buf: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    if (name.len > std.Io.Dir.max_name_bytes) return error.NameTooLong;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+
+    // Nonblocking open prevents a FIFO at the snapshot path from hanging until a writer opens it.
+    var flags: std.posix.O = .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    };
+    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+    if (@hasField(std.posix.O, "NOCTTY")) flags.NOCTTY = true;
+
+    const fd = std.posix.openat(parent.handle, name_buf[0..name.len :0], flags, 0) catch |err| switch (err) {
+        error.NoDevice => return error.NotRegularFile,
+        else => return unsafeSnapshotPathError(err),
+    };
+    var file = std.Io.File{
+        .handle = fd,
+        .flags = .{ .nonblocking = true },
+    };
+    errdefer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch |err| return unsafeSnapshotPathError(err);
+    if (stat.kind != .file) return error.NotRegularFile;
+    try makeVisionRegularFileBlocking(&file);
+    return file;
 }
 
 pub fn loadVerifiedSnapshot(
@@ -4833,4 +4864,20 @@ test "an image saved as a blob is only its handle, and readers load the blob, ev
     // A damaged blob fails its digest wherever it is read.
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = &hex, .data = "damaged" });
     try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, handle, .{}));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "eb03: verifySnapshotFile rejects a FIFO without blocking" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const fifo_path = try std.fmt.allocPrintSentinel(alloc, "{s}/snap.fifo", .{root}, 0);
+    defer alloc.free(fifo_path);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
+    const fake_sha: [snapshot_digest_hex_len]u8 = @splat('0');
+    try std.testing.expect(!verifySnapshotFile(fifo_path, &fake_sha, "image/png"));
 }

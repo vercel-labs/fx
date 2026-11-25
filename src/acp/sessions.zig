@@ -2041,11 +2041,8 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
 fn formatPendingInputsNotice(alloc: Allocator, texts: []const []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    if (texts.len == 1) {
-        try out.writer.writeAll("1 prompt you sent before fx stopped was not delivered:");
-    } else {
-        try out.writer.print("{d} prompts you sent before fx stopped were not delivered:", .{texts.len});
-    }
+    try session_adapter.writeUndeliveredPromptPrefix(&out.writer, texts.len);
+    try out.writer.writeAll(":");
     for (texts) |text| {
         try out.writer.writeAll("\n\n");
         try out.writer.writeAll(text);
@@ -2076,17 +2073,26 @@ fn notifyPendingAcceptedInputs(
         };
     };
     defer pending.deinit(alloc);
-    if (pending.ids.len == 0) return;
+    if (pending.ids.len == 0 and pending.unreadable_ids.len == 0) return;
 
-    const notice = try formatPendingInputsNotice(alloc, pending.texts);
-    defer alloc.free(notice);
-    try sendAgentHistoryChunk(state, alloc, session_id, notice);
+    if (pending.ids.len > 0) {
+        const notice = try formatPendingInputsNotice(alloc, pending.texts);
+        defer alloc.free(notice);
+        try sendAgentHistoryChunk(state, alloc, session_id, notice);
+    }
 
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer active.session_write_mutex.unlock(io_mod.getIo());
-    v2.recordInputsWithdrawn(pending.ids) catch |err| {
-        debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ pending.ids.len, @errorName(err) });
-    };
+    if (pending.ids.len > 0) {
+        v2.recordInputsWithdrawn(pending.ids) catch |err| {
+            debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ pending.ids.len, @errorName(err) });
+        };
+    }
+    if (pending.unreadable_ids.len > 0) {
+        v2.recordInputsWithdrawn(pending.unreadable_ids) catch |err| {
+            debug_trace.logf("session", "event=input_withdrawn_unreadable_failed surface=acp count={d} err={s}", .{ pending.unreadable_ids.len, @errorName(err) });
+        };
+    }
 }
 
 fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_id: []const u8, commands_json: []const u8) !void {
