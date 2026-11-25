@@ -548,23 +548,35 @@ pub const Registry = struct {
         self: *Registry,
         child_id: []const u8,
     ) Error!usize {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
+        // The workers are cancelled after the mutex is released: `cancel` takes
+        // the owner's mutex, and a stop holds that while it waits for a child's
+        // worker, so cancelling under this mutex would close the same cycle the
+        // lock-free `pin` opens (worker -> registry -> owner -> worker).
+        var cancelled: [max_pending]WorkerRoute = undefined;
+        var cancelled_len: usize = 0;
         var changed: usize = 0;
-        var index = self.bindings.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
-            var removed = self.bindings.orderedRemove(index);
-            removed.worker.cancel();
-            removed.deinit(self.alloc);
-            changed += 1;
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            var index = self.bindings.items.len;
+            while (index > 0) {
+                index -= 1;
+                if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
+                var removed = self.bindings.orderedRemove(index);
+                cancelled[cancelled_len] = removed.worker;
+                cancelled_len += 1;
+                removed.deinit(self.alloc);
+                changed += 1;
+            }
+            if (changed > 0) self.pending_revision +|= 1;
         }
         if (changed > 0) {
-            self.pending_revision +|= 1;
             // R3.8: the requests this call dropped, never their content.
             debug_trace.logf("subagent", "approval requests dropped child={s} count={d} reason=child_invalidated", .{ child_id, changed });
         }
+        // Outside the registry's mutex: `cancel` takes the owner's, and a stop
+        // holds that while it waits for the child's worker.
+        for (cancelled[0..cancelled_len]) |route| route.cancel();
         return changed;
     }
 
