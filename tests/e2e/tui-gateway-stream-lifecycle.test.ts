@@ -1833,7 +1833,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
-  test("a reply whose limit ran out before a cut-off tool call is resent and the turn finishes", async () => {
+  test("a reply whose limit ran out before a cut-off tool call is asked for again in smaller steps and the turn finishes", async () => {
     const sentinel = "cut-call-ran.txt";
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-length-resend-",
@@ -1874,7 +1874,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(existsSync(join(root!, "workspace", sentinel))).toBe(false);
     const scrollback = await session!.captureFullScrollback();
     // The notice wraps at the pane's width.
-    expect(scrollback.replace(/\s+/g, " ")).toContain("Retrying with low effort.");
+    expect(scrollback.replace(/\s+/g, " ")).toContain("Asking the model to do it in smaller steps, at low effort.");
     expect(scrollback).not.toContain("did not run them");
     expect(scrollback).not.toContain("response hit provider length limit");
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");

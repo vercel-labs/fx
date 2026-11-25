@@ -871,11 +871,12 @@ pub fn Bindings(comptime App: type) type {
             try app.cooperativeTransportPulse(agent);
         }
 
-        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {
+        fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try agent.worker.pushTurnFinished(std.heap.c_allocator, .{
                 .turn_id = turn_id,
                 .outcome = outcome,
+                .disposition = disposition,
             });
         }
 

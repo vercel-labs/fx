@@ -751,12 +751,19 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
 
 fn finalizeTurn(
     raw: *anyopaque,
-    _: u64,
+    turn_id: u64,
     outcome: types.TurnPresentationOutcome,
-    _: ?types.ProviderCompletionDisposition,
+    disposition: ?types.ProviderCompletionDisposition,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     context.turn_outcome = outcome;
+    // The parent hears why, such as a reply cut off at the output limit, in
+    // place of `agent_turn_failed`; a failure set earlier stays first.
+    if (context.turn.failureDiagnostic() == null) {
+        if (types.turnFailureFor(.{ .turn_id = turn_id, .outcome = outcome, .disposition = disposition })) |failure| {
+            context.turn.failure_diagnostic = failure;
+        }
+    }
 }
 
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {

@@ -4,7 +4,7 @@
 # verdict.
 #
 # ConfiguredRequest.tla: which effort level and request fields reach the wire,
-# the notice for an effort the model does not offer, and the one resend of a
+# the notice for an effort the model does not offer, and the note after a
 # reply that ran out of output tokens. configured-request.cfg and
 # configured-request-deep.cfg are the design and must pass.
 # configured-request-today.cfg is fx before the change, where a level a custom
@@ -19,8 +19,8 @@
 #   notice-repeats       the notice shows on every turn               NoticeOncePerSession
 #   notice-always        the notice shows for an effort that is sent  NoticeOnlyWhenIgnored
 #   wrong-limit-field    the limit always travels as max_tokens       LimitInConfiguredField
-#   resend-same          a resend repeats the request                 ResendDiffers
-#   resend-again         a resend's own reply is resent               NoResendOfResend
+#   no-cap               a third cut reply in a row gets a note       AtMostTwoNotesInARow
+#   resend-again         a request already at low is lowered again    NeverLowTwiceInARow
 #
 # ConfiguredCatalog.tla: the model list, with the server's own list fetched
 # only when the connection's settings ask for it. configured-catalog.cfg is the
@@ -77,8 +77,8 @@ ConfiguredRequest configured-request-mutation-silent-drop IgnoredEffortNoticed
 ConfiguredRequest configured-request-mutation-notice-repeats NoticeOncePerSession
 ConfiguredRequest configured-request-mutation-notice-always NoticeOnlyWhenIgnored
 ConfiguredRequest configured-request-mutation-wrong-limit-field LimitInConfiguredField
-ConfiguredRequest configured-request-mutation-resend-same ResendDiffers
-ConfiguredRequest configured-request-mutation-resend-again NoResendOfResend
+ConfiguredRequest configured-request-mutation-no-cap AtMostTwoNotesInARow
+ConfiguredRequest configured-request-mutation-resend-again NeverLowTwiceInARow
 
 ConfiguredCatalog configured-catalog -
 ConfiguredCatalog configured-catalog-today FetchOnAsks

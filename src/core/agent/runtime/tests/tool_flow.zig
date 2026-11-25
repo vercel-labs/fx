@@ -1959,17 +1959,19 @@ fn expectSingleTerminalOutcome(
     }
     try std.testing.expectEqual(@as(usize, 1), matches);
 }
-test "processQueuedPrompt length-limited calls bypass malformed local tool identity admission" {
+test "processQueuedPrompt runs no call of a cut reply whose calls fail identity admission and asks again" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}"),
     };
-    const completions = [_]FakeCompletion{.{
-        .content = "Partial answer",
-        .tool_calls = &calls,
-        .finish_reason = .length,
-    }};
+    // A later call started after both, so both are whole, and only the
+    // identity checks keep them from running.
+    const starts = calls ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Partial answer", .tool_calls = &calls, .streamed_tool_starts = &starts, .finish_reason = .length },
+        .{ .content = "Done after the note" },
+    };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -1978,13 +1980,15 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
+    // A call with no id fails the checks a finished reply's calls pass, so
+    // its sibling does not run either.
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "so fx did not run it.");
+    try expectBodyNotContains(&gateway, 1, "call_read");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Done after the note", hooks.finish_assistant_text.?);
 }
 
 test "local tool emits authoritative progress and terminal lifecycle by default" {
