@@ -66,6 +66,18 @@ class Run {
     return typeof id === "string" ? this.labels.get(id) : undefined;
   }
 
+  /// The client an entry of a list names. A client that lists sh.fx/sessionClients learns its id
+  /// from its initialize answer. A client that does not list it has no id on the wire, so its entry
+  /// is matched by the clientInfo name the driver sent it; the id is then recorded for its chunks.
+  private bind(entry: any): Client | undefined {
+    const known = this.label(entry?.clientId);
+    if (known !== undefined) return known;
+    const name = entry?.clientInfo?.name;
+    if (typeof entry?.clientId !== "string" || !LABELS.includes(name)) return undefined;
+    this.labels.set(entry.clientId, name);
+    return name;
+  }
+
   /// Reads the frames each client has received since the last call, in order, and records each
   /// one the model knows as an observation.
   pump() {
@@ -88,8 +100,8 @@ class Run {
     }
     if (frame?.method === "_sh.fx/session/clients_update") {
       const clients: any[] = frame.params?.clients ?? [];
-      const who = clients.map((entry) => this.label(entry.clientId)).filter((name): name is Client => name !== undefined);
-      const main = this.label(clients.find((entry) => entry.main === true)?.clientId) ?? "none";
+      const who = clients.map((entry) => this.bind(entry)).filter((name): name is Client => name !== undefined);
+      const main = this.bind(clients.find((entry) => entry.main === true)) ?? "none";
       this.observations.push({ op: "read", c, kind: "clients", n: 0, who, main, from: "none" });
       return;
     }
@@ -126,7 +138,7 @@ class Run {
   private latestMembers(c: Client): string {
     const last = this.frames(c).filter((frame) => frame?.method === "_sh.fx/session/clients_update").at(-1);
     if (!last) return "";
-    return (last.params.clients as any[]).map((entry) => this.label(entry.clientId) ?? "?").sort().join(",");
+    return (last.params.clients as any[]).map((entry) => this.bind(entry) ?? "?").sort().join(",");
   }
 
   waitMembers(c: Client, members: Client[]): Promise<boolean> {
@@ -142,7 +154,7 @@ class Run {
   /// publishes the session on its leader socket.
   async start() {
     this.owner = this.fixture.spawn();
-    const init = await this.owner.call("initialize", { protocolVersion: 1, clientCapabilities: capabilities(true) });
+    const init = await this.owner.call("initialize", { protocolVersion: 1, clientCapabilities: capabilities(true), clientInfo: { name: "opener", version: "1" } });
     this.labels.set(init.response?.result?._meta?.["sh.fx/clientId"], "opener");
     this.owner.listen((message) => this.ownerFrames.push(message));
     const id = this.owner.send("session/new", { mcpServers: [] });
@@ -164,8 +176,9 @@ class Run {
     const client = await SocketClient.connect(socket);
     this.followers.set(c, client);
     this.replaying.set(c, true);
-    const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: capabilities(c !== "f2") });
-    this.labels.set(init.answer?.result?._meta?.["sh.fx/clientId"], c);
+    const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: capabilities(c !== "f2"), clientInfo: { name: c, version: "1" } });
+    const clientId = init.answer?.result?._meta?.["sh.fx/clientId"];
+    if (typeof clientId === "string") this.labels.set(clientId, c);
     const id = client.send("session/load", { sessionId: this.sessionId, cwd: this.fixture.workspace, mcpServers: [] });
     this.openIds.add(`${c}:${id}`);
     await this.waitUntil(() => this.answered(c, id));
