@@ -1124,6 +1124,45 @@ test "a resumed request that continues no yielded turn sends the resume note" {
     try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[0], "session_resumed") != null);
 }
 
+test "a turn that continues a yielded resume projects the stopped turn without its abort note" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "final" }};
+    var tool_names = [_][]u8{@constCast("read_file")};
+    var history = [_]types.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("read the notes") },
+        .completed_tool_names = tool_names[0..],
+        .stopped_by_exit = true,
+    } }};
+
+    var continued_gateway = FakeGateway.init(alloc, &completions);
+    defer continued_gateway.deinit();
+    var continued_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer continued_hooks.deinit();
+    var continued_fixture = PromptFixture{};
+    var continued = continued_fixture.job();
+    continued.prompt = @constCast(session_runtime.resumed_request_prompt);
+    continued.history = history[0..];
+    continued.recovery_resume = .{};
+    continued.continues_yielded_turn = true;
+    try runFakePrompt(&continued_gateway, &continued_hooks, continued_fixture.config(), continued);
+
+    var resumed_gateway = FakeGateway.init(alloc, &completions);
+    defer resumed_gateway.deinit();
+    var resumed_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_hooks.deinit();
+    var resumed_fixture = PromptFixture{};
+    var resumed = resumed_fixture.job();
+    resumed.prompt = @constCast(session_runtime.resumed_request_prompt);
+    resumed.history = history[0..];
+    resumed.recovery_resume = .{};
+    try runFakePrompt(&resumed_gateway, &resumed_hooks, resumed_fixture.config(), resumed);
+
+    try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_bodies.items.len);
+    try expectBodyNotContains(&continued_gateway, 0, "<turn_aborted>");
+    try expectBodyNotContains(&continued_gateway, 0, "The previous response ended before completion.");
+    try std.testing.expectEqualStrings(resumed_gateway.request_bodies.items[0], continued_gateway.request_bodies.items[0]);
+}
+
 test "processQueuedPrompt presents invalid registered call without running it" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "web_fetch", "{\"url\":1}")};

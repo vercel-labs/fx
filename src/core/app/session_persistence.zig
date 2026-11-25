@@ -823,9 +823,34 @@ pub const JsHostSessionStore = struct {
     }
 };
 
+/// How much of the in-flight turn a saved checkpoint holds: its finished tool
+/// steps, steering messages, and context notes.
+pub const SavedTurnKey = struct {
+    tool_steps: usize,
+    steering: usize,
+    context_notes: usize,
+
+    pub fn of(execution: types.ExecutionMemory) SavedTurnKey {
+        return .{
+            .tool_steps = execution.tool_steps.len,
+            .steering = execution.steering.len,
+            .context_notes = execution.context_notes.len,
+        };
+    }
+
+    pub fn eql(self: SavedTurnKey, other: SavedTurnKey) bool {
+        return self.tool_steps == other.tool_steps and
+            self.steering == other.steering and
+            self.context_notes == other.context_notes;
+    }
+};
+
 const JsHostSessionOwner = struct {
     state: session_codec.DurableSessionState,
     revision: ?[]u8,
+    /// The in-flight turn as the stored checkpoint holds it. Null when no
+    /// checkpoint is stored; a session change starts it null.
+    saved_turn: ?SavedTurnKey = null,
 
     pub fn deinit(self: *JsHostSessionOwner, alloc: Allocator) void {
         self.state.deinit(alloc);

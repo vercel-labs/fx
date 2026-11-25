@@ -373,6 +373,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.startModelCacheWarmup();
         if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume(&app.main_agent);
     }
+    // A cooperative host paints the resumed session's first frame during the
+    // resume (`commitStartupResumeReplayAnchor`), so the resend queued here
+    // waits for it, as the native branch's call does.
+    if (comptime cooperative) {
+        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume(&app.main_agent);
+    }
 
     app.run() catch |err| {
         // The terminal hung up: its input closed, or a frame write failed
@@ -485,11 +491,39 @@ fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, text);
 }
 
+/// Marks every fd above stderr close-on-exec before the relaunch replaces
+/// the process: the standard library's `Io.Threaded` keeps a cached
+/// `/dev/null` fd without close-on-exec, so each relaunch kept one more.
+/// A relaunch passes on only argv and stdio.
+fn markFdsCloseOnExec() void {
+    if (comptime builtin.target.os.tag != .linux) return;
+    const linux = std.os.linux;
+    const rc = linux.close_range(3, @bitCast(@as(u32, std.math.maxInt(u32))), .{ .UNSHARE = false, .CLOEXEC = true });
+    const err = linux.errno(rc);
+    if (err != .SUCCESS) debug_trace.logf("upgrade", "event=relaunch_cloexec_failed errno={s}", .{@tagName(err)});
+}
+
+test "a relaunch marks inherited fds close-on-exec" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const open_rc = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(open_rc));
+    const fd: i32 = @intCast(open_rc);
+    defer _ = linux.close(fd);
+
+    const before = linux.fcntl(fd, linux.F.GETFD, 0);
+    try std.testing.expectEqual(@as(usize, 0), before & linux.FD_CLOEXEC);
+    markFdsCloseOnExec();
+    const after = linux.fcntl(fd, linux.F.GETFD, 0);
+    try std.testing.expect(after & linux.FD_CLOEXEC != 0);
+}
+
 fn replaceProcessDefault(
     _: ?*anyopaque,
     zio: std.Io,
     options: std.process.ReplaceOptions,
 ) std.process.ReplaceError {
+    markFdsCloseOnExec();
     return std.process.replace(zio, options);
 }
 

@@ -13,6 +13,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -6455,6 +6456,102 @@ test.skipIf(!tmuxAvailable())(
   UPGRADE_TIMEOUT * 2,
 );
 
+/// Open fds of a process that point to /dev/null: the entries of
+/// `/proc/<pid>/fd` whose link is /dev/null on Linux, and the `lsof` lines
+/// whose NAME is /dev/null on macOS.
+function devNullFdCount(pid: number): number {
+  if (process.platform === "linux") {
+    return readdirSync(`/proc/${pid}/fd`).filter((fd) => {
+      try {
+        return readlinkSync(`/proc/${pid}/fd/${fd}`) === "/dev/null";
+      } catch {
+        // The fd closed between the listing and the link read.
+        return false;
+      }
+    }).length;
+  }
+  const listing = execFileSync("lsof", ["-p", String(pid)], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return listing.split("\n").filter((line) => line.trimEnd().endsWith(" /dev/null")).length;
+}
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g relaunch leaves no /dev/null fd behind",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-fds-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([fakeGatewayFinalText("UPGRADE_FDS_DONE")]);
+    const release = startUpgradeServer(root, argvLogPath);
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save a turn before the open-files check.");
+      await active.waitForText("UPGRADE_FDS_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      const version = (await runFx(["--version"])).stdout.trim();
+
+      // The relaunch execs in place, so the fx process keeps its PID.
+      const pid = active.processPid();
+      const before = devNullFdCount(pid);
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(`✓ fx has been updated to v${version}`, UPGRADE_TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(active.processPid()).toBe(pid);
+      const after = devNullFdCount(pid);
+      console.log(`/dev/null fds of fx process ${pid} before and after the relaunch: before=${before} after=${after}`);
+      if (after > before) {
+        throw new Error(`/dev/null fds grew across the relaunch: before=${before} after=${after}`);
+      }
+      expect(after).toBeLessThanOrEqual(before);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 4,
+);
+
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g during a running turn stops it between steps and continues it after the relaunch",
   async () => {
@@ -6584,6 +6681,15 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
+      // The saved log, read once fx has exited so every line is written. The
+      // yielded turn holds the call, and the continuation extends that turn
+      // instead of copying the call again.
+      const items = savedItems(home, sessionIdFromHome(home));
+      const callItems = items.filter((item: any) => item.tool_call !== undefined && JSON.stringify(item.tool_call).includes("call_yield_read"));
+      expect(callItems.length).toBe(1);
+      const continuedItems = items.filter((item: any) => item.turn_continued !== undefined);
+      expect(continuedItems.length).toBe(1);
+      expect(JSON.stringify(continuedItems[0].turn_continued)).toContain('"extends":true');
       // Every write of both processes, exactly: none showed the turn as
       // cancelled, and the continued one never said it resumed a request.
       const frames = join(root, "frames");
@@ -6752,6 +6858,161 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g after a crash resume keeps the request append-only",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-crash-resume-")));
+    const home = join(root, "home");
+    const workspace = join(home, "project");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const resumedStderrPath = join(root, "resumed-stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    writeFileSync(join(workspaceRoot, "notes.txt"), "SIGNED_NOTES\n");
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const model = "anthropic/claude-fable-5.2";
+    // Every main request answers with reasoning signed SIG_<step> and one read.
+    const stepReply = (step: number) =>
+      fakeGatewaySse([
+        { type: "reasoning-start", id: `reasoning_${step}` },
+        { type: "reasoning-delta", id: `reasoning_${step}`, delta: `Read notes for step ${step}.` },
+        {
+          type: "reasoning-end",
+          id: `reasoning_${step}`,
+          providerMetadata: { anthropic: { signature: `SIG_${step}` } },
+        },
+        { type: "tool-call", toolCallId: `call_step_${step}`, toolName: "read_file", input: { path: "notes.txt" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+      ]);
+    const killedAsked = signal();
+    const resumedAsked = signal();
+    const heldAsked = signal();
+    let releaseStep5 = () => {};
+    const step5Held = new Promise<void>((resolve) => {
+      releaseStep5 = resolve;
+    });
+    // Request numbers count every request fx sends: 3 is the one killed, 4 is
+    // its resend after -c, 6 is held until Ctrl+G, and 7 is the continuation.
+    const gateway = startDynamicFakeGateway(async () => {
+      const count = gateway.requests.length;
+      if (count === 1) return stepReply(1);
+      if (count === 2) return stepReply(2);
+      if (count === 3) {
+        killedAsked.fire();
+        return new Promise<Response>(() => {});
+      }
+      if (count === 4) {
+        resumedAsked.fire();
+        return stepReply(3);
+      }
+      if (count === 5) return stepReply(4);
+      if (count === 6) {
+        heldAsked.fire();
+        await step5Held;
+        return stepReply(5);
+      }
+      return fakeGatewayFinalText("CRASH_RESUME_DONE");
+    }, {
+      models: [{ id: model, type: "language", tags: ["tool-use"] }],
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const upgradeEnv = {
+      ...gatewayEnv(home, gateway),
+      FX_MODEL: model,
+      FX_AUTO_UPGRADE: "1",
+      FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+    };
+    let active: TmuxSession | null = null;
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: upgradeEnv,
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      await active.sendText("Read notes.txt through four steps.");
+      await killedAsked.fired;
+      expect(gateway.requests.length).toBe(3);
+      // A kill -9 ends the turn with its request in flight, as a crash does.
+      await endFx(active, "SIGKILL");
+      active = null;
+      // The first process installed the upgrade's wrapper over the installed
+      // copy. Restore a real build there: a development build never runs
+      // auto-upgrade, so the restarted process could not upgrade.
+      copyFileSync(FX_BIN, installedFx);
+      chmodSync(installedFx, 0o755);
+
+      writeFileSync(resumedStderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${shellQuote(installedFx)} -c`,
+        cwd: workspaceRoot,
+        env: upgradeEnv,
+        stderrPath: resumedStderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await resumedAsked.fired;
+      expect(gateway.requests[3].body).toContain("<session_resumed>");
+      await heldAsked.fired;
+      // The ready label shows only while fx is idle, and this turn runs until
+      // Ctrl+G. The install replaces the installed copy with the small wrapper
+      // script, so wait for that instead.
+      await waitForCondition(() => statSync(installedFx).size <= 4096, "the upgrade to install while the turn ran", UPGRADE_TIMEOUT);
+
+      // Ctrl+G while request 6 is held: the upgrade waits for the turn to stop.
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("fx restarts for the upgrade when the running turns stop or end", TIMEOUT);
+      releaseStep5();
+
+      // The step ends, the turn stops between steps, fx relaunches, and the
+      // continuation answers.
+      await active.waitForText("CRASH_RESUME_DONE", UPGRADE_TIMEOUT);
+      expect(readFileSync(argvLogPath, "utf8")).toContain("\t--upgrade-relaunch");
+      expect(gateway.requests.length).toBe(7);
+
+      const requestFive = JSON.parse(gateway.requests[5].body).prompt as unknown[];
+      const requestSix = JSON.parse(gateway.requests[6].body).prompt as unknown[];
+      // The continuation's prompt starts with request 6's whole prompt, so
+      // the request is append-only across the relaunch.
+      expect(requestSix.slice(0, requestFive.length)).toEqual(requestFive);
+      expect(gateway.requests[6].body).not.toContain("The previous response ended before completion.");
+      expect(gateway.requests[6].body).not.toContain("<turn_aborted>");
+      expect(gateway.requests[6].body).toContain("SIG_3");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseStep5();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 4,
 );
 
 test.skipIf(!tmuxAvailable())(

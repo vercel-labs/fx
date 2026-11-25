@@ -6880,12 +6880,13 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    // A resumed request continues the turn fx stopped: superseded resume
-    // turns are dropped and the stopped turn is projected without its abort
-    // note, as a steering continuation is. A turn that continues a yielded
-    // one is not such a request: it carries its own prompt and pieces, and
-    // its history no longer holds the yielded turn.
-    const resumed_request = job.recovery_resume != null and !job.continues_yielded_turn;
+    // A resumed request continues the turn fx stopped, so the stopped turn is
+    // projected without its abort note, as a steering continuation is, and
+    // superseded resumes are dropped. A turn that continues a yielded one
+    // projects its history as that turn did, so it is a resumed request when
+    // the yielded turn was one. A resume's prompt is the resume prompt, so the
+    // prompt tells us which.
+    const resumed_request = job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
     const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
     if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(

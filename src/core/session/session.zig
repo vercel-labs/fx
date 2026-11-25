@@ -103,6 +103,11 @@ pub fn withoutSupersededResumes(history: []const HistoryTurn) []const HistoryTur
     return history[0..end];
 }
 
+/// Whether a prompt is the text fx sends for a resumed request.
+pub fn isResumePrompt(text: []const u8) bool {
+    return std.mem.eql(u8, text, resumed_request_prompt);
+}
+
 /// Whether a turn is a resume fx sent for a request it stopped. Its saved
 /// text is always `resumed_request_prompt`; the projection picks the note.
 fn isResumeTurn(turn: HistoryTurn) bool {
@@ -111,7 +116,7 @@ fn isResumeTurn(turn: HistoryTurn) bool {
         .interrupted => |entry| entry.user.text,
         .compacted_summary => return false,
     };
-    return std.mem.eql(u8, text, resumed_request_prompt);
+    return isResumePrompt(text);
 }
 
 /// A resume that ran nothing before fx resumed the request again: the later

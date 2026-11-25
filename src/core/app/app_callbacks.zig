@@ -345,7 +345,12 @@ pub fn Bindings(comptime App: type) type {
                     .asked = if (comptime @hasDecl(@TypeOf(agent.worker), "askedCompactionActivity")) askedCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
-                    if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
+                    if (agent.session_persistence.v2 != null)
+                        agentAppendTurnPiece
+                    else if (comptime runtime_profile.allows(App, .js_host_sessions))
+                        agentSaveJsHostTurnPiece
+                    else
+                        null
                 else
                     null,
                 .record_usage = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -1315,6 +1320,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(agent, progress);
+        }
+
+        fn agentSaveJsHostTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).saveJsHostTurnPiece(appOf(agent), agent, progress);
         }
 
         fn agentSaveRecoveryRecord(ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool {
