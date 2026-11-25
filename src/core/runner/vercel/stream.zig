@@ -593,6 +593,8 @@ const CountingAllocator = struct {
 // Linux holds a connect to a full accept queue until the limit ends it. Other systems answer it
 // differently, and the timing varies by machine, so the real-socket tests check only the bound there (V11).
 const linux_holds = builtin.os.tag == .linux;
+/// How long past its limit a real-socket connect may end, in milliseconds (V11).
+const v11_slack_ms: i64 = 2_000;
 
 /// Holds a connect until the connect limit cancels the wait, so only the limit can end it (V11).
 fn holdUntilLimit(connect: *Connect) anyerror!Connected {
@@ -622,12 +624,54 @@ fn connectFiller(io: std.Io, address: *const std.Io.net.IpAddress) !?std.Io.net.
 
 /// The V11 bound for a connect that a real kernel answers: it ends as ConnectTimeout or TransportFailed,
 /// and no later than the limit plus a fixed slack. It has no lower bound and no tight one (V11).
-fn expectEndedByLimit(result: StreamError!*Stream, elapsed: i64, limit_ms: i64, captured: []const u8) !void {
-    const err = if (result) |_| return error.TestUnexpectedResult else |e| e;
-    try std.testing.expect(err == error.ConnectTimeout or err == error.TransportFailed);
-    try std.testing.expect(elapsed < limit_ms + 2_000);
-    try std.testing.expect(std.mem.find(u8, captured, "step connect, failed ") != null);
+fn expectEndedByLimit(result: StreamError!*Stream, elapsed: i64, limit_ms: i64, captured: []const u8, round: ?usize) !void {
+    const outcome = outcomeText(result);
+    try checkConnect(endedWith(result, error.ConnectTimeout) or endedWith(result, error.TransportFailed), outcome, elapsed, limit_ms, round);
+    try checkConnect(elapsed < limit_ms + v11_slack_ms, outcome, elapsed, limit_ms, round);
+    try checkConnect(std.mem.find(u8, captured, "step connect, failed ") != null, outcome, elapsed, limit_ms, round);
 }
+
+fn outcomeText(result: StreamError!*Stream) []const u8 {
+    return if (result) |_| "connected" else |err| @errorName(err);
+}
+
+fn endedWith(result: StreamError!*Stream, want: anyerror) bool {
+    return if (result) |_| false else |err| err == want;
+}
+
+/// Fails after one line that names the outcome, the elapsed time, the limit and the round (V11). A passing
+/// check prints nothing, so a CI log shows what the failing real-socket test saw.
+fn checkConnect(ok: bool, outcome: []const u8, elapsed: i64, limit_ms: i64, round: ?usize) !void {
+    if (ok) return;
+    std.debug.print("V11 check failed: outcome={s} elapsed_ms={d} limit_ms={d} round={?d}\n", .{ outcome, elapsed, limit_ms, round });
+    return error.TestUnexpectedResult;
+}
+
+/// Waits for the open job that a walked-away connect left behind (V11). When it is still running after 5 s,
+/// prints the test Io's concurrency limit and busy count, and whether one more concurrent task can start now.
+fn expectOpenJobsDone() !void {
+    gateway_client.waitForOwnClientOpenJobs() catch |err| {
+        const test_io = &std.testing.io_instance;
+        std.debug.print("open job still running after 5 s: {s}; concurrent_limit={any} busy_count={d} cpus={d} one_more_concurrent_task={s}\n", .{
+            @errorName(err),
+            test_io.concurrent_limit,
+            test_io.busy_count,
+            std.Thread.getCpuCount() catch 0,
+            if (concurrencyAvailable()) "available" else "unavailable",
+        });
+        return err;
+    };
+}
+
+/// Whether the test Io can start one more concurrent task now (V11 diagnostics only).
+fn concurrencyAvailable() bool {
+    const io = std.testing.io;
+    var probe = io.concurrent(probeTask, .{}) catch return false;
+    probe.await(io);
+    return true;
+}
+
+fn probeTask() void {}
 
 test "the connect limit maps a timeout to ConnectTimeout on every platform (V11)" {
     try std.testing.expectEqual(@as(StreamError, error.ConnectTimeout), mapConnect(error.Timeout));
@@ -741,16 +785,17 @@ test "real sockets: a connect to a full accept queue ends by its limit (V11)" {
         .limits = .{ .connect_ms = 150 },
     });
     const elapsed = io_mod.milliTimestamp() - started;
+    const outcome = outcomeText(result);
     if (linux_holds) {
-        try std.testing.expectError(error.ConnectTimeout, result);
         // The hold ends at the limit: never before it, and never after the bound.
-        try std.testing.expect(elapsed >= 150 and elapsed < 3_000);
-        try std.testing.expect(std.mem.find(u8, capture.captured(), "step connect, failed ConnectTimeout") != null);
+        try checkConnect(endedWith(result, error.ConnectTimeout), outcome, elapsed, 150, null);
+        try checkConnect(elapsed >= 150 and elapsed < 3_000, outcome, elapsed, 150, null);
+        try checkConnect(std.mem.find(u8, capture.captured(), "step connect, failed ConnectTimeout") != null, outcome, elapsed, 150, null);
     } else {
-        try expectEndedByLimit(result, elapsed, 150, capture.captured());
+        try expectEndedByLimit(result, elapsed, 150, capture.captured(), null);
     }
     // The connect walked away from its open job; the test ends only when that job has finished.
-    try gateway_client.waitForOwnClientOpenJobs();
+    try expectOpenJobsDone();
 }
 
 test "an exec stream has no idle limit, so a silence past the bring-back limit does not cut it" {
@@ -1016,11 +1061,12 @@ test "real sockets: a connect to a full accept queue ends by its limit, 50 times
             .limits = .{ .connect_ms = 50 },
         });
         const round_elapsed = io_mod.milliTimestamp() - round_started;
+        const outcome = outcomeText(result);
         if (linux_holds) {
-            try std.testing.expectError(error.ConnectTimeout, result);
-            try std.testing.expect(round_elapsed >= 50);
+            try checkConnect(endedWith(result, error.ConnectTimeout), outcome, round_elapsed, 50, round);
+            try checkConnect(round_elapsed >= 50, outcome, round_elapsed, 50, round);
         } else {
-            try expectEndedByLimit(result, round_elapsed, 50, capture.captured());
+            try expectEndedByLimit(result, round_elapsed, 50, capture.captured(), round);
         }
         const response = try callBuffered(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
             .step = "user",
@@ -1029,7 +1075,7 @@ test "real sockets: a connect to a full accept queue ends by its limit, 50 times
         });
         response.deinit(std.testing.allocator);
     }
-    try gateway_client.waitForOwnClientOpenJobs();
+    try expectOpenJobsDone();
 }
 
 test "a second stream opens and reads right after a stream that read a 256 KiB line is closed (V11)" {
