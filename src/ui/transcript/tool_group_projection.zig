@@ -1773,13 +1773,11 @@ test "a command check row keeps one verb while its command runs" {
     try std.testing.expectEqualStrings("● Sent input to fx-cloud run zig build test · 2 calls ✓", std.mem.trim(u8, sent, "\n"));
 }
 
-fn isProviderSearchName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
-}
-
-/// Whether a call searches the web: fx's own search, or one a provider runs.
+/// fx's own web search, or a provider's that a header counts as one. A
+/// provider's search under its own tool name, such as `exa_search`, counts
+/// as a search.
 fn isWebSearchName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "web_search") or isProviderSearchName(name) or tooling_presentation.isProviderSearchAlias(name);
+    return std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
 }
 
 fn pluralWord(count: usize, singular: []const u8, plural_form: []const u8) []const u8 {
@@ -2972,9 +2970,10 @@ fn searchedOutputName(
     details: []const ToolDetailRecord,
     output_sources: *const OutputSources,
 ) !OutputSourceName {
-    if (output_sources.get(handle)) |index| if (isWebSearchName(details[index].tool_name)) {
-        return .{ .full = handle, .short = web_results_label };
-    };
+    if (output_sources.get(handle)) |index| {
+        const tool = details[index].tool_name;
+        if (isWebSearchName(tool) or tooling_presentation.isProviderSearchAlias(tool)) return .{ .full = handle, .short = web_results_label };
+    }
     const name = try savedOutputName(scratch, handle, phrase_source, details, output_sources) orelse
         OutputSourceName{ .full = handle, .short = read_tool_result_presentation.savedOutputNoun(handle) };
     return .{ .full = name.full, .short = try std.mem.concat(scratch, u8, &.{ name.short, " output" }) };
@@ -3160,6 +3159,33 @@ test "searches of one saved output share one row that names the source by its sh
     errdefer std.debug.print("wide: {s}\n", .{wide_row});
     try std.testing.expectEqualStrings("● Searched github.com output for +1, \" fx\", \"検索語\"", wide_row);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide_row) <= 54);
+}
+
+test "a group that searches the web, fetches two pages, and searches the saved results keeps its header" {
+    const alloc = std.testing.allocator;
+    const handle = "result-a228d.txt";
+    const refused = "http://127.0.0.1/protocol/v1/prompt-turn";
+    const denied = "https://agentclientprotocol.com/protocol/v1/slash-commands";
+    const entries = [_]TranscriptEntry{
+        fetchEntryForTest(1, "● Searched Agent Client Protocol prompt turn\n"),
+        fetchEntryForTest(2, "● Failed " ++ refused ++ ": web_fetch refuses private network addresses\n"),
+        fetchEntryForTest(3, "● Denied " ++ denied ++ "\n"),
+        fetchEntryForTest(4, "● Searched saved output for \"\"url\":\"https://agentclientprotocol.com\"\n"),
+    };
+    const search = ToolDetailRecord{ .entry_id = 4, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\":\\\"https://agentclientprotocol.com\"}"), .outcome = .completed };
+    const Case = struct { tool: []const u8, header: []const u8 };
+    const cases = [_]Case{
+        .{ .tool = "exa_search", .header = "● Searched · 1 denied" },
+        .{ .tool = "web_search", .header = "● Searched the web, searched · 1 denied" },
+    };
+    for (cases) |case| {
+        const web_search = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast(case.tool), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol prompt turn\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+        const text = try groupTextForTest(alloc, &entries, &.{ web_search, fetchDetailForTest(2, refused, .failed), fetchDetailForTest(3, denied, .denied), search });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ case.tool, text });
+        try std.testing.expectEqualStrings(case.header, firstLineForTest(text));
+        try std.testing.expect(std.mem.find(u8, text, "└ Searched web results for “\"url\":\"https://agentclientprotocol.com”") != null);
+    }
 }
 
 test "a search of a web search's saved results names them web results, and a search with a straight quote goes in curly quotes" {

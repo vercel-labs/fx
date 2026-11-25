@@ -8223,8 +8223,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const refusedRow = "Couldn't fetch prompt-turn · 127.0.0.1";
       const deniedRow = "Denied slash-commands · agentclientprotocol.com";
       const searchRow = "Searched web results for “\"url\":\"https://agentclientprotocol.com”";
-      const expectRows = (rows: string[], cols = Infinity) => {
+      // The provider's search counts as a search in the header, not as a
+      // web search. After a resume the header reads as it does on main.
+      const liveHeader = "● Searched · 1 denied";
+      const resumedHeader = "● Searched, used a tool · 1 denied";
+      const expectRows = (rows: string[], header: string, cols = Infinity) => {
         const clip = (row: string) => (row.length + 2 <= cols ? row : `${row.slice(0, cols - 3)}…`);
+        expect(rows).toContain(header);
+        expect(rows.filter((line) => line.includes("the web"))).toEqual([]);
         for (const row of [refusedRow, deniedRow, searchRow, ...unnamedHosts.map((unnamed) => unnamed.row)]) {
           expect(rows.some((line) => line.slice(2) === clip(row))).toBe(true);
         }
@@ -8238,7 +8244,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Search the protocol docs, fetch two pages, then search the saved results.");
       await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
-      expectRows(toolRows(await session.captureFullScrollback()));
+      expectRows(toolRows(await session.captureFullScrollback()), liveHeader);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -8251,7 +8257,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, width, height: 35, stderrPath: resumedStderr, env });
         await session.waitForComposer(TIMEOUT);
         await session.waitForText(finalText, TIMEOUT);
-        expectRows(toolRows(await session.captureFullScrollback()), width);
+        expectRows(toolRows(await session.captureFullScrollback()), resumedHeader, width);
         expect(readFileSync(resumedStderr, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
