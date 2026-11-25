@@ -935,6 +935,11 @@ const App = struct {
         return AgentsAppRuntime.busiest(self);
     }
 
+    /// Whether any agent's turn began or went on since the last call.
+    pub fn agentsBeganWork(self: *App) bool {
+        return AgentsAppRuntime.takeBeganWork(self);
+    }
+
     /// An agent other than the one on screen that an upgrade's restart
     /// would stop. Its name may use `buf`.
     pub fn busyAgentElsewhere(self: *App, buf: []u8) ?app_agents_runtime.BusyAgent {
@@ -5562,6 +5567,7 @@ test {
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
     _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
+    _ = @import("builtins/hooks.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
