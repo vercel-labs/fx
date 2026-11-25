@@ -5255,6 +5255,14 @@ test "stripAnsiAlloc returns the original slice for clean text and strips escape
     try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
 }
 
+test "stripAnsiAlloc drops an escape with intermediate bytes whole" {
+    const alloc = std.testing.allocator;
+    // Command output that resets its style as `tput sgr0` does.
+    const stripped = try stripAnsiAlloc(alloc, "Build failed\x1b(B\x1b[m\n");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("Build failed\n", stripped);
+}
+
 test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {
     const alloc = std.testing.allocator;
     const with_params = try stripAnsiAlloc(alloc, "\x1b]8;id=fx-1;https://ziglang.org/download/\x1b\\Zig downloads\x1b]8;;\x1b\\ ready");

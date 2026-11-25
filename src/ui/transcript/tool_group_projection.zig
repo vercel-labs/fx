@@ -1020,7 +1020,7 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
     while (index < text.len) {
         const byte = text[index];
         if (byte == 0x1b) {
-            index = escapeEnd(text, index);
+            index = display_width.ansiSequenceEnd(text, index);
             continue;
         }
         if (byte < 0x20 or byte == 0x7f or byte == ' ') {
@@ -1050,17 +1050,6 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
     return if (cut) std.mem.concat(scratch, u8, &.{ safe, "…" }) else safe;
 }
 
-/// The index right after the escape sequence that starts at `index`: a CSI
-/// sequence through its final byte, else the escape and the byte after it.
-fn escapeEnd(text: []const u8, index: usize) usize {
-    var end = index + 1;
-    if (end < text.len and text[end] == '[') {
-        end += 1;
-        while (end < text.len and (text[end] < 0x40 or text[end] > 0x7e)) : (end += 1) {}
-    }
-    return @min(end + 1, text.len);
-}
-
 test "a reason cut at its byte cap ends with an ellipsis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1087,6 +1076,54 @@ test "a reason cut at its byte cap ends with an ellipsis" {
     defer alloc.free(text);
     const want_reason: [story_reason_max_bytes]u8 = @splat('a');
     try std.testing.expectEqualStrings("● Exited 1 sh check.sh · " ++ want_reason ++ "…", firstLineForTest(text));
+}
+
+test "a failed command's reason leaves out escapes with intermediate bytes and OSC links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = story_reason_max_bytes;
+    // `tput sgr0` writes ESC ( B ESC [ m. The others pick a character set,
+    // fill the screen with a test pattern, and switch to UTF-8. The last one
+    // is cut off at the end.
+    for ([_][]const u8{ "Build failed\x1b(B\x1b[m", "\x1b)0Build failed", "\x1b#8Build failed", "\x1b%GBuild failed", "\x1b$(BBuild failed", "Build failed\x1b(" }) |line| {
+        try std.testing.expectEqualStrings("Build failed", try storySafeLine(a, line, cap));
+    }
+    // An OSC 8 link shows only its text, whether ST or BEL ends it. A link
+    // cut off at the end hides the rest of the line, as a terminal does.
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x07Problems found\x1b]8;;\x07", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "Problems found\x1b]8;;file:///x", cap));
+
+    // The row is the same live and after resume, and a list's heading in a
+    // link, or before a style reset, still heads its list.
+    const alloc = std.testing.allocator;
+    const Probe = struct { result: []const u8, reason: []const u8 };
+    for ([_]Probe{
+        .{ .result = "{\"output_delta\":\"\\u001b%G\\u001b)0\\u001b#8Build failed\\u001b(B\\u001b[m\\n\",\"exit_code\":1}", .reason = "Build failed" },
+        .{ .result = "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\\n", .reason = "Problems found" },
+        .{ .result = "\x1b]8;;file:///x\x07Problems found:\x1b]8;;\x07\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+        .{ .result = "Problems found:\x1b(B\x1b[m\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+    }) |probe| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh build.sh\n", .class = .tool_status } }};
+        var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh build.sh\"}", 1, probe.result)};
+        details[0].command_display = @constCast("sh build.sh");
+        errdefer std.debug.print("result: {f}\n", .{text_utils.terminalSafe(probe.result)});
+        const want = try std.mem.concat(alloc, u8, &.{ "● Exited 1 sh build.sh · ", probe.reason });
+        defer alloc.free(want);
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, want);
+
+        // No escape from the output reaches the row's bytes (R4.6).
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+        const row = projection.entry_actions.items[0].override.bytes;
+        var index: usize = 0;
+        while (index < row.len) {
+            if (skipSgrSequence(row, &index)) continue;
+            try std.testing.expect(row[index] != 0x1b);
+            index += 1;
+        }
+    }
 }
 
 /// A string or whole-number field of a JSON object; `.other` for any other
@@ -5453,7 +5490,7 @@ fn shownLine(line: []const u8) ?ShownLine {
     while (index < line.len) {
         const byte = line[index];
         if (byte == 0x1b) {
-            index = escapeEnd(line, index);
+            index = display_width.ansiSequenceEnd(line, index);
             continue;
         }
         if (at_start) shown.indented = byte == ' ' or byte == '\t';
