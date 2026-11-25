@@ -34,8 +34,12 @@ function mainRow(state = ""): RegExp {
   return new RegExp(`^ {2}main {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
 }
 
+// The time a working subagent's row shows after its state, such as "3s" or "1h2m3s".
+const ROW_ELAPSED = String.raw`\d+(?:h\d+m\d+s|m\d+s|s)`;
+
 function subagentRow(name: string, state = ""): RegExp {
-  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${state}(?: {2,}|$)` : ""}`, "m");
+  const shown = state === "working" ? `working(?: ${ROW_ELAPSED})?` : state;
+  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}${state ? `.* {2,}${shown}(?: {2,}|$)` : ""}`, "m");
 }
 
 // Expects the agent list in `pane` to show `rows` in this order, top to bottom.
@@ -320,6 +324,14 @@ function held() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => (release = resolve));
   return { promise, release };
+}
+
+// The seconds a "worker" row in the agent list shows after "working", or -1
+// when no such row shows a time.
+function workerTurnSeconds(pane: string): number {
+  const match = /^ {2}[\u251c\u2514] worker .*working (?:(\d+)h)?(?:(\d+)m)?(\d+)s\b/m.exec(pane);
+  if (!match) return -1;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3]);
 }
 
 // What main's report request has to carry, because the report missed main's
@@ -2971,7 +2983,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
           // Only busy runs in a profile other than main, and its row names it
           // after its model.
-          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
+          expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+ {2,}notes\s*$/m);
           expect(list).toMatch(/^ {2}\u2514 idler {2,}.* {2,}idle {2,}\S+\s*$/m);
           expect(list).not.toMatch(/ {2}main\s*$/m);
           await session.sendKeys("Escape");
@@ -3022,7 +3034,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         // The model follows the state; the main profile goes unnamed.
-        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}\S+\s*$/m.test(pane), 15_000);
+        const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working(?: \d+(?:h\d+m\d+s|m\d+s|s))? {2,}\S+\s*$/m.test(pane), 15_000);
         expect(list).toMatch(/^ {2}main {2,}Plan the parser work {2,}idle {2,}\S+\s*$/m);
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
@@ -4904,12 +4916,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a working subagent's row keeps its title and shows its call's time, and its quiet command wakes main's wait",
+    "a working subagent's row keeps its title and shows how long its turn has run, and its quiet command wakes main's wait",
     async () => {
       const command = "sh -c 'printf TUI-QUIET-READY; exec sleep 600'";
       // The shell session the child's run started, from its result.
       const sessionOf = (body: string) => /shell-\d+/.exec(body.slice(body.indexOf("TUI-QUIET-READY")))?.[0];
       let childWaiting = false;
+      let childAsked = false;
+      const firstChildRequest = held();
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           // The latest call comes first: every earlier call stays in the turn.
@@ -4928,6 +4942,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
               request: { action: "interact", session_id: sessionOf(body), yield_time_ms: 20_000 },
             });
           }
+          // The child's first request waits until the list has shown its turn's time.
+          childAsked = true;
+          await firstChildRequest.promise;
           return toolCall("child_run", "shell", { request: { action: "run", command, yield_time_ms: 300 } });
         }
         if (body.includes('"main_wait"')) {
@@ -4942,13 +4959,23 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         });
       }, async (session) => {
         await session.sendText("SWITCH_USER");
-        await until("the child's first wait", () => childWaiting);
-        // The row of the working subagent keeps its title, not its current
-        // call, and shows how long that call has run.
+        await until("the child's first request", () => childAsked);
+        // While its first request waits on the model, no call is open, and the
+        // row shows how long its turn has run.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
-        const list = await session.waitForPane((pane) =>
-          /^ {2}[\u251c\u2514] worker .*working \d+s\b/m.test(pane), 15_000);
+        const thinking = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 3, 15_000);
+        const before = workerTurnSeconds(thinking);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        firstChildRequest.release();
+        await until("the child's first wait", () => childWaiting);
+        // The row keeps its title, not its current call, and a new call does
+        // not start its clock again.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        const list = await session.waitForPane((pane) => workerTurnSeconds(pane) >= 0, 15_000);
+        expect(workerTurnSeconds(list)).toBeGreaterThanOrEqual(before);
         const workerRow = list.split("\n").find((line) => /^ {2}[\u251c\u2514] worker /.test(line)) ?? "";
         expect(workerRow).not.toContain("Waiting for");
         expect(workerRow).not.toContain("TUI-QUIET-READY");

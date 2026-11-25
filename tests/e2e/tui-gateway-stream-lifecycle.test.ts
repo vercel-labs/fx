@@ -203,7 +203,7 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
       await session.waitForStableComposer(TIMEOUT);
       await session.sendText("FOLLOWUP_AFTER_STOP: continue the same child.");
     } else if (variant === "joined") writeFileSync(release, "go");
-    await session.waitForText("CHILD_STEERING_ALL_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHILD_STEERING_ALL_DONE") && turnSettled(pane), TIMEOUT);
     expect(applied).toBe(variant === "joined");
     expect(followupDone).toBe(variant !== "late");
     expect(lateDone).toBe(variant === "late");
@@ -1825,7 +1825,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session!.sendText("Confirm a later prompt is still usable.");
-    await session!.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session!.waitForPane((pane) => pane.includes("LATER_PROMPT_OK") && turnSettled(pane), TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(12);
     await session!.sendText("/quit");
@@ -1866,7 +1866,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       },
     );
     await session!.sendText("Write the versioned test file.");
-    await session!.waitForText("AFTER_LENGTH_RESEND", TIMEOUT);
+    await session!.waitForPane((pane) => pane.includes("AFTER_LENGTH_RESEND") && turnSettled(pane), TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(2);
     expect(JSON.parse(queuedGateway.requests[0]!.body).reasoning).toBeUndefined();
@@ -1880,7 +1880,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     await session!.sendText("Confirm a later prompt is still usable.");
-    await session!.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session!.waitForPane((pane) => pane.includes("LATER_PROMPT_OK") && turnSettled(pane), TIMEOUT);
     await session!.waitForStableComposer(TIMEOUT);
     // The later prompt goes back to the selected effort.
     expect(queuedGateway.requests).toHaveLength(3);
@@ -1949,7 +1949,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       call.stop_reason === "other" && call.provider_stop_reason === "UNEXPECTED_TOOL_CALL")).toBe(true);
 
     await session.sendText("Confirm a later prompt is still usable.");
-    await session.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("LATER_PROMPT_OK") && turnSettled(pane), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(3);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2007,7 +2007,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Read notes.txt.");
-    await session.waitForText("MALFORMED_RECOVERY_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("MALFORMED_RECOVERY_DONE") && turnSettled(pane), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(queuedGateway.requests).toHaveLength(3);
     const scrollback = (await session.captureFullScrollback()).replace(/\s+/g, " ");
@@ -2152,7 +2152,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // A second prompt joins the retry already in flight instead of starting one.
       await session.waitForStableComposer(TIMEOUT);
       await session.sendText("Second prompt.");
-      await session.waitForText("SECOND_PROMPT_OK", 10_000);
+      await session.waitForPane((pane) => pane.includes("SECOND_PROMPT_OK") && turnSettled(pane), 10_000);
       expect(catalogGateway.modelRequests).toHaveLength(2);
 
       await session.waitForStableComposer(TIMEOUT);
@@ -2203,7 +2203,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Run without the catalog.");
-    await session.waitForText("REFUSED_CATALOG_PROMPT_OK", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("REFUSED_CATALOG_PROMPT_OK") && turnSettled(pane), TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
 
     const scrollback = await session.captureFullScrollback();
@@ -3172,6 +3172,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const encoder = new TextEncoder();
       let timer: ReturnType<typeof setInterval> | undefined;
       let sendRest: (() => void) | undefined;
+      let sendFinish: (() => void) | undefined;
       const { stderrPath } = await launchRouteRecoveryTui("fx-tui-subagent-pending-row-", [
         () => fakeGatewayToolCall("status_first", "subagent", { action: "status" }),
         () =>
@@ -3188,6 +3189,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
                   send({ type: "tool-input-delta", id: "status_second", delta: 'ion":"status"}' });
                   send({ type: "tool-input-end", id: "status_second" });
                   send({ type: "tool-call", toolCallId: "status_second", toolName: "subagent", input: { action: "status" } });
+                  timer = setInterval(() => controller.enqueue(encoder.encode(": hold-after-tool-call\n\n")), 50);
+                };
+                sendFinish = () => {
+                  clearInterval(timer);
                   send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
                   controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                   controller.close();
@@ -3213,6 +3218,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       sendRest?.();
+      // Its arguments have ended but it has not run yet: core still says
+      // "Managing", which a slow machine can paint before the call runs.
+      for (let i = 0; i < 15; i += 1) {
+        frames.push(treeRows(await session!.capturePane()));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      sendFinish?.();
       for (let i = 0; i < 200; i += 1) {
         const pane = await session!.capturePane();
         frames.push(treeRows(pane));
@@ -9076,7 +9088,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText(rootPrompt);
-      await session.waitForText("SUBAGENT_SELECTED_PARENT_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("SUBAGENT_SELECTED_PARENT_DONE") && turnSettled(pane), TIMEOUT);
       // Opening a tool never adds it to the tools the child sends.
       expect(offeredAfterSelect).toBe(false);
       expect(readFileSync(fixture.callStartedPath, "utf8")).toContain("selected");
@@ -9516,7 +9528,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
-        await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("MAIN_SAW_JOINED_REPORT") && turnSettled(pane), TIMEOUT);
         await session.waitForText(row, TIMEOUT);
         const live = await session.captureFullScrollback();
         expect(countOccurrences(live, row)).toBe(1);

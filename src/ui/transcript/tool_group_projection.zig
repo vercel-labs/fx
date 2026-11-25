@@ -2632,9 +2632,26 @@ fn subagentRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, record: *co
         capital[0] = std.ascii.toUpper(capital[0]);
         return capital;
     };
-    // Core's status while the call streams, "Managing reviewer".
-    if (record.outcome == null) return try runningSubagentPhrase(scratch, phrase, record, started) orelse lead;
+    // Core's status while the call streams, "Managing reviewer". A call that
+    // names no agent, such as a status check of every subagent, keeps core's
+    // bare "Managing" from its stream's end until it runs, so it reads as core
+    // words it once it runs.
+    if (record.outcome == null) {
+        if (try runningSubagentPhrase(scratch, phrase, record, started)) |running| return running;
+        if (std.mem.findScalar(u8, lead, ' ') == null) if (try activeSubagentLead(scratch, record)) |active| return active;
+    }
     return lead;
+}
+
+/// Core's words for a `subagent` call while it runs, such as "Checking
+/// subagents", with a capital. Null until its arguments parse and name an
+/// action core words that way.
+fn activeSubagentLead(scratch: std.mem.Allocator, record: *const ToolDetailRecord) !?[]const u8 {
+    const call: types.ToolCall = .{ .id = "", .name = record.tool_name, .arguments_json = record.arguments_json orelse return null };
+    const action = try tooling_presentation.subagentAction(scratch, call, .active) orelse return null;
+    if (action.label.len == 0) return null;
+    action.label[0] = std.ascii.toUpper(action.label[0]);
+    return action.label;
 }
 
 /// The verb a `subagent` call that names an agent reads with while its
@@ -13170,6 +13187,23 @@ test "a subagent call whose arguments are still coming waits in the latest subag
         errdefer std.debug.print("after status:\n{s}\n", .{text});
         try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
         try std.testing.expect(std.mem.findScalar(u8, std.mem.trim(u8, text, "\n"), '\n') == null);
+    }
+    // Once its arguments end, the call joins the status row while core still
+    // says "Managing", until the call runs; the row says what it does.
+    for ([_]bool{ true, false }) |streaming| {
+        const entries = [_]TranscriptEntry{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● checked subagents\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 2, .bytes = "● Managing\n", .class = .tool_status } },
+        };
+        const details = [_]ToolDetailRecord{
+            .{ .entry_id = 1, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .outcome = .completed },
+            .{ .entry_id = 2, .tool_name = @constCast("subagent"), .activity_kind = .subagent, .arguments_json = @constCast("{\"action\":\"status\"}"), .streaming = streaming },
+        };
+        const text = try groupTextForTest(alloc, &entries, &details);
+        defer alloc.free(text);
+        errdefer std.debug.print("arguments ended (streaming {}):\n{s}\n", .{ streaming, text });
+        try std.testing.expect(std.mem.find(u8, text, "Managing") == null);
+        try std.testing.expect(std.mem.find(u8, text, "● Checking subagents") != null);
     }
     // After a message, with a read after it, the call waits in the message's
     // row, not on a row of its own at the end.
