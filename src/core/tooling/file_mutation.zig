@@ -1511,6 +1511,13 @@ fn applyBlock(
             }
         }
     }
+    if (occurrence_count == 0 and words.last_line_without_newline) {
+        if (lastLineMatch(working.items, old_string, new_string)) |last_line| {
+            old_string = last_line.old;
+            new_string = last_line.new;
+            occurrence_count = 1;
+        }
+    }
     if (occurrence_count != 1) {
         return try matchFailureIn(alloc, failure_detail, words, block, working.items, old_string, occurrence_count);
     }
@@ -1528,6 +1535,25 @@ fn applyBlock(
     const match_start = std.mem.find(u8, working.items, old_string).?;
     try working.replaceRange(alloc, match_start, old_string.len, new_string);
     return null;
+}
+
+const LastLineMatch = struct { old: []u8, new: []u8 };
+
+/// A file whose last line has no newline cannot match a search that ends in
+/// one, so the search is matched without its newline, which must be the file's
+/// end. The replace text drops its newline too, so the file still has none.
+/// Null unless that text is the last line and occurs nowhere else.
+fn lastLineMatch(content: []const u8, old_string: []u8, new_string: []u8) ?LastLineMatch {
+    if (content.len == 0 or content[content.len - 1] == '\n') return null;
+    if (old_string.len < 2 or old_string[old_string.len - 1] != '\n') return null;
+    const bare_old = old_string[0 .. old_string.len - 1];
+    if (!std.mem.endsWith(u8, content, bare_old)) return null;
+    if (countOccurrences(content, bare_old) != 1) return null;
+    const bare_new = if (new_string.len > 0 and new_string[new_string.len - 1] == '\n')
+        new_string[0 .. new_string.len - 1]
+    else
+        new_string;
+    return .{ .old = bare_old, .new = bare_new };
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -1552,6 +1578,9 @@ const EditWords = struct {
     replace: []const u8,
     /// Names the tool in the file-size texts.
     limit_for: []const u8,
+    /// Lets a search that ends in a newline match a file's last line when the
+    /// file has no final newline. Only the bridge's `edit` wording does this.
+    last_line_without_newline: bool,
 };
 
 const edit_file_words: EditWords = .{
@@ -1559,6 +1588,7 @@ const edit_file_words: EditWords = .{
     .search = "old_string",
     .replace = "new_string",
     .limit_for = "edit_file and write_file",
+    .last_line_without_newline = false,
 };
 
 const edit_words: EditWords = .{
@@ -1566,6 +1596,7 @@ const edit_words: EditWords = .{
     .search = "search text",
     .replace = "replace text",
     .limit_for = "edit",
+    .last_line_without_newline = true,
 };
 
 const edit_file_prefix = std.fmt.comptimePrint("{s} failed: ", .{edit_file_words.tool});
@@ -2633,6 +2664,73 @@ test "a single block in the bridge wording has no block prefix" {
         "edit failed: search text not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
         try expectBlocksFailure(arena, call, input, policy, .plain),
     );
+}
+
+test "the bridge wording edits the last line of a file with no final newline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nlast");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-last-line-bridge",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "last\n", .new = "new\n" },
+    });
+
+    const prepared = try expectBlocksPrepared(arena, call, input, policy);
+    try std.testing.expectEqualStrings("alpha\nnew", prepared.after_content);
+}
+
+test "the bridge wording edits the last line as block 2 of 2, and the file keeps no final newline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nbeta\nlast");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-last-line-second-block",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit, &.{
+        .{ .old = "alpha\n", .new = "ALPHA\n" },
+        .{ .old = "last\n", .new = "new\n" },
+    });
+
+    const prepared = try expectBlocksPrepared(arena, call, input, policy);
+    try std.testing.expectEqualStrings("ALPHA\nbeta\nnew", prepared.after_content);
+}
+
+test "edit_file still refuses a last line with no final newline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "note.txt", "alpha\nlast");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "edit-file-last-line",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "note.txt", "x", "y"),
+    };
+    const policy = try evaluatePolicy(arena, root, call);
+    const input = try editBlocksInput(arena, "note.txt", .edit_file, &.{
+        .{ .old = "last\n", .new = "new\n" },
+    });
+
+    const message = try expectBlocksFailure(arena, call, input, policy, .plain);
+    try std.testing.expect(std.mem.find(u8, message, "not found") != null);
 }
 
 test "a multi-block edit refused at apply leaves the file as the program left it" {

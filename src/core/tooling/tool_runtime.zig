@@ -124,6 +124,7 @@ test {
     _ = @import("../session/command_replay_store.zig");
     _ = @import("../session/result_store.zig");
     _ = file_mutation_execution;
+    _ = file_mutation;
     _ = tool_presentation;
 }
 
@@ -1078,7 +1079,7 @@ const McpCallBridgeState = struct {
     file_ops: bool = false,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = if (self.file_ops) authorizeBridgeFile else null, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = if (comptime tool_bridge.supported) (if (self.file_ops) authorizeBridgeFile else null) else null, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
     }
 };
 
@@ -1601,9 +1602,12 @@ fn runBridgeCall(
     cancel: *std.atomic.Value(bool),
 ) anyerror!mcp_call_capability.CallOutcome {
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
-    if (allowed.prepared) |prepared| {
-        const authority: *BridgeFileAuthority = @ptrCast(@alignCast(prepared));
-        return runBridgeFileCall(state.runtime, arena, request_id, authority, cancel);
+    // A file change exists only where the bridge does (`tool_bridge.supported`).
+    if (comptime tool_bridge.supported) {
+        if (allowed.prepared) |prepared| {
+            const authority: *BridgeFileAuthority = @ptrCast(@alignCast(prepared));
+            return runBridgeFileCall(state.runtime, arena, request_id, authority, cancel);
+        }
     }
     const row = BridgeCallRow.start(state.runtime, arena, request_id, tool, arguments_json);
     const outcome = callBridgeTool(state.runtime, arena, request_id, tool, arguments_json, allowed, cancel) catch |err| {

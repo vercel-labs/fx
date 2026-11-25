@@ -24,6 +24,14 @@ pub const supported = switch (builtin.target.os.tag) {
 /// on one HTTP message (`src/mcp/io/http.zig` `max_message`).
 pub const max_result_bytes: usize = 16 * 1024 * 1024;
 
+/// fx tool's text when fx cannot take a file change from this command: a
+/// program that the experimental bash tool did not start, or outside fx.
+pub const file_tool_unavailable_text = "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.";
+
+/// fx tool's text when fx cannot review a change: the bash call that ran this
+/// program has returned, or fx's bash tool did not start it. Nothing changed.
+pub const file_change_unreviewable_text = "fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.";
+
 pub const Authorization = union(enum) {
     /// The check allowed the call, for the tool definition it checked. `prepared`
     /// is what the handler keeps for the call step: a file change's authority,
@@ -118,7 +126,7 @@ pub const Capability = struct {
     }
 
     pub fn authorizeFile(self: Capability, arena: Allocator, request_id: []const u8, file: FileRequest) anyerror!Authorization {
-        const handler = self.authorize_file_fn orelse return .{ .deny = "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs." };
+        const handler = self.authorize_file_fn orelse return .{ .deny = file_tool_unavailable_text };
         return handler(self.context, arena, request_id, file);
     }
 

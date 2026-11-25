@@ -836,7 +836,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .tool)) return .{ .tool = args[1..] };
+            if (comptime tool_bridge.supported) if (command_specs.matchesTopLevel(command_catalog, command, .tool)) return .{ .tool = args[1..] };
         },
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };

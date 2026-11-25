@@ -21,6 +21,7 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
+const tool_bridge = @import("../tool_bridge/tool_bridge.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
@@ -496,12 +497,13 @@ pub fn Runtime(comptime App: type) type {
                     .push_fn = app_callbacks.Bindings(App).pushNestedToolLifecycle,
                     .save_bridge_call_fn = app_callbacks.Bindings(App).saveNestedBridgeCall,
                 },
-                .nested_file_publisher = .{
+                // Only the bridge publishes a bridged file change (`tool_bridge.supported`).
+                .nested_file_publisher = if (comptime tool_bridge.supported) .{
                     .context = @ptrCast(agent),
                     .publish_fn = app_callbacks.Bindings(App).publishNestedCommittedFile,
                     .added_marker = app_callbacks.Bindings(App).nestedFileAddedMarker(),
                     .removed_marker = app_callbacks.Bindings(App).nestedFileRemovedMarker(),
-                },
+                } else null,
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(agent),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app, agent).scope,

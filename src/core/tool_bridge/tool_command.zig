@@ -6,6 +6,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const capability = @import("capability.zig");
 const client = @import("client.zig");
 const core = @import("core.zig");
 const edit_blocks = @import("edit_blocks.zig");
@@ -84,7 +85,7 @@ fn callSocket(context: ?*anyopaque, arena: Allocator, io: std.Io, socket_path: [
 /// Resolves `path` lexically against `cwd` without following symlinks, so a
 /// relative path from a subshell folder arrives as an absolute path and the
 /// bridge's admission layer performs the canonical path check.
-pub fn resolveCommandPath(arena: Allocator, cwd: []const u8, path: []const u8) Allocator.Error![]const u8 {
+fn resolveCommandPath(arena: Allocator, cwd: []const u8, path: []const u8) Allocator.Error![]const u8 {
     if (std.Io.Dir.path.isAbsolute(path)) {
         return std.Io.Dir.path.resolveAlloc(arena, &.{path});
     }
@@ -119,7 +120,7 @@ fn bridgeFromEnv() ?Bridge {
 }
 
 /// Reads all of `reader`, up to `limit` bytes. A longer input is `error.InputTooLarge`.
-pub fn readLimited(arena: Allocator, reader: *std.Io.Reader, limit: usize) ![]u8 {
+fn readLimited(arena: Allocator, reader: *std.Io.Reader, limit: usize) ![]u8 {
     return reader.allocRemaining(arena, .limited(limit)) catch |read_err| switch (read_err) {
         error.StreamTooLong => error.InputTooLarge,
         else => |other| other,
@@ -138,8 +139,26 @@ pub fn writeEncodedTooLarge(w: *Writer, command: Command) Writer.Error!void {
 
 /// Writes the message for a bridge that is not there, and returns its exit code.
 pub fn writeUnavailable(w: *Writer) Writer.Error!u8 {
-    try w.writeAll("fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n");
+    try w.print("{s}\n", .{capability.file_tool_unavailable_text});
     return client.exit.unavailable;
+}
+
+/// Writes the message for a change fx cannot review, and returns its exit code.
+fn writeUnreviewable(w: *Writer) Writer.Error!u8 {
+    try w.print("{s}\n", .{capability.file_change_unreviewable_text});
+    return client.exit.unavailable;
+}
+
+/// Writes the message for a bridge of another fx version, and returns its exit code.
+fn writeOtherVersion(w: *Writer, command: Command) Writer.Error!u8 {
+    try w.print("fx tool {s}: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n", .{command.verb()});
+    return client.exit.unavailable;
+}
+
+/// Writes the message for a bridge with too many requests running, and returns its exit code.
+fn writeBusy(w: *Writer, command: Command) Writer.Error!u8 {
+    try w.print("fx tool {s}: too many fx tool calls are running in this session. Nothing changed; try again when one finishes.\n", .{command.verb()});
+    return client.exit.busy;
 }
 
 /// Checks `input` for `command`, sends it to the bridge through `caller`, and
@@ -192,10 +211,9 @@ fn callFailure(err: *Writer, command: Command, call_err: anyerror) !u8 {
             try writeEncodedTooLarge(err, command);
             return client.exit.usage;
         },
-        error.UnsupportedReply => {
-            try err.print("fx tool {s}: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n", .{command.verb()});
-            return client.exit.unavailable;
-        },
+        error.UnsupportedReply => return writeOtherVersion(err, command),
+        // The bridge's socket is removed once its last call has returned.
+        error.FileNotFound, error.ConnectionRefused => return writeUnreviewable(err),
         error.ConnectionLost, error.MalformedReply => {
             try err.print("fx tool {s}: the connection to fx was lost ({s}). The change may have run; check the file before you run it again.\n", .{ command.verb(), @errorName(call_err) });
             return client.exit.failed;
@@ -217,9 +235,16 @@ fn printReply(arena: Allocator, out: *Writer, err: *Writer, command: Command, re
         .failed => return refusal(arena, err, command, reply.bytes, client.exit.failed),
         .denied => return refusal(arena, err, command, reply.bytes, client.exit.denied),
         .refused => {
-            // A command that is not a bash tool program gets no file changes: the same
-            // text as outside fx, since that is what the command can do.
-            if (reply.header.reason == .file_tool_unavailable) return writeUnavailable(err);
+            // The reason decides fx tool's text: a call that has returned, or a token
+            // the bridge does not hold, cannot be reviewed; a command that is not a bash
+            // tool program gets the experimental text.
+            if (reply.header.reason) |reason| switch (reason) {
+                .closed, .unauthorized => return writeUnreviewable(err),
+                .file_tool_unavailable => return writeUnavailable(err),
+                .busy => return writeBusy(err, command),
+                .unsupported_version => return writeOtherVersion(err, command),
+                else => {},
+            };
             return refusal(arena, err, command, reply.bytes, client.refusalExit(reply.header.reason));
         },
     }
@@ -317,6 +342,68 @@ test "a file change refused because the command is not a bash tool program exits
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
+test "a file change refused as closed cannot be reviewed, so it says so and exits 3" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .refused, .reason = .closed, .bytes = 0 }, .bytes = "" } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .write = "new.txt" }, "x", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.unavailable, code);
+    try std.testing.expectEqualStrings("fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n", err.written());
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "a file change from a token the bridge does not know cannot be reviewed, and the MCP text is not shown" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const mcp_text = "This command was not started by a running fx shell call, or that call has ended. Run fx mcp call from a command fx's shell tool runs, not from one left running in the background.";
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .refused, .reason = .unauthorized, .bytes = mcp_text.len }, .bytes = mcp_text } };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .write = "new.txt" }, "x", test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.unavailable, code);
+    try std.testing.expectEqualStrings("fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n", err.written());
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "a bridge socket that is gone cannot review a change, and exits 3" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const gone: Bridge = .{ .socket_path = "/tmp/fx-tool-returned-test-no-socket.sock", .token = @splat(0x11) };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n", gone, socket_caller);
+    try std.testing.expectEqual(client.exit.unavailable, code);
+    try std.testing.expectEqualStrings("fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n", err.written());
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+fn refusedConnection(context: ?*anyopaque, arena: Allocator, io: std.Io, socket_path: []const u8, token: core.Token, operation: wire.Operation) anyerror!client.Reply {
+    _ = .{ context, arena, io, socket_path, token, operation };
+    return error.ConnectionRefused;
+}
+
+test "a bridge socket that refuses the connection cannot review a change, and exits 3" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const refusing: Caller = .{ .context = null, .call_fn = refusedConnection };
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n", test_bridge, refusing);
+    try std.testing.expectEqual(client.exit.unavailable, code);
+    try std.testing.expectEqualStrings("fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n", err.written());
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
 test "a write under the stdin cap whose encoded request exceeds max_request_bytes exits 2 without sending" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -407,9 +494,11 @@ test "a multi-block edit is one request, and each reply status gives its exit co
         .{ .status = .tool_error, .text = "No match", .code = client.exit.tool_error, .stdout = "", .stderr = "fx tool edit: No match\n" },
         .{ .status = .denied, .text = "Denied by a rule", .code = client.exit.denied, .stdout = "", .stderr = "fx tool edit: Denied by a rule\n" },
         .{ .status = .failed, .text = "boom", .code = client.exit.failed, .stdout = "", .stderr = "fx tool edit: boom\n" },
-        .{ .status = .refused, .reason = .busy, .text = "busy", .code = client.exit.busy, .stdout = "", .stderr = "fx tool edit: busy\n" },
+        .{ .status = .refused, .reason = .busy, .text = "busy", .code = client.exit.busy, .stdout = "", .stderr = "fx tool edit: too many fx tool calls are running in this session. Nothing changed; try again when one finishes.\n" },
         .{ .status = .refused, .reason = .malformed, .text = "bad", .code = client.exit.usage, .stdout = "", .stderr = "fx tool edit: bad\n" },
-        .{ .status = .refused, .reason = .closed, .text = "closed", .code = client.exit.unavailable, .stdout = "", .stderr = "fx tool edit: closed\n" },
+        .{ .status = .refused, .reason = .closed, .text = "closed", .code = client.exit.unavailable, .stdout = "", .stderr = "fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n" },
+        .{ .status = .refused, .reason = .unauthorized, .text = "mcp", .code = client.exit.unavailable, .stdout = "", .stderr = "fx tool: fx cannot review this change because the bash call that ran this program has returned, or fx's bash tool did not start this program. Nothing changed.\n" },
+        .{ .status = .refused, .reason = .unsupported_version, .text = "other", .code = client.exit.unavailable, .stdout = "", .stderr = "fx tool edit: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n" },
     };
     for (cases) |case| {
         var out: std.Io.Writer.Allocating = .init(arena);

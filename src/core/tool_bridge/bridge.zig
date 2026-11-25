@@ -404,7 +404,7 @@ fn refusalMessage(reason: wire.Reason) []const u8 {
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
         .too_large => "The request is over 1 MiB. Pass smaller arguments.",
-        .file_tool_unavailable => "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+        .file_tool_unavailable => capability_mod.file_tool_unavailable_text,
     };
 }
 
