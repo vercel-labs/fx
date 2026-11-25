@@ -5906,6 +5906,53 @@ fn pushCyberPolicyStatus(
 /// making it terminal-safe can make it longer.
 const cyber_policy_notice_max_bytes = 1024;
 
+/// `detail` with every copy of the request's credential masked, as sent and
+/// as JSON escapes it, and with its start masked where the provider's text
+/// was cut short inside it. The cyber notice and its status show more of the
+/// provider's text than other errors do, so they must not show more of a
+/// key. `arena` owns the result.
+fn withoutCredential(arena: Allocator, detail: []const u8, credential: []const u8) ![]const u8 {
+    const masked = try arena.dupe(u8, detail);
+    if (credential.len == 0) return masked;
+    const escaped = try std.json.Stringify.valueAlloc(arena, credential, .{});
+    const escaped_credential = escaped[1 .. escaped.len - 1];
+    for ([_][]const u8{ credential, escaped_credential }) |form| {
+        text_utils.maskLiteral(masked, form);
+        maskCutCredentialStart(masked, form);
+    }
+    return masked;
+}
+
+/// Masks the end of `text` where it is the start of `credential`, as it is
+/// when the provider's text was cut short inside the key.
+fn maskCutCredentialStart(text: []u8, credential: []const u8) void {
+    var len = @min(text.len, credential.len -| 1);
+    while (len > 0) : (len -= 1) {
+        if (std.mem.endsWith(u8, text, credential[0..len])) {
+            @memset(text[text.len - len ..], '*');
+            return;
+        }
+    }
+}
+
+test "withoutCredential masks a whole key, its escaped form, and a key the text was cut short inside" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key = "test-credential-0123456789";
+    const Case = struct { detail: []const u8, credential: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .detail = "cyber_policy: key " ++ key ++ " flagged", .credential = key, .expected = "cyber_policy: key " ++ text_utils.repeat("*", key.len) ++ " flagged" },
+        .{ .detail = "cyber_policy: {\"key\":\"test\\\"credential\"}", .credential = "test\"credential", .expected = "cyber_policy: {\"key\":\"" ++ text_utils.repeat("*", 16) ++ "\"}" },
+        .{ .detail = "cyber_policy: apply via test-cred", .credential = key, .expected = "cyber_policy: apply via " ++ text_utils.repeat("*", 9) },
+        .{ .detail = "cyber_policy: nothing to hide", .credential = key, .expected = "cyber_policy: nothing to hide" },
+        .{ .detail = "cyber_policy: key " ++ key, .credential = "", .expected = "cyber_policy: key " ++ key },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.expected, try withoutCredential(arena, case.detail, case.credential));
+    }
+}
+
 /// The notice for a cyber policy block: fx's name for it, then the
 /// provider's whole message, masked and made terminal-safe. Falls back to
 /// `diagnostic` when the provider sent no message. `arena` owns the result.
@@ -10134,12 +10181,10 @@ fn processQueuedPromptLoop(
                 const failure_cause = attempt_completion.provider_failure_cause;
                 if (failure_cause == .non_retryable or failure_cause == .cyber_policy) {
                     if (failure_cause == .cyber_policy) {
-                        try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(
-                            arena,
-                            attempt_completion.provider_failure_detail orelse "",
-                            diagnostic,
-                        ));
-                        try pushCyberPolicyStatus(&request_recovery, diagnostic);
+                        const detail = try withoutCredential(arena, attempt_completion.provider_failure_detail orelse "", active_api_key);
+                        const cyber_diagnostic = try prepareExternalFailureDiagnostic(arena, detail, types.cyber_policy_code);
+                        try deps.push_system_notice(deps.ctx, try cyberPolicyNotice(arena, detail, cyber_diagnostic));
+                        try pushCyberPolicyStatus(&request_recovery, cyber_diagnostic);
                     } else {
                         try deps.push_system_notice(deps.ctx, diagnostic.view());
                     }

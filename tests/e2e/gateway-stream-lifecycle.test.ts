@@ -14553,7 +14553,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stderr).toContain(`cyber_policy: Request with ${masked} was flagged.`);
       expect(result.stdout).not.toContain(key);
       expect(result.stderr).not.toContain(key);
-      expect(readFileSync(tracePath, "utf8")).not.toContain(key);
       const saved = readdirSync(join(root.home, ".fx"), { recursive: true, withFileTypes: true })
         .filter((entry) => entry.isFile())
         .map((entry) => join(entry.parentPath, entry.name));

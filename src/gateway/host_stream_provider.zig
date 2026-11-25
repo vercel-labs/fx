@@ -203,7 +203,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         request.cancel_flag,
         request.content_capture_limit,
         .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
-        request.credential.secret() orelse "",
     ) catch |err| switch (err) {
         error.ReadFailed => return readFailure(&reader, request.cancel_flag),
         else => return err,

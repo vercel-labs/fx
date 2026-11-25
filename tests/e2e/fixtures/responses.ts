@@ -105,13 +105,6 @@ export function lengthCut(model: string) {
   return sse([...opening(model), { type: "response.incomplete", response: cut }]);
 }
 
-// Not backed by a capture: a reply that fails while it streams. The
-// `response.failed` event and its `error` follow the public API reference.
-export function failedStream(model: string, code: string, message: string) {
-  const failed = response(model, "failed", { error: { code, message }, usage: usageOf(defaultUsage) });
-  return sse([...opening(model), { type: "response.failed", response: failed }]);
-}
-
 // The recorded server sends this body on the Chat Completions path too, where a
 // 400 was also recorded. `api_error` for any other status is not backed by a capture.
 export function errorResponse(status: number, message: string) {

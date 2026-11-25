@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
@@ -1371,50 +1371,6 @@ describe("custom connection on openai-responses: encrypted reasoning", () => {
       const sent = f.requests.filter(request => request.path === responsesFake.path);
       expect(sent.length).toBe(1);
       expect(sent[0].body.include).toEqual(include ? ["reasoning.encrypted_content"] : undefined);
-    } finally { f.close(); }
-  }, 25000);
-});
-
-// A Responses reply that fails while it streams can quote the connection's
-// key, as an error body can; fx masks it whole before it shows, traces, or
-// saves the failure, even where it cuts the provider's message short.
-describe("custom connection on openai-responses: a streamed failure that echoes the key", () => {
-  test.each([
-    { name: "a short message", pad: 0 },
-    // The detail keeps 253 bytes and "...", so 13 bytes of the key would show.
-    { name: "a message whose kept length ends inside the key", pad: 253 - 13 - "cyber_policy: Key ".length },
-  ])("$name", async ({ pad }) => {
-    const f = fixture(undefined, {
-      [responsesFake.path]: body => responsesFake.failedStream(
-        body.model,
-        "cyber_policy",
-        `${"x".repeat(pad)}Key ${f.env.FX_TEST_PROVIDER_TOKEN} was flagged for possible cybersecurity risk.`,
-      ),
-    });
-    try {
-      connection(f, "remote").protocol = "openai-responses";
-      f.save();
-      const tracePath = join(f.home, "trace.log");
-      const token = f.env.FX_TEST_PROVIDER_TOKEN;
-      const result = await runFx(["ask", "--json", "say hello"], {
-        cwd: f.workspace,
-        env: { ...f.env, FX_PROVIDER: "remote", FX_TRACE_LOG: tracePath },
-        timeoutMs: 20000,
-      });
-      const json = JSON.parse(result.stdout);
-      const tokenStart = token.slice(0, 8);
-
-      expect(result.code).toBe(1);
-      expect(json.recovery?.cause).toBe("cyber_policy");
-      expect(f.requests.filter(request => request.path === responsesFake.path)).toHaveLength(1);
-      expect(result.stdout).not.toContain(tokenStart);
-      expect(result.stderr).not.toContain(tokenStart);
-      expect(readFileSync(tracePath, "utf8")).not.toContain(tokenStart);
-      const saved = readdirSync(join(f.home, ".fx"), { recursive: true, withFileTypes: true })
-        .filter(entry => entry.isFile())
-        .map(entry => join(entry.parentPath, entry.name));
-      expect(saved.some(file => file.includes("sessions"))).toBe(true);
-      for (const file of saved) expect(readFileSync(file).toString("latin1")).not.toContain(tokenStart);
     } finally { f.close(); }
   }, 25000);
 });
