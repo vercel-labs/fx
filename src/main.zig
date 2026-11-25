@@ -5693,6 +5693,7 @@ test {
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
+    _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/tooling/tool_specs.zig");
     _ = @import("core/tooling/toolbox.zig");
     _ = @import("builtins/commands.zig");
