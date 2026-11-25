@@ -1456,14 +1456,17 @@ const LaunchSignal = struct {
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
     };
 
-    path_buf: [std.posix.PATH_MAX]u8,
-    path_len: usize,
+    /// The pipe's name in its folder. The command runs in that folder, so it
+    /// names the pipe relative to its working directory, and no path, which
+    /// may hold any character, goes into a shell command.
+    const name = "launched";
+
     read_fd: std.posix.fd_t,
     write_fd: std.posix.fd_t,
 
     fn init(signal: *LaunchSignal, dir: []const u8) !void {
-        const fifo = try std.mem.printSentinel(&signal.path_buf, "{s}/launched", .{dir}, 0);
-        signal.path_len = fifo.len;
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/" ++ name, .{dir}, 0);
         if (fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestLaunchSignalFailed;
         signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         if (signal.read_fd < 0) return error.TestLaunchSignalFailed;
@@ -1475,10 +1478,6 @@ const LaunchSignal = struct {
     fn deinit(signal: *LaunchSignal) void {
         _ = std.c.close(signal.write_fd);
         _ = std.c.close(signal.read_fd);
-    }
-
-    fn path(signal: *const LaunchSignal) []const u8 {
-        return signal.path_buf[0..signal.path_len];
     }
 
     /// Blocks until the command's byte arrives, for at most `timeout_ms`.
@@ -1570,11 +1569,7 @@ test "cancelling a start after its terminal launched closes that terminal" {
     var launched: LaunchSignal = undefined;
     try launched.init(fixture.home);
     defer launched.deinit();
-    const command = try alloc.print(
-        "printf 'HELD%s\\n' START; printf x > '{s}'; sleep 30",
-        .{launched.path()},
-    );
-    defer alloc.free(command);
+    const command = "printf 'HELD%s\\n' START; printf x > ./" ++ LaunchSignal.name ++ "; sleep 30";
 
     try fixture.preparePersistence();
     const correlation_id = fixture.runtime.nextCorrelationId();
