@@ -10804,6 +10804,10 @@ fn processQueuedPromptLoop(
             output_limit_cuts = 0;
         } else {
             output_limit_cuts += 1;
+            // A cut reply skips the language check a finished one gets, so
+            // text held for that check shows now, before the notice; a short
+            // part would otherwise never show.
+            try stream_ctx.accept_staged_response_language();
         }
         if (output_limit_action) |action| if (action != .end_turn) {
             const calls = cut_reply.?;

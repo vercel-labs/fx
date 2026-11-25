@@ -11505,6 +11505,36 @@ test "processQueuedPrompt shows a continued answer's text once when the turn end
     try std.testing.expect(std.mem.find(u8, saved, "3 times in a row before it was complete, so fx stopped the turn.") != null);
 }
 
+test "processQueuedPrompt shows a short cut part that waited for the language check before the answer goes on" {
+    const alloc = std.testing.allocator;
+    // Under five letters, the part is still held for the reply language
+    // check when the limit cuts it.
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &.{"Beta."}, .content = "Beta.", .finish_reason = .length },
+        .{ .chunks = &.{" and more text here."}, .content = " and more text here." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var prompt = "Please write a short note about the weather today in plain English.".*;
+    var job = fixture.job();
+    job.prompt = &prompt;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    // The held part reaches the screen once, as the text after it does.
+    var shown: usize = 0;
+    for (hooks.assistant_sources.items) |text| shown += std.mem.count(u8, text, "Beta.");
+    try std.testing.expectEqual(@as(usize, 1), shown);
+    var rest: usize = 0;
+    for (hooks.assistant_sources.items) |text| rest += std.mem.count(u8, text, "and more text here.");
+    try std.testing.expectEqual(@as(usize, 1), rest);
+    try std.testing.expectEqualStrings("Beta. and more text here.", hooks.finish_assistant_text.?);
+}
+
 test "processQueuedPrompt keeps a cut reply's text as its own reply once tools run after it" {
     const alloc = std.testing.allocator;
     const read = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
