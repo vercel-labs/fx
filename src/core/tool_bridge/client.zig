@@ -34,7 +34,21 @@ pub const Reply = struct {
     bytes: []const u8,
 };
 
-pub const CallError = error{ MalformedReply, UnsupportedReply, ConnectionLost, OutOfMemory };
+pub const CallError = error{ RequestTooLarge, MalformedReply, UnsupportedReply, ConnectionLost, OutOfMemory };
+
+/// Encodes one request line into `arena` and checks `wire.max_request_bytes`
+/// before any socket connection is opened.
+pub fn encodeRequest(
+    arena: Allocator,
+    token: mcp_call.Token,
+    operation: wire.Operation,
+) error{ RequestTooLarge, OutOfMemory }![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    wire.writeRequest(&out.writer, token, operation) catch return error.OutOfMemory;
+    const line = out.written();
+    if (line.len > wire.max_request_bytes) return error.RequestTooLarge;
+    return line;
+}
 
 /// Sends one request to the bridge at `socket_path` and reads its whole reply.
 pub fn call(
@@ -44,12 +58,13 @@ pub fn call(
     token: mcp_call.Token,
     operation: wire.Operation,
 ) (CallError || std.Io.net.UnixAddress.ConnectError || std.Io.net.UnixAddress.InitError)!Reply {
+    const encoded = try encodeRequest(arena, token, operation);
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(io);
     defer stream.close(io);
     var write_buffer: [4096]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
-    wire.writeRequest(&writer.interface, token, operation) catch return error.ConnectionLost;
+    writer.interface.writeAll(encoded) catch return error.ConnectionLost;
     writer.interface.flush() catch return error.ConnectionLost;
     var read_buffer: [wire.max_header_bytes]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -82,4 +97,20 @@ pub fn writeSafeLine(arena: Allocator, w: *Writer, text: []const u8) !void {
     try text_utils.appendTerminalSafeText(arena, &safe, text);
     try w.writeAll(safe.items);
     if (!std.mem.endsWith(u8, safe.items, "\n")) try w.writeByte('\n');
+}
+
+test "encodeRequest and call reject an encoded request over max_request_bytes before connecting" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const token: mcp_call.Token = @splat(0x22);
+    const quotes = try arena.alloc(u8, 700_000);
+    @memset(quotes, '"');
+    const operation: wire.Operation = .{ .write = .{ .path = "/tmp/quotes.txt", .content = quotes } };
+
+    try std.testing.expectError(error.RequestTooLarge, encodeRequest(arena, token, operation));
+    try std.testing.expectError(
+        error.RequestTooLarge,
+        call(arena, std.testing.io, "/tmp/fx-must-not-connect.sock", token, operation),
+    );
 }

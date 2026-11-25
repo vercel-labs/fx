@@ -118,7 +118,7 @@ pub const Capability = struct {
     }
 
     pub fn authorizeFile(self: Capability, arena: Allocator, request_id: []const u8, file: FileRequest) anyerror!Authorization {
-        const handler = self.authorize_file_fn orelse return .{ .deny = "fx tool works only inside a program that fx's bash tool started." };
+        const handler = self.authorize_file_fn orelse return .{ .deny = "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs." };
         return handler(self.context, arena, request_id, file);
     }
 

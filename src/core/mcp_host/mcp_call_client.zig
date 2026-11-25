@@ -81,6 +81,10 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
 
     const reply = client.call(arena, io, socket_path, token, operation) catch |e| switch (e) {
         error.OutOfMemory => return e,
+        error.RequestTooLarge => {
+            try err.print("fx mcp call: the encoded request is larger than {d} bytes.\n", .{wire.max_request_bytes});
+            return exit.usage;
+        },
         error.UnsupportedReply => {
             try err.writeAll("fx mcp call: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n");
             return exit.unavailable;

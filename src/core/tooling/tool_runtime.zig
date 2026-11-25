@@ -1124,6 +1124,33 @@ const BridgeFileAuthority = union(enum) {
     },
 };
 
+fn normalizeBridgeFilePath(arena: Allocator, workspace_root: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    if (!std.Io.Dir.path.isAbsolute(path)) return path;
+    const resolved = try std.Io.Dir.path.resolveAlloc(arena, &.{path});
+    const resolved_root = if (std.Io.Dir.path.isAbsolute(workspace_root))
+        try std.Io.Dir.path.resolveAlloc(arena, &.{workspace_root})
+    else
+        workspace_root;
+    return pathing.workspaceRelative(resolved_root, resolved);
+}
+
+fn normalizeBridgeFileRequest(
+    arena: Allocator,
+    workspace_root: []const u8,
+    file: mcp_call_capability.FileRequest,
+) Allocator.Error!mcp_call_capability.FileRequest {
+    return switch (file) {
+        .edit => |value| .{ .edit = .{
+            .path = try normalizeBridgeFilePath(arena, workspace_root, value.path),
+            .blocks = value.blocks,
+        } },
+        .write => |value| .{ .write = .{
+            .path = try normalizeBridgeFilePath(arena, workspace_root, value.path),
+            .content = value.content,
+        } },
+    };
+}
+
 /// Checks a bridge file change as the agent's own `edit_file` or `write_file`
 /// call: the same rules, prompt, and automatic review, which see exactly this
 /// call (`checkNestedCall` does the same for MCP calls).
@@ -1135,12 +1162,13 @@ fn authorizeBridgeFile(
 ) anyerror!mcp_call_capability.Authorization {
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const ctx = state.runtime;
-    const block_count: usize = switch (file) {
+    const normalized_file = try normalizeBridgeFileRequest(arena, ctx.workspace_root, file);
+    const block_count: usize = switch (normalized_file) {
         .edit => |value| value.blocks.len,
         .write => 1,
     };
-    const call = try bridgeFileToolCall(arena, request_id, file);
-    const input = try bridgeFileMutationInput(arena, file);
+    const call = try bridgeFileToolCall(arena, request_id, normalized_file);
+    const input = try bridgeFileMutationInput(arena, normalized_file);
     var check = ctx;
     check.permission_review_turn = try nestedReviewTurn(ctx, arena, call);
     const decided = try tool_admission.requestDecodedFileMutationPermission(
@@ -1152,10 +1180,10 @@ fn authorizeBridgeFile(
         ctx.session_grants,
     );
     const outcome = switch (decided) {
-        .tool_failure => |reason| return failedBridgeFile(arena, call.name, bridgeFilePath(file), reason, block_count),
+        .tool_failure => |reason| return failedBridgeFile(arena, call.name, bridgeFilePath(normalized_file), reason, block_count),
         .outcome => |value| value,
     };
-    if (outcome.tool_failure) |reason| return failedBridgeFile(arena, call.name, bridgeFilePath(file), reason, block_count);
+    if (outcome.tool_failure) |reason| return failedBridgeFile(arena, call.name, bridgeFilePath(normalized_file), reason, block_count);
     if (outcome.decision.isDenied() or outcome.execution_authority == null) {
         if (outcome.feedback) |message| return .{ .deny = message };
         const reason = outcome.denial_reason orelse outcome.decision.denialReason() orelse .user_denied;
@@ -2594,6 +2622,50 @@ test "a surface that records no bridged change logs that its undo entry and diff
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "notes.txt") != null);
     try std.testing.expect(std.mem.find(u8, trace, "not recorded") != null);
+}
+
+test "a bridged edit with an absolute path inside the workspace normalizes to workspace-relative in row and reply" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/sub");
+    try writeBridgeTestFile(tmp, "workspace/app.py", "root\n");
+    try writeBridgeTestFile(tmp, "workspace/sub/app.py", "sub\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const sub_abs = try std.Io.Dir.path.join(arena, &.{ workspace, "sub", "app.py" });
+
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var rt = TestRuntime{ .workspace_root = workspace, .permission_mode = .yolo, .cancel_flag = &cancel };
+    defer rt.deinit(alloc);
+    var rows = RowRecorder{ .alloc = alloc };
+    defer rows.deinit();
+    var ctx = rt.context();
+    ctx.nested_tool_lifecycle = .{ .context = @ptrCast(&rows), .push_fn = RowRecorder.push, .save_bridge_call_fn = RowRecorder.save };
+    ctx.output_chunk_lifecycle_id = .{ .turn_id = 5, .call_id = "shell-call-sub" };
+    var state = McpCallBridgeState{ .runtime = ctx };
+    const blocks = [_]tool_bridge.edit_blocks.Edit{.{ .search = "sub\n", .replace = "sub2\n" }};
+
+    const allowed = switch (try authorizeBridgeFile(@ptrCast(&state), arena, "fx-mcp-call-27", .{ .edit = .{ .path = sub_abs, .blocks = &blocks } })) {
+        .allow => |value| value,
+        .deny => return error.TestExpectedAllow,
+    };
+    const outcome = try runBridgeCall(@ptrCast(&state), arena, "fx-mcp-call-27", sub_abs, "", allowed, &cancel);
+
+    try std.testing.expectEqual(tool_bridge.capability.CallStatus.ok, outcome.status);
+    try std.testing.expectEqualStrings("edited sub/app.py +1 -1", outcome.bytes);
+    try std.testing.expectEqualStrings("root\n", try readBridgeTestFile(arena, tmp, "workspace/app.py"));
+    try std.testing.expectEqualStrings("sub2\n", try readBridgeTestFile(arena, tmp, "workspace/sub/app.py"));
+    try std.testing.expectEqual(@as(usize, 1), rows.saved.items.len);
+    try std.testing.expectEqualStrings("Edited sub/app.py +1 / -1", rows.saved.items[0].summary orelse return error.TestUnexpectedResult);
+
+    // Outside paths and sibling-prefix paths stay absolute.
+    const outside_sibling = try alloc.print("{s}-other/app.py", .{workspace});
+    defer alloc.free(outside_sibling);
+    try std.testing.expectEqualStrings(outside_sibling, try normalizeBridgeFilePath(arena, workspace, outside_sibling));
 }
 
 test "a bridged call's review turn names the call and the turn the agent's own call would get" {

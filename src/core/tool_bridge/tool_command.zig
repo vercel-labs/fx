@@ -81,6 +81,16 @@ fn callSocket(context: ?*anyopaque, arena: Allocator, io: std.Io, socket_path: [
     return client.call(arena, io, socket_path, token, operation);
 }
 
+/// Resolves `path` lexically against `cwd` without following symlinks, so a
+/// relative path from a subshell folder arrives as an absolute path and the
+/// bridge's admission layer performs the canonical path check.
+pub fn resolveCommandPath(arena: Allocator, cwd: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    if (std.Io.Dir.path.isAbsolute(path)) {
+        return std.Io.Dir.path.resolveAlloc(arena, &.{path});
+    }
+    return std.Io.Dir.path.resolveAlloc(arena, &.{ cwd, path });
+}
+
 /// Runs `fx tool` in the program that runs it, and returns the exit code. It
 /// reads the change from stdin only when a bridge is there to receive it.
 pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Command) !u8 {
@@ -94,7 +104,12 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         },
         else => return read_err,
     };
-    return send(arena, io, out, err, command, input, bridge, socket_caller);
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const resolved_command: Command = switch (command) {
+        .edit => |path| .{ .edit = try resolveCommandPath(arena, cwd, path) },
+        .write => |path| .{ .write = try resolveCommandPath(arena, cwd, path) },
+    };
+    return send(arena, io, out, err, resolved_command, input, bridge, socket_caller);
 }
 
 fn bridgeFromEnv() ?Bridge {
@@ -116,9 +131,14 @@ pub fn writeTooLarge(w: *Writer, command: Command) Writer.Error!void {
     try w.print("fx tool {s}: the change on stdin is larger than {d} bytes. Split the change into several smaller calls.\n", .{ command.verb(), max_input_bytes });
 }
 
+/// Writes the message for an encoded request over `wire.max_request_bytes`.
+pub fn writeEncodedTooLarge(w: *Writer, command: Command) Writer.Error!void {
+    try w.print("fx tool {s}: the encoded change is larger than {d} bytes. Split the change into several smaller calls.\n", .{ command.verb(), wire.max_request_bytes });
+}
+
 /// Writes the message for a bridge that is not there, and returns its exit code.
 pub fn writeUnavailable(w: *Writer) Writer.Error!u8 {
-    try w.writeAll("fx tool: it works only inside a program that fx's bash tool started, while that program runs.\n");
+    try w.writeAll("fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n");
     return client.exit.unavailable;
 }
 
@@ -154,6 +174,13 @@ pub fn send(
             break :blk .{ .write = .{ .path = path, .content = input } };
         },
     };
+    _ = client.encodeRequest(arena, bridge.token, operation) catch |encode_err| switch (encode_err) {
+        error.RequestTooLarge => {
+            try writeEncodedTooLarge(err, command);
+            return client.exit.usage;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const reply = caller.call(arena, io, bridge, operation) catch |call_err| return callFailure(err, command, call_err);
     return printReply(arena, out, err, command, reply);
 }
@@ -161,6 +188,10 @@ pub fn send(
 fn callFailure(err: *Writer, command: Command, call_err: anyerror) !u8 {
     switch (call_err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.RequestTooLarge => {
+            try writeEncodedTooLarge(err, command);
+            return client.exit.usage;
+        },
         error.UnsupportedReply => {
             try err.print("fx tool {s}: the running fx session is another fx version. Run the fx that started the session, or restart the session with this one.\n", .{command.verb()});
             return client.exit.unavailable;
@@ -263,7 +294,10 @@ test "outside a program fx started, the command says so and exits 3" {
     defer arena_state.deinit();
     var err: std.Io.Writer.Allocating = .init(arena_state.allocator());
     try std.testing.expectEqual(client.exit.unavailable, try writeUnavailable(&err.writer));
-    try std.testing.expect(std.mem.find(u8, err.written(), "works only inside a program that fx's bash tool started") != null);
+    try std.testing.expectEqualStrings(
+        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n",
+        err.written(),
+    );
 }
 
 test "a file change refused because the command is not a bash tool program exits 3 with the bash tool text" {
@@ -276,8 +310,42 @@ test "a file change refused because the command is not a bash tool program exits
 
     const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .edit = "app.py" }, "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n", test_bridge, fake.caller());
     try std.testing.expectEqual(client.exit.unavailable, code);
-    try std.testing.expectEqualStrings("fx tool: it works only inside a program that fx's bash tool started, while that program runs.\n", err.written());
+    try std.testing.expectEqualStrings(
+        "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.\n",
+        err.written(),
+    );
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "a write under the stdin cap whose encoded request exceeds max_request_bytes exits 2 without sending" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    var fake: FakeBridge = .{ .reply = .{ .header = .{ .status = .ok, .bytes = 0 }, .bytes = "" } };
+    const quotes = try arena.alloc(u8, 700_000);
+    @memset(quotes, '"');
+
+    const code = try send(arena, std.testing.io, &out.writer, &err.writer, .{ .write = "/tmp/quotes.txt" }, quotes, test_bridge, fake.caller());
+    try std.testing.expectEqual(client.exit.usage, code);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expectEqualStrings(
+        "fx tool write: the encoded change is larger than 1048576 bytes. Split the change into several smaller calls.\n",
+        err.written(),
+    );
+}
+
+test "resolveCommandPath resolves relative paths lexically against cwd without following symlinks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("/w/repo/sub/app.py", try resolveCommandPath(arena, "/w/repo/sub", "app.py"));
+    try std.testing.expectEqualStrings("/w/repo/app.py", try resolveCommandPath(arena, "/w/repo/sub", "../app.py"));
+    try std.testing.expectEqualStrings("/w/outside.txt", try resolveCommandPath(arena, "/w/repo", "../outside.txt"));
+    try std.testing.expectEqualStrings("/tmp/x.txt", try resolveCommandPath(arena, "/w/repo/sub", "/tmp/a/../x.txt"));
 }
 
 test "an edit the decoder refuses is refused before anything is sent, with exit 2" {

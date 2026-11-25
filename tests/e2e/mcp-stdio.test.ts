@@ -5557,7 +5557,9 @@ describe("fx mcp call", () => {
     });
     expect(result.code).toBe(0);
     expect(seen).toContain("exit=3");
-    expect(seen).toContain("fx tool: it works only inside a program that fx's bash tool started");
+    expect(seen).toContain(
+      "fx tool: it works only inside a program that fx's bash tool started, with experimental.bash_tool on, while that program runs.",
+    );
     expect(readFileSync(join(root.workspace, "app.txt"), "utf8")).toBe("old\n");
   }, 40_000);
 
