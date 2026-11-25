@@ -18,6 +18,8 @@ const invalidParamsCode = -32602;
 const gatewayChatUrl = "http://127.0.0.1:9/chat";
 // A slow peer's input: the headers arrive after five 50 ms pulses. This is not a wait for state.
 const slow_host_header_delay_ms = 250;
+const fetchOperationApplied = 1;
+const catalogJson = JSON.stringify({ object: "list", data: [{ id: "native/test-model", type: "language", tags: ["tool-use"] }] });
 const chatSseBody = 'data: {"type":"text-delta","delta":"recovered"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n';
 
 function slowHostResponse(signal) {
@@ -97,7 +99,8 @@ function openCore({ home, workspaceRoot }) {
     workspaceRoot,
     gatewayChatUrl,
   });
-  const readySocket = new Socket({ fd: addon.takeCoreReadyFd(core), readable: true, writable: false });
+  const readyFd = addon.takeCoreReadyFd(core);
+  const readySocket = new Socket({ fd: readyFd, readable: true, writable: false });
   const fetchTaken = deferred();
   const waiters = new Map();
   let nextId = 1;
@@ -125,11 +128,32 @@ function openCore({ home, workspaceRoot }) {
         if (line) dispatch(JSON.parse(line));
       }
     }
-    const fetch = addon.takeCoreFetch(core);
-    if (fetch) fetchTaken.resolve(fetch);
+    takeFetches();
+  }
+
+  function answerCatalog(fetchHandle) {
+    const started = addon.startCoreFetchResponse(core, fetchHandle, 200);
+    const pushed = addon.pushCoreFetchResponse(core, fetchHandle, Buffer.from(catalogJson));
+    const finished = addon.finishCoreFetch(core, fetchHandle);
+    assert.deepEqual([started, pushed, finished], [fetchOperationApplied, fetchOperationApplied, fetchOperationApplied]);
+  }
+
+  // Answers the catalog GET at once and holds the first chat POST unanswered.
+  function takeFetches() {
+    for (let fetch = addon.takeCoreFetch(core); fetch; fetch = addon.takeCoreFetch(core)) {
+      const request = JSON.parse(fetch.request.toString("utf8"));
+      if (request.method === "GET") {
+        answerCatalog(request.handle);
+        continue;
+      }
+      fetchTaken.resolve({ request, body: fetch.body });
+      return;
+    }
   }
 
   readySocket.on("data", onReadable);
+  // Bun starts a socket built from an fd pending until connect(), as sdk/node.js does.
+  if (readySocket.pending) readySocket.connect({ fd: readyFd });
 
   return {
     core,
@@ -171,7 +195,8 @@ async function startPromptDuringHeaderWait(client) {
     prompt: [{ type: "text", text: "wait for the host" }],
   });
   turn.prompt.then(() => { turn.answered = true; }, () => {});
-  await client.waitForFetch();
+  const held = await client.waitForFetch();
+  assert.equal(held.request.method, "POST", JSON.stringify(held.request));
   return turn;
 }
 
