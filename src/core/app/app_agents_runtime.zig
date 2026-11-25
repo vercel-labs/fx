@@ -1652,6 +1652,18 @@ pub fn Runtime(comptime App: type) type {
             return busyAs(most) orelse .idle;
         }
 
+        /// Whether a turn of any agent `busiest` reads began or went on since
+        /// the last call, which clears each (`WorkerRuntime.takeBeganWork`).
+        /// Main loop only.
+        pub fn takeBeganWork(app: *App) bool {
+            var began = false;
+            if (firstOpen(app)) began = app.main_agent.worker.takeBeganWork() or began;
+            for (app.child_agents.items) |child| {
+                began = child.agent.worker.takeBeganWork() or began;
+            }
+            return began;
+        }
+
         /// The first open agent other than the one on screen that is busy:
         /// a turn going or queued, an approval or a question open, or a
         /// request only the user can continue. Restarting fx would stop it.

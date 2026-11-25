@@ -29,9 +29,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// Reports the busiest agent's state when it changed: blocked over
         /// working, and working over idle. The main loop runs it after each
-        /// pass, since it owns every agent's prompts.
+        /// pass, since it owns every agent's prompts. When a turn began or
+        /// went on since the last pass, it reports working first, so a turn
+        /// that ends before this pass looks, as one can right after an
+        /// answer, still shows as working.
         pub fn reconcile(app: *App) void {
             if (!app.herdr.enabled) return;
+            const began_work = app.agentsBeganWork();
             const Report = struct { state: herdr.State, status: ?[]const u8 = null };
             const report: Report = switch (app.agentsBusiest()) {
                 .needs_approval => .{ .state = .blocked, .status = attentionStatus(.permission) },
@@ -40,6 +44,7 @@ pub fn Runtime(comptime App: type) type {
                 .working => .{ .state = .working },
                 .idle => .{ .state = .idle },
             };
+            if (began_work and report.state != .working) app.herdr.reportStateIfChanged(.working, null);
             app.herdr.reportStateIfChanged(report.state, report.status);
         }
 
@@ -106,6 +111,10 @@ test "an app that knows its busiest agent reports the pane state only on a chang
         pub fn agentsBusiest(self: *@This()) Busiest {
             return self.busiest;
         }
+
+        pub fn agentsBeganWork(_: *@This()) bool {
+            return false;
+        }
     };
     const Provider = Runtime(TestApp);
 
@@ -141,6 +150,57 @@ test "an app that knows its busiest agent reports the pane state only on a chang
     try expectReport(app.herdr.reports[2], .blocked, "question");
     try expectReport(app.herdr.reports[3], .blocked, "permission");
     try expectReport(app.herdr.reports[4], .blocked, "recovery");
+    try expectReport(app.herdr.reports[5], .idle, null);
+}
+
+test "a turn that went on and ended between two passes reports working before idle" {
+    // The tags of `app_agents_runtime.Busiest`.
+    const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        lifecycle_runtime: hooks.Runtime,
+        herdr: RecordingClient = .{},
+        busiest: Busiest = .idle,
+        began_work: bool = false,
+
+        pub fn agentsBusiest(self: *@This()) Busiest {
+            return self.busiest;
+        }
+
+        pub fn agentsBeganWork(self: *@This()) bool {
+            defer self.began_work = false;
+            return self.began_work;
+        }
+    };
+    const Provider = Runtime(TestApp);
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+    try Provider.configure(&app, null);
+
+    // A question waits; the user answers it, and the turn ends before the
+    // next pass looks.
+    app.busiest = .has_question;
+    Provider.reconcile(&app);
+    app.busiest = .idle;
+    app.began_work = true;
+    Provider.reconcile(&app);
+    // A turn that is still working when the pass looks reports working once.
+    app.busiest = .working;
+    app.began_work = true;
+    Provider.reconcile(&app);
+    app.busiest = .idle;
+    Provider.reconcile(&app);
+
+    try std.testing.expectEqual(@as(usize, 6), app.herdr.report_count);
+    try expectReport(app.herdr.reports[0], .idle, null);
+    try expectReport(app.herdr.reports[1], .blocked, "question");
+    try expectReport(app.herdr.reports[2], .working, null);
+    try expectReport(app.herdr.reports[3], .idle, null);
+    try expectReport(app.herdr.reports[4], .working, null);
     try expectReport(app.herdr.reports[5], .idle, null);
 }
 
