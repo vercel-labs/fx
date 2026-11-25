@@ -10149,6 +10149,9 @@ for (const provider of ["codex", "grok"] as const) {
         const versioned = grok!.requests.filter((request) => request.path === "/v1/models" || request.path === "/v1/responses");
         expect(versioned.map((request) => request.path)).toEqual(expect.arrayContaining(["/v1/models", "/v1/responses"]));
         for (const request of versioned) expect(request.clientVersion).toBe(pinned);
+        const modalityRequests = grok!.requests.filter((request) => request.path === "/v1/language-models");
+        expect(modalityRequests.length).toBeGreaterThan(0);
+        for (const request of modalityRequests) expect(request.clientVersion).toBeNull();
       }
       expect(existsSync(join(home, ".fx", "provider-versions"))).toBe(false);
     } finally {

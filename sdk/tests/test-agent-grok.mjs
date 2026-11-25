@@ -17,6 +17,8 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const pins = await readFile(resolve(scriptDir, "../../src/core/gateway/provider_versions.zig"), "utf8");
+const grokClientVersion = pins.match(/pub const grok_client_version = "(\d+\.\d+\.\d+)";/)[1];
 const backendOptions = {
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
@@ -113,7 +115,7 @@ const assertNoSecrets = (value, secrets) => {
   assert.equal(reply.headers.get("x-grok-user-id"), accountId);
   assert.equal(reply.headers.get("X-XAI-Token-Auth"), "xai-grok-cli");
   assert.equal(reply.headers.get("x-authenticateresponse"), "authenticate-response");
-  assert.match(reply.headers.get("x-grok-client-version"), /^\d+\.\d+\.\d+$/);
+  assert.equal(reply.headers.get("x-grok-client-version"), grokClientVersion);
   assert.equal(reply.headers.get("x-grok-client-identifier"), "fx");
   assert.equal(reply.headers.get("x-grok-model-override"), "grok-4.5");
   const sessionId = reply.headers.get("x-grok-conv-id");

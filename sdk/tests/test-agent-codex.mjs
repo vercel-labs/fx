@@ -16,6 +16,8 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const pins = await readFile(resolve(scriptDir, "../../src/core/gateway/provider_versions.zig"), "utf8");
+const codexClientVersion = pins.match(/pub const codex_client_version = "(\d+\.\d+\.\d+)";/)[1];
 const backendOptions = {
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
@@ -54,7 +56,7 @@ function codexWorld({ rejectFirstReply = false, refreshedToken, reply = replySse
     const headers = new Headers(init.headers);
     const body = init.body === undefined ? undefined : typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body);
     log.push({ method, url, headers, body });
-    if (/^https:\/\/chatgpt\.com\/backend-api\/codex\/models\?client_version=\d+\.\d+\.\d+$/.test(url)) return Response.json(models);
+    if (url === `https://chatgpt.com/backend-api/codex/models?client_version=${codexClientVersion}`) return Response.json(models);
     if (url === "https://auth.openai.com/oauth/token" && method === "POST") {
       return Response.json({ access_token: refreshedToken, refresh_token: "rt-2", expires_in: tenDays });
     }
