@@ -706,9 +706,10 @@ describe("fx ask presentation", () => {
       held.send(ending);
       held.release("");
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
-      // tmux marks the pane dead a moment after the command's last line, so
-      // each capture waits for that mark and both show it.
-      await session.waitForPane(() => session.paneStatus().dead, TIMEOUT);
+      // tmux marks the pane dead when the command's output ends, but draws
+      // its "Pane is dead" row only once it also has the exit status, which
+      // can come later. Each capture waits for that row, so both show it.
+      await session.waitForText("Pane is dead", TIMEOUT);
       const streamed = await session.captureFullScrollback();
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -716,7 +717,7 @@ describe("fx ask presentation", () => {
       gateways.push(onePieceGateway);
       const onePiece = await startAsk(onePieceGateway, "one-piece");
       await onePiece.session.waitForText("__FX_EXIT_0__", TIMEOUT);
-      await onePiece.session.waitForPane(() => onePiece.session.paneStatus().dead, TIMEOUT);
+      await onePiece.session.waitForText("Pane is dead", TIMEOUT);
       expect(rowsOf(streamed)).toEqual(
         rowsOf(await onePiece.session.captureFullScrollback()),
       );
