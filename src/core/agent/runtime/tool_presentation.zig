@@ -2160,7 +2160,7 @@ const ProvisionalStatusTestCapture = struct {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
     fn noopPropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
-    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
     fn noopPushEvent(_: *anyopaque, _: @import("../worker_runtime.zig").WorkerEvent) !void {}
     fn noopPushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
     fn noopPushDiffBlock(_: *anyopaque, _: DiffEntryPayload) !void {}

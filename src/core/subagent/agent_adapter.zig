@@ -1040,7 +1040,7 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
 fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     switch (emission) {

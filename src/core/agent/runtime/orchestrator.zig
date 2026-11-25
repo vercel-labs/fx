@@ -6848,7 +6848,7 @@ fn processQueuedPromptInner(
         .{ active_history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
     );
     for (job.grants) |grant| {
-        try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
+        try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path, .shell_epoch = grant.shell_epoch });
     }
 
     // The turn's images are saved before any request is built, so a note

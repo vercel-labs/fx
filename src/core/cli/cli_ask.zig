@@ -3267,7 +3267,7 @@ fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) v
     ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
-fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
 
 fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));

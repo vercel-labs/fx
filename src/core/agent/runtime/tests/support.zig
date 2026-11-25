@@ -1792,11 +1792,12 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn propagateGrant(raw: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+    fn propagateGrant(raw: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try appendGrant(self.alloc, &self.propagated_grants, .{
             .tool_name = @constCast(tool_name),
             .target_path = @constCast(target_path),
+            .shell_epoch = shell_epoch,
         });
         try self.record("propagate_grant:{s}:{s}", .{ tool_name, target_path });
     }

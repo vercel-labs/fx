@@ -835,7 +835,7 @@ const NoticeCapture = struct {
     }
 
     fn propagateHistory(_: *anyopaque, _: HistoryTurn) !void {}
-    fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+    fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
     fn pushEvent(_: *anyopaque, _: WorkerEvent) !void {}
     fn pushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
     fn pushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
@@ -949,7 +949,7 @@ const StreamCapture = struct {
         return .{ .diff = .skipped, .tracker = .skipped };
     }
     fn noopPropagateHistory(_: *anyopaque, _: HistoryTurn) !void {}
-    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+    fn noopPropagateGrant(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {}
     fn noopPushDiff(_: *anyopaque, _: DiffEntryPayload) !void {}
     fn noopSystemNotice(_: *anyopaque, _: []const u8) !void {}
     fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}

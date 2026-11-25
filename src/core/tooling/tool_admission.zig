@@ -1549,10 +1549,12 @@ fn requestPermissionOutcomeResolved(
             .deny => return .{ .decision = .policy_denied },
             .allow => {},
             .ask => {
-                if (grants_apply and permissions.sessionGrantAllowed(local_grants, permission_name, target.path)) {
-                    used_session_grant = true;
-                    if (shell_grant_call) grant_epoch = shell_snapshot.processOwner().shellGrantEpoch(target.path);
-                    continue;
+                if (grants_apply) {
+                    if (permissions.sessionGrantMatch(local_grants, permission_name, target.path)) |match| {
+                        used_session_grant = true;
+                        if (shell_grant_call) grant_epoch = match.shell_epoch;
+                        continue;
+                    }
                 }
                 configured_ask = true;
             },
@@ -1609,9 +1611,10 @@ fn requestPermissionOutcomeResolved(
             if (used_session_grant) .session_grant else .configured_rule,
         ), grant_epoch), vision_path_authority);
     }
-    if (grants_apply and sessionGrantsAllowAll(local_grants, permission_name, policy_targets)) {
+    const all_allowed_epoch: ?u64 = if (grants_apply) sessionGrantsAllowAll(local_grants, permission_name, policy_targets) else null;
+    if (all_allowed_epoch) |allowed_epoch| {
         if (shell_grant_call and policy_targets.len > 0) {
-            grant_epoch = shell_snapshot.processOwner().shellGrantEpoch(policy_targets[0].path);
+            grant_epoch = allowed_epoch;
         }
         return bindVisionPathExecutionAuthority(
             withShellGrantEpoch(
@@ -2777,11 +2780,15 @@ fn commandPermissionTarget(
     );
 }
 
-fn sessionGrantsAllowAll(grants: []const PermissionGrant, tool_name: []const u8, targets: []const permissions.PermissionCallTarget) bool {
-    for (targets) |target| {
-        if (!permissions.sessionGrantAllowed(grants, tool_name, target.path)) return false;
+/// The shell epoch of the first target's grant, when every target has one;
+/// null when any target has none. Non-shell grants carry no epoch.
+fn sessionGrantsAllowAll(grants: []const PermissionGrant, tool_name: []const u8, targets: []const permissions.PermissionCallTarget) ?u64 {
+    var first_epoch: u64 = 0;
+    for (targets, 0..) |target, index| {
+        const match = permissions.sessionGrantMatch(grants, tool_name, target.path) orelse return null;
+        if (index == 0) first_epoch = match.shell_epoch;
     }
-    return true;
+    return first_epoch;
 }
 
 pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
@@ -4187,7 +4194,7 @@ test "exact command approval remains valid across live authority revalidation" {
         "printf approved > marker.txt",
         command_environment.commandFromPermissionIdentity(grants[0].target_path),
     );
-    try std.testing.expect(sessionGrantsAllowAll(grants, "bash", targets.items));
+    try std.testing.expect(sessionGrantsAllowAll(grants, "bash", targets.items) != null);
 }
 
 const test_review_tool_calls = [_]ToolCall{

@@ -7422,7 +7422,7 @@ test "interactive subagent host resolves current tools rules grants and integrat
     defer initial.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), initial.integrations.len);
 
-    try app.permission_engine.allow(alloc, "run_command", "zig build test");
+    try app.permission_engine.allow(alloc, "run_command", "zig build test", 0);
     try app.mcp_tool_names.append(alloc, try alloc.dupe(u8, "mcp_fixture_echo"));
     var changed = try host.host_authority.resolve_fn(
         host.host_authority.context,

@@ -341,7 +341,7 @@ pub const AgentRuntimeDeps = struct {
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-    propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
+    propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
     push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,

@@ -1114,9 +1114,6 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
-        if (std.mem.eql(u8, permissions.permissionNameForTool(grant.tool_name), "bash")) {
-            shell_snapshot.processOwner().recordShellGrant(grant.target_path);
-        }
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }
@@ -1150,10 +1147,11 @@ pub fn appendFrozenFileMutationGrants(
 }
 
 fn propagateGrant(hooks: *const AgentRuntimeDeps, grant: PermissionGrant) !void {
-    try hooks.propagate_grant(hooks.ctx, grant.tool_name, grant.target_path);
+    try hooks.propagate_grant(hooks.ctx, grant.tool_name, grant.target_path, grant.shell_epoch);
     try hooks.push_event(hooks.ctx, .{ .session_grant = .{
         .tool_name = try std.heap.c_allocator.dupe(u8, grant.tool_name),
         .target_path = try std.heap.c_allocator.dupe(u8, grant.target_path),
+        .shell_epoch = grant.shell_epoch,
     } });
 }
 

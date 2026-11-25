@@ -675,13 +675,13 @@ pub fn Runtime(comptime App: type) type {
             return error.ContextCompactionPersistenceUnavailable;
         }
 
-        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn propagateGrant(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             if (comptime @hasDecl(App, "propagateGrant")) {
-                try app.propagateGrant(tool_name, target_path);
+                try app.propagateGrant(tool_name, target_path, shell_epoch);
                 return;
             }
-            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path);
-            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path);
+            try app_permission_runtime.Runtime(App).allowAtOnce(app, agent, tool_name, target_path, shell_epoch);
+            try agent.worker.propagateGrant(std.heap.c_allocator, tool_name, target_path, shell_epoch);
         }
 
         pub fn pushEvent(app: *App, agent: *AppAgent, event: WorkerEvent) !void {
@@ -2062,7 +2062,7 @@ const FakeWorker = struct {
         self.propagated_history_turns += 1;
     }
 
-    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn propagateGrant(self: *FakeWorker, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, _: u64) !void {
         _ = alloc;
         _ = tool_name;
         _ = target_path;

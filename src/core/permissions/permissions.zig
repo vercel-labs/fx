@@ -55,8 +55,8 @@ pub const PermissionEngine = struct {
         return isToolAllowed(self.grants.items, tool_name, target_path);
     }
 
-    pub fn allow(self: *PermissionEngine, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
-        try allowToolForSession(alloc, &self.grants, tool_name, target_path);
+    pub fn allow(self: *PermissionEngine, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+        try allowToolForSession(alloc, &self.grants, tool_name, target_path, shell_epoch);
     }
 
     pub fn replaceRules(self: *PermissionEngine, alloc: std.mem.Allocator, next_rules: types.PermissionRuleSet) void {
@@ -135,14 +135,21 @@ pub fn isToolAllowed(grants: []const types.PermissionGrant, tool_name: []const u
     return false;
 }
 
+/// Records an approval made under `shell_epoch`, unless the list already has
+/// the same approval under that epoch.
 pub fn allowToolForSession(
     alloc: std.mem.Allocator,
     grants: *std.ArrayList(types.PermissionGrant),
     permission_name: []const u8,
     pattern: []const u8,
+    shell_epoch: u64,
 ) !void {
-    if (isToolAllowed(grants.items, permission_name, pattern)) return;
-    try appendOwnedGrant(alloc, grants, permission_name, pattern);
+    for (grants.items) |entry| {
+        if (entry.shell_epoch == shell_epoch and
+            std.mem.eql(u8, entry.tool_name, permission_name) and
+            std.mem.eql(u8, entry.target_path, pattern)) return;
+    }
+    try appendOwnedGrant(alloc, grants, permission_name, pattern, shell_epoch);
 }
 
 pub fn permissionTargetForCall(
@@ -1156,29 +1163,35 @@ fn rulesDenyAllTargetsForPermissionAndTool(rules: types.PermissionRuleSet, permi
 }
 
 pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []const u8, target_path: []const u8) bool {
+    return sessionGrantMatch(grants, tool_name, target_path) != null;
+}
+
+/// The remembered grant that authorizes `target_path`, or null. A bash grant
+/// matches only in the shell approval epoch it was made in: a refresh retires it.
+pub fn sessionGrantMatch(grants: []const types.PermissionGrant, tool_name: []const u8, target_path: []const u8) ?types.PermissionGrant {
     const permission = permissionNameForTool(tool_name);
     const pattern = patternForSessionGrantMatch(tool_name, target_path);
 
     if (std.mem.eql(u8, permission, web_fetch_permission)) {
-        if (!isCanonicalWebFetchDomainPattern(pattern)) return false;
+        if (!isCanonicalWebFetchDomainPattern(pattern)) return null;
         for (grants) |grant| {
             if (!std.mem.eql(u8, grant.tool_name, web_fetch_permission)) continue;
             if (!isCanonicalWebFetchDomainPattern(grant.target_path)) continue;
-            if (std.mem.eql(u8, grant.target_path, pattern)) return true;
+            if (std.mem.eql(u8, grant.target_path, pattern)) return grant;
         }
-        return false;
+        return null;
     }
 
+    const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
     for (grants) |grant| {
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
         if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
-            // A shell refresh resets remembered command approvals.
-            if (!shell_snapshot.processOwner().shellGrantCurrent(grant.target_path)) continue;
+            if (grant.shell_epoch != shell_epoch) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
-        return true;
+        return grant;
     }
-    return false;
+    return null;
 }
 
 const path_always_permissions = [_][]const u8{
@@ -1190,6 +1203,7 @@ const path_always_permissions = [_][]const u8{
 
 pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]types.PermissionGrant {
     const permission = permissionNameForTool(tool_name);
+    const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
     var grants: std.ArrayList(types.PermissionGrant) = .empty;
     errdefer {
         clearAllowedTools(alloc, &grants);
@@ -1199,7 +1213,7 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
     if (std.mem.eql(u8, permission, "bash")) {
         const command = patternForSessionGrantMatch(tool_name, target_path);
 
-        try appendOwnedGrant(alloc, &grants, "bash", command);
+        try appendOwnedGrant(alloc, &grants, "bash", command, shell_epoch);
         return grants.toOwnedSlice(alloc);
     }
 
@@ -1208,7 +1222,7 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         defer alloc.free(workspace_pattern);
 
         for (path_always_permissions) |path_permission| {
-            try appendOwnedGrant(alloc, &grants, path_permission, workspace_pattern);
+            try appendOwnedGrant(alloc, &grants, path_permission, workspace_pattern, shell_epoch);
         }
         return grants.toOwnedSlice(alloc);
     }
@@ -1219,12 +1233,12 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
             const external_pattern = try directoryTreePattern(alloc, external_root);
             defer alloc.free(external_pattern);
 
-            try appendOwnedGrant(alloc, &grants, permission, external_pattern);
+            try appendOwnedGrant(alloc, &grants, permission, external_pattern, shell_epoch);
             return grants.toOwnedSlice(alloc);
         }
     }
 
-    try appendOwnedGrant(alloc, &grants, permission, patternForSessionGrantMatch(tool_name, target_path));
+    try appendOwnedGrant(alloc, &grants, permission, patternForSessionGrantMatch(tool_name, target_path), shell_epoch);
     return grants.toOwnedSlice(alloc);
 }
 
@@ -1354,7 +1368,7 @@ fn appendNormalizedFileGrant(
         }
         index += 1;
     }
-    try appendOwnedGrant(alloc, grants, permission, pattern);
+    try appendOwnedGrant(alloc, grants, permission, pattern, shell_snapshot.processOwner().approvalEpoch());
 }
 
 fn directoryTreePatternContains(
@@ -1385,6 +1399,7 @@ fn appendOwnedGrant(
     grants: *std.ArrayList(types.PermissionGrant),
     permission_name: []const u8,
     pattern: []const u8,
+    shell_epoch: u64,
 ) !void {
     const owned_permission = try alloc.dupe(u8, permission_name);
     errdefer alloc.free(owned_permission);
@@ -1395,6 +1410,7 @@ fn appendOwnedGrant(
     try grants.append(alloc, .{
         .tool_name = owned_permission,
         .target_path = owned_pattern,
+        .shell_epoch = shell_epoch,
     });
 }
 
@@ -1419,7 +1435,7 @@ pub fn formatPermissionsStatus(
 /// retires the shell command grants made before it.
 pub fn sessionGrantIsLive(grant: types.PermissionGrant) bool {
     if (!std.mem.eql(u8, permissionNameForTool(grant.tool_name), "bash")) return true;
-    return shell_snapshot.processOwner().shellGrantCurrent(grant.target_path);
+    return grant.shell_epoch == shell_snapshot.processOwner().approvalEpoch();
 }
 
 pub fn liveSessionGrantCount(grants: []const types.PermissionGrant) usize {
@@ -1985,7 +2001,7 @@ fn checkAllowToolForSessionAllocFailures(alloc: std.mem.Allocator) !void {
         grants.deinit(alloc);
     }
 
-    try allowToolForSession(alloc, &grants, "edit", "/tmp/workspace/src/main.zig");
+    try allowToolForSession(alloc, &grants, "edit", "/tmp/workspace/src/main.zig", 0);
 }
 
 fn checkSuggestedSessionGrantsAllocFailures(alloc: std.mem.Allocator) !void {
@@ -2002,8 +2018,8 @@ test "PermissionEngine stores deduplicates clears replaces and deinitializes own
     var engine = PermissionEngine{};
     defer engine.deinit(alloc);
 
-    try engine.allow(alloc, "edit", "/tmp/workspace");
-    try engine.allow(alloc, "edit", "/tmp/workspace");
+    try engine.allow(alloc, "edit", "/tmp/workspace", 0);
+    try engine.allow(alloc, "edit", "/tmp/workspace", 0);
 
     try std.testing.expectEqual(@as(usize, 1), engine.grants.items.len);
     try std.testing.expect(engine.isAllowed("edit", "/tmp/workspace"));
@@ -3576,15 +3592,16 @@ test "file target evaluator propagates only operational failures" {
 test "a shell refresh resets remembered command grants only" {
     shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const owner = shell_snapshot.processOwner();
     const command = "@fx-terminal-env:user:8:/bin/zsh::npm test";
-    const grants = [_]types.PermissionGrant{
-        .{ .tool_name = @constCast("bash"), .target_path = @constCast(command) },
+    var grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast(command), .shell_epoch = owner.approvalEpoch() },
         .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/**") },
     };
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
 
-    shell_snapshot.processOwner().markDirty(.user_reload);
+    owner.markDirty(.user_reload);
     try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
 
@@ -3595,7 +3612,49 @@ test "a shell refresh resets remembered command grants only" {
     try std.testing.expect(std.mem.find(u8, listing, " - bash -> ") == null);
     try std.testing.expect(std.mem.find(u8, listing, " - edit -> ") != null);
 
-    shell_snapshot.processOwner().recordShellGrant(command);
-    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
-    try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
+    // A grant made after the refresh carries the new epoch and matches again.
+    const later = [_]types.PermissionGrant{.{ .tool_name = @constCast("bash"), .target_path = @constCast(command), .shell_epoch = owner.approvalEpoch() }};
+    try std.testing.expect(sessionGrantAllowed(&later, "run_command", command));
+    try std.testing.expectEqual(@as(usize, 1), liveSessionGrantCount(&later));
+}
+
+test "a shell command grant made before a refresh stays dead after another session records the same command" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const owner = shell_snapshot.processOwner();
+
+    var session_b = [_]types.PermissionGrant{.{ .tool_name = @constCast("bash"), .target_path = @constCast("echo x"), .shell_epoch = owner.approvalEpoch() }};
+    try std.testing.expect(sessionGrantAllowed(&session_b, "run_command", "echo x"));
+
+    owner.markDirty(.user_reload);
+    try std.testing.expect(!sessionGrantAllowed(&session_b, "run_command", "echo x"));
+
+    var session_a: std.ArrayList(types.PermissionGrant) = .empty;
+    defer {
+        clearAllowedTools(std.testing.allocator, &session_a);
+        session_a.deinit(std.testing.allocator);
+    }
+    try allowToolForSession(std.testing.allocator, &session_a, "bash", "echo x", owner.approvalEpoch());
+    try std.testing.expect(sessionGrantAllowed(session_a.items, "run_command", "echo x"));
+
+    try std.testing.expect(!sessionGrantAllowed(&session_b, "run_command", "echo x"));
+}
+
+test "an approval is recorded once per shell epoch" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var grants: std.ArrayList(types.PermissionGrant) = .empty;
+    defer {
+        clearAllowedTools(alloc, &grants);
+        grants.deinit(alloc);
+    }
+
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 0);
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 0);
+    try std.testing.expectEqual(@as(usize, 1), grants.items.len);
+
+    try allowToolForSession(alloc, &grants, "bash", "echo x", 1);
+    try std.testing.expectEqual(@as(usize, 2), grants.items.len);
+    try std.testing.expectEqual(@as(u64, 1), grants.items[1].shell_epoch);
 }

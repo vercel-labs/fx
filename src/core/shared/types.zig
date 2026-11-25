@@ -3123,6 +3123,9 @@ pub const ToolPermissionDecision = enum {
 pub const PermissionGrant = struct {
     tool_name: []u8,
     target_path: []u8,
+    /// The shell approval epoch a bash grant was made under. It matches only
+    /// while the shell owner is still in that epoch; other grants ignore it.
+    shell_epoch: u64 = 0,
 };
 
 pub const PermissionAction = enum {
@@ -4236,6 +4239,7 @@ pub fn dupePermissionGrantSlice(alloc: std.mem.Allocator, grants: []const Permis
         copy[i] = .{
             .tool_name = tool_name,
             .target_path = target_path,
+            .shell_epoch = grant.shell_epoch,
         };
         copied += 1;
     }
@@ -4693,4 +4697,12 @@ test "dupePersistedContextNotes leaves nothing behind when a later note fails to
         dupeThenFreeContextNotes,
         .{@as([]const PersistedContextNote, &notes)},
     );
+}
+
+test "copying permission grants keeps each shell epoch" {
+    const alloc = std.testing.allocator;
+    var grants = [_]PermissionGrant{.{ .tool_name = @constCast("bash"), .target_path = @constCast("echo x"), .shell_epoch = 3 }};
+    const copy = try dupePermissionGrantSlice(alloc, &grants);
+    defer freePermissionGrantSlice(alloc, copy);
+    try std.testing.expectEqual(@as(u64, 3), copy[0].shell_epoch);
 }

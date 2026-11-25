@@ -2464,7 +2464,7 @@ test "a merge of approvals makes one copy of the instance's list: a slice and tw
     for ([_]usize{ 1, 20, 200 }) |count| {
         while (held < count) : (held += 1) {
             var buf: [24]u8 = undefined;
-            try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{held}));
+            try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{held}), 0);
         }
         var counting = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
         const alloc = counting.allocator();
@@ -2491,7 +2491,7 @@ fn callsAgainstTurnArena(count: usize, limit: usize) !void {
     defer app.deinit();
     for (0..count) |i| {
         var buf: [24]u8 = undefined;
-        try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}));
+        try app.permission_engine.allow(std.testing.allocator, "skill", try std.mem.print(&buf, "t-{d}", .{i}), 0);
     }
     const buffer = try std.testing.allocator.alloc(u8, limit);
     defer std.testing.allocator.free(buffer);
@@ -2533,7 +2533,7 @@ test "the request an execution runs under holds the call's approvals, then the i
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
     defer app.deinit();
-    try app.permission_engine.allow(alloc, "skill", "granted");
+    try app.permission_engine.allow(alloc, "skill", "granted", 0);
     var own = [_]PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
     const request: agent_runtime.ToolExecutionRequest = .{
         .call_allocator = alloc,
@@ -2573,7 +2573,7 @@ test "an approval in the instance's list never makes a tool that main's turn doe
     // What the turn offers decides, and the list of approvals does not enter
     // into it: a merged approval skips a prompt, and grants no tool.
     try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
-    try app.permission_engine.allow(alloc, "mcp_unoffered", "anything");
+    try app.permission_engine.allow(alloc, "mcp_unoffered", "anything", 0);
     try std.testing.expect((try app.validateToolCall({}, arena, call)) == .not_registered);
 }
 
@@ -2589,7 +2589,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
+    try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build", 0);
 
     const ctx = testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);

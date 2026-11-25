@@ -3705,12 +3705,12 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
 }
 
 /// Stores grants on the active ACP session without persisting them.
-fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
+fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     ctx.state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.state.subagent_authority_mutex.unlock(io_mod.getIo());
     const session = if (ctx.state.active_session) |*active| active else return;
-    try session.retainGrant(ctx.alloc, tool_name, target_path);
+    try session.retainGrant(ctx.alloc, tool_name, target_path, shell_epoch);
 }
 
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -5589,9 +5589,9 @@ test "ACP propagateGrant stores deduped runtime session grants" {
         .session_id = "session_1",
     };
 
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "run_command", "git status*");
-    try retainAcpGrant(&ctx, "write_file", "/tmp/workspace/**");
+    try retainAcpGrant(&ctx, "run_command", "git status*", 0);
+    try retainAcpGrant(&ctx, "run_command", "git status*", 0);
+    try retainAcpGrant(&ctx, "write_file", "/tmp/workspace/**", 0);
 
     const session = &state.active_session.?;
     try std.testing.expectEqual(@as(usize, 2), session.session_grants.len);

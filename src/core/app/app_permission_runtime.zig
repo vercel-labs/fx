@@ -220,13 +220,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// Records an "always" approval from `agent`'s turn on its
         /// permission owner.
-        pub fn allowForSession(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn allowForSession(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             lockAuthority(app);
             defer unlockAuthority(app);
             if (comptime per_instance) {
-                try permissions.allowToolForSession(app.alloc, &permissionOwner(app, agent).session_grants, tool_name, target_path);
+                try permissions.allowToolForSession(app.alloc, &permissionOwner(app, agent).session_grants, tool_name, target_path, shell_epoch);
             } else {
-                try app.permission_engine.allow(app.alloc, tool_name, target_path);
+                try app.permission_engine.allow(app.alloc, tool_name, target_path, shell_epoch);
             }
         }
 
@@ -236,9 +236,9 @@ pub fn Runtime(comptime App: type) type {
         /// the main loop handles the event that carries the same approval. The
         /// main loop records it again then, and the list keeps one row, since
         /// `allowToolForSession` skips an approval the list already allows.
-        pub fn allowAtOnce(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8) !void {
+        pub fn allowAtOnce(app: *App, agent: *AppAgent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
             if (comptime !per_instance) return;
-            try allowForSession(app, agent, tool_name, target_path);
+            try allowForSession(app, agent, tool_name, target_path, shell_epoch);
         }
 
         /// Drops `agent`'s session approvals when its session ends: they
@@ -714,7 +714,7 @@ test "app_permission_runtime reset clears grants before syncing permission state
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
     app.permission_engine.mode = .auto;
-    try app.permission_engine.allow(std.testing.allocator, "run_command", "/tmp/workspace::git status");
+    try app.permission_engine.allow(std.testing.allocator, "run_command", "/tmp/workspace::git status", 0);
 
     try Runtime(TestApp).reset(&app, (&app).agent());
 

@@ -2713,7 +2713,7 @@ test "session_commands handlePermissions persists modes and reset clears session
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
-    try app.permission_engine.allow(alloc, "bash", "git *");
+    try app.permission_engine.allow(alloc, "bash", "git *", 0);
 
     try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "auto");
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
@@ -2753,7 +2753,7 @@ test "session_commands permissions snapshot shows the mode and grants and change
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
     app.permission_engine.mode = .auto;
-    try app.permission_engine.allow(alloc, "bash", "git *");
+    try app.permission_engine.allow(alloc, "bash", "git *", 0);
 
     var snapshot = try Commands(FakeApp).openPermissionsSnapshot(&app, (&app).agent());
     defer snapshot.deinit();
@@ -2775,7 +2775,7 @@ test "session_commands permissions snapshot shows the mode and grants and change
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.agent().worker.synced_mode);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.agent().worker.synced_state_mode);
 
-    try app.permission_engine.allow(alloc, "read_file", "src/**");
+    try app.permission_engine.allow(alloc, "read_file", "src/**", 0);
     var refreshed = (try Commands(FakeApp).refreshedPermissionsSnapshot(&app, (&app).agent(), &snapshot)).?;
     defer refreshed.deinit();
     try expectStatusRow(refreshed, "Session grants", "2");

@@ -290,9 +290,10 @@ pub const ActiveSessionState = struct {
     /// prompt, and what a running session held must reopen.
     staging_needed: StagedTotals = .{},
 
-    pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
+    pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
         for (self.session_grants) |grant| {
-            if (std.mem.eql(u8, grant.tool_name, tool_name) and
+            if (grant.shell_epoch == shell_epoch and
+                std.mem.eql(u8, grant.tool_name, tool_name) and
                 std.mem.eql(u8, grant.target_path, target_path)) return;
         }
 
@@ -306,7 +307,7 @@ pub const ActiveSessionState = struct {
             @memmove(next[0..self.session_grants.len], self.session_grants);
             alloc.free(self.session_grants);
         }
-        next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy };
+        next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy, .shell_epoch = shell_epoch };
         self.session_grants = next;
     }
 };

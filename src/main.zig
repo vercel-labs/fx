@@ -115,6 +115,7 @@ const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
+const shell_snapshot = @import("core/terminal/shell_snapshot.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
 const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
@@ -2261,8 +2262,8 @@ const App = struct {
     }
 
     /// Records an "always" approval from `agent`'s turn on its instance.
-    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) !void {
-        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path);
+    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8, shell_epoch: u64) !void {
+        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path, shell_epoch);
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
@@ -8335,13 +8336,13 @@ test "each instance keeps its own permission mode and session approvals" {
     try std.testing.expectEqual(types.PermissionMode.yolo, Permission.livePermissionSnapshot(&app, &second.agent).mode);
 
     // An approval belongs to the instance whose turn asked for it.
-    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build");
+    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build", shell_snapshot.processOwner().approvalEpoch());
     const second_count = grantCount(&app, &second.agent);
     try std.testing.expect(second_count > 0);
     try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
 
     // A subagent's still go to the first instance, as before instances.
-    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
+    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt", shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(grantCount(&app, &app.main_agent) > 0);
     try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
     try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
@@ -8395,7 +8396,7 @@ test "a subagent's always approval reaches its instance's list at once, for main
 
     // They are in the list when the call returns, before the event that
     // carries them reaches the main loop.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
         try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
     }
@@ -8403,14 +8404,14 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const stored = grantCount(app, &app.main_agent);
 
     // The same approval again leaves the list as it was.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
+    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path, grant.shell_epoch);
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
 
     // A second instance is another session: it keeps its own list, and its
     // subagent's approval stays there.
     try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
     try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
-    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
+    try Worker.propagateGrant(app, &other.agent, "skill", "demo", 0);
     try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
     try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
     try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
@@ -8418,10 +8419,10 @@ test "a subagent's always approval reaches its instance's list at once, for main
     // Main's own answer is written at once too, so a subagent that is running
     // reads it at its next call. The main loop's event for the same answer
     // then adds no second row.
-    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
+    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
     try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
-    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
+    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only", 0);
     try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
 }
 
@@ -8443,7 +8444,7 @@ test "main's check reads the approvals its instance holds when it checks, and no
     // list has none of it.
     const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
     try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
-    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
+    try Worker.propagateGrant(app, &child.agent, "skill", "granted", 0);
 
     // Main's check now reads it, and still reads the turn's own approval.
     const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
@@ -8492,7 +8493,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
-                Worker.propagateGrant(self.app, child, "skill", target) catch {
+                Worker.propagateGrant(self.app, child, "skill", target, 0) catch {
                     _ = self.torn.fetchAdd(1, .monotonic);
                     return;
                 };
@@ -8559,7 +8560,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
     for (0..Race.approvals) |i| {
         var buf: [16]u8 = undefined;
         const target = try std.mem.print(&buf, "m-{d}", .{i});
-        try Permission.allowForSession(app, &app.main_agent, "skill", target);
+        try Permission.allowForSession(app, &app.main_agent, "skill", target, 0);
     }
     first_writer.join();
     second_writer.join();
@@ -9122,4 +9123,31 @@ test "a theme change leaves hidden agents alone while a scrollback handoff is pe
     App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
 
     try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;136;192;208mshown") != null);
+}
+
+test "an approval in one instance does not revive another instance's older bash grant" {
+    const alloc = std.testing.allocator;
+    const Permission = app_permission_runtime.Runtime(App);
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer Permission.deinitSessionGrants(&app, &app.main_agent);
+    const second = try addTestChildAgent(&app, "instance-2");
+    second.agent.role = .instance;
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+
+    try Permission.allowForSession(&app, &second.agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try Permission.allowForSession(&app, &app.main_agent, "run_command", "echo x", shell_snapshot.processOwner().approvalEpoch());
+
+    const second_grants = try Permission.copyGrants(&app, &second.agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, second_grants);
+    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "run_command", "echo x"));
+
+    const main_grants = try Permission.copyGrants(&app, &app.main_agent, alloc);
+    defer types.freePermissionGrantSlice(alloc, main_grants);
+    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "run_command", "echo x"));
 }

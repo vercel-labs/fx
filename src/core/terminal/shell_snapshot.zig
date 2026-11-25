@@ -408,9 +408,6 @@ pub const Owner = struct {
     /// Why the last capture failed, while `state` is `.failed`.
     last_failure: ?CaptureFailure = null,
     notice: Notice = .{},
-    /// Epoch each remembered shell command grant was made under, keyed by
-    /// the grant target. Keys are owned by `std.heap.c_allocator`.
-    shell_grants: std.StringHashMapUnmanaged(u64) = .empty,
 
     /// Returns a lease on a ready snapshot, starts or waits for the single
     /// capture, or reports that the command must use full startup. Blocks
@@ -487,45 +484,6 @@ pub const Owner = struct {
         }
     }
 
-    /// Records that a shell command grant was made under the current epoch.
-    /// On allocation failure the grant stays unrecorded, which only makes it
-    /// stop matching after the next refresh.
-    pub fn recordShellGrant(self: *Owner, target: []const u8) void {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const entry = self.shell_grants.getOrPut(std.heap.c_allocator, target) catch {
-            debug_trace.logf("core", "shell grant epoch not recorded err=OutOfMemory", .{});
-            return;
-        };
-        if (!entry.found_existing) {
-            entry.key_ptr.* = std.heap.c_allocator.dupe(u8, target) catch {
-                self.shell_grants.removeByPtr(entry.key_ptr);
-                debug_trace.logf("core", "shell grant epoch not recorded err=OutOfMemory", .{});
-                return;
-            };
-        }
-        entry.value_ptr.* = self.epoch;
-    }
-
-    /// Epoch a shell command grant was made under. Grants fx never recorded
-    /// count as made before the first refresh.
-    pub fn shellGrantEpoch(self: *Owner, target: []const u8) u64 {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.shell_grants.get(target) orelse 0;
-    }
-
-    /// Reports whether a shell command grant was made under the current
-    /// epoch. A refresh makes every earlier grant stop matching.
-    pub fn shellGrantCurrent(self: *Owner, target: []const u8) bool {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return (self.shell_grants.get(target) orelse 0) == self.epoch;
-    }
-
     /// Reports whether fx fell back to full startup after a failed capture,
     /// so it cannot tell which names the startup files redefine.
     pub fn startupNamesUnknown(self: *Owner) bool {
@@ -600,9 +558,6 @@ pub const Owner = struct {
     /// that are no longer shared, such as test owners.
     pub fn deinit(self: *Owner) void {
         if (self.capture_thread) |thread| thread.join();
-        var grant_keys = self.shell_grants.keyIterator();
-        while (grant_keys.next()) |key| std.heap.c_allocator.free(key.*);
-        self.shell_grants.deinit(std.heap.c_allocator);
         self.capture_thread = null;
         if (self.active) |generation| {
             std.debug.assert(generation.leases == 0);
@@ -1191,22 +1146,16 @@ test "snapshot owner keeps a leased generation alive across a refresh" {
     second.release();
 }
 
-test "snapshot owner resets remembered shell grants on refresh" {
+test "snapshot owner moves the approval epoch on refresh, once per pending refresh" {
     FakeCapture.reset(0, false);
     var owner: Owner = .{ .capture_fn = FakeCapture.capture };
     defer owner.deinit();
 
-    // Grants fx never recorded count as made before the first refresh.
-    try testing.expect(owner.shellGrantCurrent("npm test"));
-    owner.recordShellGrant("npm test");
-    try testing.expectEqual(@as(u64, 0), owner.shellGrantEpoch("npm test"));
-
+    try testing.expectEqual(@as(u64, 0), owner.approvalEpoch());
     owner.markDirty(.user_reload);
-    try testing.expect(!owner.shellGrantCurrent("npm test"));
-    try testing.expect(!owner.shellGrantCurrent("never recorded"));
-    owner.recordShellGrant("npm test");
-    try testing.expect(owner.shellGrantCurrent("npm test"));
-    try testing.expectEqual(@as(u64, 1), owner.shellGrantEpoch("npm test"));
+    try testing.expectEqual(@as(u64, 1), owner.approvalEpoch());
+    owner.markDirty(.user_reload);
+    try testing.expectEqual(@as(u64, 1), owner.approvalEpoch());
 }
 
 test "snapshot owner reports aliases and functions named in a command" {
