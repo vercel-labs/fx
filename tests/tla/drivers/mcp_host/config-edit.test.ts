@@ -114,6 +114,24 @@ class Scenario {
     return loaded;
   }
 
+  /** What `fx status --json` lists from the file, and the entries of it that its configuration issues note as skipped. */
+  async inspect(file: File) {
+    const ran = await this.run(["status", "--json"]);
+    expect(ran.code, ran.stderr).toBe(0);
+    const mcp = JSON.parse(ran.stdout).mcp as { servers: { name: string; source: string }[]; configuration_issues: string[] };
+    // The project's servers have the source "workspace".
+    const source = file === "profile" ? "profile" : "workspace";
+    const shown = mcp.servers.filter((server) => server.source === source && NAMES.includes(server.name)).map((server) => server.name).sort();
+    const noted = mcp.configuration_issues
+      .flatMap((issue) => {
+        const found = /^(~\/\.fx\/mcp\.json|\.mcp\.json) server '([^']+)' was skipped/.exec(issue);
+        return found && (found[1] === "~/.fx/mcp.json") === (file === "profile") ? [found[2]!] : [];
+      })
+      .sort();
+    this.records.push({ event: "inspect", data: { file, shown, noted } });
+    return { shown, noted };
+  }
+
   /** The harness edits a file itself, as an editor would, without fx's lock. */
   tamper(kind: string, file: File, name = "a", cls: Cls = "ok") {
     const path = this.paths[file];
@@ -470,4 +488,35 @@ test("stress: add and remove on a profile with 1,000 servers stay fast, and the 
   console.log(`STRESS servers=1000 ${Object.entries(timings).map(([k, v]) => `${k}=${v}`).join(" ")}`);
   // Parsing the file a few times per command must stay far inside a second or two on a busy machine.
   for (const [what, ms] of Object.entries(timings)) expect({ what, ok: ms < 8000 }).toEqual({ what, ok: true });
+}, 240_000);
+
+test("status skips a bad entry of the profile with a note, and still shows its good entries and the project's servers (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect", { st: "ok", ent: { a: "ok", b: "bad" } }, { st: "ok", ent: { c: "ok" } });
+  expect(await s.inspect("profile")).toEqual({ shown: ["a"], noted: ["b"] });
+  expect(await s.inspect("project")).toEqual({ shown: ["c"], noted: [] });
+  s.tamper("hand", "profile", "b", "ok");
+  expect(await s.inspect("profile")).toEqual({ shown: ["a", "b"], noted: [] });
+  await s.verify();
+}, 240_000);
+
+test("status skips what each file's reader skips: an Authorization header is skipped from the profile and loads from .mcp.json (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-classes", { st: "ok", ent: { a: "auth", b: "ok", c: "bad" } }, { st: "ok", ent: { a: "auth", b: "bad" } });
+  expect(await s.inspect("profile")).toEqual({ shown: ["b"], noted: ["a", "c"] });
+  expect(await s.inspect("project")).toEqual({ shown: ["a"], noted: ["b"] });
+  await s.verify();
+}, 240_000);
+
+test("status reads a profile nested past the edit's limit like any other: its bad entry is noted and its good one shows (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-deep", { st: "deep", ent: { a: "ok", b: "bad" } }, NONE);
+  expect(await s.inspect("profile")).toEqual({ shown: ["a"], noted: ["b"] });
+  await s.verify();
+}, 240_000);
+
+test("a profile that isn't JSON still fails the whole inspection: no server of either file shows, and nothing is noted (trace ACCEPTED)", async () => {
+  const s = new Scenario("config-edit-inspect-broken", { st: "broken" }, { st: "ok", ent: { c: "ok" } });
+  expect(await s.inspect("profile")).toEqual({ shown: [], noted: [] });
+  expect(await s.inspect("project")).toEqual({ shown: [], noted: [] });
+  s.tamper("repairs", "profile");
+  expect(await s.inspect("project")).toEqual({ shown: ["c"], noted: [] });
+  await s.verify();
 }, 240_000);

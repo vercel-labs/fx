@@ -47,6 +47,7 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { ignoresFileModes } from "./file-modes";
 
@@ -354,17 +355,17 @@ test("the user talks to the parent while its subagent works, and a stop ends the
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_FIRST");
-    await tui.waitForText("FIRST_ACCEPTED", 10000);
+    await tui.waitForPane((pane) => pane.includes("FIRST_ACCEPTED") && turnSettled(pane), 10000);
     // Still the one piece of work, still running.
     expect(work()).toEqual(original);
 
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_STOP");
-    await tui.waitForText("STOP_DONE", 10000);
+    await tui.waitForPane((pane) => pane.includes("STOP_DONE") && turnSettled(pane), 10000);
     await tui.waitForPane(() => work().outcome === "cancelled", 10000);
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForText("LATER_OK", 10000);
+    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
     expect(childRequests).toBe(1);
     // A stop is answered by the stop call, never by a report.
     expect(reportTurns).toBe(0);
@@ -1351,7 +1352,7 @@ describe("gateway stream lifecycle", () => {
       tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath, width: 100, height: 36 });
       await tui.waitForComposer(15_000);
       await tui.sendText("Use $status-first and $status-second.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const first = await tui.captureFullScrollback();
       expect(first).toContain("2 requested skills loaded");
       expect(first).toContain("Loaded skill status-first");
@@ -1362,7 +1363,7 @@ describe("gateway stream lifecycle", () => {
       expect(first).not.toContain("tool call");
       await tui.resizeWindow(48, 36);
       await tui.sendText("Use $status-first and $status-duplicate.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const mixed = await tui.captureFullScrollback();
       expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
       expect(mixed).toContain("Could not load status-duplicate");
@@ -1415,7 +1416,7 @@ describe("gateway stream lifecycle", () => {
       await tui.sendKeys("C-c");
       await tui.waitForComposer(10_000);
       await tui.sendText("Please use $cancel-workflow again after cancellation.");
-      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       expect(gateway.requests).toHaveLength(2);
       const first = advertisedSkillOpenKeys(gateway.requests[0]!.body, "cancel-workflow")[0]!;
       const second = advertisedSkillOpenKeys(gateway.requests[1]!.body, "cancel-workflow")[0]!;
@@ -2654,8 +2655,8 @@ describe("gateway stream lifecycle", () => {
         await tui.sendText("verify the bounded project context");
         let compact: string;
         try {
-          compact = await tui.waitForText(
-            "CONTEXT_LIMIT_FIRST_COMPLETE",
+          compact = await tui.waitForPane(
+            (text) => text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") && turnSettled(text),
             30_000,
           );
         } catch (error) {
@@ -2704,7 +2705,7 @@ describe("gateway stream lifecycle", () => {
         expect(restored).not.toContain("toolbox menu shortened");
 
         await tui.sendText("verify the bounded project context again");
-        await tui.waitForText("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
+        await tui.waitForPane((text) => text.includes("CONTEXT_LIMIT_SECOND_COMPLETE") && turnSettled(text), 30_000);
         expect(gateway.requestCount()).toBe(2);
         await tui.resizeWindow(119, 32);
         await tui.resizeWindow(123, 34);
@@ -2820,8 +2821,8 @@ describe("gateway stream lifecycle", () => {
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("inspect the deeply scoped target");
-        const compact = await tui.waitForText(
-          "PROJECT_OMISSION_TUI_COMPLETE",
+        const compact = await tui.waitForPane(
+          (text) => text.includes("PROJECT_OMISSION_TUI_COMPLETE") && turnSettled(text),
           30_000,
         );
         const compactScrollback = await tui.captureFullScrollback();
@@ -2910,8 +2911,8 @@ describe("gateway stream lifecycle", () => {
         await tui.waitForComposer(15_000);
         await waitForMcpServerReady(tui, "fixture", mcp);
         await tui.sendText("Load the bounded skill and select the MCP tool.");
-        const compact = await tui.waitForText(
-          "TOOL_TIME_CONTEXT_COMPLETE",
+        const compact = await tui.waitForPane(
+          (text) => text.includes("TOOL_TIME_CONTEXT_COMPLETE") && turnSettled(text),
           30_000,
         );
         const compactScrollback = await tui.captureFullScrollback();
@@ -3491,7 +3492,7 @@ describe("gateway stream lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read the workflow and its supporting rules.");
-      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const scrollback = await tui.captureFullScrollback();
       expect(scrollback).toContain(`Opened ${skillName}`);
       expect(scrollback).toContain("Read skill resource references/rules.md");
@@ -3684,7 +3685,7 @@ describe("gateway stream lifecycle", () => {
             releaseFinish();
           } else {
             releaseFinish();
-            await tui.waitForText("HELD_SKILL_RESOURCE_COMPLETE", 15_000);
+            await tui.waitForPane((pane) => pane.includes("HELD_SKILL_RESOURCE_COMPLETE") && turnSettled(pane), 15_000);
             await tui.waitForStableComposer(10_000);
             const completed = await tui.captureFullScrollback();
             expect(completed).toContain(`Read skill resource ${resource}`);
@@ -3693,7 +3694,7 @@ describe("gateway stream lifecycle", () => {
             expect(gateway.requestCount()).toBe(heldRequestCount + 1);
           }
           await tui.sendText("Confirm later input still works.");
-          await tui.waitForText("HELD_SKILL_LATER_INPUT_OK", 15_000);
+          await tui.waitForPane((pane) => pane.includes("HELD_SKILL_LATER_INPUT_OK") && turnSettled(pane), 15_000);
           await tui.waitForStableComposer(10_000);
           expect(gateway.requestCount()).toBe(heldRequestCount + (scenario.cancel ? 1 : 2));
           const scrollback = await tui.captureFullScrollback();
@@ -6149,12 +6150,12 @@ describe("gateway stream lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("Run the fixture and recover from its rejected input.");
-      await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("REJECTION_RECOVERED") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       const recovered = await tui.captureFullScrollback();
       expect(recovered.match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       expect(recovered).not.toContain("MUST_NOT_EXECUTE");
       await tui.sendText("Run the next fixture command once.");
-      await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane((pane) => pane.includes("LATER_TURN_COMPLETE") && hasEmptyComposer(pane) && turnSettled(pane), 15_000);
       expect((await tui.captureFullScrollback()).match(/Failed shell request: invalid JSON arguments/g)).toHaveLength(1);
       await tui.sendText("/trace");
       await tui.waitForText("Trace saved at", 10_000);
@@ -8759,13 +8760,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath, isolated: true });
       await tui.waitForComposer(15_000);
       await tui.sendText("Read sentinel.txt six times, then finish.");
-      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
+      const automatic = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("REPLAY_TURN_DONE") || text.includes("request failed:")), 30_000);
       expect(automatic).toContain("REPLAY_TURN_DONE");
       expect(automatic).not.toContain("request failed:");
       expect(summaries).toBe(1);
       await tui.sendText("Remember the result and acknowledge this short follow-up.");
-      await tui.waitForText("RECENT_TURN_DONE", 15_000);
-      await tui.waitForComposer(15_000);
+      await tui.waitForPane((text) => text.includes("RECENT_TURN_DONE") && hasEmptyComposer(text) && turnSettled(text), 15_000);
       await compactAndWait(tui, root, 20_000);
       expect(summaries).toBe(3);
       expect(readFileSync(tracePath, "utf8")).not.toContain("ContextCapacityExceeded");
@@ -8979,7 +8979,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_TEXT_COMPLETE") || text.includes("request failed:")), 30000);
         expect(pane).not.toContain("request failed:");
         expect(pane).toContain("READ_TEXT_COMPLETE");
         expect(readOutput).toContain(`${marker} found`);
@@ -9044,7 +9044,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
         await tui.waitForComposer(15000);
         await tui.sendText("Run the fixture command, then search its output for a long text.");
-        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
+        const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("READ_LONG_COMPLETE") || text.includes("request failed:")), 30000);
         expect(pane).not.toContain("request failed:");
         expect(pane).toContain("READ_LONG_COMPLETE");
         expect(readOutput).not.toContain("must be an object");
@@ -9172,7 +9172,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
           await tui.waitForComposer(15000);
           await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
           // The read names the command whose saved output it searches, by the
@@ -9278,12 +9278,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
         await tui.waitForComposer(15_000);
         await tui.sendText("FIRST_PROMPT_COMPACTION_SENTINEL");
-        await tui.waitForText("FIRST_REPLY_COMPACTION_SENTINEL", 15_000);
+        await tui.waitForPane((pane) => pane.includes("FIRST_REPLY_COMPACTION_SENTINEL") && turnSettled(pane), 15_000);
         await tui.sendText("SECOND_PROMPT_COMPACTION_SENTINEL");
         await tui.waitForPane(
           (pane) =>
             pane.includes("SECOND_REPLY_COMPACTION_SENTINEL") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           15_000,
         );
         await tui.sendText("/quit");
@@ -9582,7 +9583,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const before = readFileSync(logPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
-          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && turnSettled(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
           expect(pane).not.toContain("request failed:");
           expect(pane).toContain("CANCEL_FOLLOWUP_COMPLETE");
           if (trigger === "manual") {
@@ -9675,12 +9676,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForComposer(15_000);
         await tui.sendText("Create the first manual compaction cancellation turn.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_FIRST_READY") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_FIRST_READY") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
         await tui.sendText("Create the second manual compaction cancellation turn.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_SECOND_READY") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_SECOND_READY") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
 
@@ -9732,7 +9733,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         await tui.sendText("Continue after the cancelled manual compaction.");
         await tui.waitForPane(
-          (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane),
+          (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane) && turnSettled(pane),
           15_000,
         );
         expect(gateway.requests).toHaveLength(5);
@@ -9828,14 +9829,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForPane(
           (pane) =>
             pane.includes("SKILL_BEFORE_COMPACTION_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await tui.sendText("Create a second turn before compaction.");
         await tui.waitForPane(
           (pane) =>
             pane.includes("SECOND_COMPACTION_TURN_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await compactAndWait(tui, root, 15_000);
@@ -9843,7 +9846,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForPane(
           (pane) =>
             pane.includes("SKILL_AFTER_COMPACTION_COMPLETE") &&
-            hasEmptyComposer(pane),
+            hasEmptyComposer(pane) &&
+            turnSettled(pane),
           20_000,
         );
         await tui.sendText("/quit");
@@ -10983,7 +10987,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(existsSync(join(target, "match.txt"))).toBe(true);
       renameSync(target, join(root.workspace, "moved-target"));
       await session.sendKeys("Enter");
-      await session.waitForText("APPROVAL_RECOVERY_COMPLETE", 15_000);
+      await session.waitForPane((pane) => pane.includes("APPROVAL_RECOVERY_COMPLETE") && turnSettled(pane), 15_000);
       await session.waitForStableComposer(15_000);
       expect(childRequests).toBe(3);
       const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("call_id=approval-search "));
@@ -13261,33 +13265,37 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  // A model reply that stays open until `hold.release` ends it with no text
+  // and the finish reason `other`.
+  const heldEmptyOtherReply = (hold: { started: boolean; release?: () => void }) => {
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        hold.started = true;
+        timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+        hold.release = () => {
+          clearInterval(timer);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: "finish",
+            finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
+          })}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        };
+      },
+      cancel() {
+        clearInterval(timer);
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+  };
+
   test.skipIf(!tmuxAvailable())("an empty reply that stops for another reason gives way to a subagent's report, with no Done.", async () => {
     const root = createFixtureRoot("other-empty-report");
     const child = heldFakeGatewayFinalText();
     const parentHold: { started: boolean; release?: () => void } = { started: false };
     // Holds the parent's reply open until the child's report is queued, then ends it empty.
-    const heldEmptyOther = () => {
-      const encoder = new TextEncoder();
-      let timer: ReturnType<typeof setInterval> | undefined;
-      return new Response(new ReadableStream<Uint8Array>({
-        start(controller) {
-          parentHold.started = true;
-          timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
-          parentHold.release = () => {
-            clearInterval(timer);
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-              type: "finish",
-              finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" },
-              usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
-            })}\n\ndata: [DONE]\n\n`));
-            controller.close();
-          };
-        },
-        cancel() {
-          clearInterval(timer);
-        },
-      }), { headers: { "content-type": "text/event-stream" } });
-    };
+    const heldEmptyOther = () => heldEmptyOtherReply(parentHold);
     const parentBodies: string[] = [];
     let childRequests = 0;
     const gateway = startDynamicFakeGateway(raw => {
@@ -13355,6 +13363,288 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(JSON.stringify(logLines(root.home, rootSessionIds(root.home)[0]!))).not.toContain("\"Done.\"");
     } finally {
       child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // The empty-reply hand-off tests. Main starts the subagent "reporter" by
+  // message, and the delivery hold keeps what the subagent sends back in the
+  // main loop's hand-off, where main's worker cannot see it, until the test
+  // writes the release file.
+  const handoffPaths = (root: { root: string }) => ({
+    trace: join(root.root, "trace.log"),
+    stderr: join(root.root, "stderr.log"),
+    held: join(root.root, "delivery-held"),
+    release: join(root.root, "delivery-release"),
+  });
+
+  const startHandoffGateway = (
+    task: string,
+    childReply: (request: number) => Response,
+    parentReply: (request: number) => Response,
+  ) => {
+    const parentBodies: string[] = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = withoutContextUpdates(JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content));
+      if (latest.includes(task)) return childReply(++childRequests);
+      parentBodies.push(raw);
+      if (parentBodies.length === 1) {
+        return fakeGatewayToolCall(`${task}-delegation`, "subagent", { request: { action: "message", agent: "reporter", message: task } });
+      }
+      return parentReply(parentBodies.length);
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    return { gateway, parentBodies, childRequests: () => childRequests };
+  };
+
+  const startHandoffTui = (
+    root: ReturnType<typeof createFixtureRoot>,
+    gateway: { baseUrl: string; chatUrl: string },
+    paths: ReturnType<typeof handoffPaths>,
+  ) => TmuxSession.create({
+    cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true, stderrPath: paths.stderr,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+      AI_GATEWAY_API_KEY: "fake-empty-handoff-key", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_REPORT_DELIVERY_HELD: paths.held, FX_TEST_REPORT_DELIVERY_RELEASE: paths.release,
+      FX_TRACE_LOG: paths.trace, FX_TRACE_SCOPES: "subagent,mailbox,worker,agent,tool",
+    },
+  });
+
+  const quitHandoffTui = async (tui: TmuxSession, paths: ReturnType<typeof handoffPaths>) => {
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => tui.paneStatus().dead, 10000);
+    expect(tui.paneStatus().status).toBe(0);
+    expect(readFileSync(paths.stderr, "utf8")).toBe("");
+  };
+
+  // A reply with no text and the finish reason `other`, which ends at once.
+  const immediateEmptyOtherReply = () => {
+    const hold: { started: boolean; release?: () => void } = { started: false };
+    const reply = heldEmptyOtherReply(hold);
+    hold.release!();
+    return reply;
+  };
+
+  test.skipIf(!tmuxAvailable())("a report that waits in the main loop's hand-off as an empty reply ends takes the nudge's place", async () => {
+    const root = createFixtureRoot("other-empty-handoff");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies, childRequests } = startHandoffGateway(
+      "EMPTY_HANDOFF_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold) : fakeGatewayFinalText("EMPTY_HANDOFF_ALL_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_HANDOFF_START");
+      await tui.waitForPane(() => childRequests() === 1 && parentBodies.length === 2 && parentHold.started, 10000);
+      // The child finishes while the parent's reply is open. The host queues
+      // its report, and the main loop keeps it in the hand-off, so the
+      // parent's worker has not seen it.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      expect(trace()).toMatch(/event=report_queued /);
+      expect(trace()).not.toMatch(/event=mail_posted .*mail=report/);
+      // The reply ends empty. The worker finds the report on its way and
+      // waits for it. The loop then gives it the report.
+      const traced = trace().length;
+      parentHold.release!();
+      await tui.waitForPane(
+        () => /event=handoff_mail_wait .*state=begin|event=steering_boundary_check .*kind=finalizing/.test(trace().slice(traced)),
+        10000,
+      );
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_HANDOFF_ALL_DONE", 10000);
+
+      expect(childRequests()).toBe(1);
+      // The report takes the nudge's place, as one that waited in the
+      // worker's queue does: the next request carries it and not the nudge,
+      // and no request goes out for the nudge.
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_REPORT_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies).toHaveLength(3);
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=joined/);
+      expect(trace()).not.toMatch(/event=empty_reply_nudge /);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a subagent's message that waits in the main loop's hand-off as an empty reply ends takes the nudge's place", async () => {
+    const root = createFixtureRoot("other-empty-handoff-message");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    // The child messages its parent at once and then stays busy, so only
+    // the message waits in the hand-off.
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_MESSAGE_TASK",
+      request => request === 1
+        ? fakeGatewayToolCall("empty-message-child-up", "subagent", { request: { action: "message", agent: "parent", message: "CHILD_MESSAGE_TEXT" } })
+        : child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold) : fakeGatewayFinalText("EMPTY_MESSAGE_ALL_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_MESSAGE_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && parentHold.started && existsSync(`${paths.held}.1`), 10000);
+      expect(trace()).not.toMatch(/event=mail_posted .*mail=/);
+      const traced = trace().length;
+      parentHold.release!();
+      await tui.waitForPane(
+        () => /event=handoff_mail_wait .*state=begin|event=steering_boundary_check .*kind=finalizing/.test(trace().slice(traced)),
+        10000,
+      );
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_MESSAGE_ALL_DONE", 10000);
+
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_MESSAGE_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies).toHaveLength(3);
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=joined/);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply whose report stays in a stalled main loop's hand-off goes on to the nudge after a second, and the report follows", async () => {
+    const root = createFixtureRoot("other-empty-handoff-bound");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_BOUND_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(parentHold)
+        : fakeGatewayFinalText(request === 3 ? "EMPTY_BOUND_NUDGED_DONE" : "EMPTY_BOUND_REPORT_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_BOUND_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && parentHold.started, 10000);
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      // The loop stays stalled: the release file is not written. The worker
+      // waits its second and sends the nudge, with no hang.
+      const released = Date.now();
+      parentHold.release!();
+      await tui.waitForPane(() => parentBodies.length === 3, 10000);
+      expect(Date.now() - released).toBeGreaterThanOrEqual(900);
+      expect(parentBodies[2]).toContain(EMPTY_REPLY_NUDGE);
+      expect(parentBodies[2]).not.toContain("CHILD_REPORT_TEXT");
+      expect(trace()).toMatch(/event=empty_reply_mail_wait .*outcome=timed_out/);
+      expect(trace()).toContain("did not land in the worker within 1000 ms");
+      await tui.waitForText("EMPTY_BOUND_NUDGED_DONE", 10000);
+      // The loop comes back: the report is still delivered, after the nudge.
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_BOUND_REPORT_DONE", 10000);
+      expect(parentBodies).toHaveLength(4);
+      expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a second empty reply waits for no report, so the turn ends and the report starts a later one", async () => {
+    const root = createFixtureRoot("other-empty-handoff-second");
+    const child = heldFakeGatewayFinalText();
+    const firstHold: { started: boolean; release?: () => void } = { started: false };
+    const secondHold: { started: boolean; release?: () => void } = { started: false };
+    const { gateway, parentBodies } = startHandoffGateway(
+      "EMPTY_SECOND_TASK",
+      () => child.response,
+      request => request === 2 ? heldEmptyOtherReply(firstHold)
+        : request === 3 ? heldEmptyOtherReply(secondHold)
+        : fakeGatewayFinalText("EMPTY_SECOND_REPORT_DONE"),
+    );
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_SECOND_START");
+      await tui.waitForPane(() => parentBodies.length === 2 && firstHold.started, 10000);
+      // Nothing waits when the first empty reply ends, so the nudge goes out.
+      firstHold.release!();
+      await tui.waitForPane(() => parentBodies.length === 3 && secondHold.started, 10000);
+      expect(parentBodies[2]).toContain(EMPTY_REPLY_NUDGE);
+      // The report reaches the hand-off while the nudged reply is open, and
+      // that reply ends empty too.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => existsSync(`${paths.held}.1`), 10000);
+      secondHold.release!();
+      await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
+      writeFileSync(paths.release, "");
+      await tui.waitForText("EMPTY_SECOND_REPORT_DONE", 10000);
+
+      expect(parentBodies).toHaveLength(4);
+      expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
+      expect(trace()).not.toMatch(/event=handoff_mail_wait /);
+      expect(trace()).not.toMatch(/event=empty_reply_mail_wait /);
+      await quitHandoffTui(tui, paths);
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply with no report waiting still nudges at once, with no wait", async () => {
+    const root = createFixtureRoot("other-empty-no-report");
+    const parentBodies: string[] = [];
+    const gateway = startDynamicFakeGateway(raw => {
+      parentBodies.push(raw);
+      return parentBodies.length === 1 ? immediateEmptyOtherReply() : fakeGatewayFinalText("EMPTY_PLAIN_ALL_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const paths = handoffPaths(root);
+    const trace = () => existsSync(paths.trace) ? readFileSync(paths.trace, "utf8") : "";
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await startHandoffTui(root, gateway, paths);
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_PLAIN_START");
+      await tui.waitForText("EMPTY_PLAIN_ALL_DONE", 10000);
+
+      expect(parentBodies).toHaveLength(2);
+      expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);
+      expect(trace()).toMatch(/event=empty_reply_nudge /);
+      expect(trace()).not.toMatch(/event=handoff_mail_wait /);
+      expect(trace()).not.toMatch(/event=empty_reply_mail_wait /);
+      await quitHandoffTui(tui, paths);
+    } finally {
       await tui?.kill();
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -15860,7 +16150,8 @@ test("a wait that starts as a subagent's work ends with nothing to report still 
 // absolute ones: a relative path is ignored, as if the hold were not set. Main
 // starts subagent `worker`, stops it, and closes it, so the run reaches the
 // start, stopped-end, settle, publish, and close holds, each set to a relative
-// path; the session-write hold is set too, though this run does not reach it.
+// path; the session-write hold and the report-delivery hold are set too, though
+// this run does not reach them (the delivery hold is in the TUI's main loop).
 // fx must neither crash nor write a marker file into the workspace.
 test("a test hold set to a relative path is ignored", async () => {
   const root = createFixtureRoot("relative-hold-paths");
@@ -15901,6 +16192,8 @@ test("a test hold set to a relative path is ignored", async () => {
         FX_TEST_SUBAGENT_CLOSE_RELEASE: "relative-close-release",
         FX_TEST_SESSION_WRITE_HELD: "relative-session-write-held",
         FX_TEST_SESSION_WRITE_RELEASE: "relative-session-write-release",
+        FX_TEST_REPORT_DELIVERY_HELD: "relative-delivery-held",
+        FX_TEST_REPORT_DELIVERY_RELEASE: "relative-delivery-release",
       },
       timeoutMs: 30_000,
     });

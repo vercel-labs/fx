@@ -256,6 +256,9 @@ const Logical = struct {
     /// refuses it (`httpListRefusal`). Null when the ending is no answer, or another flow reads it.
     list_why: ?tools.Refusal = null,
     list_status: u16 = 0,
+    /// A line fx could not read, that names no request, came while this request could be the only one it
+    /// was about: on its own stream, or when it was the one request in flight (`markOwnLine`).
+    own_line: bool = false,
     instance: []const u8 = "",
     /// 2025: the stream's last event id, sent back to resume it.
     last_event_id: ?[]const u8 = null,
@@ -884,6 +887,21 @@ pub const Server = struct {
         }
     }
 
+    /// A line that names no request is about every normal request in flight (`request.Table.refusedLine`), so it is
+    /// a list's own answer only when no other such request could have written it: it came on the list's own
+    /// stream, or the list is the one normal request in flight. A listen is not one of them: it is waited on for no
+    /// reply, and a modern server always has one open. Otherwise the list's answer is only late, and when the grace
+    /// runs out the list ends with no reason, as a lost page does (`tests/tla/mcp/Catalog.tla` `PageSharedGrace`).
+    fn markOwnLine(r: *Server, stream: ?u64) void {
+        const own = if (stream) |key| r.logicalFor(key) else if (r.table.normalInFlightCount() == 1) r.soleList() else null;
+        if (own) |l| l.own_line = true;
+    }
+
+    fn soleList(r: *Server) ?*Logical {
+        for (&r.logicals) |*l| if (l.used and l.what == .list and l.id != null) return l;
+        return null;
+    }
+
     /// A line `decode` refused that names a request in flight is that
     /// request's answer, an invalid one: the request fails with what was
     /// wrong and the start of the line. It names a request by the id read
@@ -900,6 +918,7 @@ pub const Server = struct {
         const id = wire.responseId(line) orelse {
             r.keepStray(line);
             r.refused_bytes = @intCast(@min(line.len, std.math.maxInt(u32)));
+            r.markOwnLine(stream);
             return r.stepRequest(.{ .refused_line = stream });
         };
         if (r.logicalFor(id) == null) return r.keepStray(line);
@@ -1006,7 +1025,7 @@ pub const Server = struct {
             // Answers were read on arrival; the probe timer covers silence.
             .discover => {},
             .initialize => if (outcome == .timed_out) try r.stepEra(.initialize_timed_out),
-            .list => if (!answered) try r.stepCatalog(.page_failed),
+            .list => if (!answered) try r.listFailed(l),
             // The server's notifications/cancelled. A lost one waits
             // for the process, and a listen never times out.
             .listen => if (outcome == .ended) try r.stepSubs(.{ .final = .{ .id = id, .end = .server_cancelled } }),
@@ -1081,6 +1100,7 @@ pub const Server = struct {
         r.detector.step(.operation_sent, &out) catch return error.NotReady;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         l.id = try r.newRequest(.normal);
+        l.own_line = false;
         try r.stepLegacy(.{ .send = l.id.? });
     }
 
@@ -1178,6 +1198,7 @@ pub const Server = struct {
             else => .normal,
         });
         l.id = id;
+        l.own_line = false;
         if (l.what == .listen) {
             l.listen_id = id;
             try r.stepSubs(if (l.resend) .{ .resent = .{ .sub = l.sub, .id = id } } else .{ .opened = .{ .sub = l.sub, .id = id, .filter = l.filter } });
@@ -2203,6 +2224,10 @@ pub const Server = struct {
             .malformed => if (r.logicalFor(effect.deliver.id)) |l| {
                 l.malformed = true;
                 l.refused_bytes = r.refused_bytes;
+                // The server wrote a line fx could not read and no id could tell whose it was. For a list, that is an
+                // answer fx could not use (`tests/tla/mcp/Catalog.tla` `PageUnreadable`) only when the line could be
+                // nobody else's (`markOwnLine`); a call's bad reply that gave the list a grace says nothing about it.
+                if (l.what == .list and l.own_line) l.list_why = .unreadable;
             },
             else => {},
         };
@@ -2595,6 +2620,133 @@ test "two ids on a refused line name no request, and give every request in fligh
     try r.onRefusedLine(error.InvalidJson, twice, null);
     try std.testing.expect(holdsGrace(&r, id));
     try std.testing.expect(r.logicalFor(id) != null);
+}
+
+/// Ends the grace of the one refused line the server holds, as the server's own loop does when its timer is due.
+fn fireRefusedTimer(r: *Server) !void {
+    for (r.timers.items, 0..) |t, at| if (t.kind == .request and t.kind.request.kind == .refused) {
+        _ = r.timers.swapRemove(at);
+        return r.stepRequest(.{ .timer_fired = t.kind.request });
+    };
+    return error.TestExpectedRefusedTimer;
+}
+
+/// An HTTP server with room for requests, so a list can be in flight on a stream.
+fn streamTestServer(r: *Server) !void {
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+}
+
+test "a list whose line has its id after the part fx cannot read is refused when the grace runs out, with the words of an unreadable list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    var line: [96]u8 = undefined;
+    // The id comes after the bad part, so the line names no request: the list waits out the grace, and says nothing meanwhile.
+    const unnamed = try std.mem.print(&line, "{{\"jsonrpc\":\"2.0\",\"result\":nope,\"id\":{d}}}", .{id});
+    try r.onRefusedLine(error.InvalidJson, unnamed, null);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.logicalFor(id) != null);
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list that ends with no line fx could read is not refused: a lost process says nothing about the list" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    try r.stepRequest(.{ .transport_lost = id });
+    try std.testing.expect(r.logicalFor(id) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a list whose SSE event names no request is refused when its grace runs out, as a stdio line is" {
+    var r: Server = undefined;
+    try streamTestServer(&r);
+    defer r.deinit();
+    const id = try listInFlight(&r);
+    // The list's POST is out, as it is while its stream is read; nothing here sends it.
+    r.logicalFor(id).?.exchange.phase = .posted;
+    // An event on the list's own stream that is no JSON-RPC message: the stream says which request it is about.
+    try r.onRefusedLine(error.InvalidJson, "not json", id);
+    try std.testing.expect(holdsGrace(&r, id));
+    try std.testing.expect(r.listRefusal() == null);
+
+    try fireRefusedTimer(&r);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+/// Ends every grace the server holds, as its loop does when each timer is due.
+fn fireAllRefusedTimers(r: *Server) !void {
+    while (refusedTimers(r) > 0) try fireRefusedTimer(r);
+}
+
+/// A call in flight beside the list, as a second request on the one stdio connection.
+fn callInFlight(r: *Server) !request.Id {
+    const l = try r.newLogical(.call, .call);
+    l.id = try r.newRequest(.normal);
+    return l.id.?;
+}
+
+test "a bad line that a call in flight could have written does not refuse the list that waits with it: its answer is only late" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    // The call's reply is a line with no readable id: stdio gives each request in flight a grace, and the line
+    // can be the list's as little as it can be the call's.
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+    try std.testing.expect(holdsGrace(&r, call));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.logicalFor(call) == null);
+    try std.testing.expect(!r.catalog.refused);
+    try std.testing.expect(r.listRefusal() == null);
+}
+
+test "a later bad line, when the list is the one request left, is the list's own, though it began its grace with a call's line" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    const call = try callInFlight(&r);
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    // The call is answered; the list is the one request left, and the server writes another line fx cannot read.
+    try r.stepRequest(.{ .response_received = .{ .id = call, .response = .result } });
+    try r.onRefusedLine(error.InvalidJson, "still not json", null);
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
+}
+
+test "a list is still the one request a bad line can be about while a listen is open, because the listen gets no grace" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const list = try listInFlight(&r);
+    try r.stepRequest(.{ .send = .listen });
+    try r.onRefusedLine(error.InvalidJson, "not json", null);
+    try std.testing.expect(holdsGrace(&r, list));
+
+    try fireAllRefusedTimers(&r);
+    try std.testing.expect(r.logicalFor(list) == null);
+    try std.testing.expect(r.catalog.refused);
+    try std.testing.expectEqualStrings("the answer is not a readable tool list", r.listRefusal() orelse return error.TestExpectedRefusal);
 }
 
 fn pageTestServer(r: *Server) !void {

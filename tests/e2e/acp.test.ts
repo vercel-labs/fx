@@ -55,6 +55,7 @@ import {
   tmuxAvailable,
   localCreditsEnv,
   tokenPassCatalog,
+  turnSettled,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -14569,8 +14570,7 @@ test.skipIf(!tmuxAvailable())(
         ["Latest ACP request", "ACP_LATEST_VISIBLE_RESPONSE"],
       ]) {
         await tui.sendText(prompt!);
-        await tui.waitForText(answer!, TIMEOUT);
-        await tui.waitForComposer(TIMEOUT);
+        await tui.waitForPane((pane) => pane.includes(answer!) && hasEmptyComposer(pane) && turnSettled(pane), TIMEOUT);
       }
       const ids = savedSessionIds(root.home);
       expect(ids).toHaveLength(1);
@@ -14583,7 +14583,11 @@ test.skipIf(!tmuxAvailable())(
       // The committed checkpoint, not the transcript line, establishes that
       // compaction finished before testing ACP replay.
       await waitForCondition("persisted compaction checkpoint", () => checkpointFrames().length === 1, TIMEOUT);
-      await tui.waitForPane((pane) => hasEmptyComposer(pane) && !/Compacting|Thinking/.test(pane), TIMEOUT);
+      // The success line arrives as a queued notice just after the row clears.
+      await tui.waitForPane((pane) =>
+        hasEmptyComposer(pane) &&
+        !/Compacting|Thinking/.test(pane) &&
+        /Context compacted \((?:\d+h)?(?:\d+m)?\d+s\)/.test(pane), TIMEOUT);
       expect(checkpointFrames()).toHaveLength(1);
       expect(savedText(root.home, ids[0]!)).toContain("ACP_INTERNAL_HANDOFF");
       expect(readFileSync(eventsPath).subarray(0, beforeCompaction.length)).toEqual(beforeCompaction);

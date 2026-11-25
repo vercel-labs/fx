@@ -12,6 +12,7 @@ const std = @import("std");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
+const tool_search = @import("tool_search.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -87,9 +88,19 @@ fn pageProblem(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]co
     return (try text_utils.encodeTerminalSafeInline(arena, decoded, max_problem_bytes)).bytes;
 }
 
+/// The variable a page says is unset. Only a page that names one and says no login can help (`"interactive":false`)
+/// is about a variable; any other page of `authentication_required` is a login.
+fn unsetVariable(required: std.json.ObjectMap) ?[]const u8 {
+    const interactive = required.get("interactive") orelse return null;
+    if (interactive != .bool or interactive.bool) return null;
+    const variable = tool_args.optionalStringArg(required, "environment") orelse return null;
+    return if (variable.len > 0) variable else "a variable";
+}
+
 fn pageProblemText(arena: Allocator, page: std.json.ObjectMap) Allocator.Error!?[]const u8 {
     if (page.get("authentication_required")) |required| if (required == .object) {
         const server = tool_args.optionalStringArg(required.object, "server") orelse "this server";
+        if (unsetVariable(required.object)) |variable| return try tool_search.missingEnvironmentText(arena, server, variable);
         const message = tool_args.optionalStringArg(required.object, "message") orelse "it needs a login";
         return try arena.print("MCP server '{s}' needs a login: {s}", .{ server, message });
     };
@@ -359,6 +370,29 @@ test "an empty page says why: a login, a failed server, or no such server" {
     var out: Writer.Allocating = .init(arena);
     try testing.expectError(error.InvalidSearchPage, writeToolLines(arena, &out.writer, "{\"count\":0}"));
     try testing.expectError(error.InvalidSearchPage, writeToolLines(arena, &out.writer, "not json"));
+}
+
+test "a page for an unset variable names the variable and says nothing of a login" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The page the search writes for a server held back on `${FX_KEY}`, not one typed here.
+    const held = try tool_search.writeAuthenticationRequired(arena, "keyed", .{ .bearer_environment = "FX_KEY" });
+    const cases = [_]struct { page: []const u8, problem: []const u8 }{
+        .{ .page = held, .problem = "MCP server 'keyed' needs FX_KEY set before fx starts." },
+        // A page that names no variable, or says a login can help, is a login.
+        .{ .page = "{\"tools\":[],\"authentication_required\":{\"server\":\"keyed\",\"interactive\":false,\"message\":\"Ask.\"}}", .problem = "MCP server 'keyed' needs a login: Ask." },
+        .{ .page = "{\"tools\":[],\"authentication_required\":{\"server\":\"keyed\",\"interactive\":true,\"environment\":\"FX_KEY\",\"message\":\"Ask.\"}}", .problem = "MCP server 'keyed' needs a login: Ask." },
+        .{ .page = "{\"tools\":[],\"authentication_required\":{\"server\":\"keyed\",\"environment\":\"FX_KEY\",\"message\":\"Ask.\"}}", .problem = "MCP server 'keyed' needs a login: Ask." },
+        .{ .page = "{\"tools\":[],\"authentication_required\":{\"server\":\"keyed\",\"interactive\":false,\"environment\":7}}", .problem = "MCP server 'keyed' needs a login: it needs a login" },
+        // An empty name still says a variable, never a gap.
+        .{ .page = "{\"tools\":[],\"authentication_required\":{\"server\":\"keyed\",\"interactive\":false,\"environment\":\"\"}}", .problem = "MCP server 'keyed' needs a variable set before fx starts." },
+    };
+    for (cases) |case| {
+        var out: Writer.Allocating = .init(arena);
+        const page = try writeToolLines(arena, &out.writer, case.page);
+        try testing.expectEqualStrings(case.problem, page.problem.?);
+    }
 }
 
 test "help spells out each argument's type, and which are optional" {

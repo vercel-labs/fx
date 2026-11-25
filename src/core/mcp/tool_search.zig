@@ -601,6 +601,12 @@ pub fn writeAuthenticationRequired(alloc: Allocator, server_name: []const u8, re
     return try out.toOwnedSlice();
 }
 
+/// What a server held back for an unset variable says, in the words `toolbox open` and a command's
+/// `list` and `search` share. The server needs no login, so none is mentioned.
+pub fn missingEnvironmentText(alloc: Allocator, server_name: []const u8, variable: []const u8) Allocator.Error![]u8 {
+    return alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ server_name, variable });
+}
+
 /// The page a search returns when the server it names is down.
 pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
     const message = try alloc.print("MCP server '{s}' is unavailable: {s}", .{ server_name, failure });

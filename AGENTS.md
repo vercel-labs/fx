@@ -239,25 +239,13 @@ Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgra
 
 ### Zig 0.17 Standard Library
 
-fx does not use declarations that Zig 0.17 deprecates. They still compile, so check new code against this list:
+fx does not use declarations that Zig 0.17 deprecates or removed. They can still compile, so `Build & Test` runs `python3 .fx/skills/zig/scripts/check_deprecated.py src build.zig benchmarks tests`. It fails on a std declaration it can name, such as `std.fmt.bufPrint`, and lists a match that depends on the receiver's type, such as `.getLast()`, only with `--review`. Its rule tables are the only list, and each finding names the replacement, so run it with `--review` on the files you change. fx also has its own rules:
 
-* Format with `alloc.print(fmt, args)` and `std.mem.print(buf, fmt, args)`, not `std.fmt.allocPrint` or `std.fmt.bufPrint`.
-
-* Search with the `std.mem.find` family (`find`, `findScalar`, `findAny`, `findLast`, `findScalarLast`, and their `Pos` variants), not `indexOf` or `lastIndexOf`. Trim with `trimStart` and `trimEnd`.
-
-* Copy overlapping slices with `@memmove(dest, src)`, not `std.mem.copyForwards` or `copyBackwards`. Both slices must have the same length.
-
-* Resolve paths with `std.Io.Dir.path.resolveAlloc` and `relativeAlloc`.
-
-* Read the target from `builtin.target.os`, `builtin.target.cpu`, and `builtin.target.abi`, and the optimization mode from `builtin.optimize` (`.debug`, `.safe`, `.fast`, `.small`). Gate safety-only work on `builtin.optimize.runtimeSafety()`. Language types live in `std.lang`, not `std.builtin`.
-
-* Use `std.ArrayList`, `std.array_hash_map.String` and `.Auto`, and `std.bit_set.Dynamic` and `.Static`, not the `Unmanaged` or `BitSet` aliases. Read the last list item with `last()`.
-
-* Convert enums with `@backingInt` and `@fromBackingInt`. Divide rounding up with `@divCeil`.
+* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`.
 
 * `@hasDecl` only finds `pub` declarations, so a declaration that a duck-typed caller probes for must be `pub`.
 
-* Decode one UTF-8 sequence with `display_width.decodeUtf8Sequence` from `src/core/shared/display_width.zig`, not `std.unicode.utf8Decode`.
+* Divide rounding up with `@divCeil`.
 
 ### Testing
 
@@ -335,7 +323,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, the malformed tool call feedback, and the compaction row's number, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, deprecated Zig declarations, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, the malformed tool call feedback, and the compaction row's number, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -345,7 +333,7 @@ macOS runs only when `scripts/detect-macos-need.sh` finds a change that can beha
 
 The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 40 minutes, so a pull request runs it only when `scripts/detect-ci-need.sh` finds a change to code libfx owns: `sdk/`, `tests/tla/sdk/`, the drivers in `tests/tla/drivers/*.mjs`, the Node-API and WebAssembly core entry points, `src/acp/`, `src/core/hosts/`, `src/core/session_manager/`, `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs it, which catches a durable-session regression in shared code such as the agent loop after it merges. To run it for any other change, run `gh workflow run ci.yml --ref <branch>`. If the detector cannot read the change, `Build & Test` fails instead of passing.
 
-The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel and take about 20 minutes each, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+The `TLA+ MCP engine models and driver`, `TLA+ MCP host SignIn model`, `TLA+ MCP host other models` and `TLA+ MCP host drivers` jobs run in parallel and take 7 to 28 minutes, so a pull request runs their model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, `src/core/shared/net_connect.zig`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
 
 The `TLA+ transcript window model` job takes about 4 minutes, so a pull request runs it only when the same detector finds a change to `src/ui/transcript/transcript_window*`, the model in `tests/tla/transcript_window/`, its drivers in `tests/tla/drivers/transcript_window/`, the driver code they share (`tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/transcript_window/check.sh --ci`, which leaves out the planted bugs and the run of a built fx along the model; run `tests/tla/transcript_window/check.sh` without `--ci` before you change the window.
 

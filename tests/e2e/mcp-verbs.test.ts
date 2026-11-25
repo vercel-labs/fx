@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { logLines, onlySessionId } from "./saved-sessions";
-import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -277,6 +277,33 @@ describe("fx mcp", () => {
     }, 30_000);
   }
 
+  // The reply's id comes after what fx cannot read, so the line names no request. Nothing tells which list it answers: the
+  // list waits out the 30-second grace, as every request in flight does, and then fx says it could not read the list.
+  const unnamedLists: [string, string, "text" | "json"][] = [
+    ["not JSON before the id", '{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":nope,"id":{id}}', "text"],
+    ["nested past the engine's limit before the id", `{"jsonrpc":"2.0","result":{"resultType":"complete","tools":[]},"extra":${"[".repeat(3000)}${"]".repeat(3000)},"id":{id}}`, "json"],
+  ];
+  const UNREADABLE = "the answer is not a readable tool list";
+
+  for (const [what, line, form] of unnamedLists) {
+    test(`show says the list was unreadable when no id could be read, after the grace: ${what}`, async () => {
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_LINE: line } }) } });
+      const started = Date.now();
+      const shown = await runFx(["mcp", "show", "fixture", ...(form === "json" ? ["--json"] : [])], { cwd: root.workspace, env: root.env, timeoutMs: 60_000 });
+      const seconds = (Date.now() - started) / 1000;
+      expect(shown.stderr).toBe("");
+      expect(shown.code).toBe(0);
+      if (form === "json") {
+        expect(JSON.parse(shown.stdout)).toMatchObject({ name: "fixture", status: "ready", error: null, tools_error: UNREADABLE, tools: [] });
+      } else {
+        expect(shown.stdout).toStartWith(`fixture\n  status     ready, tool list refused\n  tool list  refused: ${UNREADABLE}\n`);
+        expect(shown.stdout).not.toContain("0 tools");
+      }
+      // The wait is the grace: not at once, as a line with an id would, and far short of the 5 minutes an operation waits.
+      expect({ late: seconds > 28, early: seconds < 55 }).toEqual({ late: true, early: true });
+    }, 90_000);
+  }
+
   test("show gives no refusal for a tool list it accepted, or for a tool it could not read", async () => {
     const good = createRoot({ mcpServers: { fixture: fixtureServer() } });
     const text = await mcp(good, "show", "fixture");
@@ -392,16 +419,14 @@ describe("fx mcp", () => {
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
 
-    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    // `--global` names ~/.fx/mcp.json.
     const global = await mcp(root, "remove", "--global", "twin");
     expect(global.code).toBe(0);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
-    expect(profile.code).toBe(1);
-    // The older --profile still names the profile file, with a warning.
-    expect(profile.stderr).toBe(
-      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
-    );
+    expect(profile.code).toBe(2);
+    expect(profile.stdout).toBe("");
+    expect(profile.stderr).toBe("fx mcp remove: --profile was removed; use --global\nusage: fx mcp remove [--global | --project] NAME\n");
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -745,7 +770,7 @@ describe("/mcp in the shell", () => {
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
     // The next prompt loads it first, so its own request tells the model.
     await tui.sendText("first prompt");
-    await tui.waitForText("first done", 15_000);
+    await tui.waitForPane((pane) => pane.includes("first done") && turnSettled(pane), 15_000);
     expect(gateway.requests).toHaveLength(1);
     const firstMenu = menu(gateway.requests[0]!.body);
     expect(firstMenu).toContain("- fixture");
@@ -874,7 +899,7 @@ describe("/mcp in the shell", () => {
         await Bun.sleep(50);
       }
       held.release("first done");
-      await tui.waitForText("second done", 15_000);
+      await tui.waitForPane((pane) => pane.includes("second done") && turnSettled(pane), 15_000);
       // The next prompt, sent with no turn running, loads the change.
       await tui.sendText("third prompt");
       await tui.waitForText("third done", 15_000);

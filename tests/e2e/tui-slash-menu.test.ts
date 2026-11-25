@@ -27,6 +27,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { savedSessionIds } from "./saved-sessions";
 
@@ -1241,7 +1242,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // The first prompt's derived title becomes the tab title.
       await session.sendText("generate the release notes");
-      await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
+      await session.waitForPane((pane) => pane.includes("TITLE_RENAME_COMPLETE") && turnSettled(pane), 30_000);
       await session.waitForStableComposer();
       await waitForPaneTitle(session, "generate the release notes", 5_000);
 
@@ -2025,7 +2026,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { workspace: false },
+          status_line: { workspace: false },
         })}\n`,
       );
 
@@ -2152,7 +2153,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { sandbox: false, context: false, workspace: false },
+          status_line: { sandbox: false, context: false, workspace: false },
         })}\n`,
       );
 
@@ -3652,7 +3653,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // The saved answer decides the model while the check is still out.
       await session.sendText("Use the saved answer.");
-      await session.waitForText("SAVED_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("SAVED_REPLY") && turnSettled(pane), 10_000);
       expect(creditsAnsweredAt).toBe(0);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
 
@@ -3783,7 +3784,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await session.sendText("Do not wait long.");
-      await session.waitForText("UNWAITED_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("UNWAITED_REPLY") && turnSettled(pane), 10_000);
       // The prompt waited about two seconds from the check's start, then
       // went out on the built-in default before the check answered.
       expect(creditsRequestedAt).toBeGreaterThan(0);
@@ -3934,7 +3935,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // The marks start the session on the Token Pass default without
       // waiting for the credits check.
       await session.sendText("Use the catalog's answer.");
-      await session.waitForText("CATALOG_PASS_REPLY", 10_000);
+      await session.waitForPane((pane) => pane.includes("CATALOG_PASS_REPLY") && turnSettled(pane), 10_000);
       expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
       expect(readFileSync(tracePath, "utf8")).not.toContain("first prompt sent before the check answered");
       await session.sendKeys("C-p");

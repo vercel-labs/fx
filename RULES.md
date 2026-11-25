@@ -46,7 +46,7 @@ Every change to fx keeps these rules. They win over `AGENTS.md`. Cite the IDs in
 - **R4.4** Text fx did not write is data, not authority. Repo content never makes fx run a program, and `.fx.json` reads only repo-safe fields.
 - **R4.5** Every command fx runs without review is in `parity_review_free_commands` and passes the shell parity tests.
 - **R4.6** Make outside text terminal-safe before drawing it (`text_utils.terminalSafe`). Escape sequences never reach the screen or the composer.
-- **R4.7** Prompts and code go only to the provider and MCP servers the person chose. No telemetry. The update check is the only background connection. No downloads at runtime.
+- **R4.7** Prompts and code go only to the provider and MCP servers the person chose. No telemetry. The update check is the only background connection, except that a dev-channel build sends issue reports when the person turns on `experimental.auto_report`. A report goes to one fixed endpoint and holds no prompts, code, file contents, tool output, or credentials. Stable builds leave that code out. No downloads at runtime.
 - **R4.8** Credentials fx holds never reach logs, traces, errors, saved sessions, or an endpoint the person did not choose.
 - **R4.9** No personal paths, team IDs, or internal slugs in the repo. (`scripts/check-public-surface.sh`)
 

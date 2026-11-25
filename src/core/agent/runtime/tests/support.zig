@@ -725,6 +725,19 @@ pub const FakeAgentRuntimeDeps = struct {
     /// from it and publishes its events and tool lifecycle to it. Its queue,
     /// events, and taken steering use `alloc`.
     steering_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// A host whose main loop holds mail for the turn in a hand-off until it
+    /// posts it: what the fake does when an empty reply asks it to wait. Null
+    /// leaves the hook unset, as in a host with no hand-off.
+    handoff_wait: ?HandoffWait = null,
+    handoff_wait_calls: usize = 0,
+    handoff_wait_bound_ms: i64 = 0,
+
+    pub const HandoffWait = struct {
+        /// Mail the main loop posts to `steering_worker` while the turn waits.
+        /// The worker owns it from then on.
+        mail: ?worker_runtime.QueuedPrompt = null,
+        answer: AgentRuntimeDeps.HandoffMailWait,
+    };
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -871,6 +884,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 takeSteeringBoundary
             else
                 null,
+            .wait_for_handoff_mail = if (self.handoff_wait != null) waitForHandoffMail else null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
@@ -878,6 +892,21 @@ pub const FakeAgentRuntimeDeps = struct {
             .cache_warmer = self.cache_warmer,
             .record_usage = if (self.record_usages) recordUsage else null,
         };
+    }
+
+    fn waitForHandoffMail(raw: *anyopaque, _: u64, bound_ms: i64) AgentRuntimeDeps.HandoffMailWait {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const wait = self.handoff_wait.?;
+        self.handoff_wait_calls += 1;
+        self.handoff_wait_bound_ms = bound_ms;
+        if (wait.mail) |mail| {
+            self.steering_worker.?.postMail(self.alloc, mail) catch {
+                worker_runtime.freeQueuedPrompt(self.alloc, mail);
+                return .none;
+            };
+            self.handoff_wait.?.mail = null;
+        }
+        return wait.answer;
     }
 
     fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
