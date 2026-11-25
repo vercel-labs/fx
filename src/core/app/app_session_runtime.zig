@@ -13056,12 +13056,12 @@ const Eb03SwitchApp = struct {
 };
 
 fn eb03DrainPendingInputRestore(app: anytype, agent: anytype) !void {
-    for (0..5000) |_| {
-        try Runtime(@TypeOf(app.*)).pollPendingInputRestore(app, agent);
-        if (!agent.session_persistence.pending_input_restore.isActive()) return;
-        io_mod.sleep(std.time.ns_per_ms);
+    try Runtime(@TypeOf(app.*)).pollPendingInputRestore(app, agent);
+    agent.session_persistence.pending_input_restore.awaitRunning();
+    try Runtime(@TypeOf(app.*)).pollPendingInputRestore(app, agent);
+    if (agent.session_persistence.pending_input_restore.isActive()) {
+        return error.TestPendingInputRestoreStillActive;
     }
-    return error.TestPendingInputRestoreTimedOut;
 }
 
 fn eb03MakeQueuedPrompt(alloc: Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
@@ -13766,9 +13766,7 @@ test "eb03-b4d: stale restore result for another session is dropped" {
     try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_a, .session);
     // Start A's background restore job, then switch to session B before it applies.
     try app.agent().session_persistence.pending_input_restore.startQueued();
-    while (!app.agent().session_persistence.pending_input_restore.state.running.done.load(.acquire)) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
+    app.agent().session_persistence.pending_input_restore.awaitRunning();
     const reopened_b = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_b }, paths.workspace, .app);
     try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_b, .session);
     try eb03DrainPendingInputRestore(&app, (&app).agent());
@@ -13782,9 +13780,7 @@ test "eb03-b4d: stale restore result for another session is dropped" {
     const reopened_a2 = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_a }, paths.workspace, .app);
     try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_a2, .session);
     try app.agent().session_persistence.pending_input_restore.startQueued();
-    while (!app.agent().session_persistence.pending_input_restore.state.running.done.load(.acquire)) {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
+    app.agent().session_persistence.pending_input_restore.awaitRunning();
     // Swap the open session to B directly without clearing the completed task from A.
     Runtime(TestApp).closeWritableSession(&app, (&app).agent());
     app.agent().session_persistence.v2 = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_b }, paths.workspace, .app);

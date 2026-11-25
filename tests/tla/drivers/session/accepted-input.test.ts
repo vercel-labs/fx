@@ -296,20 +296,10 @@ function composerText(pane: string): string {
   return composerBlockLines(pane).join("\n");
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function endFx(session: InstanceType<typeof TmuxSession>, signal: "SIGKILL" | "SIGHUP") {
   const pid = session.processPid();
   process.kill(pid, signal);
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && processAlive(pid)) await Bun.sleep(25);
+  await session.waitForSessionEnd(10_000);
   await session.kill();
 }
 
@@ -328,23 +318,18 @@ async function waitForResumedPaneSettled(
   resumeRequested: (() => boolean) | null,
   resumedReplyMarker: string,
 ): Promise<{ pane: string; scrollback: string }> {
-  const deadline = Date.now() + PANE_WAIT_TIMEOUT;
-  while (Date.now() < deadline) {
-    const pane = await session.capturePane();
-    const hasComposer = pane.split("\n").some(isComposerLine);
-    const hasHistory = pane.includes(historyMarker);
+  const pane = await session.waitForPane((candidate) => {
+    const hasComposer = candidate.split("\n").some(isComposerLine);
+    const hasHistory = candidate.includes(historyMarker);
     const resumeDone =
       resumeRequested === null ||
-      (resumeRequested() && pane.includes(resumedReplyMarker) && turnSettled(pane));
-    if (hasComposer && hasHistory && resumeDone && turnSettled(pane)) {
-      return {
-        pane,
-        scrollback: await session.captureFullScrollback(),
-      };
-    }
-    await Bun.sleep(25);
-  }
-  throw new Error(`Timed out waiting for resumed session to settle.\nLast pane:\n${await session.capturePane()}`);
+      (resumeRequested() && candidate.includes(resumedReplyMarker) && turnSettled(candidate));
+    return hasComposer && hasHistory && resumeDone && turnSettled(candidate);
+  }, PANE_WAIT_TIMEOUT);
+  return {
+    pane,
+    scrollback: await session.captureFullScrollback(),
+  };
 }
 
 function fakeShellRun(callId: string, command: string, options: Record<string, unknown> = {}): Response {
@@ -563,13 +548,16 @@ test.skipIf(!tmuxAvailable())(
     ];
     let inResume = false;
     let resumeReqCount = 0;
-    let resubmitHeld = false;
+    let signalResubmitHeld: (() => void) | null = null;
+    const resubmitHeld = new Promise<void>((resolve) => {
+      signalResubmitHeld = resolve;
+    });
     let releaseResubmit: (() => void) | null = null;
 
     const gateway = startDynamicFakeGateway((body) => {
       if (inResume) {
         if (body.includes(p2)) {
-          resubmitHeld = true;
+          signalResubmitHeld?.();
           return new Promise<Response>((resolve) => {
             releaseResubmit = () => resolve(fakeGatewayFinalText(resubmittedMarker));
           });
@@ -643,7 +631,7 @@ test.skipIf(!tmuxAvailable())(
 
       // Submit the restored composer text as a brand-new prompt.
       active.sendKeysImmediate(["Enter"]);
-      await waitForCondition(() => resubmitHeld, "resubmitted turn gateway request held");
+      await resubmitHeld;
       await waitForCondition(
         () => (logLines(fixture.home, sessionId) as any[]).filter((l) => l.kind === "turn_started").length >= 3,
         "resubmitted turn started on disk",

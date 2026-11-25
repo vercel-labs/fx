@@ -1173,6 +1173,18 @@ pub const PendingInputRestore = struct {
         }
     }
 
+    /// Waits directly for the running background task's `Future` without polling.
+    pub fn awaitRunning(self: *PendingInputRestore) void {
+        const task = switch (self.state) {
+            .running => |t| t,
+            .idle, .queued => return,
+        };
+        if (task.future) |*future| {
+            future.await(io_mod.getIo());
+            task.future = null;
+        }
+    }
+
     /// Caller owns the returned `Task` and must call `task.deinit()`.
     pub fn takeCompleted(self: *PendingInputRestore) ?*Task {
         self.reapRetired();
