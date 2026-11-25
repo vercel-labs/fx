@@ -7,6 +7,7 @@ import { createConnection } from "node:net";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,6 +15,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -17607,6 +17609,339 @@ describe("acp: model-independent", () => {
         follower?.close();
         await second?.close();
         await owner?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  async function killLeader(owner: AcpClient): Promise<void> {
+    if (owner.pid === undefined) throw new Error("fx acp has no pid");
+    process.kill(owner.pid, "SIGKILL");
+    await owner.waitForExit(TIMEOUT);
+  }
+
+  async function startSecondLeader(
+    root: ReturnType<typeof createShortIsolatedRoot>,
+    gateway: ReturnType<typeof startFakeGateway>,
+    sessionId: string,
+  ): Promise<AcpClient> {
+    const second = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+    await second.request("initialize", { protocolVersion: 1 }, 1);
+    const loaded = (await second.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] }, 2)) as any;
+    expect(loaded.error).toBeUndefined();
+    return second;
+  }
+
+  test(
+    "after fx acp is killed, the next fx acp that loads the session removes the dead leader's socket folder and writes its own lock line",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-folder-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const oldSocket = (JSON.parse(sessionLock(root.home, started.sessionId)) as { socket: string }).socket;
+        const oldFolder = dirname(oldSocket);
+        await killLeader(started.owner);
+        expect(existsSync(oldSocket)).toBe(true);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(second.pid);
+        expect(existsSync(oldFolder)).toBe(false);
+        expect(second.stderr).toBe("");
+      } finally {
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a lock line that names a folder outside the leader path shape is kept by the next fx acp, with its files",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-forged-shape-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const deadPid = started.owner.pid!;
+        await killLeader(started.owner);
+        const victim = join(root.root, "victim");
+        mkdirSync(victim);
+        writeFileSync(join(victim, "keep.txt"), "keep\n");
+        writeFileSync(join(victim, "s"), "");
+        writeFileSync(join(sessionDir(root.home, started.sessionId), "lock"), `${JSON.stringify({ socket: join(victim, "s"), pid: deadPid })}\n`);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        expect(readFileSync(join(victim, "keep.txt"), "utf8")).toBe("keep\n");
+        expect(existsSync(join(victim, "s"))).toBe(true);
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(second.pid);
+      } finally {
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a lock line that names a symlink to another folder is kept by the next fx acp, and the folder it points at stays",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-forged-link-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const deadPid = started.owner.pid!;
+        await killLeader(started.owner);
+        const victim = join(root.root, "victim");
+        mkdirSync(victim);
+        writeFileSync(join(victim, "keep.txt"), "keep\n");
+        const folder = join(root.root, "fx-leader-0123456789abcdef");
+        symlinkSync(victim, folder);
+        writeFileSync(join(sessionDir(root.home, started.sessionId), "lock"), `${JSON.stringify({ socket: join(folder, "s"), pid: deadPid })}\n`);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        expect(lstatSync(folder).isSymbolicLink()).toBe(true);
+        expect(readFileSync(join(victim, "keep.txt"), "utf8")).toBe("keep\n");
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(second.pid);
+      } finally {
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a dead leader's socket folder with another mode is kept by the next fx acp, with its socket",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-forged-mode-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const oldSocket = (JSON.parse(sessionLock(root.home, started.sessionId)) as { socket: string }).socket;
+        const oldFolder = dirname(oldSocket);
+        await killLeader(started.owner);
+        chmodSync(oldFolder, 0o755);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        expect(existsSync(oldFolder)).toBe(true);
+        expect(statSync(oldFolder).mode & 0o777).toBe(0o755);
+        expect(existsSync(oldSocket)).toBe(true);
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(second.pid);
+      } finally {
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after fx acp is killed mid-turn, the next fx acp repairs the turn as interrupted and starts no model call until a client prompts",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-repair-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => heldReply.promise]);
+      const gatewayAfter = startFakeGateway([finalText("AFTER_DEATH_REPLY")]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        sendPrompt(started.owner, 10, "RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        await killLeader(started.owner);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        await waitForCondition(
+          "the running turn saved as interrupted",
+          () => logLines(root.home, started.sessionId).some((line) => line.kind === "turn_interrupted"),
+          TIMEOUT,
+        );
+        expect(gatewayAfter.requests).toHaveLength(0);
+
+        const after = await runPrompt(second, "AFTER_DEATH_PROMPT");
+        expect(after.promptResult.result.stopReason).toBe("end_turn");
+        expect(gatewayAfter.requests).toHaveLength(1);
+        expect(gatewayAfter.requests[0]!.body).toContain("AFTER_DEATH_PROMPT");
+      } finally {
+        heldReply.resolve(finalText("UNUSED"));
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a bash allow-for-this-session grant from before a leader's death does not carry over: the same command asks again in the next fx acp",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-grant-");
+      const command = "printf ACP_GRANT_RUN";
+      const shellCall = (id: string) =>
+        fakeGatewayToolCall(id, "shell", { request: { action: "run", command, yield_time_ms: 30_000 } });
+      const gateway = startFakeGateway([finalText("TURN_ONE"), shellCall("grant_call_1"), finalText("FIRST_DONE")]);
+      const gatewayAfter = startFakeGateway([shellCall("grant_call_2"), finalText("SECOND_DONE")]);
+      let owner: AcpClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+        const { sessionId } = await publishLedSession(owner, "TURN_ONE_PROMPT");
+        await owner.request("session/set_mode", { modeId: "ask" }, 3);
+        owner.setPermissionOption("allow_always");
+        const first = await runPrompt(owner, "Run the approved command.");
+        const asked = first.messages.find((message: any) => message.method === "session/request_permission") as any;
+        expect(asked.params.toolCall.toolCallId).toBe("grant_call_1");
+        expect(asked.params.options.map((option: any) => option.optionId)).toContain("allow_always");
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        await killLeader(owner);
+
+        second = await startSecondLeader(root, gatewayAfter, sessionId);
+        await second.request("session/set_mode", { modeId: "ask" }, 3);
+        second.setPermissionOption("reject_once");
+        const again = await runPrompt(second, "Run the approved command.");
+        const reasked = again.messages.find((message: any) => message.method === "session/request_permission") as any;
+        expect(reasked).toBeDefined();
+        expect(reasked.params.toolCall.toolCallId).toBe("grant_call_2");
+        expect(again.promptResult.result.stopReason).toBe("end_turn");
+      } finally {
+        await second?.close();
+        await owner?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a queued prompt from before a leader's death is not run by the next fx acp",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-queue-");
+      const heldReply = deferred<Response>();
+      const gateway = startFakeGateway([finalText("TURN_ONE"), () => heldReply.promise]);
+      const gatewayAfter = startFakeGateway([finalText("AFTER_DEATH_REPLY")]);
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        sendPrompt(started.owner, 10, "RUNNING_PROMPT");
+        await waitForCondition("the held model reply", () => gateway.requests.length === 2, TIMEOUT);
+        sendQueuedPrompt(started.owner, 11, "QUEUED_BEFORE_DEATH");
+        const refused = (await started.owner.request(
+          "session/prompt",
+          { sessionId: started.sessionId, prompt: [{ type: "text", text: "REFUSED_PROMPT" }] },
+          12,
+        )) as any;
+        expect(refused.error).toEqual({ code: -32600, message: "Prompt already in progress" });
+        // The queued prompt was taken, not refused: its answer waits for the running turn.
+        expect(parsedLines(started.owner).some((message) => message.id === 11)).toBe(false);
+        await killLeader(started.owner);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        const after = await runPrompt(second, "AFTER_DEATH_PROMPT");
+        expect(after.promptResult.result.stopReason).toBe("end_turn");
+        expect(gatewayAfter.requests).toHaveLength(1);
+        expect(gatewayAfter.requests[0]!.body).toContain("AFTER_DEATH_PROMPT");
+        expect(gatewayAfter.requests[0]!.body).not.toContain("QUEUED_BEFORE_DEATH");
+      } finally {
+        heldReply.resolve(finalText("UNUSED"));
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "two fx acp processes that load a session at once after its leader is killed: one leads and the other is busy after its wait",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-race-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let first: AcpClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        await killLeader(started.owner);
+
+        first = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gatewayAfter) });
+        second = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gatewayAfter) });
+        await first.request("initialize", { protocolVersion: 1 }, 1);
+        await second.request("initialize", { protocolVersion: 1 }, 1);
+        const load = { sessionId: started.sessionId, cwd: root.workspace, mcpServers: [] };
+        const [firstLoad, secondLoad] = (await Promise.all([
+          first.request("session/load", load, 2, 20_000),
+          second.request("session/load", load, 2, 20_000),
+        ])) as any[];
+        const outcomes = [
+          { client: first, load: firstLoad },
+          { client: second, load: secondLoad },
+        ];
+        const leaders = outcomes.filter((outcome) => outcome.load.error === undefined);
+        const busy = outcomes.filter((outcome) => outcome.load.error !== undefined);
+        expect(leaders).toHaveLength(1);
+        expect(busy.map((outcome) => outcome.load.error)).toEqual([{ code: -32603, message: "Session is busy" }]);
+        expect(JSON.parse(sessionLock(root.home, started.sessionId)).pid).toBe(leaders[0]!.client.pid);
+      } finally {
+        await first?.close();
+        await second?.close();
+        gateway.stop();
+        gatewayAfter.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after fx acp is killed with a follower attached, the follower reconnects to the new leader from the new lock line and loads the session",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-takeover-follower-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const gatewayAfter = startFakeGateway([]);
+      let follower: LeaderSocketClient | undefined;
+      let reconnected: LeaderSocketClient | undefined;
+      let second: AcpClient | undefined;
+      try {
+        const started = await ownerWithSession(root, gateway);
+        const oldSocket = started.socket;
+        follower = await followSession(started.socket, started.sessionId, root);
+        await killLeader(started.owner);
+        await waitForCondition("the follower's socket to close", () => follower!.isClosed, TIMEOUT);
+
+        second = await startSecondLeader(root, gatewayAfter, started.sessionId);
+        const record = JSON.parse(sessionLock(root.home, started.sessionId)) as { socket: string; pid: number };
+        expect(record.socket).not.toBe(oldSocket);
+        expect(record.pid).toBe(second.pid);
+
+        reconnected = await followSession(record.socket, started.sessionId, root);
+        expect(reconnected.isClosed).toBe(false);
+      } finally {
+        follower?.close();
+        reconnected?.close();
+        await second?.close();
         gateway.stop();
         gatewayAfter.stop();
         rmSync(root.root, { recursive: true, force: true });
