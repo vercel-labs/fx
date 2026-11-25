@@ -640,6 +640,11 @@ describe("fx ask presentation", () => {
   // So the rows leave it out, with the blank rows after fx's output. Only
   // the exact row goes, so another row that starts with the same words stays.
   const tmuxDeadPaneRow = /^Pane is dead \(status \d+, [^)]*\)$/;
+  // tmux's default `remain-on-exit-format`, the same in tmux 3.4, 3.6 and
+  // 3.6a. It draws the rows that `tmuxDeadPaneRow` matches.
+  const tmuxDeadPaneFormat =
+    "Pane is dead (#{?#{!=:#{pane_dead_status},},status #{pane_dead_status},}" +
+    "#{?#{!=:#{pane_dead_signal},},signal #{pane_dead_signal},}, #{t:pane_dead_time})";
   const rowsOf = (text: string) => {
     const rows = text
       .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
@@ -671,6 +676,12 @@ describe("fx ask presentation", () => {
       .toEqual([ownRow, "__FX_EXIT_0__"]);
     expect(rowsOf(`${ownRow}\n__FX_EXIT_3__\n\nPane is dead (status 3, Thu Nov  5 09:07:02 2026)\n`))
       .toEqual([ownRow, "__FX_EXIT_3__"]);
+    expect(rowsOf("")).toEqual([]);
+    // A row for a pane that a signal ended stays. Each run in these tests
+    // exits with status 0 after its exit marker, so a signal row means the run
+    // did not end cleanly, and the comparison shows it instead of hiding it.
+    const signalRow = "Pane is dead (signal 15, Wed Nov 25 21:27:52 2026)";
+    expect(rowsOf(`${ownRow}\n\n${signalRow}\n`)).toEqual([ownRow, "", signalRow]);
   });
 
   test.skipIf(!tmuxAvailable())(
@@ -698,6 +709,11 @@ describe("fx ask presentation", () => {
 
       // fx indents its reply rows by two columns.
       expect(rows).toContain(`  ${reply}`);
+      // tmux may not have drawn its row yet, so the format is checked as text.
+      // Its expansion would not help: tmux fills in the status and time at the
+      // same moment it draws the row.
+      expect(session.remainOnExitFormat()).toBe(tmuxDeadPaneFormat);
+      // A row tmux did draw matches the pattern, so it is not left.
       expect(rows.filter((row) => row.startsWith("Pane is dead ("))).toEqual([]);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
