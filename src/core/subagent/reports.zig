@@ -180,6 +180,11 @@ pub const Message = struct {
     /// What the user typed in the turn that sent it, newest last, which fx
     /// adds and the sender can't write (`WorkerRuntime.typedThisTurn`).
     user_typed: []const []const u8 = &.{},
+    /// Who started the turn that sent it, read as it is sent, while that
+    /// turn runs: the turn can end before the parent's loop delivers it.
+    /// The host fills it for its own children, and the app for the host's
+    /// owner, whose turn is a work in its own parent's host.
+    started_by: ?StartedBy = null,
 };
 
 /// The text the parent receives for a subagent's message, framed as a

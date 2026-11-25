@@ -2153,7 +2153,9 @@ const App = struct {
         // A message needs room where it goes; a report never does.
         const from_owner = delivery == .message and delivery.message.to == .owners_parent;
         if (delivery == .message) try AgentsAppRuntime.reserveMessagePlace(self, reporting_host, from_owner);
-        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery) catch |err| {
+        var posted = delivery;
+        if (from_owner) posted.message.started_by = AgentsAppRuntime.ownerTurnStartedBy(self, reporting_host);
+        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, posted) catch |err| {
             if (delivery == .message) AgentsAppRuntime.releaseMessagePlace(self, reporting_host, from_owner);
             return err;
         };

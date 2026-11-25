@@ -563,6 +563,8 @@ pub const ReportPost = struct {
     idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
+    /// Who started the turn that sent a message, read as it was sent.
+    started_by: ?subagent_reports.StartedBy = null,
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -589,6 +591,7 @@ pub const ReportPost = struct {
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
             .idle = delivery == .report and delivery.report.idle,
+            .started_by = if (delivery == .message) delivery.message.started_by else null,
         };
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
@@ -2825,6 +2828,22 @@ pub fn Runtime(comptime App: type) type {
             if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
         }
 
+        /// Who started the running turn of the subagent that owns `host`,
+        /// read on its thread as the turn sends a message to its own parent.
+        /// That turn is a work in the host that started the subagent, which
+        /// can end it before the main loop delivers the message.
+        pub fn ownerTurnStartedBy(app: *App, host: *subagent_tool_host.Runtime) ?subagent_reports.StartedBy {
+            const runner, const owner_id = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                const owner = ownerOf(app, host) orelse return null;
+                const child = hostedOf(app, owner) orelse return null;
+                break :blk .{ hostOf(app, child) orelse return null, child.id };
+            };
+            // The owner outlives its own call, which is sending the message.
+            return runner.turnStartedBy(owner_id);
+        }
+
         pub fn releaseMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) void {
             const receiver = blk: {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
@@ -2843,15 +2862,6 @@ pub fn Runtime(comptime App: type) type {
                 break :blk hostedOf(app, owner) orelse return error.AgentGone;
             } else null;
             const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
-            // Who started the turn that sent a message, from the host that
-            // runs the sender. That turn is still going: posts are taken
-            // each pass before the children's events, its end among them.
-            const started_by: ?subagent_reports.StartedBy = if (!message)
-                null
-            else if (owner_child) |child|
-                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
-            else
-                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -2864,7 +2874,7 @@ pub fn Runtime(comptime App: type) type {
                     .end = post.end,
                     .idle = post.idle,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, post.started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },

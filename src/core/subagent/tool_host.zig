@@ -2961,6 +2961,7 @@ pub const Runtime = struct {
             .child_id = options.caller_id,
             .text = text,
             .user_typed = typed,
+            .started_by = if (from_root) null else self.turnStartedBy(options.caller_id),
         } }) catch |err| return self.refuse(alloc, if (err == error.QueueFull) .{ .queue_full = .parent } else .{ .no_parent = .unreachable_now });
         debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
@@ -8164,6 +8165,46 @@ test "a subagent's message to its parent carries what the user typed in the turn
         }
     }
     try std.testing.expectEqual(@as(usize, 2), capture.posts);
+}
+
+test "a subagent's message to its parent keeps who started the turn that sent it after that turn ends" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const child_id = try reviewerId(runtime, arena);
+
+    const Capture = struct {
+        messages: usize = 0,
+        started_by: ?reports.StartedBy = null,
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (delivery != .message) return;
+            self.messages += 1;
+            self.started_by = delivery.message.started_by;
+        }
+    };
+    var capture: Capture = .{};
+    runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    const work_id = runtime.beginUserWork(alloc, child_id, null).?;
+    defer alloc.free(work_id);
+    const body = try callToolAs(runtime, arena, child_id, .{ .message = .{ .agent = "parent", .message = "the user says hi" } }, "call-2");
+    try std.testing.expect(std.mem.find(u8, body, "Sent to your parent") != null);
+    // The turn can end before the parent's loop delivers the message.
+    runtime.endUserWork(child_id, work_id, .completed, "");
+    try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
+    try std.testing.expectEqual(@as(usize, 1), capture.messages);
+    try std.testing.expectEqual(@as(?reports.StartedBy, .user), capture.started_by);
 }
 
 test "a subagent's message its parent can't take says so, and keeps nothing of what the user typed" {
