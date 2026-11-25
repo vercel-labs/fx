@@ -185,6 +185,17 @@ pub fn step(state: State, event: Event) Output {
     };
 }
 
+/// Whether request `id` still waits for its permission check. A request whose
+/// client or owner has left does not, so no prompt is opened for it. Read-only.
+pub fn awaitingPermission(state: *const State, id: RequestId) bool {
+    for (state.slots) |slot| {
+        if (slot) |entry| {
+            if (entry.id == id) return entry.stage == .authorizing;
+        }
+    }
+    return false;
+}
+
 fn quiet(state: State) Output {
     return .{ .state = state };
 }
@@ -539,6 +550,19 @@ test "stopping lets work go, but each request keeps its slot until its work ends
     const freed = step(reopened, .{ .authorized = .{ .id = rid(1), .decision = .allow } });
     try testing.expectEqual(@as(usize, 0), freed.len);
     try testing.expectEqual(Effect{ .authorize = .{ .id = rid(2), .owner = .main } }, single(step(freed.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "a request is awaiting its permission check only while its client is here" {
+    const waiting = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .request = .{ .token = main_token, .version = 1 } },
+    });
+    try testing.expect(awaitingPermission(&waiting, rid(0)));
+    try testing.expect(!awaitingPermission(&waiting, rid(1)));
+    const gone = step(waiting, .{ .client_gone = rid(0) });
+    try testing.expect(!awaitingPermission(&gone.state, rid(0)));
+    const answered = step(waiting, .{ .authorized = .{ .id = rid(0), .decision = .allow } });
+    try testing.expect(!awaitingPermission(&answered.state, rid(0)));
 }
 
 test "a result whose client is gone is dropped and logged, and so is a reply that was lost" {
