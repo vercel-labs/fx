@@ -476,7 +476,7 @@ test "a call whose cancel is already set sends nothing" {
         .path = "/v2/user",
     }));
     server.close();
-    try std.testing.expectEqual(@as(usize, 0), server.served);
+    try std.testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "a known token goes through load and one request without reaching a trace line or the wire" {

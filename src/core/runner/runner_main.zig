@@ -13,6 +13,7 @@ const sha256 = @import("sha256.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const cli_flags = @import("../cli/cli_flags.zig");
 const flags = @import("flags.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const OptionDoc = @import("../slash_commands/command_specs.zig").OptionDoc;
 
 /// The word after the binary name that selects this process (L4).
@@ -393,7 +394,9 @@ fn refuse(arena: Allocator, stderr: *std.Io.Writer, refusal: Refusal) u8 {
 /// A note is one `fx: ` line on stderr. A failed write has no reader left to tell, and the
 /// exit code still reports the result.
 fn writeNote(stderr: *std.Io.Writer, line: []const u8) void {
+    // No reader is left to tell when stderr fails, and the exit code still reports the result.
     stderr.writeAll(line) catch {};
+    // The same as the write above: a failed flush leaves no reader to tell.
     stderr.flush() catch {};
 }
 
@@ -598,7 +601,7 @@ fn runIsolated(arena: Allocator, run: Run, stdout: *std.Io.Writer, stderr: *std.
         var never_cancelled = std.atomic.Value(bool).init(false);
         var cleanup = context;
         cleanup.cancel = &never_cancelled;
-        vercel.deleteSandboxNamed(&cleanup, cleanup.name) catch {};
+        vercel.deleteSandboxNamed(&cleanup, cleanup.name) catch |err| debug_trace.logf("remote run", "event=cleanup_failed what=isolated_sandbox reason={s}", .{@errorName(err)});
     }
     var session: vercel.SandboxSession = .{ .state = created, .generation = .reset, .size_note = .none };
     vercel.prepareIsolatedRoot(&context, &session) catch |err| return sandboxFailedUnlessStopped(arena, stderr, &context, err);
@@ -622,7 +625,7 @@ fn runIsolated(arena: Allocator, run: Run, stdout: *std.Io.Writer, stderr: *std.
         .grace_ms = command.grace_ms,
     };
     const outcome = vercel.runExec(&context, &pushed.session, request, .{ .stdout = stdout, .stderr = stderr }, .{});
-    stdout.flush() catch {};
+    stdout.flush() catch |err| debug_trace.logf("remote run", "event=output_flush_failed reason={s}", .{@errorName(err)});
     if (std.meta.activeTag(outcome) == .exited) bringBackIsolated(arena, &context, &state_dir, pushed.session.state.session_id, run_id, command, stderr);
     return exitFor(arena, stderr, outcome);
 }
@@ -764,7 +767,7 @@ fn runRemote(arena: Allocator, run: Run, stdout: *std.Io.Writer, stderr: *std.Io
         .grace_ms = command.grace_ms,
     };
     const outcome = vercel.runExec(&context, &pushed.session, request, .{ .stdout = stdout, .stderr = stderr }, .{});
-    stdout.flush() catch {};
+    stdout.flush() catch |err| debug_trace.logf("remote run", "event=output_flush_failed reason={s}", .{@errorName(err)});
     const brought_failed = std.meta.activeTag(outcome) == .exited and bringBack(arena, &context, pushed.session.state.session_id, run_id, baseline, command, stderr);
     vercel.notePending(&context, run_id, started_ms, baseline, outcome, brought_failed) catch |err| notePendingFailure(arena, stderr, &context, err);
     return exitFor(arena, stderr, outcome);
@@ -1222,7 +1225,7 @@ test "V1: a matching login gets past the check, a mismatch gives N10, and no req
         try refusalLine(arena, wrong_decision.refused),
     );
     try std.testing.expect(std.mem.find(u8, try refusalLine(arena, wrong_decision.refused), token) == null);
-    try std.testing.expectEqual(@as(usize, 0), server.served);
+    try std.testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "V1: a login that is missing gives N10 without a request" {

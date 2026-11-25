@@ -135,6 +135,15 @@ pub const Server = struct {
         }
     }
 
+    /// The requests counted so far. The serve thread writes the count under `served_lock`, so a test
+    /// on another thread reads it through this accessor, not the field.
+    pub fn servedCount(self: *Server) usize {
+        const zio = self.io();
+        self.served_lock.lockUncancelable(zio);
+        defer self.served_lock.unlock(zio);
+        return self.served;
+    }
+
     fn countServed(self: *Server) void {
         const zio = self.io();
         self.served_lock.lockUncancelable(zio);
@@ -280,6 +289,7 @@ fn sendLines(zio: std.Io, stream: std.Io.net.Stream, body: []const u8, gap_ms: u
         const end = if (std.mem.findScalar(u8, rest, '\n')) |index| index + 1 else rest.len;
         send(zio, stream, rest[0..end]) catch return;
         rest = rest[end..];
+        // Paces the reply the way a slow stream arrives, which the idle and cadence tests need.
         if (gap_ms > 0 and rest.len > 0) io_mod.sleep(gap_ms * std.time.ns_per_ms);
     }
 }
@@ -308,6 +318,7 @@ fn sendHead(zio: std.Io, stream: std.Io.net.Stream, status: []const u8, length: 
 fn sendReply(zio: std.Io, stream: std.Io.net.Stream, status: []const u8, body: []const u8) void {
     defer stream.close(zio);
     if (!sendHead(zio, stream, status, body.len)) return;
+    // The client may close early; the test asserts on what it received, not on the rest of the body.
     send(zio, stream, body) catch {};
 }
 
@@ -329,6 +340,7 @@ fn sendChunked(zio: std.Io, stream: std.Io.net.Stream, status: []const u8, body:
         send(zio, stream, "\r\n") catch return;
         rest = rest[n..];
     }
+    // The same as sendReply: a client that closed early already has what it asked for.
     send(zio, stream, "0\r\n\r\n") catch {};
 }
 

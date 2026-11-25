@@ -269,6 +269,8 @@ pub const Stream = struct {
     /// watch recorded none, the error is the one given, and a total deadline that
     /// has passed makes it a timeout: a shut socket can fail as any transport error.
     fn failure(self: *Stream, err: anyerror) StreamError {
+        // A transfer that fails after the caller cancelled is a cancel, whatever the socket reported (R2.4).
+        if (self.cancel.load(.seq_cst)) return error.Cancelled;
         const cause = self.watch.failure(err);
         if (cause == err and self.totalExpired()) return error.Timeout;
         return mapWatch(cause);

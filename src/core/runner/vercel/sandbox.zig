@@ -1398,7 +1398,7 @@ test "a missing sandbox.json creates the sandbox, sets up its first use, and kee
     try std.testing.expectEqual(@as(i64, 2_701_000), session.state.expires_at_ms);
     try std.testing.expectEqual(Generation.kept, session.generation);
     server.close();
-    try std.testing.expectEqual(@as(usize, 5), server.served);
+    try std.testing.expectEqual(@as(usize, 5), server.servedCount());
     try std.testing.expect(std.mem.startsWith(u8, server.head(0), "POST /v3/sandboxes?teamId=team_fake HTTP/1.1"));
     const manifest = (try readVerified(arena, &state_dir, manifest_file, max_manifest_bytes)).?;
     try std.testing.expect(std.mem.find(u8, manifest, "\"generation\":\"fresh-generation\"") != null);
@@ -1432,7 +1432,7 @@ test "a 409 on create gives one resume GET, and a marker that is missing is writ
     try std.testing.expectEqualStrings("sess_2", session.state.session_id);
     try std.testing.expectEqual(Generation.reset, session.generation);
     server.close();
-    try std.testing.expectEqual(@as(usize, 4), server.served);
+    try std.testing.expectEqual(@as(usize, 4), server.servedCount());
     try std.testing.expect(std.mem.find(u8, server.head(1), "resume=true") != null);
 }
 
@@ -1473,7 +1473,7 @@ fn sessionGoneRecovers(status_line: []const u8) !void {
     try std.testing.expectEqualStrings("sess_2", session.state.session_id);
     try std.testing.expectEqual(Generation.kept, session.generation);
     server.close();
-    try std.testing.expectEqual(@as(usize, 4), server.served);
+    try std.testing.expectEqual(@as(usize, 4), server.servedCount());
     try std.testing.expect(std.mem.find(u8, server.head(0), "/v2/sandboxes/sessions/sess_old/cmd") != null);
     try std.testing.expect(std.mem.find(u8, server.head(1), "GET /v2/sandboxes/fx-test?projectId=prj_fake&resume=true") != null);
     try std.testing.expect(std.mem.find(u8, server.head(3), "/v2/sandboxes/sessions/sess_2/cmd") != null);
@@ -1572,7 +1572,7 @@ test "a record whose expiry has passed resumes before the first session call, th
     _ = try expectOk(Output, runCommand(&ctx, &session, .{ .step = "probe", .command = "true", .args = &.{} }, .user));
     try std.testing.expectEqualStrings("sess_2", session.state.session_id);
     server.close();
-    try std.testing.expectEqual(@as(usize, 3), server.served);
+    try std.testing.expectEqual(@as(usize, 3), server.servedCount());
     try std.testing.expect(std.mem.find(u8, server.head(0), "GET /v2/sandboxes/fx-test?projectId=prj_fake&resume=true") != null);
     try std.testing.expect(std.mem.find(u8, server.head(2), "/v2/sandboxes/sessions/sess_2/cmd") != null);
 }
@@ -1673,7 +1673,7 @@ test "a resume that answers 404 creates the sandbox once, sets up its first use,
     _ = try expectOk(Output, runCommand(&ctx, &session, .{ .step = "probe", .command = "true", .args = &.{} }, .user));
     try std.testing.expectEqualStrings("sess_1", session.state.session_id);
     server.close();
-    try std.testing.expectEqual(@as(usize, 8), server.served);
+    try std.testing.expectEqual(@as(usize, 8), server.servedCount());
     try std.testing.expect(std.mem.startsWith(u8, server.head(2), "POST /v3/sandboxes?teamId=team_fake HTTP/1.1"));
 }
 
@@ -1704,7 +1704,7 @@ test "a create that answers 409, a resume that answers 404, and a second create 
     try std.testing.expectEqualStrings("create", failure.step);
     try std.testing.expectEqual(@as(u16, 409), failure.status);
     server.close();
-    try std.testing.expectEqual(@as(usize, 3), server.served);
+    try std.testing.expectEqual(@as(usize, 3), server.servedCount());
 }
 
 test "an exec command that answers 404 resumes once and runs once more, and a second 404 is refused and marks the record (V3)" {
@@ -1739,7 +1739,7 @@ test "an exec command that answers 404 resumes once and runs once more, and a se
     try std.testing.expectEqualStrings("exec", failure.step);
     try std.testing.expectEqual(@as(u16, 410), failure.status);
     server.close();
-    try std.testing.expectEqual(@as(usize, 4), server.served);
+    try std.testing.expectEqual(@as(usize, 4), server.servedCount());
     const marked = (try loadState(&ctx)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 0), marked.expires_at_ms);
 }
@@ -1862,7 +1862,7 @@ test "a size that differs is patched with memory 2048 MiB per vCPU, and the note
         else => return error.UnexpectedSizeNote,
     }
     server.close();
-    try std.testing.expectEqual(@as(usize, 1), server.served);
+    try std.testing.expectEqual(@as(usize, 1), server.servedCount());
     try std.testing.expect(std.mem.startsWith(u8, server.head(0), "PATCH /v2/sandboxes/fx-test?projectId=prj_fake&teamId=team_fake HTTP/1.1"));
 }
 
@@ -1891,7 +1891,7 @@ test "a size already requested is not sent again (V3)" {
 
     _ = try expectOk(Session, ensure(&ctx));
     server.close();
-    try std.testing.expectEqual(@as(usize, 0), server.served);
+    try std.testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "a failed size PATCH is not sent again in this process, and its note names the size (V3, N18)" {
@@ -1927,7 +1927,7 @@ test "a failed size PATCH is not sent again in this process, and its note names 
     }
     _ = try expectOk(Session, ensure(&ctx));
     server.close();
-    try std.testing.expectEqual(@as(usize, 1), server.served);
+    try std.testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 /// Counts the bytes requested from `child`, and the most held at once, so a test can bound the

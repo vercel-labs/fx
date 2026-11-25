@@ -462,7 +462,7 @@ test "a 401 and a 403 both give rejected, and a rejected call is not retried" {
     try std.testing.expect((try getUser(arena_state.allocator(), link)) == .rejected);
     try std.testing.expect((try getUser(arena_state.allocator(), link)) == .rejected);
     server.close();
-    try std.testing.expectEqual(@as(usize, 2), server.served);
+    try std.testing.expectEqual(@as(usize, 2), server.servedCount());
 }
 
 test "a reply with an empty, missing or non-string id is refused as a bad reply" {
@@ -509,7 +509,7 @@ test "a teams listing follows pagination.next, and stops at 300 teams" {
     server.close();
     try std.testing.expectEqual(max_teams, teams.len);
     try std.testing.expectEqualStrings("team_299", teams[299].id);
-    try std.testing.expectEqual(@as(usize, 3), server.served);
+    try std.testing.expectEqual(@as(usize, 3), server.servedCount());
     try std.testing.expectEqualStrings("GET /v2/teams?limit=100 HTTP/1.1", server.line(0));
     try std.testing.expectEqualStrings("GET /v2/teams?limit=100&until=1000 HTTP/1.1", server.line(1));
     try std.testing.expectEqualStrings("GET /v2/teams?limit=100&until=2000 HTTP/1.1", server.line(2));
@@ -532,7 +532,7 @@ test "a teams listing with no pagination.next makes one request" {
     const teams = try expectOk([]const Team, try listTeams(arena, link));
     server.close();
     try std.testing.expectEqual(@as(usize, 2), teams.len);
-    try std.testing.expectEqual(@as(usize, 1), server.served);
+    try std.testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 test "a teams cursor that does not move is refused as a bad reply" {
@@ -555,7 +555,7 @@ test "a teams cursor that does not move is refused as a bad reply" {
     const link = linkTo(try originFor(&origin_buffer, server.port()), &cancel, capture.trace());
     try expectFailed([]const Team, try listTeams(arena, link), "teams", .bad_reply);
     server.close();
-    try std.testing.expectEqual(@as(usize, 2), server.served);
+    try std.testing.expectEqual(@as(usize, 2), server.servedCount());
 }
 
 test "a 404 on getTeamBySlug is not found, and the slug is escaped in the path" {
@@ -702,7 +702,7 @@ test "createProject on a 200 returns the new project" {
     const project = try expectOk(Project, try createProject(arena_state.allocator(), link, "team_1"));
     server.close();
     try std.testing.expectEqualStrings("prj_new", project.id);
-    try std.testing.expectEqual(@as(usize, 1), server.served);
+    try std.testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 test "a 500 is a failed step with its status, and describe names the step" {
@@ -736,7 +736,7 @@ test "getUser with a cancel already set sends nothing" {
     const link = linkTo(try originFor(&origin_buffer, server.port()), &cancel, capture.trace());
     try std.testing.expect((try getUser(arena_state.allocator(), link)) == .canceled);
     server.close();
-    try std.testing.expectEqual(@as(usize, 0), server.served);
+    try std.testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "an empty slug, team id or name is refused without a request" {
@@ -755,7 +755,7 @@ test "an empty slug, team id or name is refused without a request" {
     try expectFailed([]const Project, try listProjects(arena, link, ""), "projects", .bad_reply);
     try expectFailed(Project, try getProjectByName(arena, link, "team_1", ""), "project", .bad_reply);
     server.close();
-    try std.testing.expectEqual(@as(usize, 0), server.served);
+    try std.testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "escapeComponent escapes every byte outside the unreserved set" {

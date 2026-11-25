@@ -3,6 +3,7 @@
 //! four `shell` schemas is made in one place.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin_tools = @import("tools.zig");
 const modes = @import("modes.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -50,6 +51,9 @@ fn swappedTools(
     tool_set: tool_set_contract.ToolSet,
     variant: ShellVariant,
 ) !?[]tool_dispatch.Tool {
+    // libfx's addon is built without fx's built-in tools (builtin_tools in build.zig). Its shell
+    // schema is then never swapped, so the tools' descriptions stay out of the addon.
+    if (comptime !build_options.builtin_tools) return null;
     if (!variant.process_only and !variant.runner) return null;
     const shell_index = shellIndex(tool_set) orelse return null;
     const tools = try alloc.dupe(tool_dispatch.Tool, tool_set.registry.tools);

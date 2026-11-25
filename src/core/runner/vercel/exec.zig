@@ -10,6 +10,7 @@ const credentials = @import("credentials.zig");
 const reply = @import("reply.zig");
 const sandbox = @import("sandbox.zig");
 const attempt = @import("attempt.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
 const stream = @import("stream.zig");
 const test_server = @import("test_server.zig");
 const transport = @import("transport.zig");
@@ -257,6 +258,7 @@ fn watchLoop(shared: *Shared) void {
             extendOnWatch(shared);
             next_extend = io_mod.milliTimestamp() + shared.limits.extend_every_ms;
         }
+        // No event covers the cadence clock (V12) or the stop flag (V10), so the watch checks both every poll_ns.
         io_mod.sleep(poll_ns);
     }
 }
@@ -287,6 +289,8 @@ fn sendKill(shared: *Shared, id: []const u8, signal: u8, total_ms: i64) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var never = std.atomic.Value(bool).init(false);
+    // A kill that fails is not retried here. The stop stays unconfirmed until the command's exit is
+    // seen, and the run reports that (V10).
     _ = sandbox.killCommand(arena.allocator(), &never, shared.base, shared.token, shared.trace, shared.team_id, shared.session_id, id, signal, .{ .total_ms = total_ms }) catch {};
 }
 
@@ -325,6 +329,7 @@ fn noteExtendFailure(shared: *Shared, detail: []const u8) void {
 /// ends, and the run continues.
 pub fn writeExtendNote(stderr: *std.Io.Writer, detail: []const u8) void {
     stderr.print("fx: could not extend the sandbox time limit: {s}; the run continued\n", .{detail}) catch return;
+    // No reader is left to tell when stderr fails; the run's exit code still reports the result.
     stderr.flush() catch {};
 }
 
@@ -479,8 +484,8 @@ fn emit(sinks: Sinks, seen: *Seen, remaining: *Written, chunk: Chunk) void {
     const data = chunk.data[skipped..];
     if (data.len == 0) return;
     const writer = if (is_stdout) sinks.stdout else sinks.stderr;
-    writer.writeAll(data) catch {};
-    writer.flush() catch {};
+    writer.writeAll(data) catch |err| debug_trace.logf("remote run", "event=output_dropped bytes={d} reason={s}", .{ data.len, @errorName(err) });
+    writer.flush() catch |err| debug_trace.logf("remote run", "event=output_flush_failed reason={s}", .{@errorName(err)});
     if (is_stdout) seen.written.stdout += data.len else seen.written.stderr += data.len;
 }
 
@@ -743,7 +748,7 @@ test "the exec request carries the wrapper, the stamp, the folder, R, only the s
     try testing.expect(std.mem.find(u8, body, "\"/w/repo/.git/fx-stamp-run1\",\"/w/repo/app\",\"echo hi\"") != null);
     try testing.expect(std.mem.find(u8, body, "\"env\":{\"FX_SET\":\"yes\"}") != null);
     try testing.expect(std.mem.find(u8, body, "\"wait\":true,\"logs\":true,\"timeout\":6000") != null);
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 test "the exec timeout is 5 hours when the call sets none (V6)" {
@@ -811,7 +816,7 @@ test "a request that never gets a command line within the limit is cut, and sent
 
     const outcome = run(&ctx, "sess_1", testRequest(&.{}), sinks, test_limits);
     try testing.expectEqual(@as(?[]const u8, null), outcome.unknown);
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 test "a stream that ends before any command line is result unknown with no id (V7, N3)" {
@@ -872,7 +877,7 @@ test "a quiet close after the command id reattaches: logs skip the bytes already
     try testing.expectEqual(@as(u8, 0), outcome.exited);
     try testing.expectEqualStrings("ab", out_stdout.written());
     server.close();
-    try testing.expectEqual(@as(usize, 3), server.served);
+    try testing.expectEqual(@as(usize, 3), server.servedCount());
     try testing.expect(std.mem.find(u8, server.head(1), "GET /v2/sandboxes/sessions/sess_1/cmd/cmd_11/logs?teamId=team_1 HTTP/1.1") != null);
     try testing.expect(std.mem.find(u8, server.head(2), "GET /v2/sandboxes/sessions/sess_1/cmd/cmd_11?wait=true&teamId=team_1 HTTP/1.1") != null);
 }
@@ -909,7 +914,7 @@ test "three failed reattach attempts in a row are lost contact, with the id (N4)
     const outcome = run(&ctx, "sess_1", testRequest(&.{}), sinks, test_limits);
     try testing.expectEqualStrings("cmd_9", outcome.unknown.?);
     server.close();
-    try testing.expectEqual(@as(usize, 4), server.served);
+    try testing.expectEqual(@as(usize, 4), server.servedCount());
 }
 
 test "V13: an exec answered 401 or 403 before its command line is refused with N11, sent once, and not recovered (V13, V7)" {
@@ -952,7 +957,7 @@ fn execLoginRejected(status_line: []const u8, status: u16) !void {
         else => return error.TestExpectedSandboxRefused,
     }
     server.close();
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
 }
 
 test "a request that is not sent in full did not run: not_sent, never a second request (V7)" {
@@ -1001,7 +1006,7 @@ test "a stop before the request is sent exits 143 and sends nothing (V10)" {
 
     try testing.expect(std.meta.activeTag(run(&ctx, "sess_1", testRequest(&.{}), sinks, test_limits)) == .stopped_unsent);
     server.close();
-    try testing.expectEqual(@as(usize, 0), server.served);
+    try testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "a stop after the command id sends one kill at 15, then one at 9, and ends 143 unconfirmed (V10)" {
@@ -1035,7 +1040,7 @@ test "a stop after the command id sends one kill at 15, then one at 9, and ends 
     request.grace_ms = 1_000;
     try testing.expect(std.meta.activeTag(run(&ctx, "sess_1", request, sinks, test_limits)) == .stopped);
     server.close();
-    try testing.expectEqual(@as(usize, 3), server.served);
+    try testing.expectEqual(@as(usize, 3), server.servedCount());
     try testing.expect(std.mem.find(u8, server.head(1), "POST /v2/sandboxes/sessions/sess_1/cmd/cmd_7/kill?teamId=team_1 HTTP/1.1") != null);
     try testing.expect(std.mem.find(u8, server.head(2), "POST /v2/sandboxes/sessions/sess_1/cmd/cmd_7/kill?teamId=team_1 HTTP/1.1") != null);
 }
@@ -1227,7 +1232,7 @@ test "a closed send gate stops the request before any byte is sent (V10)" {
         .send_gate = &gate,
     }));
     server.close();
-    try testing.expectEqual(@as(usize, 0), server.served);
+    try testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "the stop budget is the grace less 200 ms, and never negative (V10)" {

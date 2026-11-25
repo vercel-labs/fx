@@ -10,6 +10,7 @@ const OptionDoc = @import("../../slash_commands/command_specs.zig").OptionDoc;
 const io_mod = @import("../../shared/io.zig");
 const reply = @import("reply.zig");
 const sandbox = @import("sandbox.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
 const sync = @import("sync.zig");
 const transport = @import("transport.zig");
 
@@ -204,7 +205,7 @@ pub fn sweep(arena: Allocator, ctx: *sandbox.Context, prefix: []const u8, now_ms
         for (page.items) |item| {
             if (seen >= sweep_list_limit) return;
             seen += 1;
-            if (shouldDelete(item, prefix, now_ms)) sandbox.deleteSandboxNamed(ctx, item.name) catch {};
+            if (shouldDelete(item, prefix, now_ms)) sandbox.deleteSandboxNamed(ctx, item.name) catch |err| debug_trace.logf("remote run", "event=sweep_failed what=isolated_sandbox reason={s}", .{@errorName(err)});
         }
         cursor = page.next orelse return;
     }
@@ -244,6 +245,7 @@ pub fn pruneRuns(arena: Allocator, state_dir: *io_mod.VerifiedDir) void {
         const mtime_ms = @divFloor(sync.mtimeNs(stat), 1_000_000);
         found.append(arena, .{ .name = name, .mtime_ms = mtime_ms }) catch return;
     }
+    // I1: a failed delete is not an error. The next run's sweep lists the folder again.
     for (runsToDelete(found.items)) |old| runs.deleteTree(io, old.name) catch {};
 }
 

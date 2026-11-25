@@ -11,6 +11,7 @@ const exec = @import("exec.zig");
 const io_mod = @import("../../shared/io.zig");
 const credentials = @import("credentials.zig");
 const sandbox = @import("sandbox.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
 const stream = @import("stream.zig");
 const sync = @import("sync.zig");
 const transport = @import("transport.zig");
@@ -1070,7 +1071,7 @@ const Apply = struct {
         const temp_name = try self.tempName();
         const mode: std.posix.mode_t = if (file.mode & 0o111 != 0) 0o755 else 0o644;
         var renamed = false;
-        defer if (!renamed) parent.deleteFile(io, temp_name) catch {};
+        defer if (!renamed) parent.deleteFile(io, temp_name) catch |err| debug_trace.logf("remote run", "event=temp_cleanup_failed reason={s}", .{@errorName(err)});
         try writeTemp(parent, temp_name, mode, file, iterator);
 
         const new_sha = try hashNamed(parent, temp_name);

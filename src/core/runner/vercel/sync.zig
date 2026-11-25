@@ -665,6 +665,7 @@ fn openChunk(ctx: *sandbox.Context, name: []const u8) anyerror!std.Io.File {
 
 /// The temporary chunk is always removed. A missing one is the normal case, so the error is ignored.
 fn removeChunk(ctx: *sandbox.Context, name: []const u8) void {
+    // A chunk that stays is removed by the next push before any request (V5), so the error is not kept.
     ctx.state_dir.dir.deleteFile(io_mod.getIo(), name) catch {};
 }
 
@@ -981,7 +982,7 @@ test "a new file is sent in a tar.gz, and the manifest records it only after the
     try testing.expectEqual(@as(usize, 1), result.sent_files);
     try testing.expect(result.scan_complete);
     server.close();
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
     try testing.expect(std.mem.find(u8, server.head(0), "POST /v2/sandboxes/sessions/sess_1/fs/write?teamId=team_fake HTTP/1.1") != null);
     try testing.expect(std.mem.find(u8, server.head(0), "x-cwd: ") != null);
     try testing.expect(std.ascii.findIgnoreCase(server.head(0), "content-type: application/gzip") != null);
@@ -1091,7 +1092,7 @@ test "a deletion alone is sent in one request, and the generation marker does no
     try testing.expectEqual(@as(usize, 0), result.sent_files);
     try testing.expectEqual(@as(usize, 1), result.deleted_files);
     server.close();
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
     const entries = try archiveEntries(arena, server.kept[0..server.kept_len]);
     try testing.expect(findEntry(entries, ".git/fx-delete-run1") != null);
     try testing.expect(findEntry(entries, ".git/fx-generation") == null);
@@ -1376,7 +1377,7 @@ test "a push over its byte limit is refused before any request (N2)" {
     const failure = try expectFailed(push(&ctx, .{ .run_id = "run1", .push_cap_bytes = 4 }));
     try testing.expectEqualStrings("push", failure.step);
     server.close();
-    try testing.expectEqual(@as(usize, 0), server.served);
+    try testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "a lock held past the wait refuses the push as N16, and sends nothing (V2)" {
@@ -1408,7 +1409,7 @@ test "a lock held past the wait refuses the push as N16, and sends nothing (V2)"
     try testing.expectEqualStrings("lock", failure.step);
     try testing.expectEqualStrings(busy_detail, failure.detail);
     server.close();
-    try testing.expectEqual(@as(usize, 0), server.served);
+    try testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "a fs/write answer of Cannot open repairs the root once and sends the push again (V5, V4)" {
@@ -1445,7 +1446,7 @@ test "a fs/write answer of Cannot open repairs the root once and sends the push 
     try testing.expectEqual(@as(usize, 1), result.sent_files);
     try testing.expect(result.generation_reset);
     server.close();
-    try testing.expectEqual(@as(usize, 5), server.served);
+    try testing.expectEqual(@as(usize, 5), server.servedCount());
     const entries = try archiveEntries(arena, server.kept[0..server.kept_len]);
     try testing.expectEqualStrings("hello", findEntry(entries, "a.txt").?.content);
 }
@@ -1612,15 +1613,18 @@ test "a cancel during the push ends it as Cancelled, and the upload does not han
     var capture: credentials.CaptureTrace = .{};
     var ctx = contextFor(arena, &cancel, base, &capture, &state_dir, repo_root);
 
-    var canceller = try std.Thread.spawn(.{}, cancelAfter, .{ &cancel, 300 });
+    var canceller = try std.Thread.spawn(.{}, cancelWhenServed, .{ &server, &cancel });
     defer canceller.join();
     const failure = try expectFailed(push(&ctx, .{ .run_id = "run1" }));
     try testing.expectEqualStrings("Cancelled", failure.detail);
     try expectNoChunk(&state_dir);
 }
 
-fn cancelAfter(cancel: *std.atomic.Value(bool), ms: u64) void {
-    io_mod.sleep(ms * std.time.ns_per_ms);
+/// Cancels once the test server has counted the stalled upload's request, so the cancel lands
+/// while the push waits on the upload.
+fn cancelWhenServed(server: *test_server.Server, cancel: *std.atomic.Value(bool)) void {
+    // A missing request still cancels: the push then ends, and the test fails on its own expectation.
+    server.waitServed(1) catch {};
     cancel.store(true, .seq_cst);
 }
 
@@ -1651,7 +1655,7 @@ test "a symbolic sandbox.json refuses the push before any request (V3, 5c)" {
     const failure = try expectFailed(push(&ctx, .{ .run_id = "run1" }));
     try testing.expectEqualStrings("state", failure.step);
     server.close();
-    try testing.expectEqual(@as(usize, 0), server.served);
+    try testing.expectEqual(@as(usize, 0), server.servedCount());
 }
 
 test "info/exclude is sent when it changes, and not sent again when it does not (V5)" {
@@ -1679,16 +1683,16 @@ test "info/exclude is sent when it changes, and not sent again when it does not 
     var ctx = contextFor(arena, &cancel, base, &capture, &state_dir, repo_root);
 
     _ = try expectPushed(push(&ctx, .{ .run_id = "run1" }));
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
     const first = try archiveEntries(arena, server.kept[0..server.kept_len]);
     try testing.expectEqualStrings("secret.local\n", findEntry(first, ".git/info/exclude").?.content);
 
     _ = try expectPushed(push(&ctx, .{ .run_id = "run2" }));
-    try testing.expectEqual(@as(usize, 1), server.served);
+    try testing.expectEqual(@as(usize, 1), server.servedCount());
 
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/info/exclude", .data = "secret.local\nother.local\n" });
     _ = try expectPushed(push(&ctx, .{ .run_id = "run3" }));
-    try testing.expectEqual(@as(usize, 2), server.served);
+    try testing.expectEqual(@as(usize, 2), server.servedCount());
     const third = try archiveEntries(arena, server.kept[0..server.kept_len]);
     try testing.expectEqualStrings("secret.local\nother.local\n", findEntry(third, ".git/info/exclude").?.content);
 }

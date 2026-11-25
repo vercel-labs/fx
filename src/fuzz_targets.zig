@@ -86,4 +86,10 @@ test {
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("core/runner/vercel/vercel.zig");
     _ = @import("core/runner/config.zig");
+    _ = @import("core/runner/vercel/api.zig");
+    _ = @import("core/runner/vercel/bring_back.zig");
+    _ = @import("core/runner/vercel/credentials.zig");
+    _ = @import("core/runner/vercel/exec.zig");
+    _ = @import("core/runner/vercel/isolated.zig");
+    _ = @import("core/runner/vercel/sandbox.zig");
 }

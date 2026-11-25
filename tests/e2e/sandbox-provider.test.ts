@@ -211,6 +211,7 @@ describe("sandbox provider end to end", () => {
           expect(createBody.persistent).toBe(false);
           const exec = apiSince(fixture).find((entry) => entry.route === "cmd" && entry.kind === "exec")!;
           const execBody = exec.body as { env?: unknown };
+          expect(execBody.env ?? {}).toEqual({});
           expect(JSON.stringify(execBody.env ?? {})).not.toContain("SECRET");
           expect(apiSince(fixture).some((entry) => entry.route === "deleteSandbox")).toBe(true);
         },

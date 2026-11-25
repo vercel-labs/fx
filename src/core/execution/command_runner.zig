@@ -4454,11 +4454,13 @@ test "a timeout gives a runner launch a graceful stop, and kills a local command
 
     // The trap writes its marker only when SIGTERM arrives before the kill.
     const runner_script = "trap 'echo stopped > runner.txt' TERM; sleep 5 & wait";
+    // The launch is stopped by its timeout, so this test reads only the marker that the trap leaves.
     _ = executeRunnerLaunch(.{ .max_command_output_bytes = 1024, .timeout_ms = 300 }, arena, runner_script, dir) catch {};
     const runner_marker = try readAbsoluteFile(arena, try std.Io.Dir.path.join(arena, &.{ dir, "runner.txt" }), 64);
     try std.testing.expectEqualStrings("stopped\n", runner_marker);
 
     const local_script = "trap 'echo stopped > local.txt' TERM; sleep 5 & wait";
+    // Same as above: the timeout stops the command, and the test reads only the marker it leaves.
     _ = executeCommand(.{ .max_command_output_bytes = 1024, .timeout_ms = 300 }, arena, local_script, dir) catch {};
     try std.testing.expectError(
         error.FileNotFound,

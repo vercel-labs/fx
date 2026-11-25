@@ -1304,7 +1304,7 @@ test "R5: the user check runs once per process per token, and later calls read t
     try expectReady(try env.run(arena.allocator(), "session-a", 6), "team_1", "prj_1");
     env.server.close();
     // The user, the teams, the projects, and the fx-sandbox lookup (U6); the second run asks nothing.
-    try testing.expectEqual(@as(usize, 4), env.server.served);
+    try testing.expectEqual(@as(usize, 4), env.server.servedCount());
     try testing.expect(std.mem.startsWith(u8, env.server.head(0), "GET /v2/user"));
 }
 
@@ -1391,7 +1391,7 @@ test "E10: a sub-agent call with no remote is refused with no request, and reads
     try expectRefused(result, e10_text);
     try testing.expectEqual(@as(usize, 0), env.scripted.prompts);
     env.server.close();
-    try testing.expectEqual(@as(usize, 0), env.server.served);
+    try testing.expectEqual(@as(usize, 0), env.server.servedCount());
     try testing.expectEqual(setup.Mark.declined, env.slot.markFor("session-a", 5));
 }
 
