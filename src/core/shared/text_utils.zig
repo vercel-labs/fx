@@ -1201,15 +1201,12 @@ fn cutShortSecretStart(text: []const u8, floor: usize, end: usize) ?usize {
 }
 
 /// What a redacted value is shown as.
-pub const redacted_marker = "[redacted]";
+const redacted_marker = "[redacted]";
 
 /// Where a URL's authority is, from after "://" to the first '/', '?', or
-/// '#', and where its host starts. A user name and password end at the
-/// authority's last '@', as a browser reads them, so a password with an
-/// unescaped '@' stays in them.
+/// '#', and where its host starts (`urlUserInfoEnd`).
 pub const UrlAuthority = struct {
     start: usize,
-    /// After the '@' that ends the user name and password, or `start`.
     host_start: usize,
     end: usize,
 };
@@ -1219,8 +1216,28 @@ pub fn urlAuthority(url: []const u8) ?UrlAuthority {
     const scheme_end = std.mem.find(u8, url, "://") orelse return null;
     const start = scheme_end + "://".len;
     const end = firstDelimiter(url, start, "/?#");
-    const host_start = if (std.mem.findScalarLast(u8, url[start..end], '@')) |at| start + at + 1 else start;
-    return .{ .start = start, .host_start = host_start, .end = end };
+    return .{ .start = start, .host_start = urlUserInfoEnd(url, start, end), .end = end };
+}
+
+/// Where a user name and password that start at `start` end, in a URL whose
+/// authority may end at `end`: after the last '@' before it, as a browser
+/// reads them, so a password with an unescaped '@' stays in them. `start`
+/// when there is no '@'.
+fn urlUserInfoEnd(url: []const u8, start: usize, end: usize) usize {
+    return if (std.mem.findScalarLast(u8, url[start..end], '@')) |at| start + at + 1 else start;
+}
+
+/// `redactUrlForDisplay` for a URL whose host the caller cannot trust, which
+/// also redacts what comes before the last '@' after the scheme: a '/', '?',
+/// or '#' in a password ends the authority before its '@'. Caller owns the
+/// result.
+pub fn redactUrlWithNoHost(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
+    const redacted = try redactUrlForDisplay(alloc, raw_url);
+    const start = if (urlAuthority(redacted)) |authority| authority.start else 0;
+    const user_info_end = urlUserInfoEnd(redacted, start, redacted.len);
+    if (user_info_end == start) return redacted;
+    defer alloc.free(redacted);
+    return std.mem.concat(alloc, u8, &.{ redacted[0..start], redacted_marker ++ "@", redacted[user_info_end..] });
 }
 
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
@@ -2852,6 +2869,24 @@ test "redactUrlForDisplay hides a password that holds an unescaped @" {
     const path = try redactUrlForDisplay(alloc, "https://example.com/@user/post");
     defer alloc.free(path);
     try std.testing.expectEqualStrings("https://example.com/@user/post", path);
+}
+
+test "redactUrlWithNoHost hides a user name and password that hold a '/', '?', or '#'" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { url: []const u8, shown: []const u8 }{
+        .{ .url = "https://user:pass?x@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:pa/ss@127.0.0.1/x", .shown = "https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:pa#ss@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:p@ss@127.0.0.1/x?token=abc", .shown = "https://[redacted]@127.0.0.1/x?token=[redacted]" },
+        .{ .url = "https://user:secret@/docs", .shown = "https://[redacted]@/docs" },
+        .{ .url = "user:secret@agentclientprotocol.com/docs", .shown = "[redacted]@agentclientprotocol.com/docs" },
+        .{ .url = "file://srv/share/x", .shown = "file://srv/share/x" },
+    };
+    for (cases) |case| {
+        const shown = try redactUrlWithNoHost(alloc, case.url);
+        defer alloc.free(shown);
+        try std.testing.expectEqualStrings(case.shown, shown);
+    }
 }
 
 test "redactUrlForDisplay preserves benign keys containing sig" {

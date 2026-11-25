@@ -8153,6 +8153,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const unnamedHosts = [
         { url: "https://user:secret@/docs", row: "Couldn't fetch https://[redacted]@/docs" },
         { url: "https://user:pa/ss@127.0.0.1/x", row: "Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        { url: "https://user:pass?x@host/", row: "Couldn't fetch https://[redacted]@host/" },
         { url: "user:secret@agentclientprotocol.com/docs", row: "Couldn't fetch [redacted]@agentclientprotocol.com/docs" },
         { url: "https://evil.test\\@example.com/spoof", row: "Couldn't fetch https://[redacted]@example.com/spoof" },
         { url: "file://srv/share/x", row: "Couldn't fetch file://srv/share/x" },
@@ -8234,7 +8235,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         for (const row of [refusedRow, deniedRow, searchRow, ...unnamedHosts.map((unnamed) => unnamed.row)]) {
           expect(rows.some((line) => line.slice(2) === clip(row))).toBe(true);
         }
-        expect(rows.filter((line) => /secret|user:|pa\/ss/.test(line))).toEqual([]);
+        expect(rows.filter((line) => /secret|user:|pa\/ss|pass/.test(line))).toEqual([]);
         // No row repeats the search's own quotes in straight quotes or names
         // the search tool.
         expect(rows.filter((line) => line.includes('""') || line.includes("exa_search") || line.includes("saved output"))).toEqual([]);

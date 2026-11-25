@@ -3428,7 +3428,7 @@ fn pathLastTwoParts(path: []const u8) ?[]const u8 {
 fn fetchPageNames(scratch: std.mem.Allocator, urls: []const []const u8) ![]const []const u8 {
     const names = try scratch.alloc([]const u8, urls.len);
     for (urls, names) |url, *name| {
-        name.* = if (urlParts(url)) |parts| fetchPageName(parts) else try redactedFetchUrl(scratch, url);
+        name.* = if (urlParts(url)) |parts| fetchPageName(parts) else try text_utils.redactUrlWithNoHost(scratch, url);
     }
     const shown = try scratch.dupe([]const u8, names);
     for (urls, names, shown, 0..) |url, name, *show, index| {
@@ -3442,23 +3442,11 @@ fn fetchPageNames(scratch: std.mem.Allocator, urls: []const []const u8) ![]const
     return shown;
 }
 
-/// A fetch URL with no usable host as its row shows it: core's redacted form
-/// (`redactUrlForDisplay`), with everything before the last '@' ahead of the
-/// query redacted too, since a '/' in a password or a URL with no "://"
-/// keeps a user name and password out of that form's authority.
-fn redactedFetchUrl(scratch: std.mem.Allocator, url: []const u8) ![]const u8 {
-    const redacted = try text_utils.redactUrlForDisplay(scratch, url);
-    const start = if (text_utils.urlAuthority(redacted)) |authority| authority.start else 0;
-    const end = start + (std.mem.findAny(u8, redacted[start..], "?#") orelse redacted.len - start);
-    const at = std.mem.findScalarLast(u8, redacted[start..end], '@') orelse return redacted;
-    return std.mem.concat(scratch, u8, &.{ redacted[0..start], text_utils.redacted_marker, redacted[start + at ..] });
-}
-
 /// What a fetch row names after its verb, terminal-safe: the page and its
 /// host, the host alone for a URL with no path, or the redacted URL when the
 /// row cannot name its host.
 fn fetchTargetText(scratch: std.mem.Allocator, url: []const u8) ![]const u8 {
-    const parts = urlParts(url) orelse return terminalSafeText(scratch, try redactedFetchUrl(scratch, url));
+    const parts = urlParts(url) orelse return terminalSafeText(scratch, try text_utils.redactUrlWithNoHost(scratch, url));
     const host = try terminalSafeText(scratch, parts.host);
     const page = fetchPageName(parts);
     if (std.mem.eql(u8, page, parts.host)) return host;
@@ -3587,6 +3575,8 @@ test "a fetch row never shows a user name or password, with or without the call'
         // The '/' ends the authority before the '@', so "user" reads as a
         // host and "pa" as its port.
         .{ .url = "https://user:pa/ss@127.0.0.1/x", .row = "● Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:pass?x@host/", .row = "● Couldn't fetch https://[redacted]@host/" },
+        .{ .url = "https://user:pa#ss@host/", .row = "● Couldn't fetch https://[redacted]@host/" },
         .{ .url = "https://user:p@ss@127.0.0.1/x", .row = "● Couldn't fetch x · 127.0.0.1" },
         .{ .url = "https://user:secret@agentclientprotocol.com/docs?token=abc", .row = "● Couldn't fetch docs · agentclientprotocol.com" },
         .{ .url = "ftp://user:secret@agentclientprotocol.com/x", .row = "● Couldn't fetch ftp://[redacted]@agentclientprotocol.com/x" },
@@ -3598,7 +3588,7 @@ test "a fetch row never shows a user name or password, with or without the call'
         .{ .url = "file://srv/share/x", .row = "● Couldn't fetch file://srv/share/x" },
         .{ .url = "javascript://agentclientprotocol.com/%0aalert(1)", .row = "● Couldn't fetch javascript://agentclientprotocol.com/%0aalert(1)" },
     };
-    const credentials = [_][]const u8{ "secret", "user:", "pa/ss", "p@ss" };
+    const credentials = [_][]const u8{ "secret", "user:", "pa/ss", "p@ss", "pass", "pa#ss" };
     for (cases) |case| {
         const arguments = try alloc.print("{{\"url\":{f}}}", .{std.json.fmt(case.url, .{})});
         defer alloc.free(arguments);
