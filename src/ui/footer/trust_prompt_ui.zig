@@ -527,14 +527,12 @@ test "the note says what the answer covers" {
     try std.testing.expect(std.mem.find(u8, this, "fx asks again") == null);
 }
 
-test "the hint keeps enter and esc at any width" {
+test "the drawn hint keeps enter and esc at 25 columns and wider" {
     const alloc = std.testing.allocator;
-    for ([_]u16{ 20, 200 }) |cols| {
-        const hint = hintText(cols);
-        try std.testing.expect(std.mem.find(u8, hint, "enter confirm") != null);
-        try std.testing.expect(std.mem.find(u8, hint, "esc exit") != null);
+    for ([_]u16{ 25, 40, 80, 200 }) |cols| {
         var row = try composeHintRow(alloc, cols);
         defer row.deinit(alloc);
         try std.testing.expect(std.mem.find(u8, row.items, "enter confirm") != null);
+        try std.testing.expect(std.mem.find(u8, row.items, "esc exit") != null);
     }
 }

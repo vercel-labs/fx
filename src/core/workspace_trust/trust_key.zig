@@ -49,7 +49,7 @@ pub fn resolvePlaces(alloc: std.mem.Allocator, home: ?[]const u8) error{OutOfMem
     const home_path = home orelse return .{};
     var result: OwnedPlaces = .{};
     errdefer result.deinit(alloc);
-    result.home = try realPathOrNull(alloc, home_path);
+    result.home = try repo_root.realpathOrNull(alloc, home_path);
     result.profile = try profileRealPath(alloc, home_path);
     return result;
 }
@@ -60,14 +60,7 @@ fn profileRealPath(alloc: std.mem.Allocator, home: []const u8) error{OutOfMemory
         return null;
     };
     defer alloc.free(unresolved);
-    return realPathOrNull(alloc, unresolved);
-}
-
-fn realPathOrNull(alloc: std.mem.Allocator, path: []const u8) error{OutOfMemory}!?[]u8 {
-    return io_mod.realpathAlloc(alloc, path) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return null;
-    };
+    return repo_root.realpathOrNull(alloc, unresolved);
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {

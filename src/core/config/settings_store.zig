@@ -19,7 +19,6 @@ const theme_mod = @import("../shared/theme.zig");
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
 pub const max_model_bytes: usize = 1024;
-pub const workspace_trusted_key = "trusted";
 const lock_deadline_ms: u64 = 2000;
 const backup_keep_count: usize = 5;
 const corrupt_keep_count: usize = 3;
@@ -96,7 +95,7 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
-pub const WorkspaceTrustMutation = struct {
+const WorkspaceTrustMutation = struct {
     workspace_root: []const u8,
 };
 
@@ -1826,7 +1825,7 @@ fn applyWorkspaceTrustMutationToRoot(
     mutation: WorkspaceTrustMutation,
 ) !PatchApplication {
     const workspace = try workspaceObject(arena, root, mutation.workspace_root);
-    const changed = try putBool(arena, workspace, workspace_trusted_key, true);
+    const changed = try putBool(arena, workspace, settings_keys.workspace_trusted_key, true);
     return .{ .changed = changed };
 }
 

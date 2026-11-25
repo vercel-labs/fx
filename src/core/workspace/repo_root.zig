@@ -124,7 +124,8 @@ fn hasGitDirectory(alloc: std.mem.Allocator, root: []const u8) error{OutOfMemory
     return stat.kind == .directory;
 }
 
-fn realpathOrNull(alloc: std.mem.Allocator, path: []const u8) error{OutOfMemory}!?[]u8 {
+/// The real path of `path`, or null when it cannot be resolved. The caller owns the result.
+pub fn realpathOrNull(alloc: std.mem.Allocator, path: []const u8) error{OutOfMemory}!?[]u8 {
     return io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,

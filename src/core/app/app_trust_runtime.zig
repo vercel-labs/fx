@@ -4,6 +4,8 @@ const host_target = @import("../hosts/target.zig");
 const input_action = @import("../input/input_action.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const cli_config = @import("../cli/cli_config.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
@@ -14,7 +16,12 @@ const SkillRoot = workspace_trust.gate.SkillRoot;
 const SkillSource = skill_contract.SkillSource;
 
 const trace_scope = "workspace_trust";
-const not_saved_notice = "Could not save your answer, so fx will ask again next time.";
+const not_saved_format = "Could not save your answer to {s}/settings.json: {s}. fx will ask again next time.";
+const dropped_reason = "folder_access_screen_open";
+const carriage_return: u8 = 13;
+const line_feed: u8 = 10;
+const ctrl_c: u8 = 3;
+const ctrl_d: u8 = 4;
 const module = @This();
 
 pub fn screenDisabled() bool {
@@ -27,10 +34,10 @@ pub fn screenDisabled() bool {
 pub fn inputFor(event: input_action.TerminalInputEvent) ?Input {
     return switch (event) {
         .raw => |raw| switch (raw.byte) {
-            13, 10 => .confirm,
+            carriage_return, line_feed => .confirm,
             '1' => .choose_allow,
             '2' => .choose_exit,
-            3, 4 => .cancel,
+            ctrl_c, ctrl_d => .cancel,
             else => null,
         },
         .action => |decoded| switch (decoded.action) {
@@ -43,10 +50,29 @@ pub fn inputFor(event: input_action.TerminalInputEvent) ?Input {
     };
 }
 
+fn isEntryOfKind(kind: ?std.Io.File.Kind, expected: std.Io.File.Kind) bool {
+    const found = kind orelse return false;
+    return found == expected or found == .sym_link;
+}
+
+fn traceDroppedEvent(event: input_action.TerminalInputEvent) void {
+    switch (event) {
+        .raw => debug_trace.logf(trace_scope, "event dropped kind=raw reason={s}", .{dropped_reason}),
+        .paste_byte => debug_trace.logf(trace_scope, "event dropped kind=paste_byte reason={s}", .{dropped_reason}),
+        .action => |decoded| debug_trace.logf(trace_scope, "event dropped kind=action name={s} reason={s}", .{ @tagName(decoded.action), dropped_reason }),
+    }
+}
+
+fn traceDroppedReplayByte() void {
+    debug_trace.logf(trace_scope, "replay byte dropped reason={s}", .{dropped_reason});
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub const screenDisabled = module.screenDisabled;
-        pub const inputFor = module.inputFor;
+        const McpCounts = struct {
+            servers: usize = 0,
+            pending: usize = 0,
+        };
 
         pub fn begin(app: *App) !void {
             try beginWithHome(app, io_mod.homeDir());
@@ -74,8 +100,8 @@ pub fn Runtime(comptime App: type) type {
         pub fn refreshFacts(app: *App) !void {
             if (!app.trust.asking()) return;
             const root = if (comptime @hasField(App, "workspace_root")) app.workspace_root else "";
-            const agents_md = statKindNoFollow(app.alloc, root, "AGENTS.md") == .file;
-            const agent_profiles = statKindNoFollow(app.alloc, root, ".fx/agents") == .directory;
+            const agents_md = isEntryOfKind(statKindNoFollow(app.alloc, root, "AGENTS.md"), .file);
+            const agent_profiles = isEntryOfKind(statKindNoFollow(app.alloc, root, ".fx/agents"), .directory);
 
             var skill_counts = std.EnumArray(SkillSource, usize).initFill(0);
             if (comptime @hasField(App, "skills")) {
@@ -93,41 +119,41 @@ pub fn Runtime(comptime App: type) type {
                 skill_roots_len += 1;
             }
 
-            var mcp_servers: usize = 0;
-            var mcp_pending: usize = 0;
+            const mcp = workspaceMcpCounts(app);
+
+            try app.trust.setFacts(app.alloc, .{
+                .agents_md = agents_md,
+                .agent_profiles = agent_profiles,
+                .skill_roots = skill_roots_buf[0..skill_roots_len],
+                .mcp_servers = mcp.servers,
+                .mcp_pending = mcp.pending,
+            });
+            requestFooterRender(app);
+        }
+
+        fn workspaceMcpCounts(app: *App) McpCounts {
+            var counts: McpCounts = .{};
             if (comptime @hasField(App, "mcp")) {
                 if (comptime @hasDecl(@TypeOf(app.mcp), "leaseHost")) {
                     if (app.mcp.leaseHost()) |lease| {
                         defer lease.deinit();
                         for (lease.host.runtime.servers()) |server| {
                             if (server.source != .workspace) continue;
-                            mcp_servers += 1;
-                            if (server.held == .waiting_for_approval) mcp_pending += 1;
+                            counts.servers += 1;
+                            if (server.held == .waiting_for_approval) counts.pending += 1;
                         }
                     }
                 }
             }
-
-            try app.trust.setFacts(app.alloc, .{
-                .agents_md = agents_md,
-                .agent_profiles = agent_profiles,
-                .skill_roots = skill_roots_buf[0..skill_roots_len],
-                .mcp_servers = mcp_servers,
-                .mcp_pending = mcp_pending,
-            });
-            requestFooterRender(app);
+            return counts;
         }
 
         pub fn routeIngress(app: *App, ingress: input_action.TerminalInputIngress) !bool {
             if (!app.trust.asking()) return false;
+            if (ingress.replay_byte_after_routing != null) traceDroppedReplayByte();
             const event = ingress.event orelse return true;
             const input = module.inputFor(event) orelse {
-                switch (event) {
-                    .action => |decoded| if (decoded.action == .paste_start) {
-                        debug_trace.logf(trace_scope, "paste dropped reason=folder_access_screen_open", .{});
-                    },
-                    .raw, .paste_byte => {},
-                }
+                traceDroppedEvent(event);
                 return true;
             };
             switch (app.trust.press(input)) {
@@ -138,7 +164,7 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        pub fn finishAllowed(app: *App) !void {
+        fn finishAllowed(app: *App) !void {
             try finishAllowedWithHome(app, io_mod.homeDir());
         }
 
@@ -146,25 +172,35 @@ pub fn Runtime(comptime App: type) type {
             const allowed = app.trust.allow(app.alloc, home);
             switch (allowed) {
                 .saved, .session_only => {},
-                .not_saved => {
+                .not_saved => |err| {
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        try app.writeDomainNotice(.{
-                            .topic = trace_scope,
-                            .tone = .@"error",
-                            .body = not_saved_notice,
-                        }, true);
+                        try writeNotSavedNotice(app, err);
                     }
                 },
             }
+            releaseMcpTrustHold(app);
+            requestFullRender(app);
+        }
+
+        fn writeNotSavedNotice(app: *App, err: anyerror) !void {
+            const body = try app.alloc.print(not_saved_format, .{ profile_paths.displayRoot(), cli_config.saveFailureReason(err) });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = trace_scope,
+                .tone = .@"error",
+                .body = body,
+            }, true);
+        }
+
+        fn releaseMcpTrustHold(app: *App) void {
             if (comptime @hasField(App, "mcp")) {
                 if (comptime @hasDecl(@TypeOf(app.mcp), "releaseTrustHold")) {
                     app.mcp.releaseTrustHold();
                 }
             }
-            requestFullRender(app);
         }
 
-        pub fn finishDeclined(app: *App) void {
+        fn finishDeclined(app: *App) void {
             input_submit_runtime.SubmitRuntime(App).discardLaunchPrompt(app, "folder_access_declined");
             if (comptime @hasField(App, "should_exit")) {
                 app.should_exit = true;
@@ -295,7 +331,9 @@ test "finishAllowedWithHome writes an error notice when saving fails" {
         notices: std.ArrayList(types.SemanticNotice) = .empty,
 
         pub fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
-            try self.notices.append(self.alloc, notice);
+            var copied = notice;
+            copied.body = try self.alloc.dupe(u8, notice.body);
+            try self.notices.append(self.alloc, copied);
         }
     };
 
@@ -309,6 +347,7 @@ test "finishAllowedWithHome writes an error notice when saving fails" {
     var app: FakeApp = .{ .alloc = alloc };
     defer app.trust.deinit(alloc);
     defer app.notices.deinit(alloc);
+    defer for (app.notices.items) |notice| alloc.free(notice.body);
     app.trust = try Gate.open(alloc, repo, null, false);
     try std.testing.expect(app.trust.asking());
 
@@ -320,7 +359,90 @@ test "finishAllowedWithHome writes an error notice when saving fails" {
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings(trace_scope, app.notices.items[0].topic);
     try std.testing.expectEqual(types.NoticeTone.@"error", app.notices.items[0].tone);
-    try std.testing.expectEqualStrings(not_saved_notice, app.notices.items[0].body);
+    const expected = try alloc.print(not_saved_format, .{ profile_paths.displayRoot(), cli_config.saveFailureReason(error.HomeNotSet) });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, app.notices.items[0].body);
+}
+
+test "refreshFacts shows a symlinked AGENTS.md and agent profiles folder" {
+    const render_request = @import("../../ui/render_request.zig");
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "",
+        trust: Gate = .{},
+        shell: struct {
+            render_requests: render_request.RenderRequestState = .{},
+        } = .{},
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "ws/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "ws/profiles");
+    var file = try tmp.dir.createFile(std.testing.io, "ws/instructions.md", .{ .truncate = true });
+    file.close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "instructions.md", "ws/AGENTS.md", .{ .is_directory = false });
+    try tmp.dir.symLink(std.testing.io, "../profiles", "ws/.fx/agents", .{ .is_directory = true });
+    const ws = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ws");
+    defer alloc.free(ws);
+
+    var app: FakeApp = .{ .alloc = alloc, .workspace_root = ws };
+    defer app.trust.deinit(alloc);
+    app.trust = try Gate.open(alloc, "/", null, false);
+
+    try Runtime(FakeApp).refreshFacts(&app);
+    const shown = app.trust.prompt.?;
+    try std.testing.expectEqual(@as(usize, 2), shown.rows.len);
+    try std.testing.expectEqualStrings("AGENTS.md", shown.rows[0].name);
+    try std.testing.expectEqualStrings(".fx/agents", shown.rows[1].name);
+}
+
+test "a dropped key, paste, and replay byte leave a trace line with their kind and no text" {
+    const render_request = @import("../../ui/render_request.zig");
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        trust: Gate = .{},
+        should_exit: bool = false,
+        mcp: struct {
+            held_for_trust: bool = false,
+        } = .{},
+        shell: struct {
+            render_requests: render_request.RenderRequestState = .{},
+        } = .{},
+        main_agent: struct {
+            submission: input_submit_runtime.State = .{},
+        } = .{},
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(base);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ base, "trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTest(alloc, trace_path);
+
+    var app: FakeApp = .{ .alloc = alloc };
+    defer app.trust.deinit(alloc);
+    app.trust = try Gate.open(alloc, "/", null, false);
+    const Rt = Runtime(FakeApp);
+    try std.testing.expect(try Rt.routeIngress(&app, .{ .event = .{ .raw = .{ .byte = 'q' } } }));
+    try std.testing.expect(try Rt.routeIngress(&app, .{ .event = .{ .action = .{ .action = .paste_start } } }));
+    try std.testing.expect(try Rt.routeIngress(&app, .{ .replay_byte_after_routing = 'z' }));
+    try std.testing.expect(app.trust.asking());
+
+    const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(64 * 1024));
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event dropped kind=raw reason=folder_access_screen_open") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event dropped kind=action name=paste_start reason=folder_access_screen_open") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "replay byte dropped reason=folder_access_screen_open") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "q") == null);
+    try std.testing.expect(std.mem.find(u8, trace, "z") == null);
 }
 
 test "refreshFacts stats workspace entries without following symlinks and counts workspace skills" {

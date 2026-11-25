@@ -570,7 +570,7 @@ pub fn loadWorkspaceTrustFromHome(
     if (workspaces != .object) return error.InvalidSettingsFormat;
     const workspace = workspaces.object.get(normalizeWorkspaceRoot(workspace_root)) orelse return false;
     if (workspace != .object) return false;
-    const trusted = workspace.object.get(settings_store.workspace_trusted_key) orelse return false;
+    const trusted = workspace.object.get(settings_keys.workspace_trusted_key) orelse return false;
     return trusted == .bool and trusted.bool;
 }
 
