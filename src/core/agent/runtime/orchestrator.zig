@@ -5924,12 +5924,15 @@ fn withoutCredential(arena: Allocator, detail: []const u8, credential: []const u
 }
 
 /// Masks the end of `text` where it is the start of `credential`, as it is
-/// when the provider's text was cut short inside the key.
+/// when the provider's text was cut short inside the key, before the "..."
+/// such a cut can append.
 fn maskCutCredentialStart(text: []u8, credential: []const u8) void {
-    var len = @min(text.len, credential.len -| 1);
+    const cut_marker = "...";
+    const end = if (std.mem.endsWith(u8, text, cut_marker)) text.len - cut_marker.len else text.len;
+    var len = @min(end, credential.len -| 1);
     while (len > 0) : (len -= 1) {
-        if (std.mem.endsWith(u8, text, credential[0..len])) {
-            @memset(text[text.len - len ..], '*');
+        if (std.mem.endsWith(u8, text[0..end], credential[0..len])) {
+            @memset(text[end - len .. end], '*');
             return;
         }
     }
@@ -5945,6 +5948,8 @@ test "withoutCredential masks a whole key, its escaped form, and a key the text 
         .{ .detail = "cyber_policy: key " ++ key ++ " flagged", .credential = key, .expected = "cyber_policy: key " ++ text_utils.repeat("*", key.len) ++ " flagged" },
         .{ .detail = "cyber_policy: {\"key\":\"test\\\"credential\"}", .credential = "test\"credential", .expected = "cyber_policy: {\"key\":\"" ++ text_utils.repeat("*", 16) ++ "\"}" },
         .{ .detail = "cyber_policy: apply via test-cred", .credential = key, .expected = "cyber_policy: apply via " ++ text_utils.repeat("*", 9) },
+        // The text cut short inside the key, with the "..." a cut appends.
+        .{ .detail = "cyber_policy: apply via test-cred...", .credential = key, .expected = "cyber_policy: apply via " ++ text_utils.repeat("*", 9) ++ "..." },
         .{ .detail = "cyber_policy: nothing to hide", .credential = key, .expected = "cyber_policy: nothing to hide" },
         .{ .detail = "cyber_policy: key " ++ key, .credential = "", .expected = "cyber_policy: key " ++ key },
     };
