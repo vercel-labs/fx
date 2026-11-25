@@ -264,7 +264,7 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
     // One completed turn so the full transcript has content to open.
     await session.sendLiteral("hello");
     await session.sendKeys("Enter");
-    await session.waitForText("ctrl-o probe target", 10_000);
+    await session.waitForPane((pane) => pane.includes("ctrl-o probe target") && turnSettled(pane), 10_000);
 
     // Control: a printable byte in the main view starts and settles the probe.
     await session.sendLiteral("a");

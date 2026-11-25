@@ -386,7 +386,7 @@ test.skipIf(!tmuxAvailable())("a level chosen during a turn applies to the next 
   await session.waitForPane((pane) => pane.includes("FIRST_ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   await session.sendText("second question");
-  await session.waitForText("SECOND_ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("SECOND_ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);
@@ -523,7 +523,7 @@ test.skipIf(!tmuxAvailable())("Ctrl+T steps from default through the model's lev
   expect(pane).not.toContain("Reasoning effort");
 
   await session.sendKeys("Enter");
-  await session.waitForText("ANSWER", 10_000);
+  await session.waitForPane((pane) => pane.includes("ANSWER") && turnSettled(pane), 10_000);
   await session.waitForComposer(10_000);
   expect(readFileSync(current.stderrPath, "utf8")).toBe("");
   await quit(current);

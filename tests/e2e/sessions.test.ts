@@ -5635,7 +5635,7 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     await until(() => hold.started, "the held reply");
     await app.session.sendText(steering);
     await until(() => hold.cancelled, "steering to stop the held reply");
-    await app.session.waitForText("STEERED_ANSWER", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("STEERED_ANSWER") && turnSettled(pane), TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     const steered = gateway.requests[1]!.body;
     expect(steered).toContain("<user_steering>");
@@ -5693,7 +5693,7 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     await until(() => hold.cancelled, "the cancel to reach the gateway");
     await app.session.waitForComposer(TIMEOUT);
     await app.session.sendText("Confirm the next prompt still works.");
-    await app.session.waitForText("AFTER_CANCEL_ANSWER", TIMEOUT);
+    await app.session.waitForPane((pane) => pane.includes("AFTER_CANCEL_ANSWER") && turnSettled(pane), TIMEOUT);
     const followUp = gateway.requests[1]!.body;
     expect(countIn(followUp, "<turn_aborted>")).toBe(1);
     expect(followUp).toContain("PARTIAL_BEFORE_CANCEL");
@@ -5854,7 +5854,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     expect(childWork(fixture.home, parent)).toEqual(original);
 
     held.release("HELD_CHILD_RESULT");
-    const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
+    const reported = await tui.waitForPane((pane) => pane.includes("CHILD_COMPLETE") && turnSettled(pane), 10000);
     // The report shows as a finished subagent row, not as the user's prompt.
     expect(reported).toContain("worker finished");
     expect(reported).not.toContain("Subagent report (untrusted");
@@ -5863,7 +5863,7 @@ test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and
     await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
     await tui.waitForStableComposer(10000);
     await tui.sendText("STEERING_LATER");
-    await tui.waitForText("LATER_OK", 10000);
+    await tui.waitForPane((pane) => pane.includes("LATER_OK") && turnSettled(pane), 10000);
     expect(childRequests).toBe(1);
     await tui.sendText("/quit");
     await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
@@ -6662,7 +6662,7 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
         await app.session.waitForStableComposer(TIMEOUT, 300);
         await app.session.sendText("Grid second.");
         if (exit === "committed") {
-          await app.session.waitForText("GRID_SECOND_ANSWER", TIMEOUT);
+          await app.session.waitForPane((pane) => pane.includes("GRID_SECOND_ANSWER") && turnSettled(pane), TIMEOUT);
           await app.session.waitForComposer(TIMEOUT);
           await quitApp(app);
         } else if (exit === "cancelled") {

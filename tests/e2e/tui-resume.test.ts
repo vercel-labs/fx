@@ -405,7 +405,7 @@ test.skipIf(!tmuxAvailable())(
       expect(await active.capturePane()).not.toContain(labels[0]!);
 
       await active.sendText("Continue with the prepared follow-up.");
-      await active.waitForText("AFTER_RESUME_INTERACTION", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("AFTER_RESUME_INTERACTION") && turnSettled(pane), TIMEOUT);
       await active.waitForStableComposer(TIMEOUT);
       expectPublishedRows(await active.captureFullScrollbackEscapes());
       await waitForPersistedSessionMarker(home, "AFTER_RESUME_INTERACTION");
@@ -9118,7 +9118,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["0f"]);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Continue after the compacted resume.");
-      await active.waitForText("AFTER_COMPACTED_RESUME_OK", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("AFTER_COMPACTED_RESUME_OK") && turnSettled(pane), TIMEOUT);
       const resumed = gateway.requests.at(-1)!.body;
       expect(resumed).toContain("<compacted_conversation>");
       expect(resumed).toContain(JSON.stringify(`User 1:\n${earlierRequest}\n`).slice(1, -1));
@@ -9338,7 +9338,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     await other.waitForText("REMEMBERED_B_HISTORY", TIMEOUT);
     await other.waitForStableComposer(TIMEOUT);
     await active.sendText("Continue the older active conversation without tools.");
-    await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("LATER_A_ACTIVITY") && turnSettled(pane), TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
     await close(other); other = null;

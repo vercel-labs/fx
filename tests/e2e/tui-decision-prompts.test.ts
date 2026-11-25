@@ -28,6 +28,7 @@ import {
   TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
 
@@ -1147,7 +1148,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await expectQuestionSelection(ctx.session, 1, "Inspect repo state");
 
       await resolveQuestionWithSecondOption(ctx.session);
-      const finalPane = await ctx.session.waitForText("Valid question continued.", TIMEOUT);
+      const finalPane = await ctx.session.waitForPane((pane) => pane.includes("Valid question continued.") && turnSettled(pane), TIMEOUT);
       expect(finalPane).toContain(VALID_QUESTION_PREAMBLE);
       expect(finalPane).not.toContain("SyntaxError");
       expect(finalPane).not.toContain("Request failed");
@@ -1183,7 +1184,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
 
       await ctx.session.sendText("Run the malformed question fixture.");
-      const pane = await ctx.session.waitForText("Malformed question recovered.", TIMEOUT);
+      const pane = await ctx.session.waitForPane((pane) => pane.includes("Malformed question recovered.") && turnSettled(pane), TIMEOUT);
       expect(pane).toContain("I need one detail before continuing.");
       expect(pane).not.toContain(QUESTION_PROMPT);
       expect(pane).not.toContain(APPROVAL_PROMPT);
