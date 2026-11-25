@@ -8,6 +8,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -197,6 +198,13 @@ pub const RefreshedGatewayCredential = struct {
     gateway_team_label: ?[]u8 = null,
 };
 
+/// The provider and model an agent uses now, for a request that continues
+/// after the person picked another model for it.
+pub const CurrentSelection = struct {
+    provider: model_provider.ProviderId,
+    model: []const u8,
+};
+
 pub const AgentRuntimeDeps = struct {
     /// The steps of `start_workspace_capture`.
     pub const WorkspaceCaptureStep = enum { begin, capture, settle };
@@ -353,6 +361,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// The model the agent uses now, for a request that continues after the
+    /// person picked another model for it while it waited. Null: the host
+    /// keeps the job's model.
+    current_selection: ?*const fn (ctx: *anyopaque) ?CurrentSelection = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// The failure that keeps the model catalog down, so capability drops are

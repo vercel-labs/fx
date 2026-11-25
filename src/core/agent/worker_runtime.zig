@@ -1210,6 +1210,21 @@ pub const WorkerRuntime = struct {
         return self.worker_events.items.len > 0;
     }
 
+    /// True when the picker this agent's wait opened still waits for the main
+    /// loop to open it. Safe from any thread. A view does not lend a card in
+    /// the pass before that picker, so the card never flashes under it.
+    pub fn hasPendingModelPicker(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        for (self.worker_events.items) |event| {
+            switch (event) {
+                .open_model_picker => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     pub fn takeEvents(self: *WorkerRuntime) std.ArrayList(WorkerEvent) {
         return self.takeEventBatch().events;
     }

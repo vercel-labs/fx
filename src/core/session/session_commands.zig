@@ -875,17 +875,30 @@ pub fn Commands(comptime App: type) type {
             try applyFastMode(app, agent, !app.fast_mode, announce, true);
         }
 
-        fn applyFastMode(app: *App, agent: *AppAgent, enabled: bool, announce: bool, persist: bool) !void {
-            const previous = app.fast_mode;
-            const previous_ultrafast = agent.worker.agent_turn_settings.ultrafast_mode;
+        /// `agent`'s fast mode: the app's for the agent in context, else the
+        /// mode its slot keeps while it is hidden. The setter follows the
+        /// same split, so a subagent's change never moves the screen's mode.
+        fn fastModeOf(app: *App, agent: *const AppAgent) bool {
+            if (comptime @hasDecl(App, "fastModeOf")) return app.fastModeOf(agent);
+            return app.fast_mode;
+        }
+
+        fn setFastMode(app: *App, agent: *AppAgent, enabled: bool) void {
+            if (comptime @hasDecl(App, "setFastModeFor")) return app.setFastModeFor(agent, enabled);
             app.fast_mode = enabled;
+        }
+
+        fn applyFastMode(app: *App, agent: *AppAgent, enabled: bool, announce: bool, persist: bool) !void {
+            const previous = fastModeOf(app, agent);
+            const previous_ultrafast = agent.worker.agent_turn_settings.ultrafast_mode;
+            setFastMode(app, agent, enabled);
             if (enabled) {
                 agent.worker.agent_turn_settings.ultrafast_mode = false;
                 if (comptime agents.hasAgentField(App, "session_persistence")) {
                     agent.session_persistence.process_ultrafast_override = false;
                 }
             }
-            agent.worker.syncQueuedPromptFastMode(app.fast_mode);
+            agent.worker.syncQueuedPromptFastMode(fastModeOf(app, agent));
             if (previous_ultrafast != agent.worker.agent_turn_settings.ultrafast_mode) {
                 agent.worker.syncQueuedPromptUltrafastMode(agent.worker.agent_turn_settings.ultrafast_mode);
             }
@@ -894,7 +907,7 @@ pub fn Commands(comptime App: type) type {
                 "fast mode changed old={s} new={s} ultrafast_old={s} ultrafast_new={s} model={s} supports_fast={s}",
                 .{
                     if (previous) "true" else "false",
-                    if (app.fast_mode) "true" else "false",
+                    if (fastModeOf(app, agent)) "true" else "false",
                     if (previous_ultrafast) "true" else "false",
                     if (agent.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
                     provider_runtime.modelOf(app, agent),
@@ -909,7 +922,7 @@ pub fn Commands(comptime App: type) type {
                     .{
                         .provider = provider_runtime.providerOf(app, agent),
                         .model = provider_runtime.modelOf(app, agent),
-                        .fast_mode = app.fast_mode,
+                        .fast_mode = fastModeOf(app, agent),
                         .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
                     },
                     "fast",
@@ -918,10 +931,10 @@ pub fn Commands(comptime App: type) type {
             }
 
             if (announce) {
-                const label = if (app.fast_mode) "on" else "off";
+                const label = if (fastModeOf(app, agent)) "on" else "off";
                 try app.writeDomainNotice(.{ .topic = "fast", .tone = .neutral, .body = label }, true);
                 const model = provider_runtime.modelOf(app, agent);
-                if (app.fast_mode and isGatewayTokenPassModel(app, agent, model) and tokenPassModelRunsFast(app, agent, model)) {
+                if (fastModeOf(app, agent) and isGatewayTokenPassModel(app, agent, model) and tokenPassModelRunsFast(app, agent, model)) {
                     try warnTokenPassFast(app);
                 }
                 if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
@@ -944,14 +957,14 @@ pub fn Commands(comptime App: type) type {
             }
 
             const previous_ultrafast = agent.worker.agent_turn_settings.ultrafast_mode;
-            const previous_fast = app.fast_mode;
+            const previous_fast = fastModeOf(app, agent);
             agent.worker.agent_turn_settings.ultrafast_mode = enabled;
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 agent.session_persistence.process_ultrafast_override = enabled;
             }
-            if (enabled) app.fast_mode = false;
+            if (enabled) setFastMode(app, agent, false);
             agent.worker.syncQueuedPromptUltrafastMode(agent.worker.agent_turn_settings.ultrafast_mode);
-            if (previous_fast != app.fast_mode) agent.worker.syncQueuedPromptFastMode(app.fast_mode);
+            if (previous_fast != fastModeOf(app, agent)) agent.worker.syncQueuedPromptFastMode(fastModeOf(app, agent));
             debug_trace.logf(
                 "session",
                 "ultrafast mode changed old={s} new={s} fast_old={s} fast_new={s} model={s} supports_ultrafast={s}",
@@ -959,7 +972,7 @@ pub fn Commands(comptime App: type) type {
                     if (previous_ultrafast) "true" else "false",
                     if (agent.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
                     if (previous_fast) "true" else "false",
-                    if (app.fast_mode) "true" else "false",
+                    if (fastModeOf(app, agent)) "true" else "false",
                     provider_runtime.modelOf(app, agent),
                     if (capabilities.supports_ultrafast_mode) "true" else "false",
                 },
@@ -972,7 +985,7 @@ pub fn Commands(comptime App: type) type {
                     .{
                         .provider = provider_runtime.providerOf(app, agent),
                         .model = provider_runtime.modelOf(app, agent),
-                        .fast_mode = app.fast_mode,
+                        .fast_mode = fastModeOf(app, agent),
                         .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
                     },
                     "ultrafast",
@@ -1122,29 +1135,50 @@ pub fn Commands(comptime App: type) type {
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
-            try setResolvedModelRuntime(app, agent, model);
+            // The picker's choice belongs to the agent it was opened for: a
+            // view changes a subagent's model without touching the screen's.
+            const target = modelChoiceTarget(app) orelse agent;
+            try setResolvedModelRuntime(app, target, model);
             settleStartModel(app);
             var patch = app_session_runtime.SessionPreferencePatch{
-                .provider = provider_runtime.providerOf(app, agent),
+                .provider = provider_runtime.providerOf(app, target),
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len > 0) {
-                try applyEffort(app, agent, effort, .none, false);
+                try applyEffort(app, target, effort, .none, false);
                 patch.effort = effort;
             }
             const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
             const selected_fast_mode = capabilities.supports_fast_mode and fast_mode and !selected_ultrafast_mode;
-            if (selected_fast_mode != app.fast_mode) {
-                try applyFastMode(app, agent, selected_fast_mode, false, false);
+            if (selected_fast_mode != fastModeOf(app, target)) {
+                try applyFastMode(app, target, selected_fast_mode, false, false);
             }
-            if (selected_ultrafast_mode != agent.worker.agent_turn_settings.ultrafast_mode) {
-                try applyUltrafastMode(app, agent, selected_ultrafast_mode, false, false);
+            if (selected_ultrafast_mode != target.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, target, selected_ultrafast_mode, false, false);
             }
-            patch.fast_mode = app.fast_mode;
-            patch.ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode;
-            try announceModelSelection(app, agent);
-            try persistPreferenceTargets(app, agent, patch, "model picker", false);
+            patch.fast_mode = fastModeOf(app, target);
+            patch.ultrafast_mode = target.worker.agent_turn_settings.ultrafast_mode;
+            try announceModelSelection(app, target);
+            try persistPreferenceTargets(app, target, patch, "model picker", false);
+            // A view that changed a waiting subagent's model continues that
+            // subagent's request with it, as its picker would on its own
+            // screen (`tests/tla/subagent/ViewWaits.tla` ActionReachesOwner).
+            if (target != agents.screenAgentOf(app)) target.worker.requestRecoveryContinue();
+            clearModelChoiceTarget(app);
+        }
+
+        /// The agent the picker changes: the one a view opened it for, while
+        /// that picker is open.
+        fn modelChoiceTarget(app: *App) ?*AppAgent {
+            if (comptime !@hasField(App, "model_choice_target")) return null;
+            return app.model_choice_target;
+        }
+
+        /// The choice is applied, so the next picker starts from the agent on
+        /// screen again.
+        fn clearModelChoiceTarget(app: *App) void {
+            if (comptime @hasField(App, "model_choice_target")) app.model_choice_target = null;
         }
 
         fn permissionWorkspaceRoot(
@@ -1494,7 +1528,7 @@ pub fn Commands(comptime App: type) type {
 
         fn setResolvedModelRuntime(app: *App, agent: *AppAgent, resolved: []const u8) !void {
             if (!std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved)) {
-                try provider_runtime.replaceModel(app, resolved);
+                try provider_runtime.replaceModelFor(app, agent, resolved);
             }
             const selected = provider_runtime.modelOf(app, agent);
             try agent.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
@@ -1516,17 +1550,39 @@ pub fn Commands(comptime App: type) type {
             if (app.fast_mode != fast_mode) try applyFastMode(app, agent, fast_mode, false, false);
         }
 
-        fn announceModelSelection(app: *App, agent: *AppAgent) !void {
-            const selected = provider_runtime.modelOf(app, agent);
-            const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
-            const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
+        /// The line a model change writes: the view's own for the agent on
+        /// screen, and the subagent's name for a change a view made for a
+        /// subagent, since that choice never reaches the agent on screen.
+        /// Caller owns the returned text.
+        fn modelChangeLine(app: *App, agent: *AppAgent, selected: []const u8) ![]u8 {
             const speed: []const u8 = if (agent.worker.agent_turn_settings.ultrafast_mode)
                 "ultrafast"
-            else if (app.fast_mode or model_capabilities.resolveForApp(App, app, selected).intrinsic_fast)
+            else if (fastModeOf(app, agent) or model_capabilities.resolveForApp(App, app, selected).intrinsic_fast)
                 "fast"
             else
                 "normal";
-            const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, agent.effort.displayLabel(), speed });
+            if (agent != agents.screenAgentOf(app)) {
+                return app.alloc.print("{s} continues with {s} (effort: {s}, speed: {s})", .{
+                    subagentNameOf(app, agent),
+                    selected,
+                    agent.effort.displayLabel(),
+                    speed,
+                });
+            }
+            const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
+            const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
+            return app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, agent.effort.displayLabel(), speed });
+        }
+
+        /// The view's name for `agent`, when the app names its subagents.
+        fn subagentNameOf(app: *App, agent: *AppAgent) []const u8 {
+            if (comptime @hasDecl(App, "agentNameOf")) return app.agentNameOf(agent);
+            return "";
+        }
+
+        fn announceModelSelection(app: *App, agent: *AppAgent) !void {
+            const selected = provider_runtime.modelOf(app, agent);
+            const line = try modelChangeLine(app, agent, selected);
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
             try announceTokenPass(app, agent, selected);
@@ -3831,4 +3887,64 @@ test "session_commands startsWithWord matches word boundary" {
     try std.testing.expect(!startsWithWord("ad", "add"));
     try std.testing.expect(startsWithWord("add", "add"));
     try std.testing.expect(startsWithWord("Add bash", "add"));
+}
+
+/// Just what the picker's target needs: the screen's agent and the agent a
+/// view opened the picker for.
+const ModelTargetFakeApp = struct {
+    main_agent: agents.Agent = .{},
+    model_choice_target: ?*agents.Agent = null,
+};
+
+test "wait card: the picker's target holds while it is open, and the choice clears it" {
+    var app = ModelTargetFakeApp{};
+    var child: agents.Agent = .{};
+    try std.testing.expect(Commands(ModelTargetFakeApp).modelChoiceTarget(&app) == null);
+    app.model_choice_target = &child;
+    // The picker stays open after its first stage, so its target stays with
+    // it: the card waits behind the picker for as long as it shows.
+    try std.testing.expect(Commands(ModelTargetFakeApp).modelChoiceTarget(&app).? == &child);
+    try std.testing.expect(app.model_choice_target == &child);
+    Commands(ModelTargetFakeApp).clearModelChoiceTarget(&app);
+    try std.testing.expect(Commands(ModelTargetFakeApp).modelChoiceTarget(&app) == null);
+}
+
+/// Just what a model change's line needs: the agent on screen, a subagent
+/// whose own speed differs from the screen's, and the app's name for it.
+const ModelNoticeFakeApp = struct {
+    alloc: std.mem.Allocator,
+    main_agent: agents.Agent = .{},
+    child_agent: agents.Agent = .{},
+    fast_mode: bool = false,
+    child_fast: bool = true,
+
+    pub fn agent(self: *ModelNoticeFakeApp) *agents.Agent {
+        return &self.main_agent;
+    }
+
+    pub fn fastModeOf(self: *ModelNoticeFakeApp, who: *const agents.Agent) bool {
+        return if (who == &self.main_agent) self.fast_mode else self.child_fast;
+    }
+
+    pub fn agentNameOf(self: *ModelNoticeFakeApp, who: *const agents.Agent) []const u8 {
+        return if (who == &self.main_agent) "main" else "payer";
+    }
+};
+
+test "wait card: a model change for a subagent is told in its name and its own speed" {
+    const alloc = std.testing.allocator;
+    var app = ModelNoticeFakeApp{ .alloc = alloc };
+    const model = "openai/gpt-5-mini";
+
+    // The subagent's choice is not the screen's: the line names it, and the
+    // speed is the subagent's, not the screen's.
+    const line = try Commands(ModelNoticeFakeApp).modelChangeLine(&app, &app.child_agent, model);
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("payer continues with openai/gpt-5-mini (effort: default, speed: fast)", line);
+
+    // The screen's own notice keeps its wording and its speed.
+    app.fast_mode = true;
+    const screen_line = try Commands(ModelNoticeFakeApp).modelChangeLine(&app, &app.main_agent, model);
+    defer alloc.free(screen_line);
+    try std.testing.expectEqualStrings("Switched to openai/gpt-5-mini (effort: default, speed: fast)", screen_line);
 }

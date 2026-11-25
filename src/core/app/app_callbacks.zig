@@ -389,6 +389,7 @@ pub fn Bindings(comptime App: type) type {
                     agentAskOutOfCredits
                 else
                     null,
+                .current_selection = if (comptime provider_runtime.supported(App)) agentCurrentSelection else null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
                 .model_catalog_failure = agentModelCatalogFailure,
@@ -971,6 +972,18 @@ pub fn Bindings(comptime App: type) type {
                 return app.providerSet().select(provider_runtime.providerOf(app, agent)).fallbackModelCapabilities(model);
             }
             return model_capabilities.capabilitiesForModel(model);
+        }
+
+        /// The model a continuing request uses: the agent's own choice, which
+        /// a view may have changed with the card's Change model or the
+        /// picker (`tests/tla/subagent/ViewWaits.tla` ActionReachesOwner).
+        fn agentCurrentSelection(ctx: *anyopaque) ?agent_runtime.CurrentSelection {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            return .{
+                .provider = provider_runtime.providerOf(app, agent),
+                .model = provider_runtime.modelOf(app, agent),
+            };
         }
 
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -1645,6 +1658,13 @@ pub fn Bindings(comptime App: type) type {
                 const InputRuntime = @TypeOf(app.input_runtime);
                 if (comptime @hasField(InputRuntime, "model_picker_draft")) {
                     if (app.input_runtime.model_picker_draft != null) return;
+                }
+                // A picker this agent's own worker opened changes that agent's
+                // model, so the choice reaches the subagent that waits, not
+                // the one on screen (`tests/tla/subagent/ViewWaits.tla`
+                // ActionReachesOwner).
+                if (comptime @hasField(App, "model_choice_target")) {
+                    if (agent.role == .subagent) app.model_choice_target = agent;
                 }
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
             }

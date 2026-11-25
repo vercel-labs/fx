@@ -3142,12 +3142,21 @@ pub const Runtime = struct {
         const sink = self.report_sink orelse return debug_trace.logf("mailbox", "waiting note dropped child={s} reason=no_parent", .{child_id});
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const text = (if (resend)
-            arena.allocator().print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason})
-        else
-            arena.allocator().print("fx: my last request failed and waits for the user ({s}). Only the user can continue it, on my screen, so tell them.", .{reason})) catch return;
+        const text = waitingNoteText(arena.allocator(), reason, resend) catch return;
         sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
             debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+    }
+
+    /// Tells the owner that child `child_id` needs the person for `reason`,
+    /// such as an MCP server asking for input. `reason` is a fixed sentence
+    /// for the kind, never an item's text, a field value or a URL (R4.8).
+    pub fn noteChildNeedsUser(self: *Runtime, child_id: []const u8, name: []const u8, reason: []const u8) void {
+        const sink = self.report_sink orelse return debug_trace.logf("mailbox", "needs_user note dropped child={s} reason=no_parent", .{child_id});
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const text = needsUserNoteText(arena.allocator(), reason) catch return;
+        sink.post(self, .{ .message = .{ .to = .owner, .agent = name, .child_id = child_id, .text = text } }) catch |err|
+            debug_trace.logf("mailbox", "needs_user note lost child={s} err={s}", .{ child_id, @errorName(err) });
     }
 
     /// The person answered `child_id`'s request on its own screen, so its
@@ -12249,4 +12258,47 @@ test "a stop or close with nothing waiting refuses nothing" {
     // The close's own result is not what this test reads.
     _ = try t.runtime.closeChild("child-1", .parent);
     try std.testing.expect(t.worker.decision == null);
+}
+
+/// The note that tells a parent its subagent waits for the person, for the
+/// fixed `reason` of the kind. It carries no question, field value or URL.
+pub fn waitingNoteText(alloc: Allocator, reason: []const u8, resend: bool) ![]u8 {
+    if (resend) {
+        return alloc.print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again.", .{reason});
+    }
+    return alloc.print("fx: my last request failed and waits for the user ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+}
+
+/// The note for an item that needs the person without a failed request, such
+/// as an MCP server's question. `reason` names the kind only.
+pub fn needsUserNoteText(alloc: Allocator, reason: []const u8) ![]u8 {
+    return alloc.print("fx: I wait for you ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+}
+
+test "wait card: the note to main names the reason and nothing else" {
+    const alloc = std.testing.allocator;
+    const notes = [_][]const u8{ "Out of credits", "an MCP server asks for input", "an MCP server asks to sign in" };
+    for (notes) |reason| {
+        const user = try waitingNoteText(alloc, reason, false);
+        defer alloc.free(user);
+        const expected = try alloc.print("fx: my last request failed and waits for the user ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, user);
+        // The view wording replaced "on my screen": the person may be anywhere.
+        try std.testing.expect(std.mem.find(u8, user, "on my screen") == null);
+        const needs = try needsUserNoteText(alloc, reason);
+        defer alloc.free(needs);
+        const expected_needs = try alloc.print("fx: I wait for you ({s}). Only the user can continue it from their view, so tell them.", .{reason});
+        defer alloc.free(expected_needs);
+        try std.testing.expectEqualStrings(expected_needs, needs);
+        // A fixed reason carries no URL, no field name and no value.
+        for ([_][]const u8{ user, needs }) |note| {
+            for ([_][]const u8{ "http", "://", "=", "{\"", "API key" }) |carried| {
+                try std.testing.expect(std.mem.find(u8, note, carried) == null);
+            }
+        }
+    }
+    const resend = try waitingNoteText(alloc, "Out of credits", true);
+    defer alloc.free(resend);
+    try std.testing.expectEqualStrings("fx: my last request failed and waits for a follow-up (Out of credits). A message from you sends it again.", resend);
 }

@@ -9709,6 +9709,35 @@ fn processQueuedPromptLoop(
                             // model.
                             restorePromptAfterTerminalFailure(deps, job, config);
                             try deps.push_event(deps.ctx, .open_model_picker);
+                            // A subagent has no composer to send from again:
+                            // its wait stays open across the picker, and the
+                            // person's choice continues this request with the
+                            // new model, as "retry" does
+                            // (`tests/tla/subagent/ViewWaits.tla`
+                            // ActionReachesOwner). Closing the picker without a
+                            // choice ends the turn as before.
+                            if (config.origin != .root) {
+                                if (try request_recovery.waitForSend() != null) {
+                                    // The person chose this subagent's model in
+                                    // the picker that wait opened, so this
+                                    // request continues on it
+                                    // (`tests/tla/subagent/ViewWaits.tla`
+                                    // ActionReachesOwner).
+                                    if (deps.current_selection) |current| {
+                                        if (current(deps.ctx)) |selection| {
+                                            job.provider = selection.provider;
+                                            job.model = try arena.dupe(u8, selection.model);
+                                            request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
+                                        }
+                                    }
+                                    stream_result.deinit(arena);
+                                    stream_result_set = false;
+                                    http_failure_notice_shown = false;
+                                    recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                                    reset_stream_for_next_attempt = true;
+                                    continue;
+                                }
+                            }
                         },
                         .cancelled => {},
                     }

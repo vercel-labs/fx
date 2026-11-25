@@ -1427,6 +1427,11 @@ pub fn Runtime(comptime App: type) type {
                                 if (comptime @hasDecl(App, "notePromptAsked")) {
                                     if (isSubagent(app, agent)) app.notePromptAsked(agent, .question);
                                 }
+                                // Main hears of a wait it cannot answer, with a
+                                // fixed reason and none of the item's text.
+                                if (comptime @hasDecl(App, "noteChildQuestionPrompt")) {
+                                    if (isSubagent(app, agent)) app.noteChildQuestionPrompt(agent, question_snapshot.source);
+                                }
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(

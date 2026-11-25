@@ -1373,6 +1373,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return buf[idx];
         }
 
+        /// Opens the model picker for `agent`: the choice changes that
+        /// agent's model, not the one on screen (`app.model_choice_target`).
+        pub fn openModelPickerForAgent(app: *App, agent: *AppAgent) !void {
+            if (comptime @hasField(App, "model_choice_target")) app.model_choice_target = agent;
+            try openCurrentModelPicker(app);
+        }
+
         pub fn openCurrentModelPicker(app: *App) !void {
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
             app.input_runtime.picker.model_completion_anchor_current = true;

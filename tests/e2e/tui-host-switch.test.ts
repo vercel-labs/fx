@@ -443,6 +443,9 @@ interface Run {
   launch: (args?: string) => Promise<TmuxSession>;
   /// The first fx's terminal recording, when `withFx` was asked to record.
   tape: string;
+  /// Every request the fake gateway answered, in order, with its headers: the
+  /// model rides `ai-language-model-id`, not the body.
+  requests: Array<{ body: string; headers: Headers }>;
 }
 
 async function withFx(
@@ -452,6 +455,7 @@ async function withFx(
   record = false,
   env: Record<string, string> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
+  launchArgs = "",
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
   const home = createIsolatedTestHome();
@@ -486,7 +490,7 @@ async function withFx(
     return session;
   };
   try {
-    await run(await launch(), { workspace, home, launch, tape });
+    await run(await launch(launchArgs), { workspace, home, launch, tape, requests: gateway.requests });
     return gateway.requests.map((request) => request.body);
   } finally {
     gateway.stop();
@@ -2490,7 +2494,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text(`main_done_${stage}`, "SWITCH_MAIN_DONE");
         }, async (session) => {
           await session.sendText("SWITCH_USER");
-          await session.waitForPane((pane) => pane.includes("signer needs you"), 30_000);
+          // The view shows the card for the sign-in wait, and its footer does
+          // not say the subagent needs the person.
+          const card = await session.waitForPane(
+            (pane) => pane.includes("Sign-in expired") && pane.includes("Sign in") && pane.includes("Open signer's screen"),
+            30_000,
+          );
+          expect(card).not.toContain("signer needs you");
           waitShows.release();
           await until("main's status", () => statuses.length === 1, 60_000);
           await until("main being told", () => told !== "", 60_000);
@@ -2504,7 +2514,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }
       expect(statuses[0]).toContain("signer: working");
       expect(statuses[0]).not.toContain("waiting for");
-      expect(told).toContain("waits for the user (Sign-in expired). Only the user can continue it");
+      expect(told).toContain("waits for the user (Sign-in expired). Only the user can continue it from their view, so tell them.");
     },
     TIMEOUT,
   );
@@ -3229,14 +3239,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("main_done", "ORDER_MAIN_DONE");
         }, async (session) => {
           await session.sendText("SWITCH_USER order them");
-          // Two subagents wait for the user, and the footer counts them.
-          await session.waitForPane((pane) => pane.includes("2 agents require attention \u00b7 main \u2193"), 30_000);
-          await session.sendKeys("Down");
+          // stuck1's card shows, so the footer names only the wait it does not
+          // show, and only stuck2 needs a note.
+          await session.waitForPane((pane) => pane.includes("stuck2 needs you \u00b7 main \u2193"), 30_000);
+          // stuck1's card holds the keys, so Down moves its choice; the list
+          // opens with Ctrl+X, as it does on any screen with a prompt.
+          await session.sendKeys("C-x");
           const list = await session.waitForPane((pane) =>
             subagentRow("idler", "idle").test(pane) && subagentRow("stuck2", "needs you").test(pane), 10_000);
-          // They started idler, busy, stuck1, stuck2; the list puts the two
-          // waiting for the user first, then the working one, then the idle one.
-          expectRowOrder(list, mainRow(), subagentRow("stuck1"), subagentRow("stuck2"), subagentRow("busy"), subagentRow("idler"));
+          // They started idler, busy, stuck1, stuck2; the list puts both waits
+          // first, then the working one, then the idle one, and the shown wait's
+          // row says waiting.
+          expectRowOrder(list, mainRow(), subagentRow("stuck1", "waiting"), subagentRow("stuck2", "needs you"), subagentRow("busy"), subagentRow("idler"));
           // Only busy runs in a profile other than main, and its row names it
           // after its model.
           expect(list).toMatch(/^ {2}\u251c busy {2,}.* {2,}working {2,}\S+ {2,}notes\s*$/m);
@@ -5526,6 +5540,427 @@ describe.skipIf(!tmuxAvailable())("TUI subagent approvals go to main", () => {
         writeSpikeProfile(home, "writer");
         writeSpikeProfile(home, "helper");
       });
+    },
+    TIMEOUT,
+  );
+});
+
+// A subagent's person-only wait, drawn in the view the person is on: S1 to S9
+// of the design. The card names the subagent and the reason, the footer and the
+// list stay quiet about it, its choices reach that subagent, and the subagent's
+// own screen keeps working as today.
+
+// The digit of the row in `pane` that offers `label`, on the card or on the
+// out-of-credits picker: both number their choices.
+function cardDigit(pane: string, label: string): string {
+  const row = pane.split("\n").find((line) => line.includes(label));
+  const digit = row ? /([1-9])/.exec(row) : null;
+  if (!digit) throw new Error(`no choice "${label}" in:\n${pane}`);
+  return digit[1]!;
+}
+
+describe("a subagent's wait shows in the view the person is on", () => {
+  test(
+    "S1: a refused request shows a card named for the subagent, and its cancel ends only that wait",
+    async () => {
+      let childCalls = 0;
+      const childWaits = held();
+      const mainBodies: string[] = [];
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await childWaits.promise;
+            return refused();
+          }
+          mainBodies.push(body);
+          if (!body.includes('"main_s1"')) {
+            return toolCall("main_s1", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S1_CHILD" } });
+          }
+          return text("main_s1_done", "WAIT_S1_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S1_CHILD_TASK");
+          await session.waitForText("WAIT_S1_MAIN_DONE", 30_000);
+          // Main's own draft is the state the cancel must leave alone.
+          await session.sendLiteral("SWITCH_USER WAIT_S1_DRAFT");
+          await session.waitForPane((pane) => composerContains(pane, "WAIT_S1_DRAFT"), 10_000);
+          childWaits.release();
+          const card = await session.waitForPane(
+            (pane) => pane.includes("reviewer: The provider rejected this request") && pane.includes("Open reviewer's screen") && pane.includes("Stop reviewer"),
+            30_000,
+          );
+          expect(card).not.toContain("reviewer needs you");
+          // The list's row says waiting, not needs you.
+          await session.sendKeys("C-x");
+          const list = await session.waitForPane((pane) => subagentRow("reviewer", "waiting").test(pane), 10_000);
+          expect(list).not.toContain("reviewer needs you");
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+          // Esc on the card ends that subagent's wait, and nothing of main's.
+          await session.sendKeys("Escape");
+          const after = await session.waitForPane((pane) => !pane.includes("Open reviewer's screen"), 15_000);
+          expect(composerContains(after, "WAIT_S1_DRAFT")).toBe(true);
+          expect(childCalls).toBe(1);
+          // Main may answer the subagent's turn ending; it never sends the draft.
+          expect(mainBodies.some((body) => latestUserText(body).includes("WAIT_S1_DRAFT"))).toBe(false);
+        },
+      );
+      expect(childCalls).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S2: the out-of-credits picker changes the subagent's model, and main's stays",
+    async () => {
+      const secondModel = "openai/gpt-5-mini";
+      let childCalls = 0;
+      let childModel = "";
+      let mainModel = "";
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            if (childCalls === 1) return outOfCredits();
+            return text("child_again", "WAIT_S2_CHILD_DONE");
+          }
+          if (!body.includes('"main_s2"')) {
+            return toolCall("main_s2", "subagent", { request: { action: "message", agent: "payer", message: "WAIT_S2_CHILD" } });
+          }
+          return text("main_s2_done", "WAIT_S2_MAIN_DONE");
+        },
+        async (session, context) => {
+          await session.sendText("SWITCH_USER WAIT_S2_TASK");
+          // A quota wait also opens its picker, and a wait with a prompt shows
+          // as the prompt: the same choices its own screen offers.
+          const picker = await session.waitForPane(
+            (pane) => pane.includes("payer: Out of credits") || (pane.includes("Out of credits. What should fx do?") && pane.includes("Switch to another model")),
+            30_000,
+          );
+          expect(picker).not.toContain("payer needs you");
+          const option = picker.includes("Switch to another model")
+            ? cardDigit(picker, "Switch to another model")
+            : cardDigit(picker, "Change model");
+          await session.sendKeys(option);
+          await session.waitForPane((pane) => pane.includes("/model"), 15_000);
+          // The picker lists the catalog: the first entry is main's model, the
+          // second the one this subagent takes.
+          await session.sendKeys("Down");
+          await session.sendKeys("Enter");
+          await session.waitForPane(
+            (pane) => pane.includes(`payer continues with ${secondModel} (effort: default, speed: normal)`),
+            25_000,
+          );
+          // The wait resumes with the new model, as a new request.
+          const childRequests = () => context.requests.filter((request) => request.body.includes("WAIT_S2_CHILD") && !isMainRequest(request.body));
+          await until("the subagent's next request", () => childRequests().length >= 2, 30_000);
+          // The request model rides a header, not the body.
+          const childRequest = childRequests().at(-1);
+          childModel = childRequest?.headers.get("ai-language-model-id") ?? "";
+          expect(childModel).toBe(secondModel);
+          // Main's own next turn keeps main's model. The gateway in this test
+          // answers every later main turn with WAIT_S2_MAIN_DONE, so wait on
+          // the request itself rather than a text only its first turn sends.
+          const mainRequests = () => context.requests.filter((request) => isMainRequest(request.body));
+          const mainBefore = mainRequests().length;
+          await session.sendText("SWITCH_USER WAIT_S2_AFTER");
+          await until("main's next request", () => mainRequests().length > mainBefore, 30_000);
+          const mainRequest = mainRequests().at(-1);
+          mainModel = mainRequest?.headers.get("ai-language-model-id") ?? "";
+          expect(mainModel).toBe(FAKE_GATEWAY_MODEL);
+        },
+        undefined,
+        false,
+        {},
+        {
+          models: [
+            { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+            { id: secondModel, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+      expect(childModel).toBe(secondModel);
+      expect(mainModel).toBe(FAKE_GATEWAY_MODEL);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S3: a sign-in card signs in for that subagent, and main's composer is not submitted",
+    async () => {
+      const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
+      let mainSubmits = 0;
+      const childWaits = held();
+      try {
+        await withFx(
+          async (body) => {
+            if (!isMainRequest(body)) {
+              await childWaits.promise;
+              return unauthorized();
+            }
+            if (latestUserText(body).includes("WAIT_S3_DRAFT")) mainSubmits += 1;
+            if (!body.includes('"main_s3"')) {
+              return toolCall("main_s3", "subagent", { request: { action: "message", agent: "signer", message: "WAIT_S3_CHILD" } });
+            }
+            return text("main_s3_done", "WAIT_S3_MAIN_DONE");
+          },
+          async (session) => {
+            await session.sendText("SWITCH_USER WAIT_S3_TASK");
+            await session.waitForText("WAIT_S3_MAIN_DONE", 30_000);
+            // The draft is in the composer before the card takes the keys.
+            await session.sendLiteral("WAIT_S3_DRAFT");
+            await session.waitForPane((pane) => composerContains(pane, "WAIT_S3_DRAFT"), 10_000);
+            childWaits.release();
+            const card = await session.waitForPane(
+              (pane) => pane.includes("signer: Sign-in expired") && pane.includes("Sign in") && pane.includes("Open signer's screen"),
+              30_000,
+            );
+            expect(card).not.toContain("signer needs you");
+            await session.sendKeys(cardDigit(card, "Sign in"));
+            // The sign-in starts for the subagent and never submits main's
+            // draft. The sign-in picker may take the composer's line; what it
+            // must not do is send it.
+            await Bun.sleep(2000);
+            expect(mainSubmits).toBe(0);
+          },
+          (home) => writeFxLogin(home, issuer.issuerUrl, "seeded-token"),
+          false,
+          {
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+            AI_GATEWAY_API_KEY: undefined as unknown as string,
+          },
+        );
+      } finally {
+        issuer.stop();
+      }
+      expect(mainSubmits).toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S4: two waits show one at a time, the older first",
+    async () => {
+      const laterWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((message) => message.includes("WAIT_S4_LATER"))) {
+              await laterWaits.promise;
+              return refused();
+            }
+            return refused();
+          }
+          if (!body.includes('"main_a"')) {
+            return toolCall("main_a", "subagent", { request: { action: "message", agent: "asker", message: "WAIT_S4_FIRST" } });
+          }
+          if (!body.includes('"main_b"')) {
+            return toolCall("main_b", "subagent", { request: { action: "message", agent: "later", message: "WAIT_S4_LATER" } });
+          }
+          return text("main_s4_done", "WAIT_S4_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S4_TASK");
+          const first = await session.waitForPane((pane) => pane.includes("asker: The provider rejected this request"), 30_000);
+          expect(first).not.toContain("later: The provider rejected this request");
+          laterWaits.release();
+          await session.sendKeys("Escape");
+          const second = await session.waitForPane((pane) => pane.includes("later: The provider rejected this request"), 30_000);
+          expect(second).not.toContain("asker: The provider rejected this request");
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S5: stopping the subagent takes its card away and leaves fx up",
+    async () => {
+      const childWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            await childWaits.promise;
+            return refused();
+          }
+          if (!body.includes('"main_s5"')) {
+            return toolCall("main_s5", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S5_CHILD" } });
+          }
+          return text("main_s5_done", "WAIT_S5_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S5_TASK");
+          childWaits.release();
+          const card = await session.waitForPane((pane) => pane.includes("reviewer: The provider rejected this request"), 30_000);
+          await session.sendKeys(cardDigit(card, "Stop reviewer"));
+          const after = await session.waitForPane(
+            (pane) => !pane.includes("reviewer: The provider rejected this request") && !pane.includes("Open reviewer's screen"),
+            20_000,
+          );
+          expect(after).not.toContain("API request failed");
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => pane.length > 0, 5_000);
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S6: the full transcript hides the card, and the card returns when it closes",
+    async () => {
+      const childWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            await childWaits.promise;
+            return refused();
+          }
+          if (!body.includes('"main_s6"')) {
+            return toolCall("main_s6", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S6_CHILD" } });
+          }
+          return text("main_s6_done", "WAIT_S6_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S6_TASK");
+          childWaits.release();
+          await session.waitForPane((pane) => pane.includes("reviewer: The provider rejected this request"), 30_000);
+          await session.sendKeys("C-o");
+          await session.waitForPane((pane) => !pane.includes("Open reviewer's screen") && !pane.includes("Stop reviewer"), 15_000);
+          await session.sendKeys("C-o");
+          await session.waitForPane((pane) => pane.includes("Open reviewer's screen"), 15_000);
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S7: an instance's wait shows in that instance's view only",
+    async () => {
+      const childWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            await childWaits.promise;
+            return refused();
+          }
+          if (!body.includes('"main_s7"')) {
+            return toolCall("main_s7", "subagent", { request: { action: "message", agent: "worker", message: "WAIT_S7_CHILD" } });
+          }
+          return text("main_s7_done", "WAIT_S7_MAIN_DONE");
+        },
+        async (session) => {
+          // The second instance starts the subagent, so the wait is fx 2's.
+          await session.sendKeys("C-x");
+          await session.waitForText(LIST_HINT, 10_000);
+          await session.sendKeys("Down");
+          await session.sendKeys("Enter");
+          await session.sendText("SWITCH_USER WAIT_S7_TASK");
+          await session.waitForText("WAIT_S7_MAIN_DONE", 30_000);
+          childWaits.release();
+          // Back on fx 1: nothing of that wait shows there.
+          await session.sendKeys("C-x");
+          await session.waitForText(LIST_HINT, 10_000);
+          await session.sendKeys("Up");
+          await session.sendKeys("Enter");
+          const first = await session.capturePane();
+          expect(first).not.toContain("worker: The provider rejected this request");
+          // And fx 2 shows its card.
+          await session.sendKeys("C-x");
+          await session.waitForText(LIST_HINT, 10_000);
+          await session.sendKeys("Down");
+          await session.sendKeys("Enter");
+          await session.waitForPane((pane) => pane.includes("worker: The provider rejected this request"), 30_000);
+        },
+        undefined,
+        false,
+        {},
+        undefined,
+        "--instances 2",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S8: the subagent's own screen shows its status and no card, and Enter sends its request again",
+    async () => {
+      let childCalls = 0;
+      const childWaits = held();
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            if (childCalls === 1) {
+              await childWaits.promise;
+              return refused();
+            }
+            return text("child_again", "WAIT_S8_CHILD_DONE");
+          }
+          if (!body.includes('"main_s8"')) {
+            return toolCall("main_s8", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S8_CHILD" } });
+          }
+          return text("main_s8_done", "WAIT_S8_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S8_TASK");
+          childWaits.release();
+          await session.waitForPane((pane) => pane.includes("reviewer: The provider rejected this request"), 30_000);
+          await showAgent(session, "reviewer");
+          const own = await session.capturePane();
+          expect(own).not.toContain("Open reviewer's screen");
+          expect(own).toContain("The provider rejected this request");
+          await session.sendKeys("Enter");
+          await session.waitForText("WAIT_S8_CHILD_DONE", 30_000);
+          expect(childCalls).toBe(2);
+        },
+      );
+      expect(childCalls).toBe(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "S9: the card's digit answers it, and the Enter beside it does not submit main's draft",
+    async () => {
+      let childCalls = 0;
+      const childWaits = held();
+      let draftSubmits = 0;
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            if (childCalls === 1) {
+              await childWaits.promise;
+              return refused();
+            }
+            return text("child_again", "WAIT_S9_CHILD_DONE");
+          }
+          if (latestUserText(body).includes("WAIT_S9_DRAFT")) draftSubmits += 1;
+          if (!body.includes('"main_s9"')) {
+            return toolCall("main_s9", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S9_CHILD" } });
+          }
+          return text("main_s9_done", "WAIT_S9_MAIN_DONE");
+        },
+        async (session) => {
+          await session.sendText("SWITCH_USER WAIT_S9_TASK");
+          await session.waitForText("WAIT_S9_MAIN_DONE", 30_000);
+          await session.sendLiteral("SWITCH_USER WAIT_S9_DRAFT");
+          await session.waitForPane((pane) => composerContains(pane, "WAIT_S9_DRAFT"), 10_000);
+          childWaits.release();
+          const card = await session.waitForPane((pane) => pane.includes("reviewer: The provider rejected this request"), 30_000);
+          await session.sendKeys(cardDigit(card, "Retry"));
+          // The Enter beside that digit, as a person may press: no main request.
+          await session.sendKeys("Enter");
+          await Bun.sleep(2000);
+          expect(draftSubmits).toBe(0);
+          expect(composerContains(await session.capturePane(), "WAIT_S9_DRAFT")).toBe(true);
+        },
+      );
+      expect(draftSubmits).toBe(0);
     },
     TIMEOUT,
   );
