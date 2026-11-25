@@ -11292,8 +11292,9 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         empty_reply_nudged = false;
         if (step_has_content) {
+            // The model's own call, so a toolbox question keeps the break that ends the prose in `fx ask`.
             const first_tool_is_ask = effective_tool_calls.len > 0 and
-                runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
+                tool_dispatch.toolActivityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
             if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
