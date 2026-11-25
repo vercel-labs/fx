@@ -402,7 +402,7 @@ test.skipIf(!tmuxAvailable())(
 
     // The turn ends with the command still running.
     releaseFinal();
-    await session.waitForText("CHECK_VERB_DONE", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("CHECK_VERB_DONE") && turnSettled(pane), TIMEOUT);
     await session.waitForText("● Waited for python3 · 2 calls", TIMEOUT);
     await session.sendText("/quit");
     await session.waitForText("CHECK_SHELL>", TIMEOUT);
@@ -651,7 +651,7 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForPane((pane) => pane.includes("FIRST_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
     await active.sendText("Run the second captured command.");
     await active.sendKeys("Enter");
-    await active.waitForText("SECOND_REUSED_CALL_DONE", TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("SECOND_REUSED_CALL_DONE") && turnSettled(pane), TIMEOUT);
 
     const firstSessionId = findSessionId(JSON.parse(gateway.requests[1]!.body));
     const secondSessionId = findSessionId(JSON.parse(gateway.requests[3]!.body));
@@ -1294,7 +1294,7 @@ test.skipIf(!tmuxAvailable())(
 
     const first = await launch(fixture, gateway);
     await first.sendText("Start the managed TTY.");
-    await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
+    await first.waitForPane((pane) => pane.includes("SHELL_TTY_RESUME_STARTED") && turnSettled(pane), TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const shellPid = await waitForRecordedPid(fixture.home, sessionId);
     expect(processAlive(shellPid)).toBe(true);
