@@ -1012,6 +1012,8 @@ pub fn emptyManifest() Manifest {
     };
 }
 
+/// Parses the manifest text. `bytes` must outlive the returned manifest: a record path with no escape
+/// sequence points into `bytes` (V5).
 fn parseManifest(arena: Allocator, bytes: []const u8) reply.ParseError!Manifest {
     if (bytes.len > max_manifest_bytes) return error.BadReply;
     var scanner = std.json.Scanner.initCompleteInput(arena, bytes);
