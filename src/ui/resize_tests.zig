@@ -10644,7 +10644,7 @@ test "a picker close past a tool finality floor keeps all rows visible during pr
 
 test "tall recovering resumed transcript renders a committed notice appended after the first frame" {
     const alloc = std.testing.allocator;
-    const notice_body = "1 prompt you sent before fx stopped was not delivered. It is back in the input box.";
+    const notice_body = "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
     for ([_]u16{ 40, 80, 120 }) |cols| {
         var h = try Harness.init(alloc, cols, 24, 4);
         defer h.deinit();

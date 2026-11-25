@@ -12,7 +12,7 @@
 (* where acceptedIds, deliveredIds, withdrawnIds, userItems,               *)
 (* steeringItems, and recoveryTurns (`<session_resumed>` host resume       *)
 (* items) come from the session log (`log.jsonl`), screen comes from       *)
-(* queued `┋` rows in the tmux pane, composer from the input box, notices  *)
+(* queued `┋` rows in the tmux pane, composer contents, notices            *)
 (* from the scrollback notice banner, and turnOpen from the log's          *)
 (* turn_started / turn_committed / turn_interrupted counts.                *)
 (*                                                                         *)

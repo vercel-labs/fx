@@ -10195,9 +10195,9 @@ test.skipIf(!tmuxAvailable())(
 );
 
 const RESTORE_SINGULAR_NOTICE =
-  "1 prompt you sent before fx stopped was not delivered. It is back in the input box.";
+  "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
 const RESTORE_PLURAL_NOTICE =
-  "2 prompts you sent before fx stopped were not delivered. They are back in the input box.";
+  "2 prompts you sent before fx stopped were not delivered. They are back in the composer.";
 const SWITCH_SINGULAR_NOTICE =
   "1 queued prompt was not sent. It comes back when you reopen this session.";
 
@@ -10303,7 +10303,7 @@ async function waitForResumedPaneSettled(
       const scrollback = await session.captureFullScrollback();
       if (
         !waitForRestore ||
-        (composerText(pane).length > 0 && scrollback.includes("back in the input box"))
+        (composerText(pane).length > 0 && scrollback.includes("back in the composer"))
       ) {
         return { pane, scrollback };
       }
@@ -10316,7 +10316,7 @@ async function waitForResumedPaneSettled(
 }
 
 test.skipIf(!tmuxAvailable())(
-  "a prompt typed while an MCP call runs comes back in the input box after fx is killed",
+  "a prompt typed while an MCP call runs comes back in the composer after fx is killed",
   async () => {
     const fixture = resumeFixture("fx-eb03-mcp-kill-");
     const mcpFixture = startModernMcpHttpFixture("stall_call");
@@ -10637,7 +10637,7 @@ test.skipIf(!tmuxAvailable())(
       expect(hasEmptyComposer(resumed.pane)).toBe(true);
       expect(composerText(resumed.pane)).toBe("");
       expect(resumed.scrollback).not.toContain("was not delivered");
-      expect(resumed.scrollback).not.toContain("back in the input box");
+      expect(resumed.scrollback).not.toContain("back in the composer");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -10717,7 +10717,7 @@ test.skipIf(!tmuxAvailable())(
       expect(composerText(resumed.pane)).toBe("");
       expect(resumed.scrollback).not.toContain(p2);
       expect(resumed.scrollback).not.toContain("was not delivered");
-      expect(resumed.scrollback).not.toContain("back in the input box");
+      expect(resumed.scrollback).not.toContain("back in the composer");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();

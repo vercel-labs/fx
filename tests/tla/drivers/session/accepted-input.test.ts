@@ -36,9 +36,9 @@ const TIMEOUT = 90_000;
 const PANE_WAIT_TIMEOUT = 30_000;
 
 const RESTORE_SINGULAR_NOTICE =
-  "1 prompt you sent before fx stopped was not delivered. It is back in the input box.";
+  "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
 const RESTORE_PLURAL_NOTICE =
-  "prompts you sent before fx stopped were not delivered. They are back in the input box.";
+  "prompts you sent before fx stopped were not delivered. They are back in the composer.";
 const SWITCH_SINGULAR_NOTICE =
   "1 queued prompt was not sent. It comes back when you reopen this session.";
 

@@ -1977,9 +1977,9 @@ pub fn Runtime(comptime App: type) type {
         fn formatRestoreNotice(buf: []u8, prompt_count: usize, failed_images: usize) ![]const u8 {
             var w = std.Io.Writer.fixed(buf);
             if (prompt_count == 1) {
-                try w.writeAll("1 prompt you sent before fx stopped was not delivered. It is back in the input box.");
+                try w.writeAll("1 prompt you sent before fx stopped was not delivered. It is back in the composer.");
             } else {
-                try w.print("{d} prompts you sent before fx stopped were not delivered. They are back in the input box.", .{prompt_count});
+                try w.print("{d} prompts you sent before fx stopped were not delivered. They are back in the composer.", .{prompt_count});
             }
             if (failed_images == 1) {
                 try w.writeAll(" 1 image could not be restored.");
@@ -13129,7 +13129,7 @@ test "eb03: restore on resume into empty composer writes singular notice and wit
     try std.testing.expectEqualStrings("queued before crash", app.input_runtime.edit_state.input.items);
     var restore_notices: usize = 0;
     for (app.notices.items) |notice| {
-        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box.") != null) {
+        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer.") != null) {
             restore_notices += 1;
         }
     }
@@ -13181,7 +13181,7 @@ test "eb03: restore on resume appends to non-empty composer and emits plural not
     try std.testing.expectEqualStrings("existing draft\n\nfirst queued\n\nsecond queued", app.input_runtime.edit_state.input.items);
     var restore_notices: usize = 0;
     for (app.notices.items) |notice| {
-        if (std.mem.find(u8, notice, "2 prompts you sent before fx stopped were not delivered. They are back in the input box.") != null) {
+        if (std.mem.find(u8, notice, "2 prompts you sent before fx stopped were not delivered. They are back in the composer.") != null) {
             restore_notices += 1;
         }
     }
@@ -13583,7 +13583,7 @@ test "eb03-b4a2: restore with missing image file leaves image out and adds missi
     try std.testing.expectEqualStrings("check [Image #1]", app.input_runtime.edit_state.input.items);
     var saw_notice = false;
     for (app.notices.items) |notice| {
-        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box. 1 image could not be restored.")) {
+        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer. 1 image could not be restored.")) {
             saw_notice = true;
         }
     }
@@ -13648,7 +13648,7 @@ test "eb03-b4a2: restore with hash-mismatched image files leaves them out and ad
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
     var saw_notice = false;
     for (app.notices.items) |notice| {
-        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box. 2 images could not be restored.")) {
+        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer. 2 images could not be restored.")) {
             saw_notice = true;
         }
     }
@@ -13708,7 +13708,7 @@ test "eb03-b4d: installResumedV2Session leaves composer empty before main-loop r
     try std.testing.expectEqualStrings("deferred prompt", app.input_runtime.edit_state.input.items);
     var restore_notices: usize = 0;
     for (app.notices.items) |notice| {
-        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box.") != null) {
+        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the composer.") != null) {
             restore_notices += 1;
         }
     }
