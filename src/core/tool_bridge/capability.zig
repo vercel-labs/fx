@@ -86,7 +86,7 @@ pub const Capability = struct {
     ) anyerror!Authorization,
     /// Decides a file change as `file` with call `request_id`. Like
     /// `authorize_fn`, it may prompt. Allocates in `arena`.
-    authorize_file_fn: *const fn (
+    authorize_file_fn: ?*const fn (
         context: *anyopaque,
         arena: Allocator,
         request_id: []const u8,
@@ -118,7 +118,8 @@ pub const Capability = struct {
     }
 
     pub fn authorizeFile(self: Capability, arena: Allocator, request_id: []const u8, file: FileRequest) anyerror!Authorization {
-        return self.authorize_file_fn(self.context, arena, request_id, file);
+        const handler = self.authorize_file_fn orelse return .{ .deny = "fx tool works only inside a program that fx's bash tool started." };
+        return handler(self.context, arena, request_id, file);
     }
 
     pub fn call(self: Capability, arena: Allocator, request_id: []const u8, tool: []const u8, arguments_json: []const u8, allowed: @FieldType(Authorization, "allow"), cancel: *std.atomic.Value(bool)) anyerror!CallOutcome {

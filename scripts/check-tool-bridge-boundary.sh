@@ -4,8 +4,7 @@
 # only its front door, tool_bridge.zig. The module imports only std, builtin,
 # fuzz_corpus (the saved inputs the build gives a fuzz test),
 # its own files, shared basics (types.zig, io.zig, debug_trace.zig,
-# text_utils.zig), and command_runner.zig. Only bridge.zig may import
-# mcp_call_client.zig, because its tests drive the real `fx mcp call` client.
+# text_utils.zig), and command_runner.zig.
 
 set -euo pipefail
 
@@ -76,19 +75,15 @@ if [[ -n "$reaching_in" ]]; then
 fi
 
 allowed='^(std|builtin|fuzz_corpus|[a-z_]+\.zig|\.\./shared/(types|io|debug_trace|text_utils)\.zig|\.\./execution/command_runner\.zig)$'
-client_import='../mcp_host/mcp_call_client.zig'
 reaching_out=""
 while IFS= read -r line; do
   target="${line#*@import(\"}"
   target="${target%\")}"
-  if [[ "$target" == "$client_import" && "${line%%:*}" == "$folder/bridge.zig" ]]; then
-    continue
-  fi
   if [[ ! "$target" =~ $allowed ]]; then
     reaching_out+="$line"$'\n'
   fi
 done < <(git grep --untracked -n -o -E '@import\("[^"]+"\)' -- "$folder" || true)
 if [[ -n "$reaching_out" ]]; then
-  printf 'The tool bridge module may import only std, builtin, fuzz_corpus, its own files, shared basics (types, io, debug_trace, text_utils), and command_runner.zig; only bridge.zig may import mcp_call_client.zig:\n%s' "$reaching_out" >&2
+  printf 'The tool bridge module may import only std, builtin, fuzz_corpus, its own files, shared basics (types, io, debug_trace, text_utils), and command_runner.zig:\n%s' "$reaching_out" >&2
   exit 1
 fi

@@ -404,6 +404,7 @@ fn refusalMessage(reason: wire.Reason) []const u8 {
         .busy => "Too many fx mcp call requests are running in this session. Nothing ran; try again when one finishes.",
         .malformed => "The request was not an fx mcp call request. Send requests with the fx that started the session.",
         .too_large => "The request is over 1 MiB. Pass smaller arguments.",
+        .file_tool_unavailable => "fx tool works only inside a program that fx's bash tool started.",
     };
 }
 
@@ -547,7 +548,13 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
     // A lookup reads tool metadata only, like the agent's own toolbox
     // search, so it has no permission check to wait for.
-    const authorization: capability_mod.Authorization = switch (request.operation) {
+    // Only the bash tool's programs get file changes. Another registration's
+    // are denied as the core's deny, and the client is told why.
+    const file_refused = switch (request.operation) {
+        .edit, .write => registration.capability.authorize_file_fn == null,
+        .call, .list, .search, .help => false,
+    };
+    const authorization: capability_mod.Authorization = if (file_refused) .{ .deny = refusalMessage(.file_tool_unavailable) } else switch (request.operation) {
         .call, .edit, .write => authorizeGated(io, registration, work.id, arena, request_id, request.operation),
         .list, .search, .help => .{ .allow = .{} },
     };
@@ -555,7 +562,7 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
     const decided = step(.{ .authorized = .{ .id = work.id, .decision = if (authorization == .allow) .allow else .deny } });
     bridge.mutex.unlock(io);
 
-    var reply: ?struct { status: wire.Status, bytes: []const u8 } = null;
+    var reply: ?struct { status: wire.Status, reason: ?wire.Reason = null, bytes: []const u8 } = null;
     for (decided.effects()) |effect| switch (effect) {
         .call => {
             const outcome = runOperation(arena, registration.capability, request_id, request.operation, authorization.allow, &live.cancel) catch |err|
@@ -577,11 +584,17 @@ fn serve(stream: std.Io.net.Stream, wake_read: posix.fd_t) void {
                 else => {},
             };
         },
-        .reply => reply = .{ .status = .denied, .bytes = authorization.deny },
+        .reply => {
+            if (file_refused) {
+                reply = .{ .status = .refused, .reason = .file_tool_unavailable, .bytes = authorization.deny };
+            } else {
+                reply = .{ .status = .denied, .bytes = authorization.deny };
+            }
+        },
         else => {},
     };
     const answer = reply orelse return;
-    const delivered = writeReply(stream, answer.status, null, answer.bytes);
+    const delivered = writeReply(stream, answer.status, answer.reason, answer.bytes);
     bridge.mutex.lockUncancelable(io);
     _ = step(.{ .reply_done = .{ .id = work.id, .delivery = if (delivered) .delivered else .lost } });
     bridge.mutex.unlock(io);
@@ -648,9 +661,11 @@ const FakeTool = struct {
     calls: std.atomic.Value(u32) = .init(0),
     /// File changes run. The fake changes nothing.
     file_calls: std.atomic.Value(u32) = .init(0),
+    /// The registration offers no file handler, as a shell command's does.
+    no_files: bool = false,
 
     fn capability(self: *FakeTool) capability_mod.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .authorize_file_fn = authorizeFile, .call_fn = run, .lookup_fn = lookup };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorize, .authorize_file_fn = if (self.no_files) null else authorizeFile, .call_fn = run, .lookup_fn = lookup };
     }
 
     fn authorizeFile(raw: *anyopaque, arena: Allocator, request_id: []const u8, file: capability_mod.FileRequest) anyerror!capability_mod.Authorization {
@@ -708,7 +723,7 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
     }
 }
 
-const client = @import("../mcp_host/mcp_call_client.zig");
+const client = @import("client.zig");
 
 test "a shell call's command reaches its MCP tool, and a forged token reaches nothing" {
     if (!supported) return error.SkipZigTest;
@@ -893,6 +908,29 @@ test "an edit and a write go through their permission check, then their call" {
     try std.testing.expectEqual(@as(u32, 2), fileAuthorizeCount(std.testing.io, &tool));
     try std.testing.expectEqual(@as(u32, 2), tool.file_calls.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a file change on a registration with no file handler is refused as fx tool's, and no check runs" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{ .no_files = true };
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    const socket_path = variables[0].value;
+    const token = wire.parseToken(variables[1].value).?;
+    const blocks = [_]edit_blocks.Edit{.{ .search = "a\n", .replace = "b\n" }};
+
+    const edit = try client.call(arena, std.testing.io, socket_path, token, .{ .edit = .{ .path = "notes.txt", .blocks = &blocks } });
+    try std.testing.expectEqual(wire.Status.refused, edit.header.status);
+    try std.testing.expectEqual(wire.Reason.file_tool_unavailable, edit.header.reason.?);
+    const write = try client.call(arena, std.testing.io, socket_path, token, .{ .write = .{ .path = "new.txt", .content = "x" } });
+    try std.testing.expectEqual(wire.Reason.file_tool_unavailable, write.header.reason.?);
+
+    try std.testing.expectEqual(@as(u32, 0), fileAuthorizeCount(std.testing.io, &tool));
+    try std.testing.expectEqual(@as(u32, 0), tool.file_calls.load(.acquire));
 }
 
 test "an edit whose client leaves while its permission check waits applies nothing" {

@@ -12,6 +12,8 @@ pub const core = @import("core.zig");
 pub const wire = @import("wire.zig");
 pub const capability = @import("capability.zig");
 pub const edit_blocks = @import("edit_blocks.zig");
+pub const client = @import("client.zig");
+pub const tool_command = @import("tool_command.zig");
 const bridge = @import("bridge.zig");
 
 pub const supported = bridge.supported;
@@ -27,4 +29,6 @@ test {
     _ = bridge;
     _ = capability;
     _ = edit_blocks;
+    _ = client;
+    _ = tool_command;
 }

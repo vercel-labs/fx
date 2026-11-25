@@ -33,6 +33,7 @@ pub const TopLevelKind = enum {
     workspace,
     config,
     completion,
+    tool,
 };
 
 pub const SlashKind = enum {

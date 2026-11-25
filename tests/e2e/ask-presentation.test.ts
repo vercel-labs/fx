@@ -1559,6 +1559,84 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(toolResultText(gateway.requests[3]!.body, "bash-read")).toContain("x=1 big=0");
   }, TIMEOUT);
 
+  test("edit changes a file from a heredoc, and the result names the counts", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-edit", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\nEOF",
+      }),
+      fakeGatewayFinalText("Edited.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Change the print."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('b')\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-edit")).toContain("edited app.py +1 -1");
+  }, TIMEOUT);
+
+  test("write creates a file from stdin, and the result names it", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-write", "bash", {
+        command: "write new.txt <<'EOF'\nhello\nEOF",
+      }),
+      fakeGatewayFinalText("Written.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Create the file."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "new.txt"), "utf8")).toBe("hello\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-write")).toContain("wrote new.txt +1");
+  }, TIMEOUT);
+
+  test("a malformed edit shows its line, and changes nothing", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-bad", "bash", {
+        command: "edit app.py <<'EOF'\n<<<<<<< SEARCH\nprint('a')\nprint('b')\nEOF",
+      }),
+      fakeGatewayFinalText("Refused.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Change the print."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
+    expect(toolResultText(gateway.requests[1]!.body, "bash-bad")).toContain("fx tool edit: line 1: ");
+  }, TIMEOUT);
+
+  test("fx tool run outside a program fx started exits 3 and changes nothing", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+
+    const result = await runFx(["tool", "edit", "app.py"], {
+      cwd: root.workspace,
+      env: { FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined },
+      stdin: "<<<<<<< SEARCH\nprint('a')\n=======\nprint('b')\n>>>>>>> REPLACE\n",
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(3);
+    expect(result.stderr).toContain("works only inside a program that fx's bash tool started");
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
+  }, TIMEOUT);
+
   test("a bash state over the size cap that the program ends with exit is reported, and the old value stays", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -1749,5 +1827,57 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(waitResult).toContain("Nothing is running.");
     expect(waitResult).not.toContain("send wait_more");
     expect(gateway.classifierRequests).toHaveLength(0);
+  }, TIMEOUT);
+});
+
+describe("fx tool and fx mcp call without MCP servers", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("the shell tool starts no bridge, and fx mcp call exits 3 as it does outside fx", async () => {
+    const root = createRoot();
+    const command =
+      'echo "socket=[$FX_MCP_CALL_SOCKET] token=[$FX_MCP_CALL_TOKEN]"; "' + FX_BIN + '" mcp call list fixture; echo "exit=$?"';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      fakeGatewayFinalText("Checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", "Check the bridge."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "run_call");
+    expect(shown).toContain("socket=[] token=[]");
+    expect(shown).toContain("no running fx shell call to reach");
+    expect(shown).toContain("exit=3");
+  }, TIMEOUT);
+
+  test("the bash tool without MCP servers: fx mcp call says MCP is not available, and fx tool still edits", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "app.py"), "print('a')\n");
+    const command =
+      '"' + FX_BIN + '" mcp call list fixture; echo "exit=$?"; edit app.py <<\'EOF\'\n<<<<<<< SEARCH\nprint(\'a\')\n=======\nprint(\'b\')\n>>>>>>> REPLACE\nEOF';
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-both", "bash", { command }),
+      fakeGatewayFinalText("Done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Read and edit."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const shown = toolResultText(gateway.requests[1]!.body, "bash-both");
+    expect(shown).toContain("fx mcp call: MCP is not available in this session.");
+    expect(shown).toContain("exit=1");
+    expect(shown).toContain("edited app.py +1 -1");
+    expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('b')\n");
   }, TIMEOUT);
 });

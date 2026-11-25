@@ -141,6 +141,11 @@ pub const replay_options = [_]command_specs.OptionDoc{
 };
 
 /// `fx mcp list` options; `fx mcp --help` shows them in its usage line.
+const tool_subcommands = [_]command_specs.SubcommandDoc{
+    .{ .usage = "edit PATH", .description = "Change a file with SEARCH/REPLACE blocks on stdin" },
+    .{ .usage = "write PATH", .description = "Write a whole file from stdin" },
+};
+
 const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "list", .description = "List configured servers; never connects", .options = &mcp_list_options },
     .{ .usage = "show NAME", .description = "Connect to a server: status, version, and tools", .options = &mcp_show_options },
@@ -341,6 +346,18 @@ pub const top_level_specs = [_]TopLevelSpec{
         .subcommands = &mcp_subcommands,
     },
     .{
+        .kind = .tool,
+        .token = "tool",
+        .usage = "tool edit PATH | tool write PATH",
+        .summary = "Change a file from a program that the experimental bash tool runs",
+        .subcommands = &tool_subcommands,
+        .details = &.{
+            "The change goes through fx's permission rules and review, as an edit the agent makes itself. Send the change on stdin.",
+            "Experimental: it works only in programs that the bash tool runs, with experimental.bash_tool on.",
+            "Exit codes: 0 changed; 1 failed; 2 the change or the command line is wrong; 3 no running fx program to reach; 4 busy; 5 denied; 6 the change did not apply.",
+        },
+    },
+    .{
         .kind = .models,
         .token = "models",
         .usage = "models [ls] [--json]",
@@ -521,6 +538,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
+        .{ .kind = .tool, .usage = "tool edit|write PATH" },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },

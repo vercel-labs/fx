@@ -10,6 +10,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Remove verb | `remove`, with `rm` in every group | `remove` built, `rm` planned |
 | Sessions | One `fx session` group with `list`, `last`, `resume`, `recover`, and `convert`, also reached as `fx sessions`. `fx session <last\|id>` reads one session | Planned as one group |
 | Models | `fx model list`, also reached as `fx models` | Planned |
+| Program file changes | `fx tool edit PATH` and `fx tool write PATH`: a group that reads the change on stdin, for a program that the experimental bash tool runs (`experimental.bash_tool`). Approved by Pranit on 2026-11-25 | Built, experimental |
 
 SKILL.md's table "Built today and planned" says what works today.
 

@@ -993,7 +993,14 @@ fn executeRegisteredTool(
         .access = ctx.mcp_access,
     };
     dispatch_ctx.mcp_call_status_sink = &mcp_call_status;
-    if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
+    // Experimental: `fx tool`'s file changes exist only for the bash tool, which
+    // exists only with `experimental.bash_tool` on. Any other program gets the
+    // bridge only when MCP servers are present, as before. The bash tool
+    // without MCP servers still gets the bridge, for `fx tool`, and its MCP
+    // requests get the MCP unavailable texts (`lookupBridge`, `authorizeBridgeCall`).
+    const bash_program = if (registry.lookup(call.name)) |tool| tool.captured_command_host == .bash_session else false;
+    if ((ctx.mcp_ctx != null and ctx.mcp_call_tool != null) or bash_program) {
+        mcp_call_bridge.file_ops = bash_program;
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
     dispatch_ctx.toolbox_run = toolbox_run.capability();
@@ -1067,9 +1074,11 @@ fn executeRegisteredTool(
 /// bridge while the call runs (`../tool_bridge/capability.zig`).
 const McpCallBridgeState = struct {
     runtime: Context,
+    /// Whether this bridge serves file changes: only the bash tool's programs.
+    file_ops: bool = false,
 
     fn capability(self: *McpCallBridgeState) mcp_call_capability.Capability {
-        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = authorizeBridgeFile, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
+        return .{ .context = @ptrCast(self), .authorize_fn = authorizeBridgeCall, .authorize_file_fn = if (self.file_ops) authorizeBridgeFile else null, .call_fn = runBridgeCall, .lookup_fn = lookupBridge };
     }
 };
 
@@ -2063,6 +2072,15 @@ fn readBridgeTestFile(alloc: Allocator, tmp: std.testing.TmpDir, sub_path: []con
     var file = try tmp.dir.openFile(io_mod.getIo(), sub_path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 64 * 1024);
+}
+
+test "the bridge offers file changes only to the bash tool's programs" {
+    var rt = TestRuntime{ .workspace_root = "/workspace" };
+    defer rt.deinit(std.testing.allocator);
+    var shell_state = McpCallBridgeState{ .runtime = rt.context() };
+    try std.testing.expect(shell_state.capability().authorize_file_fn == null);
+    var bash_state = McpCallBridgeState{ .runtime = rt.context(), .file_ops = true };
+    try std.testing.expect(bash_state.capability().authorize_file_fn != null);
 }
 
 test "a bridge edit that a configured deny rule covers writes nothing" {
@@ -10108,7 +10126,7 @@ fn nestedBridgeStatus(rt: *TestRuntime, grants: []const PermissionGrant, tool: [
         socket_path = lines.next() orelse continue;
         token = mcp_call_wire.parseToken(lines.next() orelse continue);
     }
-    const reply = try mcp_call_client.call(arena, std.testing.io, socket_path, token.?, .{ .call = .{ .tool = tool, .arguments_json = "{}" } });
+    const reply = try tool_bridge.client.call(arena, std.testing.io, socket_path, token.?, .{ .call = .{ .tool = tool, .arguments_json = "{}" } });
     return reply.header.status;
 }
 
@@ -10118,7 +10136,6 @@ fn echoMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.Permis
 }
 
 const mcp_call = tool_bridge.core;
-const mcp_call_client = @import("../mcp_host/mcp_call_client.zig");
 const mcp_call_wire = tool_bridge.wire;
 
 test "a command's fx mcp call is checked against the approvals its tool call began with" {

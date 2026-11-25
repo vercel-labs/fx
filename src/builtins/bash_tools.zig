@@ -15,7 +15,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_name = "bash";
 
 const bash_description = std.fmt.comptimePrint(
-    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), edit files (python3, or a heredoc that writes the whole file), run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Long output keeps its start and end.",
+    "Run one bash program in the workspace. Its variables, functions, aliases, shell options, and working folder carry over to the next program. Use it for all work: read files (cat, sed -n, head), search (rg, rg --files), change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change, run tests and builds, and use git. A call waits up to {d} s. When the program is still running, send {s} as the whole program to wait for it; only one program runs at a time. Reach this session's MCP tools with fx mcp call. Long output keeps its start and end.",
     .{ bash_impl.program_yield_ms / 1000, bash_session.wait_word },
 );
 
@@ -25,6 +25,11 @@ comptime {
     // A longer description is cut before it reaches the model.
     if (bash_description.len > model_tool_schema.description_max_bytes) @compileError("bash description exceeds the tool description limit");
     if (command_description.len > model_tool_schema.description_max_bytes) @compileError("bash command description exceeds the tool description limit");
+}
+
+test "the bash description says to change files with edit and write, not with sed or a redirect" {
+    try std.testing.expect(std.mem.find(u8, bash_description, "change files only with edit PATH (SEARCH/REPLACE blocks on stdin) and write PATH (the whole file on stdin), never with sed -i, perl -pi, or a > redirect, so fx can show and undo each change") != null);
+    try std.testing.expect(std.mem.find(u8, bash_description, "python3, or a heredoc") == null);
 }
 
 const bash = tool_dispatch.Tool{
@@ -148,7 +153,7 @@ test "the bash gateway schema stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(schema_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "887eead335f14c4ebdf410e17f772c79e2e5272a298830dd98b18bbe2973c366",
+        "f7e31520770a6863719dddc47afc688f4e4e4b5a1a1244c263df6aeef171b649",
         &actual_hex,
     );
 }

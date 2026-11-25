@@ -209,6 +209,9 @@ pub const Reason = enum {
     malformed,
     /// The request line was longer than `max_request_bytes`.
     too_large,
+    /// A file change from a command that is not a bash tool program. Only the
+    /// bash tool's programs get `fx tool`'s file changes.
+    file_tool_unavailable,
 
     pub fn fromRefusal(refusal: mcp_call.Refusal) Reason {
         return switch (refusal) {
