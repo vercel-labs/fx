@@ -370,6 +370,9 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
+    /// Records `input_withdrawn` when a failed turn hands a queued prompt back
+    /// to the composer so resume does not restore it a second time.
+    withdraw_accepted_input: ?*const fn (ctx: *anyopaque, input_id: u64) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     /// `rejected_token` is the access token the provider just answered 401

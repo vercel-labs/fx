@@ -65,6 +65,7 @@ const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const entity_spans = @import("../shared/entity_spans.zig");
 const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -653,8 +654,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn enableSessionStores(app: *App, agent: *AppAgent) void {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            const v2 = agent.session_persistence.v2 orelse return;
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                clearAcceptedInputHooks(agent);
+                return;
+            }
+            const v2 = agent.session_persistence.v2 orelse {
+                clearAcceptedInputHooks(agent);
+                return;
+            };
             if (comptime @hasDecl(@TypeOf(agent.session), "configureWebFetchArtifactBlobs")) {
                 // A v2 session's downloads are its blobs (D44, D49).
                 if (v2.childCapability()) |capability| {
@@ -665,6 +672,71 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             enableSubagentHostV2(app, agent, v2);
+            syncAcceptedInputHooks(agent);
+        }
+
+        fn syncAcceptedInputHooks(agent: *AppAgent) void {
+            if (comptime !@hasField(AppAgent, "worker") or
+                !@hasField(@FieldType(AppAgent, "worker"), "accepted_input_hooks") or
+                !@hasDecl(@FieldType(AppAgent, "worker"), "setAcceptedInputHooks"))
+            {
+                return;
+            }
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                agent.worker.setAcceptedInputHooks(null);
+                return;
+            }
+            if (agent.session_persistence.v2 != null) {
+                agent.worker.setAcceptedInputHooks(.{
+                    .ctx = &agent.session_persistence,
+                    .record_accepted = recordAcceptedInputHook,
+                    .record_withdrawn = recordWithdrawnInputHook,
+                });
+            } else {
+                agent.worker.setAcceptedInputHooks(null);
+            }
+        }
+
+        fn clearAcceptedInputHooks(agent: *AppAgent) void {
+            if (comptime !@hasField(AppAgent, "worker") or
+                !@hasField(@FieldType(AppAgent, "worker"), "accepted_input_hooks") or
+                !@hasDecl(@FieldType(AppAgent, "worker"), "setAcceptedInputHooks"))
+            {
+                return;
+            }
+            agent.worker.setAcceptedInputHooks(null);
+        }
+
+        fn recordAcceptedInputHook(ctx: *anyopaque, text: []const u8, images: []const types.ImageAttachment) ?u64 {
+            const persistence: *Persistence = @ptrCast(@alignCast(ctx));
+            persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = persistence.v2 orelse {
+                debug_trace.logf("session", "event=input_accepted_write_failed kind=user bytes={d} reason=no_session", .{text.len});
+                return null;
+            };
+            return v2.recordInputAcceptedWithImages(text, images) catch |err| {
+                debug_trace.logf("session", "event=input_accepted_write_failed kind=user bytes={d} err={s}", .{ text.len, @errorName(err) });
+                return null;
+            };
+        }
+
+        fn recordWithdrawnInputHook(ctx: *anyopaque, input_id: u64) void {
+            const persistence: *Persistence = @ptrCast(@alignCast(ctx));
+            persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = persistence.v2 orelse return;
+            v2.recordInputWithdrawn(input_id) catch |err| {
+                debug_trace.logf("session", "event=input_withdrawn_write_failed id={d} err={s}", .{ input_id, @errorName(err) });
+            };
+        }
+
+        pub fn withdrawAcceptedInput(agent: *AppAgent, input_id: u64) !void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return;
+            try v2.recordInputWithdrawn(input_id);
         }
 
         /// Starts the session an instance opens with. In a profile, it starts
@@ -1042,6 +1114,28 @@ pub fn Runtime(comptime App: type) type {
             if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
             try noteStoppedSubagentTasks(app, agent);
+            try noteKeptQueuedPrompts(app, agent);
+        }
+
+        fn noteKeptQueuedPrompts(app: *App, agent: *AppAgent) !void {
+            if (comptime !agents.hasAgentField(App, "session_persistence") or
+                !@hasField(@TypeOf(agent.session_persistence), "switch_kept_queued_prompts"))
+            {
+                return;
+            }
+            const kept = agent.session_persistence.switch_kept_queued_prompts;
+            agent.session_persistence.switch_kept_queued_prompts = 0;
+            if (kept == 0) return;
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            var buf: [128]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            const body = if (kept == 1)
+                "1 queued prompt was not sent. It comes back when you reopen this session."
+            else blk: {
+                try w.print("{d} queued prompts were not sent. They come back when you reopen this session.", .{kept});
+                break :blk w.buffered();
+            };
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = body }, true);
         }
 
         fn stopSubagentsForSwitch(app: *App, agent: *AppAgent) !usize {
@@ -1121,6 +1215,12 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginLiveSessionCancellation(app: *App, agent: *AppAgent) void {
             agent.worker.requestCancel();
+            if (comptime agents.hasAgentField(App, "session_persistence") and
+                @hasField(@TypeOf(agent.session_persistence), "switch_kept_queued_prompts") and
+                @hasDecl(@TypeOf(agent.worker), "countPendingAcceptedUserPrompts"))
+            {
+                agent.session_persistence.switch_kept_queued_prompts = agent.worker.countPendingAcceptedUserPrompts();
+            }
             app_worker_runtime.Runtime(App).clearPacer(app, agent, "session_switch");
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app, agent);
@@ -1486,6 +1586,7 @@ pub fn Runtime(comptime App: type) type {
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
+            try noteKeptQueuedPrompts(app, agent);
             startPendingResume(app, agent);
             return true;
         }
@@ -1588,6 +1689,7 @@ pub fn Runtime(comptime App: type) type {
             startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
             try noteStoppedSubagentTasks(app, agent);
+            try noteKeptQueuedPrompts(app, agent);
             return prompt;
         }
 
@@ -1620,7 +1722,271 @@ pub fn Runtime(comptime App: type) type {
             enableSessionStores(app, agent);
             syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
-            if (notice != .fork) noteInterruptedRequest(agent, v2);
+            if (notice != .fork) {
+                noteInterruptedRequest(agent, v2);
+                try schedulePendingAcceptedInputsRestore(agent, v2);
+            }
+        }
+
+        fn schedulePendingAcceptedInputsRestore(agent: *AppAgent, v2: *session_adapter.Session) !void {
+            const reader = v2.pendingInputsReader();
+            try agent.session_persistence.pending_input_restore.queue(v2.id(), reader);
+        }
+
+        /// Starts a queued pending-input restore once the first frame is on
+        /// screen, and applies its finished result on the main loop.
+        pub fn pollPendingInputRestore(app: *App, agent: *AppAgent) !void {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            const restore = &agent.session_persistence.pending_input_restore;
+            restore.reapRetired();
+            if (restore.state == .queued) {
+                if (comptime @hasField(App, "shell")) {
+                    if (app.shell.render_requests.hasReason(.first_frame)) return;
+                }
+                restore.startQueued() catch |err| {
+                    debug_trace.logf("session", "event=pending_input_restore_start_failed err={s}", .{@errorName(err)});
+                    return;
+                };
+            }
+            const task = restore.takeCompleted() orelse return;
+            defer task.deinit();
+            try applyPendingInputRestore(app, agent, task);
+        }
+
+        fn applyPendingInputRestore(
+            app: *App,
+            agent: *AppAgent,
+            task: *session_persistence.PendingInputRestore.Task,
+        ) !void {
+            const active_id = activeSessionId(agent) orelse {
+                debug_trace.logf("session", "event=pending_input_restore_dropped reason=no_active_session session={s}", .{task.session_id});
+                return;
+            };
+            if (!std.mem.eql(u8, active_id, task.session_id)) {
+                debug_trace.logf(
+                    "session",
+                    "event=pending_input_restore_dropped reason=session_changed session={s} active={s}",
+                    .{ task.session_id, active_id },
+                );
+                return;
+            }
+            if (task.failure) |err| {
+                debug_trace.logf("session", "event=pending_input_restore_failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+                return;
+            }
+            const v2 = agent.session_persistence.v2 orelse {
+                debug_trace.logf("session", "event=pending_input_restore_dropped reason=not_writable session={s}", .{task.session_id});
+                return;
+            };
+            const scan = &(task.scan orelse return);
+            v2.observeMaxInputId(scan.max_seen_input_id);
+            const pending = &scan.pending;
+            if (pending.ids.len == 0) return;
+
+            var combined_text: std.ArrayList(u8) = .empty;
+            defer combined_text.deinit(app.alloc);
+            var staged_tokens: std.ArrayList(entity_spans.ImageTokenSpan) = .empty;
+            defer staged_tokens.deinit(app.alloc);
+            var staged_attachments: std.ArrayList(types.ImageAttachment) = .empty;
+            defer {
+                for (staged_attachments.items) |image| types.freeImageAttachment(app.alloc, image);
+                staged_attachments.deinit(app.alloc);
+            }
+
+            const has_composer = comptime @hasField(App, "input_runtime");
+            const has_images_owner = comptime agents.hasAgentField(App, "pending_images") and
+                agents.hasAgentField(App, "next_image_id");
+            const existing_len = if (has_composer) app.input_runtime.edit_state.input.items.len else 0;
+            const base_offset: usize = if (existing_len > 0) existing_len + 2 else 0;
+            var next_image_id: usize = if (has_images_owner) agent.next_image_id else 1;
+            var failed_images: usize = 0;
+
+            for (pending.texts, pending.images, 0..) |prompt_text, prompt_images, prompt_index| {
+                if (prompt_index > 0) try combined_text.appendSlice(app.alloc, "\n\n");
+                const prompt_verified: []const bool = if (prompt_index < task.image_verified.len)
+                    task.image_verified[prompt_index]
+                else
+                    &.{};
+                try stageAcceptedPromptRestore(
+                    app.alloc,
+                    prompt_text,
+                    prompt_images,
+                    prompt_verified,
+                    base_offset,
+                    has_composer and has_images_owner,
+                    &next_image_id,
+                    &failed_images,
+                    &combined_text,
+                    &staged_tokens,
+                    &staged_attachments,
+                );
+            }
+
+            if (has_composer) {
+                if (has_images_owner) {
+                    try app.input_runtime.entities.image_tokens.ensureUnusedCapacity(app.alloc, staged_tokens.items.len);
+                    try agent.pending_images.ensureUnusedCapacity(app.alloc, staged_attachments.items.len);
+                }
+                if (existing_len == 0) {
+                    try app.input_runtime.textReplacementState().replace(app.alloc, combined_text.items);
+                } else {
+                    _ = app.input_runtime.edit_state.setCursor(existing_len);
+                    const suffix = try std.mem.concat(app.alloc, u8, &.{ "\n\n", combined_text.items });
+                    defer app.alloc.free(suffix);
+                    try app.input_runtime.insertionState().insertSlice(app.alloc, suffix, .preserve);
+                }
+                if (has_images_owner) {
+                    for (staged_tokens.items) |token| {
+                        app.input_runtime.entities.registerImageTokenAssumeCapacity(token);
+                    }
+                    for (staged_attachments.items) |image| {
+                        agent.pending_images.appendAssumeCapacity(image);
+                        _ = image_attachments.allocateImageId(&agent.next_image_id);
+                    }
+                    staged_attachments.clearRetainingCapacity();
+                }
+                if (comptime @hasField(App, "shell")) {
+                    app.shell.render_requests.request(.footer);
+                }
+            }
+            if (comptime @hasDecl(App, "writeDomainNotice")) {
+                var notice_buf: [224]u8 = undefined;
+                const body = try formatRestoreNotice(&notice_buf, pending.texts.len, failed_images);
+                try app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = body }, true);
+            }
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            v2.recordInputsWithdrawn(pending.ids) catch |err| {
+                debug_trace.logf("session", "event=input_withdrawn_batch_failed count={d} err={s}", .{ pending.ids.len, @errorName(err) });
+            };
+        }
+
+        const MappedAcceptedImage = struct {
+            old_id: usize,
+            new_id: usize,
+            used: bool = false,
+        };
+
+        fn stageAcceptedPromptRestore(
+            alloc: Allocator,
+            prompt_text: []const u8,
+            prompt_images: []const session_adapter.Session.PendingAcceptedImage,
+            prompt_verified: []const bool,
+            base_offset: usize,
+            attach_images: bool,
+            next_image_id: *usize,
+            failed_images: *usize,
+            combined_text: *std.ArrayList(u8),
+            staged_tokens: *std.ArrayList(entity_spans.ImageTokenSpan),
+            staged_attachments: *std.ArrayList(types.ImageAttachment),
+        ) !void {
+            if (prompt_images.len == 0) {
+                try combined_text.appendSlice(alloc, prompt_text);
+                return;
+            }
+            var mapped: std.ArrayList(MappedAcceptedImage) = .empty;
+            defer mapped.deinit(alloc);
+
+            for (prompt_images, 0..) |img, img_idx| {
+                const verified = img_idx < prompt_verified.len and prompt_verified[img_idx];
+                if (!verified) {
+                    failed_images.* += 1;
+                    continue;
+                }
+                if (!attach_images) continue;
+                const new_id = next_image_id.*;
+                next_image_id.* = try std.math.add(usize, new_id, 1);
+                try mapped.append(alloc, .{ .old_id = img.id, .new_id = new_id });
+                const attachment = try cloneAcceptedImageAttachment(alloc, new_id, img);
+                errdefer types.freeImageAttachment(alloc, attachment);
+                try staged_attachments.append(alloc, attachment);
+            }
+
+            if (mapped.items.len == 0) {
+                try combined_text.appendSlice(alloc, prompt_text);
+                return;
+            }
+
+            var cursor: usize = 0;
+            while (cursor < prompt_text.len) {
+                if (image_attachments.matchImagePlaceholder(prompt_text, cursor)) |match| {
+                    if (claimMappedImageId(mapped.items, match.id)) |new_id| {
+                        var ph_buf: [32]u8 = undefined;
+                        const ph = try image_attachments.formatImagePlaceholder(&ph_buf, new_id);
+                        const rel_start = base_offset + combined_text.items.len;
+                        try combined_text.appendSlice(alloc, ph);
+                        try staged_tokens.append(alloc, .{
+                            .id = new_id,
+                            .span = .{ .raw_start = rel_start, .raw_end = rel_start + ph.len },
+                        });
+                        cursor += match.length;
+                        continue;
+                    }
+                }
+                try combined_text.append(alloc, prompt_text[cursor]);
+                cursor += 1;
+            }
+            for (mapped.items) |*entry| {
+                if (entry.used) continue;
+                entry.used = true;
+                if (combined_text.items.len > 0 and combined_text.items[combined_text.items.len - 1] != '\n') {
+                    try combined_text.append(alloc, ' ');
+                }
+                var ph_buf: [32]u8 = undefined;
+                const ph = try image_attachments.formatImagePlaceholder(&ph_buf, entry.new_id);
+                const rel_start = base_offset + combined_text.items.len;
+                try combined_text.appendSlice(alloc, ph);
+                try staged_tokens.append(alloc, .{
+                    .id = entry.new_id,
+                    .span = .{ .raw_start = rel_start, .raw_end = rel_start + ph.len },
+                });
+            }
+        }
+
+        fn claimMappedImageId(mapped: []MappedAcceptedImage, old_id: usize) ?usize {
+            for (mapped) |*entry| {
+                if (!entry.used and entry.old_id == old_id) {
+                    entry.used = true;
+                    return entry.new_id;
+                }
+            }
+            return null;
+        }
+
+        fn cloneAcceptedImageAttachment(
+            alloc: Allocator,
+            new_id: usize,
+            img: session_adapter.Session.PendingAcceptedImage,
+        ) !types.ImageAttachment {
+            const path = try alloc.dupe(u8, img.path);
+            errdefer alloc.free(path);
+            const media_type = try alloc.dupe(u8, img.media_type);
+            errdefer alloc.free(media_type);
+            const snapshot_path = try alloc.dupe(u8, img.snapshot_path);
+            errdefer alloc.free(snapshot_path);
+            const snapshot_sha256 = try alloc.dupe(u8, img.snapshot_sha256);
+            return .{
+                .id = new_id,
+                .path = path,
+                .media_type = media_type,
+                .snapshot_path = snapshot_path,
+                .snapshot_sha256 = snapshot_sha256,
+            };
+        }
+
+        fn formatRestoreNotice(buf: []u8, prompt_count: usize, failed_images: usize) ![]const u8 {
+            var w = std.Io.Writer.fixed(buf);
+            if (prompt_count == 1) {
+                try w.writeAll("1 prompt you sent before fx stopped was not delivered. It is back in the input box.");
+            } else {
+                try w.print("{d} prompts you sent before fx stopped were not delivered. They are back in the input box.", .{prompt_count});
+            }
+            if (failed_images == 1) {
+                try w.writeAll(" 1 image could not be restored.");
+            } else if (failed_images > 1) {
+                try w.print(" {d} images could not be restored.", .{failed_images});
+            }
+            return w.buffered();
         }
 
         /// Tells the transcript the folder a replayed call's relative path is
@@ -1714,6 +2080,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.workspace_capture = app.main_agent.session_persistence.workspace_capture;
             v2_owned = false;
             errdefer {
+                clearAcceptedInputHooks(agent);
                 agent.session_persistence.v2 = null;
                 v2.close();
             }
@@ -1729,6 +2096,7 @@ pub fn Runtime(comptime App: type) type {
             }
             // Its own subagents' state lives in its own log, as main's does.
             enableSubagentHostV2(app, agent, v2);
+            syncAcceptedInputHooks(agent);
         }
 
         /// The session-state half of `hydrateResumedSession`, for a subagent.
@@ -2997,6 +3365,7 @@ pub fn Runtime(comptime App: type) type {
         /// Points what holds `agent` back at the app after `App.init` copies
         /// it: the store's notice and the subagent host.
         pub fn rebindAfterMove(app: *App, agent: *AppAgent) void {
+            syncAcceptedInputHooks(agent);
             if (agent.session_persistence.v2_store) |store| {
                 if (store.notice != null) store.notice = .{ .context = app, .emit = conversionNotice };
             }
@@ -3089,6 +3458,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn requestPersistenceShutdown(agent: *AppAgent) void {
             agent.session_persistence.session_picker_load.requestStop();
             agent.session_persistence.title_generation.requestStop();
+            agent.session_persistence.pending_input_restore.onSessionClosed();
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -5184,11 +5554,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn closeWritableSessionWithResumeHandoff(app: *App, agent: *AppAgent) ?ResumeHandoff {
+            // Clear worker hooks before taking write_mutex to keep lock order worker_mutex -> write_mutex.
+            clearAcceptedInputHooks(agent);
             const handoff_intent = agent.session_persistence.resume_handoff_intent;
             agent.session_persistence.resume_handoff_intent = .none;
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             discardAnyPendingCancelledCommand(app, agent, "writable_session_close");
+            agent.session_persistence.pending_input_restore.onSessionClosed();
             if (agent.session_persistence.v2) |v2| return closeV2Session(app, agent, v2, handoff_intent);
             return null;
         }
@@ -6138,6 +6511,7 @@ const TestApp = struct {
     assistant_thematic_rule_count: usize = 0,
     assistant_presentation_events: std.ArrayList(AssistantPresentationEvent) = .empty,
     fail_system_notice: bool = false,
+    fail_notice_substr: ?[]const u8 = null,
     fail_assistant_table_append: bool = false,
     fail_assistant_code_block_append: bool = false,
     writable_seen_during_notice_failure: bool = false,
@@ -6267,7 +6641,8 @@ const TestApp = struct {
     }
 
     pub fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
-        if (self.fail_system_notice) {
+        const fail_match = if (self.fail_notice_substr) |needle| std.mem.find(u8, notice.body, needle) != null else false;
+        if (self.fail_system_notice or fail_match) {
             self.writable_seen_during_notice_failure =
                 self.agent().session_persistence.v2 != null;
             return error.TestSystemNoticeFailure;
@@ -6997,8 +7372,9 @@ fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, w
     return .{ .home = home, .workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace") };
 }
 
-fn configureTestPreferences(app: *TestApp) !void {
-    try Runtime(TestApp).configureStartupPreferences(
+fn configureTestPreferences(app: anytype) !void {
+    const App = @TypeOf(app.*);
+    try Runtime(App).configureStartupPreferences(
         app,
         app.agent(),
         .gateway,
@@ -12551,4 +12927,924 @@ test "a live session switch drops the finishes it holds, so a later report is no
     const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
     defer worker_runtime.freeWorkItem(alloc, work);
     try std.testing.expectEqualStrings("a report", work.prompt.prompt);
+}
+
+const Eb03SwitchApp = struct {
+    alloc: Allocator,
+    workspace_root: []u8,
+    main_agent: agents.Agent = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: ui_input.Runtime = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 21,
+        .divider_top_row = 22,
+        .input_row = 23,
+        .divider_bottom_row = 24,
+        .hint_row = 22,
+    } },
+    metrics: types.Metrics = .{},
+    terminal: shell_runtime.TerminalState = .{},
+    pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
+    selected_model: std.ArrayList(u8) = .empty,
+    fast_mode: bool = false,
+    permission_engine: permissions.PermissionEngine = .{},
+    permission_state: struct {
+        authority_mutex: std.Io.Mutex = .init,
+    } = .{},
+    notices: std.ArrayList([]u8) = .empty,
+
+    fn init(alloc: Allocator, workspace_root: []const u8) !Eb03SwitchApp {
+        return .{
+            .alloc = alloc,
+            .workspace_root = try alloc.dupe(u8, workspace_root),
+        };
+    }
+
+    fn deinit(self: *Eb03SwitchApp) void {
+        self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
+        self.shell.deinit(self.alloc);
+        self.pacer.deinit(self.alloc);
+        self.selected_model.deinit(self.alloc);
+        self.permission_engine.deinit(self.alloc);
+        for (self.notices.items) |notice| self.alloc.free(notice);
+        self.notices.deinit(self.alloc);
+        Runtime(Eb03SwitchApp).deinitPersistence(self, self.agent());
+        self.agent().session.deinit(self.alloc);
+        self.agent().worker.deinit(std.heap.c_allocator);
+        self.agent().session_title.deinit(self.alloc);
+        for (self.agent().pending_images.items) |image| types.freeImageAttachment(self.alloc, image);
+        self.agent().pending_images.deinit(self.alloc);
+        self.agent().managed_executions.deinit();
+        self.agent().change_tracker.deinit(std.heap.c_allocator);
+        self.agent().context_snapshot.deinit(self.alloc);
+        self.agent().approval_prompt.deinit(self.alloc);
+        self.agent().question_prompt.deinit(self.alloc);
+        self.alloc.free(self.workspace_root);
+        self.* = undefined;
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+
+    pub fn writeDomainNotice(self: *Eb03SwitchApp, notice: types.SemanticNotice, _: bool) !void {
+        try self.notices.append(self.alloc, try self.alloc.dupe(u8, notice.body));
+    }
+
+    fn writeTranscriptClassified(
+        self: *Eb03SwitchApp,
+        text: []const u8,
+        record: bool,
+        class: transcript_runtime.RawEntryClass,
+    ) !void {
+        _ = self;
+        _ = text;
+        _ = record;
+        _ = class;
+    }
+
+    fn stopStream(self: *Eb03SwitchApp, target: *agents.Agent) void {
+        _ = self;
+        target.stream.active = false;
+    }
+
+    pub fn clearPendingImages(self: *Eb03SwitchApp, target: *agents.Agent) void {
+        self.input_runtime.entities.image_tokens.clearRetainingCapacity();
+        for (target.pending_images.items) |image| types.freeImageAttachment(self.alloc, image);
+        target.pending_images.clearRetainingCapacity();
+    }
+
+    fn toolAdvertisementSet(_: *const Eb03SwitchApp, _: anytype) tool_set_contract.ToolSet {
+        return builtin_tools.advertisement_set;
+    }
+
+    pub fn nextImageId(_: *Eb03SwitchApp, target: *agents.Agent) usize {
+        return image_attachments.allocateImageId(&target.next_image_id);
+    }
+
+    pub fn peekNextImageId(_: *const Eb03SwitchApp, target: *const agents.Agent) usize {
+        return target.next_image_id;
+    }
+
+    fn writeUserPromptCardWithSpacing(_: *Eb03SwitchApp, _: types.UserTurn, _: bool) !void {}
+    fn writeTranscript(_: *Eb03SwitchApp, _: []const u8, _: bool) !void {}
+    fn writeCompletedToolStatus(_: *Eb03SwitchApp, _: types.ToolOutcomeKind, _: []const u8, _: bool) !void {}
+    fn writeCommandOutputChunk(_: *Eb03SwitchApp, _: command_output_content.Stream, _: []const u8, _: bool) !void {}
+    fn flushCommandOutputSummary(_: *Eb03SwitchApp, _: bool) !void {}
+    fn pacerEmit(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn appendAssistantTable(_: *Eb03SwitchApp, _: assistant_presentation.TablePayload) !void {}
+    fn appendAssistantCodeBlock(_: *Eb03SwitchApp, _: assistant_presentation.CodeBlockPayload) !void {}
+    fn appendAssistantThematicRule(_: *Eb03SwitchApp) !void {}
+    fn describeToolActionCompletedWithAdvertised(_: *Eb03SwitchApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+        return arena.dupe(u8, call.name);
+    }
+    fn describeToolActionDeniedWithAdvertised(_: *Eb03SwitchApp, _: anytype, arena: Allocator, call: types.ToolCall, _: ?[]const u8, _: []const u8, _: []const []const u8) ![]const u8 {
+        return arena.dupe(u8, call.name);
+    }
+    fn toolRegistry(_: *const Eb03SwitchApp, _: anytype) tool_dispatch.Registry {
+        return builtin_tools.advertisement_set.registry;
+    }
+    fn historicalToolActivityKind(self: *Eb03SwitchApp, _: anytype, call: types.ToolCall) types.ToolActivityKind {
+        return tool_dispatch.toolActivityKindForCall(self.alloc, builtin_tools.advertisement_set.registry, call);
+    }
+    fn prepareHistoricalQuestionResolution(self: *Eb03SwitchApp, answers: []const types.QuestionAnswer) ![]u8 {
+        return question_ui.composeResolvedQuestionAnswers(self.alloc, answers, self.shell.layout.cols);
+    }
+};
+
+fn eb03DrainPendingInputRestore(app: anytype, agent: anytype) !void {
+    for (0..5000) |_| {
+        try Runtime(@TypeOf(app.*)).pollPendingInputRestore(app, agent);
+        if (!agent.session_persistence.pending_input_restore.isActive()) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestPendingInputRestoreTimedOut;
+}
+
+fn eb03MakeQueuedPrompt(alloc: Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
+    return .{
+        .prompt = try alloc.dupe(u8, text),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "test-key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    };
+}
+
+test "eb03: restore on resume into empty composer writes singular notice and withdraws after composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    const id1 = try v2.recordInputAccepted("queued before crash");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    // Simulate failure between composer update and withdrawal: composer has text, record stays pending.
+    var failing_app = try TestApp.init(alloc, paths.workspace);
+    defer failing_app.deinit();
+    failing_app.fail_notice_substr = "was not delivered";
+    try Runtime(TestApp).initializePersistence(&failing_app, (&failing_app).agent(), true);
+    const reopened_fail = try session_adapter.Session.resumeSession(alloc, failing_app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&failing_app, (&failing_app).agent(), reopened_fail, .session);
+    try std.testing.expectError(
+        error.TestSystemNoticeFailure,
+        eb03DrainPendingInputRestore(&failing_app, (&failing_app).agent()),
+    );
+    try std.testing.expectEqualStrings("queued before crash", failing_app.input_runtime.edit_state.input.items);
+    Runtime(TestApp).closeWritableSession(&failing_app, (&failing_app).agent());
+
+    // Normal resume still finds the pending record, restores it, emits notice, then withdraws it.
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("queued before crash", app.input_runtime.edit_state.input.items);
+    var restore_notices: usize = 0;
+    for (app.notices.items) |notice| {
+        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box.") != null) {
+            restore_notices += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), restore_notices);
+
+    var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+    _ = id1;
+}
+
+test "eb03: restore on resume appends to non-empty composer and emits plural notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("first queued");
+    _ = try v2.recordInputAccepted("second queued");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "existing draft");
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("existing draft\n\nfirst queued\n\nsecond queued", app.input_runtime.edit_state.input.items);
+    var restore_notices: usize = 0;
+    for (app.notices.items) |notice| {
+        if (std.mem.find(u8, notice, "2 prompts you sent before fx stopped were not delivered. They are back in the input box.") != null) {
+            restore_notices += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), restore_notices);
+}
+
+test "eb03: no restore on a second resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("restore once");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var first = try TestApp.init(alloc, paths.workspace);
+    defer first.deinit();
+    try Runtime(TestApp).initializePersistence(&first, (&first).agent(), true);
+    const reopened_first = try session_adapter.Session.resumeSession(alloc, first.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&first, (&first).agent(), reopened_first, .session);
+    try eb03DrainPendingInputRestore(&first, (&first).agent());
+    try std.testing.expectEqualStrings("restore once", first.input_runtime.edit_state.input.items);
+    Runtime(TestApp).closeWritableSession(&first, (&first).agent());
+
+    var second = try TestApp.init(alloc, paths.workspace);
+    defer second.deinit();
+    try Runtime(TestApp).initializePersistence(&second, (&second).agent(), true);
+    const reopened_second = try session_adapter.Session.resumeSession(alloc, second.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&second, (&second).agent(), reopened_second, .session);
+    try eb03DrainPendingInputRestore(&second, (&second).agent());
+
+    try std.testing.expectEqualStrings("", second.input_runtime.edit_state.input.items);
+    for (second.notices.items) |notice| {
+        try std.testing.expect(std.mem.find(u8, notice, "was not delivered") == null);
+    }
+}
+
+test "eb03: large prompt above inline limit survives resume into composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    const large_prompt = try alloc.alloc(u8, 256 * 1024 + 256);
+    defer alloc.free(large_prompt);
+    @memset(large_prompt, 'L');
+    _ = try v2.recordInputAccepted(large_prompt);
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings(large_prompt, app.input_runtime.edit_state.input.items);
+}
+
+test "eb03: accepted_input_hooks bind, rebind after move, clear on close, and fail open with trace" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ paths.home, "eb03-host-failopen.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "session,worker");
+
+    const Launch = struct {
+        fn open(a: Allocator, workspace: []const u8) !Eb03SwitchApp {
+            var app = try Eb03SwitchApp.init(a, workspace);
+            errdefer app.deinit();
+            try configureTestPreferences(&app);
+            // No v2 session yet -> hooks stay unset.
+            Runtime(Eb03SwitchApp).enableSessionStores(&app, app.agent());
+            if (app.agent().worker.accepted_input_hooks != null) return error.TestUnexpectedHooks;
+            try Runtime(Eb03SwitchApp).initializePersistence(&app, app.agent(), true);
+            try Runtime(Eb03SwitchApp).beginFresh(&app, app.agent(), .later, null);
+            Runtime(Eb03SwitchApp).enableSessionStores(&app, app.agent());
+            return app;
+        }
+    };
+
+    var app = try Launch.open(alloc, paths.workspace);
+    defer app.deinit();
+    Runtime(Eb03SwitchApp).rebindAfterMove(&app, app.agent());
+    try std.testing.expect(app.agent().worker.accepted_input_hooks != null);
+
+    // Valid prompt after move writes to v2 session.
+    try app.agent().session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    try app.agent().worker.admitInteractivePrompt(std.heap.c_allocator, try eb03MakeQueuedPrompt(std.heap.c_allocator, "valid prompt"));
+    var pending = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.ids.len);
+    try std.testing.expectEqualStrings("valid prompt", pending.texts[0]);
+
+    // Invalid UTF-8 causes recordInputAccepted to fail; host must fail open and trace kind + byte length without text.
+    const failing_secret = "bad\xffsecret-text";
+    try app.agent().worker.admitInteractivePrompt(std.heap.c_allocator, try eb03MakeQueuedPrompt(std.heap.c_allocator, failing_secret));
+    try std.testing.expectEqual(@as(usize, 2), app.agent().worker.queuedPromptCount());
+    try std.testing.expectEqual(@as(?u64, null), app.agent().worker.queued_prompts.items[1].input_id);
+
+    Runtime(Eb03SwitchApp).closeWritableSession(&app, app.agent());
+    try std.testing.expect(app.agent().worker.accepted_input_hooks == null);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "kind=user") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "bytes=15") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "secret-text") == null);
+}
+
+test "eb03: /new switch keeps accepted records and shows singular and plural switch notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(Eb03SwitchApp).initializePersistence(&app, app.agent(), true);
+    try Runtime(Eb03SwitchApp).beginFresh(&app, app.agent(), .later, null);
+    Runtime(Eb03SwitchApp).enableSessionStores(&app, app.agent());
+
+    // Singular: 1 queued prompt across /new.
+    const sid1 = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+    defer alloc.free(sid1);
+    try app.agent().session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    try app.agent().worker.admitInteractivePrompt(std.heap.c_allocator, try eb03MakeQueuedPrompt(std.heap.c_allocator, "stay one"));
+    try Runtime(Eb03SwitchApp).newSession(&app, app.agent());
+
+    var saw_singular = false;
+    for (app.notices.items) |notice| {
+        if (std.mem.eql(u8, notice, "1 queued prompt was not sent. It comes back when you reopen this session.")) {
+            saw_singular = true;
+        }
+    }
+    try std.testing.expect(saw_singular);
+
+    // Plural: 2 queued prompts across /new.
+    try app.agent().session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn two") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    try app.agent().worker.admitInteractivePrompt(std.heap.c_allocator, try eb03MakeQueuedPrompt(std.heap.c_allocator, "stay two a"));
+    try app.agent().worker.admitInteractivePrompt(std.heap.c_allocator, try eb03MakeQueuedPrompt(std.heap.c_allocator, "stay two b"));
+    const sid2 = try alloc.dupe(u8, app.agent().session_persistence.v2.?.id());
+    defer alloc.free(sid2);
+    try Runtime(Eb03SwitchApp).newSession(&app, app.agent());
+
+    var saw_plural = false;
+    for (app.notices.items) |notice| {
+        if (std.mem.eql(u8, notice, "2 queued prompts were not sent. They come back when you reopen this session.")) {
+            saw_plural = true;
+        }
+    }
+    try std.testing.expect(saw_plural);
+
+    // Records stayed in both old sessions without withdrawal.
+    Runtime(Eb03SwitchApp).closeWritableSession(&app, app.agent());
+    const store = app.agent().session_persistence.v2_store.?;
+    const reopened1 = try session_adapter.Session.resumeSession(alloc, store, .{ .id = sid1 }, paths.workspace, .app);
+    defer reopened1.close();
+    var p1 = try reopened1.pendingAcceptedInputs(alloc);
+    defer p1.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), p1.ids.len);
+    try std.testing.expectEqualStrings("stay one", p1.texts[0]);
+
+    const reopened2 = try session_adapter.Session.resumeSession(alloc, store, .{ .id = sid2 }, paths.workspace, .app);
+    defer reopened2.close();
+    var p2 = try reopened2.pendingAcceptedInputs(alloc);
+    defer p2.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), p2.ids.len);
+    try std.testing.expectEqualStrings("stay two a", p2.texts[0]);
+    try std.testing.expectEqualStrings("stay two b", p2.texts[1]);
+}
+
+fn eb03WriteImageSnapshot(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    root_path: []const u8,
+    name: []const u8,
+    id: usize,
+    payload: []const u8,
+) !types.ImageAttachment {
+    const snap_dir = try std.Io.Dir.path.join(alloc, &.{ root_path, "snapshots" });
+    defer alloc.free(snap_dir);
+    {
+        var f = try dir.createFile(io_mod.getIo(), name, .{});
+        defer f.close(io_mod.getIo());
+        try f.writeStreamingAll(io_mod.getIo(), payload);
+        try f.sync(io_mod.getIo());
+    }
+    const src_path = try std.Io.Dir.path.join(alloc, &.{ root_path, name });
+    var attachment = types.ImageAttachment{
+        .id = id,
+        .path = src_path,
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    errdefer types.freeImageAttachment(alloc, attachment);
+    try image_attachments.captureImageSnapshot(alloc, &attachment, snap_dir);
+    return attachment;
+}
+
+fn eb03MakeImageQueuedPrompt(
+    alloc: Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+) !worker_runtime.QueuedPrompt {
+    var qp = try eb03MakeQueuedPrompt(alloc, text);
+    errdefer worker_runtime.freeQueuedPrompt(alloc, qp);
+    qp.images = try types.dupeImageAttachmentSlice(alloc, images);
+    return qp;
+}
+
+test "eb03-b4a2: restore with matching image file attaches image and token to composer and stores no image bytes in log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    const raw_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(raw_root);
+    const png_bytes = "\x89PNG\r\n\x1a\nEB03_UNIQUE_IMAGE_MARKER_BYTES";
+    const att = try eb03WriteImageSnapshot(alloc, tmp.dir, raw_root, "pic.png", 1, png_bytes);
+    defer types.freeImageAttachment(alloc, att);
+
+    var writer = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(Eb03SwitchApp).initializePersistence(&writer, writer.agent(), true);
+    try Runtime(Eb03SwitchApp).beginFresh(&writer, writer.agent(), .later, null);
+    Runtime(Eb03SwitchApp).enableSessionStores(&writer, writer.agent());
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+
+    try writer.agent().worker.admitInteractivePrompt(
+        std.heap.c_allocator,
+        try eb03MakeImageQueuedPrompt(std.heap.c_allocator, "describe [Image #1]", &.{att}),
+    );
+    Runtime(Eb03SwitchApp).closeWritableSession(&writer, writer.agent());
+
+    // Record never holds image bytes (raw or base64).
+    const log_path = try std.Io.Dir.path.join(alloc, &.{ paths.home, ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_path);
+    var log_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), log_path, .{});
+    defer log_file.close(io_mod.getIo());
+    const log_bytes = try io_mod.readFileToEnd(alloc, &log_file, 1024 * 1024);
+    defer alloc.free(log_bytes);
+    try std.testing.expect(std.mem.find(u8, log_bytes, "EB03_UNIQUE_IMAGE_MARKER_BYTES") == null);
+    try std.testing.expect(std.mem.find(u8, log_bytes, "inline_data") == null);
+
+    var app = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(Eb03SwitchApp).initializePersistence(&app, app.agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(Eb03SwitchApp).installResumedV2Session(&app, app.agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, app.agent());
+
+    try std.testing.expectEqual(@as(usize, 1), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+    const restored_id = app.agent().pending_images.items[0].id;
+    try std.testing.expectEqual(restored_id, app.input_runtime.entities.image_tokens.items[0].id);
+    try std.testing.expectEqualStrings(att.snapshot_sha256.?, app.agent().pending_images.items[0].snapshot_sha256.?);
+    try std.testing.expectEqualStrings(att.snapshot_path.?, app.agent().pending_images.items[0].snapshot_path.?);
+    try std.testing.expectEqualStrings("image/png", app.agent().pending_images.items[0].media_type);
+    const tok = app.input_runtime.entities.image_tokens.items[0].span;
+    var expected_ph_buf: [32]u8 = undefined;
+    const expected_ph = try image_attachments.formatImagePlaceholder(&expected_ph_buf, restored_id);
+    try std.testing.expectEqualStrings(expected_ph, app.input_runtime.edit_state.input.items[tok.raw_start..tok.raw_end]);
+    try std.testing.expect(app.notices.items.len >= 1);
+    for (app.notices.items) |notice| {
+        try std.testing.expect(std.mem.find(u8, notice, "could not be restored") == null);
+    }
+}
+
+test "eb03-b4a2: restore with missing image file leaves image out and adds missing-image sentence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    const raw_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(raw_root);
+    const att = try eb03WriteImageSnapshot(alloc, tmp.dir, raw_root, "gone.png", 1, "\x89PNG\r\n\x1a\nrest");
+    defer types.freeImageAttachment(alloc, att);
+
+    var writer = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(Eb03SwitchApp).initializePersistence(&writer, writer.agent(), true);
+    try Runtime(Eb03SwitchApp).beginFresh(&writer, writer.agent(), .later, null);
+    Runtime(Eb03SwitchApp).enableSessionStores(&writer, writer.agent());
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+
+    try writer.agent().worker.admitInteractivePrompt(
+        std.heap.c_allocator,
+        try eb03MakeImageQueuedPrompt(std.heap.c_allocator, "check [Image #1]", &.{att}),
+    );
+    Runtime(Eb03SwitchApp).closeWritableSession(&writer, writer.agent());
+
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), att.snapshot_path.?);
+
+    var app = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(Eb03SwitchApp).initializePersistence(&app, app.agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(Eb03SwitchApp).installResumedV2Session(&app, app.agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, app.agent());
+
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqualStrings("check [Image #1]", app.input_runtime.edit_state.input.items);
+    var saw_notice = false;
+    for (app.notices.items) |notice| {
+        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box. 1 image could not be restored.")) {
+            saw_notice = true;
+        }
+    }
+    try std.testing.expect(saw_notice);
+}
+
+test "eb03-b4a2: restore with hash-mismatched image files leaves them out and adds plural sentence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    const raw_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(raw_root);
+    const att1 = try eb03WriteImageSnapshot(alloc, tmp.dir, raw_root, "a.png", 1, "\x89PNG\r\n\x1a\naaaa");
+    defer types.freeImageAttachment(alloc, att1);
+    const att2 = try eb03WriteImageSnapshot(alloc, tmp.dir, raw_root, "b.png", 2, "\x89PNG\r\n\x1a\nbbbb");
+    defer types.freeImageAttachment(alloc, att2);
+
+    var writer = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(Eb03SwitchApp).initializePersistence(&writer, writer.agent(), true);
+    try Runtime(Eb03SwitchApp).beginFresh(&writer, writer.agent(), .later, null);
+    Runtime(Eb03SwitchApp).enableSessionStores(&writer, writer.agent());
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+
+    try writer.agent().worker.admitInteractivePrompt(
+        std.heap.c_allocator,
+        try eb03MakeImageQueuedPrompt(std.heap.c_allocator, "compare [Image #1] and [Image #2]", &.{ att1, att2 }),
+    );
+    Runtime(Eb03SwitchApp).closeWritableSession(&writer, writer.agent());
+
+    // Tamper both snapshot files so SHA-256 fails.
+    for ([_][]const u8{ att1.snapshot_path.?, att2.snapshot_path.? }) |snap| {
+        var f = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), snap, .{ .mode = .read_write });
+        defer f.close(io_mod.getIo());
+        try f.writeStreamingAll(io_mod.getIo(), "\x89PNG\r\n\x1a\ntampered");
+        try f.sync(io_mod.getIo());
+    }
+
+    var app = try Eb03SwitchApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(Eb03SwitchApp).initializePersistence(&app, app.agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(Eb03SwitchApp).installResumedV2Session(&app, app.agent(), reopened, .session);
+    try eb03DrainPendingInputRestore(&app, app.agent());
+
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
+    var saw_notice = false;
+    for (app.notices.items) |notice| {
+        if (std.mem.eql(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box. 2 images could not be restored.")) {
+            saw_notice = true;
+        }
+    }
+    try std.testing.expect(saw_notice);
+}
+
+test "eb03-b4d: installResumedV2Session leaves composer empty before main-loop restore" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("deferred prompt");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    app.shell.render_requests.request(.first_frame);
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    for (app.notices.items) |notice| {
+        try std.testing.expect(std.mem.find(u8, notice, "was not delivered") == null);
+    }
+    var remaining_before = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining_before.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), remaining_before.ids.len);
+
+    // While first_frame is still pending, polling does not start or apply the restore.
+    try Runtime(TestApp).pollPendingInputRestore(&app, (&app).agent());
+    try std.testing.expect(app.agent().session_persistence.pending_input_restore.state == .queued);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    // Once first_frame clears, main-loop polling runs the job, updates composer + notice, and withdraws.
+    app.shell.render_requests.clearReason(.first_frame);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+    try std.testing.expectEqualStrings("deferred prompt", app.input_runtime.edit_state.input.items);
+    var restore_notices: usize = 0;
+    for (app.notices.items) |notice| {
+        if (std.mem.find(u8, notice, "1 prompt you sent before fx stopped was not delivered. It is back in the input box.") != null) {
+            restore_notices += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), restore_notices);
+    var remaining_after = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining_after.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining_after.ids.len);
+}
+
+test "eb03-b4d: stale restore result for another session is dropped" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ paths.home, "eb03-b4d-stale.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "session");
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    try writer.agent().session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn a") },
+        .assistant = @constCast("done a"),
+    } }, types.ConversationLanguage.default());
+    _ = try writer.agent().session_persistence.v2.?.recordInputAccepted("from session a");
+    const sid_a = try alloc.dupe(u8, writer.agent().session_persistence.v2.?.id());
+    defer alloc.free(sid_a);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    try writer.agent().session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn b") },
+        .assistant = @constCast("done b"),
+    } }, types.ConversationLanguage.default());
+    const sid_b = try alloc.dupe(u8, writer.agent().session_persistence.v2.?.id());
+    defer alloc.free(sid_b);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened_a = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_a }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_a, .session);
+    // Start A's background restore job, then switch to session B before it applies.
+    try app.agent().session_persistence.pending_input_restore.startQueued();
+    while (!app.agent().session_persistence.pending_input_restore.state.running.done.load(.acquire)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const reopened_b = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_b }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_b, .session);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    for (app.notices.items) |notice| {
+        try std.testing.expect(std.mem.find(u8, notice, "was not delivered") == null);
+    }
+
+    // Also test a completed task from A reaching pollPendingInputRestore after v2 switched to B.
+    const reopened_a2 = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_a }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened_a2, .session);
+    try app.agent().session_persistence.pending_input_restore.startQueued();
+    while (!app.agent().session_persistence.pending_input_restore.state.running.done.load(.acquire)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    // Swap the open session to B directly without clearing the completed task from A.
+    Runtime(TestApp).closeWritableSession(&app, (&app).agent());
+    app.agent().session_persistence.v2 = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_b }, paths.workspace, .app);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    Runtime(TestApp).closeWritableSession(&app, (&app).agent());
+    const check_a = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid_a }, paths.workspace, .app);
+    defer check_a.close();
+    var remaining_a = try check_a.pendingAcceptedInputs(alloc);
+    defer remaining_a.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), remaining_a.ids.len);
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=pending_input_restore_dropped reason=session_changed") != null);
+}
+
+test "eb03-b4d: restore arriving after user typed appends after blank line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var writer = try TestApp.init(alloc, paths.workspace);
+    defer writer.deinit();
+    try configureTestPreferences(&writer);
+    try Runtime(TestApp).initializePersistence(&writer, (&writer).agent(), true);
+    try Runtime(TestApp).beginFresh(&writer, (&writer).agent(), .later, null);
+    const v2 = writer.agent().session_persistence.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("done"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("restored prompt");
+    const sid = try alloc.dupe(u8, v2.id());
+    defer alloc.free(sid);
+    Runtime(TestApp).closeWritableSession(&writer, (&writer).agent());
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try Runtime(TestApp).initializePersistence(&app, (&app).agent(), true);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.agent().session_persistence.v2_store.?, .{ .id = sid }, paths.workspace, .app);
+    try Runtime(TestApp).installResumedV2Session(&app, (&app).agent(), reopened, .session);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    try app.input_runtime.insertionState().insertSlice(alloc, "typed meanwhile", .preserve);
+    try eb03DrainPendingInputRestore(&app, (&app).agent());
+
+    try std.testing.expectEqualStrings("typed meanwhile\n\nrestored prompt", app.input_runtime.edit_state.input.items);
+    var remaining = try app.agent().session_persistence.v2.?.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
 }

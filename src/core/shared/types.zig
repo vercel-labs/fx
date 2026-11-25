@@ -1481,6 +1481,9 @@ pub const PersistedSteering = struct {
     text: []u8,
     assistant_prefix: ?[]u8 = null,
     after_tool_step_count: usize,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// An instruction file a context note delivered: its absolute path and a
@@ -1967,6 +1970,9 @@ pub const UserTurn = struct {
     /// line holding it says; 0 when unknown. For display only: nothing saves
     /// it, and the model never sees it.
     sent_at_ms: i64 = 0,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -2036,6 +2042,9 @@ pub const ChatMessage = struct {
     /// prompt caching and the model honors such markers, and ignores it
     /// otherwise.
     cache_breakpoint: bool = false,
+    /// In-memory only: links steering to `input_accepted` until persisted into
+    /// `PersistedSteering.input_id`. Never sent to providers or written to JSON.
+    input_id: ?u64 = null,
 };
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
@@ -3503,6 +3512,7 @@ pub fn dupePersistedSteering(
             .text = text,
             .assistant_prefix = assistant_prefix,
             .after_tool_step_count = item.after_tool_step_count,
+            .input_id = item.input_id,
         };
         copied += 1;
     }
@@ -4102,6 +4112,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .work_id = work_id,
         .author = user.author,
         .sent_at_ms = user.sent_at_ms,
+        .input_id = user.input_id,
     };
 }
 

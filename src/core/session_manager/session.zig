@@ -414,9 +414,12 @@ pub const Session = struct {
     }
 
     /// Before the first turn, a batch without `turn_started` may only hold
-    /// settings; they wait in memory, already framed (seq 2 onward).
+    /// settings or input records; they wait in memory, already framed (seq 2 onward).
     fn hold(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
-        for (bodies) |body| if (body != .set) return error.InvalidTransition;
+        for (bodies) |body| switch (body) {
+            .set, .input_accepted, .input_delivered, .input_withdrawn => {},
+            else => return error.InvalidTransition,
+        };
         const gpa = session.env.gpa;
         const start = session.held.items.len;
         errdefer session.held.shrinkRetainingCapacity(start);
@@ -1120,6 +1123,8 @@ fn needsSync(bodies: []const schema.Body) bool {
             .permissions, .usage, .moved_files => return true,
             .prefs, .title, .workspace, .language, .client_prompt, .tool_identities, .compaction_records, .v1_source => {},
         },
+        // Accepted input records stay unsynced on the input path; a process crash keeps written bytes.
+        .input_accepted, .input_delivered, .input_withdrawn => {},
         else => {},
     };
     return false;
@@ -3895,6 +3900,95 @@ const session_tests = struct {
         crash(&t, again);
         try expectLockStatus(&t.env, id, .free);
         try testing.expect(try lockFileLength(&t, id) > 0);
+    }
+
+    test "raw log with input_accepted, input_delivered, and input_withdrawn lines reads as known kinds" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+
+        const id = "rawinputtest";
+        const dir = try t.env.s.ensureDir(t.env.root, id);
+        defer t.env.s.closeDir(dir);
+        const blobs = try t.env.s.ensureDir(dir, "blobs");
+        t.env.s.closeDir(blobs);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        const payloads = [_][]const u8{
+            "{\"v\":1,\"seq\":1,\"ts\":1,\"kind\":\"session_created\",\"id\":\"rawinputtest\",\"workspace\":\"/w\",\"role\":\"root\",\"host\":\"app\"",
+            "{\"v\":1,\"seq\":2,\"ts\":2,\"kind\":\"input_accepted\",\"id\":1,\"text\":\"queued\"",
+            "{\"v\":1,\"seq\":3,\"ts\":3,\"kind\":\"turn_started\",\"turn\":1",
+            "{\"v\":1,\"seq\":4,\"ts\":4,\"kind\":\"item\",\"turn\":1,\"type\":\"user\",\"data\":{\"text\":\"hi\"}",
+            "{\"v\":1,\"seq\":5,\"ts\":5,\"kind\":\"input_delivered\",\"id\":1",
+            "{\"v\":1,\"seq\":6,\"ts\":6,\"kind\":\"input_withdrawn\",\"id\":2",
+            "{\"v\":1,\"seq\":7,\"ts\":7,\"kind\":\"turn_committed\",\"turn\":1",
+            "{\"v\":1,\"seq\":8,\"ts\":8,\"kind\":\"closed\"",
+        };
+        for (payloads) |p| try log_mod.appendFramed(gpa, &bytes, p);
+
+        const log_file = try t.env.s.createFile(dir, "log.jsonl");
+        try t.env.s.writeAt(log_file, bytes.items, 0);
+        try t.env.s.sync(log_file);
+        t.env.s.closeFile(log_file);
+        const lock_file = try t.env.s.createFile(dir, "lock");
+        t.env.s.closeFile(lock_file);
+
+        const s = try resumeRoot(&t, id);
+        try closeAndDestroy(s);
+        var page = try session_mod.readPage(&t.env, gpa, id, .start, .forward, 20);
+        defer page.deinit();
+        try testing.expectEqual(@as(usize, 9), page.entries.len);
+        for (page.entries) |entry| {
+            try testing.expect(entry.kind != null);
+            try testing.expect(entry.body != null);
+        }
+    }
+
+    test "input records are held before turn 1, published on turn 1, and do not sync" {
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_accepted = .{ .id = 1, .text = "hi" } }}));
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_delivered = .{ .id = 1 } }}));
+        try testing.expect(!session_mod.needsSync(&.{.{ .input_withdrawn = .{ .id = 2 } }}));
+
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const s = try newRoot(&t);
+        _ = try s.append(&.{
+            .{ .input_accepted = .{ .id = 1, .text = "before turn 1" } },
+            .{ .input_withdrawn = .{ .id = 1 } },
+            .{ .input_accepted = .{ .id = 2, .text = "for turn 1" } },
+        });
+        try testing.expectError(error.InvalidTransition, s.append(&.{item}));
+        _ = try s.append(&.{ .turn_started, item, .{ .input_delivered = .{ .id = 2 } }, .turn_committed });
+
+        const accepted_seq = try s.append(&.{.{ .input_accepted = .{ .id = 3, .text = "after turn 1" } }});
+        const delivered_seq = try s.append(&.{.{ .input_delivered = .{ .id = 3 } }});
+        const withdrawn_seq = try s.append(&.{.{ .input_withdrawn = .{ .id = 4 } }});
+        s.sync_mutex.lockUncancelable(io);
+        const synced = s.synced_seq;
+        s.sync_mutex.unlock(io);
+        try testing.expect(synced < accepted_seq);
+        try testing.expect(synced < delivered_seq);
+        try testing.expect(synced < withdrawn_seq);
+
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        try closeAndDestroy(s);
+        try expectKinds(&t, id, &.{
+            .session_created,
+            .input_accepted,
+            .input_withdrawn,
+            .input_accepted,
+            .turn_started,
+            .item,
+            .input_delivered,
+            .turn_committed,
+            .input_accepted,
+            .input_delivered,
+            .input_withdrawn,
+            .closed,
+        });
     }
 };
 

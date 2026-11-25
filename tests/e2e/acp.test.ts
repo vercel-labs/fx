@@ -874,6 +874,14 @@ class AcpClient {
     return this.proc.exitCode === null && this.proc.signalCode === null;
   }
 
+  kill(signal: NodeJS.Signals = "SIGKILL"): boolean {
+    return this.proc.kill(signal);
+  }
+
+  get signalCode(): NodeJS.Signals | null {
+    return this.proc.signalCode;
+  }
+
   async close(): Promise<void> {
     if (!this._closed) {
       this.proc.stdin!.end();
@@ -4878,6 +4886,185 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         server.stop(true);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an ACP steer sent during a held MCP call is reported after fx is killed and the session is loaded",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-kill-");
+      const httpFixture = startModernMcpHttpFixture("stall_call");
+      const steerText = "ACP_STEER_DURING_HELD_MCP_CALL";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_stall_steer", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_stall_steer", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hold" } }),
+        finalText("SHOULD_NOT_RUN_AFTER_KILL"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway);
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [acpHttpServer(httpFixture, "stall")] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        sendPrompt(client, 10, "Call the held MCP tool.");
+        await waitForCondition(
+          "held MCP call",
+          () => httpFixture.requests.some((entry) => entry.message.method === "tools/call"),
+          TIMEOUT,
+        );
+
+        sendSteeringPrompt(client, 11, steerText);
+        // A rejected non-steer prompt proves the reader loop processed the steer.
+        sendPrompt(client, 12, "barrier");
+        const barrier = await readResponse(client, 12);
+        expect(barrier.error.code).toBe(-32600);
+
+        const requestsBeforeKill = gateway.requests.length;
+        const exited = client.waitForExit();
+        client.kill("SIGKILL");
+        await exited;
+        expect(client.signalCode).toBe("SIGKILL");
+        client = null;
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const loaded = await readUntilResponses(client, [21]);
+        expect(loaded.responses.get(21)!.error).toBeUndefined();
+        const updates = loaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update);
+        const noticeText = updates
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => update.content?.text ?? "")
+          .join("\n");
+        expect(noticeText).toContain("1 prompt you sent before fx stopped was not delivered:");
+        expect(noticeText).toContain(steerText);
+        expect(gateway.requests).toHaveLength(requestsBeforeKill);
+
+        // Reloading again does not re-report the withdrawn pending prompt.
+        client.send({
+          jsonrpc: "2.0",
+          id: 22,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const reloaded = await readUntilResponses(client, [22]);
+        expect(reloaded.responses.get(22)!.error).toBeUndefined();
+        const reloadedText = reloaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update?.content?.text ?? "")
+          .join("\n");
+        expect(reloadedText).not.toContain("was not delivered:");
+        expect(reloadedText).not.toContain(steerText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a withdrawn ACP steer is not reported after a kill",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-withdraw-kill-");
+      const httpFixture = startModernMcpHttpFixture("stall_call");
+      const steerText = "WITHDRAWN_ACP_STEER";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_stall_withdraw", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_stall_withdraw", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "hold" } }),
+        finalText("SHOULD_NOT_RUN"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway);
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [acpHttpServer(httpFixture, "withdraw")] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "full-access" }, 3);
+
+        sendPrompt(client, 10, "Call the held MCP tool.");
+        await waitForCondition(
+          "held MCP call",
+          () => httpFixture.requests.some((entry) => entry.message.method === "tools/call"),
+          TIMEOUT,
+        );
+
+        sendSteeringPrompt(client, 11, steerText);
+        sendPrompt(client, 12, "barrier");
+        expect((await readResponse(client, 12)).error.code).toBe(-32600);
+
+        client.send({
+          jsonrpc: "2.0",
+          method: "$/cancel_request",
+          params: { requestId: 11 },
+        });
+        sendPrompt(client, 13, "barrier-after-withdraw");
+        const afterWithdraw = await readUntilResponses(client, [11, 13]);
+        expect(afterWithdraw.responses.get(11)!.result?.stopReason).toBe("cancelled");
+        expect(afterWithdraw.responses.get(11)!.result?._meta?.fx?.steering).toBe("dropped");
+        expect(afterWithdraw.responses.get(13)!.error.code).toBe(-32600);
+
+        const log = readFileSync(join(sessionDir(root.home, sessionId), "log.jsonl"), "utf8");
+        const kinds = log.trimEnd().split("\n")
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line).kind);
+        expect(kinds).toContain("input_accepted");
+        expect(kinds).toContain("input_withdrawn");
+
+        const exited = client.waitForExit();
+        client.kill("SIGKILL");
+        await exited;
+        expect(client.signalCode).toBe("SIGKILL");
+        client = null;
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const loaded = await readUntilResponses(client, [21]);
+        expect(loaded.responses.get(21)!.error).toBeUndefined();
+        const updatesText = loaded.messages
+          .filter((message) => message.method === "session/update")
+          .map((message) => message.params.update?.content?.text ?? "")
+          .join("\n");
+        expect(updatesText).not.toContain("was not delivered:");
+        expect(updatesText).not.toContain(steerText);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        httpFixture.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

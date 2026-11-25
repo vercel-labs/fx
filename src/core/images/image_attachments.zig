@@ -1321,6 +1321,58 @@ pub fn loadVerifiedSnapshot(
     };
 }
 
+/// Streams a captured snapshot file to check existence, regular-file safety,
+/// media type header, and SHA-256 without retaining file bytes in memory.
+pub fn verifySnapshotFile(
+    snapshot_path: []const u8,
+    expected_sha256: []const u8,
+    expected_media_type: []const u8,
+) bool {
+    verifySnapshotFileErr(snapshot_path, expected_sha256, expected_media_type) catch return false;
+    return true;
+}
+
+fn verifySnapshotFileErr(
+    snapshot_path: []const u8,
+    expected_sha256: []const u8,
+    expected_media_type: []const u8,
+) !void {
+    if (expected_sha256.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+    var file = try openSnapshotFileNoFollow(snapshot_path);
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.NotRegularFile;
+    const size = std.math.cast(usize, stat.size) orelse return error.ImageTooLarge;
+    if (size == 0 or size > max_image_bytes) return error.ImageTooLarge;
+
+    var hasher = Sha256.init(.{});
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &read_buf);
+    var transfer_buf: [transfer_buffer_bytes]u8 = undefined;
+    var header_buf: [64]u8 = undefined;
+    var header_len: usize = 0;
+    var total_read: usize = 0;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&transfer_buf);
+        if (n == 0) break;
+        if (n > max_image_bytes - total_read) return error.ImageTooLarge;
+        if (header_len < header_buf.len) {
+            const take = @min(n, header_buf.len - header_len);
+            @memcpy(header_buf[header_len .. header_len + take], transfer_buf[0..take]);
+            header_len += take;
+        }
+        total_read += n;
+        hasher.update(transfer_buf[0..n]);
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual);
+    const actual_hex = std.fmt.bytesToHex(actual, .lower);
+    if (!std.mem.eql(u8, actual_hex[0..], expected_sha256)) return error.ImageSnapshotCorrupt;
+    const detected = detectMediaTypeFromBytes(header_buf[0..header_len]) orelse
+        return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, expected_media_type)) return error.ImageSnapshotMediaTypeMismatch;
+}
+
 /// Keeps a captured snapshot's verified bytes on the attachment itself, as
 /// an in-memory capture does, so durable serializers save them with the
 /// turn: a v2 session, which is not on disk at capture (D44), saves them as

@@ -32,6 +32,7 @@ const shell_runtime = @import("shell_runtime.zig");
 const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
+const resume_projection = @import("transcript/resume_projection.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -10639,4 +10640,49 @@ test "a picker close past a tool finality floor keeps all rows visible during pr
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try capturePhysicalFrame(&h, &probe);
     try expectAllToolItemsVisible(alloc, &h, &probe, item_count);
+}
+
+test "tall recovering resumed transcript renders a committed notice appended after the first frame" {
+    const alloc = std.testing.allocator;
+    const notice_body = "1 prompt you sent before fx stopped was not delivered. It is back in the input box.";
+    for ([_]u16{ 40, 80, 120 }) |cols| {
+        var h = try Harness.init(alloc, cols, 24, 4);
+        defer h.deinit();
+        try h.shell.initViewport(&h.metrics, 1);
+
+        var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &h.shell, 0, 1);
+        errdefer projection.deinit();
+        for (0..80) |i| {
+            var buf: [64]u8 = undefined;
+            const line = try std.mem.print(&buf, "resumed history line {d}\n", .{i});
+            _ = try projection.appendRawClassified(line, .unknown_raw);
+        }
+        try projection.finalize();
+        projection.install(&h.shell);
+        try std.testing.expect(h.shell.notebook.pending_resume_source != null);
+
+        // First frame exceeds the per-frame scroll cap and leaves the transcript recovering.
+        try h.renderTranscriptFrame();
+        try h.flush();
+        try std.testing.expectEqual(
+            transcript_runtime.TranscriptCommitDiagnosticState.recovering,
+            h.shell.transcriptCommitDiagnostic().state,
+        );
+
+        // App.writeDomainNotice(..., true) delegates directly to shell.writeNotice(..., true).
+        try h.shell.writeNotice(alloc, &h.metrics, .{
+            .topic = "session",
+            .tone = .information,
+            .body = notice_body,
+        }, true);
+
+        try h.renderTranscriptFrameWithBottomReservation(2);
+        try h.flush();
+        try expectGridContains(&h, "was not delivered.");
+        try std.testing.expect(h.shell.notebook.pending_resume_source == null);
+
+        // Scroll/resize after the notice still keeps the notice on the grid.
+        try h.driveResize(cols, 28, 4, true);
+        try expectGridContains(&h, "was not delivered.");
+    }
 }

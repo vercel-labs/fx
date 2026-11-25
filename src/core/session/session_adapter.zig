@@ -2004,6 +2004,12 @@ pub const Session = struct {
     /// The session's token totals as its newest `set usage` holds them
     /// (D92), read from the log on the first reply this process records.
     usage: ?types.Usage = null,
+    /// Highest accepted/delivered/withdrawn input id seen in this session's
+    /// log, or null when a resumed session has not scanned the log yet.
+    max_seen_input_id: ?u64 = null,
+    /// Highest log seq present when this resumed session opened, so background
+    /// restore ignores inputs accepted after resume.
+    opened_last_seq: u64 = 0,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -2014,6 +2020,7 @@ pub const Session = struct {
         errdefer handle.release();
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
+        self.max_seen_input_id = 0;
         try self.appendSeed(seed);
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
@@ -2084,6 +2091,7 @@ pub const Session = struct {
         const self = try init(alloc, store, handle, false);
         errdefer self.destroyInner();
         self.root = false;
+        self.max_seen_input_id = 0;
         if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
         try self.appendSeed(seed);
         return self;
@@ -2189,6 +2197,7 @@ pub const Session = struct {
         var state = try handle.state(alloc);
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
+        self.opened_last_seq = state.last_seq;
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
@@ -2226,6 +2235,7 @@ pub const Session = struct {
         const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
         const pending = try self.host.pendingCopy(a);
         const batch = try listPending(a, with_records, pending);
+        write_test_controls.recordWriteBatch(batch.events);
         const seq = if (self.import_ts) |ts| try self.handle.appendAt(batch.events, ts) else try self.handle.append(batch.events);
         if (batch.listed) self.host.listed(pending);
         if (due) |records| self.host.recordsWritten(records);
@@ -2666,7 +2676,7 @@ pub const Session = struct {
             };
             image.blob_path = self.prompt_blobs.get(digest);
         }
-        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id } });
+        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id, .input_id = user.input_id } });
     }
 
     /// Streams the turn so far (`AgentRuntimeDeps.append_turn_piece`): the
@@ -2701,7 +2711,7 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked(self.capture_turn);
         // On a missing handle the list keeps the pieces before it.
@@ -2953,6 +2963,355 @@ pub const Session = struct {
         return self.handle.ranOnlyIn(self.alloc, workspace);
     }
 
+    pub const PendingAcceptedImage = struct {
+        id: usize,
+        path: []u8,
+        media_type: []u8,
+        snapshot_path: []u8,
+        snapshot_sha256: []u8,
+
+        pub fn deinit(self: PendingAcceptedImage, alloc: Allocator) void {
+            alloc.free(self.path);
+            alloc.free(self.media_type);
+            alloc.free(self.snapshot_path);
+            alloc.free(self.snapshot_sha256);
+        }
+    };
+
+    /// Accepted prompts read from the session log. Caller owns `ids`, `texts`,
+    /// and `images`, and frees them with `deinit(alloc)`.
+    pub const PendingAcceptedInputs = struct {
+        ids: []u64,
+        texts: [][]u8,
+        images: [][]PendingAcceptedImage,
+
+        pub fn deinit(self: *PendingAcceptedInputs, alloc: Allocator) void {
+            for (self.texts) |t| alloc.free(t);
+            alloc.free(self.texts);
+            for (self.images) |list| {
+                for (list) |img| img.deinit(alloc);
+                alloc.free(list);
+            }
+            alloc.free(self.images);
+            alloc.free(self.ids);
+            self.* = undefined;
+        }
+    };
+
+    /// Records `input_accepted` without fsync and returns the assigned id,
+    /// strictly above any id previously seen in this session's log. Texts larger
+    /// than `max_inline_piece_bytes` are stored as a session blob like `itemAs`
+    /// when the session is live on disk. Allocates no returned memory.
+    pub fn recordInputAccepted(self: *Session, text: []const u8) !u64 {
+        return self.recordInputAcceptedWithImages(text, &.{});
+    }
+
+    /// As `recordInputAccepted`, also storing snapshot file references (never
+    /// image bytes) for each attachment that has a snapshot path and SHA-256.
+    pub fn recordInputAcceptedWithImages(
+        self: *Session,
+        text: []const u8,
+        images: []const types.ImageAttachment,
+    ) !u64 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const prev_max = self.max_seen_input_id orelse blk: {
+            const scanned = try self.scanMaxInputIdLocked();
+            self.max_seen_input_id = scanned;
+            break :blk scanned;
+        };
+        const input_id = std.math.add(u64, prev_max, 1) catch return error.InvalidArgument;
+
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const image_refs = try buildAcceptedImageRefs(a, images);
+
+        if (text.len > max_inline_piece_bytes) {
+            if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidArgument;
+            if (self.handle.putBlob(text)) |hash| {
+                var ref_buf: [128]u8 = undefined;
+                var w = std.Io.Writer.fixed(&ref_buf);
+                try w.print("{{\"{s}\":\"{s}\"}}", .{ blob_ref_key, &hash });
+                const refs = [_][]const u8{&hash};
+                _ = try self.write(&.{.{ .input_accepted = .{
+                    .id = input_id,
+                    .text = w.buffered(),
+                    .blobs = &refs,
+                    .images = image_refs,
+                } }});
+                self.max_seen_input_id = input_id;
+                return input_id;
+            } else |err| switch (err) {
+                // Before turn 1, the session is held in memory without a blobs directory.
+                error.InvalidTransition => {},
+                else => return err,
+            }
+        }
+        _ = try self.write(&.{.{ .input_accepted = .{
+            .id = input_id,
+            .text = text,
+            .images = image_refs,
+        } }});
+        self.max_seen_input_id = input_id;
+        return input_id;
+    }
+
+    fn buildAcceptedImageRefs(
+        a: Allocator,
+        images: []const types.ImageAttachment,
+    ) ![]const sm.Body.InputAcceptedImage {
+        if (images.len == 0) return &.{};
+        var refs: std.ArrayList(sm.Body.InputAcceptedImage) = .empty;
+        for (images) |img| {
+            const snap_path = img.snapshot_path orelse {
+                debug_trace.logf("session", "event=input_accepted_image_skipped id={d} reason=no_snapshot_path", .{img.id});
+                continue;
+            };
+            const snap_sha = img.snapshot_sha256 orelse {
+                debug_trace.logf("session", "event=input_accepted_image_skipped id={d} reason=no_snapshot_sha256", .{img.id});
+                continue;
+            };
+            if (img.id == 0 or img.path.len == 0 or img.media_type.len == 0) continue;
+            try refs.append(a, .{
+                .id = img.id,
+                .path = img.path,
+                .media_type = img.media_type,
+                .snapshot_path = snap_path,
+                .snapshot_sha256 = snap_sha,
+            });
+        }
+        return refs.items;
+    }
+
+    /// Records `input_withdrawn` for `input_id`. Allocates no returned memory.
+    pub fn recordInputWithdrawn(self: *Session, input_id: u64) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        _ = try self.write(&.{.{ .input_withdrawn = .{ .id = input_id } }});
+    }
+
+    /// Records `input_withdrawn` for all `ids` in one batch write. Allocates
+    /// only internal scratch memory.
+    pub fn recordInputsWithdrawn(self: *Session, ids: []const u64) !void {
+        if (ids.len == 0) return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const events = try arena.allocator().alloc(sm.Event, ids.len);
+        for (ids, events) |input_id, *event| event.* = .{ .input_withdrawn = .{ .id = input_id } };
+        _ = try self.write(events);
+    }
+
+    /// Result of scanning a session log for pending accepted inputs.
+    pub const PendingInputsScan = struct {
+        pending: PendingAcceptedInputs,
+        max_seen_input_id: u64,
+
+        pub fn deinit(self: *PendingInputsScan, alloc: Allocator) void {
+            self.pending.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    /// Records `max_id` if higher than any input id already observed on `self`.
+    pub fn observeMaxInputId(self: *Session, max_id: u64) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.max_seen_input_id = if (self.max_seen_input_id) |seen| @max(seen, max_id) else max_id;
+    }
+
+    /// A reader of this session's log for background pending-input restore.
+    /// Retains the session's `BlobHost` and never touches `*Session`, so the
+    /// session can close while the background scan runs.
+    pub fn pendingInputsReader(self: *Session) PendingInputsReader {
+        BlobHost.retain(self.host);
+        return .{
+            .store = self.store,
+            .host = self.host,
+            .up_to_seq = self.opened_last_seq,
+        };
+    }
+
+    /// Reads the entire log from the start (ignoring snapshots) and returns,
+    /// in log order, every `input_accepted` id and text with neither
+    /// `input_delivered` nor `input_withdrawn`. Caller owns the returned
+    /// `PendingAcceptedInputs` and must call `deinit(alloc)`.
+    pub fn pendingAcceptedInputs(self: *Session, alloc: Allocator) !PendingAcceptedInputs {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const scan = try scanPendingAcceptedInputs(self.source(), alloc, null, null);
+        self.max_seen_input_id = if (self.max_seen_input_id) |seen|
+            @max(seen, scan.max_seen_input_id)
+        else
+            scan.max_seen_input_id;
+        return scan.pending;
+    }
+
+    fn scanPendingAcceptedInputs(
+        src: Source,
+        alloc: Allocator,
+        up_to_seq: ?u64,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !PendingInputsScan {
+        const AcceptedItem = struct { id: u64, text: []u8, images: []PendingAcceptedImage };
+        var accepted: std.ArrayList(AcceptedItem) = .empty;
+        var moved = false;
+        errdefer if (!moved) {
+            for (accepted.items) |item_entry| {
+                alloc.free(item_entry.text);
+                for (item_entry.images) |img| img.deinit(alloc);
+                alloc.free(item_entry.images);
+            }
+            accepted.deinit(alloc);
+        };
+        var settled: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer settled.deinit(alloc);
+
+        var max_id: u64 = 0;
+        var from: sm.From = .start;
+        while (true) {
+            if (cancel_requested) |flag| {
+                if (flag.load(.acquire)) return error.PendingInputRestoreCancelled;
+            }
+            var page = try src.readTo(alloc, from, .forward, replay_page_lines);
+            defer page.deinit();
+            var reached_limit = false;
+            for (page.entries) |entry| {
+                if (up_to_seq) |limit| {
+                    if (entry.seq > limit) {
+                        reached_limit = true;
+                        break;
+                    }
+                }
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .input_accepted => |a| {
+                        max_id = @max(max_id, a.id);
+                        const copy = try acceptedInputText(src, alloc, a);
+                        errdefer alloc.free(copy);
+                        const imgs = try dupePendingAcceptedImages(alloc, a.images);
+                        errdefer {
+                            for (imgs) |img| img.deinit(alloc);
+                            alloc.free(imgs);
+                        }
+                        try accepted.append(alloc, .{ .id = a.id, .text = copy, .images = imgs });
+                    },
+                    .input_delivered, .input_withdrawn => |r| {
+                        max_id = @max(max_id, r.id);
+                        try settled.put(alloc, r.id, {});
+                    },
+                    else => {},
+                }
+            }
+            if (reached_limit) break;
+            from = .{ .at = page.next orelse break };
+        }
+
+        var pending_count: usize = 0;
+        for (accepted.items) |item_entry| {
+            if (!settled.contains(item_entry.id)) pending_count += 1;
+        }
+        const ids = try alloc.alloc(u64, pending_count);
+        errdefer alloc.free(ids);
+        const texts = try alloc.alloc([]u8, pending_count);
+        errdefer alloc.free(texts);
+        const images_out = try alloc.alloc([]PendingAcceptedImage, pending_count);
+        moved = true;
+
+        var out: usize = 0;
+        for (accepted.items) |item_entry| {
+            if (settled.contains(item_entry.id)) {
+                alloc.free(item_entry.text);
+                for (item_entry.images) |img| img.deinit(alloc);
+                alloc.free(item_entry.images);
+            } else {
+                ids[out] = item_entry.id;
+                texts[out] = item_entry.text;
+                images_out[out] = item_entry.images;
+                out += 1;
+            }
+        }
+        accepted.deinit(alloc);
+        return .{
+            .pending = .{ .ids = ids, .texts = texts, .images = images_out },
+            .max_seen_input_id = max_id,
+        };
+    }
+
+    fn dupePendingAcceptedImages(
+        alloc: Allocator,
+        refs: []const sm.Body.InputAcceptedImage,
+    ) ![]PendingAcceptedImage {
+        if (refs.len == 0) return &.{};
+        const out = try alloc.alloc(PendingAcceptedImage, refs.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |img| img.deinit(alloc);
+            alloc.free(out);
+        }
+        for (refs) |ref| {
+            const img_id = std.math.cast(usize, ref.id) orelse return error.InvalidSessionFormat;
+            const path = try alloc.dupe(u8, ref.path);
+            errdefer alloc.free(path);
+            const media_type = try alloc.dupe(u8, ref.media_type);
+            errdefer alloc.free(media_type);
+            const snapshot_path = try alloc.dupe(u8, ref.snapshot_path);
+            errdefer alloc.free(snapshot_path);
+            const snapshot_sha256 = try alloc.dupe(u8, ref.snapshot_sha256);
+            out[built] = .{
+                .id = img_id,
+                .path = path,
+                .media_type = media_type,
+                .snapshot_path = snapshot_path,
+                .snapshot_sha256 = snapshot_sha256,
+            };
+            built += 1;
+        }
+        return out;
+    }
+
+    fn acceptedInputText(src: Source, alloc: Allocator, accepted: sm.Body.InputAccepted) ![]u8 {
+        if (blobRefOf(accepted.text)) |hash| {
+            const listed = for (accepted.blobs) |ref| {
+                if (std.mem.eql(u8, ref, hash)) break true;
+            } else false;
+            if (listed) {
+                return src.store.manager.getBlob(alloc, src.id, hash) catch |err| switch (err) {
+                    error.NotFound, error.Corrupt => {
+                        debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
+                        return error.InvalidSessionFormat;
+                    },
+                    else => |e| return e,
+                };
+            }
+        }
+        return alloc.dupe(u8, accepted.text);
+    }
+
+    fn scanMaxInputIdLocked(self: *Session) !u64 {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        var max_id: u64 = 0;
+        var from: sm.From = .start;
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            var page = try self.source().readTo(scratch.allocator(), from, .forward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .input_accepted => |a| max_id = @max(max_id, a.id),
+                    .input_delivered, .input_withdrawn => |r| max_id = @max(max_id, r.id),
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return max_id;
+    }
+
     pub fn interruptedRequest(self: *Session) !?InterruptedRequest {
         var state = try self.handle.state(self.alloc);
         defer state.deinit(self.alloc);
@@ -3099,6 +3458,11 @@ pub const Session = struct {
                 try batch.append(a, .{ .item = try self.itemAs(a, cancelled_wait_type, data) });
             }
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
+            switch (event) {
+                .user => |u| if (u.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
+                .steering => |s| if (s.input_id) |input_id| try batch.append(a, .{ .input_delivered = .{ .id = input_id } }),
+                else => {},
+            }
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
             if (try encodeSubagentStarted(a, event)) |data| {
                 try batch.append(a, .{ .item = try self.itemAs(a, subagent_started_type, data) });
@@ -4336,6 +4700,33 @@ pub const CycleReader = struct {
     /// when reading stopped at a damaged line, so turns are missing.
     pub fn visitHistoryCycle(self: *const CycleReader, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
         return visitCycle(self.source(), alloc, start, visitor);
+    }
+};
+
+/// A session's log as a background thread scans it for pending accepted
+/// inputs (`Session.pendingInputsReader`). Holds `BlobHost` and never touches
+/// `*Session`.
+pub const PendingInputsReader = struct {
+    store: *Store,
+    host: *BlobHost,
+    up_to_seq: u64,
+
+    pub fn deinit(self: *PendingInputsReader) void {
+        BlobHost.release(self.host);
+        self.* = undefined;
+    }
+
+    fn source(self: *const PendingInputsReader) Source {
+        return .{ .store = self.store, .id = self.host.id, .host = self.host };
+    }
+
+    /// Caller owns the returned `PendingInputsScan` and frees it with `deinit(alloc)`.
+    pub fn read(
+        self: *const PendingInputsReader,
+        alloc: Allocator,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !Session.PendingInputsScan {
+        return Session.scanPendingAcceptedInputs(self.source(), alloc, self.up_to_seq, cancel_requested);
     }
 };
 
@@ -5877,7 +6268,7 @@ noinline fn replay(
                     try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed, .input_accepted, .input_delivered, .input_withdrawn => {},
             }
         }
         // Only a replay that reads past the last good line loses lines: one
@@ -6698,6 +7089,7 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
             defer scratch.deinit();
             try std.json.Stringify.value(try WireUser.of(scratch.allocator(), user), .{}, &out.writer);
         },
+        .steering => |steering| try std.json.Stringify.value(session_event.ConversationText{ .text = steering.text }, .{}, &out.writer),
         inline else => |payload| try std.json.Stringify.value(payload, .{}, &out.writer),
     }
     return out.toOwnedSlice();
@@ -6719,6 +7111,7 @@ fn decodeModelCall(arena: Allocator, data: []const u8) ?types.ModelCallRecord {
 fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
     const event: Event = switch (kind) {
         .user => .{ .user = try (try json_decode.parseFromSliceLeaky(WireUser, arena, data, .{ .allocate = allocate })).toUser(arena) },
+        .steering => .{ .steering = .{ .text = (try json_decode.parseFromSliceLeaky(session_event.ConversationText, arena, data, .{ .allocate = allocate })).text } },
         inline else => |tag| @unionInit(Event, @tagName(tag), try json_decode.parseFromSliceLeaky(
             @FieldType(Event, @tagName(tag)),
             arena,
@@ -7684,7 +8077,7 @@ fn turnLines(a: Allocator, manager: *sm.Manager, id: []const u8) ![]const []cons
                 try a.print("item {s}", .{piece.type}),
             .turn_interrupted => |ended| try a.print("turn_interrupted {t}", .{ended.reason}),
             .turn_started, .turn_committed => @tagName(body),
-            .session_created, .compacted, .set, .child_spawned, .child_finished, .snapshot, .closed => continue,
+            .session_created, .compacted, .set, .child_spawned, .child_finished, .snapshot, .closed, .input_accepted, .input_delivered, .input_withdrawn => continue,
         };
         try lines.append(a, line);
     }
@@ -14700,4 +15093,343 @@ test "forkSession copies side folders, never a link, and reports when one is ski
     defer testing.allocator.free(top);
     try testing.expectEqualStrings("top", top);
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+const RecordedWriteEntry = struct {
+    kind: std.meta.Tag(sm.Event),
+    item_type: ?[]u8 = null,
+    input_id: ?u64 = null,
+};
+
+const RecordedWriteBatch = struct {
+    entries: []RecordedWriteEntry,
+};
+
+const WriteBatchRecorder = struct {
+    var active: ?*WriteBatchRecorder = null;
+    alloc: Allocator,
+    batches: std.ArrayList(RecordedWriteBatch) = .empty,
+
+    fn install(self: *WriteBatchRecorder) void {
+        active = self;
+        write_test_controls.test_write_sink = onWrite;
+    }
+
+    fn uninstall(self: *WriteBatchRecorder) void {
+        write_test_controls.test_write_sink = null;
+        active = null;
+        for (self.batches.items) |batch| {
+            for (batch.entries) |entry| if (entry.item_type) |name| self.alloc.free(name);
+            self.alloc.free(batch.entries);
+        }
+        self.batches.deinit(self.alloc);
+    }
+
+    fn onWrite(events_ptr: ?*const anyopaque, len: usize) void {
+        const self = active orelse return;
+        const events: []const sm.Event = if (len > 0) @as([*]const sm.Event, @ptrCast(@alignCast(events_ptr.?)))[0..len] else &.{};
+        const entries = self.alloc.alloc(RecordedWriteEntry, events.len) catch return;
+        var built: usize = 0;
+        errdefer {
+            for (entries[0..built]) |entry| if (entry.item_type) |name| self.alloc.free(name);
+            self.alloc.free(entries);
+        }
+        for (events, entries) |event, *out| {
+            out.* = switch (event) {
+                .item => |piece| .{
+                    .kind = .item,
+                    .item_type = self.alloc.dupe(u8, piece.type) catch return,
+                },
+                .input_accepted => |accepted| .{ .kind = .input_accepted, .input_id = accepted.id },
+                .input_delivered => |delivered| .{ .kind = .input_delivered, .input_id = delivered.id },
+                .input_withdrawn => |withdrawn| .{ .kind = .input_withdrawn, .input_id = withdrawn.id },
+                else => .{ .kind = std.meta.activeTag(event) },
+            };
+            built += 1;
+        }
+        self.batches.append(self.alloc, .{ .entries = entries }) catch return;
+    }
+};
+
+test "encodePiece omits input_id from user and steering wire JSON" {
+    const a = testing.allocator;
+    const plain_user = try encodePiece(a, .{ .user = .{ .text = "hello" } });
+    defer a.free(plain_user);
+    const tagged_user = try encodePiece(a, .{ .user = .{ .text = "hello", .input_id = 42 } });
+    defer a.free(tagged_user);
+    try testing.expectEqualStrings(plain_user, tagged_user);
+    try testing.expect(std.mem.find(u8, tagged_user, "input_id") == null);
+
+    const plain_steering = try encodePiece(a, .{ .steering = .{ .text = "adjust" } });
+    defer a.free(plain_steering);
+    const tagged_steering = try encodePiece(a, .{ .steering = .{ .text = "adjust", .input_id = 7 } });
+    defer a.free(tagged_steering);
+    try testing.expectEqualStrings(plain_steering, tagged_steering);
+    try testing.expect(std.mem.find(u8, tagged_steering, "input_id") == null);
+}
+
+test "steering write with input_id emits item steering and input_delivered in one batch with consecutive seq" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var recorder = WriteBatchRecorder{ .alloc = testing.allocator };
+    recorder.install();
+    defer recorder.uninstall();
+
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+    const user: types.UserTurn = .{ .text = @constCast("first prompt") };
+    try s.appendProgress(user, .{}, .{});
+
+    var steer = [_]types.PersistedSteering{.{
+        .text = @constCast("adjust plan"),
+        .after_tool_step_count = 0,
+        .input_id = 7,
+    }};
+    const before_batches = recorder.batches.items.len;
+    try s.appendProgress(user, .{ .steering = &steer }, .{});
+    const after_batches = recorder.batches.items.len;
+    try testing.expectEqual(before_batches + 1, after_batches);
+
+    const batch = recorder.batches.items[before_batches];
+    var found_in_batch = false;
+    for (0..batch.entries.len -| 1) |i| {
+        const cur = batch.entries[i];
+        const next = batch.entries[i + 1];
+        if (cur.kind == .item and cur.item_type != null and std.mem.eql(u8, cur.item_type.?, "steering") and
+            next.kind == .input_delivered and next.input_id == @as(?u64, 7))
+        {
+            found_in_batch = true;
+            break;
+        }
+    }
+    try testing.expect(found_in_batch);
+    s.close();
+
+    var page = try t.store.manager.read(testing.allocator, sid, .start, .forward, 100);
+    defer page.deinit();
+    var steer_seq: ?u64 = null;
+    var steer_ts: ?u64 = null;
+    var delivered_seq: ?u64 = null;
+    var delivered_ts: ?u64 = null;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        switch (body) {
+            .item => |piece| if (std.mem.eql(u8, piece.type, "steering")) {
+                try testing.expect(std.mem.find(u8, piece.data, "input_id") == null);
+                steer_seq = entry.seq;
+                steer_ts = entry.ts_ms;
+            },
+            .input_delivered => |d| if (d.id == 7) {
+                delivered_seq = entry.seq;
+                delivered_ts = entry.ts_ms;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(steer_seq != null);
+    try testing.expectEqual(steer_seq.? + 1, delivered_seq.?);
+    try testing.expectEqual(steer_ts, delivered_ts);
+}
+
+test "second write repeating streamed piece adds no second input_delivered marker" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+
+    const id1 = try s.recordInputAccepted("prompt");
+    const user: types.UserTurn = .{ .text = @constCast("prompt"), .input_id = id1 };
+    try s.appendProgress(user, .{}, .{});
+    const id2 = try s.recordInputAccepted("steer");
+    var steer = [_]types.PersistedSteering{.{ .text = @constCast("steer"), .after_tool_step_count = 0, .input_id = id2 }};
+    try s.appendProgress(user, .{ .steering = &steer }, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .steering = &steer } } }, types.ConversationLanguage.default());
+    s.close();
+
+    var page = try t.store.manager.read(testing.allocator, sid, .start, .forward, 100);
+    defer page.deinit();
+    var user_markers: usize = 0;
+    var steer_markers: usize = 0;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body == .input_delivered) {
+            if (body.input_delivered.id == id1) user_markers += 1;
+            if (body.input_delivered.id == id2) steer_markers += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), user_markers);
+    try testing.expectEqual(@as(usize, 1), steer_markers);
+}
+
+test "user piece first landing at commit gets input_delivered in the commit batch" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var recorder = WriteBatchRecorder{ .alloc = testing.allocator };
+    recorder.install();
+    defer recorder.uninstall();
+
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+
+    const id1 = try s.recordInputAccepted("commit-only prompt");
+    const before_batches = recorder.batches.items.len;
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("commit-only prompt"), .input_id = id1 },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    const after_batches = recorder.batches.items.len;
+    try testing.expectEqual(before_batches + 1, after_batches);
+
+    const batch = recorder.batches.items[before_batches];
+    var saw_user = false;
+    var saw_delivered = false;
+    var saw_committed = false;
+    for (0..batch.entries.len) |i| {
+        const cur = batch.entries[i];
+        if (cur.kind == .item and cur.item_type != null and std.mem.eql(u8, cur.item_type.?, "user")) {
+            saw_user = true;
+            if (i + 1 < batch.entries.len and batch.entries[i + 1].kind == .input_delivered and batch.entries[i + 1].input_id == @as(?u64, id1)) {
+                saw_delivered = true;
+            }
+        }
+        if (cur.kind == .turn_committed) saw_committed = true;
+    }
+    try testing.expect(saw_user and saw_delivered and saw_committed);
+    s.close();
+
+    var page = try t.store.manager.read(testing.allocator, sid, .start, .forward, 100);
+    defer page.deinit();
+    var user_seq: ?u64 = null;
+    var delivered_seq: ?u64 = null;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        switch (body) {
+            .item => |piece| if (std.mem.eql(u8, piece.type, "user")) {
+                try testing.expect(std.mem.find(u8, piece.data, "input_id") == null);
+                user_seq = entry.seq;
+            },
+            .input_delivered => |d| if (d.id == id1) {
+                delivered_seq = entry.seq;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(user_seq.? + 1, delivered_seq.?);
+}
+
+test "pendingAcceptedInputs returns accepted minus delivered minus withdrawn in log order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var recorder = WriteBatchRecorder{ .alloc = testing.allocator };
+    recorder.install();
+    defer recorder.uninstall();
+
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+
+    const id1 = try s.recordInputAccepted("withdrawn single");
+    const id2 = try s.recordInputAccepted("delivered prompt");
+    const id3 = try s.recordInputAccepted("pending one");
+    const id4 = try s.recordInputAccepted("pending two");
+    const id5 = try s.recordInputAccepted("pending three");
+
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("delivered prompt"), .input_id = id2 },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    try s.recordInputWithdrawn(id1);
+
+    var first = try s.pendingAcceptedInputs(testing.allocator);
+    defer first.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{ id3, id4, id5 }, first.ids);
+    try testing.expectEqual(@as(usize, 3), first.texts.len);
+    try testing.expectEqualStrings("pending one", first.texts[0]);
+    try testing.expectEqualStrings("pending two", first.texts[1]);
+    try testing.expectEqualStrings("pending three", first.texts[2]);
+
+    const before_batches = recorder.batches.items.len;
+    try s.recordInputsWithdrawn(&.{ id3, id5 });
+    try testing.expectEqual(before_batches + 1, recorder.batches.items.len);
+    try testing.expectEqual(@as(usize, 2), recorder.batches.items[before_batches].entries.len);
+
+    var second = try s.pendingAcceptedInputs(testing.allocator);
+    defer second.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{id4}, second.ids);
+    try testing.expectEqual(@as(usize, 1), second.texts.len);
+    try testing.expectEqualStrings("pending two", second.texts[0]);
+}
+
+test "accepted input ids continue after session reopen" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+
+    const id1 = try s.recordInputAccepted("first");
+    const id2 = try s.recordInputAccepted("second");
+    try testing.expectEqual(@as(u64, 1), id1);
+    try testing.expectEqual(@as(u64, 2), id2);
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("first"), .input_id = id1 },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    s.close();
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = sid }, "/w", .app);
+    defer reopened.close();
+    const id3 = try reopened.recordInputAccepted("third");
+    try testing.expectEqual(@as(u64, 3), id3);
+
+    var pending = try reopened.pendingAcceptedInputs(testing.allocator);
+    defer pending.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{ id2, id3 }, pending.ids);
+}
+
+test "input records held before turn 1 publish with turn 1" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const sid = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(sid);
+
+    const id1 = try s.recordInputAccepted("held pending");
+    const id2 = try s.recordInputAccepted("held withdrawn");
+    try s.recordInputWithdrawn(id2);
+    try testing.expect(!s.saved());
+
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn one") },
+        .assistant = @constCast("ok"),
+    } }, types.ConversationLanguage.default());
+    try testing.expect(s.saved());
+    s.close();
+
+    const reopened = try Session.resumeSession(testing.allocator, &t.store, .{ .id = sid }, "/w", .app);
+    defer reopened.close();
+    var pending = try reopened.pendingAcceptedInputs(testing.allocator);
+    defer pending.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &.{id1}, pending.ids);
+    try testing.expectEqual(@as(usize, 1), pending.texts.len);
+    try testing.expectEqualStrings("held pending", pending.texts[0]);
+
+    var restored = try reopened.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored.history.len);
+    try testing.expectEqualStrings("turn one", restored.history[0].assistant.user.text);
 }

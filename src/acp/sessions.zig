@@ -958,6 +958,7 @@ fn handleRestoreSession(
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
+    try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
 
     setObserverHooks(state, observer_hooks);
@@ -1158,6 +1159,7 @@ fn reloadActiveSession(
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
+    try notifyPendingAcceptedInputs(state, alloc, session_id);
     try sendActiveSessionInfoUpdate(state, alloc);
     return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
 }
@@ -2020,6 +2022,56 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+fn formatPendingInputsNotice(alloc: Allocator, texts: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (texts.len == 1) {
+        try out.writer.writeAll("1 prompt you sent before fx stopped was not delivered:");
+    } else {
+        try out.writer.print("{d} prompts you sent before fx stopped were not delivered:", .{texts.len});
+    }
+    for (texts) |text| {
+        try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(text);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Reports pending accepted prompts on load/resume through `agent_message_chunk`
+/// (same channel as `interruptedTurnNotice` and `ConversionNotice`), then marks
+/// them withdrawn so they are never sent to the model or re-reported.
+fn notifyPendingAcceptedInputs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+) !void {
+    const active = if (state.active_session) |*value| value else return;
+    const v2 = active.v2 orelse return;
+    var pending = blk: {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        break :blk v2.pendingAcceptedInputs(alloc) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("session", "event=pending_accepted_inputs_read_failed surface=acp err={s}", .{@errorName(err)});
+                return;
+            },
+        };
+    };
+    defer pending.deinit(alloc);
+    if (pending.ids.len == 0) return;
+
+    const notice = try formatPendingInputsNotice(alloc, pending.texts);
+    defer alloc.free(notice);
+    try sendAgentHistoryChunk(state, alloc, session_id, notice);
+
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    v2.recordInputsWithdrawn(pending.ids) catch |err| {
+        debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ pending.ids.len, @errorName(err) });
+    };
 }
 
 fn sendAvailableCommands(state: *server.ServerState, alloc: Allocator, session_id: []const u8, commands_json: []const u8) !void {
@@ -3573,4 +3625,100 @@ test "libfx/new rejects a session id that is not header and path safe" {
     }
     const long = "{\"sessionId\":\"" ++ text_utils.repeat("a", 256) ++ "\"}";
     try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
+}
+
+test "eb03: formatPendingInputsNotice formats singular and plural notices with prompt texts" {
+    const alloc = std.testing.allocator;
+    const single = try formatPendingInputsNotice(alloc, &.{"first steer"});
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings(
+        "1 prompt you sent before fx stopped was not delivered:\n\nfirst steer",
+        single,
+    );
+
+    const multiple = try formatPendingInputsNotice(alloc, &.{ "first steer", "second steer" });
+    defer alloc.free(multiple);
+    try std.testing.expectEqualStrings(
+        "2 prompts you sent before fx stopped were not delivered:\n\nfirst steer\n\nsecond steer",
+        multiple,
+    );
+}
+
+test "eb03: ACP session/load and session/resume report pending accepted inputs once without altering history" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+        const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home_path);
+        const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+        defer alloc.free(workspace_path);
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-pending.jsonl", .{ .read = true });
+        defer capture.close(io_mod.getIo());
+        var state = try initAcpSessionTestState(arena, workspace_path, capture);
+        defer state.deinit();
+        state.cfg.auth_mode = .host_managed;
+        state.credential_source = .host_managed;
+        state.cfg.allow_acp_mcp = false;
+        state.cfg.home_override = home_path;
+        state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+        var new_msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/new",
+            .params_raw = "{\"mcpServers\":[]}",
+        };
+        try handleNewSession(&state, arena, &new_msg);
+        const v2 = state.active_session.?.v2.?;
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("initial turn") },
+            .assistant = @constCast("initial reply"),
+        } }, types.ConversationLanguage.default());
+        _ = try v2.recordInputAccepted("undelivered steer one");
+        _ = try v2.recordInputAccepted("undelivered steer two");
+        const sid = try arena.dupe(u8, state.active_session.?.session_id);
+        try server.releaseActiveSession(&state);
+
+        // Truncate the capture file before the first restore so we inspect only restore output.
+        var restore_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-restore.jsonl", .{ .read = true });
+        defer restore_capture.close(io_mod.getIo());
+        state.writer = .{ .stdout = restore_capture };
+
+        var restore_msg = jsonrpc.Message{
+            .id = .{ .integer = 2 },
+            .method = if (restore == handleLoadSession) "session/load" else "session/resume",
+            .params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{sid}),
+        };
+        try restore(&state, arena, &restore_msg);
+        try restore_capture.sync(io_mod.getIo());
+
+        var read_first = try tmp.dir.openFile(io_mod.getIo(), "acp-restore.jsonl", .{});
+        defer read_first.close(io_mod.getIo());
+        const first_out = try io_mod.readFileToEnd(alloc, &read_first, 64 * 1024);
+        defer alloc.free(first_out);
+        try std.testing.expect(std.mem.find(u8, first_out, "2 prompts you sent before fx stopped were not delivered:") != null);
+        try std.testing.expect(std.mem.find(u8, first_out, "undelivered steer one") != null);
+        try std.testing.expect(std.mem.find(u8, first_out, "undelivered steer two") != null);
+        try std.testing.expectEqual(@as(usize, 1), state.active_session.?.session_rt.agent.history.items.len);
+
+        // A second restore does not report them again.
+        try server.releaseActiveSession(&state);
+        var second_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-restore-2.jsonl", .{ .read = true });
+        defer second_capture.close(io_mod.getIo());
+        state.writer = .{ .stdout = second_capture };
+        try restore(&state, arena, &restore_msg);
+        try second_capture.sync(io_mod.getIo());
+        var read_second = try tmp.dir.openFile(io_mod.getIo(), "acp-restore-2.jsonl", .{});
+        defer read_second.close(io_mod.getIo());
+        const second_out = try io_mod.readFileToEnd(alloc, &read_second, 64 * 1024);
+        defer alloc.free(second_out);
+        try std.testing.expect(std.mem.find(u8, second_out, "were not delivered:") == null);
+    }
 }

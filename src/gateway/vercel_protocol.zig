@@ -2433,3 +2433,25 @@ test "freeGatewayCompletion frees parsed completions under testing allocator" {
     const completion = try parseGatewayCompletion(alloc, body);
     freeGatewayCompletion(alloc, completion);
 }
+
+test "eb03: ChatMessage.input_id leaves Vercel Gateway request body byte-identical" {
+    const alloc = std.testing.allocator;
+    const tool_call = ToolCall{ .id = "call_1", .name = "read_file", .arguments_json = "{}" };
+    const without_id = [_]ChatMessage{
+        .{ .role = .system, .content = "Be concise.", .cache_breakpoint = true },
+        .{ .role = .user, .content = "initial prompt" },
+        .{ .role = .assistant, .tool_calls = &.{tool_call} },
+        .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "ok", .tool_result_status = .success },
+        .{ .role = .user, .content = "follow up steer", .restored_steering = true },
+    };
+    var with_id = without_id;
+    with_id[1].input_id = 42;
+    with_id[4].input_id = 43;
+
+    const body_without = try buildGatewayRequestBodyWithOptions(alloc, "[]", &without_id, .{ .prompt_caching = true }, .auto);
+    defer alloc.free(body_without);
+    const body_with = try buildGatewayRequestBodyWithOptions(alloc, "[]", &with_id, .{ .prompt_caching = true }, .auto);
+    defer alloc.free(body_with);
+
+    try std.testing.expectEqualStrings(body_without, body_with);
+}

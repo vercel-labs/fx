@@ -33,6 +33,8 @@ const Entry = struct {
     request_id: ?RequestId = null,
     /// The libfx input id a journaled session records the text under.
     input_id: ?[]u8 = null,
+    /// The v2 session log id recorded when an ACP steer enters the queue.
+    v2_input_id: ?u64 = null,
 };
 
 /// Steering drained at one boundary, allocated in the caller's allocator.
@@ -40,6 +42,11 @@ pub const Drained = struct {
     texts: [][]u8,
     request_ids: []?RequestId,
     input_ids: []?[]u8 = &.{},
+    v2_input_ids: []?u64 = &.{},
+};
+
+pub const QueuedRequest = struct {
+    v2_input_id: ?u64 = null,
 };
 
 /// A libfx input id: 1 to 128 letters, digits, `.`, `_`, or `-`.
@@ -314,7 +321,17 @@ pub const Runtime = struct {
     /// Queues a libfx input under `input_id`, which no queued entry may share.
     pub fn enqueueInput(self: *Runtime, alloc: Allocator, text: []const u8, input_id: []const u8) InputError!void {
         if (!validInputId(input_id)) return error.InvalidInputId;
-        return self.enqueueEntry(alloc, text, null, input_id);
+        return self.enqueueEntry(alloc, text, null, input_id, null);
+    }
+
+    pub fn hasInput(self: *Runtime, input_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items) |entry| {
+            const id = entry.input_id orelse continue;
+            if (std.mem.eql(u8, id, input_id)) return true;
+        }
+        return false;
     }
 
     /// Removes the queued input `input_id`. False when it is not queued: the
@@ -333,6 +350,61 @@ pub const Runtime = struct {
         return false;
     }
 
+    pub fn findQueuedRequest(self: *Runtime, request_id: RequestId) ?QueuedRequest {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items) |entry| {
+            const id = entry.request_id orelse continue;
+            if (requestIdsEqual(id, request_id)) return .{ .v2_input_id = entry.v2_input_id };
+        }
+        return null;
+    }
+
+    pub fn withdrawRequest(self: *Runtime, alloc: Allocator, request_id: RequestId) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items, 0..) |entry, index| {
+            const id = entry.request_id orelse continue;
+            if (!requestIdsEqual(id, request_id)) continue;
+            const removed = self.messages.orderedRemove(index);
+            self.queued_bytes -= removed.text.len;
+            freeEntry(alloc, removed);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn collectV2InputIds(self: *Runtime, result_alloc: Allocator) Allocator.Error![]u64 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.messages.items) |entry| {
+            if (entry.v2_input_id != null) count += 1;
+        }
+        if (count == 0) return &.{};
+        const ids = try result_alloc.alloc(u64, count);
+        var copied: usize = 0;
+        for (self.messages.items) |entry| {
+            const id = entry.v2_input_id orelse continue;
+            ids[copied] = id;
+            copied += 1;
+        }
+        return ids;
+    }
+
+    pub fn validateEnqueue(self: *Runtime, text_len: usize) EnqueueError!void {
+        if (text_len == 0) return error.EmptySteeringMessage;
+        if (text_len > max_message_bytes) return error.SteeringMessageTooLarge;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.accepting) return error.SteeringNotActive;
+        if (self.messages.items.len >= max_messages or
+            self.queued_bytes > max_queued_bytes - text_len)
+        {
+            return error.SteeringQueueFull;
+        }
+    }
+
     /// Queues text for the running turn. A supplied request ID is copied and
     /// reported by `finishTurn`.
     pub fn enqueueRequest(
@@ -341,7 +413,17 @@ pub const Runtime = struct {
         text: []const u8,
         request_id: ?RequestId,
     ) EnqueueError!void {
-        return self.enqueueEntry(alloc, text, request_id, null) catch |err| switch (err) {
+        return self.enqueueRequestWithV2Id(alloc, text, request_id, null);
+    }
+
+    pub fn enqueueRequestWithV2Id(
+        self: *Runtime,
+        alloc: Allocator,
+        text: []const u8,
+        request_id: ?RequestId,
+        v2_input_id: ?u64,
+    ) EnqueueError!void {
+        return self.enqueueEntry(alloc, text, request_id, null, v2_input_id) catch |err| switch (err) {
             // Only an input id can be invalid, and none is given here.
             error.InvalidInputId => unreachable,
             else => |other| other,
@@ -354,6 +436,7 @@ pub const Runtime = struct {
         text: []const u8,
         request_id: ?RequestId,
         input_id: ?[]const u8,
+        v2_input_id: ?u64,
     ) InputError!void {
         if (text.len == 0) return error.EmptySteeringMessage;
         if (text.len > max_message_bytes) return error.SteeringMessageTooLarge;
@@ -378,7 +461,12 @@ pub const Runtime = struct {
         const owned_input = if (input_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (owned_input) |id| alloc.free(id);
         const owned_id = if (request_id) |id| try dupeRequestId(alloc, id) else null;
-        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input });
+        self.messages.appendAssumeCapacity(.{
+            .text = owned,
+            .request_id = owned_id,
+            .input_id = owned_input,
+            .v2_input_id = v2_input_id,
+        });
         self.queued_bytes += owned.len;
     }
 
@@ -410,6 +498,8 @@ pub const Runtime = struct {
         errdefer result_alloc.free(request_ids);
         const input_ids = try result_alloc.alloc(?[]u8, count);
         errdefer result_alloc.free(input_ids);
+        const v2_input_ids = try result_alloc.alloc(?u64, count);
+        errdefer result_alloc.free(v2_input_ids);
         var copied: usize = 0;
         errdefer for (0..copied) |index| {
             result_alloc.free(texts[index]);
@@ -422,6 +512,7 @@ pub const Runtime = struct {
             input_ids[index] = if (entry.input_id) |id| try result_alloc.dupe(u8, id) else null;
             errdefer if (input_ids[index]) |id| result_alloc.free(id);
             request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
+            v2_input_ids[index] = entry.v2_input_id;
             copied += 1;
         }
         // Capacity for every queued request was reserved at enqueue.
@@ -432,7 +523,7 @@ pub const Runtime = struct {
         }
         self.messages.clearRetainingCapacity();
         self.queued_bytes = 0;
-        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids };
+        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids, .v2_input_ids = v2_input_ids };
     }
 
     /// Stops accepting steering for the finished turn and reports which
@@ -517,6 +608,21 @@ pub fn freeDrained(alloc: Allocator, drained: Drained) void {
     if (drained.request_ids.len > 0) alloc.free(drained.request_ids);
     for (drained.input_ids) |maybe_id| if (maybe_id) |id| alloc.free(id);
     if (drained.input_ids.len > 0) alloc.free(drained.input_ids);
+    if (drained.v2_input_ids.len > 0) alloc.free(drained.v2_input_ids);
+}
+
+fn requestIdsEqual(lhs: RequestId, rhs: RequestId) bool {
+    return switch (lhs) {
+        .integer => |value| switch (rhs) {
+            .integer => |other| value == other,
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .null => rhs == .null,
+    };
 }
 
 fn freeEntry(alloc: Allocator, entry: Entry) void {
@@ -815,4 +921,29 @@ test "libfx steering withdraws a queued input until the turn takes it" {
     try std.testing.expectEqualStrings("in_3", drained.input_ids[1].?);
     // Taken for a model request: too late to withdraw.
     try std.testing.expect(!runtime.withdraw(alloc, "in_1"));
+}
+
+test "eb03: steering runtime carries v2_input_id, peeks ids, and withdraws request ids" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+
+    try runtime.enqueueRequestWithV2Id(alloc, "first", .{ .integer = 11 }, 101);
+    try runtime.enqueueRequestWithV2Id(alloc, "second", .{ .string = "req-2" }, 102);
+
+    const peeked = try runtime.collectV2InputIds(alloc);
+    defer alloc.free(peeked);
+    try std.testing.expectEqualSlices(u64, &.{ 101, 102 }, peeked);
+
+    try std.testing.expectEqual(@as(?u64, 101), runtime.findQueuedRequest(.{ .integer = 11 }).?.v2_input_id);
+    try std.testing.expect(runtime.withdrawRequest(alloc, .{ .integer = 11 }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, .{ .integer = 11 }));
+    try std.testing.expect(runtime.findQueuedRequest(.{ .integer = 11 }) == null);
+
+    const drained = try runtime.takeAll(alloc, alloc, false);
+    defer freeDrained(alloc, drained);
+    try std.testing.expectEqual(@as(usize, 1), drained.texts.len);
+    try std.testing.expectEqualStrings("second", drained.texts[0]);
+    try std.testing.expectEqual(@as(?u64, 102), drained.v2_input_ids[0]);
 }

@@ -380,6 +380,10 @@ pub fn Bindings(comptime App: type) type {
                 .push_route_recovery_status = agentPushRouteRecoveryStatus,
                 .save_route_recovery_status = agentSaveRouteRecoveryStatus,
                 .restore_failed_prompt = agentRestoreFailedPrompt,
+                .withdraw_accepted_input = if (comptime agents.hasAgentField(App, "session_persistence"))
+                    if (agent.session_persistence.v2 != null) agentWithdrawAcceptedInput else null
+                else
+                    null,
                 .push_command_output_complete = agentPushCommandOutputComplete,
                 .push_http_error = agentPushHttpError,
                 .refresh_gateway_credential = if (comptime @hasField(App, "auth"))
@@ -930,7 +934,7 @@ pub fn Bindings(comptime App: type) type {
             if (owned.len == 0) return &.{};
             defer worker_runtime.freeSteeringMessages(std.heap.c_allocator, owned);
             const result = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-            for (owned, result) |message, *dest| dest.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
+            for (owned, result) |message, *dest| dest.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
             return result;
         }
 
@@ -1491,6 +1495,11 @@ pub fn Bindings(comptime App: type) type {
             const app = appOf(agent);
             // pushEvent copies the payload into the queue's ownership.
             try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .restore_failed_prompt = @constCast(prompt) });
+        }
+
+        fn agentWithdrawAcceptedInput(ctx: *anyopaque, input_id: u64) !void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).withdrawAcceptedInput(agent, input_id);
         }
 
         fn agentPushCommandOutputComplete(ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
@@ -3173,4 +3182,135 @@ test "worker bridge history append fallback updates runtime history" {
         "saved",
         app.agent().session.agent.history.items[0].assistant.assistant,
     );
+}
+
+test "eb03: copyOwnedSteering preserves input_id across arena copy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const owned = try std.heap.c_allocator.alloc(worker_runtime.SteeringMessage, 2);
+    owned[0] = .{
+        .text = try std.heap.c_allocator.dupe(u8, "first"),
+        .author = .user,
+        .input_id = 77,
+    };
+    owned[1] = .{
+        .text = try std.heap.c_allocator.dupe(u8, "second"),
+        .author = .child,
+        .input_id = null,
+    };
+
+    const copied = try Bindings(FakeApp).copyOwnedSteering(arena, owned);
+    try std.testing.expectEqual(@as(usize, 2), copied.len);
+    try std.testing.expectEqualStrings("first", copied[0].text);
+    try std.testing.expectEqual(@as(?u64, 77), copied[0].input_id);
+    try std.testing.expectEqualStrings("second", copied[1].text);
+    try std.testing.expectEqual(@as(?u64, null), copied[1].input_id);
+}
+
+test "eb03: buildWorkerDeps wires withdraw_accepted_input only when v2 session is active" {
+    const alloc = std.testing.allocator;
+    const session_adapter = @import("../session/session_adapter.zig");
+    const session_codec = @import("../session/session_codec.zig");
+    const model_provider = @import("../config/model_provider.zig");
+
+    const CallbackSessionApp = struct {
+        alloc: Allocator,
+        main_agent: agents.Agent = .{},
+        shell: FakeShell = .{},
+        pacer: FakePacer = .{},
+        selected_model: std.ArrayList(u8) = .empty,
+
+        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+            return &self.main_agent;
+        }
+        fn appendRuntimeContextMessage(_: *@This(), _: anytype, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+        fn validateToolCall(_: *@This(), _: anytype, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
+            return .{ .failure = try arena.print("invalid {s}", .{call.name}) };
+        }
+        fn checkToolAvailability(_: *@This(), _: anytype, _: Allocator, _: ToolCall) !?[]const u8 {
+            return null;
+        }
+        fn requestToolPermissionSyncWithAdvertised(_: *@This(), _: anytype, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?agent_runtime.LiveToolAuthority, _: ?agent_runtime.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
+            return .{ .decision = .once, .execution_authority = .ordinary };
+        }
+        fn requestPreparedFileMutationPermissionSyncWithAdvertised(_: *@This(), _: anytype, _: Allocator, _: ToolCall, _: *tool_admission.PreparedFileMutationCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?agent_runtime.LiveToolAuthority, _: []const []const u8) !command_admission.PermissionOutcome {
+            return .{ .decision = .once, .execution_authority = .ordinary };
+        }
+        fn resolveUnselectedMcpTool(_: *@This(), _: anytype, _: Allocator, _: []const u8) !?tool_mcp_runtime.SelectedTool {
+            return null;
+        }
+        fn describeToolActionWithAdvertised(_: *@This(), _: anytype, arena: Allocator, _: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+            return arena.dupe(u8, "");
+        }
+        fn describeToolActionCompletedWithAdvertised(_: *@This(), _: anytype, arena: Allocator, _: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
+            return arena.dupe(u8, "");
+        }
+        fn describeToolActionDeniedWithAdvertised(_: *@This(), _: anytype, arena: Allocator, _: ToolCall, _: ?[]const u8, _: []const u8, _: []const []const u8) ![]const u8 {
+            return arena.dupe(u8, "");
+        }
+        fn permissionTargetForCallWithAdvertised(_: *@This(), _: anytype, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
+            return arena.dupe(u8, "");
+        }
+        fn executeToolCallWithAdvertised(_: *@This(), _: anytype, _: agent_runtime.ToolExecutionRequest) !ToolExecutionResult {
+            return .{ .model_output = "" };
+        }
+        fn publishCommittedFileHandoff(_: *@This(), _: anytype, _: types.CommittedFilePresentation) !void {}
+        fn propagateHistoryTurn(_: *@This(), _: anytype, _: types.HistoryTurn) !void {}
+        fn recordHistoryOutcome(_: *@This(), _: anytype, _: agent_runtime.HistoryOutcome) void {}
+        fn writeUserPromptCard(_: *@This(), _: anytype, _: types.UserTurn) !void {}
+        fn writeTranscript(_: *@This(), _: []const u8, _: bool) !void {}
+        fn writeDomainNotice(_: *@This(), _: types.SemanticNotice, _: bool) !void {}
+        fn pacerCallbacks(_: *@This()) void {}
+        fn writeCommandOutputChunk(_: *@This(), _: command_output_content.Stream, _: []const u8, _: bool) !void {}
+        fn flushCommandOutputSummary(_: *@This(), _: bool) !void {}
+        fn formatToolExecutionErrorForAgent(_: *@This(), arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
+            return arena.dupe(u8, @errorName(err));
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const store_ptr = try alloc.create(session_adapter.Store);
+    store_ptr.* = try session_adapter.Store.open(alloc, root);
+
+    var app = CallbackSessionApp{ .alloc = alloc };
+    app.agent().session_persistence.v2_store = store_ptr;
+    defer {
+        app_session_runtime.Runtime(CallbackSessionApp).deinitPersistence(&app, app.agent());
+        app.agent().session.deinit(alloc);
+        app.agent().worker.deinit(std.heap.c_allocator);
+        app.agent().managed_executions.deinit();
+        app.shell.lifecycle.deinit(alloc);
+        app.pacer.deinit(alloc);
+        app.selected_model.deinit(alloc);
+    }
+
+    const without_session = Bindings(CallbackSessionApp).agentRuntimeDeps(&app, app.agent());
+    try std.testing.expect(without_session.withdraw_accepted_input == null);
+
+    const prefs = session_codec.DurableSessionPreferences{
+        .provider = model_provider.ProviderId.gateway,
+        .model = @constCast("m"),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+    const v2 = try session_adapter.Session.create(alloc, store_ptr, root, .app, .{
+        .preferences = prefs,
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    app.agent().session_persistence.v2 = v2;
+
+    const with_session = Bindings(CallbackSessionApp).agentRuntimeDeps(&app, app.agent());
+    try std.testing.expect(with_session.withdraw_accepted_input != null);
+    const input_id = try v2.recordInputAccepted("restored prompt");
+    try with_session.withdraw_accepted_input.?(with_session.ctx, input_id);
+
+    var pending = try v2.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
 }
