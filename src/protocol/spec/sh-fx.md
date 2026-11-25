@@ -630,11 +630,33 @@ The leader of a session is the `fx acp` process that holds the session's lock: t
 {"socket":"/tmp/fx-leader-0123456789abcdef/s","pid":4242}
 ```
 
-The process makes its socket when it starts, in a new folder named `fx-leader-` and 16 hex characters, with mode `0700`, under `TMPDIR` when the socket's path stays at most 103 bytes, and under `/tmp` when it doesn't or when `TMPDIR` is unset or not an absolute path. It writes the line when a session becomes live, and empties the file before it releases the lock, so a normal exit leaves every lock it held empty and removes the socket and its folder. A process that is killed leaves its line and its folder behind; the next process that takes the lock replaces or empties the line. A process that can't make its socket runs without one and writes no line.
+The process makes its socket when it starts, in a new folder named `fx-leader-` and 16 hex characters, with mode `0700`, under `TMPDIR` when the socket's path stays at most 103 bytes, and under `/tmp` when it doesn't or when `TMPDIR` is unset or not an absolute path. It writes the line when a session becomes live, and empties the file before it releases the lock, so a normal exit leaves every lock it held empty and removes the socket and its folder. A process that is killed leaves its line, its socket and its folder behind. The next process that takes the lock replaces or empties the line, and removes the old socket and folder when the checks in "When the leader dies" hold. A process that can't make its socket runs without one and writes no line.
 
 The socket speaks newline-delimited JSON-RPC 2.0, as stdio does, and serves ACP as stdio does. A connection on the socket is a full ACP connection of the same process: it gets the same answers as stdio to the same requests, and it shares the process's store and session table, so a session it opens or joins is the one stdio sees. Its `initialize` answer is the stdio answer plus `_meta["sh.fx/leader"]`: the process's `pid` and the ids of the sessions it leads, `sessions`. Before it uses a line, a reader connects to its socket and checks that `sessions` lists the session: a socket that refuses the connection belongs to a process that is gone, and the session has no leader until another process takes its lock.
 
 `tests/tla/acp/AcpLeader.tla` checks which process a line names, when its socket answers, and when that process leads the session, and `tests/tla/drivers/acp/leader/driver.ts` checks the same on fx.
+
+### When the leader dies
+
+When the `fx acp` process that leads a session dies, the kernel frees its lock at once. The lock's line and the leader's socket folder stay behind until the next process takes the lock.
+
+A client that was connected to the dead leader sees its connection close. It must load the session again to reach the next leader.
+
+The next `fx acp` that loads the session takes the lock, and then:
+
+- It marks a turn that was running as interrupted, and it starts no model call until a client sends a prompt.
+- It starts with no queued prompts, no open permission questions, and no "allow for this session" grants. These lived in the dead process's memory, and none of them is restored.
+- It writes its own line to the lock. It removes the old leader's socket and folder only when all of these hold:
+  - the folder has the leader's own shape: a folder named `fx-leader-` and 16 lowercase hex characters, under an absolute base, holding a socket named `s`;
+  - the folder is a real folder, not a link, with mode `0700`, owned by the same user;
+  - a connection to the socket is refused, or the socket is gone. A socket that stays busy for 200 ms keeps the folder;
+  - the old process is gone.
+
+  Otherwise the folder stays. A removal that fails does not stop the session from opening.
+
+A process killed before any session became live leaves a folder that no lock names. fx never removes that folder.
+
+A second process that loads a session while another process holds its lock gets `Session is busy` after its wait of 2 seconds. It never joins the process that holds the lock, even when that process's socket answers.
 
 ### A host's journal
 

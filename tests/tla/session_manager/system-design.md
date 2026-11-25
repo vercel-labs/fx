@@ -119,7 +119,10 @@ lifecycle.
   The recovery checkpoint shrinks to fx's small recovery details.
 - **No truncation (D1).** An unfinished turn gets `turn_interrupted` on
   reopen instead of being cut. `recovery.json`, `recovery.asked` and
-  `owner.live` go away; flock is the only liveness signal.
+  `owner.live` go away; flock is the only liveness signal for a session. The
+  connect probe and the process check of a leader socket only decide whether a
+  dead leader's socket folder may be removed. They never decide who holds a
+  session.
 - **Sync at durability points only (D3).** A plain `fsync` on every platform,
   and no fsync per line.
 - **Lazy creation (D2).** A session folder is created at the first turn. There
