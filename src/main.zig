@@ -45,6 +45,8 @@ const input_full_transcript_runtime = @import("core/app/input_full_transcript_ru
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
+const app_trust_runtime = @import("core/app/app_trust_runtime.zig");
+const workspace_trust = @import("core/workspace_trust/workspace_trust.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
@@ -576,6 +578,8 @@ const App = struct {
         app_oauth_transport,
         app_secret_store,
     ),
+    /// Folder access gate state; `Gate` owns its state and `app_trust_runtime` owns the app glue.
+    trust: workspace_trust.gate.Gate = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     /// Replaced in `init` with the real home directory.
@@ -1062,6 +1066,7 @@ const App = struct {
 
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
+        self.trust.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
@@ -1164,6 +1169,7 @@ const App = struct {
         self.lifecycle_runtime.deinit();
 
         self.auth.deinit(self.alloc);
+        self.trust.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
@@ -5459,6 +5465,9 @@ test {
     _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
+    _ = @import("core/workspace_trust/workspace_trust.zig");
+    _ = @import("core/app/app_trust_runtime.zig");
+    _ = @import("ui/footer/trust_prompt_ui.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");

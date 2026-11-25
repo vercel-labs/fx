@@ -1,5 +1,6 @@
 const std = @import("std");
 const question_state = @import("../../core/agent/question_prompt.zig");
+const workspace_trust = @import("../../core/workspace_trust/workspace_trust.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const permission_request = @import("../../core/permissions/permission_request.zig");
@@ -29,6 +30,7 @@ const effort_menu_presentation = @import("effort_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const agents_menu_presentation = @import("agents_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
+const trust_prompt_ui = @import("trust_prompt_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
@@ -641,10 +643,12 @@ pub fn composeFooterFrame(
 ) !footer_viewport.ComposedFooterFrame {
     const rows = plan.footer;
     const ctx = input.ctx;
-    const approval_active = input.approval != null;
-    const question_projection = if (!approval_active) ctx.question else null;
+    const trust_prompt = ctx.trust_prompt;
+    const trust_active = trust_prompt != null;
+    const approval_active = !trust_active and input.approval != null;
+    const question_projection = if (!trust_active and !approval_active) ctx.question else null;
     const question_active = question_projection != null;
-    const compact_command_menu = if (!approval_active and !question_active)
+    const compact_command_menu = if (!trust_active and !approval_active and !question_active)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
@@ -694,13 +698,15 @@ pub fn composeFooterFrame(
         cursor_col = cursor.col;
     }
 
-    if (approval_active or question_active or compact_command_active or input.show_picker) {
+    if (trust_active or approval_active or question_active or compact_command_active or input.show_picker) {
         if (input.input_visible) {
             var picker_divider = try row_text.composeDividerRow(alloc, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_divider, &picker_divider);
         }
 
-        if (approval_active) {
+        if (trust_prompt) |prompt| {
+            try pushTrustPromptRows(alloc, &frame, plan, rows.picker_start, input.picker_rows, prompt, shell.layout.cols);
+        } else if (approval_active) {
             var approval_row_index: u16 = 0;
             while (approval_row_index < input.picker_rows) : (approval_row_index += 1) {
                 var approval_row = try approval_ui.composeInlineApprovalPanelRow(
@@ -973,7 +979,7 @@ pub fn composeFooterFrame(
         }
     }
 
-    const needs_bottom_divider = !input.input_visible or approval_active or question_active or compact_command_active or input.show_picker;
+    const needs_bottom_divider = !input.input_visible or trust_active or approval_active or question_active or compact_command_active or input.show_picker;
     var bottom_row: std.ArrayList(u8) = if (needs_bottom_divider)
         try row_text.composeDividerRow(alloc, shell.layout.cols)
     else
@@ -981,7 +987,9 @@ pub fn composeFooterFrame(
     try pushFooterBandRow(alloc, &frame, plan, rows.bottom_divider, &bottom_row);
 
     var danger_status_visible = false;
-    var hint_row = if (approval_active)
+    var hint_row = if (trust_active)
+        try trust_prompt_ui.composeHintRow(alloc, shell.layout.cols)
+    else if (approval_active)
         try approval_ui.composeInlineApprovalHintRow(
             alloc,
             input.approval.?,
@@ -1196,6 +1204,30 @@ fn pushQuestionPanelRows(
     while (row_index < row_count) : (row_index += 1) {
         const line = question_ui.nextPanelLine(text, &line_start);
         var row: std.ArrayList(u8) = .empty;
+        try row_text.appendClipped(alloc, &row, line, width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        try pushFooterBandRow(alloc, frame, plan, start_row + row_index, &row);
+    }
+}
+
+fn pushTrustPromptRows(
+    alloc: Allocator,
+    frame: *footer_viewport.ComposedFooterFrame,
+    plan: PaintPlan,
+    start_row: u16,
+    row_count: u16,
+    prompt: *const workspace_trust.prompt.Prompt,
+    width: u16,
+) !void {
+    const text = try trust_prompt_ui.composeTrustPromptText(alloc, prompt, width, row_count);
+    defer alloc.free(text);
+
+    var line_start: usize = 0;
+    var row_index: u16 = 0;
+    while (row_index < row_count) : (row_index += 1) {
+        const line = question_ui.nextPanelLine(text, &line_start);
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(alloc);
         try row_text.appendClipped(alloc, &row, line, width);
         try row.appendSlice(alloc, ui_render.reset_style);
         try pushFooterBandRow(alloc, frame, plan, start_row + row_index, &row);

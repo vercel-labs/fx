@@ -19,6 +19,7 @@ const theme_mod = @import("../shared/theme.zig");
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
 pub const max_model_bytes: usize = 1024;
+pub const workspace_trusted_key = "trusted";
 const lock_deadline_ms: u64 = 2000;
 const backup_keep_count: usize = 5;
 const corrupt_keep_count: usize = 3;
@@ -93,6 +94,10 @@ pub const WorkspaceDirectoryMutation = struct {
 pub const ProjectMcpMutation = struct {
     workspace_root: []const u8,
     action: project_config.ProjectMcpAction,
+};
+
+pub const WorkspaceTrustMutation = struct {
+    workspace_root: []const u8,
 };
 
 pub const UserSettingsPatch = struct {
@@ -308,6 +313,7 @@ const SettingsMutation = union(enum) {
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
     project_mcp: ProjectMcpMutation,
+    workspace_trust: WorkspaceTrustMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
@@ -315,6 +321,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
             .project_mcp => "project_mcp_patch",
+            .workspace_trust => "workspace_trust_patch",
         };
     }
 
@@ -327,6 +334,7 @@ const SettingsMutation = union(enum) {
                 .local => .local,
             },
             .project_mcp => .local,
+            .workspace_trust => .local,
         };
     }
 
@@ -339,6 +347,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "commit_first",
             .permission => "commit_first",
             .project_mcp => "commit_first",
+            .workspace_trust => "commit_first",
         };
     }
 
@@ -348,6 +357,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => false,
             .permission => false,
             .project_mcp => false,
+            .workspace_trust => false,
         };
     }
 };
@@ -522,6 +532,14 @@ pub const Store = struct {
         mutation: ProjectMcpMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
+    pub fn applyWorkspaceTrustMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: WorkspaceTrustMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .workspace_trust = mutation });
     }
 
     fn applyMutation(
@@ -964,6 +982,7 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
+        .workspace_trust => |trust| try validateWorkspaceRoot(trust.workspace_root),
     }
 }
 
@@ -1232,6 +1251,7 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
         .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
+        .workspace_trust => |trust| applyWorkspaceTrustMutationToRoot(arena, root, trust),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -1800,6 +1820,16 @@ fn applyProjectMcpMutationToRoot(
     };
 }
 
+fn applyWorkspaceTrustMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: WorkspaceTrustMutation,
+) !PatchApplication {
+    const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    const changed = try putBool(arena, workspace, workspace_trusted_key, true);
+    return .{ .changed = changed };
+}
+
 fn workspaceObject(
     arena: Allocator,
     root: *std.json.Value,
@@ -2119,6 +2149,7 @@ fn validateCandidate(
             .local => permission.workspace_root.?,
         },
         .project_mcp => |project_mcp| project_mcp.workspace_root,
+        .workspace_trust => |trust| trust.workspace_root,
     };
     const workspace_may_be_absent = switch (mutation) {
         .workspace_directory => |workspace| workspace.patch != .add,
@@ -3973,6 +4004,43 @@ test "workspace directory mutations compose against the latest settings state" {
     defer alloc.free(empty_cleared);
     try std.testing.expect(std.mem.find(u8, empty_cleared, "\"/empty\":") == null);
     try std.testing.expect(std.mem.find(u8, empty_cleared, "\"/other\":{\"sandbox\":\"none\"}") != null);
+}
+
+test "a workspace trust grant marks only that folder and keeps the rest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"model\":\"user/model\",\"workspaces\":{\"/a\":{\"additional_directories\":[\"/x\"]}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var granted = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/b" });
+    defer granted.deinit(alloc);
+    try std.testing.expect(granted == .committed);
+    const composed = try store.readPrimaryForTest(alloc);
+    defer alloc.free(composed);
+    try std.testing.expect(std.mem.find(u8, composed, "\"/b\":{\"trusted\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, composed, "\"/a\":{\"additional_directories\":[\"/x\"]}") != null);
+    try std.testing.expect(std.mem.find(u8, composed, "\"model\":\"user/model\"") != null);
+
+    var again = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/b" });
+    defer again.deinit(alloc);
+    try std.testing.expect(again == .unchanged);
+
+    var both = try store.applyWorkspaceTrustMutation(alloc, .{ .workspace_root = "/a" });
+    defer both.deinit(alloc);
+    try std.testing.expect(both == .committed);
+    const after = try store.readPrimaryForTest(alloc);
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.find(u8, after, "\"/a\":{\"additional_directories\":[\"/x\"],\"trusted\":true}") != null);
 }
 
 test "workspace directory clear removes the final empty workspace" {

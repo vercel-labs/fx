@@ -547,6 +547,33 @@ pub fn loadProjectMcpChoicesFromHome(
     return result;
 }
 
+/// Reads whether the profile trusts the folder; the caller passes its real path.
+pub fn loadWorkspaceTrustFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) !bool {
+    var store = try settings_store.Store.initFromHome(alloc, home, .read_only);
+    defer store.deinit(alloc);
+    var primary = try store.loadPrimary(alloc);
+    defer primary.deinit(alloc);
+    const bytes = switch (primary) {
+        .absent => return false,
+        .valid => |value| value,
+        .invalid => return error.InvalidSettingsFormat,
+        .oversized => return error.SettingsPrimaryTooLarge,
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsFormat;
+    const workspaces = parsed.value.object.get("workspaces") orelse return false;
+    if (workspaces != .object) return error.InvalidSettingsFormat;
+    const workspace = workspaces.object.get(normalizeWorkspaceRoot(workspace_root)) orelse return false;
+    if (workspace != .object) return false;
+    const trusted = workspace.object.get(settings_store.workspace_trusted_key) orelse return false;
+    return trusted == .bool and trusted.bool;
+}
+
 pub fn loadMergedSettingsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Settings {
     var paths = try discoverPathsFromHome(alloc, home_dir, workspace_root);
     defer paths.deinit(alloc);
@@ -1232,6 +1259,25 @@ pub fn attemptProjectMcpMutation(
     const outcome = store.applyProjectMcpMutation(alloc, .{
         .workspace_root = workspace_root,
         .action = action,
+    }) catch |err| return .{ .failure = .{
+        .err = err,
+        .cleanup = store.takeFailureCleanup(),
+    } };
+    return .{ .outcome = outcome };
+}
+
+/// Saves that the profile trusts the folder; the caller passes its real path.
+pub fn attemptWorkspaceTrustInHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+) CommitAttempt {
+    var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
+        return .{ .failure = .{ .err = err } };
+    };
+    defer store.deinit(alloc);
+    const outcome = store.applyWorkspaceTrustMutation(alloc, .{
+        .workspace_root = workspace_root,
     }) catch |err| return .{ .failure = .{
         .err = err,
         .cleanup = store.takeFailureCleanup(),
@@ -3812,6 +3858,44 @@ test "user effort preference preserves unrelated workspace override keys" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("future-tier", parsed.value.object.get("effort").?.string);
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("effort") == null);
+}
+
+test "workspace trust counts only a true boolean for the exact folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "empty-home");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"workspaces\":{\"/r\":{\"trusted\":true},\"/s\":{\"trusted\":\"yes\"},\"/t\":{}}}",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const empty_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "empty-home");
+    defer alloc.free(empty_home);
+
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r/"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/s"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/t"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, home, "/u"));
+    try std.testing.expect(!try loadWorkspaceTrustFromHome(alloc, empty_home, "/r"));
+}
+
+test "a saved workspace trust grant is read back" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var attempt = attemptWorkspaceTrustInHome(alloc, home, "/r");
+    defer attempt.deinit(alloc);
+    try std.testing.expect(attempt == .outcome);
+    try std.testing.expect(try loadWorkspaceTrustFromHome(alloc, home, "/r"));
 }
 
 test "user fast mode preference writes bool and preserves unrelated keys" {

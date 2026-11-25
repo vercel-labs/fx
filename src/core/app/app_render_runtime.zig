@@ -1,6 +1,7 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
+const workspace_trust = @import("../workspace_trust/workspace_trust.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
@@ -892,6 +893,7 @@ pub fn Runtime(comptime App: type) type {
                     "",
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
+                .trust_prompt = shownTrustPrompt(app),
                 .question = shownQuestion(app, agent),
                 .statusline = statusline,
                 .activity = activityProjection(app),
@@ -2094,6 +2096,12 @@ pub fn Runtime(comptime App: type) type {
         fn shownQuestion(app: *const App, agent: *AppAgent) ?question_prompt.Projection {
             if (agentsMenuActive(app)) return null;
             return agent.question_prompt.projection();
+        }
+
+        fn shownTrustPrompt(app: *const App) ?*const workspace_trust.prompt.Prompt {
+            if (comptime !@hasField(App, "trust")) return null;
+            if (app.trust.prompt) |*prompt| return prompt;
+            return null;
         }
 
         fn forkMenuActive(_: *const App, agent: *const AppAgent) bool {

@@ -2114,6 +2114,7 @@ class RenderLabTmux {
       "VERCEL_OIDC_TOKEN",
       "FX_DISABLE_KEYCHAIN=1",
       "FX_TEST_SKIP_ONBOARDING=1",
+      "FX_TEST_SKIP_WORKSPACE_TRUST=1",
       `HOME=${shQuote(opts.fixture.home)}`,
       `ZDOTDIR=${shQuote(opts.fixture.zdotdir)}`,
       `HISTFILE=${shQuote(opts.fixture.histfile)}`,
@@ -2321,6 +2322,7 @@ function testEnv(fixture: Fixture, manifest: RenderLabManifest): NodeJS.ProcessE
   delete env.VERCEL_OIDC_TOKEN;
   env.FX_DISABLE_KEYCHAIN = "1";
   env.FX_TEST_SKIP_ONBOARDING = "1";
+  env.FX_TEST_SKIP_WORKSPACE_TRUST = "1";
   env.HOME = fixture.home;
   env.ZDOTDIR = fixture.zdotdir;
   env.HISTFILE = fixture.histfile;

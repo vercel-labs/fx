@@ -19,6 +19,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
+const workspace_trust = @import("../../core/workspace_trust/workspace_trust.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
@@ -509,6 +510,8 @@ pub const RenderContext = struct {
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
     esc_interrupt_armed: bool = false,
+    /// Shown while the startup folder-access gate asks for trust.
+    trust_prompt: ?*const workspace_trust.prompt.Prompt = null,
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
