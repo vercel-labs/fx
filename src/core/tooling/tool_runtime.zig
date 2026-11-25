@@ -2565,6 +2565,7 @@ fn toolRunCommand(
         .timeout_started_ms = timeout.started_ms,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
+        .session_id = ctx.lifecycle_scope.session_id,
     }, arena, route) catch |err| {
         if (err == error.TimeoutExpired) {
             return finishCommandToolResult(

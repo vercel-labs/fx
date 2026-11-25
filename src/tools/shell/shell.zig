@@ -761,6 +761,7 @@ fn callRun(
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
+        .session_id = ctx.terminal_owner_session_id,
         .extra_environment = if (bridge_registration) |registration| registration.environment() else &.{},
         .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
@@ -5156,4 +5157,62 @@ test "process exit during a busy-client retry of the unpublished tty close ends 
     defer t.alloc.free(trace);
     _ = try traceLineWith(trace, "unpublished TTY cleanup refused session_id=", " reason=terminal_busy");
     _ = try traceLineWith(trace, "unpublished TTY cleanup gave up session_id=", " reason=runtime_stopping dropped=unpublished_tty_close");
+}
+
+test "captured shell run exports FX_SESSION_ID from the calling session" {
+    if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .windows) return;
+    const alloc = std.testing.allocator;
+    var runtime = managed_execution.Runtime.init(alloc);
+    defer runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(cwd);
+
+    const command = "printf 'sid=%s' \"${FX_SESSION_ID-unset}\"";
+    const env = try commandEnvironment(alloc, .{ .allocator = alloc }, .clean);
+    defer switch (env) {
+        .clean => |path| alloc.free(path),
+        .user => |path| alloc.free(path),
+        .legacy, .workspace_clean => {},
+    };
+    const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+        .fingerprint = .init(.{
+            .command = command,
+            .resolved_cwd = cwd,
+            .target_os = builtin.target.os.tag,
+            .environment = env,
+        }),
+        .source = .yolo,
+    } };
+
+    var with_session = try callRun(.{
+        .allocator = alloc,
+        .workspace_root = cwd,
+        .managed_executions = &runtime,
+        .execution_authority = .{ .run_command = authority },
+        .terminal_owner_session_id = "subagent-session-42",
+        .max_command_output_bytes = 4096,
+    }, .{
+        .action = .run,
+        .command = command,
+        .profile = .clean,
+    });
+    defer with_session.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, with_session.success, "sid=subagent-session-42") != null);
+
+    var without_session = try callRun(.{
+        .allocator = alloc,
+        .workspace_root = cwd,
+        .managed_executions = &runtime,
+        .execution_authority = .{ .run_command = authority },
+        .terminal_owner_session_id = null,
+        .max_command_output_bytes = 4096,
+    }, .{
+        .action = .run,
+        .command = command,
+        .profile = .clean,
+    });
+    defer without_session.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, without_session.success, "sid=unset") != null);
 }

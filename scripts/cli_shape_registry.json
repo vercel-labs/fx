@@ -109,6 +109,10 @@
       "job": "setting-override",
       "stability": "stable"
     },
+    "FX_SESSION_ID": {
+      "job": "integration",
+      "stability": "stable"
+    },
     "FX_SKILL_SYMLINK_AUTHORITIES": {
       "job": "setting-override",
       "stability": "internal"

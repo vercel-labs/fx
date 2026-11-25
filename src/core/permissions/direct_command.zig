@@ -275,7 +275,7 @@ fn runDirectReadOnly(
         const stage = plan.stages[child_count];
         var environment = try environmentForProfile(scratch, stage.environment_profile);
         defer environment.deinit();
-        try command_runner.applyAgentEnvironment(&environment);
+        try command_runner.applyAgentEnvironment(&environment, execution_cfg.session_id);
 
         const child = std.process.spawn(io_mod.getIo(), .{
             .argv = stage.argv,
@@ -482,16 +482,37 @@ test "direct commands receive fx agent environment" {
         .argv = &.{"/usr/bin/env"},
         .environment_profile = .basic_read_only,
     }};
-    const result = try executeDirectReadOnly(.{
+    const extra = [_]command_runner.EnvironmentVariable{
+        .{ .name = "DIRECT_EXTRA_SECRET", .value = "must-not-leak" },
+    };
+    const without_session = try executeDirectReadOnly(.{
         .max_command_output_bytes = 4096,
+        .extra_environment = &extra,
     }, std.testing.allocator, .{
         .command = "env",
         .cwd = "/tmp",
         .stages = &stages,
     });
-    defer std.testing.allocator.free(result.output);
+    defer std.testing.allocator.free(without_session.output);
 
-    try std.testing.expect(std.mem.find(u8, result.output, "AI_AGENT=fx") != null);
+    try std.testing.expect(std.mem.find(u8, without_session.output, "AI_AGENT=fx") != null);
+    try std.testing.expect(std.mem.find(u8, without_session.output, "FX_SESSION_ID=") == null);
+    try std.testing.expect(std.mem.find(u8, without_session.output, "DIRECT_EXTRA_SECRET=") == null);
+
+    const with_session = try executeDirectReadOnly(.{
+        .max_command_output_bytes = 4096,
+        .session_id = "direct-session-1",
+        .extra_environment = &extra,
+    }, std.testing.allocator, .{
+        .command = "env",
+        .cwd = "/tmp",
+        .stages = &stages,
+    });
+    defer std.testing.allocator.free(with_session.output);
+
+    try std.testing.expect(std.mem.find(u8, with_session.output, "AI_AGENT=fx") != null);
+    try std.testing.expect(std.mem.find(u8, with_session.output, "FX_SESSION_ID=direct-session-1") != null);
+    try std.testing.expect(std.mem.find(u8, with_session.output, "DIRECT_EXTRA_SECRET=") == null);
 }
 
 const DirectTerminationCause = enum {

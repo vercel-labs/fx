@@ -3234,4 +3234,97 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     TIMEOUT,
   );
 
+  test(
+    "FX_SESSION_ID identifies the calling session in user and clean shells",
+    async () => {
+      let step = 0;
+      const results: string[] = [];
+      await withHost(
+        (body) => {
+          if (answered(body)) results.push(JSON.stringify(JSON.parse(body).prompt.at(-1).content));
+          if (step < 2) {
+            const profile = step++ === 0 ? "user" : "clean";
+            return call(`session_env_${step}`, "shell", {
+              action: "run",
+              command: "printf 'SESSION_ENV_ID=%s' \"$FX_SESSION_ID\"",
+              profile,
+            });
+          }
+          return text("session_env_done", "SESSION_ENV_VERIFIED");
+        },
+        { env: { FX_PERMISSION_MODE: "full-access" } },
+        async ({ home, session }) => {
+          await session.sendText("CHECK_CALLING_SESSION_ENV");
+          await session.waitForText("SESSION_ENV_VERIFIED", 30_000);
+          const id = sessionHolding(home, "CHECK_CALLING_SESSION_ENV");
+          expect(id).not.toBeNull();
+          expect(results).toHaveLength(2);
+          for (const body of results) expect(body).toContain(`SESSION_ENV_ID=${id}`);
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "FX_SESSION_ID identifies a subagent's own session separately from its parent",
+    async () => {
+      let rootResult = "";
+      let childResult = "";
+      await withHost(
+        (body) => {
+          const texts = userTexts(body).join("\n");
+          if (texts.includes("SUBAGENT_ENV_TASK")) {
+            if (answered(body)) {
+              childResult = JSON.stringify(JSON.parse(body).prompt.at(-1).content);
+              return text("sub_env_done", "SUBAGENT_ENV_REPORT");
+            }
+            return call("sub_env_shell", "shell", {
+              action: "run",
+              command: "printf 'SUB_SID=%s' \"$FX_SESSION_ID\"",
+              profile: "clean",
+            });
+          }
+          if (texts.includes("SUBAGENT_ENV_REPORT")) {
+            return text("main_env_final", "SUBAGENT_ENV_VERIFIED");
+          }
+          if (answered(body)) {
+            const last = JSON.stringify(JSON.parse(body).prompt.at(-1).content);
+            if (!rootResult) {
+              rootResult = last;
+              return call("sub_env_spawn", "subagent", {
+                request: { action: "message", agent: "helper", message: "SUBAGENT_ENV_TASK" },
+              });
+            }
+            return text("main_env_wait", "WAITING_FOR_SUBAGENT_ENV");
+          }
+          return call("root_env_shell", "shell", {
+            action: "run",
+            command: "printf 'ROOT_SID=%s' \"$FX_SESSION_ID\"",
+            profile: "clean",
+          });
+        },
+        { env: { FX_PERMISSION_MODE: "full-access" } },
+        async ({ home, session }) => {
+          await session.sendText("CHECK_SUBAGENT_SESSION_ENV");
+          await session.waitForText("SUBAGENT_ENV_VERIFIED", 30_000);
+          const v2Dir = join(home, ".fx", "sessions", "v2");
+          const sessionIds = readdirSync(v2Dir).filter(
+            (id) => !id.startsWith(".") && statSync(join(v2Dir, id)).isDirectory(),
+          );
+          const roleOf = (id: string) =>
+            JSON.parse(readFileSync(join(v2Dir, id, "log.jsonl"), "utf8").split("\n", 1)[0]!).role;
+          const rootId = sessionIds.find((id) => roleOf(id) !== "child");
+          const childId = sessionIds.find((id) => roleOf(id) === "child");
+          expect(rootId).toBeDefined();
+          expect(childId).toBeDefined();
+          expect(childId).not.toBe(rootId);
+          expect(rootResult).toContain(`ROOT_SID=${rootId}`);
+          expect(childResult).toContain(`SUB_SID=${childId}`);
+        },
+      );
+    },
+    TIMEOUT,
+  );
+
 });

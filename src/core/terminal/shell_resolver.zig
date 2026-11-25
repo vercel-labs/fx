@@ -460,11 +460,19 @@ pub fn buildBootstrap(
     control_path: []const u8,
     nonce: []const u8,
     command_path: ?[]const u8,
+    session_id: ?[]const u8,
 ) Allocator.Error![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
     try output.appendSlice(alloc, "set +x; export AI_AGENT=fx; ");
+    if (session_id != null and session_id.?.len > 0) {
+        try output.appendSlice(alloc, "export FX_SESSION_ID=");
+        try appendShellWord(&output, alloc, session_id.?);
+        try output.appendSlice(alloc, "; ");
+    } else {
+        try output.appendSlice(alloc, "unset FX_SESSION_ID; ");
+    }
     if (command_path) |path| {
         try output.appendSlice(alloc, "fx_terminal_command=$(< ");
         try appendShellWord(&output, alloc, path);
@@ -794,12 +802,45 @@ test "bootstrap quotes private paths and separates command completion" {
         "/tmp/control",
         "nonce",
         null,
+        null,
     );
     defer std.testing.allocator.free(commandless);
     try std.testing.expectEqualStrings(
-        "set +x; export AI_AGENT=fx; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+        "set +x; export AI_AGENT=fx; unset FX_SESSION_ID; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
             "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
         commandless,
+    );
+
+    const empty_session = try buildBootstrap(
+        std.testing.allocator,
+        .bash,
+        "/tmp/fx",
+        "/tmp/control",
+        "nonce",
+        null,
+        "",
+    );
+    defer std.testing.allocator.free(empty_session);
+    try std.testing.expectEqualStrings(
+        "set +x; export AI_AGENT=fx; unset FX_SESSION_ID; '/tmp/fx' '--fx-internal-terminal-control' " ++
+            "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
+        empty_session,
+    );
+
+    const with_session = try buildBootstrap(
+        std.testing.allocator,
+        .zsh,
+        "/tmp/fx",
+        "/tmp/control",
+        "nonce",
+        null,
+        "child-session'1",
+    );
+    defer std.testing.allocator.free(with_session);
+    try std.testing.expectEqualStrings(
+        "set +x; export AI_AGENT=fx; export FX_SESSION_ID='child-session'\"'\"'1'; '/tmp/fx' '--fx-internal-terminal-control' " ++
+            "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
+        with_session,
     );
 
     const command = try buildBootstrap(
@@ -809,6 +850,7 @@ test "bootstrap quotes private paths and separates command completion" {
         "/tmp/control",
         "nonce",
         "/tmp/command",
+        null,
     );
     defer std.testing.allocator.free(command);
     try std.testing.expect(
@@ -828,6 +870,7 @@ test "bootstrap quotes private paths and separates command completion" {
         "/tmp/control",
         "nonce",
         "/tmp/command",
+        null,
     );
     defer std.testing.allocator.free(bash_command);
     try std.testing.expect(
@@ -854,6 +897,7 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
         "/tmp/control",
         "nonce",
         "/tmp/command",
+        "child-session-1",
     );
     defer alloc.free(bootstrap);
     const source = try buildSourceCommand(alloc, "/tmp/bootstrap");

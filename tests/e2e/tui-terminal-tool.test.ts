@@ -1524,3 +1524,56 @@ test("the full terminal budget starts, refuses one more, and ends together at ex
   );
   expect(records.every((record) => record.lifecycle === "lost")).toBe(true);
 }, 150_000);
+
+test("FX_SESSION_ID is exported in interactive terminals and cleared for unsaved runs", async () => {
+  const fixture = createFixture("fx-session-id-tty-");
+  const ttyGateway = startFakeGateway([
+    ttyRun("shell_tty_sid", "printf 'TTY_SID=%s\\n' \"$FX_SESSION_ID\""),
+    fakeGatewayFinalText("TTY_SID_DONE"),
+  ]);
+  gateways.push(ttyGateway);
+
+  const saved = await runFx(["ask", "--json", "Check TTY session id."], {
+    cwd: fixture.workspace,
+    env: { ...askEnv(fixture, ttyGateway), FX_SESSION_ID: "outer-inherited-session" },
+    timeoutMs: TIMEOUT,
+  });
+  expect(saved.code).toBe(0);
+  const [savedSessionId] = rootSessionIds(fixture.home);
+  expect(savedSessionId).toBeDefined();
+  const ttyOutput = toolResultEnvelope(ttyGateway.requests[1]!.body, "shell_tty_sid");
+  expect(ttyOutput).toContain(`TTY_SID=${savedSessionId}`);
+  expect(ttyOutput).not.toContain("outer-inherited-session");
+
+  const unsavedGateway = startFakeGateway([
+    fakeGatewayToolCall("shell_unsaved_clean", "shell", {
+      request: {
+        action: "run",
+        command: "printf 'UNSAVED_CLEAN=%s' \"${FX_SESSION_ID-unset}\"",
+        profile: "clean",
+      },
+    }),
+    fakeGatewayToolCall("shell_unsaved_user", "shell", {
+      request: {
+        action: "run",
+        command: "printf 'UNSAVED_USER=%s' \"${FX_SESSION_ID-unset}\"",
+        profile: "user",
+      },
+    }),
+    fakeGatewayFinalText("UNSAVED_SID_DONE"),
+  ]);
+  gateways.push(unsavedGateway);
+
+  const unsaved = await runFx(["ask", "--no-save", "--json", "Check unsaved session id."], {
+    cwd: fixture.workspace,
+    env: { ...askEnv(fixture, unsavedGateway), FX_SESSION_ID: "outer-inherited-session" },
+    timeoutMs: TIMEOUT,
+  });
+  expect(unsaved.code).toBe(0);
+  expect(toolResultEnvelope(unsavedGateway.requests[1]!.body, "shell_unsaved_clean")).toContain(
+    "UNSAVED_CLEAN=unset",
+  );
+  expect(toolResultEnvelope(unsavedGateway.requests[2]!.body, "shell_unsaved_user")).toContain(
+    "UNSAVED_USER=unset",
+  );
+}, TIMEOUT);
