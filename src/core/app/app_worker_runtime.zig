@@ -842,7 +842,10 @@ pub fn Runtime(comptime App: type) type {
             const prompt = &agent.approval_prompt;
             if (waiting) |pending| {
                 if (prompt.reviewCopyMatches(pending.request_id, pending.review)) return false;
-                const review = agent.worker.copyPendingReview(app.alloc, pending.request_id) catch return false;
+                const review = agent.worker.copyPendingReview(app.alloc, pending.request_id) catch |err| {
+                    debug_trace.logf("approval", "review copy dropped request={d} reason={s}", .{ pending.request_id, @errorName(err) });
+                    return false;
+                };
                 return prompt.adoptReview(app.alloc, pending.request_id, pending.review, review);
             }
             return prompt.adoptReview(app.alloc, null, null, null);
