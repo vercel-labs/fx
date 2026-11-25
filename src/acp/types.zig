@@ -175,11 +175,18 @@ pub fn writeAgentThoughtChunk(w: *std.Io.Writer, text: []const u8) !void {
 }
 
 pub fn writeUserMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8) !void {
+    try writeUserMessageChunkFrom(w, message_id, text, null);
+}
+
+/// A user message chunk. With `client`, its `_meta` names the client that sent the prompt.
+pub fn writeUserMessageChunkFrom(w: *std.Io.Writer, message_id: []const u8, text: []const u8, client: ?u64) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
-    try w.writeAll("}}");
+    try w.writeByte('}');
+    try writeClientMeta(w, client);
+    try w.writeByte('}');
 }
 
 pub fn writeUserImageChunk(
@@ -188,13 +195,33 @@ pub fn writeUserImageChunk(
     media_type: []const u8,
     bytes: []const u8,
 ) !void {
+    try writeUserImageChunkFrom(w, message_id, media_type, bytes, null);
+}
+
+/// A user image chunk. With `client`, its `_meta` names the client that sent the prompt.
+pub fn writeUserImageChunkFrom(
+    w: *std.Io.Writer,
+    message_id: []const u8,
+    media_type: []const u8,
+    bytes: []const u8,
+    client: ?u64,
+) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
     try w.writeAll(",\"content\":{\"type\":\"image\",\"data\":\"");
     try std.base64.standard.Encoder.encodeWriter(w, bytes);
     try w.writeAll("\",\"mimeType\":");
     try writeJsonStr(media_type, w);
-    try w.writeAll("}}");
+    try w.writeByte('}');
+    try writeClientMeta(w, client);
+    try w.writeByte('}');
+}
+
+/// The `_meta` that names the client which sent a prompt or a steer, as `sh.fx/client`.
+/// Writes nothing for a null `client`.
+pub fn writeClientMeta(w: *std.Io.Writer, client: ?u64) !void {
+    const id = client orelse return;
+    try w.print(",\"_meta\":{{\"sh.fx/client\":\"c{d}\"}}", .{id});
 }
 
 /// Host-facing identity of a tool call, sent as `sh.fx/toolCall` to a client
@@ -480,7 +507,8 @@ pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delive
 
 /// Replays delivered steering where the agent inserted it into the turn.
 /// `steer_input` adds `sh.fx/steerInput`, with the steer's request id and,
-/// for a host's steer, the input id the host gave it.
+/// for a host's steer, the input id the host gave it. `client` adds
+/// `sh.fx/client`, the client that sent the steer.
 pub fn writeSteeringUserMessageChunk(
     w: *std.Io.Writer,
     message_id: []const u8,
@@ -488,34 +516,41 @@ pub fn writeSteeringUserMessageChunk(
     request_id: ?jsonrpc.RequestId,
     input_id: ?[]const u8,
     steer_input: bool,
+    client: ?u64,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
     try w.writeByte('}');
+    if (steer_input or client != null) try w.writeAll(",\"_meta\":{");
     if (steer_input) {
-        try w.writeAll(",\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":");
+        try w.writeAll("\"sh.fx/steerInput\":{\"requestId\":");
         try jsonrpc.Writer.writeId(w, request_id);
         if (input_id) |id| {
             try w.writeAll(",\"inputId\":");
             try writeJsonStr(id, w);
         }
-        try w.writeAll("}}");
+        try w.writeByte('}');
     }
+    if (client) |id| {
+        if (steer_input) try w.writeByte(',');
+        try w.print("\"sh.fx/client\":\"c{d}\"", .{id});
+    }
+    if (steer_input or client != null) try w.writeByte('}');
     try w.writeAll("}");
 }
 
 test "steering replay carries a host's input id only when it has one" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, true);
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, true, null);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":4}}}",
         out.written(),
     );
     out.clearRetainingCapacity();
-    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1", true);
+    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1", true, null);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":null,\"inputId\":\"s1\"}}}",
         out.written(),
@@ -525,7 +560,7 @@ test "steering replay carries a host's input id only when it has one" {
 test "steering replay and responses carry no sh.fx key for a client that doesn't list it" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, false);
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, false, null);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"}}",
         out.written(),

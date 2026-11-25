@@ -43,6 +43,8 @@ pub const Drained = struct {
     texts: [][]u8,
     request_ids: []?RequestId,
     input_ids: []?[]u8 = &.{},
+    /// The connection that sent each steer, in the same order.
+    senders: []connection.ConnectionId = &.{},
 };
 
 /// A libfx input id: 1 to 128 letters, digits, `.`, `_`, or `-`.
@@ -470,6 +472,8 @@ pub const Runtime = struct {
         errdefer result_alloc.free(request_ids);
         const input_ids = try result_alloc.alloc(?[]u8, count);
         errdefer result_alloc.free(input_ids);
+        const senders = try result_alloc.alloc(connection.ConnectionId, count);
+        errdefer result_alloc.free(senders);
         var copied: usize = 0;
         errdefer for (0..copied) |index| {
             result_alloc.free(texts[index]);
@@ -482,6 +486,7 @@ pub const Runtime = struct {
             input_ids[index] = if (entry.input_id) |id| try result_alloc.dupe(u8, id) else null;
             errdefer if (input_ids[index]) |id| result_alloc.free(id);
             request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
+            senders[index] = entry.from;
             copied += 1;
         }
         // Capacity for every queued request was reserved at enqueue.
@@ -492,7 +497,7 @@ pub const Runtime = struct {
         }
         self.messages.clearRetainingCapacity();
         self.queued_bytes = 0;
-        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids };
+        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids, .senders = senders };
     }
 
     /// Stops accepting steering for the finished turn and reports the
@@ -669,6 +674,7 @@ pub fn freeDrained(alloc: Allocator, drained: Drained) void {
     if (drained.request_ids.len > 0) alloc.free(drained.request_ids);
     for (drained.input_ids) |maybe_id| if (maybe_id) |id| alloc.free(id);
     if (drained.input_ids.len > 0) alloc.free(drained.input_ids);
+    if (drained.senders.len > 0) alloc.free(drained.senders);
 }
 
 fn freeEntry(alloc: Allocator, entry: Entry) void {

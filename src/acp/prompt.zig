@@ -2586,7 +2586,7 @@ fn takeSteeringBoundary(
             const messages = try arena.alloc(worker_runtime.SteeringMessage, taken.len);
             for (taken, messages) |entry, *message| {
                 message.* = .{ .text = entry.text };
-                try publishSteeringReplay(ctx, entry.text, null, entry.id);
+                try publishSteeringReplay(ctx, entry.text, null, entry.id, null);
             }
             return .{ .continue_turn = messages };
         }
@@ -2620,7 +2620,7 @@ fn takeSteeringBoundary(
     // Steering shows where it joined the turn, a libfx steer by its input id.
     for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
-        try publishSteeringReplay(ctx, text, request_id, input_id);
+        try publishSteeringReplay(ctx, text, request_id, input_id, drained.senders[index]);
     }
     // An ACP client's steering is the user's own.
     const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
@@ -2684,28 +2684,18 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     }
 }
 
-fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
+fn publishSteeringReplay(
+    ctx: *AcpContext,
+    text: []const u8,
+    request_id: ?jsonrpc.RequestId,
+    input_id: ?[]const u8,
+    sender: ?server.ConnectionId,
+) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
-    // Without `follow_supported` no follower takes the other version: the owner's own steer setting picks it.
-    if (comptime !server.follow_supported) {
-        const main_record = server.holdMain(ctx.session);
-        defer main_record.drop();
-        const params = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, main_record.sendsSteerInput());
-        defer ctx.alloc.free(params);
-        var audience = server.lockAudience(ctx.session);
-        defer audience.unlock();
-        try audience.deliver(ctx.alloc, "session/update", .none, params, null);
-        return;
-    }
-    // Each member takes the chunk with or without `sh.fx/steerInput`, by its own prompt delivery.
-    const with = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, true);
-    defer ctx.alloc.free(with);
-    const without = try server.steerChunkParams(ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, false);
-    defer ctx.alloc.free(without);
     var audience = server.lockAudience(ctx.session);
     defer audience.unlock();
-    try audience.deliver(ctx.alloc, "session/update", .steer_input, with, without);
+    try server.deliverSteerChunk(&audience, ctx.alloc, ctx.session_id, message_id, text, request_id, input_id, sender);
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {

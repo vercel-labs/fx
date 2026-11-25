@@ -2350,6 +2350,7 @@ fn sendSteeringHistoryChunk(state: *server.Member, alloc: Allocator, session_id:
         null,
         null,
         state.sendsSteerInput(),
+        null,
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());

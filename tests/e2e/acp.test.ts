@@ -15262,7 +15262,7 @@ describe("acp: model-independent", () => {
     socket: string,
     sessionId: string,
     root: SharedRoot,
-    options: { clientInfo?: object; lists?: boolean } = {},
+    options: { clientInfo?: object; lists?: boolean; method?: "session/load" | "session/resume" } = {},
   ) {
     const follower = await LeaderSocketClient.connect(socket);
     const capabilities = options.lists === false ? fxClientCapabilities : listingCapabilities;
@@ -15271,7 +15271,7 @@ describe("acp: model-independent", () => {
       clientCapabilities: capabilities,
       ...(options.clientInfo ? { clientInfo: options.clientInfo } : {}),
     });
-    const loaded = await follower.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+    const loaded = await follower.request(options.method ?? "session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
     expect(loaded.answer.error).toBeUndefined();
     const clientId = initialized.answer.result._meta?.["sh.fx/clientId"] as string;
     expect(clientId).toMatch(/^c\d+$/);
@@ -15349,6 +15349,43 @@ describe("acp: model-independent", () => {
         await waitForCondition("the opener's copy of the list", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
         expect(latestClients(parsedLines(owner))).toEqual(expected);
         expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that resumes the session gets the list before its resume answer, with itself included",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-resume-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const ownerInfo = { name: "editor-one", version: "1.2.3", title: "Editor One" };
+      const followerInfo = { name: "editor-two", version: "2.0.0" };
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, ownerInfo);
+        owner = started.owner;
+        const resumed = await followAs(started.socket, started.sessionId, root, {
+          clientInfo: followerInfo,
+          method: "session/resume",
+        });
+        follower = resumed.follower;
+        const listAt = follower.received.findIndex((message) => message.method === "_sh.fx/session/clients_update");
+        const answerAt = follower.received.findIndex(
+          (message) => message.id === resumed.loaded.answer.id && message.result !== undefined,
+        );
+        expect(listAt).toBeGreaterThanOrEqual(0);
+        expect(answerAt).toBeGreaterThan(listAt);
+        expect(latestClients(follower.received)).toEqual([
+          { clientId: started.clientId, clientInfo: ownerInfo, main: true },
+          { clientId: resumed.clientId, clientInfo: followerInfo, main: false },
+        ]);
       } finally {
         follower?.close();
         await owner?.close();
