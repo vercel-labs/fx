@@ -224,6 +224,49 @@ describe("provider compaction", () => {
     });
   }, 240_000);
 
+  test("a fork of a provider-compacted session sends the block to its own model and fx's text to another", async () => {
+    const models = Object.values(FAMILIES).map((family) => ({ id: family.model, type: "language", tags: ["tool-use", "reasoning"], context_window: 400_000, max_tokens: 8192 }));
+    await withSession(FAMILIES.anthropic.model, { models }, async (session, { observed, counts, edits }) => {
+      const { root, cwd, env, sessionId, before } = session;
+      const seventh = await ask({ ...env, FX_AUTO_COMPACT_PERCENT: "10" }, cwd, root, "t7", ["--resume", sessionId], "TURN 7 Continue.");
+      expect(seventh.code).toBe(0);
+      expect(counts.provider).toBe(1);
+      const block = observed.slice(before).find((request) => request.kind === "compaction")!.block!;
+      const seventhConversation = conversationOf(agentRequestFor(observed, before, 7)!);
+      expect(blockKeyOf(seventhConversation[0]!)).toBe(block);
+
+      const fork = async (label: string) => {
+        const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
+        const child = Bun.spawn([binary, "session", "fork", sessionId, "--json"], { cwd, env, stdin: "ignore", stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
+        const code = await child.exited;
+        expect(readFileSync(stderr, "utf8")).toBe("");
+        expect(code).toBe(0);
+        const forked = JSON.parse(readFileSync(stdout, "utf8"));
+        expect(forked).toMatchObject({ kind: "session_fork", source_id: sessionId, files_complete: true });
+        return forked.fork_id as string;
+      };
+
+      // The same model: the block leads, then the turns the compacting request sent, unchanged.
+      const sameFork = await fork("fork-same-cli");
+      const same = await ask(env, cwd, root, "fork-same", ["--resume", sameFork], "TURN 8 Continue.");
+      expect(same.code).toBe(0);
+      const sameConversation = conversationOf(agentRequestFor(observed, before, 8)!);
+      expect(blockKeyOf(sameConversation[0]!)).toBe(block);
+      expect(sameConversation.slice(0, seventhConversation.length).map(withoutCacheMarkers)).toEqual(seventhConversation.map(withoutCacheMarkers));
+
+      // Another model: no block anywhere, and fx's text of the same turns first.
+      const otherFork = await fork("fork-other-cli");
+      const other = await ask({ ...env, FX_MODEL: FAMILIES.openai.model }, cwd, root, "fork-other", ["--resume", otherFork, "--model", FAMILIES.openai.model], "TURN 9 Continue.");
+      expect(other.code).toBe(0);
+      const otherRequest = observed.slice(before).find((request) => request.kind === "agent" && lastUserText(request.body).includes("TURN 9"))!;
+      expect(otherRequest.model).toBe(FAMILIES.openai.model);
+      const otherConversation = conversationOf(otherRequest.body);
+      expect(otherConversation.some((message) => blockKeyOf(message) !== null)).toBe(false);
+      expect(isFxSummary(otherConversation[0]!)).toBe(true);
+      expect(edits).toEqual([]);
+    });
+  }, 240_000);
+
   test.skipIf(!tmuxAvailable())("/compact waits for the next message, then compacts with the provider before sending it", async () => {
     // The whole session runs in one terminal: the terminal's instructions
     // differ from fx ask's, and a change before the first turn would void
