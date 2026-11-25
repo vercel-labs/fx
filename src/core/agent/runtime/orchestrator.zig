@@ -10447,7 +10447,9 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
-                    .asked_question = step_asked_question,
+                    // A length-limited reply's calls never run: they are
+                    // dropped for a resend or blocked below.
+                    .asked_question = step_asked_question and disposition == .completed,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =

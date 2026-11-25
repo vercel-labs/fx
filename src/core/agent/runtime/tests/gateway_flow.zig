@@ -10877,6 +10877,45 @@ test "tool calls after a question start a new presentation group" {
     try std.testing.expectEqual(groups[1], groups[2]);
 }
 
+/// The presentation group of the call `call_id` when it started.
+fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        const started = event.authoritative_started;
+        if (std.mem.eql(u8, started.id.call_id, call_id)) return started.presentation_group_id;
+    }
+    return null;
+}
+
+test "a question dropped from a length-cut reply and sent again leaves the presentation group open" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const cut_ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &cut_ask, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    for (hooks.executed_names.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ask_user_question"));
+    }
+    try std.testing.expectEqual(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    );
+}
+
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
