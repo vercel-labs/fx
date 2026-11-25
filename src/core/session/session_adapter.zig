@@ -4731,6 +4731,15 @@ pub fn writeUndeliveredPromptPrefix(writer: *std.Io.Writer, prompt_count: usize)
     }
 }
 
+/// Formats the shared failure notice used when pending-input restore scanning fails.
+pub fn formatPendingRestoreFailedNotice(alloc: Allocator, err: anyerror) Allocator.Error![]u8 {
+    var plain_buf: [96]u8 = undefined;
+    return alloc.print(
+        "Couldn't restore prompts sent before fx stopped: {s}.",
+        .{types.plainErrorText(@errorName(err), &plain_buf)},
+    );
+}
+
 /// The turns of one compaction cycle from `src`, each handed to
 /// `visitor.append` and freed after it returns (`CycleReader.visitHistoryCycle`).
 fn visitCycle(src: Source, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {

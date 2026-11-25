@@ -2067,6 +2067,11 @@ fn notifyPendingAcceptedInputs(
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf("session", "event=pending_accepted_inputs_read_failed surface=acp err={s}", .{@errorName(err)});
+            const notice = try session_adapter.formatPendingRestoreFailedNotice(alloc, err);
+            defer alloc.free(notice);
+            sendAgentHistoryChunk(state, alloc, session_id, notice) catch |send_err| {
+                debug_trace.logf("session", "event=restore_notice_failed surface=acp err={s}", .{@errorName(send_err)});
+            };
             return;
         },
     };
@@ -3935,4 +3940,109 @@ test "eb03: notifyPendingAcceptedInputs scans without holding session_write_mute
     var remaining = try reopened.pendingAcceptedInputs(alloc);
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+}
+
+test "eb03: failed ACP pending input scan sends error chunk and leaves records pending" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace_path);
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-init-err.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.auth_mode = .host_managed;
+    state.credential_source = .host_managed;
+    state.cfg.allow_acp_mcp = false;
+    state.cfg.home_override = home_path;
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    const v2 = state.active_session.?.v2.?;
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, types.ConversationLanguage.default());
+    _ = try v2.recordInputAccepted("keep across failed acp scan");
+    const sid = try arena.dupe(u8, state.active_session.?.session_id);
+    try server.releaseActiveSession(&state);
+
+    var notice_capture = try tmp.dir.createFile(io_mod.getIo(), "acp-err-notice.jsonl", .{ .read = true });
+    defer notice_capture.close(io_mod.getIo());
+    state.writer = .{ .stdout = notice_capture };
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, sid),
+        .v2 = reopened,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = workspace_path,
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer if (state.active_session != null) {
+        state.active_session.?.session_rt.deinit(alloc);
+        alloc.free(state.active_session.?.session_id);
+        alloc.free(state.active_session.?.model);
+        if (state.active_session.?.v2) |s| s.close();
+        state.active_session = null;
+    };
+
+    const log_rel = try std.Io.Dir.path.join(alloc, &.{ "home", ".fx", "sessions", "v2", sid, "log.jsonl" });
+    defer alloc.free(log_rel);
+    const saved_log = try tmp.dir.readFileAlloc(io_mod.getIo(), log_rel, alloc, .limited(1 << 20));
+    defer alloc.free(saved_log);
+    {
+        var f = try tmp.dir.openFile(io_mod.getIo(), log_rel, .{ .mode = .read_write });
+        defer f.close(io_mod.getIo());
+        try f.writePositionalAll(io_mod.getIo(), "not valid json\n", 0);
+    }
+
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    try notice_capture.sync(io_mod.getIo());
+    var read_out = try tmp.dir.openFile(io_mod.getIo(), "acp-err-notice.jsonl", .{});
+    defer read_out.close(io_mod.getIo());
+    const out = try io_mod.readFileToEnd(alloc, &read_out, 64 * 1024);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, "Couldn't restore prompts sent before fx stopped: corrupt.") != null);
+
+    // Close active_session, restore log.jsonl, and verify the accepted record is still pending.
+    state.active_session.?.session_rt.deinit(alloc);
+    alloc.free(state.active_session.?.session_id);
+    alloc.free(state.active_session.?.model);
+    if (state.active_session.?.v2) |s| s.close();
+    state.active_session = null;
+
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = log_rel, .data = saved_log });
+    const retry = try session_adapter.Session.resumeSession(alloc, &state.sessions_v2.?, .{ .id = sid }, workspace_path, .acp);
+    defer retry.close();
+    var remaining = try retry.pendingAcceptedInputs(alloc);
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), remaining.ids.len);
+    try std.testing.expectEqualStrings("keep across failed acp scan", remaining.texts[0]);
 }

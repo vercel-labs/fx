@@ -1796,11 +1796,7 @@ pub fn Runtime(comptime App: type) type {
                 debug_trace.logf("session", "event=pending_input_restore_failed session={s} err={s}", .{ task.session_id, @errorName(err) });
                 if (err != error.PendingInputRestoreCancelled) {
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
-                        var plain_buf: [96]u8 = undefined;
-                        const body = try app.alloc.print(
-                            "Couldn't restore prompts sent before fx stopped: {s}.",
-                            .{types.plainErrorText(@errorName(err), &plain_buf)},
-                        );
+                        const body = try session_adapter.formatPendingRestoreFailedNotice(app.alloc, err);
                         defer app.alloc.free(body);
                         app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
                     }
