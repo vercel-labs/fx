@@ -15447,3 +15447,53 @@ test "input records held before turn 1 publish with turn 1" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("turn one", restored.history[0].assistant.user.text);
 }
+
+test "eb03: fork skips input_accepted, input_delivered, and input_withdrawn and has empty pendingAcceptedInputs" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+
+    // Turn 1: pending input_accepted before turn + delivered prompt inside turn 1.
+    _ = try s.recordInputAccepted("pending before turn 1");
+    const delivered_id = try s.recordInputAccepted("delivered turn 1");
+    const user1: types.UserTurn = .{ .text = @constCast("delivered turn 1"), .input_id = delivered_id };
+    try s.commitTurn(.{ .assistant = .{
+        .user = user1,
+        .assistant = @constCast("answer 1"),
+    } }, types.ConversationLanguage.default());
+
+    // Turn 2: withdrawn input before turn 2.
+    const withdrawn_id = try s.recordInputAccepted("withdrawn turn 2");
+    try s.recordInputWithdrawn(withdrawn_id);
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("turn two") },
+        .assistant = @constCast("answer 2"),
+    } }, types.ConversationLanguage.default());
+
+    const io = io_mod.getIo();
+    for ([_]u64{ 1, 2 }) |before_turn| {
+        const forked = try s.fork(testing.allocator, .{
+            .before_turn = before_turn,
+            .workspace = "/w",
+            .host = .app,
+        });
+        const fork_id = try testing.allocator.dupe(u8, forked.id());
+        defer testing.allocator.free(fork_id);
+        defer forked.close();
+
+        var pending = try forked.pendingAcceptedInputs(testing.allocator);
+        defer pending.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), pending.ids.len);
+
+        const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", fork_id, "log.jsonl" });
+        defer testing.allocator.free(log_path);
+        const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(bytes);
+        try testing.expect(std.mem.find(u8, bytes, "\"input_accepted\"") == null);
+        try testing.expect(std.mem.find(u8, bytes, "\"input_delivered\"") == null);
+        try testing.expect(std.mem.find(u8, bytes, "\"input_withdrawn\"") == null);
+    }
+}

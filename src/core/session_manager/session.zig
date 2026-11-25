@@ -1816,11 +1816,15 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const src = source_log.file;
     const end = source_log.end;
     const point = try findForkPoint(env, options.source, src, end, options.at);
+    const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
+    defer gpa.free(copied);
+    if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
+    const fork_seq = try forkLastCopiedSeq(copied);
 
     const session = try openNew(env, .{
         .workspace = options.workspace,
         .host = options.host,
-        .forked_from = .{ .id = options.source, .seq = point.seq },
+        .forked_from = .{ .id = options.source, .seq = fork_seq },
     });
     errdefer {
         session.phase = .closed;
@@ -1848,29 +1852,26 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
         });
         made += 1;
     }
-    // Line 1 is new; lines 2..S are copied (see `copyFolded`).
+    // Line 1 is new; lines 2..S are copied without input_* queue records (see `copyFolded`).
     session.batch.clearRetainingCapacity();
     session.bounds.clearRetainingCapacity();
     const created = env.nowMs();
     session.frameMarked(1, created, .{ .session_created = session.identity.created() }) catch |err| return forkError(err);
     session.created_ms = created;
-    const copied = try gpa.alloc(u8, @intCast(point.end - point.line1_end));
-    defer gpa.free(copied);
-    if ((s.readAt(src, copied, point.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, point.seq) catch |err| return forkError(err);
+    copyFolded(session, copied, fork_seq) catch |err| return forkError(err);
     // Then one finished work item per copy, after S, so the fork owns them.
-    var seq = point.seq;
+    var seq = fork_seq;
     for (children, copies) |child, copy| {
         const ids: schema.Body.WorkItem = .{ .child = copy.identity.id, .work_id = child.work_id, .data = child.spawn_data };
         seq += 1;
-        session.frameFolded(seq, created, .{ .child_spawned = ids }, point.seq) catch |err| return forkError(err);
+        session.frameFolded(seq, created, .{ .child_spawned = ids }, fork_seq) catch |err| return forkError(err);
         seq += 1;
         session.frameFolded(seq, created, .{ .child_finished = .{
             .child = ids.child,
             .work_id = ids.work_id,
             .outcome = child.outcome,
             .data = child.finish_data,
-        } }, point.seq) catch |err| return forkError(err);
+        } }, fork_seq) catch |err| return forkError(err);
     }
     const blobs = s.openDir(src_dir, "blobs") catch |err| switch (err) {
         error.NotFound => null,
@@ -1924,13 +1925,17 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const src = source_log.file;
     const end = source_log.end;
     const cut = try findChildCut(env, options.source, src, end, options.cut_ms);
+    const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
+    defer gpa.free(copied);
+    if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
+    const fork_seq = try forkLastCopiedSeq(copied);
 
     const session = try openNew(env, .{
         .workspace = options.workspace,
         .role = .child,
         .host = .child,
         .parent = options.parent,
-        .forked_from = .{ .id = options.source, .seq = cut.seq },
+        .forked_from = .{ .id = options.source, .seq = fork_seq },
     });
     errdefer {
         session.phase = .closed;
@@ -1941,15 +1946,12 @@ fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session 
     const created = env.nowMs();
     session.frameMarked(1, created, .{ .session_created = session.identity.created() }) catch |err| return forkError(err);
     session.created_ms = created;
-    const copied = try gpa.alloc(u8, @intCast(cut.end - cut.line1_end));
-    defer gpa.free(copied);
-    if ((s.readAt(src, copied, cut.line1_end) catch |io_err| return storage.ioFault(io_err)) != copied.len) return error.Io;
-    copyFolded(session, copied, cut.seq) catch |err| return forkError(err);
-    var seq = cut.seq;
+    copyFolded(session, copied, fork_seq) catch |err| return forkError(err);
+    var seq = fork_seq;
     if (session.state.open_turn) |turn| {
         // At the last copied line's time, which is at or before the cut.
         seq += 1;
-        session.frameFolded(seq, cut.ts_ms, .{ .turn_interrupted = .{ .turn = turn, .reason = .cancel } }, cut.seq) catch |err| return forkError(err);
+        session.frameFolded(seq, cut.ts_ms, .{ .turn_interrupted = .{ .turn = turn, .reason = .cancel } }, fork_seq) catch |err| return forkError(err);
     }
     const blobs = s.openDir(src_dir, "blobs") catch |err| switch (err) {
         error.NotFound => null,
@@ -2185,28 +2187,73 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
     };
 }
 
-/// Pass 2 of a fork: appends the source's lines 2..S to the batch and folds
-/// each at its offset in the fork. Lines are copied byte for byte, so their
-/// crc holds, except snapshots: a snapshot records byte offsets, and the
-/// fork's line 1 has a different length, so each snapshot is encoded again
-/// from the fork's own fold at that point, with the same seq and time.
+/// Accepted-input queue records belong to the source session's own live queue.
+fn isForkSkippedInputKind(kind: ?schema.Kind) bool {
+    return switch (kind orelse return false) {
+        .input_accepted, .input_delivered, .input_withdrawn => true,
+        else => false,
+    };
+}
+
+fn forkLastCopiedSeq(copied: []const u8) ForkError!u64 {
+    var seq: u64 = 1;
+    var at: usize = 0;
+    while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
+        const header = log_mod.checkLine(copied[at .. nl + 1]) catch |io_err| return storage.ioFault(io_err);
+        if (!isForkSkippedInputKind(header.kind)) seq += 1;
+    }
+    return seq;
+}
+
+fn appendReframedLine(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    seq: u64,
+    source_header: schema.Header,
+    body: []const u8,
+) AppendError!void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try payload.print(gpa, "{{\"v\":{d},\"seq\":{d},\"ts\":{d},\"kind\":\"{s}\"", .{
+        source_header.v,
+        seq,
+        source_header.ts_ms,
+        source_header.kind_name,
+    });
+    try payload.appendSlice(gpa, body);
+    log_mod.appendFramed(gpa, out, payload.items) catch |err| switch (err) {
+        error.TooLarge => return error.TooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Pass 2 of a fork: appends the source's lines 2..S (skipping `input_*` queue
+/// records) to the batch and folds each at its offset in the fork. Lines are
+/// copied byte for byte when their seq is unchanged; skipped lines renumber
+/// later lines cleanly, and snapshots are re-encoded from the fork's own fold.
 fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!void {
     const gpa = session.env.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(gpa);
+    var seq: u64 = 1;
     var at: usize = 0;
     while (std.mem.findScalarPos(u8, copied, at, '\n')) |nl| : (at = nl + 1) {
         _ = arena.reset(.retain_capacity);
         const source_line = copied[at .. nl + 1];
         const source_header = log_mod.checkLine(source_line) catch |io_err| return storage.ioFault(io_err);
+        if (isForkSkippedInputKind(source_header.kind)) continue;
+        seq += 1;
         const start = session.batch.items.len;
         if (source_header.kind == .snapshot) {
             encoded.clearRetainingCapacity();
-            try session.frameMarked(source_header.seq, source_header.ts_ms, try session.snapshotBody(&encoded));
-        } else {
+            try session.frameMarked(seq, source_header.ts_ms, try session.snapshotBody(&encoded));
+        } else if (seq == source_header.seq) {
             try session.batch.appendSlice(gpa, source_line);
+            try session.bounds.append(gpa, session.batch.items.len);
+        } else {
+            try appendReframedLine(gpa, &session.batch, seq, source_header, log_mod.lineBody(source_line, source_header));
             try session.bounds.append(gpa, session.batch.items.len);
         }
         const line = session.batch.items[start..];
@@ -2219,6 +2266,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
             session.state.last_seq = header.seq;
         }
     }
+    std.debug.assert(seq == fork_seq);
     // The fork owns no children spawned before its fork point.
     std.debug.assert(session.state.children.items.len == 0);
 }
