@@ -1992,6 +1992,17 @@ pub const Session = struct {
     continued_base: std.ArrayList(PieceIdentity) = .empty,
     /// The continuation's base is not empty, so its marker says `extends`.
     continued_extends: bool = false,
+    /// The yielded turn's log number, taken out of `turn_numbers` by
+    /// `setContinuesYielded`: the number an `extends` continuation keeps
+    /// (RULES R1.8). Null when none was taken. Cleared when the turn commits.
+    continued_from: ?u64 = null,
+    /// The open log turn was started with the `extends` marker and no later
+    /// write superseded it (`startedTurn`, `supersedeOpenTurn`).
+    open_extends: bool = false,
+    /// The open log turn carries a `turn_continued` marker, in either format,
+    /// so a write that supersedes it gives its fresh copy the marker too
+    /// (`supersedeOpenTurn`, RULES R1.8).
+    open_continued: bool = false,
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
@@ -2560,9 +2571,15 @@ pub const Session = struct {
 
         const written = try withoutSkipped(a, all, encoded, skip);
         try self.writePieces(a, written.events[start..], written.encoded[start..], tail.items, openingAuthor(turn), owner);
+        // An `extends` continuation numbers its turn as its chain's first turn
+        // (RULES R1.8). The copy format numbers it as its own log turn.
+        const number = if (self.open_extends) self.continued_from orelse self.last_turn else self.last_turn;
         self.clearContinuedBase();
-        self.turn_numbers.appendAssumeCapacity(self.last_turn);
+        self.continued_from = null;
+        self.turn_numbers.appendAssumeCapacity(number);
         self.turn_open = false;
+        self.open_extends = false;
+        self.open_continued = false;
         self.turn_token = 0;
         self.clearStreamed();
         if (owned_language) |owned| {
@@ -2972,9 +2989,24 @@ pub const Session = struct {
         self.clearContinuedBase();
         const execution = base orelse {
             self.continues_yielded = false;
+            // The caller put the yielded turn back into the history, so its number returns too (RULES R1.8).
+            if (self.continued_from) |number| self.turn_numbers.append(self.alloc, number) catch |err|
+                debug_trace.logf("session", "event=sessions_v2_continued_number_lost session={s} err={s}", .{ self.id(), @errorName(err) });
+            self.continued_from = null;
             return;
         };
         self.continues_yielded = true;
+        // The caller took the yielded turn out of the history, so its number
+        // leaves `turn_numbers` too (RULES R1.8). Taken even in the copy format,
+        // which then numbers its own turn.
+        self.continued_from = null;
+        const newest = if (self.turn_numbers.items.len > 0) self.turn_numbers.items[self.turn_numbers.items.len - 1] else null;
+        if (newest) |number| {
+            _ = self.turn_numbers.pop();
+            self.continued_from = number;
+        } else {
+            debug_trace.logf("session", "event=sessions_v2_continued_number_missing session={s}", .{self.id()});
+        }
         const identities = self.baseIdentities(withoutDisplayRecords(execution.*)) catch |err| {
             debug_trace.logf("session", "event=sessions_v2_continued_base_unavailable session={s} err={s} dropped=base", .{ self.id(), @errorName(err) });
             return;
@@ -3198,6 +3230,9 @@ pub const Session = struct {
         self.last_turn += 1;
         self.turn_open = true;
         self.turn_token = opener;
+        // The marker was written with this turn when it continues a yielded one.
+        self.open_extends = self.continues_yielded and self.continued_extends;
+        self.open_continued = self.continues_yielded;
         self.continues_yielded = false;
         if (opener != 0) self.markStartsWritten(opener);
     }
@@ -3331,6 +3366,8 @@ pub const Session = struct {
         };
         try self.writePieces(a, events, encoded, &.{end}, author, 0);
         self.turn_open = false;
+        self.open_extends = false;
+        self.open_continued = false;
         self.turn_token = 0;
     }
 
@@ -3369,15 +3406,27 @@ pub const Session = struct {
     /// (D98).
     fn supersedeOpenTurn(self: *Session, reason: []const u8) !void {
         debug_trace.logf("session", "event=sessions_v2_turn_superseded session={s} reason={s}", .{ self.id(), reason });
+        const continuation = self.open_continued;
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
         self.turn_open = false;
         self.turn_stale = false;
+        self.open_extends = false;
+        self.open_continued = false;
         self.turn_token = 0;
         self.clearStreamed();
         for (self.captures.items) |*capture| capture.written = false;
+        // RULES R1.8: the fresh turn that replaces a superseded continuation is a
+        // continuation too, in the copy format, so the reader drops the held
+        // turn and the copy keeps its own number. The next write that opens a
+        // turn reads `continues_yielded` and `continued_extends` (`openTurnLocked`,
+        // `writePieces`), so both paths write the marker.
+        if (continuation) {
+            self.clearContinuedBase();
+            self.continues_yielded = true;
+        }
     }
 
     /// One piece as an item; a large one goes to a blob.
@@ -3427,7 +3476,8 @@ pub const Session = struct {
         // A failed turn left open is not the active turn: its fresh turn is
         // not on disk yet (D98).
         if (keep_from == null and active_prefix and self.turn_open and !self.turn_stale) {
-            keep_from = self.last_turn;
+            // An open `extends` continuation is its chain's turn, numbered by its first turn (RULES R1.8).
+            keep_from = if (self.open_extends) self.continued_from orelse self.last_turn else self.last_turn;
             cut_turn = true;
         }
         // A cut inside a turn counts from where fx's view of that turn starts,
@@ -5881,17 +5931,25 @@ fn continuedExtends(a: Allocator, data: []const u8) bool {
     return marker.extends;
 }
 
-/// Gives `turn`, a finished turn, its held turn when it continues one: they
-/// merge into one turn and `held` is cleared. Otherwise `turn` is returned.
-fn joinHeld(alloc: Allocator, held: *?HeldTurn, continues_held: *bool, turn: types.HistoryTurn) !types.HistoryTurn {
-    if (!continues_held.*) return turn;
+/// A finished turn as the replay reports it, with its log number.
+const JoinedTurn = struct {
+    turn: types.HistoryTurn,
+    number: ?u64,
+};
+
+/// Gives `turn`, a finished turn numbered `number`, its held turn when it
+/// continues one: they merge into one turn, numbered as the held turn is
+/// (RULES R1.8), and `held` is cleared. Otherwise `turn` and `number` are
+/// returned as they are.
+fn joinHeld(alloc: Allocator, held: *?HeldTurn, continues_held: *bool, turn: types.HistoryTurn, number: ?u64) !JoinedTurn {
+    if (!continues_held.*) return .{ .turn = turn, .number = number };
     continues_held.* = false;
     const value = held.* orelse {
         types.freeHistoryTurn(alloc, turn);
         return error.InvalidConversationFrame;
     };
     held.* = null;
-    return mergeContinued(alloc, value.turn, turn);
+    return .{ .turn = try mergeContinued(alloc, value.turn, turn), .number = value.number };
 }
 
 /// Drops the open builder of a continuation that never ended. Its held turn
@@ -6211,12 +6269,16 @@ noinline fn replay(
                         .runtime_context => |value| try builder.setRuntimeContext(value.messages),
                         .turn_completed => |value| {
                             const finished = try presentStoredResults(src, alloc, try builder.finishAssistant(value));
-                            try sink.turn(try joinHeld(alloc, &held, &continues_held, finished), lastStarted(entry));
+                            // Numbered as its chain's first turn when it continues one (RULES R1.8).
+                            const joined = try joinHeld(alloc, &held, &continues_held, finished, lastStarted(entry));
+                            try sink.turn(joined.turn, joined.number);
                         },
                         .interrupted => |value| {
                             interrupted_item = true;
                             const finished = try presentStoredResults(src, alloc, try builder.finishInterrupted(value));
-                            try sink.turn(try joinHeld(alloc, &held, &continues_held, finished), lastStarted(entry));
+                            // Numbered as its chain's first turn when it continues one (RULES R1.8).
+                            const joined = try joinHeld(alloc, &held, &continues_held, finished, lastStarted(entry));
+                            try sink.turn(joined.turn, joined.number);
                         },
                         .context_checkpoint => return error.InvalidConversationFrame,
                     }
@@ -6251,10 +6313,13 @@ noinline fn replay(
                     // If none does, it shows as stopped, not as cancelled.
                     if (yield_item and (ended.reason == .closed or ended.reason == .crash)) {
                         shown.interrupted.yielded = true;
-                        const joined = try joinHeld(alloc, &held, &continues_held, shown);
-                        held = .{ .turn = joined, .number = ended.turn };
+                        // Held under its chain's first turn number when it continues one (RULES R1.8).
+                        const joined = try joinHeld(alloc, &held, &continues_held, shown, ended.turn);
+                        held = .{ .turn = joined.turn, .number = joined.number orelse ended.turn };
                     } else {
-                        try sink.turn(try joinHeld(alloc, &held, &continues_held, shown), ended.turn);
+                        // Numbered as its chain's first turn when it continues one (RULES R1.8).
+                        const joined = try joinHeld(alloc, &held, &continues_held, shown, ended.turn);
+                        try sink.turn(joined.turn, joined.number);
                     }
                 },
                 .compacted => |line| {
@@ -8617,6 +8682,354 @@ test "a closed turn without the yield marker does not come back as yielded" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expect(restored.history[0].interrupted.stopped_by_exit);
     try testing.expect(!restored.history[0].interrupted.yielded);
+}
+
+/// Commits a turn with no tool steps, as a session's turn before the one under test.
+fn commitPlainTurn(s: *Session, text: []const u8) !void {
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast(text) }, .assistant = @constCast("done") } }, types.ConversationLanguage.default());
+}
+
+/// Resumes `id` the way the app continues a yielded turn: it restores the
+/// session and gives the newest turn to `setContinuesYielded` as the base.
+/// The caller closes the returned session.
+fn resumeContinuing(t: *TestHome, id: []const u8) !*Session {
+    const c = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    errdefer c.close();
+    var restored = try c.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const yielded = restored.history[restored.history.len - 1].interrupted;
+    try testing.expect(yielded.yielded);
+    c.setContinuesYielded(&yielded.execution);
+    return c;
+}
+
+/// The restored history of session `id` as JSON, in `a`.
+fn restoredJson(t: *TestHome, a: Allocator, id: []const u8) ![]u8 {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    return historyJson(a, restored.history);
+}
+
+/// Asserts that the newest continuation in session `id` is in the `extends` format.
+fn expectExtendsMarker(t: *TestHome, id: []const u8) !void {
+    const marker = try lastItemData(t.store.manager, id, continued_type);
+    defer testing.allocator.free(marker);
+    try testing.expectEqualStrings(continued_extends_data, marker);
+}
+
+/// The same steps with no yield: turn 1 is committed; turn 2 streams two
+/// steps, a compaction cuts its first step, and turn 2 commits with three
+/// steps. Returns its session id, owned by the caller.
+fn writeCutReference(t: *TestHome, a: Allocator, user: types.UserTurn) ![]u8 {
+    var model = "m".*;
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 3) } } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a cut that keeps a twice-continued turn whole restores every step" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const second = try resumeContinuing(&t, id);
+    try second.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try testing.expect(try second.markYielded());
+    second.close();
+
+    const third = try resumeContinuing(&t, id);
+    try third.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 3) } } }, types.ConversationLanguage.default());
+    try third.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
+    third.close();
+    try expectExtendsMarker(&t, id);
+
+    const reference = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(reference, "first");
+    try reference.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 3) } } }, types.ConversationLanguage.default());
+    try reference.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
+    const reference_id = try testing.allocator.dupe(u8, reference.id());
+    defer testing.allocator.free(reference_id);
+    reference.close();
+    try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+test "a cut inside a continuation restores the turn from the cut" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const c = try resumeContinuing(&t, id);
+    try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try c.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 3) } } }, types.ConversationLanguage.default());
+    c.close();
+    try expectExtendsMarker(&t, id);
+
+    const reference_id = try writeCutReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+test "a cut inside the yielded turn, then a continuation, restores the turn from the cut" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // The restored yielded turn keeps only step 2, so its base is that step.
+    const c = try resumeContinuing(&t, id);
+    try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = (try stepsUpTo(a, 3))[1..] } } }, types.ConversationLanguage.default());
+    c.close();
+    try expectExtendsMarker(&t, id);
+
+    const reference_id = try writeCutReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+test "a cut that covers every turn after a continuation keeps none" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const c = try resumeContinuing(&t, id);
+    try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 2) } } }, types.ConversationLanguage.default());
+    // Two raw turns, the first and the chain, are all the history there is.
+    try c.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, .{ .turns = 2 });
+    c.close();
+    try expectExtendsMarker(&t, id);
+
+    // Closed before the next resume: a session has one live writer (RULES R3.6).
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    var restored = try r.restore(testing.allocator);
+    const history_len = restored.history.len;
+    const only_summary = history_len == 1 and std.meta.activeTag(restored.history[0]) == .compacted_summary;
+    restored.deinit(testing.allocator);
+    r.close();
+    try testing.expectEqual(@as(usize, 1), history_len);
+    try testing.expect(only_summary);
+
+    const reference = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(reference, "first");
+    try reference.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 2) } } }, types.ConversationLanguage.default());
+    try reference.commitCompaction(.{ .summary = &summary, .removed_turn_count = 2, .compaction_count = 1 }, false, .{ .turns = 2 });
+    const reference_id = try testing.allocator.dupe(u8, reference.id());
+    defer testing.allocator.free(reference_id);
+    reference.close();
+    try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+test "a continuation leaves one turn number per history turn" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 1) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const c = try resumeContinuing(&t, id);
+    try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = try stepsUpTo(a, 2) } } }, types.ConversationLanguage.default());
+    // Read before the close, so a failed check below still closes the session.
+    const numbers = c.turn_numbers.items;
+    const count = numbers.len;
+    const first = if (count > 0) numbers[0] else null;
+    const last = if (count > 0) numbers[count - 1] else null;
+    c.close();
+    // The history holds two turns: the first, numbered 1, and the chain, whose first turn is 2.
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(?u64, 1), first);
+    try testing.expectEqual(@as(?u64, 2), last);
+    try expectExtendsMarker(&t, id);
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+}
+
+/// The last item of `item_type` in session `id` is `data`.
+fn expectLastItem(t: *TestHome, id: []const u8, item_type: []const u8, data: []const u8) !void {
+    const found = try lastItemData(t.store.manager, id, item_type);
+    defer testing.allocator.free(found);
+    try testing.expectEqualStrings(data, found);
+}
+
+/// What a restored history holds: how many turns, and the tool steps of its
+/// last turn as JSON, in the caller's arena.
+const Kept = struct { turns: usize, steps: []u8 };
+
+fn restoredKept(t: *TestHome, a: Allocator, id: []const u8) !Kept {
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    if (restored.history.len == 0) return error.TestUnexpectedResult;
+    const steps = switch (restored.history[restored.history.len - 1]) {
+        .interrupted => |turn| turn.execution.tool_steps,
+        .assistant => |turn| turn.execution.tool_steps,
+        .compacted_summary => return error.TestUnexpectedResult,
+    };
+    return .{ .turns = restored.history.len, .steps = try std.json.Stringify.valueAlloc(a, steps, .{}) };
+}
+
+/// Continues the yielded turn `id` as T3, whose first write is `extends`,
+/// then cuts a step inside T3 and writes the view after the cut. That view
+/// no longer matches what T3 streamed, so T3 is superseded and the write
+/// starts its fresh copy. Returns the session, open on the copy; the caller ends it.
+fn supersedeAfterCut(t: *TestHome, a: Allocator, user: types.UserTurn, id: []const u8) !*Session {
+    const c = try resumeContinuing(t, id);
+    try c.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 3) }, .{});
+    var summary = "summary".*;
+    try c.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try c.appendProgress(user, .{ .tool_steps = (try stepsUpTo(a, 3))[1..] }, .{});
+    return c;
+}
+
+/// The same cut with no yield: turn 2 streams steps 1 and 2, a compaction
+/// cuts step 1, steps 2 and 3 no longer match what turn 2 streamed, so
+/// turn 2 is superseded, and its fresh copy commits with steps 2 and 3.
+/// Returns its session id, owned by the caller.
+fn writeSupersededReference(t: *TestHome, a: Allocator, user: types.UserTurn) ![]u8 {
+    var model = "m".*;
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    try s.appendProgress(user, .{ .tool_steps = (try stepsUpTo(a, 3))[1..] }, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = (try stepsUpTo(a, 3))[1..] } } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+/// Writes turn 1, then turn 2 streams steps 1 and 2 and yields. Returns its
+/// session id, owned by the caller.
+fn writeYieldedTwo(t: *TestHome, a: Allocator, user: types.UserTurn) ![]u8 {
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try commitPlainTurn(s, "first");
+    try s.appendProgress(user, .{ .tool_steps = try stepsUpTo(a, 2) }, .{});
+    try testing.expect(try s.markYielded());
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a continuation superseded after a compaction is replaced by its fresh copy" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const id = try writeYieldedTwo(&t, a, user);
+    defer testing.allocator.free(id);
+
+    const c = try supersedeAfterCut(&t, a, user, id);
+    try testing.expect(try c.markYielded());
+    c.close();
+    // The fresh copy is a continuation in the copy format: its marker is `{}`, not `extends`.
+    try expectLastItem(&t, id, continued_type, "{}");
+
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    const got = try restoredKept(&t, a, id);
+    const want = try restoredKept(&t, a, reference_id);
+    try testing.expectEqual(@as(usize, 2), got.turns);
+    try testing.expectEqualStrings(want.steps, got.steps);
+}
+
+test "a continuation superseded after a compaction commits its fresh copy" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const id = try writeYieldedTwo(&t, a, user);
+    defer testing.allocator.free(id);
+
+    const c = try supersedeAfterCut(&t, a, user, id);
+    try c.commitTurn(.{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = .{ .tool_steps = (try stepsUpTo(a, 3))[1..] } } }, types.ConversationLanguage.default());
+    c.close();
+    try expectLastItem(&t, id, continued_type, "{}");
+
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
 }
 
 fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
