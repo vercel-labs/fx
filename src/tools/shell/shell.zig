@@ -4654,9 +4654,18 @@ const TtySteeringCancelTest = struct {
         };
     }
 
-    /// Runs `command` in a tty in turn `turn_id` while steering waits, and
-    /// returns its session id, which the caller frees.
-    fn run(self: *TtySteeringCancelTest, command: []const u8, turn_id: u64) ![]u8 {
+    /// Dispatches the `shell` call `run` with a tty as the agent does, and
+    /// returns the result body, which the caller frees. With `steered` the
+    /// start returns once the command runs and a steering wait follows;
+    /// without it the start waits for the command to exit, for at most
+    /// `yield_ms`.
+    fn dispatchRun(
+        self: *TtySteeringCancelTest,
+        command: []const u8,
+        turn_id: u64,
+        yield_ms: u32,
+        steered: bool,
+    ) ![]u8 {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -4677,13 +4686,13 @@ const TtySteeringCancelTest = struct {
             .source = .yolo,
         } };
         const arguments = try arena.print(
-            "{{\"action\":\"run\",\"tty\":true,\"command\":\"{s}\",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\",\"clean_start\":true}},\"yield_time_ms\":30000}}",
-            .{ command, shell_path },
+            "{{\"action\":\"run\",\"tty\":true,\"command\":\"{s}\",\"shell\":{{\"kind\":\"executable\",\"path\":\"{s}\",\"clean_start\":true}},\"yield_time_ms\":{d}}}",
+            .{ command, shell_path, yield_ms },
         );
         var ctx = self.context();
         ctx.tool_call_id = "steered-tty-call";
         ctx.execution_authority = .{ .run_command = authority };
-        ctx.tool_yield_flag = &self.yield_flag;
+        ctx.tool_yield_flag = if (steered) &self.yield_flag else null;
         ctx.output_chunk_lifecycle_id = .{ .turn_id = turn_id, .call_id = "steered-tty-call" };
         const result = try tool_dispatch.dispatchAuthorizedToolCall(
             ctx,
@@ -4691,10 +4700,18 @@ const TtySteeringCancelTest = struct {
             .{ .id = "steered-tty-call", .name = "shell", .arguments_json = arguments },
         );
         defer result.deinit(self.alloc);
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, result.body, .{});
+        return self.alloc.dupe(u8, result.body);
+    }
+
+    /// Runs `command` in a tty in turn `turn_id` while steering waits, and
+    /// returns its session id, which the caller frees.
+    fn run(self: *TtySteeringCancelTest, command: []const u8, turn_id: u64) ![]u8 {
+        const body = try self.dispatchRun(command, turn_id, 30000, true);
+        defer self.alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
         defer parsed.deinit();
         std.testing.expectEqualStrings("running", parsed.value.object.get("state").?.string) catch |err| {
-            std.debug.print("tty run result: {s}\n", .{result.body});
+            std.debug.print("tty run result: {s}\n", .{body});
             return err;
         };
         try std.testing.expect(parsed.value.object.get("steering_notice") != null);
@@ -4750,6 +4767,352 @@ const TtySteeringCancelTest = struct {
         };
     }
 };
+
+/// Holds a start at a point of `start`, and an `inspect` that holds a copy, so
+/// a test can run another call while the start has not returned. Every hold
+/// ends after `max_wait_ms`, so a test that fails cannot hang.
+const StartGate = struct {
+    const native = @import("../../core/terminal/native_session.zig");
+    const max_wait_ms: i64 = 10_000;
+
+    var hold_start_at: ?native.GapPoint = null;
+    var hold_copy = false;
+    /// The start has saved its record, and `id` names it.
+    var saved: std.Io.Event = .unset;
+    /// The start waits at `hold_start_at`.
+    var held: std.Io.Event = .unset;
+    var release_start: std.Io.Event = .unset;
+    /// The command runs and the start waits for it.
+    var launched: std.Io.Event = .unset;
+    /// An `inspect` holds a copy, or the second caller finished.
+    var progress: std.Io.Event = .unset;
+    var release_copy: std.Io.Event = .unset;
+    var copies = std.atomic.Value(u32).init(0);
+    var id_buf: [128]u8 = undefined;
+    var id_len: usize = 0;
+
+    fn arm(hold_at: ?native.GapPoint, hold_open_copy: bool) void {
+        hold_start_at = hold_at;
+        hold_copy = hold_open_copy;
+        saved = .unset;
+        held = .unset;
+        release_start = .unset;
+        launched = .unset;
+        progress = .unset;
+        release_copy = .unset;
+        copies.store(0, .release);
+        id_len = 0;
+        native.test_gap = &hook;
+    }
+
+    fn disarm() void {
+        native.test_gap = null;
+        releaseAll();
+    }
+
+    fn releaseAll() void {
+        release_start.set(std.testing.io);
+        release_copy.set(std.testing.io);
+    }
+
+    fn id() []const u8 {
+        return id_buf[0..id_len];
+    }
+
+    fn hook(point: native.GapPoint, session_id: []const u8) void {
+        switch (point) {
+            .record_saved => {
+                id_len = @min(session_id.len, id_buf.len);
+                @memcpy(id_buf[0..id_len], session_id[0..id_len]);
+                saved.set(std.testing.io);
+            },
+            .launched => launched.set(std.testing.io),
+            .resident_registered => {},
+            .copy_held => {
+                _ = copies.fetchAdd(1, .acq_rel);
+                progress.set(std.testing.io);
+                if (hold_copy) waitBounded(&release_copy);
+                return;
+            },
+        }
+        if (hold_start_at == point) {
+            held.set(std.testing.io);
+            waitBounded(&release_start);
+        }
+    }
+
+    fn timeout() std.Io.Timeout {
+        return .{ .duration = .{ .raw = .fromMilliseconds(max_wait_ms), .clock = .awake } };
+    }
+
+    fn waitBounded(event: *std.Io.Event) void {
+        // A timeout lets the held call go on, so a test that failed still ends.
+        event.waitTimeout(std.testing.io, timeout()) catch {};
+    }
+
+    fn waitFor(event: *std.Io.Event) !void {
+        event.waitTimeout(std.testing.io, timeout()) catch return error.TestStartGateTimedOut;
+    }
+};
+
+/// A `shell` call `run` on its own thread.
+const StartCall = struct {
+    t: *TtySteeringCancelTest,
+    command: []const u8,
+    yield_ms: u32,
+    body: ?[]u8 = null,
+    failure: ?anyerror = null,
+    returned: std.Io.Event = .unset,
+
+    fn run(self: *StartCall) void {
+        defer self.returned.set(std.testing.io);
+        self.body = self.t.dispatchRun(self.command, 5, self.yield_ms, false) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+
+    fn deinit(self: *StartCall) void {
+        if (self.body) |body| self.t.alloc.free(body);
+    }
+
+    /// The string field `key` of the result body, which the caller frees.
+    fn field(self: *StartCall, key: []const u8) !?[]u8 {
+        const body = self.body orelse return null;
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.t.alloc, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const value = parsed.value.object.get(key) orelse return null;
+        if (value != .string) return null;
+        return try self.t.alloc.dupe(u8, value.string);
+    }
+
+    /// The call returned a result that is not an error, in `state`.
+    fn expectState(self: *StartCall, state: []const u8) !void {
+        if (self.failure) |err| return err;
+        errdefer std.debug.print("start result: {?s}\n", .{self.body});
+        const body = self.body orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.find(u8, body, "\"error\"") == null);
+        const actual = try self.field("state") orelse return error.TestUnexpectedResult;
+        defer self.t.alloc.free(actual);
+        try std.testing.expectEqualStrings(state, actual);
+    }
+};
+
+/// What a `shell` call that names a terminal id the managed runtime does not
+/// know does first, on its own thread.
+const SyncCall = struct {
+    t: *TtySteeringCancelTest,
+    named_id: []const u8,
+    outcome: anyerror!terminal_managed_observer.SyncOutcome = error.TestSyncNotRun,
+    finished: std.Io.Event = .unset,
+
+    fn run(self: *SyncCall) void {
+        defer self.finished.set(std.testing.io);
+        defer StartGate.progress.set(std.testing.io);
+        self.outcome = ensureOwnedTtyIndexed(self.t.context(), &self.t.runtime, self.named_id);
+    }
+};
+
+/// A named pipe that the test writes one byte to, to let a command go on. The
+/// test holds both ends open, so the command's `read` blocks on that byte and
+/// a hang-up cannot pass for it. The command names the pipe relative to its
+/// working directory, which is `dir`.
+const GoSignal = struct {
+    const fifo_c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+
+    const name = "go";
+
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+
+    fn init(signal: *GoSignal, dir: []const u8) !void {
+        var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+        const fifo = try std.mem.printSentinel(&path_buf, "{s}/" ++ name, .{dir}, 0);
+        if (fifo_c.mkfifo(fifo, 0o600) != 0) return error.TestGoSignalFailed;
+        signal.read_fd = std.c.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        if (signal.read_fd < 0) return error.TestGoSignalFailed;
+        errdefer _ = std.c.close(signal.read_fd);
+        signal.write_fd = std.c.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        if (signal.write_fd < 0) return error.TestGoSignalFailed;
+    }
+
+    fn deinit(signal: *GoSignal) void {
+        _ = std.c.close(signal.write_fd);
+        _ = std.c.close(signal.read_fd);
+    }
+
+    fn send(signal: *GoSignal) !void {
+        if (std.c.write(signal.write_fd, "\n", 1) != 1) return error.TestGoSignalFailed;
+    }
+};
+
+const unknown_terminal_id = "terminal-not-known-to-this-process";
+
+/// A command that never forks: the shell becomes `sleep`, so the exit close,
+/// which records the process tree once, always reaches it. A forked `sleep`
+/// that the tree misses outlives its terminal and keeps the PTY open.
+const idle_command = "exec sleep 30";
+
+/// Waits for `text` in the output of a running terminal, as another call that names it would.
+fn waitForTerminalOutput(t: *TtySteeringCancelTest, session_id: []const u8, text: []const u8) !void {
+    var authority = try reloadTerminalAuthority(t.context(), session_id);
+    defer authority.deinit();
+    var executed = try executeTerminal(t.context(), .{ .wait = .{
+        .session_id = session_id,
+        .return_when = .{ .match = text },
+        .safety_ceiling_ms = 10_000,
+        .authority = authority.view(),
+    } });
+    defer executed.deinit(t.alloc);
+    const outcome = switch (executed.result.view()) {
+        .success => |success| switch (success) {
+            .wait => |value| value.outcome,
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(terminal_contracts.ReturnOutcome.condition_met, outcome);
+}
+
+test "start in flight: a sync before the resident is registered opens no copy and the start survives" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    StartGate.arm(.record_saved, true);
+    defer StartGate.disarm();
+    var start = StartCall{ .t = &t, .command = idle_command, .yield_ms = 0 };
+    defer start.deinit();
+    const start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start});
+    defer start_thread.join();
+    try StartGate.waitFor(&StartGate.held);
+
+    // The record is on disk and the start waits before it registers its
+    // resident. The second caller either finishes or holds a copy.
+    var sync = SyncCall{ .t = &t, .named_id = unknown_terminal_id };
+    const sync_thread = try std.Thread.spawn(.{}, SyncCall.run, .{&sync});
+    defer sync_thread.join();
+    defer StartGate.releaseAll();
+    try StartGate.waitFor(&StartGate.progress);
+    try std.testing.expect(t.runtime.stateFor(StartGate.id()) == null);
+
+    StartGate.release_start.set(std.testing.io);
+    try StartGate.waitFor(&start.returned);
+    try StartGate.waitFor(&sync.finished);
+    try std.testing.expectEqual(@as(u32, 0), StartGate.copies.load(.acquire));
+    try std.testing.expectEqual(terminal_managed_observer.SyncOutcome.indexed, try sync.outcome);
+    try start.expectState("running");
+    try std.testing.expect(t.runtime.stateFor(StartGate.id()) != null);
+}
+
+test "start in flight: a sync before the slot is reserved finds nothing to inspect and succeeds" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    StartGate.arm(.resident_registered, false);
+    defer StartGate.disarm();
+    var start = StartCall{ .t = &t, .command = idle_command, .yield_ms = 0 };
+    defer start.deinit();
+    const start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start});
+    defer start_thread.join();
+    defer StartGate.releaseAll();
+    try StartGate.waitFor(&StartGate.held);
+
+    // The resident is registered and the registry cannot find the session.
+    const outcome = ensureOwnedTtyIndexed(t.context(), &t.runtime, unknown_terminal_id);
+    const indexed_during = t.runtime.stateFor(StartGate.id()) != null;
+
+    StartGate.release_start.set(std.testing.io);
+    try StartGate.waitFor(&start.returned);
+    try std.testing.expectEqual(terminal_managed_observer.SyncOutcome.indexed, try outcome);
+    try std.testing.expect(!indexed_during);
+    try start.expectState("running");
+    try std.testing.expect(t.runtime.stateFor(StartGate.id()) != null);
+}
+
+test "start in flight: a sync that names a forgotten terminal indexes it while another start waits to be reserved" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    // X is a terminal of this owner that the managed runtime does not know,
+    // as after a resume.
+    var first = StartCall{ .t = &t, .command = idle_command, .yield_ms = 0 };
+    defer first.deinit();
+    first.run();
+    try first.expectState("running");
+    const x_id = try first.field("session_id") orelse return error.TestUnexpectedResult;
+    defer t.alloc.free(x_id);
+    t.runtime.deinit();
+    t.runtime = managed_execution.Runtime.init(t.alloc);
+    try std.testing.expect(t.runtime.stateFor(x_id) == null);
+
+    StartGate.arm(.resident_registered, false);
+    defer StartGate.disarm();
+    var second = StartCall{ .t = &t, .command = idle_command, .yield_ms = 0 };
+    defer second.deinit();
+    const second_thread = try std.Thread.spawn(.{}, StartCall.run, .{&second});
+    defer second_thread.join();
+    defer StartGate.releaseAll();
+    try StartGate.waitFor(&StartGate.held);
+
+    const outcome = ensureOwnedTtyIndexed(t.context(), &t.runtime, x_id);
+    const x_indexed = t.runtime.stateFor(x_id) != null;
+    const y_indexed_during = t.runtime.stateFor(StartGate.id()) != null;
+
+    StartGate.release_start.set(std.testing.io);
+    try StartGate.waitFor(&second.returned);
+    try std.testing.expectEqual(terminal_managed_observer.SyncOutcome.indexed, try outcome);
+    try std.testing.expect(x_indexed);
+    try std.testing.expect(!y_indexed_during);
+    try second.expectState("running");
+
+    // Once the start has returned, a sync lists it like any other terminal.
+    t.runtime.deinit();
+    t.runtime = managed_execution.Runtime.init(t.alloc);
+    _ = try ensureOwnedTtyIndexed(t.context(), &t.runtime, x_id);
+    try std.testing.expect(t.runtime.stateFor(StartGate.id()) != null);
+}
+
+test "start in flight: a sync during a start that waits for exit does not double its output" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    var go: GoSignal = undefined;
+    try go.init(t.home);
+    defer go.deinit();
+    StartGate.arm(null, false);
+    defer StartGate.disarm();
+    var start = StartCall{
+        .t = &t,
+        .command = "printf FIRST; read -r _ < ./" ++ GoSignal.name ++ "; printf SECOND",
+        .yield_ms = 20_000,
+    };
+    defer start.deinit();
+    const start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start});
+    defer start_thread.join();
+    // A test that failed lets the command go on, so the start returns.
+    defer go.send() catch {};
+    try StartGate.waitFor(&StartGate.launched);
+    try waitForTerminalOutput(&t, StartGate.id(), "FIRST");
+
+    // The command has printed its first word and the start waits for its exit.
+    _ = try ensureOwnedTtyIndexed(t.context(), &t.runtime, unknown_terminal_id);
+    const indexed_during = t.runtime.stateFor(StartGate.id()) != null;
+
+    try go.send();
+    try StartGate.waitFor(&start.returned);
+    try start.expectState("completed");
+    const output = try start.field("output_delta") orelse return error.TestUnexpectedResult;
+    defer t.alloc.free(output);
+    try std.testing.expectEqualStrings("FIRSTSECOND", output);
+    try std.testing.expect(!indexed_during);
+}
 
 test "a stop failure counts as busy only for a retryable capacity refusal" {
     const alloc = std.testing.allocator;
