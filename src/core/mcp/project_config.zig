@@ -1853,7 +1853,9 @@ fn containsName(values: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
+/// Whether a server of `configs` has this name: the one rule for which of two servers keeps a name, in `mergeNative`,
+/// `appendWorkspaceAfterAcpPrimary`, and the host's compose (`builtins/mcp.zig`).
+pub fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
     for (configs) |config| if (std.mem.eql(u8, config.name, name)) return true;
     return false;
 }
