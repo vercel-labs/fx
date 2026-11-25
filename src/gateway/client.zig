@@ -255,6 +255,8 @@ pub const vercel_gateway_extended_time_value = "true";
 pub const user_agent = "fx/" ++ build_options.app_version;
 var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
 var test_cancel_watcher_spawn_error: ?anyerror = null;
+var test_cancel_watcher_poll_ms: ?i64 = null;
+var test_cancel_watcher_waiting: ?*std.Io.Event = null;
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -615,13 +617,13 @@ fn fetchGatewayJsonAtUrlCore(
     if (connected) |flag| flag.store(true, .release);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
+    var cancel_watch_done: std.Io.Event = .unset;
     const cancel_watcher = if (req.connection) |conn|
         try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
-        cancel_watch_done.store(true, .seq_cst);
+        cancel_watch_done.set(io_mod.getIo());
         if (cancel_watcher) |thread| thread.join();
     }
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -2201,7 +2203,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
-        var cancel_watch_done = std.atomic.Value(bool).init(false);
+        var cancel_watch_done: std.Io.Event = .unset;
         var connected_watch = ConnectedRequestWatch.init(core_options.response_head_timing);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
@@ -2218,7 +2220,7 @@ fn streamGatewayCompletionCoreWithOptions(
         else
             null;
         defer {
-            cancel_watch_done.store(true, .seq_cst);
+            cancel_watch_done.set(io_mod.getIo());
             if (cancel_watcher) |thread| thread.join();
         }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -2383,7 +2385,7 @@ fn streamGatewayCompletionCoreWithOptions(
             // deadline shuts the socket, turning the hang into a drain error;
             // only reuse is lost, never the response.
             const drain_started = io_mod.milliTimestamp();
-            var drain_watch_done = std.atomic.Value(bool).init(false);
+            var drain_watch_done: std.Io.Event = .unset;
             const drain_deadline = std.Io.Clock.Timestamp{
                 .clock = .awake,
                 .raw = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.addDuration(.fromMilliseconds(pool_drain_budget_ms)),
@@ -2399,7 +2401,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 debug_trace.eventf("gateway", "pool_body_drain", trace_ctx, "attempt={d} result=error err={s}", .{ attempt + 1, @errorName(err) });
                 break :blk false;
             };
-            drain_watch_done.store(true, .seq_cst);
+            drain_watch_done.set(io_mod.getIo());
             if (drain_thread) |thread| thread.join();
             // The connection returns to the pool NOW, at stream end — the
             // TTL invariant requires last_activity to track the freshest
@@ -2729,16 +2731,22 @@ const LocalAddressWatch = struct {
     }
 };
 
+const cancel_watcher_poll_ms: i64 = 10;
+
 const GatewayCancelWatcher = struct {
     fn run(
-        done: *std.atomic.Value(bool),
+        done: *std.Io.Event,
         cancel_flag: *std.atomic.Value(bool),
         deadline: ?std.Io.Clock.Timestamp,
         connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
+        var poll_ms: i64 = cancel_watcher_poll_ms;
+        if (builtin.is_test) {
+            if (test_cancel_watcher_poll_ms) |ms| poll_ms = ms;
+        }
         var address_watch = LocalAddressWatch.init(stream.socket.handle, std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
-        while (!done.load(.seq_cst)) {
+        while (!done.isSet()) {
             if (cancel_flag.load(.seq_cst)) {
                 if (connected_watch == null or connected_watch.?.win(.cancelled)) {
                     stream.shutdown(io_mod.getIo(), .both) catch {};
@@ -2771,7 +2779,17 @@ const GatewayCancelWatcher = struct {
                 }
                 if (watch.phase.load(.seq_cst) == .completed) return;
             }
-            io_mod.sleep(10 * std.time.ns_per_ms);
+            if (builtin.is_test) {
+                if (test_cancel_watcher_waiting) |waiting| waiting.set(io_mod.getIo());
+            }
+            done.waitTimeout(io_mod.getIo(), .{ .duration = .{
+                .raw = .fromMilliseconds(poll_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                // No Io task owns this thread, so a cancel cannot target it; the loop re-checks every state on its next pass anyway.
+                error.Canceled => {},
+            };
         }
     }
 };
@@ -2957,7 +2975,7 @@ fn fetchOnRequest(req: *std.http.Client.Request, options: std.http.Client.FetchO
 /// read the body through an `sse.Reader` given `progress`, pass a failed read
 /// to `failure`, and call `finish` after a complete response.
 pub const ConnectionWatch = struct {
-    done: std.atomic.Value(bool) = .init(false),
+    done: std.Io.Event = .unset,
     thread: ?std.Thread = null,
     state: ConnectedRequestWatch,
 
@@ -2977,7 +2995,7 @@ pub const ConnectionWatch = struct {
     }
 
     pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
-        self.done.store(false, .seq_cst);
+        self.done.reset();
         self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, deadline, &self.state, connection);
     }
 
@@ -3016,7 +3034,7 @@ pub const ConnectionWatch = struct {
     }
 
     pub fn stop(self: *ConnectionWatch) void {
-        self.done.store(true, .seq_cst);
+        self.done.set(io_mod.getIo());
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
@@ -3125,6 +3143,31 @@ test "connection watch closes a body that stops sending as stalled" {
     try std.testing.expectEqual(@as(?anyerror, error.StreamStalled), body.err);
     try std.testing.expectEqual(@as(usize, 1), body.events);
     try std.testing.expect(body.elapsed_ms >= 70 and body.elapsed_ms < 2_000);
+}
+
+test "gateway cancel watcher wakes when done is set without finishing its poll" {
+    const zio = io_mod.getIo();
+    test_cancel_watcher_poll_ms = 5000;
+    defer test_cancel_watcher_poll_ms = null;
+    defer test_cancel_watcher_waiting = null;
+
+    var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try listen_address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const connect_address = std.Io.net.IpAddress{ .ip4 = .loopback(server.socket.address.getPort()) };
+    const stream = try connect_address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    var done: std.Io.Event = .unset;
+    var cancel = std.atomic.Value(bool).init(false);
+    var watcher_waiting: std.Io.Event = .unset;
+    test_cancel_watcher_waiting = &watcher_waiting;
+    const thread = try spawn_gateway_cancel_watcher(&done, &cancel, null, null, stream);
+    watcher_waiting.waitUncancelable(zio);
+    const started_ms = io_mod.milliTimestamp();
+    done.set(zio);
+    thread.join();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
 }
 
 test "connection watch never cuts a body whose events arrive inside the window" {
@@ -3312,7 +3355,7 @@ test "a refused probe option is reported instead of failing the request" {
 }
 
 fn spawn_gateway_cancel_watcher(
-    done: *std.atomic.Value(bool),
+    done: *std.Io.Event,
     cancel_flag: *std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
     connected_watch: ?*ConnectedRequestWatch,
