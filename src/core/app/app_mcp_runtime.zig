@@ -575,10 +575,11 @@ pub const State = struct {
             debug_trace.logf("mcp", "MCP warning dropped: no host sink", .{});
             return;
         };
-        const copy = std.heap.c_allocator.dupe(u8, text) catch return;
-        sink.mutex.lockUncancelable(io_mod.getIo());
-        defer sink.mutex.unlock(io_mod.getIo());
-        sink.pushLocked(copy, true);
+        const copy = std.heap.c_allocator.dupe(u8, text) catch {
+            debug_trace.logf("mcp", "MCP warning dropped: out of memory", .{});
+            return;
+        };
+        sink.push(copy, true);
     }
 
     /// The notices waiting for the UI, owned by `std.heap.c_allocator`.

@@ -855,7 +855,10 @@ const Asking = struct {
 
     fn tellDeclined(self: *Asking, alloc: Allocator, server: []const u8, err: anyerror) void {
         if (self.told) return;
-        const text = (elicitation_interaction.declinedText(alloc, server, err) catch return) orelse return;
+        const text = (elicitation_interaction.declinedText(alloc, server, err) catch {
+            debug_trace.logf("mcp", "MCP declined-question notice dropped: out of memory server={s}", .{server});
+            return;
+        }) orelse return;
         self.told = true;
         self.responder.declined(text);
     }
