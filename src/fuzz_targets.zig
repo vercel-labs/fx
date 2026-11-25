@@ -78,6 +78,7 @@ test {
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
     _ = @import("gateway/tool_call_ids.zig");
+    _ = @import("gateway/vercel_protocol.zig");
     _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");
