@@ -1532,6 +1532,81 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
   test(
+    "a subagent's message says the user started its turn when that turn ends before the main loop delivers the message",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-message-starter-")));
+      const deliveryHeld = join(dir, "delivery-held");
+      const deliveryRelease = join(dir, "delivery-release");
+      const tracePath = join(dir, "fx-trace.log");
+      const heldDeliveries = () => readdirSync(dir).filter((name) => name.startsWith("delivery-held.")).length;
+      let markedByUser = false;
+      let typed: unknown = null;
+      try {
+        await withFx((body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
+              if (!body.includes('"child_up"')) {
+                return toolCall("child_up", "subagent", {
+                  request: { action: "message", agent: "parent", message: "SWITCH_HI_FROM_CHILD" },
+                });
+              }
+              return text("child_told", "SWITCH_CHILD_TOLD_MAIN");
+            }
+            return text("child_answer", "SWITCH_CHILD_FIRST");
+          }
+          if (body.includes("SWITCH_HI_FROM_CHILD")) {
+            const frame = userTexts(body).find((t) => t.includes("SWITCH_HI_FROM_CHILD")) ?? "";
+            markedByUser = frame.includes('"started_by":"user"');
+            typed = JSON.parse(frame.slice(frame.indexOf("{"))).user_typed ?? null;
+            return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+          }
+          if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+            });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          // Each report before the message waits in the main loop's hand-off
+          // until it is let through.
+          const releaseHeld = () => {
+            for (let n = 1; n <= heldDeliveries(); n += 1) writeFileSync(`${deliveryRelease}.${n}`, "");
+          };
+          await session.waitForPane((pane) => {
+            releaseHeld();
+            return pane.includes("SWITCH_MAIN_SAW_FIRST") && hasEmptyComposer(pane) && turnSettled(pane);
+          }, 30_000);
+          releaseHeld();
+          const before = heldDeliveries();
+          await showAgent(session, "reviewer");
+          await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_TELL_MAIN tell main I said hi");
+          // The message waits in the hand-off, and the turn that sent it ends.
+          await until("the message's held delivery", () => heldDeliveries() > before);
+          await session.waitForText("SWITCH_CHILD_TOLD_MAIN", 30_000);
+          await until("the end of the turn that sent the message", () => traceHas(tracePath, "event=user_work_ended"));
+          expect(traceHas(tracePath, "kind=message")).toBe(false);
+          writeFileSync(`${deliveryRelease}.${before + 1}`, "");
+          await showAgent(session, "main");
+          await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
+        }, () => {}, false, {
+          FX_TRACE_LOG: tracePath,
+          FX_TEST_REPORT_DELIVERY_HELD: deliveryHeld,
+          FX_TEST_REPORT_DELIVERY_RELEASE: deliveryRelease,
+        });
+      } finally {
+        writeFileSync(deliveryRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+      expect(markedByUser).toBe(true);
+      expect(typed).toEqual(["SWITCH_TELL_MAIN tell main I said hi"]);
+    },
+    TIMEOUT,
+  );
+  test(
     "a line typed on a subagent's screen that joins main's work reaches main with the subagent's next message, and a message before it carries none",
     async () => {
       let release = () => {};
