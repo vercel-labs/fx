@@ -3,7 +3,7 @@
 # and one run of the built-in remote runner, with TLC, and require each
 # config's expected verdict.
 #
-# These model code that has not landed (src/core/runner/). The driver in
+# These model the code in src/core/runner/. The driver in
 # ../drivers/runner/ runs the built fx along them only with --next.
 #
 # runner-setup-one-call.cfg, runner-setup.cfg, runner-setup-sub.cfg and

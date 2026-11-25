@@ -3,7 +3,7 @@
 (* Trace validation: checks one observed run of the built-in remote runner *)
 (* against RemoteRun's own actions.                                        *)
 (*                                                                         *)
-(* This checks code that has not landed (src/core/runner/vercel/). The    *)
+(* This checks the code in src/core/runner/vercel/. The                   *)
 (* driver runs the built fx only with --next; --self-check checks          *)
 (* hand-written observation sets.                                          *)
 (*                                                                         *)

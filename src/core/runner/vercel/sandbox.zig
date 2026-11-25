@@ -916,9 +916,6 @@ pub const FileRecord = struct {
 
 pub const FileMap = std.array_hash_map.String(FileRecord);
 
-/// `manifest.json` (V5): the generation the remote folder was last synced to, and the
-/// files pushed. A file that is missing, malformed, or over the entry limit is read as
-/// empty, so the next push sends everything again.
 /// One file a bring-back recorded, or one file under a bring-back root at run start (V9).
 pub const BringBackFile = struct {
     rel: []const u8,
@@ -926,6 +923,9 @@ pub const BringBackFile = struct {
     mtime_ns: i64,
 };
 
+/// `manifest.json` (V5): the generation the remote folder was last synced to, and the
+/// files pushed. A file that is missing, malformed, or over the entry limit is read as
+/// empty, so the next push sends everything again.
 pub const Manifest = struct {
     generation: ?[]const u8,
     files: FileMap,
@@ -941,6 +941,9 @@ pub const Manifest = struct {
     bring_back_roots: ?[]const u8,
     /// The SHA-256 (hex) of the pending names last written to `.git/fx-pending-back` (V9).
     pending_sha: ?[]const u8 = null,
+    /// The stamps the last committed bring-back covered, its own included, as spent (V9). The next
+    /// bring-back script deletes them before it walks, and this list is replaced when that bring-back commits.
+    spent_stamps: []const []const u8 = &.{},
 };
 
 pub const max_manifest_files: usize = 100_000;
@@ -953,6 +956,8 @@ pub const max_back_bytes: u64 = 64 * 1024 * 1024;
 pub const max_back_file_bytes: u64 = 64 * 1024 * 1024;
 /// The most names `manifest.pending_back` keeps (V9). Past it, files are only counted (N8).
 pub const max_pending_names: usize = 10_000;
+/// The most spent stamps a manifest keeps (V9). Past it, the stamps stay in the sandbox, unrecorded.
+pub const max_spent_stamps: usize = 10_000;
 /// The most `brought` records a manifest keeps; the oldest go first (V9).
 pub const max_brought_entries: usize = 20_000;
 /// The longest repository path the manifest and the bring-back accept, in bytes.
@@ -1033,7 +1038,7 @@ fn parseManifest(arena: Allocator, bytes: []const u8) reply.ParseError!Manifest 
     return manifest;
 }
 
-const ManifestMember = enum { files, brought, generation, excludes, bring_back_roots, pending_sha, pending_back, skipped };
+const ManifestMember = enum { files, brought, generation, excludes, bring_back_roots, pending_sha, pending_back, skipped, spent_stamps };
 const RecordMember = enum { size, mtime_ns, sha256 };
 
 /// Reads the value of one manifest member under its field's rules (V5). An unknown member is skipped
@@ -1049,7 +1054,20 @@ fn applyMember(arena: Allocator, manifest: *Manifest, scanner: *std.json.Scanner
         .pending_sha => manifest.pending_sha = try textValue(arena, scanner, sha256_hex_bytes),
         .pending_back => manifest.pending_back = try textArray(arena, scanner, max_pending_names, max_repo_path_bytes),
         .skipped => manifest.skipped = try textArray(arena, scanner, max_manifest_files, max_skipped_text_bytes),
+        .spent_stamps => manifest.spent_stamps = try spentStamps(arena, scanner),
     }
+}
+
+const max_stamp_name_bytes: usize = stamp_prefix.len + run_id_hex_bytes;
+
+/// The spent stamps (V9). Each must be a stamp name, so the bring-back script never receives a path that
+/// is not one; any other name refuses the manifest, as a bad field does.
+fn spentStamps(arena: Allocator, scanner: *std.json.Scanner) reply.ParseError![]const []const u8 {
+    const names = try textArray(arena, scanner, max_spent_stamps, max_stamp_name_bytes);
+    for (names) |name| {
+        if (!validStampName(name)) return error.BadReply;
+    }
+    return names;
 }
 
 /// A JSON object of path to file record, as `files` and `brought` hold them. A repeated object replaces
@@ -1204,6 +1222,8 @@ fn writeManifestJson(w: *std.Io.Writer, manifest: *const Manifest) !void {
     }
     try w.writeAll("\"pending_back\":");
     try std.json.Stringify.value(manifest.pending_back, .{}, w);
+    try w.writeAll(",\"spent_stamps\":");
+    try std.json.Stringify.value(manifest.spent_stamps, .{}, w);
     try w.writeAll(",\"files\":");
     try writeRecords(w, &manifest.files);
     try w.writeAll(",\"brought\":");
@@ -1422,12 +1442,15 @@ pub fn foldJournal(ctx: *Context) Error!void {
         error.OutOfMemory => return error.OutOfMemory,
     };
     var manifest = try readManifest(ctx);
+    // A manifest with no generation cannot be committed, and the records have nothing to apply to (V9).
+    if (manifest.generation == null) return setJournalAside(ctx);
     for (parsed.records) |record| try applyBackRecord(ctx.alloc, &manifest, record);
     try commitManifest(ctx, &manifest);
     journal.remove(ctx.state_dir) catch |err| return refuseError(ctx, "journal", err);
 }
 
-/// Moves a damaged journal aside, so later runs are not refused (V9). Its records are not applied,
+/// Moves a journal aside, so later runs are not refused (V9): a damaged one, or one beside a manifest with no
+/// generation. Its records are not applied,
 /// so the files it listed count as changed on this machine at the next run (N9, N31).
 fn setJournalAside(ctx: *Context) Error!void {
     ctx.state_dir.dir.rename(journal.file_name, ctx.state_dir.dir, journal.damaged_file_name, io_mod.getIo()) catch |err| return refuseError(ctx, "journal", err);
@@ -2451,6 +2474,34 @@ test "a journal with a damaged complete line is set aside, its records are not a
     try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io, journal.file_name, .{}));
     _ = try state_dir.dir.statFile(io, "manifest.journal.damaged", .{});
     try std.testing.expect(ctx.journal_set_aside);
+}
+
+test "a journal beside a manifest with no generation is set aside, not committed, and the fold goes on (N31, V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var buffer: [64]u8 = undefined;
+    const base = try baseFor(&buffer, 9);
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, base, &capture, &state_dir);
+
+    // No manifest.json, so the manifest has no generation.
+    const sha_one = "1111111111111111" ++ "1111111111111111" ++ "1111111111111111" ++ "1111111111111111";
+    const bytes = try journal.encodeLine(arena, .{ .kind = .brought, .rel = "a.txt", .size = 1, .mtime_ns = 2, .sha256 = sha_one });
+    try state_dir.dir.writeFile(io, .{ .sub_path = journal.file_name, .data = bytes });
+
+    try foldJournal(&ctx);
+
+    try std.testing.expect(ctx.journal_set_aside);
+    _ = try state_dir.dir.statFile(io, journal.damaged_file_name, .{});
+    try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io, journal.file_name, .{}));
+    try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io, manifest_file, .{}));
 }
 
 test "a manifest without a generation writes back as one the reader accepts (V9)" {

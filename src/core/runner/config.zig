@@ -178,8 +178,6 @@ pub fn parse(
     };
 }
 
-/// The `include` paths for a workspace root: those of the longest folder that
-/// contains the root, or none.
 /// The largest config file fx reads.
 pub const max_bytes: usize = 256 * 1024;
 
@@ -244,6 +242,8 @@ fn writeCanonical(out: *std.Io.Writer, value: std.json.Value, arena: std.mem.All
     }
 }
 
+/// The `include` paths for a workspace root: those of the longest folder that
+/// contains the root, or none.
 pub fn includeFor(cfg: *const Config, workspace_root: []const u8) []const []const u8 {
     return pathsCovering(cfg.include, workspace_root);
 }

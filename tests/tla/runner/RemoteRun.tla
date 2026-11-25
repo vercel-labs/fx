@@ -3,7 +3,7 @@
 (* One run of fx's built-in remote runner: push, start the command, stream *)
 (* it, bring changed files back, or stop it.                               *)
 (*                                                                         *)
-(* This models code that has not landed: src/core/runner/vercel/. Its      *)
+(* This models the code in src/core/runner/vercel/. Its                    *)
 (* driver runs only with --next.                                           *)
 (*                                                                         *)
 (* One file stands for the repository. It is either tracked (pushed, and   *)

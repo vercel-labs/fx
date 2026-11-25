@@ -1,5 +1,5 @@
 // A fake Vercel REST API for fx's built-in remote runner and its in-chat
-// setup (src/core/runner/, which has not landed): the account, team and
+// setup (src/core/runner/): the account, team and
 // project reads and the project create that setup makes, persistent and
 // isolated sandboxes, and the session calls of one run. Routes and bodies
 // follow the shell runner contracts that tests/tla/runner/RemoteRun.tla and
@@ -28,6 +28,8 @@
 //   idleCloseAfterBytes the next exec stream ends cleanly after this many
 //                       output bytes, without the exit line; the command
 //                       keeps running and its logs stay readable
+//   cutBringBackAfterBytes the next bring-back stream ends after this many
+//                       output bytes, without the exit line
 //   goneOnce            the next session call answers 410 and stops the session
 //   goneWrites          the next N fs/write calls each answer 410 and stop the session
 //   goneExtends         the next N extend-timeout calls each answer 410 and stop the session
@@ -114,6 +116,8 @@ export type FakeVercelFaults = {
   dropAfterExecBody?: "ran" | "not_run";
   delayCommandLineMs?: number;
   idleCloseAfterBytes?: number;
+  // The next bring-back stream ends after this many output bytes, without the exit line, once.
+  cutBringBackAfterBytes?: number;
   goneOnce?: boolean;
   // The next command whose arguments contain this text answers 410 and stops the session, once.
   goneCommand?: string;
@@ -619,7 +623,7 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
             const chunk = state.chunks[index++]!;
             send({ stream: chunk.stream, data: chunk.data });
             sent += encoder.encode(chunk.data).length;
-            if (closeAfterBytes !== undefined && sent >= closeAfterBytes) return close(`idle close after ${sent} bytes`);
+            if (closeAfterBytes !== undefined && sent >= closeAfterBytes) return close(`stream closed after ${sent} bytes`);
           }
           if (state.finished) {
             if (withCommand) send({ command: { ...state.view } });
@@ -875,9 +879,11 @@ export function startFakeVercelApi(options: FakeVercelOptions): FakeVercelApi {
         if (cmd.wait !== true) return Response.json({ command: { ...state.view } });
         const closeAfter = kind === "exec" ? faults.idleCloseAfterBytes : undefined;
         if (closeAfter !== undefined) faults.idleCloseAfterBytes = undefined;
+        const cutAfter = kind === "bring_back" ? faults.cutBringBackAfterBytes : undefined;
+        if (cutAfter !== undefined) faults.cutBringBackAfterBytes = undefined;
         const delay = kind === "exec" ? faults.delayCommandLineMs ?? 0 : 0;
         if (delay > 0) faults.delayCommandLineMs = undefined;
-        return new Response(streamOf(state, entry, true, closeAfter, delay), { headers: { "content-type": "application/x-ndjson" } });
+        return new Response(streamOf(state, entry, true, closeAfter ?? cutAfter, delay), { headers: { "content-type": "application/x-ndjson" } });
       }
       case "cmdGet": {
         const state = commandFor(params);

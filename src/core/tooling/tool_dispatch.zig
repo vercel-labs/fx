@@ -246,7 +246,6 @@ pub const RunCommandBackend = struct {
     }
 };
 
-/// Context shared by core tool dispatch, validation, and execution.
 /// The tool context's values that remote setup reads for a shell run. The
 /// session key is null unless setup is allowed, and the turn id scopes a decline mark.
 pub const RemoteSetupContext = struct {
@@ -255,6 +254,7 @@ pub const RemoteSetupContext = struct {
     turn_id: u64 = 0,
 };
 
+/// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
     allocator: Allocator,
     permission_mode: permission_gate.PermissionMode = .ask,

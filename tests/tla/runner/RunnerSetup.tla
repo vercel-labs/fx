@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* Where a shell run goes, and the in-chat setup of a remote runner.       *)
 (*                                                                         *)
-(* This models code that has not landed: src/core/runner/ (decide, setup)  *)
+(* This models the code in src/core/runner/ (decide, setup)                *)
 (* and the built-in runner's login check. Its driver runs only with        *)
 (* --next.                                                                 *)
 (*                                                                         *)

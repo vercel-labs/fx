@@ -3,7 +3,7 @@
 (* Trace validation: checks one observed scenario of where shell runs went *)
 (* and of the in-chat remote setup against RunnerSetup's own actions.      *)
 (*                                                                         *)
-(* This checks code that has not landed (src/core/runner/). The driver    *)
+(* This checks the code in src/core/runner/. The driver                   *)
 (* runs the built fx only with --next; --self-check checks hand-written    *)
 (* observation sets.                                                       *)
 (*                                                                         *)

@@ -2,7 +2,7 @@
 // and RemoteRun.tla by trace validation (RunnerSetupTrace.tla and
 // RemoteRunTrace.tla).
 //
-// The models describe code that has not landed (src/core/runner/), so the
+// The models describe the code in src/core/runner/, so the
 // run of the built fx needs --next. --self-check needs only TLC.
 //
 // An observation set describes one scenario. A setup set holds the inputs of
@@ -575,7 +575,7 @@ type ToolResult = {
 
 function nextBlocker(): string | null {
   if (!existsSync(join(worktree, "src", "core", "runner"))) {
-    return "src/core/runner/ is not in this checkout: the runner code these models describe has not landed";
+    return "src/core/runner/ is not in this checkout: the runner code these models describe is missing";
   }
   if (!existsSync(binary)) return `missing ${binary}; run zig build first or set FX_BIN`;
   return null;

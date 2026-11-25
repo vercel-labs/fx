@@ -675,9 +675,14 @@ fn refuseProfileArgument(arena: Allocator, stderr: *std.Io.Writer, profile: []co
 
 /// N28: pending records were cleared without a bring-back, because the sandbox was replaced or its
 /// record was reset (V4). It is printed once per run, after the push.
+/// N30: the noun for the stopped runs N28 counts.
+fn stoppedRunNoun(count: usize) []const u8 {
+    return if (count == 1) "run" else "runs";
+}
+
 fn noteCleared(arena: Allocator, stderr: *std.Io.Writer, count: usize) void {
     if (count == 0) return;
-    const line = arena.print("fx: files from {d} earlier stopped runs were not brought back, because the sandbox was replaced or its record was reset\n", .{count}) catch return;
+    const line = arena.print("fx: files from {d} earlier stopped {s} were not brought back, because the sandbox was replaced or its record was reset\n", .{ count, stoppedRunNoun(count) }) catch return;
     writeNote(stderr, line);
 }
 
@@ -703,7 +708,16 @@ test "N28 names the pending records a reset cleared, and prints nothing when non
     try std.testing.expectEqualStrings("", quiet.written());
     var out: std.Io.Writer.Allocating = .init(arena);
     noteCleared(arena, &out.writer, 1);
-    try std.testing.expectEqualStrings("fx: files from 1 earlier stopped runs were not brought back, because the sandbox was replaced or its record was reset\n", out.written());
+    try std.testing.expectEqualStrings("fx: files from 1 earlier stopped run were not brought back, because the sandbox was replaced or its record was reset\n", out.written());
+}
+
+test "N28 keeps the plural for any count but one (N30)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(arena);
+    noteCleared(arena, &out.writer, 2);
+    try std.testing.expectEqualStrings("fx: files from 2 earlier stopped runs were not brought back, because the sandbox was replaced or its record was reset\n", out.written());
 }
 
 /// The steps of V3 and V4, which set up the sandbox before the push.
@@ -741,7 +755,10 @@ fn runRemote(arena: Allocator, run: Run, stdout: *std.Io.Writer, stderr: *std.Io
     };
     const started_ms = io_mod.milliTimestamp();
     const run_id = try newRunId(arena);
-    const baseline: []const vercel.BringBackFile = vercel.bringBackBaseline(&context, command.bring_back) catch @as([]const vercel.BringBackFile, &.{});
+    const baseline: []const vercel.BringBackFile = vercel.bringBackBaseline(&context, command.bring_back) catch |err| blk: {
+        debug_trace.logf("remote run", "event=bring_back_baseline_dropped reason={s}", .{@errorName(err)});
+        break :blk @as([]const vercel.BringBackFile, &.{});
+    };
     const push_outcome = vercel.pushRoot(&context, .{ .run_id = run_id, .include = command.include, .bring_back = command.bring_back });
     noteManifestReset(stderr, context.manifest_reset);
     noteJournalSetAside(stderr, context.journal_set_aside);

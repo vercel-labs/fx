@@ -84,7 +84,12 @@ const script_source =
     \\set -u
     \\own=$1
     \\n=$2
-    \\shift 2
+    \\m=$3
+    \\shift 3
+    \\for ((i = 0; i < m; i++)); do
+    \\  rm -f -- ".git/$1"
+    \\  shift
+    \\done
     \\work=$(mktemp -d) || exit 1
     \\trap 'rm -rf "$work"' EXIT
     \\main=""
@@ -236,8 +241,8 @@ const script_source =
     \\printf 'dropped %s\n' "$dropped" >&2
     \\tar -cz --no-recursion --null -T - < "$work/keep" | base64
     \\status=$?
-    \\rm -f -- ".git/$own" "$sent_file"
-    \\while IFS= read -r -d '' name; do rm -f -- ".git/$name"; printf 'covered %s\n' "$name" >&2; done < "$work/covered"
+    \\rm -f -- "$sent_file"
+    \\while IFS= read -r -d '' name; do printf 'covered %s\n' "$name" >&2; done < "$work/covered"
     \\exit $status
 ;
 
@@ -310,7 +315,7 @@ pub fn run(arena: Allocator, ctx: *sandbox.Context, session_id: []const u8, inpu
 
     var baselines: std.array_hash_map.String(BaselineMap) = .empty;
     var args: std.ArrayList([]const u8) = .empty;
-    buildArgs(arena, &baselines, &args, own_stamp, input, ordered) catch return .{ .failed = "out of memory" };
+    buildArgs(arena, &baselines, &args, own_stamp, input, ordered, manifest.spent_stamps) catch return .{ .failed = "out of memory" };
     const request = encodeRequest(arena, ctx.repo_root, args.items) catch return .{ .failed = "out of memory" };
 
     var counts: Counts = .{};
@@ -338,20 +343,54 @@ pub fn run(arena: Allocator, ctx: *sandbox.Context, session_id: []const u8, inpu
     const pending = pendingBack(arena, overflow.items, deferred) catch return .{ .failed = "out of memory" };
     counts.over_cap = pending.names.len;
     counts.over_untracked = pending.untracked;
-    for (ordered) |entry| {
-        if (!listed(notes.covered.items, entry.stamp) and !listed(notes.missing.items, entry.stamp)) continue;
-        sandbox.removePending(ctx, entry.run_id) catch return .{ .failed = "the pending runs could not be removed" };
-    }
-    manifest.pending_back = pending.names;
-    apply.finish() catch |err| return .{ .failed = switch (err) {
-        error.JournalNotRemoved => "the journal could not be removed",
-        else => "the manifest could not be written",
-    } };
+    const spent = spentStamps(arena, own_stamp, notes.covered.items) catch return .{ .failed = "out of memory" };
+    if (commitRun(ctx, &apply, &manifest, pending.names, ordered, &notes, spent)) |detail| return .{ .failed = detail };
     return .{ .done = .{ .counts = counts, .pending = pending.names } };
 }
 
-/// The script's arguments (see `script`): this run's stamp, the count of pending stamps, then those
-/// stamps oldest first. The pending names are not arguments: they reach the sandbox in
+/// The end of a bring-back (V9, N8): the manifest gets the over-cap names and the spent stamps, and then the pending records whose
+/// stamps were covered or missing are removed. The records go only after the manifest is written, so a failed
+/// write, or a crash before the removal, leaves each record for the next run, which walks it again and writes
+/// nothing twice. Returns the failure detail, or null.
+fn commitRun(
+    ctx: *sandbox.Context,
+    apply: *Apply,
+    manifest: *sandbox.Manifest,
+    pending_names: []const []const u8,
+    ordered: []const sandbox.Pending,
+    notes: *const Notes,
+    spent: []const []const u8,
+) ?[]const u8 {
+    manifest.pending_back = pending_names;
+    manifest.spent_stamps = spent;
+    apply.finish() catch |err| return switch (err) {
+        error.JournalNotRemoved => "the journal could not be removed",
+        else => "the manifest could not be written",
+    };
+    for (ordered) |entry| {
+        if (!listed(notes.covered.items, entry.stamp) and !listed(notes.missing.items, entry.stamp)) continue;
+        sandbox.removePending(ctx, entry.run_id) catch return "the pending runs could not be removed";
+    }
+    return null;
+}
+
+/// The stamps a committed bring-back spends (V9): this run's own stamp, then each pending stamp it covered.
+/// Only stamp names are kept, each once, and at most `sandbox.max_spent_stamps`. A stamp past the cap stays
+/// in the sandbox unrecorded, and nothing reads it again.
+fn spentStamps(arena: Allocator, own_stamp: []const u8, covered: []const []const u8) Allocator.Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    try addSpent(arena, &names, own_stamp);
+    for (covered) |name| try addSpent(arena, &names, name);
+    return names.items;
+}
+
+fn addSpent(arena: Allocator, names: *std.ArrayList([]const u8), name: []const u8) Allocator.Error!void {
+    if (names.items.len == sandbox.max_spent_stamps or !sandbox.validStampName(name) or listed(names.items, name)) return;
+    try names.append(arena, name);
+}
+
+/// The script's arguments (see `script`): this run's stamp, the count of pending stamps, the count of spent
+/// stamps and the spent stamps, then the pending stamps oldest first. The pending names are not arguments: they reach the sandbox in
 /// `.git/fx-pending-back`. Each pending run's baseline is indexed by its stamp for the root the
 /// script reports back.
 fn buildArgs(
@@ -361,6 +400,7 @@ fn buildArgs(
     own_stamp: []const u8,
     input: Input,
     ordered: []const sandbox.Pending,
+    spent: []const []const u8,
 ) !void {
     try baselines.put(arena, own_stamp, try baselineMapOf(arena, input.own_baseline));
     for (ordered) |entry| {
@@ -368,6 +408,8 @@ fn buildArgs(
     }
     try args.append(arena, own_stamp);
     try args.append(arena, try arena.print("{d}", .{ordered.len}));
+    try args.append(arena, try arena.print("{d}", .{spent.len}));
+    for (spent) |name| try args.append(arena, name);
     for (ordered) |entry| {
         const mark: []const u8 = if (entry.baseline != null) "b" else "n";
         try args.append(arena, try arena.print("{s}{s}", .{ mark, entry.stamp }));
@@ -614,7 +656,7 @@ pub fn runIsolated(arena: Allocator, ctx: *sandbox.Context, session_id: []const 
     var baselines: std.array_hash_map.String(BaselineMap) = .empty;
     var args: std.ArrayList([]const u8) = .empty;
     const own_stamp = sandbox.stampName(arena, input.run_id) catch return .{ .failed = "out of memory" };
-    buildArgs(arena, &baselines, &args, own_stamp, input, &.{}) catch return .{ .failed = "out of memory" };
+    buildArgs(arena, &baselines, &args, own_stamp, input, &.{}, &.{}) catch return .{ .failed = "out of memory" };
     const request = encodeRequest(arena, ctx.repo_root, args.items) catch return .{ .failed = "out of memory" };
 
     var counts: Counts = .{};
@@ -1262,7 +1304,12 @@ test "the bring-back script is pinned byte for byte (V9)" {
         \\set -u
         \\own=$1
         \\n=$2
-        \\shift 2
+        \\m=$3
+        \\shift 3
+        \\for ((i = 0; i < m; i++)); do
+        \\  rm -f -- ".git/$1"
+        \\  shift
+        \\done
         \\work=$(mktemp -d) || exit 1
         \\trap 'rm -rf "$work"' EXIT
         \\main=""
@@ -1414,8 +1461,8 @@ test "the bring-back script is pinned byte for byte (V9)" {
         \\printf 'dropped %s\n' "$dropped" >&2
         \\tar -cz --no-recursion --null -T - < "$work/keep" | base64
         \\status=$?
-        \\rm -f -- ".git/$own" "$sent_file"
-        \\while IFS= read -r -d '' name; do rm -f -- ".git/$name"; printf 'covered %s\n' "$name" >&2; done < "$work/covered"
+        \\rm -f -- "$sent_file"
+        \\while IFS= read -r -d '' name; do printf 'covered %s\n' "$name" >&2; done < "$work/covered"
         \\exit $status
     , script);
 }
@@ -1708,6 +1755,172 @@ test "a journal that cannot be removed after the manifest is written is reported
     // A folder where the journal file belongs cannot be removed as a file.
     try state_dir.dir.createDir(io, journal.file_name, std.Io.File.Permissions.fromMode(0o700));
     try testing.expectError(error.JournalNotRemoved, apply.finish());
+}
+
+test "a failed manifest write keeps every covered pending record for the next run (N8)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    const baseline = [_]sandbox.BringBackFile{.{ .rel = "out/app", .size = 7, .mtime_ns = 9 }};
+    try notePending(&context, "0123456789abcdef", 42, &baseline, .{ .exited = 0 }, true);
+    // A folder where manifest.json belongs makes the manifest write fail.
+    try state_dir.dir.createDir(io, "manifest.json", std.Io.File.Permissions.fromMode(0o700));
+    const ordered = try sandbox.readPending(arena, &context);
+    var manifest = try testManifest(arena, &.{});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    try notes.covered.append(arena, ordered[0].stamp);
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    apply.ctx = &context;
+
+    const detail = commitRun(&context, &apply, &manifest, &.{"zig-out/bin/over-cap.txt"}, ordered, &notes, &.{});
+    try testing.expectEqualStrings("the manifest could not be written", detail.?);
+    // The record stays, so the next run walks the stamp again and rebuilds the over-cap names.
+    const pending = try sandbox.readPending(arena, &context);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings("0123456789abcdef", pending[0].run_id);
+}
+
+test "a pending record that outlives a committed bring-back is walked again, and no file is brought back twice (N8)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    const baseline = [_]sandbox.BringBackFile{.{ .rel = "out/app", .size = 7, .mtime_ns = 9 }};
+    try notePending(&context, "0123456789abcdef", 42, &baseline, .{ .exited = 0 }, true);
+    const archive = try buildArchive(arena, &.{
+        .{ .name = "one.txt", .data = "1" },
+        .{ .name = "two.txt", .data = "2" },
+    });
+
+    // The first run writes one.txt, leaves two.txt past its cap, and commits the manifest.
+    var manifest = try testManifest(arena, &.{});
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, 1);
+    apply.ctx = &context;
+    var first_input: std.Io.Reader = .fixed(archive);
+    try applyArchive(&first_input, &apply);
+    try apply.finish();
+    try testing.expectEqual(@as(usize, 1), counts.written);
+
+    // A crash after the commit and before the pending record is removed leaves the record. The next run
+    // reads the manifest from disk and walks the same archive again.
+    var next_manifest = try sandbox.readManifest(&context);
+    var next_counts: Counts = .{};
+    var next_overflow: std.ArrayList([]const u8) = .empty;
+    var next_baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var next_notes: Notes = .{ .alloc = arena };
+    var next = testApply(arena, tmp.dir, &next_manifest, &next_counts, &next_overflow, &next_baselines, &next_notes, &.{}, 1);
+    next.ctx = &context;
+    var again: std.Io.Reader = .fixed(archive);
+    try applyArchive(&again, &next);
+    try testing.expectEqual(@as(usize, 1), next_counts.written);
+    try testing.expectEqual(@as(usize, 0), next_overflow.items.len);
+    try testing.expectEqual(@as(usize, 2), next_manifest.brought.count());
+
+    // The next run commits, and its covered record is removed.
+    const pending = try sandbox.readPending(arena, &context);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try next_notes.covered.append(arena, pending[0].stamp);
+    try testing.expect(commitRun(&context, &next, &next_manifest, &.{}, pending, &next_notes, &.{}) == null);
+    try testing.expectEqual(@as(usize, 0), (try sandbox.readPending(arena, &context)).len);
+}
+
+test "a committed bring-back records its own and covered stamps as spent, replacing the old list (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    var manifest = try testManifest(arena, &.{});
+    manifest.spent_stamps = &.{"fx-stamp-00000000000000aa"};
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    apply.ctx = &context;
+    const spent = [_][]const u8{ "fx-stamp-0123456789abcdef", "fx-stamp-00000000000000bb" };
+    try testing.expect(commitRun(&context, &apply, &manifest, &.{}, &.{}, &notes, &spent) == null);
+
+    const back = try sandbox.readManifest(&context);
+    try testing.expectEqual(@as(usize, 2), back.spent_stamps.len);
+    try testing.expectEqualStrings("fx-stamp-0123456789abcdef", back.spent_stamps[0]);
+    try testing.expectEqualStrings("fx-stamp-00000000000000bb", back.spent_stamps[1]);
+}
+
+test "the bring-back script takes the spent stamps after the entry count, so it deletes them first (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var args: std.ArrayList([]const u8) = .empty;
+    const input: Input = .{ .run_id = "0123456789abcdef", .roots = &.{}, .own_baseline = &.{} };
+    const spent = [_][]const u8{"fx-stamp-00000000000000aa"};
+    try buildArgs(arena, &baselines, &args, "fx-stamp-0123456789abcdef", input, &.{}, &spent);
+
+    try testing.expectEqual(@as(usize, 4), args.items.len);
+    try testing.expectEqualStrings("fx-stamp-0123456789abcdef", args.items[0]);
+    try testing.expectEqualStrings("0", args.items[1]);
+    try testing.expectEqualStrings("1", args.items[2]);
+    try testing.expectEqualStrings("fx-stamp-00000000000000aa", args.items[3]);
 }
 
 test "an untracked file the bring-back wrote is written again only while the Mac still matches it (V9)" {

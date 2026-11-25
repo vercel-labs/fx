@@ -2341,6 +2341,22 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     expect(next.stderr).toBe(ranLine(1));
   }, TIMEOUT * 4);
 
+  test("a bring-back cut on the Mac side keeps its stamps, so the next run brings the file back (V9)", async () => {
+    const repo = makeRepo("bring-back-cut");
+    expect((await runRemote(repo, "true")).code).toBe(0);
+    runner.api.faults.cutBringBackAfterBytes = 1;
+    const cut = await runRemote(repo, "echo made > made.txt");
+    expect(cut.code).toBe(0);
+    expect(cut.stderr).toContain("fx: did not bring back the files:");
+    expect(existsSync(join(repo, "made.txt"))).toBe(false);
+    expect(readdirSync(join(stateOf(repo), "pending"))).toHaveLength(1);
+
+    const next = await runRemote(repo, "true");
+    expect(next.code).toBe(0);
+    expect(readFileSync(join(repo, "made.txt"), "utf8")).toBe("made\n");
+    expect(readdirSync(join(stateOf(repo), "pending"))).toEqual([]);
+  }, TIMEOUT * 4);
+
   test("AC-35 (a, c): a file the command installs with an old mtime comes back, and zig-out/other stays on the sandbox", async () => {
     const repo = makeRepo("ac-35-old-mtime");
     git(repo, ["init", "-q"]);
@@ -2996,7 +3012,7 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     runner.api.faults.sandboxGone = true;
     const result = await runRemote(repo, "true");
     expect(result.code).toBe(0);
-    expect(result.stderr).toBe(`fx: files from 1 earlier stopped runs were not brought back, because the sandbox was replaced or its record was reset\n${ranLine(0)}`);
+    expect(result.stderr).toBe(`fx: files from 1 earlier stopped run were not brought back, because the sandbox was replaced or its record was reset\n${ranLine(0)}`);
     expect(existsSync(join(repo, "made.txt"))).toBe(false);
     expect(existsSync(join(stateOf(repo), "pending"))).toBe(false);
   }, TIMEOUT * 4);
