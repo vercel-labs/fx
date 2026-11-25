@@ -120,6 +120,8 @@ pub const Context = struct {
     failure: Failure = .{ .step = "", .status = 0, .detail = "" },
     /// Tests only: the generation a new marker gets, in place of a random one.
     generation_override: ?[]const u8 = null,
+    /// Set when a fold set a damaged journal aside. The run prints N31 for it (V9).
+    journal_set_aside: bool = false,
     /// The run's mode. An isolated run never resumes a session (I3).
     mode: attempt.Mode = .remote,
     /// What the operation in progress has already used of its recovery budget (V3, V5).
@@ -1012,50 +1014,162 @@ pub fn emptyManifest() Manifest {
 
 fn parseManifest(arena: Allocator, bytes: []const u8) reply.ParseError!Manifest {
     if (bytes.len > max_manifest_bytes) return error.BadReply;
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+    var scanner = std.json.Scanner.initCompleteInput(arena, bytes);
+    defer scanner.deinit();
+    switch (try nextToken(arena, &scanner)) {
+        .object_begin => {},
         else => return error.BadReply,
-    };
-    const object = try reply.objectOf(root);
+    }
     var manifest = emptyManifest();
-    if (object.get("generation")) |value| manifest.generation = try reply.requiredText(arena, value, max_generation_bytes);
-    if (object.get("excludes")) |value| manifest.excludes = try reply.requiredText(arena, value, sha256_hex_bytes);
-    if (object.get("bring_back_roots")) |value| manifest.bring_back_roots = try reply.requiredText(arena, value, sha256_hex_bytes);
-    if (object.get("pending_sha")) |value| manifest.pending_sha = try reply.requiredText(arena, value, sha256_hex_bytes);
-    if (object.get("pending_back")) |value| manifest.pending_back = try textArray(arena, value, max_pending_names, max_repo_path_bytes);
-    if (object.get("skipped")) |value| manifest.skipped = try textArray(arena, value, max_manifest_files, max_skipped_text_bytes);
-    if (object.get("files")) |value| try parseRecords(arena, value, &manifest.files);
-    if (object.get("brought")) |value| try parseRecords(arena, value, &manifest.brought);
+    while (try memberName(arena, &scanner)) |name| {
+        try applyMember(arena, &manifest, &scanner, name);
+    }
+    switch (try nextToken(arena, &scanner)) {
+        .end_of_document => {},
+        else => return error.BadReply,
+    }
     return manifest;
 }
 
-/// A JSON object of path to file record, as `files` and `brought` hold them.
-fn parseRecords(arena: Allocator, value: std.json.Value, files: *FileMap) reply.ParseError!void {
-    const records = try reply.objectOf(value);
-    if (records.count() > max_manifest_files) return error.BadReply;
-    var entries = records.iterator();
-    while (entries.next()) |entry| {
-        const record = try reply.objectOf(entry.value_ptr.*);
-        const sha256 = try reply.requiredText(arena, record.get("sha256"), sha256_hex_bytes);
-        if (sha256.len != sha256_hex_bytes) return error.BadReply;
-        try files.put(arena, entry.key_ptr.*, .{
-            .size = try unsignedOf(record.get("size")),
-            .mtime_ns = try integerOf(record.get("mtime_ns") orelse return error.BadReply),
-            .sha256 = sha256,
-        });
+const ManifestMember = enum { files, brought, generation, excludes, bring_back_roots, pending_sha, pending_back, skipped };
+const RecordMember = enum { size, mtime_ns, sha256 };
+
+/// Reads the value of one manifest member under its field's rules (V5). An unknown member is skipped
+/// after its syntax is checked.
+fn applyMember(arena: Allocator, manifest: *Manifest, scanner: *std.json.Scanner, name: []const u8) reply.ParseError!void {
+    const member = std.meta.stringToEnum(ManifestMember, name) orelse return skipValue(scanner);
+    switch (member) {
+        .files => try parseRecords(arena, scanner, &manifest.files),
+        .brought => try parseRecords(arena, scanner, &manifest.brought),
+        .generation => manifest.generation = try textValue(arena, scanner, max_generation_bytes),
+        .excludes => manifest.excludes = try textValue(arena, scanner, sha256_hex_bytes),
+        .bring_back_roots => manifest.bring_back_roots = try textValue(arena, scanner, sha256_hex_bytes),
+        .pending_sha => manifest.pending_sha = try textValue(arena, scanner, sha256_hex_bytes),
+        .pending_back => manifest.pending_back = try textArray(arena, scanner, max_pending_names, max_repo_path_bytes),
+        .skipped => manifest.skipped = try textArray(arena, scanner, max_manifest_files, max_skipped_text_bytes),
     }
 }
 
-/// A JSON array of at most `max_items` texts, each at most `max_bytes` long.
-fn textArray(arena: Allocator, value: std.json.Value, max_items: usize, max_bytes: usize) reply.ParseError![]const []const u8 {
-    const items = switch (value) {
-        .array => |array| array.items,
+/// A JSON object of path to file record, as `files` and `brought` hold them. A repeated object replaces
+/// the earlier one, as the object reader's last-wins rule did. Records are read one at a time from the
+/// token stream, so no tree of a record outlives it (V5).
+fn parseRecords(arena: Allocator, scanner: *std.json.Scanner, files: *FileMap) reply.ParseError!void {
+    switch (try nextToken(arena, scanner)) {
+        .object_begin => {},
+        else => return error.BadReply,
+    }
+    files.clearRetainingCapacity();
+    var count: usize = 0;
+    while (try memberName(arena, scanner)) |path| {
+        count += 1;
+        if (count > max_manifest_files) return error.BadReply;
+        try files.put(arena, path, try recordOf(arena, scanner));
+    }
+}
+
+/// One file record: its size, mtime and SHA-256, under the rules the object reader enforced (V5).
+fn recordOf(arena: Allocator, scanner: *std.json.Scanner) reply.ParseError!FileRecord {
+    switch (try nextToken(arena, scanner)) {
+        .object_begin => {},
+        else => return error.BadReply,
+    }
+    var size: ?u64 = null;
+    var mtime_ns: ?i64 = null;
+    var sha256: ?[]const u8 = null;
+    while (try memberName(arena, scanner)) |name| {
+        const member = std.meta.stringToEnum(RecordMember, name) orelse {
+            try skipValue(scanner);
+            continue;
+        };
+        switch (member) {
+            .size => size = try unsignedToken(try nextToken(arena, scanner)),
+            .mtime_ns => mtime_ns = try integerToken(try nextToken(arena, scanner)),
+            .sha256 => sha256 = try textValue(arena, scanner, sha256_hex_bytes),
+        }
+    }
+    const digest = sha256 orelse return error.BadReply;
+    if (digest.len != sha256_hex_bytes) return error.BadReply;
+    return .{
+        .size = size orelse return error.BadReply,
+        .mtime_ns = mtime_ns orelse return error.BadReply,
+        .sha256 = digest,
+    };
+}
+
+/// The next value, read as one required text (V5).
+fn textValue(arena: Allocator, scanner: *std.json.Scanner, max: usize) reply.ParseError![]const u8 {
+    return textOf(arena, try nextToken(arena, scanner), max);
+}
+
+/// A required text: a JSON string that is not empty and at most `max` bytes. It is copied out of the
+/// reply, so it outlives the reply's bytes (V5).
+fn textOf(arena: Allocator, token: std.json.Token, max: usize) reply.ParseError![]const u8 {
+    const text = switch (token) {
+        .string => |value| value,
+        .allocated_string => |value| value,
         else => return error.BadReply,
     };
-    if (items.len > max_items) return error.BadReply;
-    const texts = try arena.alloc([]const u8, items.len);
-    for (items, texts) |item, *text| text.* = try reply.requiredText(arena, item, max_bytes);
-    return texts;
+    if (text.len == 0 or text.len > max) return error.BadReply;
+    return arena.dupe(u8, text);
+}
+
+/// A JSON array of at most `max_items` texts, each at most `max_bytes` long (V5).
+fn textArray(arena: Allocator, scanner: *std.json.Scanner, max_items: usize, max_bytes: usize) reply.ParseError![]const []const u8 {
+    switch (try nextToken(arena, scanner)) {
+        .array_begin => {},
+        else => return error.BadReply,
+    }
+    var texts: std.ArrayList([]const u8) = .empty;
+    while (true) {
+        const token = try nextToken(arena, scanner);
+        switch (token) {
+            .array_end => return texts.toOwnedSlice(arena),
+            else => {},
+        }
+        if (texts.items.len == max_items) return error.BadReply;
+        try texts.append(arena, try textOf(arena, token, max_bytes));
+    }
+}
+
+/// A JSON integer that fits i64, read from its token. Any other number is a bad reply, as `integerOf` is.
+fn integerToken(token: std.json.Token) reply.ParseError!i64 {
+    const text = switch (token) {
+        .number => |value| value,
+        .allocated_number => |value| value,
+        else => return error.BadReply,
+    };
+    return std.fmt.parseInt(i64, text, 10) catch error.BadReply;
+}
+
+fn unsignedToken(token: std.json.Token) reply.ParseError!u64 {
+    const number = try integerToken(token);
+    if (number < 0) return error.BadReply;
+    return @intCast(number);
+}
+
+/// The next token of the manifest text. A bad token is a bad reply, and memory stays a memory error (V5).
+fn nextToken(arena: Allocator, scanner: *std.json.Scanner) reply.ParseError!std.json.Token {
+    return scanner.nextAlloc(arena, .alloc_if_needed) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadReply,
+    };
+}
+
+/// The next member name of an object, or null at its end (V5).
+fn memberName(arena: Allocator, scanner: *std.json.Scanner) reply.ParseError!?[]const u8 {
+    switch (try nextToken(arena, scanner)) {
+        .object_end => return null,
+        .string => |text| return text,
+        .allocated_string => |text| return text,
+        else => return error.BadReply,
+    }
+}
+
+fn skipValue(scanner: *std.json.Scanner) reply.ParseError!void {
+    scanner.skipValue() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadReply,
+    };
 }
 
 fn unsignedOf(value: ?std.json.Value) reply.ParseError!u64 {
@@ -1302,13 +1416,20 @@ pub fn applyBackRecord(alloc: Allocator, manifest: *Manifest, record: journal.Re
 pub fn foldJournal(ctx: *Context) Error!void {
     const bytes = (readVerified(ctx.alloc, ctx.state_dir, journal.file_name, journal.max_bytes) catch |err| return refuseError(ctx, "journal", err)) orelse return;
     const parsed = journal.parse(ctx.alloc, bytes) catch |err| switch (err) {
-        error.BadJournal => return refuse(ctx, "journal", 0, "the manifest journal could not be read"),
+        error.BadJournal => return setJournalAside(ctx),
         error.OutOfMemory => return error.OutOfMemory,
     };
     var manifest = try readManifest(ctx);
     for (parsed.records) |record| try applyBackRecord(ctx.alloc, &manifest, record);
     try commitManifest(ctx, &manifest);
     journal.remove(ctx.state_dir) catch |err| return refuseError(ctx, "journal", err);
+}
+
+/// Moves a damaged journal aside, so later runs are not refused (V9). Its records are not applied,
+/// so the files it listed count as changed on this machine at the next run (N9, N31).
+fn setJournalAside(ctx: *Context) Error!void {
+    ctx.state_dir.dir.rename(journal.file_name, ctx.state_dir.dir, journal.damaged_file_name, io_mod.getIo()) catch |err| return refuseError(ctx, "journal", err);
+    ctx.journal_set_aside = true;
 }
 
 /// Reads a file of the state folder without following a link. A missing file is null.
@@ -2294,6 +2415,40 @@ test "a journal of three records and a torn fourth folds into the manifest at th
     try std.testing.expectEqualStrings(sha_two, folded.files.get("c.txt").?.sha256);
     try std.testing.expect(folded.brought.get("d.txt") == null);
     try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io_mod.getIo(), journal.file_name, .{}));
+}
+
+test "a journal with a damaged complete line is set aside, its records are not applied, and later folds go on (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var buffer: [64]u8 = undefined;
+    const base = try baseFor(&buffer, 9);
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var ctx = contextFor(arena, &cancel, base, &capture, &state_dir);
+
+    var manifest = emptyManifest();
+    manifest.generation = "generation-1";
+    try commitManifest(&ctx, &manifest);
+
+    const sha_one = "1111111111111111" ++ "1111111111111111" ++ "1111111111111111" ++ "1111111111111111";
+    const good = try journal.encodeLine(arena, .{ .kind = .brought, .rel = "a.txt", .size = 1, .mtime_ns = 2, .sha256 = sha_one });
+    const bytes = try arena.print("{s}not a record\n", .{good});
+    try state_dir.dir.writeFile(io, .{ .sub_path = journal.file_name, .data = bytes });
+
+    _ = try foldJournal(&ctx);
+    _ = try foldJournal(&ctx);
+
+    const folded = try readManifest(&ctx);
+    try std.testing.expect(folded.brought.get("a.txt") == null);
+    try std.testing.expectError(error.FileNotFound, state_dir.dir.statFile(io, journal.file_name, .{}));
+    _ = try state_dir.dir.statFile(io, "manifest.journal.damaged", .{});
+    try std.testing.expect(ctx.journal_set_aside);
 }
 
 test "a manifest without a generation writes back as one the reader accepts (V9)" {

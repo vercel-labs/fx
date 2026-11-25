@@ -6,6 +6,7 @@
 //! this file.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../../shared/io.zig");
 const secret = @import("../../auth/secret.zig");
 const gateway_client = @import("../../../gateway/client.zig");
@@ -580,8 +581,20 @@ const CountingAllocator = struct {
     }
 };
 
-test "the connect limit ends a connect the kernel holds, as ConnectTimeout (V11)" {
-    // With the accept queue full, Linux holds a new connect, so the 150 ms limit must end it.
+// What a connect ends as, when the accept queue is full and the kernel answers the next one (V11).
+// Linux holds the connect until the limit ends it, as ConnectTimeout. macOS resets it at once, which
+// the product reports as TransportFailed, well inside the limit.
+const linux_holds = builtin.os.tag == .linux;
+const held_connect_error: anyerror = if (linux_holds) error.ConnectTimeout else error.TransportFailed;
+const held_connect_name = if (linux_holds) "ConnectTimeout" else "TransportFailed";
+
+test "the connect limit maps a timeout to ConnectTimeout on every platform (V11)" {
+    try std.testing.expectEqual(@as(StreamError, error.ConnectTimeout), mapConnect(error.Timeout));
+    try std.testing.expectEqual(@as(StreamError, error.TransportFailed), mapConnect(error.ConnectionResetByPeer));
+}
+
+test "the connect limit ends a connect the kernel answers, within the limit (V11)" {
+    // With the accept queue full, the kernel answers a new connect: Linux holds it, macOS resets it.
     const io = std.testing.io;
     const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true });
@@ -597,14 +610,21 @@ test "the connect limit ends a connect the kernel holds, as ConnectTimeout (V11)
     var cancel = std.atomic.Value(bool).init(false);
     var capture: credentials.CaptureTrace = .{};
     const started = io_mod.milliTimestamp();
-    try std.testing.expectError(error.ConnectTimeout, open(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
+    try std.testing.expectError(held_connect_error, open(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
         .step = "connect",
         .method = .GET,
         .path = "/v2/user",
         .limits = .{ .connect_ms = 150 },
     }));
-    try std.testing.expect(io_mod.milliTimestamp() - started < 3_000);
-    try std.testing.expect(std.mem.find(u8, capture.captured(), "step connect, failed ConnectTimeout") != null);
+    const elapsed = io_mod.milliTimestamp() - started;
+    if (linux_holds) {
+        // The hold ends at the limit: never before it, and never after the bound.
+        try std.testing.expect(elapsed >= 150 and elapsed < 3_000);
+    } else {
+        // The reset came well inside the limit, not after it.
+        try std.testing.expect(elapsed < 150);
+    }
+    try std.testing.expect(std.mem.find(u8, capture.captured(), "step connect, failed " ++ held_connect_name) != null);
     // The connect walked away from its open job; the test ends only when that job has finished.
     try gateway_client.waitForOwnClientOpenJobs();
 }
@@ -837,8 +857,8 @@ test "a second call connects and completes while an exec stream is still open (V
     try std.testing.expectEqual(@as(u16, 200), kill.status);
 }
 
-test "a connect held past its limit ends as ConnectTimeout, 50 times in a row, with a call between each (V11)" {
-    // Two connections fill the accept queue, so the kernel holds every later connect.
+test "a connect the kernel answers ends within its limit, 50 times in a row, with a call between each (V11)" {
+    // Two connections fill the accept queue, so the kernel answers every later connect.
     const io = std.testing.io;
     const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try any.listen(io, .{ .kernel_backlog = 1, .reuse_address = true });
@@ -862,12 +882,19 @@ test "a connect held past its limit ends as ConnectTimeout, 50 times in a row, w
 
     var round: usize = 0;
     while (round < 50) : (round += 1) {
-        try std.testing.expectError(error.ConnectTimeout, open(std.testing.allocator, &cancel, held_base, .{ .value = token_text }, capture.trace(), .{
+        const round_started = io_mod.milliTimestamp();
+        try std.testing.expectError(held_connect_error, open(std.testing.allocator, &cancel, held_base, .{ .value = token_text }, capture.trace(), .{
             .step = "connect",
             .method = .GET,
             .path = "/v2/user",
             .limits = .{ .connect_ms = 50 },
         }));
+        const round_elapsed = io_mod.milliTimestamp() - round_started;
+        if (linux_holds) {
+            try std.testing.expect(round_elapsed >= 50);
+        } else {
+            try std.testing.expect(round_elapsed < 50);
+        }
         const response = try callBuffered(std.testing.allocator, &cancel, base, .{ .value = token_text }, capture.trace(), .{
             .step = "user",
             .method = .GET,

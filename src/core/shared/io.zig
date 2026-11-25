@@ -218,6 +218,24 @@ pub fn openExistingRegularFile(
     });
 }
 
+/// Opens a regular file for appending, creating it with `mode` when it is missing. A symbolic link
+/// at that name is refused, never followed, and every write goes to the end of the file.
+pub fn openAppendNoFollow(dir: std.Io.Dir, sub_path: []const u8, mode: std.posix.mode_t) !std.Io.File {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.Unsupported;
+    var flags: std.posix.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .NOFOLLOW = true,
+    };
+    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    const fd = std.posix.openat(dir.handle, sub_path, flags, mode) catch |err| switch (err) {
+        error.SymLinkLoop => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
 /// Opens an existing read-only regular file according to `final_symlink`.
 /// Hardlinks are accepted. Following a link does not authorize its target;
 /// the caller owns that policy and the returned file.

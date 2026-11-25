@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 
 /// The journal's file name in the sandbox state folder.
 pub const file_name = "manifest.journal";
+/// Where a damaged journal is set aside, so later runs are not refused (V9, N31).
+pub const damaged_file_name = "manifest.journal.damaged";
 /// The most journal bytes one fold reads. A run writes at most 2,000 files, and each run folds
 /// the journal before it appends, so a valid journal never reaches this bound.
 pub const max_bytes: usize = 16 * 1024 * 1024;
@@ -145,12 +147,8 @@ pub fn append(alloc: Allocator, dir: *io_mod.VerifiedDir, record: Record) !void 
     const io = io_mod.getIo();
     const line = try encodeLine(alloc, record);
     const existed = try exists(dir.dir, file_name);
-    var file = try dir.dir.createFile(io, file_name, .{
-        .truncate = false,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
-    });
+    var file = try io_mod.openAppendNoFollow(dir.dir, file_name, 0o600);
     defer file.close(io);
-    _ = std.c.lseek(file.handle, 0, std.posix.SEEK.END);
     try file.writeStreamingAll(io, line);
     try file.sync(io);
     if (!existed) try io_mod.syncVerifiedDir(dir.dir);
@@ -221,6 +219,25 @@ test "a complete journal line that is not a valid record is refused, not skipped
     for (cases) |bytes| {
         try std.testing.expectError(error.BadJournal, parse(arena, bytes));
     }
+}
+
+test "a journal that is a symbolic link is refused, and the file it points to is not written (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    var state = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state.close();
+    try tmp.dir.writeFile(io, .{ .sub_path = "target.txt", .data = "keep" });
+    try state.dir.symLink(io, "../target.txt", file_name, .{});
+    const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    try std.testing.expectError(error.BadJournal, append(arena, &state, .{ .kind = .files, .rel = "a.txt", .size = 1, .mtime_ns = 2, .sha256 = sha }));
+    var target = try io_mod.openExistingReadOnlyRegularFile(tmp.dir, "target.txt", .no_follow);
+    defer target.close(io);
+    try std.testing.expectEqualStrings("keep", try io_mod.readFileToEnd(arena, &target, 16));
 }
 
 test "append writes one fsynced line per record, and remove deletes the journal (V9)" {

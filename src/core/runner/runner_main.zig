@@ -744,6 +744,7 @@ fn runRemote(arena: Allocator, run: Run, stdout: *std.Io.Writer, stderr: *std.Io
     const baseline: []const vercel.BringBackFile = vercel.bringBackBaseline(&context, command.bring_back) catch @as([]const vercel.BringBackFile, &.{});
     const push_outcome = vercel.pushRoot(&context, .{ .run_id = run_id, .include = command.include, .bring_back = command.bring_back });
     noteManifestReset(stderr, context.manifest_reset);
+    noteJournalSetAside(stderr, context.journal_set_aside);
     noteCleared(arena, stderr, context.pending_cleared);
     var pushed = switch (push_outcome) {
         .ok => |result| result,
@@ -799,6 +800,22 @@ const stopped_before_send_note = "fx: stopped before the command was sent; it di
 fn stoppedBeforeSend(stderr: *std.Io.Writer) u8 {
     writeNote(stderr, stopped_before_send_note);
     return exit_stopped;
+}
+
+const journal_set_aside_note = "fx: the sync journal was damaged, so fx set it aside; files from the last bring-back count as changed on this machine\n";
+
+/// N31: push found a damaged sync journal and set it aside (V9). Printed once per run.
+fn noteJournalSetAside(stderr: *std.Io.Writer, set_aside: bool) void {
+    if (set_aside) writeNote(stderr, journal_set_aside_note);
+}
+
+test "N31 is printed when push set a damaged journal aside, and never otherwise (V9)" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    noteJournalSetAside(&out.writer, false);
+    try std.testing.expectEqualStrings("", out.written());
+    noteJournalSetAside(&out.writer, true);
+    try std.testing.expectEqualStrings(journal_set_aside_note, out.written());
 }
 
 /// N20: the one note for a cut file list (V5). The push still ran, and nothing was deleted.

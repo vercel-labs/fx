@@ -343,7 +343,10 @@ pub fn run(arena: Allocator, ctx: *sandbox.Context, session_id: []const u8, inpu
         sandbox.removePending(ctx, entry.run_id) catch return .{ .failed = "the pending runs could not be removed" };
     }
     manifest.pending_back = pending.names;
-    apply.finish() catch return .{ .failed = "the manifest could not be written" };
+    apply.finish() catch |err| return .{ .failed = switch (err) {
+        error.JournalNotRemoved => "the journal could not be removed",
+        else => "the manifest could not be written",
+    } };
     return .{ .done = .{ .counts = counts, .pending = pending.names } };
 }
 
@@ -1197,7 +1200,7 @@ const Apply = struct {
         self.manifest_writes += 1;
         const ctx = self.ctx orelse return;
         try sandbox.commitManifest(ctx, self.manifest);
-        try journal.remove(ctx.state_dir);
+        journal.remove(ctx.state_dir) catch return error.JournalNotRemoved;
     }
 
     fn tempName(self: *Apply) ![]const u8 {
@@ -1668,6 +1671,43 @@ test "a file written but never journaled counts as changed on this machine when 
     try testing.expectEqualStrings("mac-edit", try readBack(arena, tmp.dir, "unjournaled.txt"));
     try testing.expectEqual(@as(usize, 1), counts.kept);
     try testing.expectEqual(@as(usize, 0), counts.written);
+}
+
+test "a journal that cannot be removed after the manifest is written is reported as such (V9)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    var state_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "state");
+    defer state_dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var capture: credentials.CaptureTrace = .{};
+    var context: sandbox.Context = .{
+        .alloc = arena,
+        .cancel = &cancel,
+        .base = transport.resolveBaseUrl(null),
+        .token = .{ .value = "fx-test-token" },
+        .trace = capture.trace(),
+        .team_id = "team_1",
+        .project_id = "prj_1",
+        .name = "fx-repo",
+        .repo_root = "/vercel/sandbox/repo",
+        .state_dir = &state_dir,
+    };
+    var manifest = try testManifest(arena, &.{});
+    manifest.generation = "generation-1";
+    var counts: Counts = .{};
+    var overflow: std.ArrayList([]const u8) = .empty;
+    var baselines: std.array_hash_map.String(BaselineMap) = .empty;
+    var notes: Notes = .{ .alloc = arena };
+    var apply = testApply(arena, tmp.dir, &manifest, &counts, &overflow, &baselines, &notes, &.{}, max_files_per_run);
+    apply.ctx = &context;
+
+    // A folder where the journal file belongs cannot be removed as a file.
+    try state_dir.dir.createDir(io, journal.file_name, std.Io.File.Permissions.fromMode(0o700));
+    try testing.expectError(error.JournalNotRemoved, apply.finish());
 }
 
 test "an untracked file the bring-back wrote is written again only while the Mac still matches it (V9)" {
