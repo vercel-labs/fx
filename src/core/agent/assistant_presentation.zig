@@ -5263,7 +5263,7 @@ test "named open lines preview as open text" {
         try std.testing.expectEqualStrings(case.visible, plain);
         if (case.styled.len > 0) try expectPreviewHas(preview.items, case.styled);
         if (case.code.len > 0) {
-            const needle = try std.fmt.allocPrint(alloc, "{s}{s}", .{ ansi.inline_code_open, case.code });
+            const needle = try alloc.print("{s}{s}", .{ ansi.inline_code_open, case.code });
             defer alloc.free(needle);
             try expectPreviewHas(preview.items, needle);
         }
