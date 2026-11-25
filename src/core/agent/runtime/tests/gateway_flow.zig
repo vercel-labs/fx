@@ -10843,6 +10843,112 @@ test "tool presentation groups span silent steps and split on visible assistant 
     try std.testing.expect(group_b_start_index != null);
 }
 
+test "tool calls after a question start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const read_third = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask },
+        .{ .tool_calls = &read_second },
+        .{ .tool_calls = &read_third },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    var groups: [3]types.ToolPresentationGroupId = undefined;
+    var group_count: usize = 0;
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        try std.testing.expect(group_count < groups.len);
+        groups[group_count] = event.authoritative_started.presentation_group_id.?;
+        group_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expect(!std.meta.eql(groups[0], groups[1]));
+    try std.testing.expectEqual(groups[1], groups[2]);
+}
+
+/// The presentation group of the call `call_id` when it started.
+fn startedPresentationGroup(hooks: *const FakeAgentRuntimeDeps, call_id: []const u8) ?types.ToolPresentationGroupId {
+    for (hooks.lifecycle_events.items) |event| {
+        if (event != .authoritative_started) continue;
+        const started = event.authoritative_started;
+        if (std.mem.eql(u8, started.id.call_id, call_id)) return started.presentation_group_id;
+    }
+    return null;
+}
+
+test "a question dropped from a length-cut reply and sent again leaves the presentation group open" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const cut_ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &cut_ask, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    for (hooks.executed_names.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "ask_user_question"));
+    }
+    try std.testing.expectEqual(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    );
+}
+
+test "a question a length-cut reply finished runs, and the calls after it start a new presentation group" {
+    const alloc = std.testing.allocator;
+    const read_first = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const ask = [_]ToolCall{toolCall("call_ask", "ask_user_question", "{\"questions\":[]}")};
+    // The question is whole, and a call after it was cut.
+    const starts = ask ++ [_]ToolCall{toolCall("call_cut", "edit_file", "{}")};
+    const read_second = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_first },
+        .{ .tool_calls = &ask, .streamed_tool_starts = &starts, .finish_reason = .length },
+        .{ .tool_calls = &read_second },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    var asked = false;
+    for (hooks.executed_names.items) |name| {
+        if (std.mem.eql(u8, name, "ask_user_question")) asked = true;
+    }
+    try std.testing.expect(asked);
+    try std.testing.expect(!std.meta.eql(
+        startedPresentationGroup(&hooks, "call_1").?,
+        startedPresentationGroup(&hooks, "call_2").?,
+    ));
+}
+
 test "processQueuedPrompt asks the model to act after replies cut before any text, with no silent-tool summary" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();

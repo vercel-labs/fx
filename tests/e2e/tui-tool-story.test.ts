@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
@@ -107,7 +108,17 @@ const REFUSED_REQUESTS: StoryStep[] = [
 const REFUSED_LAST: StoryStep[] = [
   { at: 0, calls: [sh("printf done")] },
   { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
-  { at: 2, text: "I could not list the folder." },
+  // The reply's words show a second before its stream ends, so the row's
+  // reason, which shows at the turn's end, comes after them.
+  {
+    at: 2,
+    response: () => {
+      const held = heldFakeGatewayFinalText();
+      held.send("I could not list the folder.");
+      setTimeout(() => held.release(""), 1_000);
+      return held.response;
+    },
+  },
 ];
 
 // Two commands fail, the last of them too.
@@ -296,7 +307,9 @@ async function runStory(
   sessions.push(session);
   await session.waitForComposer();
   await session.sendText(options.prompt);
-  await session.waitForText(options.finalText, TIMEOUT);
+  // The reply's last words show before its turn ends, and the turn-end rows
+  // and the saved turn come after them.
+  await session.waitForPane((pane) => pane.includes(options.finalText) && turnSettled(pane), TIMEOUT);
   const pane = await session.waitForComposer(TIMEOUT);
   return { root, gateway, session, pane };
 }
@@ -844,7 +857,7 @@ test.skipIf(!tmuxAvailable())(
     const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
     expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
     writeFileSync(join(root.workspace, "released"), "");
-    await session.waitForText("The desktop app has two source files.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The desktop app has two source files.") && turnSettled(pane), TIMEOUT);
     const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
     const expectRow = (pane: string, row: string) => {
       expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
@@ -987,7 +1000,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("save the notes in a session");
     // While the wait runs, its row names the same programs.
     await session.waitForText("Waiting for cat, sleep, printf", TIMEOUT);
-    await session.waitForText("The session saved the notes.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The session saved the notes.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // The session's row names the programs of its launch command, and says
       // it ran once the check found the command ended; the document's text
@@ -1046,7 +1059,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("write the files");
-    await session.waitForText("The files are written.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The files are written.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // Each row names its file, and two files with one name stay two rows.
       expect(treeRows(group(lines, /^● Wrote files/))).toEqual([
@@ -1226,7 +1239,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("ask the reviewer");
     await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
     sendRead!();
-    await session.waitForText("The reviewer is done.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The reviewer is done.") && turnSettled(pane), TIMEOUT);
 
     const expectOwnLine = (lines: string[]) => {
       // Main's calls share a group; the report is a line of its own after

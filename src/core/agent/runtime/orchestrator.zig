@@ -447,6 +447,14 @@ const CutReplyCalls = struct {
     cut_tool: ?[]const u8,
 };
 
+/// Whether one of `calls` asks the user a question.
+fn callsAskQuestion(arena: Allocator, registry: tool_dispatch.Registry, calls: []const ToolCall) bool {
+    for (calls) |call| {
+        if (runtime_tool_presentation.activityKindForCall(arena, registry, call) == .ask) return true;
+    }
+    return false;
+}
+
 fn classifyCutReplyCalls(
     arena: Allocator,
     calls: []const ToolCall,
@@ -10723,12 +10731,33 @@ fn processQueuedPromptLoop(
                 },
             }
         }
+        // A reply cut off at its output limit runs the calls the provider
+        // finished, or keeps the text it wrote before any call, and the model
+        // hears in the same turn what was cut, so it goes on without a person
+        // (`tests/tla/agent_runtime/OutputLimit.tla`).
+        const cut_reply: ?CutReplyCalls = if (disposition == .length_limited)
+            try classifyCutReplyCalls(arena, completion.tool_calls, &stream_ctx.tool_starts, stream_ctx.saw_tool_start)
+        else
+            null;
+        const reply_text = std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+        const output_limit_action: ?output_limit.Action = if (cut_reply) |calls| output_limit.decide(.{
+            .earlier_cuts = output_limit_cuts,
+            .complete_calls = calls.complete.len,
+            .complete_calls_admitted = completeCallsAdmitted(completion, calls.complete),
+            .cut_calls = calls.cut,
+            .text = reply_text,
+            .provider_executed = hasProviderExecutedCall(completion.tool_calls),
+            .step_left = agent_steps.allowsStep(config.agent_step_limit, step + 1),
+        }) else null;
         if (disposition == .completed) try stream_ctx.start_response();
         var step_has_visible_tool_calls = false;
+        var step_asked_question = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
-            step_has_visible_tool_calls = true;
-            break;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) {
+                step_asked_question = true;
+            } else {
+                step_has_visible_tool_calls = true;
+            }
         }
         const step_has_visible_text =
             stream_ctx.saw_visible_text or
@@ -10745,6 +10774,14 @@ fn processQueuedPromptLoop(
                     .has_visible_text = step_has_visible_text,
                     .saw_tool_start = stream_ctx.saw_tool_start,
                     .saw_visible_text_after_tool_start = stream_ctx.saw_visible_text_after_tool_start,
+                    // A cut reply runs only its complete calls, and only
+                    // when fx runs them, so only a question among those shows.
+                    .asked_question = if (disposition == .completed)
+                        step_asked_question
+                    else if (output_limit_action) |action|
+                        action == .run_complete_calls and callsAskQuestion(arena, deps.tool_registry, cut_reply.?.complete)
+                    else
+                        false,
                 },
             );
         stream_ctx.provisional_statuses.presentation_group_id =
@@ -10755,13 +10792,14 @@ fn processQueuedPromptLoop(
             "agent",
             "tool_presentation_group",
             step_ctx,
-            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s}",
+            "anchor_step_id={d} visible_tool_calls={s} saw_tool_start={s} visible_text={s} saw_visible_text_after_tool_start={s} asked_question={s}",
             .{
                 if (active_presentation_group_id) |group| group.anchor_step_id else 0,
                 if (step_has_visible_tool_calls) "true" else "false",
                 if (stream_ctx.saw_tool_start) "true" else "false",
                 if (step_has_visible_text) "true" else "false",
                 if (stream_ctx.saw_visible_text_after_tool_start) "true" else "false",
+                if (step_asked_question) "true" else "false",
             },
         );
 
@@ -10788,24 +10826,6 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
-        // A reply cut off at its output limit runs the calls the provider
-        // finished, or keeps the text it wrote before any call, and the model
-        // hears in the same turn what was cut, so it goes on without a person
-        // (`tests/tla/agent_runtime/OutputLimit.tla`).
-        const cut_reply: ?CutReplyCalls = if (disposition == .length_limited)
-            try classifyCutReplyCalls(arena, completion.tool_calls, &stream_ctx.tool_starts, stream_ctx.saw_tool_start)
-        else
-            null;
-        const reply_text = std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
-        const output_limit_action: ?output_limit.Action = if (cut_reply) |calls| output_limit.decide(.{
-            .earlier_cuts = output_limit_cuts,
-            .complete_calls = calls.complete.len,
-            .complete_calls_admitted = completeCallsAdmitted(completion, calls.complete),
-            .cut_calls = calls.cut,
-            .text = reply_text,
-            .provider_executed = hasProviderExecutedCall(completion.tool_calls),
-            .step_left = agent_steps.allowsStep(config.agent_step_limit, step + 1),
-        }) else null;
         const sent_output_limit: ?u32 = if (config.provider_capabilities.sends_output_limit)
             stepOutputTokens(request_capabilities, cut_reply_output_tokens)
         else

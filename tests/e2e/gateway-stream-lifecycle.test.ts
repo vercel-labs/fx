@@ -347,7 +347,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     await tui.waitForStableComposer(15000);
     await tui.sendText("STEERING_START");
     // The parent's turn ends with the receipt while its subagent works.
-    await tui.waitForText("START_SENT", 10000);
+    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
     await tui.waitForPane(() => childRequests === 1, 10000);
     await tui.waitForPane(() => work().spawns === 1, 10000);
     const original = work();
@@ -1593,7 +1593,7 @@ describe("gateway stream lifecycle", () => {
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("!echo bang-routing-probe");
-      await session.waitForText("BANG_PROMPT_ROUTED", 15_000);
+      await session.waitForPane((pane) => pane.includes("BANG_PROMPT_ROUTED") && turnSettled(pane), 15_000);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
@@ -13391,7 +13391,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       child.release("CHILD_REPORT_TEXT");
       await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
-      await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_REPORT_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(childRequests).toBe(1);
       expect(parentBodies).toHaveLength(3);
@@ -13514,7 +13514,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_HANDOFF_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_HANDOFF_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(childRequests()).toBe(1);
       // The report takes the nudge's place, as one that waited in the
@@ -13564,7 +13564,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_MESSAGE_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_MESSAGE_ALL_DONE") && turnSettled(pane), 10000);
 
       const next = parentBodies[2]!;
       expect(next).toContain("CHILD_MESSAGE_TEXT");
@@ -13656,7 +13656,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       secondHold.release!();
       await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_SECOND_REPORT_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_SECOND_REPORT_DONE") && turnSettled(pane), 10000);
 
       expect(parentBodies).toHaveLength(4);
       expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
@@ -13685,7 +13685,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await startHandoffTui(root, gateway, paths);
       await tui.waitForStableComposer(15000);
       await tui.sendText("EMPTY_PLAIN_START");
-      await tui.waitForText("EMPTY_PLAIN_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_PLAIN_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(parentBodies).toHaveLength(2);
       expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);
