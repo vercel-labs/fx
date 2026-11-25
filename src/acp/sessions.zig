@@ -2063,6 +2063,8 @@ fn notifyPendingAcceptedInputs(
     const v2 = active.v2 orelse return;
     var reader = v2.pendingInputsReader();
     defer reader.deinit();
+    // In-place ACP reloads reuse the open handle after prior withdrawals at higher seqs.
+    reader.up_to_seq = null;
     var pending = reader.read(alloc, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -3830,6 +3832,18 @@ test "eb03: failed ACP restore notice still withdraws accepted inputs" {
     var remaining = try reopened.pendingAcceptedInputs(alloc);
     defer remaining.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), remaining.ids.len);
+
+    // Reloading on the same open handle sees the withdrawal at seq > opened_last_seq.
+    var second_calls: usize = 0;
+    const CountWriter = struct {
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const count: *usize = @ptrCast(@alignCast(raw.?));
+            count.* += 1;
+        }
+    };
+    state.writer = jsonrpc.Writer.initCallback(&second_calls, CountWriter.write);
+    try notifyPendingAcceptedInputs(&state, alloc, sid);
+    try std.testing.expectEqual(@as(usize, 0), second_calls);
 }
 
 test "eb03: notifyPendingAcceptedInputs scans without holding session_write_mutex" {

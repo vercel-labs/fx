@@ -4701,7 +4701,7 @@ pub const CycleReader = struct {
 pub const PendingInputsReader = struct {
     store: *Store,
     host: *BlobHost,
-    up_to_seq: u64,
+    up_to_seq: ?u64,
 
     pub fn deinit(self: *PendingInputsReader) void {
         BlobHost.release(self.host);
