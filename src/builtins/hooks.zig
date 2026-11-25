@@ -99,16 +99,17 @@ const RecordingClient = struct {
     }
 };
 
+/// The tags of `app_agents_runtime.Busiest`, for the test apps below.
+const TestBusiest = enum { needs_approval, has_question, needs_you, working, idle };
+
 test "an app that knows its busiest agent reports the pane state only on a change" {
-    // The tags of `app_agents_runtime.Busiest`.
-    const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
     const TestApp = struct {
         alloc: std.mem.Allocator,
         lifecycle_runtime: hooks.Runtime,
         herdr: RecordingClient = .{},
-        busiest: Busiest = .idle,
+        busiest: TestBusiest = .idle,
 
-        pub fn agentsBusiest(self: *@This()) Busiest {
+        pub fn agentsBusiest(self: *@This()) TestBusiest {
             return self.busiest;
         }
 
@@ -154,16 +155,14 @@ test "an app that knows its busiest agent reports the pane state only on a chang
 }
 
 test "a turn that went on and ended between two passes reports working before idle" {
-    // The tags of `app_agents_runtime.Busiest`.
-    const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
     const TestApp = struct {
         alloc: std.mem.Allocator,
         lifecycle_runtime: hooks.Runtime,
         herdr: RecordingClient = .{},
-        busiest: Busiest = .idle,
+        busiest: TestBusiest = .idle,
         began_work: bool = false,
 
-        pub fn agentsBusiest(self: *@This()) Busiest {
+        pub fn agentsBusiest(self: *@This()) TestBusiest {
             return self.busiest;
         }
 
