@@ -3099,12 +3099,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(unnamed).not.toContain("Running web_fetch");
       expect(unnamed).not.toContain("Fetching");
       // Its url is in and the rest of its arguments are not, so the row
-      // reads as a direct web_fetch call does.
+      // reads as a direct web_fetch call does, by the page and its host.
       sendTarget?.();
       const named = await waitForScrollback(
         session!,
-        (value) => value.includes(`● Fetching ${url}`),
-        "the toolbox run's row naming web_fetch's url while its arguments stream in",
+        (value) => value.includes("● Fetching page · 127.0.0.1"),
+        "the toolbox run's row naming web_fetch's page while its arguments stream in",
       );
       expect(named).not.toContain("Running web_fetch");
       expect(queuedGateway.requests).toHaveLength(1);
@@ -3115,7 +3115,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The group counts the runs as the reads they are.
       const expectDirectRows = (scrollback: string) => {
         expect(scrollback).toContain("● Read a file");
-        expect(scrollback).toContain(`Couldn't fetch ${url}`);
+        expect(scrollback).toContain("Couldn't fetch page · 127.0.0.1");
+        expect(scrollback).not.toContain(`fetch ${url}`);
         expect(scrollback).toContain(`Couldn't search ${query}`);
         expect(scrollback).toContain("Read notes.txt");
         expect(scrollback).toContain("Explored 1 file");
@@ -8128,6 +8129,143 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(resumedStderr, "utf8")).toBe("");
     },
     TIMEOUT * 3,
+  );
+
+  test(
+    "fetch rows name the page and its host or the redacted URL, and a search of web search results names them, live, after a resume, and in a narrow terminal",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-fetch-rows-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      // The deny keeps the second fetch off the network, and web_fetch
+      // refuses the first one's address before it sends anything.
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ permission: { web_fetch: { "domain:agentclientprotocol.com": "deny" } } }),
+      );
+      const refusedUrl = "http://127.0.0.1/protocol/v1/prompt-turn";
+      const deniedUrl = "https://agentclientprotocol.com/protocol/v1/slash-commands";
+      // URLs whose host a row cannot name, which web_fetch refuses too. Each
+      // row shows the URL redacted, never its user name or password.
+      const unnamedHosts = [
+        { url: "https://user:secret@/docs", row: "Couldn't fetch https://[redacted]@/docs" },
+        { url: "https://user:pa/ss@127.0.0.1/x", row: "Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        { url: "https://user:pass?x@host/", row: "Couldn't fetch https://[redacted]@host/" },
+        { url: "user:secret@agentclientprotocol.com/docs", row: "Couldn't fetch [redacted]@agentclientprotocol.com/docs" },
+        { url: "https://evil.test\\@example.com/spoof", row: "Couldn't fetch https://[redacted]@example.com/spoof" },
+        { url: "file://srv/share/x", row: "Couldn't fetch file://srv/share/x" },
+      ];
+      // The search of the user's session, which starts with a straight quote.
+      const query = '"url":"https://agentclientprotocol.com';
+      // Large enough that fx saves the provider's search results behind a
+      // handle, as it did in the user's session.
+      const results = Array.from({ length: 60 }, (_, index) => ({
+        id: `https://agentclientprotocol.com/protocol/v1/page-${index}`,
+        title: `Page ${index}`,
+        url: `https://agentclientprotocol.com/protocol/v1/page-${index}`,
+        highlights: [`${"Agent Client Protocol reference text. ".repeat(12)}${index}`],
+      }));
+      const finalText = "FETCH_ROWS_FINISHED";
+
+      const fetchGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        ) as Array<Record<string, unknown>>;
+        const output = (callId: string): string | null => {
+          const part = parts.find((candidate) => candidate.type === "tool-result" && candidate.toolCallId === callId);
+          return part ? contentText(part.output) : null;
+        };
+        if (output("search_saved") !== null) return fakeGatewayFinalText(finalText);
+        const searchResults = output("provider_search");
+        if (searchResults === null) {
+          return fakeGatewaySse([
+            { type: "tool-input-start", id: "provider_search", toolName: "exa_search" },
+            {
+              type: "tool-call",
+              toolCallId: "provider_search",
+              toolName: "exa_search",
+              input: { query: "Agent Client Protocol prompt turn", include_domains: ["agentclientprotocol.com"] },
+              providerExecuted: true,
+            },
+            { type: "tool-result", toolCallId: "provider_search", result: { requestId: "fetch-rows", results } },
+            { type: "tool-call", toolCallId: "fetch_refused", toolName: "web_fetch", input: { url: refusedUrl } },
+            { type: "tool-call", toolCallId: "fetch_denied", toolName: "web_fetch", input: { url: deniedUrl } },
+            ...unnamedHosts.map(({ url }, index) => ({ type: "tool-call", toolCallId: `fetch_unnamed_${index}`, toolName: "web_fetch", input: { url } })),
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        const handle = searchResults.match(/result-[A-Za-z0-9_.-]+?\.txt/)?.[0];
+        if (!handle) return new Response("missing saved search handle", { status: 500 });
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "search_saved", toolName: "read_tool_result", input: { handle, query } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = fetchGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-fetch-rows-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: fetchGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: fetchGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: fetchGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      const toolRows = (pane: string) =>
+        pane.split("\n").map((line) => line.trim()).filter((line) => /^[●├└] /.test(line));
+      const refusedRow = "Couldn't fetch prompt-turn · 127.0.0.1";
+      const deniedRow = "Denied slash-commands · agentclientprotocol.com";
+      const searchRow = "Searched web results for “\"url\":\"https://agentclientprotocol.com”";
+      // The provider's search counts as a search in the header, not as a
+      // web search. After a resume the header reads as it does on main.
+      const liveHeader = "● Searched · 1 denied";
+      const resumedHeader = "● Searched, used a tool · 1 denied";
+      const expectRows = (rows: string[], header: string, cols = Infinity) => {
+        const clip = (row: string) => (row.length + 2 <= cols ? row : `${row.slice(0, cols - 3)}…`);
+        expect(rows).toContain(header);
+        expect(rows.filter((line) => line.includes("the web"))).toEqual([]);
+        for (const row of [refusedRow, deniedRow, searchRow, ...unnamedHosts.map((unnamed) => unnamed.row)]) {
+          expect(rows.some((line) => line.slice(2) === clip(row))).toBe(true);
+        }
+        expect(rows.filter((line) => /secret|user:|pa\/ss|pass/.test(line))).toEqual([]);
+        // No row repeats the search's own quotes in straight quotes or names
+        // the search tool.
+        expect(rows.filter((line) => line.includes('""') || line.includes("exa_search") || line.includes("saved output"))).toEqual([]);
+      };
+
+      session = await TmuxSession.create({ cwd: workspace, width: 140, height: 35, stderrPath, env });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Search the protocol docs, fetch two pages, then search the saved results.");
+      await session.waitForPane((pane) => pane.includes(finalText) && turnSettled(pane), TIMEOUT);
+      expectRows(toolRows(await session.captureFullScrollback()), liveHeader);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // A resume shows the rows the live session showed, and a narrow
+      // terminal clips each one at its end on its own line.
+      for (const width of [140, 44]) {
+        const resumedStderr = join(root, `resumed-${width}-stderr.log`);
+        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, width, height: 35, stderrPath: resumedStderr, env });
+        await session.waitForComposer(TIMEOUT);
+        await session.waitForText(finalText, TIMEOUT);
+        expectRows(toolRows(await session.captureFullScrollback()), resumedHeader, width);
+        expect(readFileSync(resumedStderr, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      }
+    },
+    TIMEOUT * 4,
   );
 
   test(

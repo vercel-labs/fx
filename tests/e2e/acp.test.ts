@@ -7083,6 +7083,82 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
+  // The user hears that fx declined the form, on the path the client's capabilities pick, in fx's words alone.
+  for (const advertised of [true, false]) {
+    test(
+      `a form fx refuses is told to ${advertised ? "an editor that shows notices as a session notice" : "an editor with no notices as an operational message"}`,
+      async () => {
+        const sentinel = "S10_SECRET_SENTINEL_7f3c";
+        const declined = "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+        const root = createIsolatedRoot(`fx-acp-mcp-declined-${advertised ? "notice" : "message"}-`);
+        const pidPath = join(root.root, "mcp-declined.pid");
+        const gateway = startFakeGateway([
+          fakeGatewayToolCall("select_secret", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_secret", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "secret" } }),
+          finalText("Secret form declined"),
+        ]);
+        const directRequests: Array<Record<string, unknown>> = [];
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+          await client.request(
+            "initialize",
+            {
+              protocolVersion: 1,
+              clientCapabilities: { elicitation: { form: {} }, ...(advertised ? { session: { notices: {} } } : {}) },
+            },
+            1,
+          );
+          const created = await client.request(
+            "session/new",
+            {
+              cwd: root.workspace,
+              mcpServers: [acpStdioServer("unused", pidPath, "mrtr_secret_required", { FX_MCP_EXPECT_ELICITATION: "form" })],
+            },
+            2,
+          ) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId: "auto" }, 3);
+          client.setElicitationHandler((params) => {
+            directRequests.push(params);
+            return { action: "accept", content: {} };
+          });
+
+          const prompt = await runPrompt(client, "Call the MCP fixture that attempts a secret form.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          expect(directRequests).toHaveLength(0);
+          const updates = prompt.messages.map((message) => message.params?.update).filter(Boolean);
+          const notices = updates.filter((update) => update.sessionUpdate === "notice");
+          const texts = updates
+            .filter((update) => update.sessionUpdate === "agent_message_chunk")
+            .map((update) => update.content?.text ?? "");
+          if (advertised) {
+            // The session notice path: one notice, and nothing in the conversation.
+            expect(notices.map((notice) => notice.title)).toEqual([declined]);
+            expect(notices[0].severity).toBe("info");
+            expect(texts.join("")).not.toContain("fx declined it");
+          } else {
+            // The operational message path: no notice update, one message.
+            expect(notices).toEqual([]);
+            expect(texts.filter((text) => text.includes(declined))).toHaveLength(1);
+          }
+          // The form was still declined: the call did not go on.
+          expect(gateway.requests.map((request) => request.body).join("\n")).not.toContain("continued after elicitation");
+          // fx's reason only: no field, value or control byte of the server's form.
+          expect(JSON.stringify(prompt.messages)).not.toContain(sentinel);
+          expect(JSON.stringify(prompt.messages)).not.toContain("accessToken");
+          expect(client.stderr).not.toContain(sentinel);
+        } finally {
+          await client?.close();
+          if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      LIVE_TIMEOUT,
+    );
+  }
+
   test(
     `ACP URL consent completes only after modern MCP retry without prefetching`,
     async () => {

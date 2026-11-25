@@ -175,8 +175,75 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
     if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (err == error.GrokModelCatalogTooLarge) return .{ .category = .malformed_response };
+    if (isCutOffCatalogAnswer(err)) return .{ .category = .malformed_response, .retryable = true };
+    if (isBrokenCatalogAnswer(err)) return .{ .category = .malformed_response };
     return .{ .category = .transport, .retryable = true };
+}
+
+/// Errors from an answer that arrived but cannot be read, other than the std
+/// decoder errors that `isBrokenCatalogAnswer` finds. Repeating the request gets
+/// the same answer, so these are not retryable. `ReadFailed` is not here: the
+/// same name is returned for a read that failed before the answer's head.
+const broken_answer_errors = [_]anyerror{
+    error.GrokModelCatalogTooLarge,
+    error.HttpHeadersInvalid,
+    error.HttpHeadersOversize,
+    error.HttpContentEncodingUnsupported,
+    error.UnsupportedCompressionMethod,
+    error.HttpChunkInvalid,
+};
+
+/// The error sets of the std gzip, deflate, and zstd decoders.
+const decoder_error_sets = .{
+    std.compress.flate.Decompress.Error,
+    std.compress.zstd.Decompress.Error,
+};
+
+/// Whether a std decoder returns `err`. `ReadFailed` is excluded: a decoder
+/// reports a failed input read with it, and `decompressError` maps it to null.
+fn isDecoderError(err: anyerror) bool {
+    inline for (decoder_error_sets) |Set| {
+        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+            if (!std.mem.eql(u8, name, "ReadFailed") and err == @field(Set, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// An answer cut off before its end. A retry can get the whole answer.
+const cut_off_answer_errors = [_]anyerror{
+    error.HttpChunkTruncated,
+    error.EndOfStream,
+    error.HttpBodyCutOff,
+};
+
+/// fx's own zstd buffer sizes, not the answer, so these stay transport.
+const fx_buffer_errors = [_]anyerror{
+    error.OutputBufferUndersize,
+    error.InputBufferUndersize,
+};
+
+fn isCutOffCatalogAnswer(err: anyerror) bool {
+    for (cut_off_answer_errors) |cut_off| {
+        if (err == cut_off) return true;
+    }
+    return false;
+}
+
+fn isFxBufferError(err: anyerror) bool {
+    for (fx_buffer_errors) |buffer_error| {
+        if (err == buffer_error) return true;
+    }
+    return false;
+}
+
+fn isBrokenCatalogAnswer(err: anyerror) bool {
+    if (isCutOffCatalogAnswer(err) or isFxBufferError(err)) return false;
+    if (isDecoderError(err)) return true;
+    for (broken_answer_errors) |broken| {
+        if (err == broken) return true;
+    }
+    return false;
 }
 
 const FetchResponse = struct {
@@ -229,7 +296,7 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
-        const result = gateway_client.fetchOnOpenJob(.{
+        const result = gateway_client.fetchWholeBodyOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
@@ -668,6 +735,51 @@ test "Grok oversized catalog responses are terminal malformed data" {
     try std.testing.expect(!failure.retryable);
 }
 
+fn expectCatalogFetchFailure(err: anyerror, category: model_catalog.FailureCategory, retryable: bool) !void {
+    const failure = catalogFetchFailure(err);
+    try std.testing.expectEqual(category, failure.category);
+    try std.testing.expectEqual(retryable, failure.retryable);
+}
+
+test "Grok catalog fetch failures split unreadable answers from connection failures" {
+    inline for (decoder_error_sets) |Set| {
+        inline for (@typeInfo(Set).error_set.error_names.?) |name| {
+            const err = @field(Set, name);
+            if (!std.mem.eql(u8, name, "ReadFailed")) {
+                if (isFxBufferError(err)) {
+                    try expectCatalogFetchFailure(err, .transport, true);
+                } else {
+                    try expectCatalogFetchFailure(err, .malformed_response, isCutOffCatalogAnswer(err));
+                }
+            }
+        }
+    }
+    try expectCatalogFetchFailure(error.HttpChunkTruncated, .malformed_response, true);
+    try expectCatalogFetchFailure(error.EndOfStream, .malformed_response, true);
+    try expectCatalogFetchFailure(error.HttpBodyCutOff, .malformed_response, true);
+    const broken = [_]anyerror{
+        error.BadGzipHeader,
+        error.WrongGzipChecksum,
+        error.HttpChunkInvalid,
+        error.HttpHeadersInvalid,
+        error.GrokModelCatalogTooLarge,
+    };
+    for (broken) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
+    for (fx_buffer_errors) |err| try expectCatalogFetchFailure(err, .transport, true);
+    for (broken_answer_errors) |err| try expectCatalogFetchFailure(err, .malformed_response, false);
+
+    const refused = catalogFetchFailure(error.ConnectionRefused);
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, refused.category);
+    try std.testing.expect(refused.retryable);
+
+    const reset = catalogFetchFailure(error.ReadFailed);
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, reset.category);
+    try std.testing.expect(reset.retryable);
+
+    const cancelled = catalogFetchFailure(error.Cancelled);
+    try std.testing.expectEqual(model_catalog.FailureCategory.cancellation, cancelled.category);
+}
+
 test "Grok model ids enforce the exact provider-local bound" {
     const exact_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes, 0);
     defer std.testing.allocator.free(exact_json);
@@ -731,6 +843,12 @@ const CatalogBodyFixture = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
     body: []const u8,
+    /// When set, the server sends these bytes as the whole answer instead of
+    /// a 200 response with `body`.
+    raw_answer: ?[]const u8 = null,
+    /// When set, the server resets the connection after the answer instead of
+    /// closing it cleanly.
+    reset_on_close: bool = false,
     thread: ?std.Thread = null,
     server_open: bool = true,
     stopping: std.atomic.Value(bool) = .init(false),
@@ -792,12 +910,19 @@ const CatalogBodyFixture = struct {
 
         var writer_buffer: [16 * 1024]u8 = undefined;
         var writer = stream.writer(zio, &writer_buffer);
-        try writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{self.body.len},
-        );
-        try writer.interface.writeAll(self.body);
+        if (self.raw_answer) |answer| {
+            try writer.interface.writeAll(answer);
+        } else {
+            try writer.interface.print(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+                .{self.body.len},
+            );
+            try writer.interface.writeAll(self.body);
+        }
         try writer.interface.flush();
+        if (self.reset_on_close) {
+            try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&std.posix.linger{ .onoff = 1, .linger = 0 }));
+        }
     }
 };
 
@@ -988,6 +1113,124 @@ test "Grok catalog adapter rejects oversized subscription bodies but tolerates u
     modalities_fixture.deinit();
     if (valid_fixture.failure) |err| return err;
     if (modalities_fixture.failure) |err| return err;
+}
+
+const grok_subscription_test_access: credentials.CatalogAccess = .{ .authenticated = .{
+    .source = .grok_subscription,
+    .credential = "grok-token",
+    .team_context = null,
+    .account_id = "acct_grok",
+} };
+
+fn expectGrokModelListFailure(fixture: *CatalogBodyFixture, expected: model_catalog.FailureCategory, retryable: bool) !void {
+    const alloc = std.testing.allocator;
+    try fixture.start();
+    const models_url = try catalogFixtureUrl(alloc, fixture, "models");
+    defer alloc.free(models_url);
+    const environment = try CatalogEndpointEnvironment.install(alloc, models_url, "http://127.0.0.1:1/modalities");
+    defer environment.deinit();
+    const result = try model_catalog_provider.fetch(alloc, .{ .access = grok_subscription_test_access, .endpoint = "" });
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(expected, failure.category);
+            try std.testing.expectEqual(retryable, failure.retryable);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(alloc, &unexpected);
+            return error.TestExpectedCatalogFailure;
+        },
+    }
+}
+
+test "Grok model list cut off inside its Content-Length is malformed and retryable" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[{\"model\":\"grok-";
+    try expectGrokModelListFailure(&fixture, .malformed_response, true);
+}
+
+test "Grok model list cut off inside its Content-Length after a valid JSON prefix is malformed and retryable" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"data\":[]}";
+    try expectGrokModelListFailure(&fixture, .malformed_response, true);
+}
+
+test "Grok model list cut off inside a chunk is malformed" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n{\"data\":[";
+    try expectGrokModelListFailure(&fixture, .malformed_response, true);
+}
+
+test "Grok model list gzip cut off inside its data is malformed and retryable" {
+    const alloc = std.testing.allocator;
+    const plain = "{\"object\":\"list\",\"data\":[{\"id\":\"grok-4.20\"}]}";
+    var compressed_out = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
+    defer compressed_out.deinit();
+    var flate_scratch: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&compressed_out.writer, &flate_scratch, .gzip, .fastest);
+    try compressor.writer.writeAll(plain);
+    try compressor.finish();
+    const gzip_body = try compressed_out.toOwnedSlice();
+    defer alloc.free(gzip_body);
+    const cut = gzip_body[0 .. gzip_body.len / 2];
+    const answer = try alloc.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ cut.len, cut });
+    defer alloc.free(answer);
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = answer;
+    try expectGrokModelListFailure(&fixture, .malformed_response, true);
+}
+
+test "Grok model list with an overflowing chunk size is malformed" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nffffffffffffffffff\r\n{\"data\":[]}\r\n0\r\n\r\n";
+    try expectGrokModelListFailure(&fixture, .malformed_response, false);
+}
+
+test "Grok model list with gzip encoding that is not gzip is malformed" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}";
+    try expectGrokModelListFailure(&fixture, .malformed_response, false);
+}
+
+test "Grok model list with an empty 200 answer is malformed and not retryable" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    try expectGrokModelListFailure(&fixture, .malformed_response, false);
+}
+
+test "Grok model list reset inside a chunk is a retryable transport failure" {
+    var fixture = try CatalogBodyFixture.init("");
+    defer fixture.deinit();
+    fixture.raw_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n{\"data\":[";
+    fixture.reset_on_close = true;
+    try expectGrokModelListFailure(&fixture, .transport, true);
+}
+
+test "Grok model list refused before it connects is a retryable transport failure" {
+    const alloc = std.testing.allocator;
+    const environment = try CatalogEndpointEnvironment.install(alloc, "http://127.0.0.1:1/models", "http://127.0.0.1:1/modalities");
+    defer environment.deinit();
+    const result = try model_catalog_provider.fetch(alloc, .{ .access = grok_subscription_test_access, .endpoint = "" });
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(model_catalog.FailureCategory.transport, failure.category);
+            try std.testing.expect(failure.retryable);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(alloc, &unexpected);
+            return error.TestExpectedTransportFailure;
+        },
+    }
 }
 
 test "a Grok catalog fetch ends at its deadline during a lookup that hangs" {

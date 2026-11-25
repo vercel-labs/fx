@@ -2454,6 +2454,14 @@ const BlockSequenceState = struct {
         return 1 -| @intFromBool(self.previous_ends_with_newline);
     }
 
+    /// The newlines that continue the previous block's text: the newlines its
+    /// text ended with, which the block drops, so the blank rows they make stay
+    /// as they will when the next text commits into the same block.
+    fn continuedTextNewlineCountBefore(self: BlockSequenceState) usize {
+        if (!self.emitted_any) return 0;
+        return @max(1, self.final_tail_newlines) -| @intFromBool(self.previous_ends_with_newline);
+    }
+
     fn observe(
         self: *BlockSequenceState,
         kind: TranscriptBlockKind,
@@ -2703,8 +2711,9 @@ const RenderEntriesBuilder = struct {
         try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
     }
 
-    /// Starts an assistant text block on the row under the previous one, as
-    /// the text of one turn continues in the same block.
+    /// Starts an assistant text block where the previous block's text would
+    /// continue, after the blank rows that text ended with, as the text of one
+    /// turn continues in the same block.
     fn appendContinuedBlock(
         self: *RenderEntriesBuilder,
         alloc: Allocator,
@@ -2714,9 +2723,12 @@ const RenderEntriesBuilder = struct {
         block_provenance: []const LineProvenance,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
-        const newlines = self.sequence.attachedNewlineCountBefore();
+        const newlines = self.sequence.continuedTextNewlineCountBefore();
         try self.out.appendNTimes(alloc, '\n', newlines);
         self.line_index += newlines;
+        if (options.line_provenance) |lines| {
+            try lines.appendNTimes(alloc, .block_separator, newlines -| 1);
+        }
         try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
     }
 

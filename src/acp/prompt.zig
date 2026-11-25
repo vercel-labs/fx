@@ -1030,6 +1030,7 @@ const AcpElicitationResponderContext = struct {
             .capabilities = capabilities,
             .callback = respondToAcpMcpInput,
             .continuation_terminal = finishAcpUrlElicitations,
+            .declined_notice = tellAcpMcpDeclined,
         };
     }
 };
@@ -3867,6 +3868,15 @@ const AcpInputResponse = struct {
         self.* = undefined;
     }
 };
+
+/// A question fx declined, said by the two paths `pushContextNotice` chooses between: an ACP v1 notice for a client that
+/// advertised them, else an operational message. A repeat is not dropped, so each refused call is told.
+fn tellAcpMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
+    const ctx = responder.acp;
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+    pushSystemNotice(@ptrCast(ctx), text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+}
 
 fn respondToAcpMcpInput(
     raw_ctx: *anyopaque,

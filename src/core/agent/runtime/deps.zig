@@ -383,6 +383,10 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
+    /// A request that waited for a sign-in found the login another fx
+    /// process stored, and sends again with no answer from the host. The TUI
+    /// marks the turn as working for Herdr. Null: nothing marks it.
+    stored_sign_in_resumed: ?*const fn (ctx: *anyopaque) void = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// The failure that keeps the model catalog down, so capability drops are
