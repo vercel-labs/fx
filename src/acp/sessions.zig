@@ -624,6 +624,8 @@ fn writeNewSessionResponse(
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    // The opener's list of clients follows its answer.
+    server.releaseOpenerListHold(state, session);
 
     try sendAvailableCommands(state, alloc, session_id, "[]");
 }
@@ -861,7 +863,8 @@ fn joinSession(
     try server.reserveMemberLocked(session, state.host.alloc);
     try state.memberships.ensureUnusedCapacity(state.alloc, 1);
     const joiner = try server.newMember(state.host.alloc, state);
-    errdefer joiner.destroy();
+    var listed = false;
+    errdefer if (!listed) joiner.destroy();
     if (kind.replaysHistory()) {
         var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
         defer sources.deinit(alloc);
@@ -872,12 +875,21 @@ fn joinSession(
     }
     try server.offerOpenPermissionQuestion(session, joiner, alloc);
     errdefer server.dropOpenPermissionCopies(session, joiner.connection_id);
-    try state.writer.writeResponse(alloc, msg.id, answer);
     if (!server.listMemberLocked(session, joiner)) {
+        // A connection that is already listed gets its answer and no second membership.
         server.dropOpenPermissionCopies(session, joiner.connection_id);
+        try state.writer.writeResponse(alloc, msg.id, answer);
         joiner.destroy();
         return;
     }
+    listed = true;
+    errdefer {
+        _ = server.removeMemberLocked(session, joiner.connection_id);
+        server.flushClientsListLocked(session);
+    }
+    // The joiner is listed before its answer, so the list that names it goes out first.
+    server.flushClientsListLocked(session);
+    try state.writer.writeResponse(alloc, msg.id, answer);
     server.addMembershipLocked(state, session, joiner);
 }
 
@@ -1397,6 +1409,8 @@ fn writeLoadSessionResponse(
     setObserverHooks(session, observer_hooks);
     const answer = try buildSessionAnswer(state, alloc, session, null);
     defer alloc.free(answer);
+    // A session this request opens lists its opener before the answer.
+    server.releaseOpenerListHold(state, session);
     try state.writer.writeResponse(alloc, msg.id, answer);
 }
 
@@ -2336,6 +2350,7 @@ fn sendSteeringHistoryChunk(state: *server.Member, alloc: Allocator, session_id:
         null,
         null,
         state.sendsSteerInput(),
+        null,
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
@@ -3300,8 +3315,8 @@ fn testReplaySession(state: *server.ServerState, session: *server.ActiveSessionS
 }
 
 fn releaseTestReplaySession(state: *server.ServerState, session: *server.ActiveSessionState) void {
-    server.freeMembers(session, state.host.alloc);
     server.dropMembershipForTest(state, session);
+    server.freeMembers(session, state.host.alloc);
 }
 
 fn sendTestHistoryTurn(state: *server.ServerState, alloc: Allocator, session_id: []const u8, turn: types.HistoryTurn) !void {
@@ -4205,6 +4220,37 @@ test "a second connection of the process follows a loaded session: the saved tur
     try expectOccurrences(owner_frames.bytes.items, "thought before join", 1);
     const live_at = std.mem.find(u8, joiner_frames.bytes.items, "after join") orelse return error.TestExpectedEqual;
     try std.testing.expect(live_at > answer_at);
+}
+
+test "a joiner's first clients list names both clients, comes before its load answer, and marks the owner main" {
+    const alloc = std.testing.allocator;
+    var test_host = server.testHost(alloc);
+    defer test_host.deinit();
+    var owner_frames = JoinFrames{ .alloc = alloc };
+    defer owner_frames.deinit();
+    var joiner_frames = JoinFrames{ .alloc = alloc };
+    defer joiner_frames.deinit();
+    var owner = try joinTestState(alloc, &test_host, &owner_frames, "/tmp/workspace");
+    owner.connection_id = 1;
+    owner.extensions = .initMany(&.{.session_clients});
+    defer owner.deinit();
+    _ = try openJoinSession(&owner);
+
+    var joiner = try joinTestState(alloc, &test_host, &joiner_frames, "/tmp/elsewhere");
+    joiner.connection_id = 2;
+    joiner.extensions = .initMany(&.{.session_clients});
+    defer joiner.deinit();
+    var load_msg = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/load",
+        .params_raw = "{\"sessionId\":\"session_joined\",\"cwd\":\"/elsewhere\",\"mcpServers\":[]}",
+    };
+    try handleLoadSession(&joiner, alloc, &load_msg);
+
+    const list_at = std.mem.find(u8, joiner_frames.bytes.items, "_sh.fx/session/clients_update") orelse return error.TestExpectedEqual;
+    const answer_at = std.mem.find(u8, joiner_frames.bytes.items, "\"sh.fx/cwd\"") orelse return error.TestExpectedEqual;
+    try std.testing.expect(list_at < answer_at);
+    try std.testing.expect(std.mem.find(u8, joiner_frames.bytes.items, "\"clients\":[{\"clientId\":\"c1\",\"main\":true},{\"clientId\":\"c2\",\"main\":false}]") != null);
 }
 
 test "a resume joins a session another connection has open, with no replay" {

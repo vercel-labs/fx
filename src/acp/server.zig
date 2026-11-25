@@ -8,6 +8,7 @@ const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const client_info = @import("client_info.zig");
 const sessions = @import("sessions.zig");
 const leader_mod = @import("leader.zig");
 const prompt_handler = @import("prompt.zig");
@@ -321,6 +322,11 @@ pub const Member = struct {
     extensions: sh_fx.Set,
     host_tools: host_tool_runtime.Runtime,
     terminal_client: terminal_client_runtime.Runtime,
+    /// The client's `clientInfo`, copied from the connection when the client joined.
+    client_info: ?client_info.Info = null,
+    /// Set on the opener of a session until its answer is written, so its list of clients
+    /// goes out after the answer. Under `audience_mutex`.
+    list_held: bool = false,
     /// The connection default credential, copied when the client joined. A turn that changes it
     /// changes this copy, never the connection's.
     gateway_source_preference: ?types.CredentialSource = null,
@@ -360,6 +366,7 @@ pub const Member = struct {
     pub fn destroy(self: *Member) void {
         self.host_tools.deinit();
         self.terminal_client.deinit();
+        if (self.client_info) |*info| info.deinit();
         for (self.pending_legacy_urls.items) |*pending| pending.deinit(self.alloc);
         self.pending_legacy_urls.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -373,6 +380,9 @@ pub const ActiveSessionState = struct {
     /// The record of the last member that left. It keeps the list's reference while the session
     /// has no member, so a kept turn can still read the main client. Null while `members` is not empty.
     last_main: ?*Member = null,
+    /// Set when `members` changes and the list of clients is not sent yet. Each audience
+    /// unlock sends the list when it is set. Under `audience_mutex`.
+    list_dirty: bool = false,
     /// How many connection memberships list this session. Under `audience_mutex`.
     holders: usize = 0,
     /// Set when the session closes. A closed session is freed by its last holder. Under `audience_mutex`.
@@ -622,6 +632,8 @@ pub const ServerState = struct {
     /// The client takes ACP v1's compaction updates (`session.compaction`).
     client_compaction: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
+    /// The client's `clientInfo` from `initialize`, copied into each member the connection joins.
+    client_info: ?client_info.Info = null,
     /// The directory `fx acp` was launched in, or `--workspace`'s: the
     /// workspace of the libfx kernel's and the web core's one session, and
     /// where a native session's workspace starts before its `cwd`.
@@ -713,6 +725,7 @@ pub const ServerState = struct {
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
         self.host_tools.deinit();
+        if (self.client_info) |*info| info.deinit();
         self.configured_providers.deinit(self.alloc);
     }
 };
@@ -1308,10 +1321,86 @@ pub const Audience = struct {
         }
     }
 
+    /// Sends the list of clients when a membership change is pending, then releases the audience.
     pub fn unlock(self: *Audience) void {
+        flushClientsListLocked(self.session);
         self.session.audience_mutex.unlock(io_mod.getIo());
     }
 };
+
+/// Sends the list of clients to each member that lists `sh.fx/sessionClients`, while a membership
+/// change is pending. A member whose write fails is dropped, and the list goes out again without
+/// it. With no member left, nothing is sent. The caller holds `audience_mutex`.
+pub fn flushClientsListLocked(session: *ActiveSessionState) void {
+    var audience = Audience{ .session = session };
+    while (session.list_dirty) {
+        session.list_dirty = false;
+        const listing = Audience{ .session = session };
+        if (!listing.anyLists(.session_clients)) return;
+        const alloc = session.members.items[0].host.alloc;
+        const params = buildClientsUpdate(session, alloc) catch |err| {
+            debug_trace.logf("acp", "event=clients_update_not_built session={s} err={s}", .{ session.session_id, @errorName(err) });
+            return;
+        };
+        defer alloc.free(params);
+        audience.next_member = 0;
+        while (audience.next()) |member| {
+            if (!member.extensions.contains(.session_clients) or member.list_held) continue;
+            sendClientsUpdate(&audience, member, alloc, params);
+        }
+    }
+}
+
+/// Writes one list to `member`. A failed write drops the member. The main client's failure
+/// makes the oldest remaining member the main, as `Audience.writeNotification` does, but this
+/// list is not re-sent through that path: the pending flag sends it again to the listing members.
+fn sendClientsUpdate(audience: *Audience, member: *Member, alloc: Allocator, params: []const u8) void {
+    const method = sh_fx.method.session_clients_update;
+    const is_main = member == audience.session.members.items[0];
+    member.writer.writeNotification(alloc, method, params) catch |err| {
+        if (is_main) {
+            _ = removeMemberLocked(audience.session, member.connection_id);
+            audience.next_member -= 1;
+            debug_trace.logf("acp", "event=clients_update_main_dropped session={s} err={s}", .{ audience.session.session_id, @errorName(err) });
+        } else {
+            audience.dropMember(member, method, .{ .write_failed = err });
+        }
+        return;
+    };
+    if (!is_main and Audience.memberStopped(member)) audience.dropMember(member, method, .client_gone);
+}
+
+/// The params of `_sh.fx/session/clients_update`: every member of `session` in join order, the
+/// first one as `main`. The caller frees the bytes.
+fn buildClientsUpdate(session: *ActiveSessionState, alloc: Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try jsonrpc.writeJsonStr(session.session_id, &out.writer);
+    try out.writer.writeAll(",\"clients\":[");
+    for (session.members.items, 0..) |member, index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.print("{{\"clientId\":\"c{d}\"", .{connection.clientNumber(member.connection_id)});
+        if (member.client_info) |info| try out.writer.print(",\"clientInfo\":{s}", .{info.json});
+        try out.writer.print(",\"main\":{s}}}", .{if (index == 0) "true" else "false"});
+    }
+    try out.writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+/// Ends the hold on the opener's list of clients, which waits for the opener's answer, and sends
+/// the list. Call it right after the answer of `session/new`, and before the answer of a load.
+/// The caller holds no audience.
+pub fn releaseOpenerListHold(state: *ServerState, session: *ActiveSessionState) void {
+    var audience = lockAudience(session);
+    if (findMemberLocked(session, state.connection_id)) |member| {
+        if (member.list_held) {
+            member.list_held = false;
+            session.list_dirty = true;
+        }
+    }
+    audience.unlock();
+}
 
 /// Takes a session's audience. The caller sends through `next`, then `unlock`.
 pub fn lockAudience(session: *ActiveSessionState) Audience {
@@ -1337,8 +1426,12 @@ pub const RunningCopy = struct {
         extension: sh_fx.Extension,
         /// A member takes `with` when its client shows ACP notices.
         notices,
-        /// A member takes `with` when `ServerState.sendsSteerInput` holds.
-        steer_input,
+        /// A prompt chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
+        /// `listed`, and it is not `sender`, the connection that sent the prompt.
+        prompt_chunk: struct { listed: bool, sender: ?ConnectionId },
+        /// A steer chunk: a member takes `with` when its listing of `sh.fx/sessionClients` is
+        /// `listed`, and its `sh.fx/steerInput` is `steer_input`.
+        steer_chunk: struct { listed: bool, steer_input: bool },
         /// A member takes `with` unless it is `sender`, the connection that sent the
         /// prompt, which sees its own prompt in its own client.
         except_sender: ConnectionId,
@@ -1352,6 +1445,9 @@ pub const RunningCopy = struct {
         with: []u8,
         /// The params the other members take; null when they take nothing.
         without: ?[]u8,
+        /// A user chunk kept as its inputs, in place of `with` and `without`. Replay builds the
+        /// version each joiner's client takes. Null for every other entry.
+        chunk: ?UserChunk = null,
     };
 
     /// Why the copy is freed. The save that commits the turn frees it, since the
@@ -1417,6 +1513,20 @@ pub const RunningCopy = struct {
         self.dropped += 1;
     }
 
+    /// Keeps one user chunk as its inputs, with its own copies. Past the limit, or when an allocation
+    /// fails, the chunk is dropped and logged, as `add` does.
+    fn addChunk(self: *RunningCopy, alloc: Allocator, chunk: UserChunk) void {
+        // Only a joined connection replays the copy, and one exists only where `follow_supported` holds.
+        if (comptime !follow_supported) return;
+        const size = chunk.size();
+        if (self.dropped > 0 or self.bytes + size > limit_bytes) return self.drop("session/update", "limit");
+        const kept = dupeUserChunk(alloc, chunk) catch return self.drop("session/update", "out_of_memory");
+        self.entries.append(alloc, .{ .method = "session/update", .need = .none, .with = &.{}, .without = null, .chunk = kept }) catch {
+            freeUserChunk(alloc, kept);
+            return self.drop("session/update", "out_of_memory");
+        };
+        self.bytes += size;
+    }
     /// Keeps `params` as the turn's latest progress, in place of an earlier one.
     fn setProgress(self: *RunningCopy, alloc: Allocator, params: []const u8) void {
         // Only a joined connection replays the progress; see `follow_supported`.
@@ -1447,6 +1557,10 @@ pub const RunningCopy = struct {
             );
         }
         for (self.entries.items) |entry| {
+            if (entry.chunk) |chunk| {
+                freeUserChunk(alloc, chunk);
+                continue;
+            }
             alloc.free(entry.with);
             if (entry.without) |bytes| alloc.free(bytes);
         }
@@ -1459,13 +1573,144 @@ pub const RunningCopy = struct {
     }
 };
 
+/// A user chunk that fx sends to the other clients: a prompt's text or image, or a steer.
+pub const UserChunk = struct {
+    /// The connection that sent the prompt or the steer. A listing client gets it as `sh.fx/client`.
+    /// Null for a host's steer.
+    sender: ?ConnectionId,
+    message_id: []const u8,
+    content: Content,
+
+    pub const Content = union(enum) {
+        text: []const u8,
+        image: struct { media_type: []const u8, bytes: []const u8 },
+        steer: struct { text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8 },
+    };
+
+    /// The bytes the chunk holds, which the running copy counts against its limit.
+    pub fn size(self: UserChunk) usize {
+        return self.message_id.len + switch (self.content) {
+            .text => |text| text.len,
+            .image => |image| image.media_type.len + image.bytes.len,
+            .steer => |steer| steer.text.len + (if (steer.input_id) |id| id.len else 0),
+        };
+    }
+};
+
+/// Copies `chunk` into memory that the running copy owns. Free it with `freeUserChunk`.
+fn dupeUserChunk(alloc: Allocator, chunk: UserChunk) !UserChunk {
+    var owned = UserChunk{ .sender = chunk.sender, .message_id = &.{}, .content = .{ .text = &.{} } };
+    errdefer freeUserChunk(alloc, owned);
+    owned.message_id = try alloc.dupe(u8, chunk.message_id);
+    switch (chunk.content) {
+        .text => |text| owned.content = .{ .text = try alloc.dupe(u8, text) },
+        .image => |image| {
+            owned.content = .{ .image = .{ .media_type = &.{}, .bytes = &.{} } };
+            owned.content.image.media_type = try alloc.dupe(u8, image.media_type);
+            owned.content.image.bytes = try alloc.dupe(u8, image.bytes);
+        },
+        .steer => |steer| {
+            owned.content = .{ .steer = .{ .text = &.{}, .request_id = null, .input_id = null } };
+            owned.content.steer.text = try alloc.dupe(u8, steer.text);
+            owned.content.steer.request_id = if (steer.request_id) |id| try jsonrpc.dupeRequestId(alloc, id) else null;
+            owned.content.steer.input_id = if (steer.input_id) |id| try alloc.dupe(u8, id) else null;
+        },
+    }
+    return owned;
+}
+
+/// Frees a chunk that `dupeUserChunk` made.
+fn freeUserChunk(alloc: Allocator, chunk: UserChunk) void {
+    alloc.free(chunk.message_id);
+    switch (chunk.content) {
+        .text => |text| alloc.free(text),
+        .image => |image| {
+            alloc.free(image.media_type);
+            alloc.free(image.bytes);
+        },
+        .steer => |steer| {
+            alloc.free(steer.text);
+            if (steer.request_id) |id| jsonrpc.freeRequestId(alloc, id);
+            if (steer.input_id) |id| alloc.free(id);
+        },
+    }
+}
+
+/// Whether a prompt from `sender` is not echoed to `member`: the sender sees its own prompt in its own client.
+fn takesPromptFrom(member: *const Member, sender: ?ConnectionId) bool {
+    const id = sender orelse return true;
+    return !connection.sameConnection(member.connection_id, id);
+}
+
+/// Whether `member` takes `chunk` at all. A steer goes to every member; a prompt is not echoed to its sender.
+fn takesUserChunk(member: *const Member, chunk: UserChunk) bool {
+    if (std.meta.activeTag(chunk.content) == .steer) return true;
+    return takesPromptFrom(member, chunk.sender);
+}
+
+/// The `session/update` params of `chunk` for a member that lists `sh.fx/sessionClients` as `listed`
+/// and takes `sh.fx/steerInput` as `steer_input`. `sh.fx/client` names the sender when `listed`.
+/// The caller frees the bytes.
+fn userChunkParams(alloc: Allocator, session_id: []const u8, chunk: UserChunk, listed: bool, steer_input: bool) ![]u8 {
+    const client: ?u64 = if (listed) if (chunk.sender) |sender| connection.clientNumber(sender) else null else null;
+    var update: std.Io.Writer.Allocating = .init(alloc);
+    defer update.deinit();
+    switch (chunk.content) {
+        .text => |text| try acp_types.writeUserMessageChunkFrom(&update.writer, chunk.message_id, text, client),
+        .image => |image| try acp_types.writeUserImageChunkFrom(&update.writer, chunk.message_id, image.media_type, image.bytes, client),
+        .steer => |steer| try acp_types.writeSteeringUserMessageChunk(&update.writer, chunk.message_id, steer.text, steer.request_id, steer.input_id, steer_input, client),
+    }
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    try acp_types.writeSessionUpdate(&params.writer, session_id, update.writer.buffered());
+    return params.toOwnedSlice();
+}
+
+/// Whether some member of `session` is a receiver of `chunk` of the given kind.
+fn hasUserChunkReceiver(session: *ActiveSessionState, chunk: UserChunk, listed: bool, steer_input: bool) bool {
+    for (session.members.items) |member| {
+        if (member.extensions.contains(.session_clients) != listed) continue;
+        if (std.meta.activeTag(chunk.content) == .steer and member.sendsSteerInput() != steer_input) continue;
+        if (takesUserChunk(member, chunk)) return true;
+    }
+    return false;
+}
+
+/// Sends one user chunk to the members that take it, and keeps its inputs in the running copy, so a
+/// joiner's replay builds the version its client takes. A version is built only for each kind of
+/// receiver that is present: listing or not, and for a steer, with or without `sh.fx/steerInput`.
+/// Returns how many versions it built. The caller holds the audience.
+pub fn deliverUserChunk(audience: *Audience, alloc: Allocator, session_id: []const u8, chunk: UserChunk) !usize {
+    var built: usize = 0;
+    for ([_]bool{ true, false }) |listed| {
+        for ([_]bool{ true, false }) |steer_input| {
+            if (std.meta.activeTag(chunk.content) != .steer and steer_input) continue;
+            if (!hasUserChunkReceiver(audience.session, chunk, listed, steer_input)) continue;
+            const params = try userChunkParams(alloc, session_id, chunk, listed, steer_input);
+            defer alloc.free(params);
+            const need: RunningCopy.Need = if (std.meta.activeTag(chunk.content) == .steer)
+                .{ .steer_chunk = .{ .listed = listed, .steer_input = steer_input } }
+            else
+                .{ .prompt_chunk = .{ .listed = listed, .sender = chunk.sender } };
+            // Each kind walks the members from the first one, so a later kind reaches them all.
+            audience.next_member = 0;
+            try audience.writeEach(alloc, "session/update", need, params, null);
+            built += 1;
+        }
+    }
+    audience.session.running_copy.addChunk(mainLocked(audience.session).?.alloc, chunk);
+    return built;
+}
+
 /// Whether `member` takes the `with` params of an entry that needs `need`.
 fn memberTakes(member: *const Member, need: RunningCopy.Need) bool {
     return switch (need) {
         .none => true,
         .extension => |extension| member.extensions.contains(extension),
         .notices => member.client_notices,
-        .steer_input => member.sendsSteerInput(),
+        .prompt_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and takesPromptFrom(member, chunk.sender),
+        .steer_chunk => |chunk| member.extensions.contains(.session_clients) == chunk.listed and
+            member.sendsSteerInput() == chunk.steer_input,
         .except_sender => |sender| !connection.sameConnection(member.connection_id, sender),
     };
 }
@@ -1484,25 +1729,6 @@ pub fn releaseRunningCopy(session: *ActiveSessionState, reason: RunningCopy.Reas
 
 /// The params of a steering chunk, with `sh.fx/steerInput` when `steer_input`
 /// holds. The caller frees them.
-pub fn steerChunkParams(
-    alloc: Allocator,
-    session_id: []const u8,
-    message_id: []const u8,
-    text: []const u8,
-    request_id: ?jsonrpc.RequestId,
-    input_id: ?[]const u8,
-    steer_input: bool,
-) ![]u8 {
-    var update: std.Io.Writer.Allocating = .init(alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try jsonrpc.writeJsonStr(session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id, steer_input);
-    try update.writer.writeByte('}');
-    return try update.toOwnedSlice();
-}
-
 /// The member record this connection holds in `session`. A session the connection has open always
 /// has its membership, and only the connection's reader thread changes the membership list, so no lock is needed.
 fn ownMember(state: *ServerState, session: *ActiveSessionState) *Member {
@@ -1616,6 +1842,7 @@ pub fn openSession(state: *ServerState, value: ActiveSessionState, binding: ?*wo
     session.account_id = null;
     session.gateway_team = null;
     try copyDefaultCredential(state, session);
+    opener.list_held = true;
     _ = listMemberLocked(session, opener);
     addMembershipLocked(state, session, opener);
     // Without `follow_supported` no other connection can follow the session.
@@ -1731,6 +1958,13 @@ pub fn replayRunningCopy(member: *Member, alloc: Allocator, session: *ActiveSess
     if (comptime !follow_supported) return;
     const copy = &session.running_copy;
     for (copy.entries.items) |entry| {
+        if (entry.chunk) |chunk| {
+            if (!takesUserChunk(member, chunk)) continue;
+            const params = try userChunkParams(alloc, session.session_id, chunk, member.extensions.contains(.session_clients), member.sendsSteerInput());
+            defer alloc.free(params);
+            try member.writer.writeNotification(alloc, entry.method, params);
+            continue;
+        }
         const params = (if (memberTakes(member, entry.need)) entry.with else entry.without) orelse continue;
         try member.writer.writeNotification(alloc, entry.method, params);
     }
@@ -1760,10 +1994,7 @@ pub fn announcePromptTurn(
     var audience = lockAudience(session);
     defer audience.unlock();
     if (text.len > 0) {
-        var update: std.Io.Writer.Allocating = .init(alloc);
-        defer update.deinit();
-        try acp_types.writeUserMessageChunk(&update.writer, message_id, text);
-        try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+        _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .text = text } });
     }
     for (images) |attachment| {
         var snapshot = image_attachments.loadVerifiedSnapshot(alloc, attachment, .{}) catch |err| {
@@ -1771,33 +2002,15 @@ pub fn announcePromptTurn(
             debug_trace.logf("acp", "prompt image unavailable id={d} err={s}", .{ attachment.id, @errorName(err) });
             var unavailable: [96]u8 = undefined;
             const notice = try std.mem.print(&unavailable, "Image #{d} unavailable", .{attachment.id});
-            var update: std.Io.Writer.Allocating = .init(alloc);
-            defer update.deinit();
-            try acp_types.writeUserMessageChunk(&update.writer, message_id, notice);
-            try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+            _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .text = notice } });
             continue;
         };
         defer snapshot.deinit(alloc);
-        var update: std.Io.Writer.Allocating = .init(alloc);
-        defer update.deinit();
-        try acp_types.writeUserImageChunk(&update.writer, message_id, snapshot.media_type, snapshot.bytes);
-        try deliverPromptUpdate(&audience, alloc, sender, session.session_id, update.writer.buffered());
+        _ = try deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = sender, .message_id = message_id, .content = .{ .image = .{
+            .media_type = snapshot.media_type,
+            .bytes = snapshot.bytes,
+        } } });
     }
-}
-
-/// Sends one `session/update` built from `update` to every member but `sender`, and
-/// records it in the running copy. The caller holds the audience.
-fn deliverPromptUpdate(
-    audience: *Audience,
-    alloc: Allocator,
-    sender: ConnectionId,
-    session_id: []const u8,
-    update: []const u8,
-) !void {
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    try acp_types.writeSessionUpdate(&params.writer, session_id, update);
-    try audience.deliver(alloc, "session/update", .{ .except_sender = sender }, params.writer.buffered(), null);
 }
 
 /// Writes the partial-copy notice to `member`: an ACP notice when its client
@@ -1837,6 +2050,7 @@ pub fn newMember(alloc: Allocator, state: *ServerState) !*Member {
         .client_elicitation = state.client_elicitation,
         .extensions = state.extensions,
         .host_tools = state.host_tools,
+        .client_info = if (state.client_info) |info| try info.dupe(alloc) else null,
         .terminal_client = state.terminal_client,
         .credential_source = state.credential_source,
         .gateway_source_preference = state.gateway_source_preference,
@@ -1847,8 +2061,8 @@ pub fn newMember(alloc: Allocator, state: *ServerState) !*Member {
     return member;
 }
 
-/// Makes room for one more member of `session`. Call it before the answer that lists the member
-/// goes out, so listing after it cannot fail.
+/// Makes room for one more member of `session`. Call it before the member is listed, so that
+/// listing it cannot fail.
 pub fn reserveMemberLocked(session: *ActiveSessionState, alloc: Allocator) Allocator.Error!void {
     try session.members.ensureUnusedCapacity(alloc, 1);
 }
@@ -1865,6 +2079,7 @@ pub fn listMemberLocked(session: *ActiveSessionState, member: *Member) bool {
         last.drop();
     }
     session.members.appendAssumeCapacity(member);
+    session.list_dirty = true;
     return true;
 }
 
@@ -1921,13 +2136,13 @@ pub fn dropMembershipForTest(state: *ServerState, session: *ActiveSessionState) 
 /// Frees a test session's member list and each membership a test made for it, and the list
 /// itself once no membership is left. A test defers it right after it attaches the session.
 pub fn releaseTestSession(state: *ServerState, session: *ActiveSessionState) void {
-    freeMembers(session, state.host.alloc);
     var index = state.memberships.items.len;
     while (index > 0) {
         index -= 1;
         if (state.memberships.items[index].session != session) continue;
         removeMembershipAt(state, index);
     }
+    freeMembers(session, state.host.alloc);
     if (state.memberships.items.len == 0) {
         state.memberships.deinit(state.alloc);
         state.memberships = .empty;
@@ -1948,6 +2163,7 @@ pub fn removeMemberLocked(session: *ActiveSessionState, connection_id: Connectio
     for (session.members.items, 0..) |listed, index| {
         if (listed.connection_id != connection_id) continue;
         _ = session.members.orderedRemove(index);
+        session.list_dirty = true;
         markMemberGone(listed);
         releaseLeftLocked(session, listed);
         break;
@@ -5301,35 +5517,13 @@ fn publishStartingSteers(session: *ActiveSessionState, alloc: Allocator, steers:
     for (steers) |steer| {
         var message_id_storage: acp_types.MessageIdBuffer = undefined;
         const message_id = acp_types.generateMessageId(&message_id_storage);
-        // Without `follow_supported` no follower takes the other version, so only the owner's is built.
-        if (comptime !follow_supported) {
-            const main_record = holdMain(session);
-            defer main_record.drop();
-            const params = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, main_record.sendsSteerInput()) catch {
-                debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
-                continue;
-            };
-            defer alloc.free(params);
-            var audience = lockAudience(session);
-            defer audience.unlock();
-            audience.deliver(alloc, "session/update", .none, params, null) catch |err|
-                debug_trace.logf("acp", "failed to send the update for a steer that starts a turn err={s}", .{@errorName(err)});
-            continue;
-        }
-        // Both versions are built, so a joiner takes the one its prompt delivery asks for.
-        const with = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, true) catch {
-            debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
-            continue;
-        };
-        defer alloc.free(with);
-        const without = steerChunkParams(alloc, session.session_id, message_id, steer.text, steer.request_id, null, false) catch {
-            debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
-            continue;
-        };
-        defer alloc.free(without);
         var audience = lockAudience(session);
         defer audience.unlock();
-        audience.deliver(alloc, "session/update", .steer_input, with, without) catch |err|
+        _ = deliverUserChunk(&audience, alloc, session.session_id, .{ .sender = steer.from, .message_id = message_id, .content = .{ .steer = .{
+            .text = steer.text,
+            .request_id = steer.request_id,
+            .input_id = null,
+        } } }) catch |err|
             debug_trace.logf("acp", "failed to send the update for a steer that starts a turn err={s}", .{@errorName(err)});
     }
 }
@@ -5665,9 +5859,12 @@ const InitializeRequest = struct {
     host_tools: host_tool_runtime.Runtime = .{},
     /// The extensions the client lists in `clientCapabilities._meta`.
     client_extensions: sh_fx.Set = .empty,
+    /// The client's `clientInfo`, or null when it sent none.
+    client_info: ?client_info.Info = null,
 
     fn deinit(self: *InitializeRequest) void {
         self.host_tools.deinit();
+        if (self.client_info) |*info| info.deinit();
         self.* = .{};
     }
 };
@@ -5692,6 +5889,8 @@ fn parseInitializeRequest(
     var request = InitializeRequest{
         .terminal_ui = acp_types.metaBool(parsed.value.object, "sh.fx/terminalUi") orelse true,
     };
+    errdefer request.deinit();
+    request.client_info = try client_info.fromValue(alloc, parsed.value.object.get("clientInfo"));
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
     if (capabilities != .object) return request;
@@ -5729,6 +5928,28 @@ fn parseInitializeRequest(
         );
     };
     return request;
+}
+
+test "ACP initialize gives a client id only to a client that lists sh.fx/sessionClients" {
+    const id = connection.newConnectionId();
+    try std.testing.expectEqual(@as(?u64, null), answerClientId(.empty, id));
+    try std.testing.expectEqual(@as(?u64, null), answerClientId(.initMany(&.{.hooks}), id));
+    try std.testing.expectEqual(@as(?u64, connection.clientNumber(id)), answerClientId(.initMany(&.{.session_clients}), id));
+}
+
+test "ACP initialize keeps the clientInfo the client sent, and keeps nothing when it sent none" {
+    const alloc = std.testing.allocator;
+    var sent = try parseInitializeRequest(
+        alloc,
+        "{\"protocolVersion\":1,\"clientInfo\":{\"name\":\"zed\",\"version\":\"0.190.0\"}}",
+        false,
+    );
+    defer sent.deinit();
+    try std.testing.expectEqualStrings("{\"name\":\"zed\",\"version\":\"0.190.0\"}", sent.client_info.?.json);
+
+    var missing = try parseInitializeRequest(alloc, "{\"protocolVersion\":1}", false);
+    defer missing.deinit();
+    try std.testing.expect(missing.client_info == null);
 }
 
 test "ACP initialize owns the tools a host lists in sh.fx/hostTools" {
@@ -6083,6 +6304,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
     request.host_tools = .{};
+    state.client_info = request.client_info;
+    request.client_info = null;
     const agent_extensions = agentExtensions(state.host.cfg.minimal_kernel);
     state.extensions = agent_extensions.intersectWith(request.client_extensions);
     debug_trace.logf("acp", "initialize host_tools={d} extensions={d}", .{
@@ -6121,9 +6344,17 @@ fn writeInitializeAnswer(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
     try state.writer.writeResponse(alloc, id, out.writer.buffered());
 }
 
+/// The `sh.fx/clientId` that an `initialize` answer carries. Only a client that
+/// lists `sh.fx/sessionClients` gets one, so a plain client's answer stays ACP v1.
+fn answerClientId(extensions: sh_fx.Set, id: connection.ConnectionId) ?u64 {
+    if (!extensions.contains(.session_clients)) return null;
+    return connection.clientNumber(id);
+}
+
 /// The capabilities fx answers `initialize` with. A socket connection's answer
 /// adds `leader` (see `writeInitializeAnswer`), and the rest is this same value,
-/// so the two always agree. It reads only `cfg`, never the client's request.
+/// so the two always agree. It reads `cfg`, and the client's listed extensions
+/// for the client id, which `handleInitialize` sets before the answer.
 fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
     return .{
         .image_prompts = !host_target.is_wasm,
@@ -6135,6 +6366,7 @@ fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
         // HTTP.
         .mcp_over_acp = false,
         .mcp_sse = false,
+        .client_id = answerClientId(state.extensions, state.connection_id),
     };
 }
 
@@ -6143,7 +6375,7 @@ fn agentCapabilities(state: *ServerState) acp_types.AgentCapabilities {
 /// tools. Every build sends hooks, tool call identities, permission modes,
 /// model recovery, and turn events to a client that lists them.
 fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
-    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result, .keep_turn_on_disconnect });
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery, .turn_progress, .model_calls, .usage, .command_result, .keep_turn_on_disconnect, .session_clients });
     if (minimal_kernel) {
         set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
     } else if (!host_target.is_wasm) {
@@ -9354,6 +9586,466 @@ test "a queued prompt's answer is written on the connection that sent it, not on
     try std.testing.expect(std.mem.find(u8, follower_wire.bytes.items, "\"id\":7") != null);
 }
 
+/// The frames one connection's writer got in a test, in order.
+const ClientsWire = struct {
+    alloc: Allocator,
+    frames: std.ArrayList([]u8) = .empty,
+    fail: bool = false,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        const self: *ClientsWire = @ptrCast(@alignCast(raw.?));
+        if (self.fail) return error.WriteFailed;
+        try self.frames.append(self.alloc, try self.alloc.dupe(u8, frame));
+    }
+
+    fn deinit(self: *ClientsWire) void {
+        for (self.frames.items) |frame| self.alloc.free(frame);
+        self.frames.deinit(self.alloc);
+    }
+
+    /// How many clients updates the connection got.
+    fn updates(self: *const ClientsWire) usize {
+        var count: usize = 0;
+        for (self.frames.items) |frame| {
+            if (std.mem.find(u8, frame, sh_fx.method.session_clients_update) != null) count += 1;
+        }
+        return count;
+    }
+
+    /// The last clients update the connection got, or an empty slice when it got none.
+    fn lastUpdate(self: *const ClientsWire) []const u8 {
+        var index = self.frames.items.len;
+        while (index > 0) {
+            index -= 1;
+            const frame = self.frames.items[index];
+            if (std.mem.find(u8, frame, sh_fx.method.session_clients_update) != null) return frame;
+        }
+        return "";
+    }
+};
+
+test "the clients list goes to the members that list sh.fx/sessionClients, and to no other" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    releaseOpenerListHold(&owner, session);
+
+    try std.testing.expectEqual(@as(usize, 1), owner_wire.updates());
+    try std.testing.expectEqual(@as(usize, 0), follower_wire.updates());
+    try std.testing.expect(std.mem.find(u8, owner_wire.lastUpdate(), "\"clients\":[{\"clientId\":\"c1\",\"main\":true},{\"clientId\":\"c2\",\"main\":false}]") != null);
+}
+
+test "the main client's takeover makes the next client in join order main in the next list" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    releaseOpenerListHold(&owner, session);
+    {
+        var audience = lockAudience(session);
+        _ = removeMemberLocked(session, owner.connection_id);
+        audience.unlock();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), follower_wire.updates());
+    try std.testing.expect(std.mem.find(u8, follower_wire.lastUpdate(), "\"clients\":[{\"clientId\":\"c2\",\"main\":true}]") != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_wire.updates());
+}
+
+test "no clients list is written once no member is left" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    releaseOpenerListHold(&owner, session);
+    {
+        var audience = lockAudience(session);
+        _ = removeMemberLocked(session, follower.connection_id);
+        audience.unlock();
+    }
+    try std.testing.expectEqual(@as(usize, 2), owner_wire.updates());
+    {
+        var audience = lockAudience(session);
+        _ = removeMemberLocked(session, owner.connection_id);
+        audience.unlock();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), owner_wire.updates());
+    try std.testing.expect(!session.list_dirty);
+}
+
+test "a member whose write fails is dropped, and the list goes out again without it" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    follower_wire.fail = true;
+    releaseOpenerListHold(&owner, session);
+
+    try std.testing.expectEqual(@as(usize, 1), session.members.items.len);
+    try std.testing.expectEqual(@as(usize, 2), owner_wire.updates());
+    try std.testing.expect(std.mem.find(u8, owner_wire.lastUpdate(), "\"clients\":[{\"clientId\":\"c1\",\"main\":true}]") != null);
+}
+
+/// The first frame of `wire` that contains `needle`, or an empty slice.
+fn frameWith(wire: *const ClientsWire, needle: []const u8) []const u8 {
+    for (wire.frames.items) |frame| {
+        if (std.mem.find(u8, frame, needle) != null) return frame;
+    }
+    return "";
+}
+
+test "a listing member's prompt chunk names the sender, and the sender gets no copy" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    try announcePromptTurn(session, follower.connection_id, alloc, "prompt-follower", "FOLLOWER_PROMPT", &.{});
+
+    try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "FOLLOWER_PROMPT"), "\"sh.fx/client\":\"c2\"") != null);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "FOLLOWER_PROMPT"), "FOLLOWER_PROMPT") == null);
+}
+
+test "a member that does not list sh.fx/sessionClients gets its prompt chunk without sh.fx/client" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    try announcePromptTurn(session, owner.connection_id, alloc, "prompt-owner", "OWNER_PROMPT", &.{});
+
+    const chunk = frameWith(&follower_wire, "OWNER_PROMPT");
+    try std.testing.expect(std.mem.find(u8, chunk, "user_message_chunk") != null);
+    try std.testing.expect(std.mem.find(u8, chunk, "sh.fx/client") == null);
+    try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "OWNER_PROMPT"), "OWNER_PROMPT") == null);
+}
+
+test "a steer group's chunks each name their own sender, for the listing members" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    const steers = [_]libfx_steering.Steer{
+        .{ .text = @constCast("first steer"), .request_id = .{ .integer = 7 }, .from = 1 },
+        .{ .text = @constCast("second steer"), .request_id = .{ .integer = 8 }, .from = 2 },
+    };
+    publishStartingSteers(session, alloc, &steers);
+
+    try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "first steer"), "\"sh.fx/client\":\"c1\"") != null);
+    try std.testing.expect(std.mem.find(u8, frameWith(&owner_wire, "second steer"), "\"sh.fx/client\":\"c2\"") != null);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "second steer"), "\"sh.fx/client\":\"c2\"") != null);
+}
+
+/// The frames of `wire` from index `start` on that contain `needle`.
+fn frameSince(wire: *const ClientsWire, start: usize, needle: []const u8) []const u8 {
+    for (wire.frames.items[start..]) |frame| {
+        if (std.mem.find(u8, frame, needle) != null) return frame;
+    }
+    return "";
+}
+
+test "with every member listing sh.fx/sessionClients, a user chunk is built once" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const built = try deliverUserChunk(&audience, alloc, session.session_id, .{
+        .sender = owner.connection_id,
+        .message_id = "m-all",
+        .content = .{ .text = "ALL_LISTING" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), built);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "ALL_LISTING"), "\"sh.fx/client\":\"c1\"") != null);
+}
+
+test "with listing and non-listing members, a user chunk is built once for each kind" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var follower_wire = ClientsWire{ .alloc = alloc };
+    defer follower_wire.deinit();
+    var third_wire = ClientsWire{ .alloc = alloc };
+    defer third_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var follower = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&follower_wire, ClientsWire.write),
+        .connection_id = 2,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer follower.deinit();
+    var third = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&third_wire, ClientsWire.write),
+        .connection_id = 3,
+    };
+    defer third.deinit();
+    const session = try openAnswerSession(alloc, &owner, &follower);
+    try joinMemberForTest(session, &third);
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const built = try deliverUserChunk(&audience, alloc, session.session_id, .{
+        .sender = owner.connection_id,
+        .message_id = "m-mixed",
+        .content = .{ .text = "MIXED" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), built);
+    try std.testing.expect(std.mem.find(u8, frameWith(&follower_wire, "MIXED"), "\"sh.fx/client\":\"c1\"") != null);
+    const plain = frameWith(&third_wire, "MIXED");
+    try std.testing.expect(std.mem.find(u8, plain, "user_message_chunk") != null);
+    try std.testing.expect(std.mem.find(u8, plain, "sh.fx/client") == null);
+}
+
+test "a joiner's replay of a running image names the sender only for a listing joiner" {
+    const alloc = std.testing.allocator;
+    var test_host = testHost(alloc);
+    defer test_host.deinit();
+    var owner_wire = ClientsWire{ .alloc = alloc };
+    defer owner_wire.deinit();
+    var plain_wire = ClientsWire{ .alloc = alloc };
+    defer plain_wire.deinit();
+    var listing_wire = ClientsWire{ .alloc = alloc };
+    defer listing_wire.deinit();
+    const launch_root = try alloc.dupe(u8, "/tmp/workspace");
+    var owner = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&owner_wire, ClientsWire.write),
+        .launch = .{ .root = launch_root },
+        .connection_id = 1,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer owner.deinit();
+    var plain = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&plain_wire, ClientsWire.write),
+        .connection_id = 2,
+    };
+    defer plain.deinit();
+    const session = try openAnswerSession(alloc, &owner, &plain);
+
+    const png = "\x89PNG\r\n\x1a\nimage-bytes";
+    const image = try image_attachments.captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, image);
+    const images = [_]types.ImageAttachment{image};
+    try announcePromptTurn(session, owner.connection_id, alloc, "m-img", "", &images);
+
+    var listing = ServerState{
+        .alloc = alloc,
+        .host = &test_host,
+        .writer = jsonrpc.Writer.initCallback(&listing_wire, ClientsWire.write),
+        .connection_id = 3,
+        .extensions = .initMany(&.{.session_clients}),
+    };
+    defer listing.deinit();
+    try joinMemberForTest(session, &listing);
+
+    var audience = lockAudience(session);
+    defer audience.unlock();
+    const plain_start = plain_wire.frames.items.len;
+    try replayRunningCopy(findMemberLocked(session, plain.connection_id).?, alloc, session);
+    const listing_start = listing_wire.frames.items.len;
+    try replayRunningCopy(findMemberLocked(session, listing.connection_id).?, alloc, session);
+
+    const plain_image = frameSince(&plain_wire, plain_start, "m-img");
+    try std.testing.expect(std.mem.find(u8, plain_image, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.find(u8, plain_image, "sh.fx/client") == null);
+    const listing_image = frameSince(&listing_wire, listing_start, "m-img");
+    try std.testing.expect(std.mem.find(u8, listing_image, "\"sh.fx/client\":\"c1\"") != null);
+}
+
 test "a steer's outcome is written on the connection that sent the steer" {
     const alloc = std.testing.allocator;
     var test_host = testHost(alloc);
@@ -10839,8 +11531,13 @@ test "a follower's prompt queued behind the owner's turn reaches the owner's cli
 
     // The queued prompt's turn starts: the owner's client gets its text, and the follower's
     // client gets none.
+    // The owner lists sh.fx/sessionClients, so its copy names the queued prompt's sender.
+    pair.session.members.items[0].extensions = .initMany(&.{.session_clients});
     try announcePromptTurn(pair.session, running.from, alloc, "prompt-queued", "QUEUED_PROMPT", &.{});
     try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, "QUEUED_PROMPT") != null);
+    const sender_key = try std.fmt.allocPrint(alloc, "\"sh.fx/client\":\"c{d}\"", .{running.from});
+    defer alloc.free(sender_key);
+    try std.testing.expect(std.mem.find(u8, pair.owner_wire.bytes.items, sender_key) != null);
     try std.testing.expect(std.mem.find(u8, pair.follower_wire.bytes.items, "user_message_chunk") == null);
 
     giveBackClaim(pair.session, running);

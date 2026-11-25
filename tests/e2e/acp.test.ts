@@ -15218,6 +15218,446 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  /// The client capabilities that list every sh.fx extension and sh.fx/sessionClients.
+  const listingCapabilities = { _meta: { ...fxClientCapabilities._meta, "sh.fx/sessionClients": {} } };
+
+  type SharedRoot = ReturnType<typeof createShortIsolatedRoot>;
+
+  /// The params of each `_sh.fx/session/clients_update` notification in `messages`, in order.
+  function clientsUpdates(messages: any[]): any[] {
+    return messages.filter((message) => message.method === "_sh.fx/session/clients_update").map((message) => message.params);
+  }
+
+  /// The entries of the last clients update in `messages`, or undefined when none arrived.
+  function latestClients(messages: any[]): any[] | undefined {
+    return clientsUpdates(messages).at(-1)?.clients;
+  }
+
+  /// A client that lists sh.fx/sessionClients opens a stdio connection to a fresh fx acp and initializes.
+  async function listingOwner(root: SharedRoot, gateway: ReturnType<typeof startFakeGateway>, clientInfo?: object) {
+    const owner = await AcpClient.create({ cwd: root.workspace, env: leaderEnv(root, gateway) });
+    const initialized = (await owner.request(
+      "initialize",
+      { protocolVersion: 1, clientCapabilities: listingCapabilities, ...(clientInfo ? { clientInfo } : {}) },
+      1,
+    )) as any;
+    const clientId = initialized.result?._meta?.["sh.fx/clientId"] as string;
+    expect(clientId).toMatch(/^c\d+$/);
+    return { owner, initialized, clientId };
+  }
+
+  /// A listing owner that opens a session, then runs one plain turn, which publishes the session on its leader socket.
+  async function publishListingSession(root: SharedRoot, gateway: ReturnType<typeof startFakeGateway>, clientInfo?: object) {
+    const started = await listingOwner(root, gateway, clientInfo);
+    const created = (await started.owner.request("session/new", { mcpServers: [] }, 2)) as any;
+    const sessionId = created.result.sessionId as string;
+    const { promptResult } = await runPrompt(started.owner, "TURN_ONE_PROMPT", TIMEOUT);
+    expect(promptResult.result.stopReason).toBe("end_turn");
+    const socket = (JSON.parse(sessionLock(root.home, sessionId)) as { socket: string }).socket;
+    return { ...started, sessionId, socket };
+  }
+
+  /// A follower on the leader socket loads the session. `lists: false` sends the capabilities without sh.fx/sessionClients.
+  async function followAs(
+    socket: string,
+    sessionId: string,
+    root: SharedRoot,
+    options: { clientInfo?: object; lists?: boolean; method?: "session/load" | "session/resume" } = {},
+  ) {
+    const follower = await LeaderSocketClient.connect(socket);
+    const capabilities = options.lists === false ? fxClientCapabilities : listingCapabilities;
+    const initialized = await follower.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: capabilities,
+      ...(options.clientInfo ? { clientInfo: options.clientInfo } : {}),
+    });
+    const loaded = await follower.request(options.method ?? "session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+    expect(loaded.answer.error).toBeUndefined();
+    const clientId = initialized.answer.result._meta?.["sh.fx/clientId"];
+    if (options.lists === false) {
+      expect(clientId).toBeUndefined();
+    } else {
+      expect(clientId).toMatch(/^c\d+$/);
+    }
+    return { follower, clientId: clientId as string | undefined, loaded };
+  }
+
+  test(
+    "a client that lists sh.fx/sessionClients gets its own id as sh.fx/clientId in its initialize answer",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-client-id-");
+      const gateway = startFakeGateway([]);
+      let owner: AcpClient | undefined;
+      try {
+        const started = await listingOwner(root, gateway);
+        owner = started.owner;
+        expect(started.clientId).toMatch(/^c\d+$/);
+        expect(started.initialized.result.error).toBeUndefined();
+        expect(owner.stderr).toBe("");
+      } finally {
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "after session/new the opener gets the clients update after its answer, with its own entry marked main",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-new-");
+      const gateway = startFakeGateway([]);
+      const clientInfo = { name: "editor-one", version: "1.2.3", title: "Editor One" };
+      let owner: AcpClient | undefined;
+      try {
+        const started = await listingOwner(root, gateway, clientInfo);
+        owner = started.owner;
+        await owner.request("session/new", { mcpServers: [] }, 2);
+        await waitForCondition("the opener's clients update", () => clientsUpdates(parsedLines(owner!)).length === 1, TIMEOUT);
+        const lines = parsedLines(owner);
+        const answerAt = lines.findIndex((message) => message.id === 2 && message.result !== undefined);
+        const updateAt = lines.findIndex((message) => message.method === "_sh.fx/session/clients_update");
+        expect(answerAt).toBeGreaterThanOrEqual(0);
+        expect(updateAt).toBeGreaterThan(answerAt);
+        expect(latestClients(lines)).toEqual([{ clientId: started.clientId, clientInfo, main: true }]);
+        expect(owner.stderr).toBe("");
+      } finally {
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that loads the session gets the list before its load answer, with both clients and itself, and the opener is main; the opener gets the same list",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-load-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const ownerInfo = { name: "editor-one", version: "1.2.3", title: "Editor One" };
+      const followerInfo = { name: "editor-two", version: "2.0.0" };
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, ownerInfo);
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, { clientInfo: followerInfo });
+        follower = joined.follower;
+        const expected = [
+          { clientId: started.clientId, clientInfo: ownerInfo, main: true },
+          { clientId: joined.clientId, clientInfo: followerInfo, main: false },
+        ];
+        expect(latestClients(joined.loaded.before)).toEqual(expected);
+        await waitForCondition("the opener's copy of the list", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        expect(latestClients(parsedLines(owner))).toEqual(expected);
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that resumes the session gets the list before its resume answer, with itself included",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-resume-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const ownerInfo = { name: "editor-one", version: "1.2.3", title: "Editor One" };
+      const followerInfo = { name: "editor-two", version: "2.0.0" };
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, ownerInfo);
+        owner = started.owner;
+        const resumed = await followAs(started.socket, started.sessionId, root, {
+          clientInfo: followerInfo,
+          method: "session/resume",
+        });
+        follower = resumed.follower;
+        const listAt = follower.received.findIndex((message) => message.method === "_sh.fx/session/clients_update");
+        const answerAt = follower.received.findIndex(
+          (message) => message.id === resumed.loaded.answer.id && message.result !== undefined,
+        );
+        expect(listAt).toBeGreaterThanOrEqual(0);
+        expect(answerAt).toBeGreaterThan(listAt);
+        expect(latestClients(follower.received)).toEqual([
+          { clientId: started.clientId, clientInfo: ownerInfo, main: true },
+          { clientId: resumed.clientId, clientInfo: followerInfo, main: false },
+        ]);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that does not list sh.fx/sessionClients gets no list, and the chunks it gets carry no sh.fx/client",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-optin-");
+      const gateway = startFakeGateway([finalText("TURN_ONE"), finalText("OWNER_REPLY")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, {
+          lists: false,
+          clientInfo: { name: "plain-viewer", version: "0.1.0" },
+        });
+        follower = joined.follower;
+        // The client that lists gets the list with both clients, so the empty list below is not an absent update.
+        await waitForCondition("the opener's list with both clients", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        expect(clientsUpdates(follower.received)).toEqual([]);
+
+        const { promptResult } = await runPrompt(owner, "OWNER_PROMPT", TIMEOUT);
+        expect(promptResult.result.stopReason).toBe("end_turn");
+        await follower.waitForMessage((message) => isUserChunk(message, "OWNER_PROMPT"), "the owner's prompt", TIMEOUT);
+        expect(steerChunk(follower.received, "OWNER_PROMPT").params.update._meta?.["sh.fx/client"]).toBeUndefined();
+        expect(clientsUpdates(follower.received)).toEqual([]);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a follower that closes the session leaves the other listing clients a list without it",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-leave-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const ownerInfo = { name: "editor-one", version: "1.2.3" };
+      const leavingInfo = { name: "editor-two", version: "2.0.0" };
+      const remainingInfo = { name: "editor-three", version: "3.0.0" };
+      let owner: AcpClient | undefined;
+      let leaving: LeaderSocketClient | undefined;
+      let remaining: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, ownerInfo);
+        owner = started.owner;
+        const first = await followAs(started.socket, started.sessionId, root, { clientInfo: leavingInfo });
+        leaving = first.follower;
+        const second = await followAs(started.socket, started.sessionId, root, { clientInfo: remainingInfo });
+        remaining = second.follower;
+        await waitForCondition("the opener's list with three clients", () => latestClients(parsedLines(owner!))?.length === 3, TIMEOUT);
+
+        const closed = await leaving.request("session/close", { sessionId: started.sessionId });
+        expect(closed.answer.error).toBeUndefined();
+        const expected = [
+          { clientId: started.clientId, clientInfo: ownerInfo, main: true },
+          { clientId: second.clientId, clientInfo: remainingInfo, main: false },
+        ];
+        await waitForCondition("the opener's list without the closed follower", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        expect(latestClients(parsedLines(owner))).toEqual(expected);
+        await waitForCondition("the other follower's list without the closed follower", () => latestClients(remaining!.received)?.length === 2, TIMEOUT);
+        expect(latestClients(remaining.received)).toEqual(expected);
+      } finally {
+        leaving?.close();
+        remaining?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "when the main client leaves, the next client in join order is marked main",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-takeover-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const ownerInfo = { name: "editor-one", version: "1.2.3" };
+      const followerInfo = { name: "editor-two", version: "2.0.0" };
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, ownerInfo);
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, { clientInfo: followerInfo });
+        follower = joined.follower;
+
+        const closed = (await owner.request("session/close", { sessionId: started.sessionId }, 3)) as any;
+        expect(closed.error).toBeUndefined();
+        await waitForCondition("the follower's list after the opener left", () => latestClients(follower!.received)?.length === 1, TIMEOUT);
+        expect(latestClients(follower.received)).toEqual([{ clientId: joined.clientId, clientInfo: followerInfo, main: true }]);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a prompt chunk sent to a listing client carries the sender's id as sh.fx/client in its _meta",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-chunk-");
+      const gateway = startFakeGateway([finalText("TURN_ONE"), finalText("OWNER_REPLY")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        expect(started.clientId).toMatch(/^c\d+$/);
+        const joined = await followAs(started.socket, started.sessionId, root, { clientInfo: { name: "editor-two", version: "2.0.0" } });
+        follower = joined.follower;
+        const { promptResult } = await runPrompt(owner, "OWNER_PROMPT", TIMEOUT);
+        expect(promptResult.result.stopReason).toBe("end_turn");
+        await follower.waitForMessage((message) => isUserChunk(message, "OWNER_PROMPT"), "the owner's prompt", TIMEOUT);
+        expect(steerChunk(follower.received, "OWNER_PROMPT").params.update._meta["sh.fx/client"]).toBe(started.clientId);
+        expect(owner.stderr).toBe("");
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a steer chunk carries its sender's id as sh.fx/client, to the owner and the steering client",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-steer-");
+      const running = deferred<void>();
+      const runningReply = deferred<Response>();
+      const gateway = startFakeGateway([
+        finalText("TURN_ONE"),
+        () => {
+          running.resolve();
+          return runningReply.promise;
+        },
+        finalText("STEER_REPLY"),
+      ]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, { clientInfo: { name: "editor-two", version: "2.0.0" } });
+        follower = joined.follower;
+        expect(joined.clientId).toMatch(/^c\d+$/);
+        sendPrompt(owner, 10, "RUNNING_PROMPT");
+        await running.promise;
+
+        const steerId = follower.start("session/prompt", {
+          sessionId: started.sessionId,
+          prompt: [{ type: "text", text: "FOLLOWER_STEER" }],
+          _meta: { "sh.fx/delivery": "steer" },
+        });
+        await expectRefusedWhileRunning(follower, started.sessionId);
+        runningReply.resolve(finalText("RUNNING_DONE"));
+        expect((await readResponse(owner, 10)).result.stopReason).toBe("end_turn");
+        await follower.waitForMessage((message) => message.id === steerId && message.result !== undefined, "the steer's answer", TIMEOUT);
+        expect(steerChunk(parsedLines(owner), "FOLLOWER_STEER").params.update._meta["sh.fx/client"]).toBe(joined.clientId);
+        expect(steerChunk(follower.received, "FOLLOWER_STEER").params.update._meta["sh.fx/client"]).toBe(joined.clientId);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a clientInfo name longer than 256 bytes is cut to 256 bytes in the clients update",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-long-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, {
+          clientInfo: { name: "n".repeat(300), version: "1.0.0" },
+        });
+        follower = joined.follower;
+        await waitForCondition("the opener's list with both clients", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        const entry = latestClients(parsedLines(owner))!.find((client) => client.clientId === joined.clientId)!;
+        expect(entry.clientInfo.name).toBe("n".repeat(256));
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a client that sent no clientInfo is listed without a clientInfo field",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-noinfo-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root);
+        follower = joined.follower;
+        await waitForCondition("the opener's list with both clients", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        const entry = latestClients(parsedLines(owner))!.find((client) => client.clientId === joined.clientId)!;
+        expect("clientInfo" in entry).toBe(false);
+        expect(entry.main).toBe(false);
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a clientInfo name cut to 256 bytes never splits a UTF-8 character",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-clients-utf8-");
+      const gateway = startFakeGateway([finalText("TURN_ONE")]);
+      const name = "a".repeat(254) + "\u{1F642}" + "b";
+      expect(Buffer.byteLength(name)).toBeGreaterThan(256);
+      let owner: AcpClient | undefined;
+      let follower: LeaderSocketClient | undefined;
+      try {
+        const started = await publishListingSession(root, gateway, { name: "editor-one", version: "1.2.3" });
+        owner = started.owner;
+        const joined = await followAs(started.socket, started.sessionId, root, { clientInfo: { name, version: "1.0.0" } });
+        follower = joined.follower;
+        await waitForCondition("the opener's list with both clients", () => latestClients(parsedLines(owner!))?.length === 2, TIMEOUT);
+        const entry = latestClients(parsedLines(owner))!.find((client) => client.clientId === joined.clientId)!;
+        expect(entry.clientInfo.name).toBe("a".repeat(254));
+      } finally {
+        follower?.close();
+        await owner?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "a session's lock names the socket of the fx acp that leads it",
     async () => {

@@ -31,6 +31,13 @@ pub fn newConnectionId() ConnectionId {
     return connection_ids.fetchAdd(1, .monotonic);
 }
 
+/// The number of a connection's client id, `c<number>`. WebAssembly has one connection, so its
+/// number is 1.
+pub fn clientNumber(id: ConnectionId) u64 {
+    if (comptime !follow_supported) return 1;
+    return id;
+}
+
 /// Whether two waiting entries came from the same connection. With one connection
 /// (WebAssembly) every entry does, so the answer is always true there.
 pub fn sameConnection(a: ConnectionId, b: ConnectionId) bool {

@@ -42,6 +42,9 @@ pub const Extension = enum {
     /// fx lets its sessions' running turns finish and saves them, instead of
     /// cancelling them, and exits once they and the queued prompts are done.
     keep_turn_on_disconnect,
+    /// `sh.fx/sessionClients`: the client lists the clients that have the session open, and fx
+    /// sends each listing client the list as `_sh.fx/session/clients_update`.
+    session_clients,
 
     pub fn capabilityName(self: Extension) []const u8 {
         return switch (self) {
@@ -58,6 +61,7 @@ pub const Extension = enum {
             .usage => "sh.fx/usage",
             .command_result => "sh.fx/commandResult",
             .keep_turn_on_disconnect => "sh.fx/keepTurnOnDisconnect",
+            .session_clients => "sh.fx/sessionClients",
         };
     }
 };
@@ -105,6 +109,7 @@ pub const method = struct {
     pub const session_turn_progress = "_sh.fx/session/turn_progress";
     pub const session_model_call = "_sh.fx/session/model_call";
     pub const tools_call = "_sh.fx/tools/call";
+    pub const session_clients_update = "_sh.fx/session/clients_update";
 };
 
 test "clientList takes the extensions a client lists with an object" {
@@ -144,4 +149,19 @@ test "clientList takes keepTurnOnDisconnect only as an object" {
     , .{});
     defer not_object.deinit();
     try std.testing.expect(!clientList(not_object.value.object).contains(.keep_turn_on_disconnect));
+}
+
+test "clientList takes sessionClients only as an object" {
+    const alloc = std.testing.allocator;
+    const listed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"_meta":{"sh.fx/sessionClients":{}}}
+    , .{});
+    defer listed.deinit();
+    try std.testing.expect(clientList(listed.value.object).contains(.session_clients));
+
+    const not_object = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"_meta":{"sh.fx/sessionClients":true}}
+    , .{});
+    defer not_object.deinit();
+    try std.testing.expect(!clientList(not_object.value.object).contains(.session_clients));
 }
