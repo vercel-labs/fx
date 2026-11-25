@@ -1797,7 +1797,10 @@ fn handleRequestCancellation(
     const withdrawn = withdrawn: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        const queued = session.steering.findQueuedRequest(requested) orelse break :withdrawn false;
+        const queued = session.steering.findQueuedRequest(requested) orelse {
+            debug_trace.logf("acp", "event=cancel_steering_not_queued", .{});
+            break :withdrawn false;
+        };
         if (comptime has_v2_session_store) {
             if (queued.v2_input_id) |input_id| {
                 if (session.v2) |v2| {
@@ -1808,12 +1811,19 @@ fn handleRequestCancellation(
                 }
             }
         }
-        break :withdrawn session.steering.withdrawRequest(state.alloc, requested);
+        if (!session.steering.withdrawRequest(state.alloc, requested)) {
+            debug_trace.logf("acp", "event=cancel_steering_not_queued", .{});
+            break :withdrawn false;
+        }
+        break :withdrawn true;
     };
     if (!withdrawn) return;
     var response: std.Io.Writer.Allocating = .init(alloc);
     defer response.deinit();
-    acp_types.writeSteeringPromptResponse(&response.writer, .cancelled, .dropped) catch return;
+    acp_types.writeSteeringPromptResponse(&response.writer, .cancelled, .dropped) catch |err| {
+        debug_trace.logf("acp", "event=cancel_steering_response_encode_failed err={s}", .{@errorName(err)});
+        return;
+    };
     state.writer.writeResponse(alloc, requested, response.written()) catch |err| {
         debug_trace.logf("acp", "event=cancel_steering_response_failed err={s}", .{@errorName(err)});
     };
@@ -5760,4 +5770,55 @@ test "eb03: turn end withdraws queued v2 steering ids in chunks even when active
     var pending = try v2.pendingAcceptedInputs(alloc);
     defer pending.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
+}
+
+test "eb03: $/cancel_request traces unqueued steering cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cancel-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "acp");
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "cancel-unqueued.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, "s-trace"),
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    state.active_session.?.steering.open(alloc);
+
+    handleRequestCancellation(&state, alloc, "{\"requestId\":404}");
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=cancel_steering_not_queued") != null);
 }
