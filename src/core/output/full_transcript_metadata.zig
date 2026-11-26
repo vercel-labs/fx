@@ -90,6 +90,12 @@ pub fn writeModelCallText(writer: *std.Io.Writer, record: types.ModelCallRecord)
         return;
     }
     try writer.writeAll(model);
+    if (record.resolved_model) |resolved| {
+        if (!std.mem.eql(u8, resolved, record.model)) {
+            try writer.writeAll(" -> ");
+            try writer.writeAll(resolved);
+        }
+    }
     if (record.served_by) |served_by| try writer.print(" via {s}", .{served_by});
     try writer.writeAll(" · ");
     try writeDuration(writer, record.elapsed_ms);
@@ -218,6 +224,20 @@ test "full transcript metadata writes a call record's text" {
         "claude-opus-4.8 · 2.1 s · in 1,204 · out 188 · gen_01JC7P5XQ2M8VZ|" ++
             "claude-opus-4.8 · 9.7 s · in 141,880 · no gen ID returned (compaction)|" ++
             "rate limited\ngateway · claude-opus-4.8 · retrying in 12 s · no gen ID returned",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeModelCallText(&out.writer, .{
+        .at_ms = 1,
+        .elapsed_ms = 400,
+        .provider = "local",
+        .model = "Qwen3.8-27B",
+        .resolved_model = "served-model-AAA",
+        .generation_id = "chat-1",
+    });
+    try std.testing.expectEqualStrings(
+        "Qwen3.8-27B -> served-model-AAA · 0.4 s · chat-1",
         out.written(),
     );
 }

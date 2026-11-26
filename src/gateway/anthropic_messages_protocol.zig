@@ -561,6 +561,7 @@ const Reducer = struct {
     thinking: std.ArrayList(Thinking) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
+    response_model: ?[]u8 = null,
     counts: Counts = .{},
     stop: ?Stop = null,
     failure: ?Failure = null,
@@ -594,6 +595,7 @@ const Reducer = struct {
         self.thinking.deinit(self.alloc);
         self.content.deinit(self.alloc);
         if (self.generation_id) |id| self.alloc.free(id);
+        if (self.response_model) |model| self.alloc.free(model);
         if (self.failure) |failure| self.alloc.free(failure.detail);
         self.* = undefined;
     }
@@ -655,6 +657,11 @@ const Reducer = struct {
             if (id.len == 0) return error.InvalidEvent;
             if (id.len > self.limits.identity_bytes) return error.IdentityTooLarge;
             self.generation_id = try self.alloc.dupe(u8, id);
+        }
+        if (non_null(message, "model")) |value| {
+            if (value == .string and value.string.len > 0 and value.string.len <= configured_provider.max_model_bytes) {
+                self.response_model = try self.alloc.dupe(u8, value.string);
+            }
         }
         if (non_null(message, "usage")) |usage| try self.accept_usage(usage);
         self.phase = .streaming;
@@ -945,12 +952,15 @@ const Reducer = struct {
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         const generation_id = self.generation_id;
         self.generation_id = null;
+        const resolved_model = self.response_model;
+        self.response_model = null;
         self.phase = .closed;
         return .{ .completed = .{
             .completion = .{
                 .content = content,
                 .tool_calls = owned_calls,
                 .generation_id = generation_id,
+                .resolved_model = resolved_model,
                 .finish_reason = reason,
                 .finish_reason_raw = stop.raw,
                 .usage = self.final_usage(),
@@ -2102,4 +2112,26 @@ fn test_consume_allocations(alloc: Allocator) !void {
 test "anthropic messages allocation failures release every partial reply" {
     try test_consume_allocations(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_consume_allocations, .{});
+}
+
+test "anthropic messages completion carries the server's reported model id" {
+    const alloc = std.testing.allocator;
+    {
+        var reply = try test_consume(alloc, capture_text, test_request(), null);
+        defer reply.deinit(alloc);
+        try std.testing.expectEqualStrings("qwen2.5:0.5b", reply.completed.completion.resolved_model.?);
+    }
+    {
+        const empty_model = sse_wire(&.{
+            "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"\",\"usage\":{\"input_tokens\":1}}}",
+            test_text_start,
+            test_text_delta,
+            test_stop_0,
+            test_end_turn,
+            test_message_stop,
+        });
+        var reply = try test_consume(alloc, empty_model, test_request(), null);
+        defer reply.deinit(alloc);
+        try std.testing.expect(reply.completed.completion.resolved_model == null);
+    }
 }

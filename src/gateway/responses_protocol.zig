@@ -872,6 +872,7 @@ pub const Reducer = struct {
     finish_reason: ?types.ProviderFinishReason = null,
     usage: types.Usage = .{},
     generation_id: ?[]u8 = null,
+    response_model: ?[]u8 = null,
     provider_failure_detail: ?[]u8 = null,
     provider_failure_cause: ?types.ProviderFailureCause = null,
     /// An error event or a failed response said why the request failed.
@@ -899,6 +900,7 @@ pub const Reducer = struct {
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
         if (self.generation_id) |id| alloc.free(id);
+        if (self.response_model) |model| alloc.free(model);
         if (self.provider_failure_detail) |detail| alloc.free(detail);
         self.* = undefined;
     }
@@ -938,7 +940,12 @@ pub const Reducer = struct {
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
 
-        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+        if (std.mem.eql(u8, event_type, "response.created")) {
+            if (parsed.value.object.get("response")) |response_value| {
+                if (response_value == .object) try self.accept_response_model(alloc, response_value.object);
+            }
+            return false;
+        } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
@@ -1087,6 +1094,7 @@ pub const Reducer = struct {
                 if (self.generation_id) |prior| alloc.free(prior);
                 self.generation_id = try alloc.dupe(u8, id);
             }
+            try self.accept_response_model(alloc, response_value.object);
             return true;
         } else if (std.mem.eql(u8, event_type, "error")) {
             try self.accept_failure(alloc, parsed.value.object);
@@ -1095,6 +1103,14 @@ pub const Reducer = struct {
             return true;
         }
         return false;
+    }
+
+    fn accept_response_model(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) std.mem.Allocator.Error!void {
+        const max_resolved_model_bytes: usize = 1024;
+        const model = stringField(fields, "model") orelse return;
+        if (model.len == 0 or model.len > max_resolved_model_bytes) return;
+        if (self.response_model) |prior| alloc.free(prior);
+        self.response_model = try alloc.dupe(u8, model);
     }
 
     fn check_output_kind(self: *const Reducer, output_index: i64, kind: enum { function_call, reasoning, message, unknown }) error{ResponsesOutputItemConflict}!void {
@@ -1386,12 +1402,15 @@ pub const Reducer = struct {
         }
         const generation_id = self.generation_id;
         self.generation_id = null;
+        const resolved_model = self.response_model;
+        self.response_model = null;
         const provider_failure_detail = self.provider_failure_detail;
         self.provider_failure_detail = null;
         return .{
             .content = owned_content,
             .tool_calls = owned_tools,
             .generation_id = generation_id,
+            .resolved_model = resolved_model,
             .provider_failure_detail = provider_failure_detail,
             .provider_failure_cause = self.provider_failure_cause,
             .provider_state_json = owned_provider_state,
@@ -1441,6 +1460,7 @@ const ToolRecordTest = struct {
         if (completion.content) |value| self.alloc.free(value);
         if (completion.provider_state_json) |value| self.alloc.free(value);
         if (completion.generation_id) |value| self.alloc.free(value);
+        if (completion.resolved_model) |value| self.alloc.free(value);
         if (completion.provider_failure_detail) |value| self.alloc.free(value);
     }
 
@@ -2782,4 +2802,33 @@ test "a Responses event that is not JSON is malformed, and valid JSON fx refuses
     var duplicate = ToolRecordTest.init(std.testing.allocator);
     defer duplicate.deinit();
     try std.testing.expectError(error.InvalidEvent, duplicate.apply("{\"type\":\"response.created\",\"type\":\"response.completed\"}"));
+}
+
+test "Responses completion carries the server's reported model id" {
+    {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply("{\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"served-from-created\"}}");
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}");
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings("served-from-created", completion.resolved_model.?);
+    }
+    {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply("{\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"initial-model\"}}");
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"final-served-model\",\"status\":\"completed\"}}");
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings("final-served-model", completion.resolved_model.?);
+    }
+    {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"\",\"status\":\"completed\"}}");
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expect(completion.resolved_model == null);
+    }
 }

@@ -617,7 +617,7 @@ pub const Result = union(enum) {
                 copy.completed.ownership = .owned;
                 const dst = &copy.completed.completion;
                 const src = completed.completion;
-                const strings = .{ "content", "generation_id", "resolved_provider", "provider_failure_detail", "provider_state_json" };
+                const strings = .{ "content", "generation_id", "resolved_model", "resolved_provider", "provider_failure_detail", "provider_state_json" };
                 inline for (strings) |field| @field(dst, field) = null;
                 dst.tool_calls = &.{};
                 errdefer copy.deinit(alloc);
@@ -637,6 +637,7 @@ pub const Result = union(enum) {
             .completed => |completed| if (completed.ownership == .owned) {
                 if (completed.completion.content) |content| alloc.free(@constCast(content));
                 if (completed.completion.generation_id) |id| alloc.free(@constCast(id));
+                if (completed.completion.resolved_model) |model| alloc.free(@constCast(model));
                 if (completed.completion.resolved_provider) |provider| alloc.free(@constCast(provider));
                 types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
                 if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));

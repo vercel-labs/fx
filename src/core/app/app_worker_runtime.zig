@@ -458,6 +458,7 @@ pub fn Runtime(comptime App: type) type {
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
+                .model_resolved,
                 .provider_resolved,
                 .api_status_text,
                 .context_compaction,
@@ -1549,10 +1550,12 @@ pub fn Runtime(comptime App: type) type {
                         }
                         if (comptime agents.hasAgentField(App, "child_run")) agent.worker.parent_may_continue.store(false, .seq_cst);
                     },
-                    // The serving provider already appears on the ctrl+o
-                    // network record; nothing interactive consumes the event
-                    // today. The batch drain frees the payload.
-                    .provider_resolved => {},
+                    // The serving model and provider already appear on the
+                    // ctrl+o network record; nothing interactive consumes these
+                    // events today. The batch drain frees the payload.
+                    .model_resolved,
+                    .provider_resolved,
+                    => {},
                     .api_status_text => |text| {
                         resetStream(app, agent, false);
                         app.shell.worker_status_state().set_api(text, .danger);

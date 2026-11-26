@@ -1589,6 +1589,8 @@ pub const ModelCallRecord = struct {
     outcome: ModelCallOutcome = .completed,
     provider: []const u8,
     model: []const u8,
+    /// The serving model ID the server reported when it differed from `model`.
+    resolved_model: ?[]const u8 = null,
     served_by: ?[]const u8 = null,
     /// The gateway's generation id, or the provider's response id.
     generation_id: ?[]const u8 = null,
@@ -1640,6 +1642,8 @@ pub fn dupeModelCallRecord(alloc: std.mem.Allocator, record: ModelCallRecord) !M
     errdefer alloc.free(copy.provider);
     copy.model = try alloc.dupe(u8, record.model);
     errdefer alloc.free(copy.model);
+    copy.resolved_model = try dupeOptionalText(alloc, record.resolved_model);
+    errdefer if (copy.resolved_model) |text| alloc.free(text);
     copy.served_by = try dupeOptionalText(alloc, record.served_by);
     errdefer if (copy.served_by) |text| alloc.free(text);
     copy.generation_id = try dupeOptionalText(alloc, record.generation_id);
@@ -1657,7 +1661,7 @@ fn dupeOptionalText(alloc: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
 pub fn freeModelCallRecordStrings(alloc: std.mem.Allocator, record: ModelCallRecord) void {
     alloc.free(record.provider);
     alloc.free(record.model);
-    inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+    inline for (.{ record.resolved_model, record.served_by, record.generation_id, record.finish, record.failure }) |text| {
         if (text) |value| alloc.free(value);
     }
 }
@@ -2526,6 +2530,9 @@ pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     generation_id: ?[]const u8 = null,
+    /// Owned model ID the server reported in its reply, when it sent one.
+    /// Null when omitted.
+    resolved_model: ?[]const u8 = null,
     /// Owned gateway provider slug that actually served the request (the
     /// gateway's routing finalProvider/resolvedProvider). Null when the
     /// provider did not report routing metadata.

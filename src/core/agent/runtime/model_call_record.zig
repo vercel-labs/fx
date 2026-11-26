@@ -45,6 +45,9 @@ pub fn ofResult(
         .completed => |*completed| {
             const completion = completed.completion;
             record.generation_id = checked(completion.generation_id);
+            if (checked(completion.resolved_model)) |resolved| {
+                if (!std.mem.eql(u8, resolved, model)) record.resolved_model = resolved;
+            }
             record.served_by = checked(completion.resolved_provider);
             if (completion.finish_reason) |reason| record.finish = @tagName(reason);
             record.input_tokens = completion.usage.input_tokens;
@@ -126,12 +129,27 @@ test "a settled request's record keeps its outcome, cost and checked provider id
 test "a settled request's record leaves out provider text that could forge a line" {
     var completed: agent_stream_provider.Result = .{ .completed = .{ .completion = .{
         .generation_id = "gen_\x1b[2Jcleared",
+        .resolved_model = "bad\x1b[31mmodel",
         .resolved_provider = "line\nbreak",
     } } };
     const record = ofResult("gateway", "m", .turn, 0, 0, &completed, false);
     try std.testing.expect(record.generation_id == null);
+    try std.testing.expect(record.resolved_model == null);
     try std.testing.expect(record.served_by == null);
     try std.testing.expect(record.finish == null);
+
+    var matched: agent_stream_provider.Result = .{ .completed = .{ .completion = .{
+        .resolved_model = "local-model",
+    } } };
+    try std.testing.expect(ofResult("local", "local-model", .turn, 0, 0, &matched, false).resolved_model == null);
+
+    var substituted: agent_stream_provider.Result = .{ .completed = .{ .completion = .{
+        .resolved_model = "served-model-AAA",
+    } } };
+    try std.testing.expectEqualStrings(
+        "served-model-AAA",
+        ofResult("local", "requested-model", .turn, 0, 0, &substituted, false).resolved_model.?,
+    );
 }
 
 test "a request that ends in an error is recorded as cancelled or failed" {

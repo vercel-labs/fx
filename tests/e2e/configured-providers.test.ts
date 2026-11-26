@@ -5,7 +5,7 @@ import { FX_BIN, fxChildEnv, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { completion, neverAnswers, stallsAfterFirstChunk, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 import * as messagesFake from "./fixtures/anthropic-messages";
 import * as responsesFake from "./fixtures/responses";
-import { holdChildAnswer, logLines, rootSessionIds } from "./saved-sessions";
+import { holdChildAnswer, logLines, rootSessionIds, savedText } from "./saved-sessions";
 import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -1732,4 +1732,107 @@ describe("custom connection errors name the setting", () => {
       expect(f.requests[1].headers["x-org"]).toBe("org-fixture-123");
     } finally { f.close(); }
   }, 30000);
+
+  test("response model: reports the serving model and warns once when a custom server answers with a different one", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      if (body.model === "local-model") return completion("local-model", "matched reply");
+      return ++calls === 1
+        ? toolCompletion("served-model-AAA", "read_file", { path: "note.txt" })
+        : completion("served-model-AAA", "substituted reply");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const mismatched = await runFx(["ask", "--model", "Qwen3.8-27B", "--json", "Read note.txt"], {
+        cwd: f.workspace, env: f.env, timeoutMs: 20000,
+      });
+      if (mismatched.code !== 0) throw new Error(mismatched.stdout + mismatched.stderr);
+      const parsed = JSON.parse(mismatched.stdout);
+      expect(parsed.model).toBe("Qwen3.8-27B");
+      expect(parsed.resolved_model).toBe("served-model-AAA");
+      // Two model requests in one turn, one mismatch notice on stderr.
+      expect(f.requests).toHaveLength(2);
+      expect(occurrences(mismatched.stderr, "Requested model Qwen3.8-27B, but local answered with served-model-AAA.")).toBe(1);
+
+      const sessionText = savedText(f.home, parsed.session_id);
+      expect(sessionText).toContain("\"resolved_model\":\"served-model-AAA\"");
+
+      // Matching serving model produces resolved_model with no warning.
+      const matched = await runFx(["ask", "--json", "--no-save", "say hi"], {
+        cwd: f.workspace, env: f.env, timeoutMs: 20000,
+      });
+      if (matched.code !== 0) throw new Error(matched.stdout + matched.stderr);
+      const matchedJson = JSON.parse(matched.stdout);
+      expect(matchedJson.model).toBe("local-model");
+      expect(matchedJson.resolved_model).toBe("local-model");
+      expect(matched.stderr).toBe("");
+    } finally { f.close(); }
+  }, 45000);
+
+  test("response model: control bytes in a server model id are escaped on stderr and kept out of saved model_call records", async () => {
+    const f = fixture(() => completion("bad\x1b[31mmodel", "reply"));
+    try {
+      const result = await runFx(["ask", "--json", "say hi"], {
+        cwd: f.workspace, env: f.env, timeoutMs: 20000,
+      });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.resolved_model).toBe("bad\x1b[31mmodel");
+      expect(result.stderr).not.toContain("\x1b");
+      expect(result.stderr).toContain("Requested model local-model, but local answered with bad\\x1b[31mmodel.");
+      const sessionText = savedText(f.home, parsed.session_id);
+      expect(sessionText).not.toContain("bad\\u001b");
+    } finally { f.close(); }
+  }, 30000);
+
+  test("response model: Responses and Anthropic Messages custom connections also report mismatched serving models", async () => {
+    const f = fixture(undefined, {
+      "/v1/responses": () => new Response(
+        [
+          `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", model: "served-responses-model" } })}\n\n`,
+          `data: ${JSON.stringify({ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "ok" })}\n\n`,
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", model: "served-responses-model", status: "completed", usage: { input_tokens: 4, output_tokens: 1 } } })}\n\n`,
+        ].join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+      "/v1/messages": () => new Response(
+        [
+          `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "served-anthropic-model", content: [], usage: { input_tokens: 4, output_tokens: 0 } } })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+          `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ].join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+    try {
+      (f.settings.providers as any).resp = {
+        protocol: "openai-responses",
+        base_url: connection(f).base_url,
+        auth: { type: "none" },
+      };
+      (f.settings.providers as any).anth = {
+        protocol: "anthropic-messages",
+        base_url: connection(f).base_url,
+        auth: { type: "none" },
+      };
+      f.save();
+
+      const respRun = await runFx(["ask", "--provider", "resp", "--model", "asked-resp", "--json", "--no-save", "hi"], {
+        cwd: f.workspace, env: f.env, timeoutMs: 20000,
+      });
+      if (respRun.code !== 0) throw new Error(respRun.stdout + respRun.stderr);
+      expect(JSON.parse(respRun.stdout).resolved_model).toBe("served-responses-model");
+      expect(respRun.stderr).toContain("Requested model asked-resp, but resp answered with served-responses-model.");
+
+      const anthRun = await runFx(["ask", "--provider", "anth", "--model", "asked-anth", "--json", "--no-save", "hi"], {
+        cwd: f.workspace, env: f.env, timeoutMs: 20000,
+      });
+      if (anthRun.code !== 0) throw new Error(anthRun.stdout + anthRun.stderr);
+      expect(JSON.parse(anthRun.stdout).resolved_model).toBe("served-anthropic-model");
+      expect(anthRun.stderr).toContain("Requested model asked-anth, but anth answered with served-anthropic-model.");
+    } finally { f.close(); }
+  }, 45000);
 });
