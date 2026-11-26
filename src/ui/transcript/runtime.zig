@@ -10319,7 +10319,11 @@ pub const TranscriptRuntime = struct {
                     receipt.accepted_history_visual_offset +| accepted_semantic_rows,
                 );
                 target.normal_buffer_recovery_pending =
-                    receipt.normal_buffer_recovery_pending;
+                    receipt.normal_buffer_recovery_pending or
+                    (scroll_facts.recovery_projection_deferred and
+                        !receipt.flow_owned and
+                        target.body_disposition == .paint and
+                        target.visual_offset > target.history_visual_offset);
                 if (scroll_facts.publication_hold == .none and recoveringCanAdvanceSemanticProgress(scroll_facts)) {
                     target.visual_offset =
                         scroll_facts.source_visual_offset +
@@ -10658,12 +10662,16 @@ pub const TranscriptRuntime = struct {
                 }
             },
             .recovering => |receipt| {
-                if (receipt.retention_identity.publication_entries.len > 0 and
+                if ((receipt.retention_identity.publication_entries.len > 0 or
+                    (receipt.normal_buffer_recovery_pending and !receipt.flow_owned)) and
                     self.committed_frame_layout.terminal_cols == self.layout.cols and
                     self.committed_frame_layout.terminal_rows == self.layout.rows and
                     !self.terminal_reset_pending)
                 {
-                    const committed_flow = flowPrefixBeforeTail(receipt.flow, receipt.retention_identity.lines);
+                    const committed_flow = if (receipt.retention_identity.publication_entries.len > 0)
+                        flowPrefixBeforeTail(receipt.flow, receipt.retention_identity.lines)
+                    else
+                        receipt.flow;
                     if (compatibleHistoryReplayRange(prepared, self.layout.cols, target_flow, committed_flow, receipt.accepted_history_visual_offset, target_history_visual_offset)) |replay| {
                         return .{
                             .flow_len = replay.flow_start,
@@ -11419,6 +11427,13 @@ pub const TranscriptRuntime = struct {
                 };
                 if (base.history_replay != null) flow_boundaries.replay = start_kept else flow_boundaries.start = start_kept;
                 start.resume_bytes = &.{};
+                if (borrows_pending_resume and base.history_replay == null) {
+                    if (prepared_append.endpoint_resume_bytes.len > 0) {
+                        presentation_resume_bytes = try alloc.dupe(u8, prepared_append.endpoint_resume_bytes);
+                    }
+                    presentation_pending_wrap = prepared_append.endpoint_pending_wrap;
+                    presentation_valid = true;
+                }
                 flow_boundaries.end = .{
                     .offset = projected_flow_end.?,
                     .cols = self.layout.cols,
@@ -11827,12 +11842,14 @@ pub const TranscriptRuntime = struct {
             var presentation_resume_bytes: []u8 = &.{};
             var presentation_pending_wrap = false;
             var presentation_valid = false;
-            if (result.document_append_applied() and transition.presentation_valid) {
-                presentation_resume_bytes = transition.presentation_resume_bytes;
-                presentation_pending_wrap = transition.presentation_pending_wrap;
-                presentation_valid = true;
-                transition.presentation_resume_bytes = &.{};
-                transition.presentation_valid = false;
+            if (result.document_append_applied()) {
+                if (transition.presentation_valid) {
+                    presentation_resume_bytes = transition.presentation_resume_bytes;
+                    presentation_pending_wrap = transition.presentation_pending_wrap;
+                    presentation_valid = true;
+                    transition.presentation_resume_bytes = &.{};
+                    transition.presentation_valid = false;
+                }
             } else switch (previous_state) {
                 .recovering => |*receipt| {
                     presentation_resume_bytes = receipt.presentation_resume_bytes;
@@ -13983,7 +14000,7 @@ fn resolveRecoveryMaterializedEndpoint(
         planned.flow_len = null;
         return planned;
     }
-    if (commit.complete or
+    if ((commit.complete and !transition.recovery_projection_deferred) or
         result.document_append_applied() or
         !transition.recovery_progress_compatible or
         !transition.recovery_tracks_semantic_progress or
@@ -14528,6 +14545,166 @@ test "resume recovery selects a safe materialized endpoint for every outcome" {
     try std.testing.expectEqual(@as(?usize, 6), absent.materialized_flow_len);
     try std.testing.expectEqual(@as(u16, 3), absent.materialized_cursor_row);
     try std.testing.expectEqual(@as(u16, 1), absent.materialized_cursor_col);
+}
+
+test "deferred recovery projection keeps materialized_without_append when commit completes" {
+    var target_flow = [_]u8{ 'f', 'i', 'r', 's', 't', '\n', 's', 'e', 'c', 'o', 'n', 'd' };
+    const scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(8, 1);
+    const prior_materialized: MaterializedEndpoint = .{
+        .visual_offset = 1,
+        .visual_rows = 1,
+        .flow_len = 6,
+        .cursor_row = 3,
+        .cursor_col = 1,
+    };
+    const planned: MaterializedEndpoint = .{
+        .visual_offset = 1,
+        .visual_rows = 1,
+        .flow_len = target_flow.len,
+        .cursor_row = 3,
+        .cursor_col = 7,
+    };
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{},
+        .semantic_rows = 1,
+        .semantic_progress_rows = 1,
+        .recovery_progress_compatible = true,
+        .recovery_tracks_semantic_progress = true,
+        .recovery_projection_deferred = true,
+        .target_flow = &target_flow,
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 80,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 8,
+            .start_line = 0,
+            .partial_skip_rows = 0,
+            .line_count = 2,
+        },
+        .visual_offset = 2,
+        .history_visual_offset = 1,
+        .total_visual_rows = 2,
+        .materialized = planned,
+        .materialized_without_append = prior_materialized,
+        .cursor_row = 3,
+        .cursor_col = 7,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 3,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 2,
+    };
+    const committed_result = testFrameCommitResult(0, .committed);
+    const commit = resolveTranscriptTransitionCommit(
+        &transition,
+        committed_result,
+        scroll_plan.commit(committed_result.terminal_scroll_rows_committed),
+    );
+    try std.testing.expect(commit.complete);
+    try std.testing.expect(!commit.stable);
+    try std.testing.expect(!committed_result.document_append_applied());
+
+    // Deferred frame with no document append leaves the materialized endpoint at
+    // the prior receipt rather than jumping to the end of target_flow.
+    try std.testing.expectEqualDeep(
+        prior_materialized,
+        resolveRecoveryMaterializedEndpoint(&transition, committed_result, commit),
+    );
+
+    // Edge: if a document append did apply on the deferred frame, that append
+    // materialized the planned endpoint.
+    var appended_result = committed_result;
+    appended_result.document_append_committed = true;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, appended_result, commit),
+    );
+
+    // Edge: a rebase supersedes the prior materialized endpoint.
+    transition.recovery_rebase = true;
+    try std.testing.expectEqualDeep(
+        planned,
+        resolveRecoveryMaterializedEndpoint(&transition, committed_result, commit),
+    );
+}
+
+test "applied document append without presentation state clears stale resume presentation" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = testLayoutWithRows(8),
+        .committed_frame_layout = .{
+            .terminal_rows = 8,
+            .terminal_cols = 80,
+            .transcript_area = .{ .top = 1, .bottom = 8 },
+        },
+        .transcript_commit_state = .{ .recovering = .{
+            .accepted_visual_offset = 1,
+            .accepted_history_visual_offset = 1,
+            .attempt_visual_offset = 1,
+            .attempt_total_visual_rows = 2,
+            .materialized_visual_offset = 1,
+            .materialized_visual_rows = 1,
+            .materialized_flow_len = 6,
+            .remaining_semantic_rows = 2,
+            .remaining_semantic_progress_rows = 2,
+            .attempt_cols = 80,
+            .tracks_semantic_progress = true,
+            .flow = try alloc.dupe(u8, "first\nsecond"),
+            .presentation_resume_bytes = try alloc.dupe(u8, "\x1b[31m"),
+            .presentation_valid = true,
+        } },
+    };
+    defer runtime.deinit(alloc);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(8, 1, 0, 1);
+    var transition = TranscriptTransition{
+        .scroll_plan = scroll_plan,
+        .document_append = .{
+            .bytes = "first\n",
+            .start_row = 1,
+            .start_col = 1,
+            .clear = .{ .rows = 1 },
+        },
+        .semantic_rows = 2,
+        .semantic_progress_rows = 2,
+        .recovery_progress_compatible = true,
+        .recovery_tracks_semantic_progress = true,
+        .target_flow = try alloc.dupe(u8, "first\nsecond"),
+        .target_cache = .empty,
+        .folded_summary_indices = &.{},
+        .target_layout = .{ .terminal_rows = 8, .terminal_cols = 80 },
+        .selection = .{ .top_row = 1, .bottom_row = 8, .start_line = 0, .partial_skip_rows = 0, .line_count = 2 },
+        .visual_offset = 2,
+        .history_visual_offset = 2,
+        .total_visual_rows = 2,
+        .materialized = .{ .visual_offset = 2, .visual_rows = 0, .flow_len = 12, .cursor_row = 1, .cursor_col = 1 },
+        .materialized_without_append = .{},
+        .cursor_row = 1,
+        .cursor_col = 1,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 1,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 2,
+    };
+    defer transition.deinit(alloc);
+
+    var result = testFrameCommitResult(1, .committed);
+    result.document_append_committed = true;
+    runtime.consumeTranscriptTransition(alloc, &transition, result);
+
+    switch (runtime.transcript_commit_state) {
+        .recovering => |receipt| {
+            try std.testing.expect(!receipt.presentation_valid);
+            try std.testing.expectEqual(@as(usize, 0), receipt.presentation_resume_bytes.len);
+        },
+        .invalid, .stable => return error.TestExpectedRecoveringTranscript,
+    }
 }
 
 test "partial resume publication retains its cursor and requests the next frame" {
@@ -16012,6 +16189,87 @@ test "history replay starts at committed source top and follows resize eligibili
         resize_facts.target_visual_offset,
     )) orelse return error.TestExpectedNaturalAppendBase;
     try std.testing.expect(resize_append_base.history_replay == null);
+}
+
+test "borrowed recovery with pending normal-buffer recovery replays history" {
+    const alloc = std.testing.allocator;
+    const target_flow =
+        "row-01\nrow-02\nrow-03\nrow-04\n" ++
+        "row-05\nrow-06\nrow-07\nrow-08\n" ++
+        "row-09\nrow-10\nrow-11\nrow-12\n";
+    const layout: Layout = .{
+        .rows = 12,
+        .cols = 40,
+        .content_bottom = 8,
+        .divider_top_row = 9,
+        .input_row = 10,
+        .divider_bottom_row = 11,
+        .hint_row = 12,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 5,
+        .viewport_top_row = 5,
+        .committed_frame_layout = .{
+            .layout_id = 17,
+            .owned_top = 5,
+            .owned_band = .{ .top = 5, .bottom = 12 },
+            .body_area = .{ .top = 5, .bottom = 8 },
+            .transcript_area = .{ .top = 5, .bottom = 8 },
+            .footer_area = .{ .top = 9, .bottom = 12 },
+            .solved_frame_height = 8,
+            .terminal_rows = 12,
+            .terminal_cols = 40,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.notebook.pending_resume_source = try runtime.prepareFullTranscriptViewportSource(
+        alloc,
+        try alloc.dupe(u8, target_flow),
+    );
+    const pending_bytes = runtime.notebook.pending_resume_source.?.bytes;
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .accepted_visual_offset = 0,
+        .accepted_history_visual_offset = 0,
+        .attempt_visual_offset = 0,
+        .attempt_total_visual_rows = 12,
+        .materialized_visual_offset = 0,
+        .materialized_visual_rows = 0,
+        .materialized_flow_len = 0,
+        .remaining_semantic_rows = 8,
+        .remaining_semantic_progress_rows = 8,
+        .attempt_cols = 40,
+        .tracks_semantic_progress = true,
+        .flow = pending_bytes,
+        .flow_owned = false,
+        .normal_buffer_recovery_pending = true,
+    } };
+
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &runtime.notebook.pending_resume_source.?,
+        .{ .top = 1, .bottom = 8 },
+    );
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    const append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        runtime.owned_top_row,
+        facts,
+        false,
+        pending_bytes,
+        4,
+    )) orelse return error.TestExpectedHistoryReplay;
+    try std.testing.expect(append_base.history_replay != null);
+    try std.testing.expectEqual(
+        runtime.committed_frame_layout.transcript_area.top,
+        append_base.cursor_row,
+    );
+    try std.testing.expectEqual(@as(u16, 1), append_base.cursor_col);
 }
 
 test "preserved source rewrite holds the normal buffer at committed history" {

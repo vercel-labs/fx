@@ -293,6 +293,28 @@ async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>,
   await terminal.waitForComposer(5000);
 }
 
+async function assertResumeScrollbackIntact(terminal: InstanceType<typeof TmuxSession>, expectedRows: number, exact = false) {
+  const scrollback = await terminal.captureFullScrollback();
+  const scrollbackLines = scrollback.split("\n");
+  const headIndices = scrollbackLines.flatMap((line, index) => (line.includes(HEAD) ? [index] : []));
+  const seedIndices = scrollbackLines.flatMap((line, index) => (line.includes("SEED_DONE_1") ? [index] : []));
+  const tailIndices = scrollbackLines.flatMap((line, index) => (line.includes(TAIL) ? [index] : []));
+  expect(headIndices).toHaveLength(1);
+  expect(seedIndices).toHaveLength(1);
+  expect(tailIndices).toHaveLength(1);
+  const body = scrollbackLines.slice(headIndices[0]! + 1, seedIndices[0]!);
+  if (exact) {
+    expect(body.length).toBe(expectedRows);
+  } else {
+    // Compaction invalidates the transcript anchor and redraws the 28-row
+    // active screen (`source_state=invalid`), overwriting the 4-10 on-screen
+    // suffix lines (`17983..17992`) even when no deferral occurred.
+    expect(body.length).toBeGreaterThanOrEqual(expectedRows - 20);
+    expect(body.length).toBeLessThanOrEqual(expectedRows);
+  }
+  expect(body.every((line) => line.includes("history alpha beta gamma delta sample line"))).toBe(true);
+}
+
 async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
   const first = await terminal.waitForText(ACTIVITY, 10_000);
   const clock = first.match(ACTIVITY)![0];
@@ -347,6 +369,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
           await f.waitForResumeHandoff();
           await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane) && turnSettled(pane), 10_000);
+          if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000);
         }
         expect(f.counts().overflowSent).toBe(trigger === "overflow");
         expect(f.durable()).toBe(1);
@@ -542,9 +565,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         await f.waitForResumeHandoff();
+        if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000, true);
         await until(() => f.requestsContaining(steer).length > 0, "steer request after compaction");
         expect(f.requestsContaining(steer)[0]).toContain("INTERNAL_HANDOFF_4e12");
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 20_000);
+        if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000);
         await f.close();
         passed = true;
       } finally { await f.cleanup(passed); }
