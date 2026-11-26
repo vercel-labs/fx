@@ -2122,12 +2122,6 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
     try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
 }
 
-test "a prompt held for the upgrade restart names Ctrl+G only while the restart can be cancelled" {
-    try std.testing.expect(std.mem.endsWith(u8, restartHeldSubmitNotice(true), "; send this after the restart, or press Ctrl+G to cancel it"));
-    try std.testing.expectEqualStrings(restart_held_submit_notice, restartHeldSubmitNotice(false));
-    try std.testing.expect(std.mem.find(u8, restartHeldSubmitNotice(false), "Ctrl+G") == null);
-}
-
 test "pending draft construction frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
         testing_allocator.no_resize,

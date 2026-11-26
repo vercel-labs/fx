@@ -1725,27 +1725,37 @@ pub fn Runtime(comptime App: type) type {
         /// keep working: the restart waits until they finish
         /// (`anyTurnRunning`), so an upgrade loses none of their work.
         pub fn requestYields(app: *App) void {
-            app.main_agent.worker.requestYield();
-            for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) child.agent.worker.requestYield();
-            }
+            yieldStepOnRestartAgents(app, .request);
         }
 
         /// Lets the turns held for the restart return (`WorkerRuntime.releaseYield`),
         /// on the agents `requestYields` asked.
         pub fn releaseYields(app: *App) void {
-            app.main_agent.worker.releaseYield();
-            for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) child.agent.worker.releaseYield();
-            }
+            yieldStepOnRestartAgents(app, .release);
         }
 
         /// Takes back `requestYields` when the restart is cancelled
         /// (`WorkerRuntime.cancelYield`).
         pub fn cancelYields(app: *App) void {
-            app.main_agent.worker.cancelYield();
+            yieldStepOnRestartAgents(app, .cancel);
+        }
+
+        const YieldStep = enum { request, release, cancel };
+
+        /// Takes `step` on the workers an upgrade's restart stops between
+        /// steps: main's and the other instances'.
+        fn yieldStepOnRestartAgents(app: *App, comptime step: YieldStep) void {
+            yieldStep(&app.main_agent.worker, step);
             for (app.child_agents.items) |child| {
-                if (child.agent.role == .instance) child.agent.worker.cancelYield();
+                if (child.agent.role == .instance) yieldStep(&child.agent.worker, step);
+            }
+        }
+
+        fn yieldStep(worker: anytype, comptime step: YieldStep) void {
+            switch (step) {
+                .request => worker.requestYield(),
+                .release => worker.releaseYield(),
+                .cancel => worker.cancelYield(),
             }
         }
 
