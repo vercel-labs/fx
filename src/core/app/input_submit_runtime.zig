@@ -71,6 +71,15 @@ fn buildPendingPromptDraft(
     };
 }
 
+const restart_held_submit_notice = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart";
+
+/// What a prompt sent while fx waits to restart for an upgrade gets. Ctrl+G
+/// cancels a restart only while it waits for its turns, not once the held
+/// turns are let go (`app_upgrade_runtime.zig` `applyReadyUpgradeWithDeps`).
+fn restartHeldSubmitNotice(cancellable: bool) []const u8 {
+    return if (cancellable) restart_held_submit_notice ++ ", or press Ctrl+G to cancel it" else restart_held_submit_notice;
+}
+
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -635,7 +644,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "upgrade",
                         .tone = .neutral,
-                        .body = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart, or press Ctrl+G to cancel it",
+                        .body = restartHeldSubmitNotice(app.upgrader.restart == .waiting),
                     }, true);
                     return;
                 }
@@ -2111,6 +2120,12 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
     try std.testing.expectEqualStrings("hello $review", draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), draft.images.len);
     try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
+}
+
+test "a prompt held for the upgrade restart names Ctrl+G only while the restart can be cancelled" {
+    try std.testing.expect(std.mem.endsWith(u8, restartHeldSubmitNotice(true), "; send this after the restart, or press Ctrl+G to cancel it"));
+    try std.testing.expectEqualStrings(restart_held_submit_notice, restartHeldSubmitNotice(false));
+    try std.testing.expect(std.mem.find(u8, restartHeldSubmitNotice(false), "Ctrl+G") == null);
 }
 
 test "pending draft construction frees every partial allocation" {

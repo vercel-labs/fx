@@ -1755,32 +1755,30 @@ pub fn Runtime(comptime App: type) type {
         /// for the main loop to deliver it. An upgrade's restart waits until
         /// none does.
         pub fn anyTurnRunning(app: *App) bool {
-            if (app.main_agent.worker.isProcessing() or app.main_agent.worker.hasPendingEvents()) return true;
-            for (app.child_agents.items) |child| {
-                const worker = &child.agent.worker;
-                if (worker.isProcessing() or worker.hasPendingEvents()) return true;
-                // Only instances hold their queued work, so a subagent's runs.
-                if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
-            }
-            return deliveriesPending(app);
+            return anyTurnBusy(app, false);
         }
 
         /// As `anyTurnRunning`, with a turn held at its step boundary for the
         /// restart counted as stopped: the restart lets the held turns return
         /// once this is false (`tests/tla/recovery/RestartWait.tla` Release).
         pub fn anyTurnUnheld(app: *App) bool {
-            if (runsUnheld(&app.main_agent.worker)) return true;
+            return anyTurnBusy(app, true);
+        }
+
+        fn anyTurnBusy(app: *App, comptime held_counts_as_stopped: bool) bool {
+            if (workerBusy(&app.main_agent.worker, held_counts_as_stopped)) return true;
             for (app.child_agents.items) |child| {
                 const worker = &child.agent.worker;
-                if (runsUnheld(worker)) return true;
+                if (workerBusy(worker, held_counts_as_stopped)) return true;
                 // Only instances hold their queued work, so a subagent's runs.
                 if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
             }
             return deliveriesPending(app);
         }
 
-        fn runsUnheld(worker: anytype) bool {
-            return worker.turnActivity() == .running or worker.hasPendingEvents();
+        fn workerBusy(worker: anytype, comptime held_counts_as_stopped: bool) bool {
+            const runs = if (held_counts_as_stopped) worker.turnActivity() == .running else worker.isProcessing();
+            return runs or worker.hasPendingEvents();
         }
 
         /// Whether a subagent runs work, has work queued, or holds events

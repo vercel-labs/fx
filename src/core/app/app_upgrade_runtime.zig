@@ -273,14 +273,14 @@ pub fn Runtime(comptime App: type) type {
             try writeUpgradeNotice(app, .neutral, restart_cancelled_notice);
         }
 
-        /// Ctrl+G asked the agent on screen for a resume handoff, and that agent
-        /// may no longer be on screen, so every agent the restart asked drops it.
+        /// Ctrl+G asked the agent on screen, which can be a subagent, for a
+        /// resume handoff, and that agent may no longer be on screen, so every
+        /// agent drops the handoff the restart asked for. A subagent's left in
+        /// place would move to its instance at a later exit (`liftResumeIntent`).
         fn cancelUpgradeHandoffs(app: *App) void {
             app.cancelResumeHandoffForUpgrade(&app.main_agent);
             if (comptime @hasField(App, "child_agents")) {
-                for (app.child_agents.items) |child| {
-                    if (child.agent.role == .instance) app.cancelResumeHandoffForUpgrade(&child.agent);
-                }
+                for (app.child_agents.items) |child| app.cancelResumeHandoffForUpgrade(&child.agent);
             }
         }
 
@@ -427,15 +427,25 @@ const TestShell = struct {
     render_requests: TestRenderRequests = .{},
 };
 
+const TestAgent = struct {
+    worker: TestWorker = .{},
+    stream: struct { active: bool = false } = .{},
+    submission: struct { pending: ?u8 = null } = .{},
+    role: enum { instance, subagent } = .instance,
+    /// Whether this agent holds the resume handoff an upgrade asked for.
+    upgrade_handoff: bool = false,
+};
+
+const TestChild = struct {
+    agent: TestAgent = .{},
+};
+
 const TestApp = struct {
     alloc: std.mem.Allocator,
     auto_upgrade_enabled: bool = true,
     upgrader: TestUpgrader = .{},
-    main_agent: struct {
-        worker: TestWorker = .{},
-        stream: struct { active: bool = false } = .{},
-        submission: struct { pending: ?u8 = null } = .{},
-    } = .{},
+    main_agent: TestAgent = .{},
+    child_agents: std.ArrayList(*TestChild) = .empty,
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
     shell: TestShell = .{},
@@ -462,6 +472,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.input_runtime.edit_state.deinit(self.alloc);
         self.notices.deinit(self.alloc);
+        self.child_agents.deinit(self.alloc);
     }
 
     fn prepareResumeHandoffForUpgrade(self: *TestApp, _: anytype) !void {
@@ -477,8 +488,9 @@ const TestApp = struct {
         self.relaunch_path_len = executable_path.len;
     }
 
-    fn requestResumeHandoffForUpgrade(self: *TestApp, _: anytype) void {
+    fn requestResumeHandoffForUpgrade(self: *TestApp, asked: *TestAgent) void {
         self.request_handoff_count += 1;
+        asked.upgrade_handoff = true;
     }
 
     pub fn needsUserElsewhere(self: *TestApp, _: []u8) ?app_agents_runtime.BusyAgent {
@@ -513,8 +525,9 @@ const TestApp = struct {
         self.cancel_yield_count += 1;
     }
 
-    pub fn cancelResumeHandoffForUpgrade(self: *TestApp, _: anytype) void {
+    pub fn cancelResumeHandoffForUpgrade(self: *TestApp, asked: *TestAgent) void {
         self.cancel_handoff_count += 1;
+        asked.upgrade_handoff = false;
     }
 
     pub fn logHeldWorkForRestart(self: *TestApp) void {
@@ -969,6 +982,29 @@ test "app_upgrade_runtime cancels the waiting restart on a second Ctrl+G" {
     const third = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
     try std.testing.expectEqual(ApplyOutcome.waiting, third);
     try std.testing.expectEqual(@as(usize, 2), app.yield_request_count);
+}
+
+test "app_upgrade_runtime cancel takes back the resume handoff Ctrl+G asked of a subagent on screen" {
+    var app = TestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    var instance = TestChild{};
+    var subagent = TestChild{ .agent = .{ .role = .subagent } };
+    try app.child_agents.appendSlice(app.alloc, &.{ &instance, &subagent });
+    app.upgrader.state = .ready;
+    app.turn_running = true;
+    var deps_state = TestDepsState{};
+
+    // Ctrl+G on the subagent's screen asks that subagent for the handoff.
+    const first = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, &subagent.agent, deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.waiting, first);
+    try std.testing.expect(subagent.agent.upgrade_handoff);
+
+    // The second Ctrl+G comes from main's screen.
+    const second = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, &app.main_agent, deps_state.deps());
+    try std.testing.expectEqual(ApplyOutcome.restart_cancelled, second);
+    try std.testing.expect(!subagent.agent.upgrade_handoff);
+    try std.testing.expect(!instance.agent.upgrade_handoff);
+    try std.testing.expect(!app.main_agent.upgrade_handoff);
 }
 
 test "app_upgrade_runtime says the restart is under way once the held turns are let go" {
