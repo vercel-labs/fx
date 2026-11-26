@@ -20,6 +20,12 @@ const { HAS_API_KEY } = await import("../evals/eval-helpers");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
 const TAIL = "HISTORY_TAIL_16d3";
+const HISTORY_ROW_PREFIX = "history alpha beta gamma delta sample line";
+function historyRows(count: number): string {
+  return Array.from({ length: count }, (_, index) =>
+    `${HISTORY_ROW_PREFIX} ${String(index + 1).padStart(5, "0")}\n`).join("");
+}
+const HISTORY_ROW = new RegExp(`^\\s*${HISTORY_ROW_PREFIX} (\\d{5})$`);
 // A fact entry, which the compacted conversation keeps whatever the turn
 // numbers.
 const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
@@ -104,8 +110,6 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   // must leave the next ordinary request below the automatic pressure threshold.
   const seedTurns = trigger === "manual" && outcome !== "success" ? 3 : 1;
   const lines = seedTurns > 1 ? 400 : trigger === "ordinary" ? 2 : trigger === "auto" || longResume ? 18_000 : 1600;
-  const historyRows = (count: number) => Array.from({ length: count }, (_, index) =>
-    `history alpha beta gamma delta sample line ${String(index + 1).padStart(5, "0")}\n`).join("");
   const seedReply = (turn: number) => `${turn === 1 ? HEAD : `HISTORY_MIDDLE_${turn}`}\n${historyRows(lines)}SEED_DONE_${turn}${turn === seedTurns ? `\n${TAIL}` : ""}`;
   const summaryHold = heldFakeGatewayFinalText();
   const ordinaryHold = heldFakeGatewayFinalText();
@@ -269,6 +273,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     phase = "attempt";
     return {
       launch, close, cleanup, durable, cli, tapes, root, seedTurns, summaryHold, ordinaryHold, waitForResumeHandoff,
+      trace: () => readFileSync(join(root, `terminal-${launchIndex}.trace`), "utf8"),
       savedEvents: () => readFileSync(eventsPath, "utf8"),
       counts: () => ({ summaries, ordinary, overflowSent }),
       phase: (value: typeof phase) => { phase = value; },
@@ -297,8 +302,6 @@ async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>,
   await terminal.sendKeys("C-o");
   await terminal.waitForComposer(5000);
 }
-
-const HISTORY_ROW = /^\s*history alpha beta gamma delta sample line (\d{5})$/;
 
 async function assertResumeScrollbackIntact(terminal: InstanceType<typeof TmuxSession>, expectedRows: number) {
   const paneRows = terminal.paneSize().rows;
@@ -384,7 +387,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           f.ordinaryHold.release("CURRENT_TURN_OK_f713");
           await f.waitForResumeHandoff();
           await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane) && turnSettled(pane), 10_000);
-          if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000);
+          if (trigger === "auto") {
+            expect(f.trace()).toContain("recovery_projection_deferred=true");
+            await assertResumeScrollbackIntact(terminal, 18_000);
+          }
         }
         expect(f.counts().overflowSent).toBe(trigger === "overflow");
         expect(f.durable()).toBe(1);
@@ -580,7 +586,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         await f.waitForResumeHandoff();
-        if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000);
+        if (trigger === "auto") {
+          expect(f.trace()).toContain("recovery_projection_deferred=true");
+          await assertResumeScrollbackIntact(terminal, 18_000);
+        }
         await until(() => f.requestsContaining(steer).length > 0, "steer request after compaction");
         expect(f.requestsContaining(steer)[0]).toContain("INTERNAL_HANDOFF_4e12");
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 20_000);
@@ -1064,9 +1073,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (!raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
         seeded++;
         const head = seeded === 1 ? HEAD : `HISTORY_MIDDLE_${seeded}`;
-        const rows = Array.from({ length: 400 }, (_, index) =>
-          `history alpha beta gamma delta sample line ${String(index + 1).padStart(5, "0")}\n`).join("");
-        return fakeGatewayFinalText(`${head}\n${rows}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
+        return fakeGatewayFinalText(`${head}\n${historyRows(400)}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
       }
       return fakeGatewayFinalText(FOLLOWUP);
     }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
