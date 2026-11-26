@@ -5400,17 +5400,25 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
 
 const resumed_history_rows = 300;
 const resumed_history_prompt = "SENT_WHILE_PUBLISHING";
+const resumed_history_composer = "COMPOSER_LINE_ONE\nCOMPOSER_LINE_TWO\nCOMPOSER_LINE_THREE";
+
+/// What makes the footer taller after the first frame of a resume.
+const ResumeFooterGrowth = enum {
+    none,
+    /// A prompt sent as Enter sends it: its card shows above the composer.
+    prompt_card,
+    /// A composer of several lines, with nothing sent yet.
+    taller_composer,
+};
 
 /// Resumes `resumed_history_rows` numbered rows into the 12-row coordinator
-/// terminal and paints frames until the resumed flow is released. With
-/// `prompt_after_frames`, a prompt is sent after that many frames, as Enter
-/// sends it: its card makes the footer taller, and the transcript is asked to
-/// finish the publication. Appends the history rows each frame wrote into
-/// scrollback to `frame_rows`, and checks that every row reached the terminal
-/// once, in order, above the prompt's card.
+/// terminal and paints frames until the resumed flow is released, with the
+/// footer made taller by `growth` after the first frame. Appends the history
+/// rows each frame wrote into scrollback to `frame_rows`, and checks that
+/// every row reached the terminal once, in order, above what grew.
 fn publishResumedHistory(
     alloc: std.mem.Allocator,
-    prompt_after_frames: ?usize,
+    growth: ResumeFooterGrowth,
     frame_rows: *std.ArrayList(u32),
 ) !void {
     var tmp = std.testing.tmpDir(.{});
@@ -5448,15 +5456,19 @@ fn publishResumedHistory(
     var settle_frames: usize = 0;
     while (settle_frames < 3) {
         if (frame_rows.items.len == 40) return error.TestResumePublicationNeverFinished;
-        if (prompt_after_frames == frame_rows.items.len) {
-            app.agent().submission.pending = .{ .draft = .{
+        if (frame_rows.items.len == 1) switch (growth) {
+            .none => {},
+            .prompt_card => app.agent().submission.pending = .{ .draft = .{
                 .turn_id = 1,
                 .prompt = try alloc.dupe(u8, resumed_history_prompt),
                 .images = &.{},
                 .skill_display_spans = &.{},
-            } };
-            app.shell.finishResumePublication();
-        }
+            } },
+            .taller_composer => {
+                try app.input_runtime.edit_state.setText(alloc, resumed_history_composer);
+                app.shell.render_requests.request(.footer);
+            },
+        };
         const rows_before = std.mem.count(u8, scrollback.items, "\n");
         app.shell.render_requests.request(.transcript);
         app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
@@ -5483,10 +5495,21 @@ fn publishResumedHistory(
         last_row_end = lines.index orelse text.len;
     }
     try std.testing.expectEqual(@as(usize, resumed_history_rows), next_row);
-    if (prompt_after_frames != null) {
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, resumed_history_prompt));
-        try std.testing.expect(std.mem.find(u8, text, resumed_history_prompt).? > last_row_end);
-    }
+    const grown = switch (growth) {
+        .none => return,
+        .prompt_card => resumed_history_prompt,
+        .taller_composer => "COMPOSER_LINE_THREE",
+    };
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, grown));
+    try std.testing.expect(std.mem.find(u8, text, grown).? > last_row_end);
+}
+
+/// The first frame writes one batch, the frame after the footer grew writes
+/// the rest, and later frames write nothing more.
+fn expectRestAfterGrowth(frame_rows: []const u32) !void {
+    try std.testing.expectEqual(@as(u32, 64), frame_rows[0]);
+    try std.testing.expect(frame_rows[1] > 64);
+    for (frame_rows[2..]) |rows| try std.testing.expectEqual(@as(u32, 0), rows);
 }
 
 test "core.app_render_runtime a prompt sent while resumed history publishes writes the rest in its next frame" {
@@ -5494,13 +5517,22 @@ test "core.app_render_runtime a prompt sent while resumed history publishes writ
     var frame_rows: std.ArrayList(u32) = .empty;
     defer frame_rows.deinit(alloc);
     errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
-    try publishResumedHistory(alloc, 1, &frame_rows);
+    try publishResumedHistory(alloc, .prompt_card, &frame_rows);
 
     // Without this, the taller footer leaves the rest of the history waiting
     // until the turn ends, and the prompt's card waits with it.
-    try std.testing.expectEqual(@as(u32, 64), frame_rows.items[0]);
-    try std.testing.expect(frame_rows.items[1] > 64);
-    for (frame_rows.items[2..]) |rows| try std.testing.expectEqual(@as(u32, 0), rows);
+    try expectRestAfterGrowth(frame_rows.items);
+}
+
+test "core.app_render_runtime a composer of several lines while resumed history publishes writes the rest in its next frame" {
+    const alloc = std.testing.allocator;
+    var frame_rows: std.ArrayList(u32) = .empty;
+    defer frame_rows.deinit(alloc);
+    errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
+    try publishResumedHistory(alloc, .taller_composer, &frame_rows);
+
+    // No prompt was sent; the footer grew all the same.
+    try expectRestAfterGrowth(frame_rows.items);
 }
 
 test "core.app_render_runtime resumed history with no prompt publishes in paced batches" {
@@ -5508,7 +5540,7 @@ test "core.app_render_runtime resumed history with no prompt publishes in paced 
     var frame_rows: std.ArrayList(u32) = .empty;
     defer frame_rows.deinit(alloc);
     errdefer std.debug.print("rows per frame: {any}\n", .{frame_rows.items});
-    try publishResumedHistory(alloc, null, &frame_rows);
+    try publishResumedHistory(alloc, .none, &frame_rows);
 
     var batches: usize = 0;
     for (frame_rows.items) |rows| {

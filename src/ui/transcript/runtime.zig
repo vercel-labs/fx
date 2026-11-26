@@ -4806,6 +4806,15 @@ const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
+/// How many rows of a resumed history one frame may write into scrollback.
+const ResumePublicationBatch = enum {
+    /// `resume_publication_rows_per_frame`, so input stays live meanwhile.
+    paced,
+    /// All the rows it owes: the footer grew, and the history must reach the
+    /// new viewport top before a later frame defers (`finish_at_new_top`).
+    rest,
+};
+
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
     transcript_bottom: u16 = 0,
@@ -5086,7 +5095,6 @@ const transcript_slot_fields = [_][:0]const u8{
     "has_painted_transcript",
     "unpainted_resume_hold",
     "resume_handoff_repaint_pending",
-    "finish_resume_publication",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
     "last_visible_transcript_partial_skip_rows",
@@ -5384,11 +5392,6 @@ pub const TranscriptRuntime = struct {
     /// every drop until then, or until the transcript leaves the screen
     /// (`slotLeftScreen`).
     resume_handoff_repaint_pending: bool = false,
-    /// A prompt was sent while the resumed history was still being written
-    /// into scrollback. The next frame writes the rest of it, up to that
-    /// frame's viewport top, instead of `resume_publication_rows_per_frame`
-    /// rows. Cleared when the resume flow is released.
-    finish_resume_publication: bool = false,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -5565,7 +5568,6 @@ pub const TranscriptRuntime = struct {
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
-        self.finish_resume_publication = false;
         var source = self.notebook.pending_resume_source orelse return 0;
         const released_bytes = source.bytes.len;
         source.deinit(alloc);
@@ -5584,21 +5586,6 @@ pub const TranscriptRuntime = struct {
         const released = self.releasePendingResumeSource(alloc);
         if (released > 0) self.unpainted_resume_hold = true;
         return released;
-    }
-
-    /// A prompt was sent. While the resumed history is still being written
-    /// into scrollback, the prompt's card and activity row make the footer
-    /// taller, and the paced write would wait for the whole turn
-    /// (`recovery_projection_deferred`), so the next frame writes the rest.
-    pub fn finishResumePublication(self: *TranscriptRuntime) void {
-        if (self.notebook.pending_resume_source == null or self.finish_resume_publication) return;
-        self.finish_resume_publication = true;
-        debug_trace.logf(
-            "scroll",
-            "resume_publication_finish_requested state={s}",
-            .{@tagName(self.transcript_commit_state)},
-        );
-        self.render_requests.request(.transcript);
     }
 
     pub fn pendingResumeFlow(self: *const TranscriptRuntime) []const u8 {
@@ -9317,9 +9304,9 @@ pub const TranscriptRuntime = struct {
         resize_reflow_rows: u16,
         semantic_rows: u32,
         semantic_progress_rows: u32,
+        batch: ResumePublicationBatch,
     ) u16 {
-        const semantic_cap = if (self.notebook.pending_resume_source != null and
-            !self.finish_resume_publication)
+        const semantic_cap = if (self.notebook.pending_resume_source != null and batch == .paced)
             resume_publication_rows_per_frame
         else
             std.math.maxInt(u32);
@@ -9475,7 +9462,7 @@ pub const TranscriptRuntime = struct {
                 if (restore_projection) {
                     facts.semantic_rows = 0;
                     facts.semantic_progress_rows = 0;
-                    facts.planned_rows = self.plannedTranscriptRows(prepared, facts.source_visual_offset, facts.resize_reflow_rows, 0, 0);
+                    facts.planned_rows = self.plannedTranscriptRows(prepared, facts.source_visual_offset, facts.resize_reflow_rows, 0, 0, .paced);
                 }
             }
         }
@@ -9538,14 +9525,14 @@ pub const TranscriptRuntime = struct {
                     0
                 else
                     receipt.remaining_resize_reflow_rows;
-                // A sent prompt's card and activity row make the footer
-                // taller, which moves the viewport top further down the same
-                // history flow. The rows up to the old top would then no
-                // longer fit, and every frame would defer until the turn
-                // ends, so the finishing frame owes the rows up to the new
-                // top instead.
-                const finish_at_new_top = self.finish_resume_publication and
-                    source_equal and
+                // A taller footer, such as a sent prompt's card, a resent
+                // request's activity row, or a composer of several lines,
+                // moves the viewport top further down the same history flow.
+                // The rows up to the old top would then no longer fit, and
+                // every later frame would defer and lose its append base, so
+                // the first frame that sees the new top writes the rest of
+                // the history, up to that top, at once.
+                const finish_at_new_top = source_equal and
                     recovery_progress_compatible and
                     recovery_tracks_semantic_progress and
                     receipt.remaining_semantic_progress_rows > 0 and
@@ -9638,10 +9625,11 @@ pub const TranscriptRuntime = struct {
                         resize_reflow_rows,
                         semantic_rows,
                         semantic_progress_rows,
+                        if (finish_at_new_top) .rest else .paced,
                     );
                 debug_trace.logf(
                     "scroll",
-                    "transcript_transition_plan source_state=recovering source_visual_offset={d} attempt_visual_offset={d} target_visual_offset={d} attempt_total_visual_rows={d} target_total_visual_rows={d} remaining_resize_reflow_rows={d} remaining_semantic_rows={d} remaining_semantic_progress_rows={d} growth_rows={d} semantic_progress_rows={d} planned_rows={d} source_compatible={s} recovery_progress_compatible={s} recovery_rebase={s} recovery_projection_deferred={s} finish_resume_publication={s}",
+                    "transcript_transition_plan source_state=recovering source_visual_offset={d} attempt_visual_offset={d} target_visual_offset={d} attempt_total_visual_rows={d} target_total_visual_rows={d} remaining_resize_reflow_rows={d} remaining_semantic_rows={d} remaining_semantic_progress_rows={d} growth_rows={d} semantic_progress_rows={d} planned_rows={d} source_compatible={s} recovery_progress_compatible={s} recovery_rebase={s} recovery_projection_deferred={s} finish_at_new_top={s}",
                     .{
                         receipt.accepted_visual_offset,
                         receipt.attempt_visual_offset,
@@ -9658,7 +9646,7 @@ pub const TranscriptRuntime = struct {
                         if (recovery_progress_compatible) "true" else "false",
                         if (recovery_rebase) "true" else "false",
                         if (recovery_projection_deferred) "true" else "false",
-                        if (self.finish_resume_publication) "true" else "false",
+                        if (finish_at_new_top) "true" else "false",
                     },
                 );
                 return .{
@@ -9689,6 +9677,7 @@ pub const TranscriptRuntime = struct {
                             0,
                             semantic_rows,
                             semantic_rows,
+                            .paced,
                         ),
                         .source_compatible = true,
                         .recovery_progress_compatible = true,
@@ -9823,6 +9812,7 @@ pub const TranscriptRuntime = struct {
             resize_reflow_rows,
             semantic_rows,
             semantic_rows,
+            .paced,
         );
         if (history_behind_viewport and !geometry_rebase and
             semantic_rows == 0 and releasable_advance > 0 and
@@ -15270,7 +15260,7 @@ test "pending resume publication yields after a bounded row batch" {
 
     try std.testing.expectEqual(
         @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .paced),
     );
     runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
         &runtime,
@@ -15279,49 +15269,12 @@ test "pending resume publication yields after a bounded row batch" {
     );
     try std.testing.expectEqual(
         @as(u16, resume_publication_rows_per_frame),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .paced),
     );
-}
-
-test "a sent prompt lifts the resume publication's row batch until the flow is released" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
-    defer runtime.deinit(alloc);
-    const prepared = transcript_painter.PreparedTranscriptSurfacePaint{ .selection = .{
-        .top_row = 1,
-        .bottom_row = 1,
-        .start_line = 0,
-        .partial_skip_rows = 0,
-        .line_count = 1,
-    } };
-
-    // With no resumed history to write, a prompt has nothing to finish.
-    runtime.finishResumePublication();
-    try std.testing.expect(!runtime.finish_resume_publication);
-
-    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
-        &runtime,
-        alloc,
-        try alloc.dupe(u8, "pending"),
-    );
-    runtime.finishResumePublication();
-    try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+    // The frame that sees a taller footer writes all it owes.
     try std.testing.expectEqual(
         @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
-    );
-
-    // The next resume starts paced again.
-    _ = runtime.releasePendingResumeSource(alloc);
-    try std.testing.expect(!runtime.finish_resume_publication);
-    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
-        &runtime,
-        alloc,
-        try alloc.dupe(u8, "next"),
-    );
-    try std.testing.expectEqual(
-        @as(u16, resume_publication_rows_per_frame),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0, .rest),
     );
 }
 

@@ -12705,15 +12705,8 @@ const FakeSubmitApp = struct {
             .hint_row = 24,
         },
 
-        /// Sent prompts that asked a resumed history to finish its publication.
-        finish_resume_publication_requests: usize = 0,
-
         pub fn fullTranscriptActive(self: *const @This()) bool {
             return self.full_transcript_active;
-        }
-
-        pub fn finishResumePublication(self: *@This()) void {
-            self.finish_resume_publication_requests += 1;
         }
     } = .{},
     next_image_id_counter: usize = 1,
@@ -13323,37 +13316,6 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "app_input_runtime a sent prompt asks a resumed history to finish its publication" {
-    const alloc = std.testing.allocator;
-    const Case = struct {
-        text: []const u8,
-        worker_idle: bool,
-        admitted: bool = true,
-        requests: usize,
-    };
-    const cases = [_]Case{
-        // The prompt's card shows at once.
-        .{ .text = "pending prompt", .worker_idle = true, .requests = 1 },
-        // The worker is busy, so the prompt waits in the queue.
-        .{ .text = "queued prompt", .worker_idle = false, .requests = 1 },
-        // A prompt the credential check rejects starts no turn.
-        .{ .text = "rejected prompt", .worker_idle = false, .admitted = false, .requests = 0 },
-        .{ .text = "/help", .worker_idle = true, .requests = 0 },
-    };
-    for (cases) |case| {
-        errdefer std.debug.print("case: {s}\n", .{case.text});
-        var app = FakeSubmitApp{ .alloc = alloc, .prompt_admitted = case.admitted };
-        defer app.deinit();
-        app.agent().worker.hold_available = case.worker_idle;
-        try app.input_runtime.edit_state.input.appendSlice(alloc, case.text);
-        app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
-
-        try Runtime(FakeSubmitApp).submit(&app, 100);
-
-        try std.testing.expectEqual(case.requests, app.shell.finish_resume_publication_requests);
-    }
 }
 
 test "app_input_runtime idle submit commits its frame before credential preflight" {
