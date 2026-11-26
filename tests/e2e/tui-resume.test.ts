@@ -6704,6 +6704,14 @@ test.skipIf(!tmuxAvailable())(
       // the continuation after it.
       expect(tapesShowed([tapeBefore], ["stopped between steps for the upgrade"], join(frames, "before"))).toEqual(["stopped between steps for the upgrade"]);
       expect(tapesShowed([tapeAfter], ["continuing the turn after the upgrade"], join(frames, "after"))).toEqual(["continuing the turn after the upgrade"]);
+      // The yielded turn stays open, so the first launch never reports it to
+      // the terminal as failed, only as work in progress.
+      const writtenBefore = readTapeFrames(tapeBefore, { ignoreTruncatedTail: true })
+        .filter((frame) => frame.kind === 1)
+        .map((frame) => frame.payload.toString("utf8"))
+        .join("");
+      expect(writtenBefore).toContain("\x1b]7501;state=working:app=fx");
+      expect(writtenBefore).not.toContain("\x1b]7501;state=error");
       await active.kill();
       active = null;
     } finally {

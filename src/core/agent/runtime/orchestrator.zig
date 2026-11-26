@@ -6250,7 +6250,9 @@ pub fn processAgentPrompt(
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         observed_error = err;
-        if (finalization.state == .open) {
+        if (err == error.TurnYielded) {
+            finalization.leaveOpenForResume();
+        } else if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| {
                 observed_error = finalization_err;
                 if (deps.compaction_failure) |out| out.* = null;

@@ -2437,6 +2437,39 @@ test "TurnFinalizationGuard runs PostTurnEnd once for every terminal outcome and
     }
 }
 
+test "TurnFinalizationGuard leaves a yielded turn open and still releases its terminal leases" {
+    const alloc = std.testing.allocator;
+    var hook_capture = PostTurnEndFinalizationCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerPostTurnEnd(.{
+        .name = "capture",
+        .ctx = &hook_capture,
+        .run = PostTurnEndFinalizationCapture.run,
+    });
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    const runtime_deps = deps.deps();
+    var finalization = TurnFinalizationGuard.init(
+        &runtime_deps,
+        1,
+        testLifecycleContext(hook_runtime.freeze(), alloc, "/tmp/workspace"),
+    );
+    defer finalization.deinit();
+    try finalization.track_agent_terminal_lease("terminal-owned");
+
+    finalization.leaveOpenForResume();
+    // A finish after it, as a caller's catch might try, changes nothing.
+    try finalization.finish(.failed, null, null);
+
+    try std.testing.expectEqual(TurnFinalizationGuard.State.yielded, finalization.state);
+    try std.testing.expectEqual(@as(?types.TurnPresentationOutcome, null), finalization.outcome);
+    try std.testing.expectEqual(@as(usize, 1), deps.terminal_lease_cleanup_ids.items.len);
+    try std.testing.expectEqualStrings("terminal-owned", deps.terminal_lease_cleanup_ids.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), deps.finalization_count);
+    try std.testing.expectEqual(@as(usize, 0), hook_capture.calls);
+}
+
 test "TurnFinalizationGuard attempts every tracked lease without replacing accepted completion" {
     const alloc = std.testing.allocator;
     const cleanup_errors = [_]?anyerror{
