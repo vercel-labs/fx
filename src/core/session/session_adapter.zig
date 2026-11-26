@@ -2006,6 +2006,14 @@ pub const Session = struct {
     /// so a write that supersedes it gives its fresh copy the marker too
     /// (`supersedeOpenTurn`, RULES R1.8).
     open_continued: bool = false,
+    /// The open log turn is a copy written after a supersede, once a
+    /// compaction inside the turn cut steps, so it holds fx's view after the
+    /// cut; every later write of the turn keeps to that view (`TurnView`).
+    open_cut_copy: bool = false,
+    /// How many open turns this session closed as superseded. A write
+    /// compares it before and after its checks to tell that it starts its
+    /// turn afresh.
+    supersedes: u64 = 0,
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
@@ -2547,19 +2555,23 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var events: std.ArrayList(Event) = .empty;
-        try session_event.appendHistoryTurnConversationEvents(a, &events, types.savedHistoryTurn(turn));
-        if (events.items.len < 2) return error.InvalidConversationFrame;
-        const pieces = events.items[0 .. events.items.len - 1];
-        const end = events.items[events.items.len - 1];
-
+        const whole = savedExecutionOf(turn);
+        const view: TurnView = .{ .cut = whole != null, .copy = self.open_cut_copy, .supersedes = self.supersedes };
         // The end piece joins the others; its line ends the turn.
-        const all = events.items;
-        const encoded = try a.alloc([]u8, all.len);
-        for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
+        const whole_pieces = try self.turnPieces(a, types.savedHistoryTurn(turn));
+        const cut_pieces = if (view.cut) try self.turnPieces(a, turn) else whole_pieces;
+        var all = if (view.keepsCut()) cut_pieces else whole_pieces;
+        const end = all.events[all.events.len - 1];
         if (self.othersOpenTurn(owner)) try self.supersedeOpenTurn("other_turn");
-        const skip = try self.continuedSkip(all);
-        const start = try self.streamedPrefix(encoded[0..pieces.len], .commit, countResults(pieces));
+        var skip = try self.continuedSkip(all.events);
+        const piece_count = all.events.len - 1;
+        var start = try self.streamedPrefix(all.encoded[0..piece_count], .commit, countResults(all.events[0..piece_count]));
+        if (view.copiesCut(self)) {
+            self.traceCutCopy("commit", whole.?, executionOf(turn));
+            all = cut_pieces;
+            skip = try self.continuedSkip(all.events);
+            start = 0;
+        }
 
         var tail: std.ArrayList(sm.Event) = .empty;
         if (owner != 0) {
@@ -2602,7 +2614,7 @@ pub const Session = struct {
         const owned_language = if (language_changed) try self.alloc.dupe(u8, language_tag) else null;
         errdefer if (owned_language) |owned| self.alloc.free(owned);
 
-        const written = try withoutSkipped(a, all, encoded, skip);
+        const written = try withoutSkipped(a, all.events, all.encoded, skip);
         try self.writePieces(a, written.events[start..], written.encoded[start..], tail.items, openingAuthor(turn), owner);
         // An `extends` continuation numbers its turn as its chain's first turn
         // (RULES R1.8). The copy format numbers it as its own log turn.
@@ -2613,6 +2625,7 @@ pub const Session = struct {
         self.turn_open = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
         self.clearStreamed();
         if (owned_language) |owned| {
@@ -2761,7 +2774,8 @@ pub const Session = struct {
     /// `appendProgress`, with the whole turn as `saved_execution` once a
     /// compaction inside it cut steps out of `execution`, fx's view (D87),
     /// and the recovery module's record for the send this write goes before
-    /// (`recovery_type`). The log streams the whole turn.
+    /// (`recovery_type`). The log streams `saved_execution`, except into a
+    /// copy written after a supersede (`TurnView`).
     pub fn appendProgressWithRecord(
         self: *Session,
         user: types.UserTurn,
@@ -2775,37 +2789,107 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var events: std.ArrayList(Event) = .empty;
-        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
         const whole = saved_execution orelse execution;
-        // A result's blob needs the turn on disk first (D44).
+        const view: TurnView = .{ .cut = saved_execution != null, .copy = self.open_cut_copy, .supersedes = self.supersedes };
+        // A result's blob needs the turn on disk first (D44). Both views
+        // get their files now, while the turn is open: a cut view's results
+        // are the whole turn's, so the second pass writes none.
         if (storesBodies(whole)) try self.openTurnLocked(self.capture_turn);
-        // On a missing handle the list keeps the pieces before it.
-        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, whole)) catch |err| switch (err) {
-            error.ConversationArtifactRequired => {},
-            else => return err,
-        };
-        const encoded = try a.alloc([]u8, events.items.len);
-        for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
-        const skip = try self.continuedSkip(events.items);
-        const start = try self.streamedPrefix(encoded, .stream, countResults(events.items));
+        const whole_pieces = try self.progressPieces(a, user, whole);
+        const cut_pieces = if (view.cut) try self.progressPieces(a, user, execution) else whole_pieces;
+        var pieces = if (view.keepsCut()) cut_pieces else whole_pieces;
+        var skip = try self.continuedSkip(pieces.events);
+        var start = try self.streamedPrefix(pieces.encoded, .stream, countResults(pieces.events));
+        const copies_cut = view.copiesCut(self);
+        if (copies_cut) {
+            self.traceCutCopy("stream", whole, execution);
+            pieces = cut_pieces;
+            skip = try self.continuedSkip(pieces.events);
+            start = 0;
+        }
         // The record goes out in the same write as the pieces before its
         // send, so a turn's first write already carries it
         // (`tests/tla/recovery/Resume.tla` CrashLoopAsks).
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
-        if (!self.turn_open or start < encoded.len) {
+        if (!self.turn_open or start < pieces.encoded.len) {
             // A skip happens only before the first write, so `start` is 0 then.
-            const written = try withoutSkipped(a, events.items, encoded, skip);
+            const written = try withoutSkipped(a, pieces.events, pieces.encoded, skip);
             try self.writePieces(a, written.events[start..], written.encoded[start..], tail.items, user.author, self.capture_turn);
             self.clearContinuedBase();
             // The skipped pieces are streamed too, so a later rebuild still matches the log.
-            try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
-            for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
+            try self.streamed.ensureUnusedCapacity(self.alloc, pieces.encoded.len - start);
+            for (pieces.encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
             _ = try self.write(tail.items);
         }
+        if (copies_cut) self.open_cut_copy = true;
         try self.saveRunning(a, running);
+    }
+
+    /// A turn's pieces as the log writes them, and their bytes.
+    const EncodedPieces = struct { events: []Event, encoded: [][]u8 };
+
+    /// The turn so far as pieces: `user`, then `execution`'s, each result
+    /// with the side file the commit would give it (`withResultFiles`).
+    fn progressPieces(self: *Session, a: Allocator, user: types.UserTurn, execution: types.ExecutionMemory) !EncodedPieces {
+        var events: std.ArrayList(Event) = .empty;
+        try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
+        // On a missing handle the list keeps the pieces before it.
+        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
+            error.ConversationArtifactRequired => {},
+            else => return err,
+        };
+        return self.encodePieces(a, events.items);
+    }
+
+    /// A finished turn's pieces, its end last, as a commit writes them.
+    fn turnPieces(self: *Session, a: Allocator, turn: types.HistoryTurn) !EncodedPieces {
+        var events: std.ArrayList(Event) = .empty;
+        try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
+        if (events.items.len < 2) return error.InvalidConversationFrame;
+        return self.encodePieces(a, events.items);
+    }
+
+    fn encodePieces(self: *Session, a: Allocator, events: []Event) !EncodedPieces {
+        const encoded = try a.alloc([]u8, events.len);
+        for (events, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
+        return .{ .events = events, .encoded = encoded };
+    }
+
+    /// Which view of a turn a write puts in the log. The log saves the
+    /// whole turn, and resume leaves out what a compaction inside it cut
+    /// (D87). It finds that turn by its number, and a copy written after a
+    /// supersede has a new one, so resume cannot trim the copy: a copy of a
+    /// turn with a cut holds fx's view after the cut, and every later write
+    /// of the turn keeps to it. The model never gets the summarized steps
+    /// back; the transcript loses them, which `traceCutCopy` logs.
+    const TurnView = struct {
+        /// A compaction inside the turn cut steps, so the views differ.
+        cut: bool,
+        /// The open turn is such a copy already (`open_cut_copy`).
+        copy: bool,
+        /// `Session.supersedes` before the write's checks.
+        supersedes: u64,
+
+        fn keepsCut(self: TurnView) bool {
+            return self.cut and self.copy;
+        }
+
+        /// Whether the write's checks just closed the open turn, so the write
+        /// starts a copy that must hold the cut view.
+        fn copiesCut(self: TurnView, session: *const Session) bool {
+            return self.cut and session.supersedes != self.supersedes;
+        }
+    };
+
+    fn traceCutCopy(self: *Session, phase: []const u8, whole: types.ExecutionMemory, kept: types.ExecutionMemory) void {
+        debug_trace.logf("session", "event=sessions_v2_cut_copy session={s} phase={s} path=superseded_after_cut kept=view_after_cut dropped=summarized_steps tool_steps={d} steering={d}", .{
+            self.id(),
+            phase,
+            whole.tool_steps.len -| kept.tool_steps.len,
+            whole.steering.len -| kept.steering.len,
+        });
     }
 
     /// Saves or clears the record in the open turn. A turn not written yet
@@ -3629,6 +3713,7 @@ pub const Session = struct {
         // The marker was written with this turn when it continues a yielded one.
         self.open_extends = self.continues_yielded and self.continued_extends;
         self.open_continued = self.continues_yielded;
+        self.open_cut_copy = false;
         self.continues_yielded = false;
         if (opener != 0) self.markStartsWritten(opener);
     }
@@ -3764,6 +3849,7 @@ pub const Session = struct {
         self.turn_open = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
     }
 
@@ -3807,10 +3893,12 @@ pub const Session = struct {
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
+        self.supersedes += 1;
         self.turn_open = false;
         self.turn_stale = false;
         self.open_extends = false;
         self.open_continued = false;
+        self.open_cut_copy = false;
         self.turn_token = 0;
         self.clearStreamed();
         for (self.captures.items) |*capture| capture.written = false;
@@ -7196,6 +7284,26 @@ fn openingAuthor(turn: types.HistoryTurn) types.MessageAuthor {
     };
 }
 
+/// fx's view of `turn`: after a compaction inside it, only the part after
+/// the cut.
+fn executionOf(turn: types.HistoryTurn) types.ExecutionMemory {
+    return switch (turn) {
+        .assistant => |entry| entry.execution,
+        .interrupted => |entry| entry.execution,
+        .compacted_summary => .{},
+    };
+}
+
+/// The whole turn the log saves, when a compaction inside `turn` cut
+/// steps out of fx's view (`types.savedHistoryTurn`); null otherwise.
+fn savedExecutionOf(turn: types.HistoryTurn) ?types.ExecutionMemory {
+    return switch (turn) {
+        .assistant => |entry| entry.saved_execution,
+        .interrupted => |entry| entry.saved_execution,
+        .compacted_summary => null,
+    };
+}
+
 const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
@@ -9483,6 +9591,84 @@ test "a continuation superseded after a compaction commits its fresh copy" {
     const reference_id = try writeSupersededReference(&t, a, user);
     defer testing.allocator.free(reference_id);
     try testing.expectEqualStrings(try restoredJson(&t, a, reference_id), try restoredJson(&t, a, id));
+}
+
+/// Turn 2 streams step 1, then a compaction cuts it out of fx's view. The
+/// whole turn fx gives next no longer matches the stream, as after a bug:
+/// step 1's call has other arguments. With `at_stream`, the next stream
+/// shows the mismatch while fx's view is still empty, and one more stream
+/// adds step 2; otherwise the commit shows it. The turn ends with steps 1
+/// to 3 whole and 2 and 3 in fx's view. Returns its session id, owned by
+/// the caller.
+fn writeCutCopy(t: *TestHome, a: Allocator, user: types.UserTurn, at_stream: bool) ![]u8 {
+    var model = "m".*;
+    var summary = "summary".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    errdefer s.close();
+    try commitPlainTurn(s, "first");
+    const steps = try stepsUpTo(a, 3);
+    try s.appendProgress(user, .{ .tool_steps = steps[0..1] }, .{});
+    try s.commitCompaction(.{ .summary = &summary, .removed_turn_count = 1, .compaction_count = 1 }, true, .{ .turns = 1, .tool_steps = 1 });
+    const drifted = try a.dupe(types.ToolExecutionStep, steps);
+    drifted[0].tool_calls = try a.dupe(types.ToolCall, &.{.{ .id = steps[0].tool_calls[0].id, .name = "read_file", .arguments_json = "{\"path\":\"other\"}" }});
+    if (at_stream) {
+        try s.appendProgressWithRecord(user, .{}, .{ .tool_steps = drifted[0..1] }, .{}, .keep);
+        try s.appendProgressWithRecord(user, .{ .tool_steps = steps[1..2] }, .{ .tool_steps = drifted[0..2] }, .{}, .keep);
+    }
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = steps[1..3] },
+        .saved_execution = .{ .tool_steps = drifted },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    s.close();
+    return id;
+}
+
+test "a turn whose commit no longer matches its stream after a cut saves fx's view in its fresh copy" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    const id = try writeCutCopy(&t, a, user, false);
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    // The copy has a new number, so resume cannot trim it; it holds only
+    // what fx kept after the cut, as a copy main wrote does.
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    const got = try restoredKept(&t, a, id);
+    const want = try restoredKept(&t, a, reference_id);
+    try testing.expectEqual(@as(usize, 2), got.turns);
+    try testing.expectEqualStrings(want.steps, got.steps);
+}
+
+test "a turn whose stream no longer matches after a cut keeps fx's view in its fresh copy to the commit" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const user: types.UserTurn = .{ .text = @constCast("work") };
+    // The cut takes the one streamed step, so the copy starts with the user
+    // piece only, a prefix of the whole turn too; the later writes still
+    // keep to the view, and the commit supersedes nothing more.
+    const id = try writeCutCopy(&t, a, user, true);
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, superseded_type));
+
+    const reference_id = try writeSupersededReference(&t, a, user);
+    defer testing.allocator.free(reference_id);
+    const got = try restoredKept(&t, a, id);
+    const want = try restoredKept(&t, a, reference_id);
+    try testing.expectEqual(@as(usize, 2), got.turns);
+    try testing.expectEqualStrings(want.steps, got.steps);
 }
 
 fn expectLines(expected: []const []const u8, actual: []const []const u8) !void {
