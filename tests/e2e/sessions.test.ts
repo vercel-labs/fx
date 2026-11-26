@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -221,7 +221,7 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
 function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
     cwd,
-    env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+    env: fxChildEnv(env(fixture, gateway)) as Record<string, string>,
     stdio: "ignore",
   });
   const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -251,7 +251,7 @@ function askWithSizeLimit(fixture: Fixture, gateway: any, blocks: number, args: 
     const child = spawn(
       "/bin/sh",
       ["-c", `trap '' XFSZ; ulimit -f ${blocks}; exec "$0" "$@"`, FX_BIN, "ask", "--json", "--auto", ...args],
-      { cwd: fixture.workspace, env: { ...process.env, ...env(fixture, gateway) } as Record<string, string> },
+      { cwd: fixture.workspace, env: fxChildEnv(env(fixture, gateway)) as Record<string, string> },
     );
     let stdout = "";
     let stderr = "";
@@ -570,6 +570,47 @@ test("fx ask sends the turn's request while its start capture runs, and saves th
   }
 }, TIMEOUT);
 
+test("fx started by runFx or spawnAsk ignores a start capture hold left in the developer's environment, with experimental.workspace_capture", async () => {
+  const fixture = createFixture("fx-v2-capture-inherited-hold-");
+  makeCaptureRepository(fixture);
+  enableWorkspaceCapture(fixture);
+  const held = join(fixture.root, "inherited-held");
+  const release = join(fixture.root, "inherited-release");
+  // The release comes with the first request, so an fx that takes the hold
+  // still finishes and leaves its marker behind.
+  const gateway = startDynamicFakeGateway(() => {
+    writeFileSync(release, "");
+    return fakeGatewayFinalText("DONE");
+  });
+  const before = {
+    held: process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD,
+    release: process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE,
+  };
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = held;
+  process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = release;
+  try {
+    const run = await runFx(["ask", "--json", "--auto", "First."], { cwd: fixture.workspace, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+    const runHeld = existsSync(held);
+    rmSync(held, { force: true });
+    const { exited } = spawnAsk(fixture, gateway, ["Second."]);
+    const spawnedCode = await exited;
+    expect({
+      runFx: { code: run.code, held: runHeld },
+      spawnAsk: { code: spawnedCode, held: existsSync(held) },
+    }).toEqual({
+      runFx: { code: 0, held: false },
+      spawnAsk: { code: 0, held: false },
+    });
+  } finally {
+    if (before.held === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_HELD = before.held;
+    if (before.release === undefined) delete process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE;
+    else process.env.FX_TEST_WORKSPACE_CAPTURE_START_RELEASE = before.release;
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("fx ask killed while its start capture is held keeps the prompt, and the resumed turn records its own captures, with experimental.workspace_capture", async () => {
   const fixture = createFixture("fx-v2-capture-kill-");
   makeCaptureRepository(fixture);
@@ -589,7 +630,7 @@ test("fx ask killed while its start capture is held keeps the prompt, and the re
   try {
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "Before the kill."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), FX_TEST_WORKSPACE_CAPTURE_START_HELD: held, FX_TEST_WORKSPACE_CAPTURE_START_RELEASE: release }) as Record<string, string>,
       stdio: "ignore",
     });
     const exited = new Promise((resolve) => child.on("exit", resolve));
@@ -1160,7 +1201,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
 
     const child = spawn(FX_BIN, ["ask", "--json", "--auto", "--resume", id, "This turn is killed."], {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
+      env: fxChildEnv(env(fixture, gateway)) as Record<string, string>,
       stdio: "ignore",
     });
     await reachedStall;
@@ -2863,7 +2904,7 @@ class AcpRpc {
       : ["/bin/sh", ["-c", `trap '' XFSZ; ulimit -f ${limitBlocks}; exec "$0" "$@"`, FX_BIN, "acp"]];
     this.proc = spawn(command, args, {
       cwd: fixture.workspace,
-      env: { ...process.env, ...env(fixture, gateway), ...extraEnv } as Record<string, string>,
+      env: fxChildEnv({ ...env(fixture, gateway), ...extraEnv }) as Record<string, string>,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exited = new Promise((resolve) => this.proc.on("exit", (code) => resolve(code)));

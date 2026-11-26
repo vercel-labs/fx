@@ -19,7 +19,7 @@ import {
 import { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { latestTraceReportPath, readTraceReport } from "./trace-report";
-import { envWithoutFxHome, FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, fxChildEnv, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
   AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
@@ -250,7 +250,7 @@ test("fx killed while a compaction's write holds its records resumes the session
   const f = compactionRaceFixture("compaction-commit-kill");
   try {
     const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
-      cwd: f.root.workspace, env: { ...envWithoutFxHome(), ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      cwd: f.root.workspace, env: fxChildEnv(f.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
     expect(await f.waitFor(() => existsSync(`${f.heldMarker}.1`), 40_000)).toBe(true);
     // fx dies while the compaction's write holds its records: neither the
@@ -275,7 +275,7 @@ test("fx killed while a compaction's write holds its records resumes the session
 test("fx told to quit while a compaction's write is held and a subagent's waits behind it exits without a panic", async () => {
   const f = compactionRaceFixture("compaction-commit-term");
   const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
-    cwd: f.root.workspace, env: { ...envWithoutFxHome(), ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    cwd: f.root.workspace, env: fxChildEnv(f.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   const stderr = new Response(proc.stderr).text();
   try {
@@ -4968,7 +4968,7 @@ describe("gateway stream lifecycle", () => {
       const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model, FX_SOUND: "0" };
       const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", "Read notes.txt and say what it holds."], {
         cwd: root.workspace,
-        env: { ...process.env, ...env },
+        env: fxChildEnv(env),
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -5165,7 +5165,7 @@ describe("gateway stream lifecycle", () => {
       const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model, FX_SOUND: "0" };
       const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", "$notes-workflow check the notes."], {
         cwd: root.workspace,
-        env: { ...process.env, ...env },
+        env: fxChildEnv(env),
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -8290,11 +8290,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         "Run both terminal commands.",
       ], {
         cwd: root.workspace,
-        env: {
-          ...envWithoutFxHome(),
+        env: fxChildEnv({
           ...fixtureEnv(root, gateway, tracePath),
           FX_AUTO_UPGRADE: "0",
-        },
+        }),
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -8382,11 +8381,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       "Run the active command fixture.",
     ], {
       cwd: root.workspace,
-      env: {
-        ...envWithoutFxHome(),
+      env: fxChildEnv({
         ...fixtureEnv(root, gateway, tracePath),
         FX_AUTO_UPGRADE: "0",
-      },
+      }),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -13018,7 +13016,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_SOUND: "0" };
       const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Answer briefly."], {
         cwd: root.workspace,
-        env: { ...process.env, ...env },
+        env: fxChildEnv(env),
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -15628,7 +15626,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const env = { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" };
       const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "Read notes.txt."], {
         cwd: root.workspace,
-        env: { ...process.env, ...env },
+        env: fxChildEnv(env),
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -16446,7 +16444,7 @@ async function runStartGap(label: string, options: { releaseWhenWaiting: boolean
       // fx is told to quit while main's message waits for the start, which
       // nothing lets go.
       const proc = Bun.spawn([FX_BIN, "ask", "--json", "--full-access", "Start the worker and tell it one more thing."], {
-        cwd: root.workspace, env: { ...process.env, ...env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        cwd: root.workspace, env: fxChildEnv(env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       const stderr = new Response(proc.stderr).text();
       const waited = await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
