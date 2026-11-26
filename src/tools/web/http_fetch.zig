@@ -1,7 +1,9 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
-const select_watch = @import("../../core/shared/select_watch.zig");
+const open_job = @import("../../core/shared/open_job.zig");
+const test_markers = @import("../../core/shared/test_markers.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -337,65 +339,146 @@ fn isRedirectStatus(status: std.http.Status) bool {
 fn resolveDefault(_: *anyopaque, alloc: Allocator, host: []const u8, port: u16, options: FetchOptions) anyerror![]IpAddress {
     try checkControl(options);
     const host_name = try std.Io.net.HostName.init(host);
-    if (options.deadline) |deadline| return resolveWithDeadline(alloc, host_name, port, deadline, options);
+    if (options.deadline != null or options.cancel_flag != null) {
+        return resolveWithDeadline(alloc, host_name, port, options.deadline, options);
+    }
     return collectLookup(alloc, host_name, port, options);
 }
 
-const ResolveSelect = union(enum) {
-    lookup: anyerror![]IpAddress,
-    watch: std.Io.Cancelable!select_watch.Outcome,
-};
+const resolve_poll_ms: i64 = 2;
 
-/// Ends a DNS lookup's watch when the hop deadline passes. Cancellation is
-/// checked by the lookup itself. See `select_watch` for why the resolver stops
-/// the watch instead of cancelling it.
-const ResolveCondition = struct {
-    deadline: Deadline,
+const LookupFn = *const fn (?*anyopaque, Allocator, std.Io.net.HostName, u16) anyerror![]IpAddress;
 
-    pub fn cancelled(_: ResolveCondition) bool {
-        return false;
+const ResolveJob = struct {
+    handoff: open_job.Handoff = .{},
+    host_copy: []u8,
+    port: u16,
+    lookup_fn: LookupFn,
+    lookup_ctx: ?*anyopaque,
+    on_destroy: ?*std.Io.Event = null,
+    result: anyerror![]IpAddress = error.Timeout,
+
+    fn start(
+        host_name: std.Io.net.HostName,
+        port: u16,
+        lookup_fn: LookupFn,
+        lookup_ctx: ?*anyopaque,
+        on_destroy: ?*std.Io.Event,
+    ) !*ResolveJob {
+        const gpa = std.heap.c_allocator;
+        const job = try gpa.create(ResolveJob);
+        errdefer gpa.destroy(job);
+        const host_copy = try gpa.dupe(u8, host_name.bytes);
+        errdefer gpa.free(host_copy);
+        job.* = .{
+            .host_copy = host_copy,
+            .port = port,
+            .lookup_fn = lookup_fn,
+            .lookup_ctx = lookup_ctx,
+            .on_destroy = on_destroy,
+        };
+        // Detached thread: std.Io cannot cancel an uninterruptible or
+        // EINTR-retrying getaddrinfo, so the caller must walk away without
+        // joining (`tests/tla/web_fetch_dns/WebFetchDns.tla` CancelIsPrompt).
+        const thread = try std.Thread.spawn(.{}, run, .{job});
+        thread.detach();
+        return job;
     }
 
-    pub fn expired(condition: ResolveCondition, _: std.Io) bool {
-        return monotonicMillis() >= condition.deadline.deadline_ms;
+    fn run(self: *ResolveJob) void {
+        const host_name = std.Io.net.HostName.init(self.host_copy) catch |err| {
+            self.result = err;
+            self.publishOrFree();
+            return;
+        };
+        self.result = self.lookup_fn(self.lookup_ctx, std.heap.c_allocator, host_name, self.port);
+        self.publishOrFree();
+    }
+
+    fn publishOrFree(self: *ResolveJob) void {
+        // After `.hand_over`, the caller may free `self` at any moment, so the
+        // job must not touch `self` again.
+        switch (self.handoff.publish()) {
+            .hand_over => {},
+            .close_late => self.destroy(),
+        }
+    }
+
+    fn destroy(self: *ResolveJob) void {
+        const done_signal = self.on_destroy;
+        if (self.result) |addrs| std.heap.c_allocator.free(addrs) else |_| {}
+        std.heap.c_allocator.free(self.host_copy);
+        std.heap.c_allocator.destroy(self);
+        if (done_signal) |ev| ev.set(io_mod.getIo());
     }
 };
 
-const ResolveWatch = select_watch.Watch(ResolveCondition);
+fn defaultLookupJob(_: ?*anyopaque, alloc: Allocator, host_name: std.Io.net.HostName, port: u16) anyerror![]IpAddress {
+    // Detached from the caller's turn: read no caller-owned cancel_flag or
+    // deadline (`tests/tla/web_fetch_dns/WebFetchDns.tla` NoUseAfterReturn).
+    return collectLookup(alloc, host_name, port, .{});
+}
 
-fn resolveWithDeadline(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, deadline: Deadline, options: FetchOptions) anyerror![]IpAddress {
+fn resolveWithDeadline(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, deadline: ?Deadline, options: FetchOptions) anyerror![]IpAddress {
+    return resolveWithDeadlineUsing(alloc, host_name, port, deadline, options, defaultLookupJob, null, null);
+}
+
+fn resolveWithDeadlineUsing(
+    alloc: Allocator,
+    host_name: std.Io.net.HostName,
+    port: u16,
+    deadline: ?Deadline,
+    options: FetchOptions,
+    lookup_fn: LookupFn,
+    lookup_ctx: ?*anyopaque,
+    on_destroy: ?*std.Io.Event,
+) anyerror![]IpAddress {
+    try checkControl(options);
+    if (deadline) |limit| if (monotonicMillis() >= limit.deadline_ms) return error.Timeout;
     const zio = io_mod.getIo();
-    var watch: ResolveWatch = .{};
-    var select_buffer: [2]ResolveSelect = undefined;
-    var select: std.Io.Select(ResolveSelect) = .init(zio, &select_buffer);
-
-    try select.concurrent(.watch, ResolveWatch.run, .{ &watch, zio, ResolveCondition{ .deadline = deadline } });
-    select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options }) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const result = select.await() catch |err| {
-        watch.stop(zio);
-        cancelResolveSelect(alloc, &select);
-        return err;
-    };
-    switch (result) {
-        .lookup => |lookup_result| {
-            watch.finish(&select);
-            return lookup_result;
-        },
-        // getaddrinfo cannot be stopped any other way, so the lookup is cancelled.
-        .watch => |watch_result| {
-            cancelResolveSelect(alloc, &select);
-            _ = try watch_result;
-            return error.Timeout;
-        },
+    const job = try ResolveJob.start(host_name, port, lookup_fn, lookup_ctx, on_destroy);
+    var task_cancelled = false;
+    while (true) {
+        if (task_cancelled) return walkAwayResolve(job, error.Canceled);
+        if (options.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+            return walkAwayResolve(job, error.Canceled);
+        };
+        if (deadline) |limit| if (monotonicMillis() >= limit.deadline_ms) {
+            return walkAwayResolve(job, error.Timeout);
+        };
+        switch (job.handoff.poll()) {
+            .take => {
+                defer job.destroy();
+                const addrs = try job.result;
+                return try alloc.dupe(IpAddress, addrs);
+            },
+            .wait => {
+                zio.sleep(.fromMilliseconds(resolve_poll_ms), .awake) catch |err| switch (err) {
+                    error.Canceled => task_cancelled = true,
+                };
+            },
+        }
     }
+}
+
+fn walkAwayResolve(job: *ResolveJob, err: anyerror) anyerror {
+    switch (job.handoff.stop()) {
+        .walk_away => {},
+        .close_handed => job.destroy(),
+    }
+    return err;
+}
+
+fn dnsTestHold() void {
+    if (comptime build_options.libfx) return;
+    const ready_path = io_mod.getenvAbsolutePath("FX_TEST_WEB_FETCH_DNS_READY") orelse return;
+    const release_path = io_mod.getenvAbsolutePath("FX_TEST_WEB_FETCH_DNS_RELEASE") orelse return;
+    test_markers.pauseUntilRelease(ready_path, "dns_ready", release_path);
 }
 
 fn collectLookup(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, options: FetchOptions) anyerror![]IpAddress {
     try checkControl(options);
+    dnsTestHold();
     const zio = io_mod.getIo();
     var lookup_buffer: [64]std.Io.net.HostName.LookupResult = undefined;
     var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
@@ -415,16 +498,6 @@ fn collectLookup(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, op
     try checkControl(options);
     if (addresses.items.len == 0) return error.NoAddressReturned;
     return addresses.toOwnedSlice(alloc);
-}
-
-fn cancelResolveSelect(alloc: Allocator, select: *std.Io.Select(ResolveSelect)) void {
-    while (select.cancel()) |item| switch (item) {
-        .lookup => |lookup_result| {
-            const addresses = lookup_result catch continue;
-            alloc.free(addresses);
-        },
-        .watch => {},
-    };
 }
 
 const Dialer = struct {
@@ -4159,4 +4232,127 @@ fn readFuzzResponse(alloc: Allocator, wire: []const u8, splits: []const usize, c
 fn expectEqualOptionalStrings(expected: ?[]const u8, actual: ?[]const u8) !void {
     if (expected) |value| return std.testing.expectEqualStrings(value, actual orelse return error.TestExpectedEqual);
     try std.testing.expect(actual == null);
+}
+
+test "web_fetch resolveDefault resolves localhost without cancel" {
+    const alloc = std.testing.allocator;
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    var ctx: u8 = 0;
+    const addresses = try resolveDefault(&ctx, alloc, "localhost", 443, .{
+        .deadline = .{ .deadline_ms = monotonicMillis() + 5_000 },
+        .cancel_flag = &cancel_flag,
+    });
+    defer alloc.free(addresses);
+    try std.testing.expect(addresses.len > 0);
+}
+
+test "web_fetch resolveWithDeadline ends with Timeout when deadline expires without cancel" {
+    const alloc = std.testing.allocator;
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    const host_name = try std.Io.net.HostName.init("localhost");
+    try std.testing.expectError(error.Timeout, resolveWithDeadline(alloc, host_name, 443, .{
+        .deadline_ms = monotonicMillis() - 1,
+    }, .{
+        .cancel_flag = &cancel_flag,
+    }));
+}
+
+test "web_fetch ResolveJob walks away on cancel and late lookup frees its own result" {
+    const FakeLookup = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn run(raw: ?*anyopaque, alloc: Allocator, _: std.Io.net.HostName, port: u16) anyerror![]IpAddress {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.started.set(io_mod.getIo());
+            self.release.waitUncancelable(io_mod.getIo());
+            const out = try alloc.alloc(IpAddress, 1);
+            out[0] = .{ .ip4 = .loopback(port) };
+            return out;
+        }
+    };
+    var fake = FakeLookup{};
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    var destroyed: std.Io.Event = .unset;
+    const host_name = try std.Io.net.HostName.init("example.com");
+
+    const CancelStarter = struct {
+        fn run(f: *FakeLookup, flag: *std.atomic.Value(bool)) void {
+            f.started.waitUncancelable(io_mod.getIo());
+            flag.store(true, .seq_cst);
+        }
+    };
+    const trigger = try std.Thread.spawn(.{}, CancelStarter.run, .{ &fake, &cancel_flag });
+    defer trigger.join();
+
+    var caller_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    try std.testing.expectError(error.Canceled, resolveWithDeadlineUsing(
+        caller_arena.allocator(),
+        host_name,
+        443,
+        .{ .deadline_ms = monotonicMillis() + 30_000 },
+        .{ .cancel_flag = &cancel_flag },
+        FakeLookup.run,
+        &fake,
+        &destroyed,
+    ));
+    // Caller frees its arena before the lookup thread finishes.
+    caller_arena.deinit();
+
+    fake.release.set(io_mod.getIo());
+    destroyed.waitUncancelable(io_mod.getIo());
+}
+
+test "web_fetch ResolveJob frees result when lookup finishes just as cancel arrives" {
+    const InstantLookup = struct {
+        fn run(_: ?*anyopaque, alloc: Allocator, _: std.Io.net.HostName, port: u16) anyerror![]IpAddress {
+            const out = try alloc.alloc(IpAddress, 1);
+            out[0] = .{ .ip4 = .loopback(port) };
+            return out;
+        }
+    };
+    const host_name = try std.Io.net.HostName.init("example.com");
+    const job = try ResolveJob.start(host_name, 443, InstantLookup.run, null, null);
+    while (job.handoff.poll() != .take) {
+        try std.Thread.yield();
+    }
+    try std.testing.expectEqual(error.Canceled, walkAwayResolve(job, error.Canceled));
+}
+
+test "web_fetch ResolveJob enforces deadline without cancel and resolveDefault routes cancel_flag with null deadline" {
+    const SlowLookup = struct {
+        release: std.Io.Event = .unset,
+
+        fn run(raw: ?*anyopaque, alloc: Allocator, _: std.Io.net.HostName, port: u16) anyerror![]IpAddress {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.release.waitUncancelable(io_mod.getIo());
+            const out = try alloc.alloc(IpAddress, 1);
+            out[0] = .{ .ip4 = .loopback(port) };
+            return out;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const host_name = try std.Io.net.HostName.init("example.com");
+    var slow = SlowLookup{};
+    var destroyed: std.Io.Event = .unset;
+    var cancel_flag: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectError(error.Timeout, resolveWithDeadlineUsing(
+        alloc,
+        host_name,
+        443,
+        .{ .deadline_ms = monotonicMillis() + 10 },
+        .{ .cancel_flag = &cancel_flag },
+        SlowLookup.run,
+        &slow,
+        &destroyed,
+    ));
+    slow.release.set(io_mod.getIo());
+    destroyed.waitUncancelable(io_mod.getIo());
+
+    var ctx: u8 = 0;
+    cancel_flag.store(true, .seq_cst);
+    try std.testing.expectError(error.Canceled, resolveDefault(&ctx, alloc, "example.com", 443, .{
+        .deadline = null,
+        .cancel_flag = &cancel_flag,
+    }));
 }

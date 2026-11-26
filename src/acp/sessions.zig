@@ -3161,6 +3161,29 @@ const test_session_mode_registry = mode_registry.Registry{
     .modes = test_session_modes[0..],
 };
 
+/// AI Gateway's catalog with a fetch that fails at once, as on a runner with
+/// no network. Session requests in these tests still refresh the catalog,
+/// but never reach AI Gateway (R7.3), and no load outlives its test.
+const OfflineTestCatalog = struct {
+    var fetch_count = std.atomic.Value(usize).init(0);
+
+    fn fetch(_: ?*anyopaque, _: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        _ = fetch_count.fetchAdd(1, .monotonic);
+        return .{ .failure = .{ .category = .transport } };
+    }
+};
+
+const acp_session_test_bundle = bundle: {
+    var catalog = test_builtin_gateway.model_catalog_provider;
+    catalog.fetch_fn = OfflineTestCatalog.fetch;
+    // A catalog that reports no connection loads on the caller's thread
+    // (`CapabilityResolver.loadWithin`).
+    catalog.reports_connection = false;
+    var gateway_bundle = test_builtin_gateway.provider_bundle;
+    gateway_bundle.model_catalog = catalog;
+    break :bundle gateway_bundle;
+};
+
 fn acpSessionTestConfig() server.Config {
     return .{
         .default_model = "test/model",
@@ -3169,7 +3192,7 @@ fn acpSessionTestConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1/unused",
         .gateway_models_path = "/v1/models",
         .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
+        .provider_set = provider_set.gateway_only(acp_session_test_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -3211,6 +3234,42 @@ fn initAcpSessionTestState(
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
+}
+
+test "ACP session tests refresh the model catalog without AI Gateway" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-output.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+    var msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    const fetches_before = OfflineTestCatalog.fetch_count.load(.monotonic);
+    try handleNewSession(&state, arena, &msg);
+
+    try std.testing.expectEqual(fetches_before + 1, OfflineTestCatalog.fetch_count.load(.monotonic));
+    try std.testing.expectEqual(
+        @as(?model_catalog.FailureCategory, .transport),
+        state.capability_resolver.downFailure(),
+    );
 }
 
 test "ACP project MCP loading expands workspace environment templates" {
