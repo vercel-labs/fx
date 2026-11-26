@@ -18,8 +18,10 @@
 // three with a window small enough to compact. Planted changes to a kept run
 // must be rejected, and a run without decisions is no evidence at all. With
 // FX_TLA_BASE_BIN set, the long turn and the compacting turn also run on that
-// binary, untraced: the report compares the CPU time both spent, and both
-// must leave the same log.
+// binary, untraced: the report compares the CPU time both spent, and the
+// compacting turn must leave the same log on both. A base binary from before
+// the log saved the steps a cut summarized (D87) writes the turn again after
+// each cut, so its log has superseded markers and that check fails there.
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -454,7 +456,8 @@ test(`a ${STRESS_STEPS}-step turn is a behavior of TurnStream, and no rebuild re
 // of the session log (D87). fx's own trace must show that every stream still
 // stood across the cuts and nothing was reparsed, and the turn must end with
 // every result in order and no superseded marker. TLC replays it too. With
-// FX_TLA_BASE_BIN set, that binary must leave the same log.
+// FX_TLA_BASE_BIN set, that binary must leave the same log, which a binary
+// from before D87 does not (see the top of this file).
 test("a turn that compacts mid-turn keeps every result in its log, supersedes nothing, and never reparses", async () => {
   const run = await runTurn(compaction, binary, true);
   expectFinishedTurn(run);

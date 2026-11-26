@@ -1434,13 +1434,9 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
   test("auto: the calls after an in-turn compaction draw below its line, and share one row after resume", async () => {
     const { liveRows, resumedRows } = await readAroundNotice("auto");
     expect(liveRows).toEqual(compactedRows);
-    // This compaction folds the turn's first step into its summary. Whether
-    // resume draws that step is not what this test checks: the calls share
-    // one row.
-    expect(resumedRows).toHaveLength(3);
-    expect(resumedRows[0]).toBe(`┃ ${NOTICE_PROMPT}`);
-    expect(resumedRows[1]).toMatch(/^● Read (?:a\.txt, )?b\.txt, c\.txt$/);
-    expect(resumedRows[2]).toBe(`  ${NOTICE_DONE}`);
+    // This compaction folds the turn's first step into its summary. The log
+    // still saves that step (D87), so resume draws it in the shared row.
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
   }, 120_000);
 
   test("provider error: the calls after the reason fx showed while it waited draw below it, and share one row after resume", async () => {
