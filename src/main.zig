@@ -7713,6 +7713,7 @@ test "the footer indicator names the agent on screen and the key that opens the 
 
 test "an open_agent_list key that opens no list says why in the trace" {
     const alloc = std.testing.allocator;
+    const agent_test_support = @import("core/agent/runtime/tests/support.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -7741,16 +7742,10 @@ test "an open_agent_list key that opens no list says why in the trace" {
     try sendTerminalBytes(&app, "\x18");
     debug_trace.shutdown();
 
-    const trace = try readTraceFileForTest(alloc, trace_path);
+    const trace = try agent_test_support.readTraceFile(alloc, trace_path, 8192);
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=no_other_agent") != null);
     try std.testing.expect(std.mem.find(u8, trace, "open_agent_list refused reason=full_transcript") != null);
-}
-
-fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, 8192);
 }
 
 /// What the tests of a subagent's end build: an app that writes its tab title
