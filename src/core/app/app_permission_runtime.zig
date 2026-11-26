@@ -341,7 +341,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn selectMode(app: *App, agent: *AppAgent, mode: types.PermissionMode) !void {
             setMode(app, agent, mode);
             if (comptime @hasDecl(App, "persistAcceptedPermissionMode")) {
-                try app.persistAcceptedPermissionMode(mode);
+                if (!isSubagent(app, agent)) try app.persistAcceptedPermissionMode(mode);
             }
             try finalizeModePreference(app);
         }
@@ -456,6 +456,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn persistModePreference(app: *App) !void {
+            // A subagent's mode applies to that subagent only; the saved
+            // preference is the next session's default.
+            if (isSubagent(app, agents.screenAgentOf(app))) return;
             const mode = currentMode(app);
             if (comptime @hasDecl(App, "persistPermissionModePreference")) {
                 try app.persistPermissionModePreference(mode);
@@ -736,4 +739,60 @@ test "app_permission_runtime reset clears grants before syncing permission state
     try std.testing.expectEqual(@as(?types.PermissionMode, .ask), snapshot.synced_state_mode);
     try std.testing.expectEqual(@as(usize, 0), snapshot.synced_state_grant_count);
     try std.testing.expectEqual(@as(usize, 1), snapshot.state_sync_count);
+}
+
+const SubagentScreenAgent = struct {
+    permission_mode: ?types.PermissionMode = null,
+    child_run: ?struct {
+        child_id: []const u8 = "child",
+        authority_resolver: struct {
+            fn currentMode(_: @This(), _: std.mem.Allocator, _: []const u8) !types.PermissionMode {
+                return .ask;
+            }
+        } = .{},
+        admission: struct { permission_mode: types.PermissionMode = .ask } = .{},
+    } = null,
+    worker: TestWorker = .{},
+};
+
+const SubagentScreenApp = struct {
+    alloc: std.mem.Allocator,
+    permission_engine: permissions.PermissionEngine = .{},
+    permission_state: State = .{},
+    main_agent: SubagentScreenAgent = .{},
+    sub_agent: SubagentScreenAgent = .{},
+    screen_owner: ?*SubagentScreenAgent = null,
+    shell: struct {
+        render_requests: render_request.RenderRequestState = .{},
+    } = .{},
+    permission_mode_preference_commit_count: usize = 0,
+    last_preference_permission_mode: ?types.PermissionMode = null,
+
+    pub fn persistPermissionModePreference(self: *SubagentScreenApp, mode: types.PermissionMode) !void {
+        self.permission_mode_preference_commit_count += 1;
+        self.last_preference_permission_mode = mode;
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
+};
+
+test "app_permission_runtime a subagent screen's mode change is not saved as the preference" {
+    var app = SubagentScreenApp{ .alloc = std.testing.allocator };
+    defer app.permission_engine.deinit(app.alloc);
+    const Rt = Runtime(SubagentScreenApp);
+
+    app.screen_owner = &app.sub_agent;
+    try Rt.selectMode(&app, &app.sub_agent, .yolo);
+    try std.testing.expectEqual(types.PermissionMode.yolo, Rt.modeOf(&app, &app.sub_agent));
+    try std.testing.expectEqual(types.PermissionMode.ask, Rt.modeOf(&app, &app.main_agent));
+    try Rt.toggleMode(&app, &app.sub_agent);
+    try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.screen_owner = &app.main_agent;
+    try Rt.selectMode(&app, &app.main_agent, .auto);
+    try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
+    try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.last_preference_permission_mode);
 }
