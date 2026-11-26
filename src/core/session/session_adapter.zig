@@ -2755,15 +2755,18 @@ pub const Session = struct {
         execution: types.ExecutionMemory,
         running: Running,
     ) !void {
-        return self.appendProgressWithRecord(user, execution, running, .keep);
+        return self.appendProgressWithRecord(user, execution, null, running, .keep);
     }
 
-    /// `appendProgress`, with the recovery module's record for the send this
-    /// write goes before (`recovery_type`).
+    /// `appendProgress`, with the whole turn as `saved_execution` once a
+    /// compaction inside it cut steps out of `execution`, fx's view (D87),
+    /// and the recovery module's record for the send this write goes before
+    /// (`recovery_type`). The log streams the whole turn.
     pub fn appendProgressWithRecord(
         self: *Session,
         user: types.UserTurn,
         execution: types.ExecutionMemory,
+        saved_execution: ?types.ExecutionMemory,
         running: Running,
         record: types.RecoveryRecordWrite,
     ) !void {
@@ -2774,10 +2777,11 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id, .input_id = user.input_id } });
+        const whole = saved_execution orelse execution;
         // A result's blob needs the turn on disk first (D44).
-        if (storesBodies(execution)) try self.openTurnLocked(self.capture_turn);
+        if (storesBodies(whole)) try self.openTurnLocked(self.capture_turn);
         // On a missing handle the list keeps the pieces before it.
-        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
+        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, whole)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
             else => return err,
         };
@@ -8556,7 +8560,7 @@ test "a send's record rides with the turn's first write, and a reopen finds the 
     const user: types.UserTurn = .{ .text = @constCast("go") };
     // Nothing is written until the turn's first pieces are.
     try testing.expect(!try s.saveRecovery(.{ .save = @splat(0x11) }));
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x22) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x22) });
     try testing.expect(try s.saveRecovery(.{ .save = @splat(0x33) }));
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);
@@ -8609,7 +8613,7 @@ test "a cleared record leaves the turn resumable without one" {
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
     const user: types.UserTurn = .{ .text = @constCast("run it") };
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x44) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x44) });
     // The response arrived: its tool call runs with no request in flight.
     try testing.expect(try s.saveRecovery(.clear));
     const call: types.ToolCall = .{ .id = "call_1", .name = "bash", .arguments_json = "{}" };
@@ -8662,7 +8666,7 @@ test "a yielded turn is found as yielded, and a later piece clears it" {
     const user: types.UserTurn = .{ .text = @constCast("work") };
     // Nothing is open yet, so nothing is marked.
     try testing.expect(!try s.markYielded());
-    try s.appendProgressWithRecord(user, .{}, .{}, .{ .save = @splat(0x55) });
+    try s.appendProgressWithRecord(user, .{}, null, .{}, .{ .save = @splat(0x55) });
     try testing.expect(try s.saveRecovery(.{ .save = @splat(0x66) }));
     try testing.expect(try s.markYielded());
     const id = try testing.allocator.dupe(u8, s.id());
@@ -10553,7 +10557,7 @@ test "workspace capture: a recovery record is not saved into a failed turn left 
     try leaveStaleTurn(s, &failing);
     // The host takes the record with the fresh turn's first write instead.
     try testing.expect(!try s.saveRecovery(.{ .save = @splat(7) }));
-    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, .{}, .{ .save = @splat(7) });
+    try s.appendProgressWithRecord(.{ .text = @constCast("two") }, .{}, null, .{}, .{ .save = @splat(7) });
     try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, s.id(), superseded_type));
     try testing.expect(s.turn_open and !s.turn_stale);
 }

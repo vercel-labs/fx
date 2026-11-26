@@ -88,12 +88,6 @@ pub const TurnFinalizationGuard = struct {
         return self.withTurnRecords(execution);
     }
 
-    /// What the session log streams of this turn: `savedExecution`, or
-    /// `persistedExecution` when nothing was cut.
-    pub fn loggedExecution(self: *TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
-        return self.savedExecution(execution) orelse try self.persistedExecution(arena, execution);
-    }
-
     fn withTurnRecords(self: *TurnFinalizationGuard, execution: types.ExecutionMemory) types.ExecutionMemory {
         for (self.model_calls.items[self.stamped_model_calls..]) |*record| {
             record.after_tool_step_count = execution.tool_steps.len;

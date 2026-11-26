@@ -4325,10 +4325,11 @@ fn persistPromptBeforeCapture(
     const arena = scratch.allocator();
     const saved = saved: {
         const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
-        const logged = finalization.loggedExecution(arena, execution) catch |err| break :saved err;
+        const projected = finalization.persistedExecution(arena, execution) catch |err| break :saved err;
         append(deps.ctx, .{
             .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
-            .execution = logged,
+            .execution = projected,
+            .saved_execution = finalization.savedExecution(execution),
         }) catch |err| break :saved err;
         return;
     };
@@ -4358,7 +4359,8 @@ fn appendRunningToolCalls(
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
         .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
-        .execution = try finalization.loggedExecution(arena, execution),
+        .execution = try finalization.persistedExecution(arena, execution),
+        .saved_execution = finalization.savedExecution(execution),
         .running_calls = running,
         .running_assistant = issuing.content,
     });
@@ -4516,7 +4518,7 @@ fn persistRecoveryCheckpointWithAction(
     const projected = try finalization.persistedExecution(arena, execution);
     const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
-    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = finalization.savedExecution(execution) orelse projected, .recovery_record = record });
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .saved_execution = finalization.savedExecution(execution), .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
