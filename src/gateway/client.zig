@@ -4591,9 +4591,9 @@ fn streamFailureCause(
 /// The finish a stream's error events give it. The code wins: an error event
 /// whose code, or HTTP status in place of one, classifies the failure makes
 /// the stream a provider error even when no finish followed it. A cyber
-/// policy block makes a missing, error, or content filter finish a provider
-/// error, so the block ends the turn instead of being resent as a content
-/// filter's is. A content filter block makes a missing or error finish a
+/// policy block makes any finish but a normal one a provider error, so the
+/// block ends the turn instead of being resent as a content filter's block
+/// or a reply cut at its length limit is. A content filter block makes a missing or error finish a
 /// content filter finish, so it reads like the provider's own. A stream
 /// timeout keeps its own path, an
 /// event with neither a code nor a usable status says nothing, and any other
@@ -4603,7 +4603,8 @@ fn finishFromErrorEvents(
     finish: ?types.ProviderFinishReason,
 ) ?types.ProviderFinishReason {
     const error_or_missing = finish == null or finish == .provider_error;
-    if (class == .cyber_policy and (error_or_missing or finish == .content_filter)) return .provider_error;
+    const normal_finish = finish == .stop or finish == .tool_calls;
+    if (class == .cyber_policy and !normal_finish) return .provider_error;
     if (class == .content_filter and error_or_missing) return .content_filter;
     if (finish != null) return finish;
     return switch (class) {
@@ -6520,6 +6521,27 @@ test "consumeSseStream keeps a cyber policy block through a content filter finis
         try std.testing.expectEqual(@as(?types.ProviderFinishReason, .content_filter), filtered.finish_reason);
         try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), filtered.provider_failure_cause);
     }
+}
+
+test "consumeSseStream keeps a cyber policy block through a length or unknown finish" {
+    const length_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"length\",\"raw\":\"max_tokens\"}}\n\n";
+    const other_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"other\",\"raw\":\"other\"}}\n\n";
+    for ([_][]const u8{
+        test_cyber_type_event ++ length_finish,
+        "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\n" ++ test_cyber_type_event ++ length_finish,
+        test_cyber_type_event ++ other_finish,
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("cyber_policy", @tagName(completion.provider_failure_cause.?));
+    }
+    // Without a cyber policy block, a length finish still decides.
+    var cut = try testStreamOutcome("data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\n" ++ length_finish);
+    defer deinitGatewayCompletion(std.testing.allocator, &cut);
+    try std.testing.expectEqual(@as(?types.ProviderFinishReason, .length), cut.finish_reason);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), cut.provider_failure_cause);
 }
 
 test "httpFailureKind names a cyber policy block in any HTTP error body" {

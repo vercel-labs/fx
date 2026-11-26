@@ -14474,6 +14474,32 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("cyber policy error event before a length finish ends the turn once under its own cause", async () => {
+    const root = createFixtureRoot("cyber-policy-then-length-finish");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      fakeGatewaySse([
+        { type: "text-delta", id: "t1", delta: "Looking at the binary." },
+        { type: "error", error: { type: "cyber_policy", message: cyberPolicyMessage } },
+        { type: "finish", finishReason: { unified: "length", raw: "max_tokens" } },
+      ])
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect the binary."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.recovery?.cause).toBe("cyber_policy");
+      expect(gateway.requestCount()).toBe(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("cyber policy error event before a content filter finish ends the turn once under its own cause", async () => {
     const root = createFixtureRoot("cyber-policy-then-content-filter-finish");
     const tracePath = join(root.root, "trace.log");
