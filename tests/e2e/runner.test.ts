@@ -1955,6 +1955,15 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
   const homeOf = (repo: string) => join(runRoot, "homes", basename(repo));
   const stateOf = (repo: string) => join(homeOf(repo), "sandbox", "state", keyOf(repo));
 
+  // Removes a repository, its copy in the fake sandbox, and its home on this Mac. The tests that write thousands of
+  // files call it in `finally`, under their own timeout: left to the describe's afterAll, those trees took 9.5 s
+  // on a loaded host, past Bun's 5 s hook timeout.
+  function discardRepo(repo: string): void {
+    rmSync(runner.api.remotePath(repo), { recursive: true, force: true });
+    rmSync(homeOf(repo), { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+
   function spawnRemote(
     repo: string,
     command: string,
@@ -2266,34 +2275,46 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
 
   test("past 2,000 files, the rest stay pending and the next run brings them back (V9)", async () => {
     const repo = makeRepo("cap");
-    const result = await runRemote(repo, "i=1; while [ $i -le 2005 ]; do echo $i > f$i.txt; i=$((i+1)); done");
-    expect(result.code).toBe(0);
-    expect(result.stderr).toBe(
-      `fx: 5 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`,
-    );
-    const next = await runRemote(repo, "true");
-    expect(next.stderr).toBe(ranLine(5));
-    expect(readFileSync(join(repo, "f2005.txt"), "utf8")).toBe("2005\n");
+    try {
+      const result = await runRemote(repo, "i=1; while [ $i -le 2005 ]; do echo $i > f$i.txt; i=$((i+1)); done");
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        `fx: 5 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`,
+      );
+      const next = await runRemote(repo, "true");
+      expect(next.stderr).toBe(ranLine(5));
+      expect(readFileSync(join(repo, "f2005.txt"), "utf8")).toBe("2005\n");
+    } finally {
+      discardRepo(repo);
+    }
   }, TIMEOUT * 4);
 
   test("AC-22: 2,001 new files: 2,000 come back, and N8 counts the one left for the next run (V9)", async () => {
     const repo = makeRepo("ac-22");
-    const result = await runRemote(repo, "i=1; while [ $i -le 2001 ]; do echo $i > f$i.txt; i=$((i+1)); done");
-    expect(result.code).toBe(0);
-    expect(result.stderr).toBe(
-      `fx: 1 file not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`,
-    );
-    expect(readdirSync(repo).filter((name) => /^f\d+\.txt$/.test(name))).toHaveLength(2000);
+    try {
+      const result = await runRemote(repo, "i=1; while [ $i -le 2001 ]; do echo $i > f$i.txt; i=$((i+1)); done");
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        `fx: 1 file not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`,
+      );
+      expect(readdirSync(repo).filter((name) => /^f\d+\.txt$/.test(name))).toHaveLength(2000);
+    } finally {
+      discardRepo(repo);
+    }
   }, TIMEOUT * 4);
 
   test("an include walk past its entry limit prints N20 once, and the run still goes on (V5, N20)", async () => {
     const repo = makeRepo("cut-walk");
-    mkdirSync(join(repo, "conf"));
-    for (let i = 0; i < 10_001; i++) writeFileSync(join(repo, "conf", `f${i}.txt`), "x");
-    const result = await spawnRemote(repo, "true", ["conf"]).result;
-    expect(result.code).toBe(0);
-    const note = "fx: the file list was cut short, so nothing was deleted in the sandbox\n";
-    expect(result.stderr.split(note).length - 1).toBe(1);
+    try {
+      mkdirSync(join(repo, "conf"));
+      for (let i = 0; i < 10_001; i++) writeFileSync(join(repo, "conf", `f${i}.txt`), "x");
+      const result = await spawnRemote(repo, "true", ["conf"]).result;
+      expect(result.code).toBe(0);
+      const note = "fx: the file list was cut short, so nothing was deleted in the sandbox\n";
+      expect(result.stderr.split(note).length - 1).toBe(1);
+    } finally {
+      discardRepo(repo);
+    }
   }, TIMEOUT * 4);
 
   test("an ignored file under a bring-back root comes back to the Mac (V9)", async () => {
@@ -2478,6 +2499,7 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     writeFileSync(lockPath, "", { mode: 0o600 });
     const holder = spawn("perl", ["-MFcntl=:flock", "-e", '$| = 1; open my $fh, ">>", $ARGV[0] or die; flock($fh, LOCK_EX) or die; print "locked\\n"; sleep 75;', lockPath], { stdio: ["ignore", "pipe", "ignore"] });
     children.push(holder);
+    const holderExit = new Promise<void>((resolve) => holder.once("exit", () => resolve()));
     await new Promise<void>((resolve) => {
       holder.stdout?.once("data", () => resolve());
       holder.once("exit", () => resolve());
@@ -2485,7 +2507,9 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     const timedOut = await run.result;
     expect(timedOut.stderr).not.toContain(ranLine(1));
     expect(existsSync(join(repo, "zig-out", "bin", "fx"))).toBe(false);
-    await new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+    // The bring-back has given up, so the holder lets go of the lock now instead of sleeping on to 75 s.
+    holder.kill("SIGKILL");
+    await holderExit;
     const next = await spawnRemote(repo, "true", [], ["zig-out/bin"]).result;
     expect(readFileSync(join(repo, "zig-out", "bin", "fx"), "utf8")).toBe("app\n");
     expect(next.stderr).toBe(ranLine(1));
@@ -2518,8 +2542,11 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
       "while [ ! -e .git/go ]; do sleep 0.05; done; echo a > a.txt; while [ ! -e .git/stop ]; do sleep 0.05; done; echo a2 > a.txt",
     );
     await waitFor(() => execsSince(before) >= 1);
-    const second = spawnRemote(repo, "while [ ! -e a.txt ]; do sleep 0.05; done; echo b > b.txt");
+    const second = spawnRemote(repo, ": > .git/started2; while [ ! -e a.txt ]; do sleep 0.05; done; echo b > b.txt");
     await waitFor(() => execsSince(before) >= 2);
+    // V9: a run's stamp is taken when its command starts. Run 2's command writes .git/started2 first, so its stamp is
+    // in place before run 1 writes a.txt, and that file belongs to run 2.
+    await waitFor(() => existsSync(join(sandboxRoot, ".git", "started2")));
     writeFileSync(join(sandboxRoot, ".git", "go"), "");
     const secondResult = await second.result;
     expect(secondResult.code).toBe(0);
@@ -2800,31 +2827,39 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
 
   test("a command that writes 3,000 files brings back 2,000 and defers 1,000, which the next run brings back (V9)", async () => {
     const repo = makeRepo("defer-cap");
-    const first = await runRemote(repo, "for i in $(seq 1 3000); do echo $i > f$i.txt; done");
-    expect(first.code).toBe(0);
-    expect(first.stderr).toBe(`fx: 1000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
-    expect(readdirSync(repo).filter((name) => name.endsWith(".txt"))).toHaveLength(2000);
-    const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
-    expect(manifest.pending_back).toHaveLength(1000);
-    const second = await runRemote(repo, "true");
-    expect(second.code).toBe(0);
-    expect(readdirSync(repo).filter((name) => name.endsWith(".txt"))).toHaveLength(3000);
-    expect(second.stderr).toBe(ranLine(1000));
+    try {
+      const first = await runRemote(repo, "for i in $(seq 1 3000); do echo $i > f$i.txt; done");
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe(`fx: 1000 files not brought back: past this run's limit of 2,000 files or 64 MiB; the next run brings them back\n${ranLine(2000)}`);
+      expect(readdirSync(repo).filter((name) => name.endsWith(".txt"))).toHaveLength(2000);
+      const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
+      expect(manifest.pending_back).toHaveLength(1000);
+      const second = await runRemote(repo, "true");
+      expect(second.code).toBe(0);
+      expect(readdirSync(repo).filter((name) => name.endsWith(".txt"))).toHaveLength(3000);
+      expect(second.stderr).toBe(ranLine(1000));
+    } finally {
+      discardRepo(repo);
+    }
   }, TIMEOUT * 6);
 
   test("a pending run with a big push still brings this run's own output back (V9)", async () => {
     const repo = makeRepo("pending-big-push");
-    expect((await runRemote(repo, "true")).code).toBe(0);
-    const stopping = spawnRemote(repo, "echo made > made.txt; sleep 30");
-    await waitFor(() => existsSync(join(runner.api.remotePath(repo), "made.txt")));
-    stopping.child.kill("SIGTERM");
-    expect((await stopping.result).code).toBe(143);
-    for (let index = 0; index < 2100; index++) writeFileSync(join(repo, `pushed-${index}.txt`), `${index}\n`);
-    const result = await runRemote(repo, "echo own > own.txt");
-    expect(result.code).toBe(0);
-    expect(readFileSync(join(repo, "own.txt"), "utf8")).toBe("own\n");
-    expect(readFileSync(join(repo, "made.txt"), "utf8")).toBe("made\n");
-    expect(result.stderr).toBe(ranLine(2));
+    try {
+      expect((await runRemote(repo, "true")).code).toBe(0);
+      const stopping = spawnRemote(repo, "echo made > made.txt; sleep 30");
+      await waitFor(() => existsSync(join(runner.api.remotePath(repo), "made.txt")));
+      stopping.child.kill("SIGTERM");
+      expect((await stopping.result).code).toBe(143);
+      for (let index = 0; index < 2100; index++) writeFileSync(join(repo, `pushed-${index}.txt`), `${index}\n`);
+      const result = await runRemote(repo, "echo own > own.txt");
+      expect(result.code).toBe(0);
+      expect(readFileSync(join(repo, "own.txt"), "utf8")).toBe("own\n");
+      expect(readFileSync(join(repo, "made.txt"), "utf8")).toBe("made\n");
+      expect(result.stderr).toBe(ranLine(2));
+    } finally {
+      discardRepo(repo);
+    }
   }, TIMEOUT * 6);
 
   test("a command that exits 125 itself still brings its files back (L6)", async () => {
@@ -3052,28 +3087,32 @@ describe("the built-in remote runner runs a command through the fake sandbox", (
     } finally {
       // The 16,000 files of this test are removed inside the test, under its own timeout. Left to the
       // describe's afterAll, their removal took 5.7 s on CI, past Bun's 5 s hook timeout.
-      rmSync(runner.api.remotePath(repo), { recursive: true, force: true });
-      rmSync(repo, { recursive: true, force: true });
+      discardRepo(repo);
     }
   }, TIMEOUT * 8);
 
   test("a pending name whose folder became a link in the sandbox brings back nothing from outside the repository (V9)", async () => {
     const repo = makeRepo("pending-link");
-    expect((await runRemote(repo, "mkdir -p d && for i in $(seq 1 2100); do : > d/f$i; done")).code).toBe(0);
-    const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
-    expect(manifest.pending_back.length).toBeGreaterThan(0);
-    const second = await runRemote(
-      repo,
-      "rm -rf d && mkdir -p /tmp/fx-link-target && for i in $(seq 1 2100); do echo leak > /tmp/fx-link-target/f$i; done && ln -s /tmp/fx-link-target d",
-    );
-    expect(second.code).toBe(0);
-    // The link `d` is itself a walked entry that is not a regular file, so it counts once more.
-    expect(second.stderr).toContain(`fx: ${manifest.pending_back.length + 1} files not brought back: not regular files`);
-    const after = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
-    expect(after.pending_back.filter((name) => manifest.pending_back.includes(name))).toEqual([]);
-    for (const name of manifest.pending_back) {
-      const path = join(repo, name);
-      expect(existsSync(path) && readFileSync(path, "utf8") === "leak\n").toBe(false);
+    try {
+      expect((await runRemote(repo, "mkdir -p d && for i in $(seq 1 2100); do : > d/f$i; done")).code).toBe(0);
+      const manifest = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
+      expect(manifest.pending_back.length).toBeGreaterThan(0);
+      const second = await runRemote(
+        repo,
+        "rm -rf d && mkdir -p /tmp/fx-link-target && for i in $(seq 1 2100); do echo leak > /tmp/fx-link-target/f$i; done && ln -s /tmp/fx-link-target d",
+      );
+      expect(second.code).toBe(0);
+      // The link `d` is itself a walked entry that is not a regular file, so it counts once more.
+      expect(second.stderr).toContain(`fx: ${manifest.pending_back.length + 1} files not brought back: not regular files`);
+      const after = JSON.parse(readFileSync(join(stateOf(repo), "manifest.json"), "utf8")) as { pending_back: string[] };
+      expect(after.pending_back.filter((name) => manifest.pending_back.includes(name))).toEqual([]);
+      for (const name of manifest.pending_back) {
+        const path = join(repo, name);
+        expect(existsSync(path) && readFileSync(path, "utf8") === "leak\n").toBe(false);
+      }
+    } finally {
+      discardRepo(repo);
+      rmSync("/tmp/fx-link-target", { recursive: true, force: true });
     }
   }, TIMEOUT * 4);
 
@@ -3123,9 +3162,11 @@ describe("a placed run's result through the host: the runner's lines pass throug
   }, TIMEOUT * 2);
 
   test("a host timeout on a placed run gives N7 once, and the runner's N5 line says the remote command was killed", async () => {
-    await withSandboxFixture(shellCall({ command: "sleep 30", runner: "remote", timeout_ms: 1000 }), async (fixture) => {
+    // The budget covers the push and setup as well as the command, so it is 5 s. The command sleeps for 30 s, far
+    // longer, so the timeout fires while it runs. The check below still needs exactly one N7 line.
+    await withSandboxFixture(shellCall({ command: "sleep 30", runner: "remote", timeout_ms: 5000 }), async (fixture) => {
       const texts = await askSandbox(fixture);
-      expect(texts.split("fx: timed out after 1000 ms").length - 1).toBe(1);
+      expect(texts.split("fx: timed out after 5000 ms").length - 1).toBe(1);
       expect(texts).toContain("fx: stopped; the remote command was killed");
       // AC-24: the timeout reaches the remote command as a graceful kill (signal 15) before the runner exits.
       expect(apiSince(fixture).some((entry) => entry.route === "kill" && (entry.body as { signal?: number } | null)?.signal === 15)).toBe(true);
@@ -3143,7 +3184,7 @@ describe("a placed run's result through the host: the runner's lines pass throug
   test("a placed background run that times out gives N7 once, in the notice of the call that reports its end", async () => {
     await withSandboxFixture(
       [
-        fakeGatewayToolCall("call-1", "shell", { command: "sleep 30", runner: "remote", timeout_ms: 1500, yield_time_ms: 300 }),
+        fakeGatewayToolCall("call-1", "shell", { command: "sleep 30", runner: "remote", timeout_ms: 5000, yield_time_ms: 300 }),
         (body: string) =>
           fakeGatewayToolCall("call-2", "shell", { request: { action: "interact", session_id: lastSessionId(body), yield_time_ms: 8000 } }),
         (body: string) =>
@@ -3151,10 +3192,11 @@ describe("a placed run's result through the host: the runner's lines pass throug
         fakeGatewayFinalText("done\n"),
       ],
       async (fixture) => {
+        // The budget covers the push and setup as well as the command, so it is 5 s. The command sleeps for 30 s.
         const texts = await askSandbox(fixture);
         expect(texts).toContain("TimeoutExpired");
         // The later interact reports the same ended command again, and its notice carries no second line.
-        expect(texts.split("fx: timed out after 1500 ms").length - 1).toBe(1);
+        expect(texts.split("fx: timed out after 5000 ms").length - 1).toBe(1);
         expect(texts).toContain("fx: stopped; the remote command was killed");
         expect(apiSince(fixture).some((entry) => entry.route === "kill" && (entry.body as { signal?: number } | null)?.signal === 15)).toBe(true);
       },
