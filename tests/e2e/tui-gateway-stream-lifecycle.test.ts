@@ -1356,21 +1356,47 @@ function replayTape(tapePath: string, args: readonly string[]): string {
   );
 }
 
-function findEnterAfterSubmittedPrompt(
+function submittedPromptInputFrames(
   frames: ReturnType<typeof readTapeFrames>,
   submittedPrompt: string,
-): number {
+): { promptInputIndex: number; enterIndex: number } {
   const promptInputIndex = frames.findIndex((frame) =>
     frame.kind === 2 && frame.payload.includes(Buffer.from(submittedPrompt))
   );
-  expect(promptInputIndex).toBeGreaterThanOrEqual(0);
   const enterIndex = frames.findIndex((frame, index) =>
     index > promptInputIndex &&
     frame.kind === 2 &&
     frame.payload.equals(Buffer.from("\r"))
   );
+  return { promptInputIndex, enterIndex };
+}
+
+function findEnterAfterSubmittedPrompt(
+  frames: ReturnType<typeof readTapeFrames>,
+  submittedPrompt: string,
+): number {
+  const { promptInputIndex, enterIndex } = submittedPromptInputFrames(frames, submittedPrompt);
+  expect(promptInputIndex).toBeGreaterThanOrEqual(0);
   expect(enterIndex).toBeGreaterThan(promptInputIndex);
   return enterIndex;
+}
+
+// The tape once it holds the Enter that submitted `submittedPrompt` and the
+// first output after it: fx can read the Enter after the test sends it, and
+// it records output just after it writes it. fx is still writing the tape,
+// so a last frame cut short is left out, as `fx replay` does.
+async function waitForTapeOutputAfterEnter(
+  tapePath: string,
+  submittedPrompt: string,
+): Promise<ReturnType<typeof readTapeFrames>> {
+  let frames: ReturnType<typeof readTapeFrames> = [];
+  await waitForCondition(() => {
+    frames = readTapeFrames(tapePath, { ignoreTruncatedTail: true });
+    const { promptInputIndex, enterIndex } = submittedPromptInputFrames(frames, submittedPrompt);
+    return promptInputIndex >= 0 && enterIndex > promptInputIndex &&
+      frames.slice(enterIndex + 1).some((frame) => frame.kind === 1);
+  }, "tape output after the Enter that submitted the prompt");
+  return frames;
 }
 
 function assertSubmittedPromptRowStaysStableAfterEnter(
@@ -5333,13 +5359,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
-      await session.sendText(SPLIT_NEW_USER_PROMPT);
+      await session.sendLiteral(SPLIT_NEW_USER_PROMPT);
+      // Enter waits until fx shows the draft. Sent sooner, fx can read the
+      // text and the Enter in one read, and the tape holds no Enter frame.
+      await session.waitForPane(
+        (pane) => composerContains(pane, SPLIT_NEW_USER_PROMPT),
+        TIMEOUT,
+      );
+      await session.sendKeys("Enter");
       const cutoffPane = await session.capturePane();
       expect(cutoffPane).not.toContain(
         `┋ ${SPLIT_NEW_USER_PROMPT}`,
       );
       expect(cutoffPane).toMatch(/Thinking|Generating/);
-      const tapeFrames = readTapeFrames(tapePath);
+      const tapeFrames = await waitForTapeOutputAfterEnter(tapePath, SPLIT_NEW_USER_PROMPT);
       const enterIndex = findEnterAfterSubmittedPrompt(tapeFrames, SPLIT_NEW_USER_PROMPT);
       const firstOutput = tapeFrames.slice(enterIndex + 1).find((frame) => frame.kind === 1)!;
       expect(firstOutput).toBeDefined();
@@ -5426,6 +5459,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const startPath = join(workspace, "started");
       const releasePath = join(workspace, "release");
       const effectPath = join(workspace, "effect");
+      const yieldHeldPath = join(root, "yield-held");
+      const yieldReleasePath = join(root, "yield-release");
       const finalText = "RETAINED_HISTORY_COMPLETE";
       const lines = [
         "RETAINED_FIRST adjust the header",
@@ -5494,12 +5529,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_TRACE_SCOPES: "agent,worker,input,tool,scroll,frame_schedule",
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
+          FX_TEST_SHELL_YIELD_HELD: yieldHeldPath,
+          FX_TEST_SHELL_YIELD_RELEASE: yieldReleasePath,
         },
       });
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("Run the prepared check.");
         await waitForPath(startPath);
+        // The yield's row change must rewrite a row a frame has committed, so
+        // the yield waits for the test, and typing waits for the row: a key
+        // cancels the frame fx is building.
+        await waitForPath(yieldHeldPath);
+        await session.waitForText("● Running sh check.sh", TIMEOUT);
         for (let index = 0; index < lines.length; index++) {
           if (index > 0) await session.sendKeys("M-Enter");
           for (const character of lines[index]!) {
@@ -5507,6 +5549,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             await Bun.sleep(3);
           }
         }
+        writeFileSync(yieldReleasePath, "go");
         await waitForCondition(
           () => readFileSync(tracePath, "utf8").includes("reason=lifecycle_status_replacement"),
           "completed tool status replacement",
@@ -5540,6 +5583,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       } finally {
+        writeFileSync(yieldReleasePath, "go");
         writeFileSync(releasePath, "go");
         finalHold.release?.();
       }

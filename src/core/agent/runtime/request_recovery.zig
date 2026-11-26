@@ -176,6 +176,11 @@ pub const RequestRecovery = struct {
     pub fn start(self: *RequestRecovery, fast: bool, resumed: ?Resume) !?Send {
         if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         if (self.deps.save_recovery_record != null) register(self);
+        // A continue from before this request answers none of its questions.
+        // It is cleared before the step, which may ask, to keep a quick answer.
+        if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
+            debug_trace.eventf("recovery", "answer_dropped", self.trace_ctx, "event=user_continue origin=start reason=nothing_waits_for_it", .{});
+        };
         const from = resumed orelse Resume{};
         return self.event(.{ .start = .{ .fast = fast, .resume_from = from.record, .stale = from.stale, .continues = from.continues } });
     }
@@ -1507,6 +1512,46 @@ test "a resumed start that must ask first sends nothing" {
         defer request.deinit();
         try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
     }
+}
+
+test "a continue from before a request does not answer the question it starts with" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var continue_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+
+    // An Enter that reached no waiting request, such as one typed just
+    // after the out-of-credits picker's retry.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expect(!continue_flag.load(.seq_cst));
+    try std.testing.expect(recovery.usesAnswer(&request.state, .user_continue));
+    try std.testing.expectEqual(@as(u16, 0), request.attempt());
+    // The user's own Enter answers it.
+    continue_flag.store(true, .seq_cst);
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
+}
+
+test "an Enter as soon as a request's first question shows answers it" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var continue_flag = std.atomic.Value(bool).init(false);
+    fake.continue_on_need_user = &continue_flag;
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.continue_flag = &continue_flag;
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
+    try std.testing.expect(continue_flag.load(.seq_cst));
+    try std.testing.expectEqual(Send{}, (try request.waitForSend()).?);
+    try std.testing.expectEqual(@as(u16, 1), request.attempt());
 }
 
 test "a resend leaves within one wait tick of its jittered deadline" {

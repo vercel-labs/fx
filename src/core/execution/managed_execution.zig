@@ -14,6 +14,7 @@ const command_replay_store = @import("../session/command_replay_store.zig");
 const quiet_notice = @import("quiet_notice.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const yield_test_controls = @import("yield_test_controls.zig");
 
 const Allocator = std.mem.Allocator;
 const max_entries = contract.max_live_entries + contract.max_tombstones;
@@ -818,6 +819,7 @@ pub const Runtime = struct {
                 quiet_wait = step.wait;
                 if (step.end == .ceiling) {
                     quiet_crossed = step.crossed;
+                    yield_test_controls.holdTimedYield();
                     break;
                 }
                 if (steerYieldDue(input.tool_yield_flag, started_ms, now_ms, yield_grace_ms)) {
@@ -2353,6 +2355,83 @@ test "a command that ends inside the steering grace returns its result" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.find(u8, started.snapshot.output_delta, "quick") != null);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+var timed_yield_holds: u32 = 0;
+var timed_yield_held_at_ms: i64 = 0;
+
+fn holdTimedYieldForTest() void {
+    timed_yield_holds += 1;
+    timed_yield_held_at_ms = io_mod.milliTimestamp();
+}
+
+test "a timed yield returns its command running only after the test hold lets it go" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    timed_yield_holds = 0;
+    yield_test_controls.test_hold = holdTimedYieldForTest;
+    defer yield_test_controls.test_hold = null;
+    var input = StartCapturedInput{
+        .execution_id = "managed-held-yield",
+        .command = "sleep 1; printf done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 50,
+    };
+    input.authority = testAuthority(input);
+    const started_ms = io_mod.milliTimestamp();
+    var started = try runtime.startCaptured(alloc, input);
+    const returned_ms = io_mod.milliTimestamp();
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
+    try std.testing.expectEqual(@as(u32, 1), timed_yield_holds);
+    try std.testing.expect(timed_yield_held_at_ms - started_ms >= input.yield_time_ms);
+    try std.testing.expect(returned_ms >= timed_yield_held_at_ms);
+    try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+
+    var completed = try runtime.wait(alloc, input.execution_id, 10_000, null);
+    defer completed.deinit(alloc);
+    switch (completed.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+}
+
+test "a command that ends before its yield time never reaches the test hold" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    timed_yield_holds = 0;
+    yield_test_controls.test_hold = holdTimedYieldForTest;
+    defer yield_test_controls.test_hold = null;
+    var input = StartCapturedInput{
+        .execution_id = "managed-unheld-yield",
+        .command = "printf quick",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 30_000,
+    };
+    input.authority = testAuthority(input);
+    var started = try runtime.startCaptured(alloc, input);
+    defer started.deinit(alloc);
+    switch (started.snapshot.state) {
+        .completed => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u32, 0), timed_yield_holds);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 }
 
