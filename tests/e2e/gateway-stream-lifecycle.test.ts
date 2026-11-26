@@ -9217,6 +9217,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
           expect(readFileSync(tracePath, "utf8")).not.toContain("event=transaction_failed");
+          // The clipped page streams with the preview its commit gives it, so
+          // no turn is written again.
+          logLines(root.home, sessionId);
         } finally {
           await tui?.kill();
           gateway.stop();
