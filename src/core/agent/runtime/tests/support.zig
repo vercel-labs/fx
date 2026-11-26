@@ -1931,7 +1931,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 try self.record("status:finished:{s}", .{terminal.outcome.summary});
                 if (self.fail_status_finished) return error.TestStatusPublicationFailure;
             },
-            .progress, .turn_finished => {},
+            .progress, .execution_started, .review_started, .turn_finished => {},
         }
         const owned = try worker_runtime.dupeToolLifecycleEvent(self.alloc, event);
         errdefer worker_runtime.freeToolLifecycleEvent(self.alloc, owned);

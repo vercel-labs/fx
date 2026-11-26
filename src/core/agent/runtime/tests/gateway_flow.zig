@@ -112,6 +112,8 @@ fn lifecycleEventCallId(event: types.ToolLifecycleEvent) ?[]const u8 {
         .provisional => |value| value.id.call_id,
         .authoritative_started => |value| value.id.call_id,
         .progress => |value| value.id.call_id,
+        .execution_started => |value| value.id.call_id,
+        .review_started => null,
         .terminal => |value| value.id.call_id,
         .turn_finished => null,
     };
@@ -10836,7 +10838,7 @@ test "tool presentation groups span silent steps and split on visible assistant 
                     group_a_terminal_count += 1;
                 }
             },
-            .provisional, .progress, .turn_finished => {},
+            .provisional, .progress, .execution_started, .review_started, .turn_finished => {},
         }
     }
     try std.testing.expectEqual(@as(usize, 2), group_a_terminal_count);

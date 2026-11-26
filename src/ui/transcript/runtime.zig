@@ -722,6 +722,8 @@ fn lifecycleEventTurnId(event: types.ToolLifecycleEvent) u64 {
         .provisional => |payload| payload.id.turn_id,
         .authoritative_started => |payload| payload.id.turn_id,
         .progress => |payload| payload.id.turn_id,
+        .execution_started => |payload| payload.id.turn_id,
+        .review_started => |payload| payload.id.turn_id,
         .terminal => |payload| payload.id.turn_id,
         .turn_finished => |payload| payload.turn_id,
     };
@@ -5817,6 +5819,8 @@ pub const TranscriptRuntime = struct {
                 started.arguments_json,
                 started.place_after_current_transcript,
             ),
+            .execution_started => null,
+            .review_started => null,
             .progress => |progress| self.applyProgressLifecycle(
                 alloc,
                 progress.id,

@@ -909,6 +909,24 @@ test "auto permission lifecycle deferral applies only to shell run" {
     ));
 }
 
+/// Sends a call's review-start event to the host, using the turn of the call.
+const ReviewStartedSink = struct {
+    hooks: *const AgentRuntimeDeps,
+    turn_id: u64,
+
+    fn hook(self: *ReviewStartedSink) permission_auto_classifier.ReviewStartedHook {
+        return .{ .context = self, .notify_fn = notify };
+    }
+
+    fn notify(context: *anyopaque, call_id: []const u8, tool_name: []const u8) anyerror!void {
+        const self: *ReviewStartedSink = @ptrCast(@alignCast(context));
+        try self.hooks.push_tool_lifecycle(self.hooks.ctx, .{ .review_started = .{
+            .id = .{ .turn_id = self.turn_id, .call_id = call_id },
+            .tool_name = tool_name,
+        } });
+    }
+};
+
 pub fn requestToolPermissionTraced(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -938,6 +956,8 @@ pub fn requestToolPermissionTraced(
     if (hooks.observer) |observer| observer.emit(.{ .permission_start = call });
     var observed_review = review_turn;
     observed_review.observer = hooks.observer;
+    var review_started: ReviewStartedSink = .{ .hooks = hooks, .turn_id = ctx.turn_id };
+    observed_review.review_started = review_started.hook();
     const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, observed_review, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, review_schema) catch |err| {
         if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .error_name = @errorName(err) } });
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
@@ -975,6 +995,8 @@ pub fn requestPreparedFileMutationPermissionTraced(
     if (hooks.observer) |observer| observer.emit(.{ .permission_start = call });
     var observed_review = review_turn;
     observed_review.observer = hooks.observer;
+    var review_started: ReviewStartedSink = .{ .hooks = hooks, .turn_id = ctx.turn_id };
+    observed_review.review_started = review_started.hook();
     const outcome = request(hooks.ctx, arena, call, prepared, observed_review, mode, local_grants, live_authority, advertised_dynamic_tool_names) catch |err| {
         if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .error_name = @errorName(err) } });
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);

@@ -442,6 +442,9 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
+  // Answers the confirming second review of a held action, in order. Without
+  // it, the identical second request gets the held answer again.
+  confirmationResponses?: FakeGatewayResponse[];
   titleResponses?: FakeGatewayTitleResponse[];
   // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
   // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
@@ -489,6 +492,7 @@ function serveFakeGateway(
   const confirmationRequests: Array<{ body: string; headers: Headers }> = [];
   const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const confirmationResponses = [...(options.confirmationResponses ?? [])];
   const confirmations = confirmationReplay();
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
@@ -552,6 +556,8 @@ function serveFakeGateway(
         const confirmation = confirmations.replay(body);
         if (confirmation) {
           confirmationRequests.push({ body, headers });
+          const next = confirmationResponses.shift();
+          if (next) return typeof next === "function" ? await next(body) : next;
           return confirmation;
         }
         classifierRequests.push({ body, headers });

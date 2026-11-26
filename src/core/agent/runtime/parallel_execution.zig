@@ -392,6 +392,9 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
+    try exec_ctx.hooks.push_tool_lifecycle(exec_ctx.hooks.ctx, .{ .execution_started = .{
+        .id = .{ .turn_id = exec_ctx.turn_id, .call_id = call.id },
+    } });
     return exec_ctx.hooks.executeToolCall(.{
         .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,

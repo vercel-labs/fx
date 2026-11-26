@@ -788,7 +788,7 @@ pub fn Bindings(comptime App: type) type {
                 .applied_activity_kind = applied_activity_kind,
                 .terminal_record = switch (event) {
                     .terminal => |terminal| app.shell.toolActivityRecord(terminal.id),
-                    .provisional, .authoritative_started, .progress, .turn_finished => null,
+                    .provisional, .authoritative_started, .progress, .execution_started, .review_started, .turn_finished => null,
                 },
             };
         }

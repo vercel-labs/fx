@@ -688,7 +688,7 @@ test "same completion duplicate toolbox opens both execute for explicit rereads"
     try std.testing.expect(!logContains(&hooks, "skip:toolbox"));
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_1", "call_1", "call_1", "call_2", "call_2", "call_2" },
+        &.{ "call_1", "call_1", "call_1", "call_1", "call_2", "call_2", "call_2", "call_2" },
     );
 
     const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
@@ -2335,6 +2335,8 @@ fn lifecycleCallId(event: types.ToolLifecycleEvent) ?[]const u8 {
         .provisional => |value| value.id.call_id,
         .authoritative_started => |value| value.id.call_id,
         .progress => |value| value.id.call_id,
+        .execution_started => |value| value.id.call_id,
+        .review_started => null,
         .terminal => |value| value.id.call_id,
         .turn_finished => null,
     };
@@ -2414,7 +2416,7 @@ test "local tool emits authoritative progress and terminal lifecycle by default"
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_read", "call_read", "call_read" },
+        &.{ "call_read", "call_read", "call_read", "call_read" },
     );
     try std.testing.expect(
         hooks.lifecycle_events.items[0].authoritative_started
@@ -2422,7 +2424,7 @@ test "local tool emits authoritative progress and terminal lifecycle by default"
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.completed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
 }
 
@@ -2461,7 +2463,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_vision", "call_vision", "call_vision" },
+        &.{ "call_vision", "call_vision", "call_vision", "call_vision" },
     );
     try std.testing.expectEqual(
         types.ToolActivityKind.read,
@@ -2469,7 +2471,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.completed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings("vision", hooks.executed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2627,15 +2629,15 @@ test "vision failure uses the generic failed terminal lifecycle" {
 
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "call_vision_failed", "call_vision_failed", "call_vision_failed" },
+        &.{ "call_vision_failed", "call_vision_failed", "call_vision_failed", "call_vision_failed" },
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings(
         "Failed vision: provider response stayed invalid after one retry",
-        hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     const persisted = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results[0];
     try std.testing.expectEqual(
@@ -2721,9 +2723,13 @@ test "provider search emits visible lifecycle retains detail and reports observe
     try std.testing.expectEqual(@as(u32, 1), hooks.inner_usages.items[0].web_search_requests);
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "provider_search", "provider_search", "provider_search" },
+        &.{ "provider_search", "provider_search", "provider_search", "provider_search" },
     );
-    const terminal = hooks.lifecycle_events.items[2].terminal;
+    try std.testing.expectEqual(
+        std.meta.Tag(types.ToolLifecycleEvent).execution_started,
+        std.meta.activeTag(hooks.lifecycle_events.items[2]),
+    );
+    const terminal = hooks.lifecycle_events.items[3].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.completed, terminal.outcome.kind);
     try std.testing.expect(terminal.result != null);
     try std.testing.expect(std.mem.find(u8, terminal.result.?, "https://example.test/source") != null);
@@ -2768,9 +2774,13 @@ test "provider search finalizes when stop includes provider result and final ans
     );
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
-        &.{ "provider_search", "provider_search", "provider_search" },
+        &.{ "provider_search", "provider_search", "provider_search", "provider_search" },
     );
-    const terminal = hooks.lifecycle_events.items[2].terminal;
+    try std.testing.expectEqual(
+        std.meta.Tag(types.ToolLifecycleEvent).execution_started,
+        std.meta.activeTag(hooks.lifecycle_events.items[2]),
+    );
+    const terminal = hooks.lifecycle_events.items[3].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.completed, terminal.outcome.kind);
     try std.testing.expect(terminal.result != null);
     try std.testing.expect(std.mem.find(u8, terminal.result.?, "https://example.test/source") != null);
@@ -2820,6 +2830,7 @@ test "interactive authoritative identity reconciles changed provisional id" {
         &.{
             "provisional_read",
             "provisional_read",
+            "final_read",
             "final_read",
             "final_read",
             "final_read",
@@ -3928,6 +3939,8 @@ test "same-batch retarget defers stale scoped call before permission and reloads
                 );
             },
             .authoritative_started => stale_authoritative += 1,
+            .execution_started => {},
+            .review_started => {},
             .turn_finished => unreachable,
         }
     }
@@ -4334,6 +4347,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
             "candidate_read",
             "candidate_read",
             "candidate_read",
+            "candidate_read",
             "terminal_unsupported",
             "terminal_unsupported",
             "terminal_unsupported",
@@ -4346,7 +4360,7 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     );
     try std.testing.expectEqualStrings(
         "Failed missing_tool",
-        hooks.lifecycle_events.items[5].terminal.outcome.summary,
+        hooks.lifecycle_events.items[6].terminal.outcome.summary,
     );
 
     const results = hooks.history_turns.items[0].assistant.execution.tool_steps[0].tool_results;
@@ -6584,11 +6598,11 @@ test "processQueuedPrompt command output completion fires on command success and
     try expectBodyContains(&error_gateway, 1, "Tool terminal failed: AccessDenied");
     try std.testing.expectEqualStrings(
         "Failed terminal",
-        error_hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        error_hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        error_hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        error_hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
 }
 
@@ -6630,11 +6644,11 @@ test "processQueuedPrompt includes structured failure detail in tool status" {
 
     try std.testing.expectEqualStrings(
         "Failed browser_snapshot: Browser/CDP cdp failed during discover_targets: Browser is not reachable",
-        hooks.lifecycle_events.items[2].terminal.outcome.summary,
+        hooks.lifecycle_events.items[3].terminal.outcome.summary,
     );
     try std.testing.expectEqual(
         types.ToolOutcomeKind.failed,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
+        hooks.lifecycle_events.items[3].terminal.outcome.kind,
     );
     try expectBodyContains(&gateway, 1, "browser_cdp_error");
 }
@@ -6780,8 +6794,13 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
         "call_read",
         "call_read",
         "call_read",
+        "call_read",
     });
-    const terminal = hooks.lifecycle_events.items[9].terminal;
+    try std.testing.expectEqual(
+        std.meta.Tag(types.ToolLifecycleEvent).execution_started,
+        std.meta.activeTag(hooks.lifecycle_events.items[9]),
+    );
+    const terminal = hooks.lifecycle_events.items[10].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
         "Failed read_file: permission preflight failed",
@@ -7428,6 +7447,111 @@ test "execution cancellation closes every later streamed tool action" {
         if (event != .terminal) continue;
         try std.testing.expect(!std.mem.eql(u8, event.terminal.outcome.summary, "Tool cancelled"));
     }
+}
+
+test "processQueuedPrompt provider_executed search releases execution_started once before terminal" {
+    const alloc = std.testing.allocator;
+    const provider_call: ToolCall = .{
+        .id = "provider_search_1",
+        .name = "exa_search",
+        .arguments_json = "{\"query\":\"zig\"}",
+        .provider_result = "{\"results\":[]}",
+        .provenance = .provider_executed,
+    };
+    const calls = [_]ToolCall{provider_call};
+    for ([_]bool{ true, false }) |streamed| {
+        const starts: []const ToolCall = if (streamed) &calls else &.{};
+        const completions = [_]FakeCompletion{
+            .{
+                .tool_calls = &calls,
+                .streamed_tool_starts = starts,
+            },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+        var started_count: usize = 0;
+        var started_index: ?usize = null;
+        var terminal_index: ?usize = null;
+        for (deps.lifecycle_events.items, 0..) |event, idx| {
+            switch (event) {
+                .execution_started => |started| if (std.mem.eql(u8, started.id.call_id, provider_call.id)) {
+                    started_count += 1;
+                    started_index = idx;
+                },
+                .terminal => |term| if (std.mem.eql(u8, term.id.call_id, provider_call.id)) {
+                    terminal_index = idx;
+                },
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), started_count);
+        try std.testing.expect(started_index != null and terminal_index != null);
+        try std.testing.expect(started_index.? < terminal_index.?);
+        try expectSingleTerminalOutcome(deps.lifecycle_events.items, provider_call.id, .completed);
+    }
+}
+
+test "processQueuedPrompt parallel permission preflight failure emits execution_started before terminal" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_search", "web_search", "{\"query\":\"current news\"}"),
+        toolCall("call_read", "read_file", "{\"path\":\"/outside\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.permission_decisions = &.{.once};
+    hooks.permission_failure_names = &.{"read_file"};
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("web_search", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
+
+    const EventTag = std.meta.Tag(types.ToolLifecycleEvent);
+    var fail_tags: std.ArrayList(EventTag) = .empty;
+    defer fail_tags.deinit(alloc);
+    var ok_tags: std.ArrayList(EventTag) = .empty;
+    defer ok_tags.deinit(alloc);
+
+    for (hooks.lifecycle_events.items) |event| {
+        const call_id = lifecycleCallId(event) orelse continue;
+        if (std.mem.eql(u8, call_id, "call_read")) {
+            try fail_tags.append(alloc, std.meta.activeTag(event));
+        } else if (std.mem.eql(u8, call_id, "call_search")) {
+            try ok_tags.append(alloc, std.meta.activeTag(event));
+        }
+    }
+
+    try std.testing.expectEqualSlices(
+        EventTag,
+        &.{ .authoritative_started, .progress, .execution_started, .terminal },
+        fail_tags.items,
+    );
+    try std.testing.expectEqualSlices(
+        EventTag,
+        &.{ .authoritative_started, .progress, .execution_started, .terminal },
+        ok_tags.items,
+    );
+    try expectSingleTerminalOutcome(hooks.lifecycle_events.items, "call_read", .failed);
+    try expectSingleTerminalOutcome(hooks.lifecycle_events.items, "call_search", .completed);
 }
 
 test "processQueuedPrompt interruption persists staged feedback from a completed sibling" {

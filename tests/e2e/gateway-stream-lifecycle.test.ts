@@ -3984,7 +3984,9 @@ describe("gateway stream lifecycle", () => {
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      expect(result.stderr).toBe("");
+      const repeatedReason =
+        "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.";
+      expect(result.stderr).toBe(`Refused ${MALFORMED_TOOL_NAME}: ${repeatedReason}\n`);
       expect(gateway.requestCount()).toBe(2);
       expect(json.error).toBeUndefined();
       expect(result.code).toBe(0);
@@ -3994,6 +3996,7 @@ describe("gateway stream lifecycle", () => {
       expect(json.tool_calls).toContainEqual({
         name: MALFORMED_TOOL_NAME,
         status: "error",
+        reason: repeatedReason,
       });
       const followup = JSON.parse(gateway.requests[1].body) as {
         prompt: Array<{ role: string; content: Array<Record<string, unknown>> }>;
@@ -4055,15 +4058,18 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,tool" },
         timeoutMs: 20_000,
       });
+      const nonObjectReason = "Tool arguments must be a JSON object. The call was not executed.";
       expect(first.code).toBe(0);
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.tool_calls.filter((call) => call.name === "read_file")).toEqual(
-        badCalls.map(() => ({ name: "read_file", status: "error" })),
+        badCalls.map(() => ({ name: "read_file", status: "error", reason: nonObjectReason })),
       );
       expect(firstJson.tool_calls.filter((call) => call.name === "write_file")).toEqual([{ name: "write_file", status: "success" }]);
-      expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error" }]);
+      expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error", reason: nonObjectReason }]);
       expect(readFileSync(join(root.workspace, "valid.txt"), "utf8")).toBe("written once\n");
       expect(readFileSync(tracePath, "utf8")).toContain("failure=non_object_json");
+      expect(first.stderr).toContain(`Refused read_file: ${nonObjectReason}\n`);
+      expect(first.stderr).toContain(`Refused subagent: ${nonObjectReason}\n`);
       expect(first.stderr).not.toContain("Reading");
       expect(gateway.requests).toHaveLength(2);
 
@@ -4141,19 +4147,29 @@ describe("gateway stream lifecycle", () => {
       const notice =
         "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
 
+      const repeatedReason =
+        "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.";
+      const syntaxReason =
+        "Tool arguments were not valid JSON, so fx did not run the call. The conversation shows its arguments as {}.";
       expect(result.code).toBe(1);
       expect(json.exit_code).toBe(1);
       expect(json.error).toBeUndefined();
+      expect(result.stderr).toContain(`Refused ${MALFORMED_TOOL_NAME}: ${repeatedReason}\n`);
+      expect(result.stderr).toContain(`Refused read_file: ${syntaxReason}\n`);
       expect(result.stderr).toContain(notice);
       expect(gateway.requestCount()).toBe(3);
       expect(
         json.tool_calls.filter(
-          (call) => call.name === MALFORMED_TOOL_NAME && call.status === "error",
+          (call) =>
+            call.name === MALFORMED_TOOL_NAME &&
+            call.status === "error" &&
+            call.reason === repeatedReason,
         ),
       ).toHaveLength(2);
       expect(json.tool_calls).toContainEqual({
         name: "read_file",
         status: "error",
+        reason: syntaxReason,
       });
       expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
       expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
@@ -4230,10 +4246,8 @@ describe("gateway stream lifecycle", () => {
         expect(result.code).toBe(0);
         const progressLine = "Writing build/pkg/proof.txt\n";
         expect(occurrenceCount(result.stderr, progressLine)).toBe(1);
-        expect(result.stderr).toBe(
-          "Writing file\n" +
-            progressLine,
-        );
+        expect(result.stderr).toBe(progressLine);
+        expect(result.stderr).not.toContain("Writing file\n");
         const assistantOutput = variant.json
           ? JSON.parse(result.stdout).output
           : result.stdout;
@@ -5620,7 +5634,9 @@ describe("gateway stream lifecycle", () => {
         session_id: string;
       };
       expect(first.code).toBe(0);
-      expect(first.stderr).toBe("");
+      expect(first.stderr).toBe(
+        "Refused terminal: Tool arguments ended before the JSON was complete, so fx did not run the call. The conversation shows its arguments as {}.\n",
+      );
       expect(firstJson.session_id.length).toBeGreaterThan(0);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(sideEffectPath)).toBe(false);
@@ -9911,8 +9927,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       const trace = readFileSync(tracePath, "utf8");
 
+      const repeatedReason =
+        "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.";
       expect(result.code).toBe(0);
-      expect(result.stderr).toBe("");
+      expect(result.stderr).toBe(`Refused ${MALFORMED_TOOL_NAME}: ${repeatedReason}\n`);
       expect(result.stdout).toContain("I need one detail before continuing.");
       expect(result.stdout).toContain("Recovered after invalid tool arguments.");
       expect(gateway.requestCount()).toBe(2);
@@ -12488,6 +12506,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
             status: "error",
+            reason: "Action held after safety review",
           });
           expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
@@ -12558,9 +12577,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         // The open, then the run. A run whose arguments don't parse never
         // reaches the tool, so it stays toolbox's; one the server refuses is
         // reported as the tool it ran.
+        const malformedReason = serialized === MALFORMED_ARGUMENTS
+          ? "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}."
+          : "Tool arguments were not valid JSON, so fx did not run the call. The conversation shows its arguments as {}.";
         expect(json.tool_calls).toEqual([
           { name: "toolbox", status: "success" },
-          { name: serialized === '{"text":7}' ? DYNAMIC_MCP_TOOL_NAME : "toolbox", status: "error" },
+          serialized === '{"text":7}'
+            ? { name: DYNAMIC_MCP_TOOL_NAME, status: "error" }
+            : { name: "toolbox", status: "error", reason: malformedReason },
         ]);
         expect(gateway.requestCount()).toBe(3);
         expect(gateway.requests[1].body).toContain(DYNAMIC_MCP_TOOL_NAME);

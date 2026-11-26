@@ -1209,6 +1209,7 @@ fn runAutomaticReview(
     call: ToolCall,
     request: permission_auto_classifier.ReviewRequest,
 ) !permission_auto_classifier.ParseOutcome {
+    if (request.review_turn.review_started) |started| try started.notify(call.id, call.name);
     const started_ms = io_mod.milliTimestamp();
     debug_trace.logf(
         "permission",
@@ -4509,6 +4510,90 @@ test "automatic review trace preserves the typed unavailable cause without actio
     try std.testing.expect(
         std.mem.find(u8, trace, "SECRET_SHOULD_NOT_APPEAR") == null,
     );
+}
+
+/// Notes each review-start event the admission path sends: how many
+/// reviewer calls had run by then, and the call it names.
+const ReviewStartProbe = struct {
+    reviewer: *FakeAutoClassifier,
+    count: usize = 0,
+    reviewer_calls_at_start: usize = 0,
+    call_id: []const u8 = "",
+    tool_name: []const u8 = "",
+
+    fn notify(raw: *anyopaque, call_id: []const u8, tool_name: []const u8) anyerror!void {
+        const self: *ReviewStartProbe = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        self.reviewer_calls_at_start = self.reviewer.calls;
+        self.call_id = call_id;
+        self.tool_name = tool_name;
+    }
+
+    fn hook(self: *ReviewStartProbe) permission_auto_classifier.ReviewStartedHook {
+        return .{ .context = self, .notify_fn = notify };
+    }
+};
+
+test "an automatic review tells the host it started before the reviewer answers" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{ .decision = .clear, .risk = .low, .rationale = "bounded safe action" };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+    var probe = ReviewStartProbe{ .reviewer = &fake };
+    var review_turn = testReviewTurn();
+    review_turn.review_started = probe.hook();
+    input.permission_review_turn = review_turn;
+    const call = ToolCall{
+        .id = "review-start",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"agent-browser skills get core\"}",
+    };
+
+    const outcome = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(@as(usize, 0), probe.reviewer_calls_at_start);
+    try std.testing.expectEqualStrings("review-start", probe.call_id);
+    try std.testing.expectEqualStrings("shell", probe.tool_name);
+}
+
+test "a revalidation of a reviewed call asks the reviewer again and tells the host again" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{ .decision = .clear, .risk = .low, .rationale = "bounded safe action" };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+    var probe = ReviewStartProbe{ .reviewer = &fake };
+    var review_turn = testReviewTurn();
+    review_turn.review_started = probe.hook();
+    input.permission_review_turn = review_turn;
+    const call = ToolCall{
+        .id = "review-again",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"agent-browser skills get core\"}",
+    };
+
+    const first = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, first.decision);
+    const again = try revalidateLiveActionPermissionOutcome(input, arena, call, .auto, &.{}, .ordinary, .none);
+    try std.testing.expectEqual(ToolPermissionDecision.once, again.decision);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqualStrings("review-again", probe.call_id);
 }
 
 test "automatic admission honors reviewer clear when command appears in tool output" {

@@ -409,6 +409,9 @@ const ToolCallRecord = struct {
     error_code: ?[]u8 = null,
     command_result_json: ?[]u8 = null,
     ask_question_text: ?[]u8 = null,
+    /// Why fx refused the call: the output's `error.message`. Set only on a
+    /// refused call's entry.
+    reason: ?[]u8 = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
 };
@@ -467,6 +470,7 @@ fn freeToolCallRecord(alloc: Allocator, record: ToolCallRecord) void {
     if (record.error_code) |code| alloc.free(code);
     if (record.command_result_json) |json| alloc.free(json);
     if (record.ask_question_text) |text| alloc.free(text);
+    if (record.reason) |reason| alloc.free(reason);
 }
 
 fn freeToolCallRecords(alloc: Allocator, records: []ToolCallRecord) void {
@@ -696,7 +700,11 @@ const AskContext = struct {
     prompt_permissions: bool = false,
     presenter: ?*ask_presentation.Runtime = null,
     pending_tool_progress: std.ArrayList(PendingToolProgress) = .empty,
+    /// Start lines of calls the permission check refused. Their record
+    /// prints the refusal and then frees the line.
+    refused_tool_progress: std.ArrayList(PendingToolProgress) = .empty,
     deferred_tool_progress: std.ArrayList([]u8) = .empty,
+    reviewing_call_ids: std.ArrayList([]u8) = .empty,
     pending_tool_progress_mutex: std.Io.Mutex = .init,
     raw_boundary_pending: bool = false,
     response_output_start: usize = 0,
@@ -806,8 +814,12 @@ const AskContext = struct {
         self.final_source.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
+        for (self.refused_tool_progress.items) |progress| progress.deinit(self.alloc);
+        self.refused_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
         self.deferred_tool_progress.deinit(self.alloc);
+        for (self.reviewing_call_ids.items) |told| self.alloc.free(told);
+        self.reviewing_call_ids.deinit(self.alloc);
         for (self.tool_call_records.items) |record| {
             freeToolCallRecord(self.alloc, record);
         }
@@ -2493,7 +2505,6 @@ fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, a
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
     return finishCliPermissionOutcome(
         ctx,
-        tool_ctx,
         arena,
         call,
         permission_mode,
@@ -2513,7 +2524,6 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, null);
     return finishCliPermissionOutcome(
         ctx,
-        tool_ctx,
         arena,
         call,
         permission_mode,
@@ -2533,7 +2543,6 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
     tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     return finishCliPermissionOutcome(
         ctx,
-        tool_ctx,
         arena,
         call,
         permission_mode,
@@ -2573,46 +2582,38 @@ test "permission outcome failure writer preserves exact error type and identity"
     try std.testing.expectError(error.NonInteractivePermissionRequired, failure);
 }
 
+/// The reasons a no-terminal blocker gives. Its notice prints each after
+/// `fx ask: `, and `--json` records the same text as the call's reason.
+const configured_rule_reason = "permission required by configured rule";
+const noninteractive_permission_reason = "permission required for tool execution in noninteractive mode";
+
 fn finishCliPermissionOutcome(
     ctx: *AskContext,
-    tool_ctx: tool_runtime.Context,
     arena: Allocator,
     call: ToolCall,
     permission_mode: PermissionMode,
     outcome: command_admission.PermissionOutcome,
 ) !command_admission.PermissionOutcome {
     if (outcome.decision != .permission_required) return outcome;
-    const label = try tool_presentation.formatPlainAction(arena, .{
-        .tool_registry = tool_ctx.tool_registry,
-        .call = call,
-        .workspace_root = tool_ctx.workspace_root,
-    });
     switch (outcome.requirement orelse .approval_required) {
-        .configured_rule => try writeBlockedActionGuidance(
+        .configured_rule => try writeBlockedAction(
             ctx,
-            "fx ask: permission required by configured rule",
-            label,
-            "noninteractive_permission_prompt_unavailable",
+            arena,
+            call,
+            configured_rule_reason,
             "fx ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
         ),
-        .approval_required => try writeBlockedActionGuidance(
+        .approval_required => try writeBlockedAction(
             ctx,
-            "fx ask: permission required for tool execution in noninteractive mode",
-            label,
-            "noninteractive_permission_prompt_unavailable",
+            arena,
+            call,
+            noninteractive_permission_reason,
             if (permission_mode == .auto)
                 "fx ask: human approval is required for this action; use the interactive shell to approve it, or add a narrow matching permission rule\n"
             else
                 "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
         ),
     }
-    try recordToolCallRejected(
-        @ptrCast(ctx),
-        arena,
-        call,
-        "Permission required",
-        null,
-    );
     return failPermissionOutcome(error.NonInteractivePermissionRequired);
 }
 
@@ -2638,20 +2639,54 @@ const TestReviewTurn = struct {
     }
 };
 
-fn writeBlockedActionGuidance(
+/// Writes the notice a no-terminal blocker prints for a call it stops, then
+/// records the call in `--json` with the same reason. The notice is the call's
+/// refusal, so no Refused line follows it.
+fn writeBlockedAction(
     ctx: *AskContext,
-    headline: []const u8,
-    label: []const u8,
+    arena: Allocator,
+    call: ToolCall,
     reason: []const u8,
     hint: []const u8,
 ) !void {
-    try ctx.writeLine(headline);
+    try ctx.writeLine(try arena.print("fx ask: {s}", .{reason}));
     try ctx.writeStderr("fx ask: blocked action: ");
-    try ctx.writeStderr(label);
-    try ctx.writeStderr("\nfx ask: reason=");
-    try ctx.writeStderr(reason);
-    try ctx.writeStderr("\n");
+    try ctx.writeStderr(try blockedActionLabel(ctx, arena, call));
+    try ctx.writeStderr("\nfx ask: reason=noninteractive_permission_prompt_unavailable\n");
     try ctx.writeStderr(hint);
+    try recordBlockedCallRejected(ctx, call, reason);
+}
+
+/// The blocked call as `tool: summary`, where the summary is the one the
+/// Reviewing line uses, or the bare tool name when the call has no start line.
+fn blockedActionLabel(ctx: *AskContext, arena: Allocator, call: ToolCall) ![]const u8 {
+    ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+    const start_text = (findPendingToolProgressLocked(ctx, call.id) orelse return call.name).text orelse return call.name;
+    return try arena.print("{s}: {f}", .{ call.name, text_utils.terminalSafe(progressSummary(start_text)) });
+}
+
+/// Records a call that a no-terminal blocker stopped, with the blocker's reason
+/// as its refusal reason. It writes no Refused line: the notice is the refusal.
+fn recordBlockedCallRejected(ctx: *AskContext, call: ToolCall, reason: []const u8) !void {
+    const start_line = takeRefusedToolProgress(ctx, call.id);
+    defer if (start_line) |line| line.deinit(ctx.alloc);
+    if (!ctx.output_mode.capturesJson()) return;
+    appendToolCallRecordWithReason(
+        ctx,
+        call,
+        "error",
+        .{ .status = .failure, .model_output = "", .command_result_json = null },
+        .rejected,
+        "rejected",
+        reason,
+    ) catch |err| {
+        debug_trace.logf(
+            "cli_ask",
+            "tool-call capture dropped name={s} status=error err={s}",
+            .{ call.name, @errorName(err) },
+        );
+    };
 }
 
 fn requestCliPermission(
@@ -2856,14 +2891,16 @@ fn publishCommittedFileHandoff(
 
 fn recordToolCallRejected(
     raw_ctx: *anyopaque,
-    _: Allocator,
+    arena: Allocator,
     call: ToolCall,
     model_output: []const u8,
     command_result_json: ?[]const u8,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const reason = try tool_result_errors.refusalMessage(arena, model_output);
+    if (!ctx.output_mode.isTerminal()) try writeRefusal(ctx, call, reason);
     if (!ctx.output_mode.capturesJson()) return;
-    appendToolCallRecordBestEffort(
+    appendToolCallRecordWithReason(
         ctx,
         call,
         "error",
@@ -2874,7 +2911,14 @@ fn recordToolCallRejected(
         },
         .rejected,
         "rejected",
-    );
+        reason,
+    ) catch |err| {
+        debug_trace.logf(
+            "cli_ask",
+            "tool-call capture dropped name={s} status=error err={s}",
+            .{ call.name, @errorName(err) },
+        );
+    };
 }
 
 fn recordToolCallFailed(
@@ -2932,6 +2976,18 @@ fn appendToolCallRecord(
     error_category: ?workspace_diagnostics.ToolCallOutcome,
     explicit_error_code: ?[]const u8,
 ) !void {
+    return appendToolCallRecordWithReason(ctx, call, status, result, error_category, explicit_error_code, null);
+}
+
+fn appendToolCallRecordWithReason(
+    ctx: *AskContext,
+    call: ToolCall,
+    status: []const u8,
+    result: ?ToolExecutionResult,
+    error_category: ?workspace_diagnostics.ToolCallOutcome,
+    explicit_error_code: ?[]const u8,
+    refusal_reason: ?[]const u8,
+) !void {
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
 
@@ -2978,6 +3034,8 @@ fn appendToolCallRecord(
     errdefer if (command_result_json) |json| ctx.alloc.free(json);
     const ask_question_text = try questionTextForAskCall(ctx.alloc, ran);
     errdefer if (ask_question_text) |text| ctx.alloc.free(text);
+    const reason = if (refusal_reason) |text| try ctx.alloc.dupe(u8, text) else null;
+    errdefer if (reason) |text| ctx.alloc.free(text);
 
     try ctx.tool_call_records.append(ctx.alloc, .{
         .name = name,
@@ -2987,6 +3045,7 @@ fn appendToolCallRecord(
         .error_code = error_code,
         .command_result_json = command_result_json,
         .ask_question_text = ask_question_text,
+        .reason = reason,
         .web_search_completion = if (result) |execution| execution.web_search_completion else null,
         .web_fetch_completion = if (result) |execution| execution.web_fetch_completion else null,
     });
@@ -3403,6 +3462,12 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
         .progress => |progress| if (!ctx.output_mode.isTerminal()) {
             try publishPendingToolProgress(ctx, progress.id.call_id, progress.text);
         },
+        .review_started => |started| if (!ctx.output_mode.isTerminal()) {
+            try startReviewLine(ctx, started.id.call_id, started.tool_name);
+        },
+        .execution_started => |started| if (!ctx.output_mode.isTerminal()) {
+            try startPendingToolProgress(ctx, started.id.call_id);
+        },
         .turn_finished => if (!ctx.output_mode.isTerminal()) clearPendingToolProgress(ctx),
         .terminal => |value| {
             if (!ctx.output_mode.isTerminal()) {
@@ -3438,6 +3503,8 @@ fn publishPendingToolProgress(ctx: *AskContext, call_id: []const u8, text: []con
     const owned_text = try ctx.alloc.dupe(u8, text);
     if (pending.text) |previous| ctx.alloc.free(previous);
     pending.text = owned_text;
+    // Before the call starts, its start line waits for execution_started.
+    if (!pending.visible) return;
     pending.visible = false;
     if (ctx.toolRegistry().lookup(pending.tool_name)) |tool| {
         if (tool.executor_kind == .web_fetch) return;
@@ -3451,16 +3518,117 @@ fn publishPendingToolProgress(ctx: *AskContext, call_id: []const u8, text: []con
     pending.visible = true;
 }
 
+/// Writes a call's start line once the call is admitted and runs.
+fn startPendingToolProgress(ctx: *AskContext, call_id: []const u8) !void {
+    ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+
+    const pending = findPendingToolProgressLocked(ctx, call_id) orelse return;
+    try showStartLineLocked(ctx, pending);
+}
+
+/// Writes a start line that was held, unless it was written already or the
+/// tool prints none. The caller holds the pending-progress mutex.
+fn showStartLineLocked(ctx: *AskContext, pending: *PendingToolProgress) !void {
+    if (pending.visible) return;
+    const text = pending.text orelse return;
+    if (ctx.toolRegistry().lookup(pending.tool_name)) |tool| {
+        if (tool.executor_kind == .web_fetch) return;
+    }
+    pending.visible = true;
+    if (consumeDeferredToolProgressLocked(ctx, text)) return;
+    try ctx.writeStderr(text);
+    try ctx.writeStderr("\n");
+}
+
+/// Writes the Reviewing line when an automatic review of a call starts. Its
+/// summary is the call's start line when that line is already known, as for
+/// a shell call, whose start line shows before its review. A call gets one
+/// Reviewing line per turn, even when its review starts again.
+fn startReviewLine(ctx: *AskContext, call_id: []const u8, tool_name: []const u8) !void {
+    ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+
+    for (ctx.reviewing_call_ids.items) |told| {
+        if (std.mem.eql(u8, told, call_id)) return;
+    }
+    const owned_id = try ctx.alloc.dupe(u8, call_id);
+    errdefer ctx.alloc.free(owned_id);
+    try ctx.reviewing_call_ids.append(ctx.alloc, owned_id);
+    const start_text = if (findPendingToolProgressLocked(ctx, call_id)) |pending| pending.text else null;
+    try writeReviewingLine(ctx, tool_name, start_text);
+}
+
+/// The Reviewing line text. Its summary is the start line after the verb,
+/// which for a shell call is the command.
+fn writeReviewingLine(ctx: *AskContext, tool_name: []const u8, start_line: ?[]const u8) !void {
+    const line = if (start_line) |text|
+        try ctx.alloc.print("Reviewing {s}: {f}", .{ tool_name, text_utils.terminalSafe(progressSummary(text)) })
+    else
+        try ctx.alloc.print("Reviewing {s}", .{tool_name});
+    defer ctx.alloc.free(line);
+    try ctx.writeStderr(line);
+    try ctx.writeStderr("\n");
+}
+
+fn progressSummary(text: []const u8) []const u8 {
+    const space = std.mem.findScalar(u8, text, ' ') orelse return text;
+    return text[space + 1 ..];
+}
+
+/// Takes the start line a refused call held, or null when it held none.
+fn takeRefusedToolProgress(ctx: *AskContext, call_id: []const u8) ?PendingToolProgress {
+    ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+    for (ctx.refused_tool_progress.items, 0..) |pending, index| {
+        if (std.mem.eql(u8, pending.call_id, call_id)) return ctx.refused_tool_progress.swapRemove(index);
+    }
+    return null;
+}
+
+/// Writes the line that says fx refused a call. The call's held start line is
+/// freed here; its Reviewing line, if any, printed when its review started.
+/// A refusal with no reason text prints nothing here: its own notice, such as
+/// the headless permission blocker, already says it.
+fn writeRefusal(ctx: *AskContext, call: ToolCall, reason: ?[]const u8) !void {
+    const start_line = takeRefusedToolProgress(ctx, call.id);
+    defer if (start_line) |line| line.deinit(ctx.alloc);
+    const text = reason orelse return;
+    const line = try ctx.alloc.print(
+        "Refused {s}: {f}",
+        .{ call.name, text_utils.terminalSafe(text) },
+    );
+    defer ctx.alloc.free(line);
+    try ctx.writeStderr(line);
+    try ctx.writeStderr("\n");
+}
+
 fn settlePendingToolProgress(ctx: *AskContext, call_id: []const u8, outcome: types.ToolOutcome) !void {
     ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
     var pending = takePendingToolProgressLocked(ctx, call_id) orelse return;
-    defer pending.deinit(ctx.alloc);
     const context_deferred = outcome.kind == .deferred and
         std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ " ");
     const legacy_deferred = outcome.kind == .denied and
         std.mem.startsWith(u8, outcome.summary, types.deferred_tool_result_output ++ ": ");
-    if (!context_deferred and !legacy_deferred) return;
+    if (outcome.kind == .denied and !pending.visible and !legacy_deferred) {
+        // The call's refusal record prints the refusal, then frees this line.
+        ctx.refused_tool_progress.append(ctx.alloc, pending) catch |err| {
+            pending.deinit(ctx.alloc);
+            return err;
+        };
+        return;
+    }
+    defer pending.deinit(ctx.alloc);
+    if (!context_deferred and !legacy_deferred) {
+        if (!pending.visible) {
+            debug_trace.logf("cli_ask", "event=tool_start_line_dropped call_id={s} outcome={s}", .{ call_id, @tagName(outcome.kind) });
+        }
+        return;
+    }
+    // A deferred call never runs, but its start line has always shown at its
+    // terminal, so it still does.
+    try showStartLineLocked(ctx, &pending);
     if (!pending.visible) return;
     const text = pending.text orelse return;
     try ctx.deferred_tool_progress.append(ctx.alloc, text);
@@ -3504,8 +3672,19 @@ fn consumeDeferredToolProgressLocked(ctx: *AskContext, text: []const u8) bool {
 fn clearPendingToolProgress(ctx: *AskContext) void {
     ctx.pending_tool_progress_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
+    if (ctx.pending_tool_progress.items.len > 0 or ctx.refused_tool_progress.items.len > 0) {
+        debug_trace.logf(
+            "cli_ask",
+            "event=tool_start_lines_dropped pending={d} refused={d}",
+            .{ ctx.pending_tool_progress.items.len, ctx.refused_tool_progress.items.len },
+        );
+    }
     for (ctx.pending_tool_progress.items) |progress| progress.deinit(ctx.alloc);
     ctx.pending_tool_progress.clearRetainingCapacity();
+    for (ctx.reviewing_call_ids.items) |told| ctx.alloc.free(told);
+    ctx.reviewing_call_ids.clearRetainingCapacity();
+    for (ctx.refused_tool_progress.items) |progress| progress.deinit(ctx.alloc);
+    ctx.refused_tool_progress.clearRetainingCapacity();
     for (ctx.deferred_tool_progress.items) |progress| ctx.alloc.free(progress);
     ctx.deferred_tool_progress.clearRetainingCapacity();
 }
@@ -4222,6 +4401,10 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         if (tc.ask_question_text) |text| {
             try out.writer.writeAll(",\"question\":");
             try std.json.Stringify.value(text, .{}, &out.writer);
+        }
+        if (tc.reason) |reason| {
+            try out.writer.writeAll(",\"reason\":");
+            try std.json.Stringify.value(reason, .{}, &out.writer);
         }
         if (tc.web_search_completion) |completion| {
             try out.writer.print(",\"web_search\":{{\"searches\":{d},\"duration_ms\":{d}}}", .{ completion.searches, completion.duration_ms });
@@ -7265,7 +7448,9 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
     };
-    const configured_label = try tool_presentation.formatPlainAction(arena, .{ .tool_registry = ctx.toolRegistry(), .call = configured_rule_ask });
+    try beginPendingToolProgress(&ctx, configured_rule_ask.id, configured_rule_ask.name);
+    ctx.pending_tool_progress.items[ctx.pending_tool_progress.items.len - 1].text = try alloc.dupe(u8, "Running touch configured.txt");
+    const configured_label = "shell: touch configured.txt";
     try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(
         &ctx,
         arena,
@@ -7294,7 +7479,9 @@ test "fx ask preserves CLI headless blocker diagnostics" {
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch approval.txt\"}",
     };
-    const approval_label = try tool_presentation.formatPlainAction(arena, .{ .tool_registry = ctx.toolRegistry(), .call = approval_required });
+    try beginPendingToolProgress(&ctx, approval_required.id, approval_required.name);
+    ctx.pending_tool_progress.items[ctx.pending_tool_progress.items.len - 1].text = try alloc.dupe(u8, "Running touch approval.txt");
+    const approval_label = "shell: touch approval.txt";
     try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(
         &ctx,
         arena,
@@ -7348,6 +7535,87 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     try std.testing.expect(default_safe_web_search.execution_authority != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+}
+
+test "fx ask names a blocked file write by its tool when the write has no start line" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        workspace,
+    );
+    defer ctx.deinit();
+    const runtime_deps = agentRuntimeDeps(&ctx);
+    const callback = runtime_deps.request_prepared_file_mutation_permission orelse
+        return error.TestExpectedPreparedFileMutationCallback;
+
+    // A provisional event starts a call's pending entry before its permission
+    // check, with no start text yet. Without that event the call has no entry.
+    const cases = [_]struct { id: []const u8, file: []const u8, provisional: bool }{
+        .{ .id = "blocked-provisional", .file = "provisional.txt", .provisional = true },
+        .{ .id = "blocked-unannounced", .file = "unannounced.txt", .provisional = false },
+    };
+    for (cases) |case| {
+        stdout_capture.bytes.clearRetainingCapacity();
+        stderr_capture.bytes.clearRetainingCapacity();
+        const target_path = try std.Io.Dir.path.join(arena, &.{ external, case.file });
+        const call: ToolCall = .{
+            .id = case.id,
+            .name = "write_file",
+            .arguments_json = try arena.print(
+                "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
+                .{target_path},
+            ),
+        };
+        if (case.provisional) try beginPendingToolProgress(&ctx, call.id, call.name);
+        var prepared = switch (try tool_admission.prepareFileMutationCall(arena, call, .{
+            .tool_registry = ctx.toolRegistry(),
+            .workspace_root = workspace,
+        })) {
+            .tool_failure => return error.TestExpectedPreparedFileMutation,
+            .not_file_mutation => return error.TestExpectedPreparedFileMutation,
+            .prepared => |value| value,
+        };
+        defer prepared.deinit(arena);
+        var review_turn = TestReviewTurn.init("Write the blocked file.", call);
+        try std.testing.expectError(error.NonInteractivePermissionRequired, callback(
+            runtime_deps.ctx,
+            arena,
+            call,
+            &prepared,
+            review_turn.context(),
+            .ask,
+            &.{},
+            null,
+            &.{},
+        ));
+
+        try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+        try std.testing.expectEqualStrings(
+            "fx ask: permission required for tool execution in noninteractive mode\n" ++
+                "fx ask: blocked action: write_file\n" ++
+                "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
+                "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
+            stderr_capture.bytes.items,
+        );
+    }
 }
 
 test "runWithDeps projects exec-only terminal when saved setup has no capability" {
@@ -8403,6 +8671,206 @@ test "fx ask JSON records permission-denied tool calls as error status" {
     );
 }
 
+test "fx ask text writes one Refused line with the reason for a refused call" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        root,
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    try recordToolCallRejected(@ptrCast(&ctx), arena, .{
+        .id = "cmd",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf denied-cmd\"}",
+    }, "{\"error\":{\"type\":\"tool_permission_denied\",\"message\":\"Tool access was denied by configured policy\"}}", null);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        stderr_capture.bytes.items,
+        "Refused shell: Tool access was denied by configured policy\n",
+    ) != null);
+}
+
+test "fx ask refusal line keeps escape bytes from a reason out of the terminal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        root,
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    try recordToolCallRejected(@ptrCast(&ctx), arena, .{
+        .id = "cmd",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf denied-cmd\"}",
+    }, "{\"error\":{\"type\":\"tool_permission_denied\",\"message\":\"bad\\u001b[31m reason\"}}", null);
+
+    const text = stderr_capture.bytes.items;
+    try std.testing.expect(std.mem.find(u8, text, "Refused shell: bad") != null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+}
+
+test "fx ask text holds a Running line until the call starts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        root,
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd" };
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .progress = .{
+        .id = id,
+        .text = "Running printf held-line",
+    } });
+
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+}
+
+test "fx ask text writes a held call's Reviewing line before its Running line when the call starts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        root,
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd" };
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .progress = .{
+        .id = id,
+        .text = "Running printf held-line",
+    } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .review_started = .{
+        .id = id,
+        .tool_name = "shell",
+    } });
+    try std.testing.expectEqualStrings("Reviewing shell: printf held-line\n", stderr_capture.bytes.items);
+
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .execution_started = .{ .id = id } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .review_started = .{
+        .id = id,
+        .tool_name = "shell",
+    } });
+    try std.testing.expectEqualStrings(
+        "Reviewing shell: printf held-line\nRunning printf held-line\n",
+        stderr_capture.bytes.items,
+    );
+}
+
+test "fx ask text prints one Reviewing line when a revalidation asks the reviewer again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        root,
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .raw;
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd" };
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .progress = .{
+        .id = id,
+        .text = "Running printf held-line",
+    } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .review_started = .{ .id = id, .tool_name = "shell" } });
+    try pushToolLifecycle(@ptrCast(&ctx), .{ .review_started = .{ .id = id, .tool_name = "shell" } });
+
+    try std.testing.expectEqualStrings(
+        "Reviewing shell: printf held-line\n",
+        stderr_capture.bytes.items,
+    );
+}
+
 test "fx ask JSON names a toolbox run by the tool it ran, with that tool's fields, at any size" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9266,6 +9734,9 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
             .text = "Reading src/main.zig",
         },
     });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .execution_started = .{
+        .id = .{ .turn_id = 1, .call_id = "read_1" },
+    } });
     try std.testing.expectEqualStrings("Reading src/main.zig\n", stderr_capture.bytes.items);
     try deps.push_text(deps.ctx, .{ .assistant_source = "after **tool**\n" });
     try deps.push_text(deps.ctx, .{ .operational = "diagnostic\n" });
@@ -9596,6 +10067,9 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
         .id = .{ .turn_id = 4, .call_id = "resolved_write" },
         .text = "Writing build/pkg/proof.txt",
     } });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .execution_started = .{
+        .id = .{ .turn_id = 4, .call_id = "resolved_write" },
+    } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\n",
         stderr_capture.bytes.items,
@@ -9624,6 +10098,9 @@ test "CLI nonterminal progress preserves distinct not-run labels without duplica
     try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
         .id = .{ .turn_id = 6, .call_id = "streamed_read" },
         .text = "Reading streamed input",
+    } });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .execution_started = .{
+        .id = .{ .turn_id = 6, .call_id = "streamed_read" },
     } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\n",

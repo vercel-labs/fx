@@ -1,0 +1,39 @@
+%% Statechart of AskRefusal.tla for one call under design "a" (the pick).
+%% Rule breaks on origin/main ("today") are noted on the states they break.
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Reviewing: shell call starts (Begin)
+  Idle --> Reviewing: file target reaches its check (Review)
+  Idle --> Refusing: hook or bad arguments block it (Refuse)
+  Reviewing --> Reviewing: auto review starts, one Reviewing line (StartReview)
+  Reviewing --> Held: auto review holds the call (Hold)
+  Reviewing --> Admitted: review or permission admits a run (Admit)
+  Reviewing --> Refusing: configured deny, no terminal, file deny (Refuse)
+  Held --> Refusing: held call is refused (Refuse)
+  Held --> Admitted: fresh review clears the held call (Admit)
+  Idle --> Cancelled: you cancel (Cancel)
+  Reviewing --> Cancelled: you cancel (Cancel)
+  Held --> Cancelled: you cancel (Cancel)
+  Admitted --> Cancelled: you cancel (Cancel)
+  Refusing --> Closed: record written, refusal printed once (Close)
+  Admitted --> Closed: run finishes, no reason (Close)
+  Cancelled --> Closed: record written, no refusal line (Close)
+  Closed --> [*]
+
+  note right of Reviewing
+    Design a: a reviewed call prints one "Reviewing <tool>: <summary>" line when
+    its review starts, then nothing until its final line. The Running line is held.
+    A call the rules allow with no review prints no Reviewing line.
+    Today: Running is written here, before admission (breaks NoRunningForRefused).
+    Today: no Reviewing line at all (breaks ReviewTold).
+  end note
+  note right of Held
+    Design a: the hold prints nothing; the Reviewing line printed at review start.
+  end note
+  note right of Refusing
+    Design a: one "Refused <tool>: <reason>" line, reason in --json.
+    Today: no line, no reason (breaks RefusalTold and JsonReason).
+  end note
+  note right of Cancelled
+    Today: a Running line already on stderr stays there (breaks NoRunningForRefused).
+  end note

@@ -339,7 +339,7 @@ fn batchContainsTerminalClosure(
             .turn_finished => |finished| {
                 if (finished.turn_id == id.turn_id) return true;
             },
-            .provisional, .authoritative_started, .progress => {},
+            .provisional, .authoritative_started, .progress, .execution_started, .review_started => {},
         }
     }
     return false;
@@ -386,6 +386,8 @@ fn scanSegmentEvent(state: HeadSegmentScan, event: WorkerEvent) HeadSegmentScan 
             .provisional => |value| .{ .turn = value.id.turn_id },
             .authoritative_started => |value| .{ .turn = value.id.turn_id },
             .progress => |value| .{ .turn = value.id.turn_id },
+            .execution_started => |value| .{ .turn = value.id.turn_id },
+            .review_started => |value| .{ .turn = value.id.turn_id },
             .terminal => |value| .{ .turn = value.id.turn_id },
         },
         else => state,
@@ -441,6 +443,8 @@ pub fn Runtime(comptime App: type) type {
                     .provisional => |started| cancelledToolStartAdmission(presenter, started.id, batch_events),
                     .authoritative_started => |started| cancelledToolStartAdmission(presenter, started.id, batch_events),
                     .progress => .drop,
+                    .execution_started => .drop,
+                    .review_started => .drop,
                     .terminal => |terminal| if (presenter.record(terminal.id) == null)
                         .drop
                     else
@@ -1564,7 +1568,7 @@ pub fn Runtime(comptime App: type) type {
                                     break :events;
                                 }
                             },
-                            .progress, .terminal, .turn_finished => {},
+                            .progress, .execution_started, .review_started, .terminal, .turn_finished => {},
                         }
                         if (comptime agents.hasAgentField(App, "child_run")) {
                             app_agents_runtime.Runtime(App).noteChildToolLifecycle(app, agent, lifecycle);
@@ -1712,7 +1716,7 @@ pub fn Runtime(comptime App: type) type {
             lifecycle: types.ToolLifecycleEvent,
         ) !void {
             const tool_work_active = switch (lifecycle) {
-                .provisional, .authoritative_started, .progress => true,
+                .provisional, .authoritative_started, .progress, .execution_started, .review_started => true,
                 .terminal, .turn_finished => false,
             };
             const transition = try presenter.apply(
@@ -1740,7 +1744,7 @@ pub fn Runtime(comptime App: type) type {
                             );
                         }
                     },
-                    .provisional, .authoritative_started, .progress, .turn_finished => {},
+                    .provisional, .authoritative_started, .progress, .execution_started, .review_started, .turn_finished => {},
                 }
             }
 
@@ -2234,7 +2238,7 @@ const FakeShell = struct {
                     self.fail_next_update = false;
                     return error.InjectedTranscriptUpdateFailure;
                 },
-                .provisional, .authoritative_started => {},
+                .provisional, .authoritative_started, .execution_started, .review_started => {},
             }
         }
         return self.lifecycle.applyToolLifecycle(alloc, event);
@@ -2629,7 +2633,7 @@ const NoopBridge = struct {
             .applied_activity_kind = applied_activity_kind,
             .terminal_record = switch (event) {
                 .terminal => |terminal| app.shell.toolActivityRecord(terminal.id),
-                .provisional, .authoritative_started, .progress, .turn_finished => null,
+                .provisional, .authoritative_started, .progress, .execution_started, .review_started, .turn_finished => null,
             },
         };
     }

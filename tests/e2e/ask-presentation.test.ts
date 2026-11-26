@@ -16,10 +16,12 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LiveOutput } from "./live-output";
 import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayHeldDecision,
   fakeGatewayPermissionDecision,
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
@@ -1643,6 +1645,628 @@ describe("fx ask shell startup files", () => {
       expect(readFileSync(tracePath, "utf8")).not.toContain(secret);
       expect(filesContaining(join(root.home, ".fx"), secret)).toEqual([]);
       for (const request of gateway.requests) expect(request.body).not.toContain(secret);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("fx ask refused calls", () => {
+  const DENIED = "Tool access was denied by configured policy";
+
+  function writeSettings(home: string, settings: Record<string, unknown>) {
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
+  }
+
+  function twoCallReply(shellId: string, readId: string) {
+    return fakeGatewaySse([
+      {
+        type: "tool-call",
+        toolCallId: shellId,
+        toolName: "shell",
+        input: { request: { action: "run", command: "printf denied-two" } },
+      },
+      { type: "tool-call", toolCallId: readId, toolName: "read_file", input: { path: "note.txt" } },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }
+
+  test(
+    "text mode: a denied shell call prints Refused with its reason and no Running line",
+    async () => {
+      const root = createRoot();
+      writeSettings(root.home, { permission: { bash: "deny" } });
+      const gateway = startFakeGateway([
+        fakeShellRun("call_deny", "printf denied-cmd"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(`Refused shell: ${DENIED}\n`);
+      expect(result.stderr).not.toContain("Running printf denied-cmd");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text mode: a denied file write prints Refused and no Writing line",
+    async () => {
+      const root = createRoot();
+      writeSettings(root.home, { permission: { edit: "deny" } });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("call_file", "write_file", { path: "denied-note.txt", content: "x\n" }),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(`Refused write_file: ${DENIED}\n`);
+      expect(result.stderr).not.toMatch(/^Writing /m);
+      expect(existsSync(join(root.workspace, "denied-note.txt"))).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text mode: a tool call with malformed arguments prints its refusal",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeGatewaySerializedToolCall("call_bad", "shell", "{not json"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--yolo", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(
+        "Refused shell: Tool arguments were not valid JSON, so fx did not run the call.",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text mode: a denied call next to a second call prints its refusal, and the second call prints its own line",
+    async () => {
+      const root = createRoot();
+      writeSettings(root.home, { permission: { bash: "deny" } });
+      writeFileSync(join(root.workspace, "note.txt"), "hello\n");
+      const gateway = startFakeGateway([
+        twoCallReply("call_two_a", "call_two_b"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(`Refused shell: ${DENIED}\n`);
+      expect(result.stderr).not.toContain("Running printf denied-two");
+      expect(result.stderr).toContain("Reading note.txt\n");
+      expect(result.stderr.indexOf("Refused shell:")).toBeLessThan(
+        result.stderr.indexOf("Reading note.txt"),
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "text mode: a denied call that repeats a model id prints its refusal, and the other call prints its own line",
+    async () => {
+      const root = createRoot();
+      writeSettings(root.home, { permission: { bash: "deny" } });
+      writeFileSync(join(root.workspace, "note.txt"), "hello\n");
+      const gateway = startFakeGateway([
+        twoCallReply("same", "same"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(`Refused shell: ${DENIED}\n`);
+      expect(result.stderr).not.toContain("Running printf denied-two");
+      expect(result.stderr).toContain("Reading note.txt\n");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "JSON: the refused call's entry carries its reason, and the other entry is unchanged",
+    async () => {
+      const root = createRoot();
+      writeSettings(root.home, { permission: { bash: "deny" } });
+      writeFileSync(join(root.workspace, "note.txt"), "hello\n");
+      const gateway = startFakeGateway([
+        twoCallReply("call_two_a", "call_two_b"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--json", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).tool_calls).toEqual([
+        {
+          name: "shell",
+          status: "error",
+          action: "run",
+          error: { category: "rejected", code: "rejected" },
+          reason: DENIED,
+        },
+        { name: "read_file", status: "success" },
+      ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a call the no-terminal blocker stops prints its notice with the tool and command, and no Running line",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeShellRun("call_blocked", "printf denied-cmd"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_PERMISSION_MODE: "ask" },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(1);
+      const lines = result.stderr.split("\n");
+      expect(lines).toContain("fx ask: permission required for tool execution in noninteractive mode");
+      expect(lines).toContain("fx ask: blocked action: shell: printf denied-cmd");
+      expect(lines.filter((line) => line.startsWith("Running ") || line.startsWith("Refused "))).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a call the no-terminal blocker stops has a JSON entry that carries the blocker reason",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeShellRun("call_blocked", "printf denied-cmd"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--json", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_PERMISSION_MODE: "ask" },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).tool_calls).toEqual([
+        {
+          name: "shell",
+          status: "error",
+          action: "run",
+          error: { category: "rejected", code: "rejected" },
+          reason: "permission required for tool execution in noninteractive mode",
+        },
+      ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "auto review that holds a shell call prints Reviewing once before Refused, and no Running line",
+    async () => {
+      const root = createRoot();
+      const command = `python3 -c 'print("held-cmd")'`;
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_held", command), fakeGatewayFinalText("done")],
+        { classifierResponses: [fakeGatewayHeldDecision("held_review")] },
+      );
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const reviewing = result.stderr.split("\n").filter((line) => line.startsWith("Reviewing shell: "));
+      expect(reviewing).toEqual([`Reviewing shell: ${command}`]);
+      expect(result.stderr).toContain("Refused shell: ");
+      expect(result.stderr.indexOf("Reviewing shell: ")).toBeLessThan(
+        result.stderr.indexOf("Refused shell: "),
+      );
+      expect(result.stderr).not.toContain("Running python3");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a call that runs prints exactly its Running line and its output",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeShellRun("call_run", "printf ran-ok"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--yolo", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        "Full access enabled: fx permission checks disabled\nRunning printf ran-ok\nran-ok\n",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a call that runs and fails prints exactly its Running line and its output",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([
+        fakeShellRun("call_fail", "printf failed-out; exit 1"),
+        fakeGatewayFinalText("done"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--yolo", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        "Full access enabled: fx permission checks disabled\nRunning printf failed-out; exit 1\nfailed-out\n",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a held shell call that a fresh review clears prints Reviewing once, then Running",
+    async () => {
+      const root = createRoot();
+      const command = `python3 -c 'print("held-cmd")'`;
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_held_cleared", command), fakeGatewayFinalText("done")],
+        {
+          classifierResponses: [fakeGatewayHeldDecision("held_review")],
+          confirmationResponses: [fakeGatewayPermissionDecision("clear", "confirm_review")],
+        },
+      );
+      gateways.push(gateway);
+
+      const result = await runFx(["ask", "--no-save", "--no-color", "Do the task."], {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code).toBe(0);
+      expect(gateway.confirmationRequests).toHaveLength(1);
+      const lines = result.stderr.split("\n");
+      expect(lines.filter((line) => line.startsWith("Reviewing shell: "))).toEqual([
+        `Reviewing shell: ${command}`,
+      ]);
+      expect(lines).toContain(`Running ${command}`);
+      expect(result.stderr).not.toContain("Refused shell:");
+      expect(result.stderr.indexOf("Reviewing shell: ")).toBeLessThan(
+        result.stderr.indexOf(`Running ${command}`),
+      );
+    },
+    TIMEOUT,
+  );
+
+  // Starts `fx ask` and reads its stderr as each line arrives. Its stdout is
+  // not read, so it is discarded.
+  function startLiveAsk(root: ReturnType<typeof createRoot>, gateway: ReturnType<typeof startFakeGateway>) {
+    const proc = Bun.spawn([FX_BIN, "ask", "--no-save", "--no-color", "Do the task."], {
+      cwd: root.workspace,
+      env: { ...gatewayEnv(root.home, gateway), PATH: process.env.PATH, FX_SOUND: "0", NO_COLOR: "1" },
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    return { proc, stderr: new LiveOutput(proc.stderr) };
+  }
+
+  // A line fx prints within a second. A shorter deadline than the test's own
+  // timeout names the missing line instead of a test timeout.
+  const LINE_DEADLINE_MS = 15_000;
+
+  function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  }
+
+  // Holds the first review until the test answers it. `arrived` resolves when
+  // the review request reaches the gateway.
+  // Rejects when `what` does not happen within the line deadline, so a run that
+  // never reaches the reviewer fails with its name, not a test timeout.
+  function withinDeadline<T>(promise: Promise<T>, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), LINE_DEADLINE_MS);
+    });
+    return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+  }
+
+  function holdReview() {
+    const arrived = deferred<void>();
+    const answer = deferred<Response>();
+    return {
+      arrived: arrived.promise,
+      answer,
+      classifier: async () => {
+        arrived.resolve();
+        return answer.promise;
+      },
+    };
+  }
+
+  test(
+    "a held shell call prints Reviewing while its review is pending, then Refused",
+    async () => {
+      const root = createRoot();
+      const command = `python3 -c 'print("held-cmd")'`;
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_live_refused", command), fakeGatewayFinalText("done")],
+        { classifierResponses: [held.classifier] },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor(`Reviewing shell: ${command}\n`, LINE_DEADLINE_MS);
+        expect(stderr.text).not.toContain("Running ");
+        expect(stderr.text).not.toContain("Refused ");
+
+        held.answer.resolve(fakeGatewayHeldDecision("held_review")(gateway.classifierRequests[0]!.body));
+        expect(await proc.exited).toBe(0);
+        await stderr.done;
+        const reviewing = stderr.text.split("\n").filter((line) => line.startsWith("Reviewing shell: "));
+        expect(reviewing).toEqual([`Reviewing shell: ${command}`]);
+        expect(stderr.text).toContain("Refused shell: ");
+        expect(stderr.text).not.toContain("Running python3");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a held shell call that a fresh review clears prints Reviewing while its review is pending, then Running",
+    async () => {
+      const root = createRoot();
+      const command = `python3 -c 'print("held-cmd")'`;
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_live_cleared", command), fakeGatewayFinalText("done")],
+        {
+          classifierResponses: [held.classifier],
+          confirmationResponses: [fakeGatewayPermissionDecision("clear", "confirm_review")],
+        },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor(`Reviewing shell: ${command}\n`, LINE_DEADLINE_MS);
+        expect(stderr.text).not.toContain("Running ");
+        expect(gateway.confirmationRequests).toHaveLength(0);
+
+        held.answer.resolve(fakeGatewayHeldDecision("held_review")(gateway.classifierRequests[0]!.body));
+        expect(await proc.exited).toBe(0);
+        await stderr.done;
+        const lines = stderr.text.split("\n");
+        expect(lines.filter((line) => line.startsWith("Reviewing shell: "))).toEqual([
+          `Reviewing shell: ${command}`,
+        ]);
+        expect(lines).toContain(`Running ${command}`);
+        expect(lines.indexOf(`Running ${command}`)).toBeGreaterThan(
+          lines.indexOf(`Reviewing shell: ${command}`),
+        );
+        expect(gateway.confirmationRequests).toHaveLength(1);
+        expect(stderr.text).not.toContain("Refused shell:");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a shell call that a plain automatic review allows prints Reviewing while the review is pending, then Running",
+    async () => {
+      const root = createRoot();
+      const command = "printf reviewed-ok";
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_live_allowed", command), fakeGatewayFinalText("done")],
+        { classifierResponses: [held.classifier] },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor(`Reviewing shell: ${command}\n`, LINE_DEADLINE_MS);
+        expect(stderr.text).not.toContain("Running ");
+
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        expect(await proc.exited).toBe(0);
+        await stderr.done;
+        const lines = stderr.text.split("\n");
+        expect(lines.filter((line) => line.startsWith("Reviewing shell: "))).toEqual([
+          `Reviewing shell: ${command}`,
+        ]);
+        expect(lines).toContain(`Running ${command}`);
+        expect(lines.indexOf(`Running ${command}`)).toBeGreaterThan(
+          lines.indexOf(`Reviewing shell: ${command}`),
+        );
+        expect(stderr.text).not.toContain("Refused");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a cancel while the automatic review of a shell call is pending prints Reviewing and no Running line",
+    async () => {
+      const root = createRoot();
+      const command = `python3 -c 'print("held-cmd")'`;
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [fakeShellRun("call_live_cancelled", command), fakeGatewayFinalText("done")],
+        { classifierResponses: [held.classifier] },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor(`Reviewing shell: ${command}\n`, LINE_DEADLINE_MS);
+        proc.kill("SIGINT");
+        await proc.exited;
+        await stderr.done;
+        expect(stderr.text.split("\n").filter((line) => line.startsWith("Reviewing shell: "))).toEqual([
+          `Reviewing shell: ${command}`,
+        ]);
+        expect(stderr.text).not.toContain("Running ");
+        expect(stderr.text).not.toContain("Refused ");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
+    },
+    TIMEOUT,
+  );
+
+  // A write inside the workspace is reversible and runs without review, so the
+  // target is an existing file outside the workspace, which the reviewer sees.
+  test(
+    "a file write that goes to the automatic reviewer prints Reviewing write_file, then its start line",
+    async () => {
+      const root = createRoot();
+      const target = join(root.root, "outside-review.txt");
+      writeFileSync(target, "old\n");
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [
+          fakeGatewayToolCall("call_file_review", "write_file", { path: target, content: "reviewed\n" }),
+          fakeGatewayFinalText("done"),
+        ],
+        { classifierResponses: [held.classifier] },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor("Reviewing write_file\n", LINE_DEADLINE_MS);
+        expect(stderr.text).not.toContain("Writing");
+        expect(readFileSync(target, "utf8")).toBe("old\n");
+
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        expect(await proc.exited).toBe(0);
+        await stderr.done;
+        const lines = stderr.text.split("\n");
+        expect(lines[0]).toBe("Reviewing write_file");
+        expect(lines[1]).toMatch(/^Writing /);
+        expect(lines.filter((line) => line.startsWith("Reviewing "))).toEqual(["Reviewing write_file"]);
+        expect(stderr.text).not.toContain("Refused");
+        expect(readFileSync(target, "utf8")).toBe("reviewed\n");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a file write that the automatic reviewer holds prints Reviewing write_file, then Refused write_file",
+    async () => {
+      const root = createRoot();
+      const target = join(root.root, "outside-review.txt");
+      writeFileSync(target, "old\n");
+      const held = holdReview();
+      const gateway = startFakeGateway(
+        [
+          fakeGatewayToolCall("call_file_held", "write_file", { path: target, content: "held\n" }),
+          fakeGatewayFinalText("done"),
+        ],
+        { classifierResponses: [held.classifier] },
+      );
+      gateways.push(gateway);
+      const { proc, stderr } = startLiveAsk(root, gateway);
+      try {
+        await withinDeadline(held.arrived, "the review request");
+        await stderr.waitFor("Reviewing write_file\n", LINE_DEADLINE_MS);
+        expect(stderr.text).not.toContain("Refused");
+
+        held.answer.resolve(fakeGatewayHeldDecision("held_review")(gateway.classifierRequests[0]!.body));
+        expect(await proc.exited).toBe(0);
+        await stderr.done;
+        const lines = stderr.text.split("\n");
+        expect(lines[0]).toBe("Reviewing write_file");
+        expect(stderr.text).toContain("Refused write_file: ");
+        expect(stderr.text).not.toContain("Writing");
+        expect(readFileSync(target, "utf8")).toBe("old\n");
+      } finally {
+        held.answer.resolve(fakeGatewayPermissionDecision("clear"));
+        if (proc.exitCode === null) proc.kill("SIGKILL");
+      }
     },
     TIMEOUT,
   );

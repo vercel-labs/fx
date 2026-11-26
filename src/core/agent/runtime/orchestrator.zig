@@ -3564,6 +3564,13 @@ fn appendProviderExecutedToolResult(
         },
     );
     if (provider_visible_lifecycle) |visible_lifecycle| {
+        if (visible_lifecycle.status_started) {
+            try runtime_tool_presentation.startToolExecution(
+                deps,
+                turn_id,
+                visible_lifecycle.call.id,
+            );
+        }
         try runtime_tool_presentation.finishExecutedToolStatus(
             deps,
             arena,
@@ -11533,6 +11540,12 @@ fn processQueuedPromptLoop(
                     }
                     const permission_outcome = maybe_parallel_permission.?;
                     if (permission_outcome.tool_failure) |failure_output| {
+                        if (!parallel_status_started[group_index]) {
+                            parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
+                        }
+                        if (parallel_status_started[group_index]) {
+                            try runtime_tool_presentation.startToolExecution(deps, turn_id, parallel_call.id);
+                        }
                         const failure: ToolExecutionResult = .{
                             .status = .failure,
                             .model_output = failure_output,
@@ -12695,6 +12708,8 @@ fn processQueuedPromptLoop(
                         advertised_dynamic_tool_names,
                     );
                 }
+                // The preflight checks ran, so the call started and failed.
+                try runtime_tool_presentation.startToolExecution(deps, turn_id, execution_call.id);
                 const failure: ToolExecutionResult = .{
                     .status = .failure,
                     .model_output = failure_output,
@@ -13001,6 +13016,7 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            try runtime_tool_presentation.startToolExecution(deps, turn_id, execution_call.id);
             var execution_error: ?anyerror = null;
             var execution = deps.executeToolCall(.{
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,

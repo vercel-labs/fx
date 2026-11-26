@@ -2783,7 +2783,7 @@ pub const WorkerRuntime = struct {
                 else
                     .none,
                 .turn_finished => |finished| if (finished.turn_id == self.active_turn_id) .clear else .none,
-                .provisional, .progress => .none,
+                .provisional, .progress, .execution_started, .review_started => .none,
             },
             else => .none,
         };
@@ -5425,6 +5425,23 @@ pub fn dupeToolLifecycleEvent(
                 .text = text,
             } };
         },
+        .review_started => |started| blk: {
+            const call_id = try alloc.dupe(u8, started.id.call_id);
+            errdefer alloc.free(call_id);
+            const tool_name = try alloc.dupe(u8, started.tool_name);
+            errdefer alloc.free(tool_name);
+            break :blk .{ .review_started = .{
+                .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
+                .tool_name = tool_name,
+            } };
+        },
+        .execution_started => |started| blk: {
+            const call_id = try alloc.dupe(u8, started.id.call_id);
+            errdefer alloc.free(call_id);
+            break :blk .{ .execution_started = .{
+                .id = .{ .turn_id = started.id.turn_id, .call_id = call_id },
+            } };
+        },
         .terminal => |terminal| blk: {
             const call_id = try alloc.dupe(u8, terminal.id.call_id);
             errdefer alloc.free(call_id);
@@ -5486,6 +5503,11 @@ pub fn freeToolLifecycleEvent(
         .progress => |progress| {
             alloc.free(@constCast(progress.id.call_id));
             alloc.free(@constCast(progress.text));
+        },
+        .execution_started => |started| alloc.free(@constCast(started.id.call_id)),
+        .review_started => |started| {
+            alloc.free(@constCast(started.id.call_id));
+            alloc.free(@constCast(started.tool_name));
         },
         .terminal => |terminal| {
             alloc.free(@constCast(terminal.id.call_id));
