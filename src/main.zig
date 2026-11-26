@@ -5767,7 +5767,6 @@ test {
     _ = @import("core/execution/process_provider.zig");
     _ = @import("core/execution/managed_execution_contract.zig");
     _ = @import("core/execution/managed_execution.zig");
-    _ = @import("core/execution/quiet_notice.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");

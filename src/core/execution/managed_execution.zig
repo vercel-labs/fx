@@ -36,6 +36,22 @@ fn capturedWaitPollMs() i64 {
     return captured_wait_poll_ms;
 }
 
+fn traceDroppedCrossing(
+    quiet_wait: quiet_notice.Wait,
+    now_ms: i64,
+    last_output_ms: i64,
+    limit_ms: u64,
+    execution_id: []const u8,
+    reason: []const u8,
+) void {
+    if (!quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms)) return;
+    debug_trace.logf(
+        "managed-execution",
+        "event=quiet_crossing_dropped reason={s} execution={s} quiet_ms={d}",
+        .{ reason, execution_id, quiet_notice.quietMs(now_ms, last_output_ms) },
+    );
+}
+
 /// The quiet limit (`quiet_notice.zig`), or the shorter one the end-to-end
 /// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
 /// result needs it, since `Runtime.init` also runs at compile time as a
@@ -801,14 +817,14 @@ pub const Runtime = struct {
             if (terminal) break;
             if (input.cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) {
-                    const now_ms = io_mod.milliTimestamp();
-                    if (quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms)) {
-                        debug_trace.logf(
-                            "managed-execution",
-                            "event=quiet_crossing_dropped reason=cancelled execution={s} quiet_ms={d}",
-                            .{ entry.execution_id, quiet_notice.quietMs(now_ms, last_output_ms) },
-                        );
-                    }
+                    traceDroppedCrossing(
+                        quiet_wait,
+                        io_mod.milliTimestamp(),
+                        last_output_ms,
+                        limit_ms,
+                        entry.execution_id,
+                        "cancelled",
+                    );
                     entry.cancel.store(true, .seq_cst);
                     self.joinEntry(entry);
                     const prepared = try self.prepareSnapshot(
@@ -1152,18 +1168,28 @@ pub const Runtime = struct {
             const preempted = entry.preempted_waiter == waiter_id;
             const last_output_ms = entry.last_output_ms;
             entry.mutex.unlock(zio);
-            if (preempted) return error.WaitPreempted;
+            if (preempted) {
+                traceDroppedCrossing(
+                    quiet_wait,
+                    io_mod.milliTimestamp(),
+                    last_output_ms,
+                    limit_ms,
+                    execution_id,
+                    "preempted",
+                );
+                return error.WaitPreempted;
+            }
             if (terminal) break;
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) {
-                    const now_ms = io_mod.milliTimestamp();
-                    if (quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms)) {
-                        debug_trace.logf(
-                            "managed-execution",
-                            "event=quiet_crossing_dropped reason=cancelled execution={s} quiet_ms={d}",
-                            .{ execution_id, quiet_notice.quietMs(now_ms, last_output_ms) },
-                        );
-                    }
+                    traceDroppedCrossing(
+                        quiet_wait,
+                        io_mod.milliTimestamp(),
+                        last_output_ms,
+                        limit_ms,
+                        execution_id,
+                        "cancelled",
+                    );
                     return error.Cancelled;
                 }
             }
@@ -2453,7 +2479,7 @@ test "a command that ends before its yield time never reaches the test hold" {
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 }
 
-test "cancelling a run or wait past the quiet limit traces the dropped crossing without command text" {
+test "cancelling or preempting a run or wait past the quiet limit traces the dropped crossing without command text" {
     if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2476,15 +2502,76 @@ test "cancelling a run or wait past the quiet limit traces the dropped crossing 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    const CancelAfterQuiet = struct {
-        fn run(flag: *std.atomic.Value(bool)) void {
-            io_mod.sleep(160 * std.time.ns_per_ms);
+    const WaitUntilQuiet = struct {
+        fn waitForNotice(
+            rt: *Runtime,
+            execution_id: []const u8,
+            require_active_waiter: bool,
+            stop_helper: *const std.atomic.Value(bool),
+            timed_out: *std.atomic.Value(bool),
+        ) void {
+            const zio = io_mod.getIo();
+            const limit_ms = quietLimitMs();
+            const deadline_ms = io_mod.milliTimestamp() + 5_000;
+            while (!stop_helper.load(.seq_cst) and io_mod.milliTimestamp() < deadline_ms) {
+                if (rt.acquireEntry(execution_id)) |entry| {
+                    defer rt.releaseEntry(entry);
+                    entry.mutex.lockUncancelable(zio);
+                    const running = !entry.isTerminal();
+                    const has_waiter = entry.active_waiter != null;
+                    const times = quiet_notice.timesFor(
+                        running,
+                        io_mod.milliTimestamp(),
+                        entry.started_ms,
+                        entry.last_output_ms,
+                        limit_ms,
+                    );
+                    entry.mutex.unlock(zio);
+                    if (times) |value| {
+                        if (value.notice and (!require_active_waiter or has_waiter)) return;
+                    }
+                    entry.waitForWorkerOrPoll(zio, 5);
+                } else {
+                    std.Thread.yield() catch std.atomic.spinLoopHint();
+                }
+            }
+            if (!stop_helper.load(.seq_cst)) timed_out.store(true, .seq_cst);
+        }
+
+        fn cancel(
+            rt: *Runtime,
+            execution_id: []const u8,
+            require_active_waiter: bool,
+            flag: *std.atomic.Value(bool),
+            stop_helper: *const std.atomic.Value(bool),
+            timed_out: *std.atomic.Value(bool),
+        ) void {
+            waitForNotice(rt, execution_id, require_active_waiter, stop_helper, timed_out);
             flag.store(true, .seq_cst);
+        }
+
+        fn preempt(
+            rt: *Runtime,
+            execution_id: []const u8,
+            stop_helper: *const std.atomic.Value(bool),
+            timed_out: *std.atomic.Value(bool),
+        ) void {
+            waitForNotice(rt, execution_id, true, stop_helper, timed_out);
+            if (!stop_helper.load(.seq_cst)) rt.preemptWait(execution_id);
         }
     };
 
     var run_cancel = std.atomic.Value(bool).init(false);
-    const run_thread = try std.Thread.spawn(.{}, CancelAfterQuiet.run, .{&run_cancel});
+    var run_helper_stop = std.atomic.Value(bool).init(false);
+    var run_timed_out = std.atomic.Value(bool).init(false);
+    const run_thread = try std.Thread.spawn(
+        .{},
+        WaitUntilQuiet.cancel,
+        .{ &runtime, "managed-cancel-run-quiet", false, &run_cancel, &run_helper_stop, &run_timed_out },
+    );
+    defer run_thread.join();
+    defer run_helper_stop.store(true, .seq_cst);
+
     var run_input = StartCapturedInput{
         .execution_id = "managed-cancel-run-quiet",
         .command = "sleep 30",
@@ -2499,8 +2586,8 @@ test "cancelling a run or wait past the quiet limit traces the dropped crossing 
     };
     run_input.authority = testAuthority(run_input);
     var run_cancelled = try runtime.startCaptured(alloc, run_input);
-    run_thread.join();
     defer run_cancelled.deinit(alloc);
+    try std.testing.expect(!run_timed_out.load(.seq_cst));
     try std.testing.expect(!run_cancelled.snapshot.quiet_crossed);
     try runtime.commitDelivery(run_cancelled.snapshot.execution_id, run_cancelled.reservation_id);
 
@@ -2522,16 +2609,64 @@ test "cancelling a run or wait past the quiet limit traces the dropped crossing 
     defer started.deinit(alloc);
 
     var wait_cancel = std.atomic.Value(bool).init(false);
-    const wait_thread = try std.Thread.spawn(.{}, CancelAfterQuiet.run, .{&wait_cancel});
-    try std.testing.expectError(
-        error.Cancelled,
-        runtime.waitOrYield(alloc, wait_execution_id, 5_000, &wait_cancel, null),
-    );
-    wait_thread.join();
+    var wait_helper_stop = std.atomic.Value(bool).init(false);
+    var wait_timed_out = std.atomic.Value(bool).init(false);
+    {
+        const wait_thread = try std.Thread.spawn(
+            .{},
+            WaitUntilQuiet.cancel,
+            .{ &runtime, wait_execution_id, true, &wait_cancel, &wait_helper_stop, &wait_timed_out },
+        );
+        defer wait_thread.join();
+        defer wait_helper_stop.store(true, .seq_cst);
+        try std.testing.expectError(
+            error.Cancelled,
+            runtime.waitOrYield(alloc, wait_execution_id, 5_000, &wait_cancel, null),
+        );
+    }
+    try std.testing.expect(!wait_timed_out.load(.seq_cst));
+
+    var preempt_start_input = StartCapturedInput{
+        .execution_id = "managed-preempt-wait-quiet",
+        .command = "sleep 30",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    preempt_start_input.authority = testAuthority(preempt_start_input);
+    var preempt_started = try runtime.startCaptured(alloc, preempt_start_input);
+    const preempt_execution_id = preempt_started.snapshot.execution_id;
+    try runtime.commitDelivery(preempt_execution_id, preempt_started.reservation_id);
+    defer preempt_started.deinit(alloc);
+
+    var preempt_helper_stop = std.atomic.Value(bool).init(false);
+    var preempt_timed_out = std.atomic.Value(bool).init(false);
+    {
+        const preempt_thread = try std.Thread.spawn(
+            .{},
+            WaitUntilQuiet.preempt,
+            .{ &runtime, preempt_execution_id, &preempt_helper_stop, &preempt_timed_out },
+        );
+        defer preempt_thread.join();
+        defer preempt_helper_stop.store(true, .seq_cst);
+        try std.testing.expectError(
+            error.WaitPreempted,
+            runtime.waitOrYield(alloc, preempt_execution_id, 5_000, null, null),
+        );
+    }
+    try std.testing.expect(!preempt_timed_out.load(.seq_cst));
 
     var stopped = try runtime.stop(alloc, wait_execution_id, true);
     defer stopped.deinit(alloc);
     try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+
+    var preempt_stopped = try runtime.stop(alloc, preempt_execution_id, true);
+    defer preempt_stopped.deinit(alloc);
+    try runtime.commitDelivery(preempt_stopped.snapshot.execution_id, preempt_stopped.reservation_id);
 
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
     defer trace_file.close(io_mod.getIo());
@@ -2539,6 +2674,7 @@ test "cancelling a run or wait past the quiet limit traces the dropped crossing 
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "event=quiet_crossing_dropped reason=cancelled execution=managed-cancel-run-quiet quiet_ms=") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=quiet_crossing_dropped reason=cancelled execution=managed-cancel-wait-quiet quiet_ms=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=quiet_crossing_dropped reason=preempted execution=managed-preempt-wait-quiet quiet_ms=") != null);
     try std.testing.expect(std.mem.find(u8, trace, "sleep 30") == null);
 }
 
