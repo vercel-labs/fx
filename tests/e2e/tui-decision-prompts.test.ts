@@ -4132,6 +4132,38 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "the auto-mode review cuts twenty long questions at the same items as their answers",
+    async () => {
+      // Twenty questions of about 60 bytes, each answered with its first option.
+      const longQuestion = (index: number) => `${batchQuestionText(index)} Which setting should fx keep for this step?`;
+      const questions = batchQuestions(FULL_QUESTION_BATCH).map((entry, index) => ({ ...entry, question: longQuestion(index) }));
+      const body = await reviewRequestAfterAnswer(
+        { id: QUESTION_CALL.id, name: QUESTION_CALL.name, input: { questions } },
+        {},
+        async (activeSession) => {
+          await waitForPaneState(activeSession, "long batch page 1", (value) =>
+            value.includes(`Question 1 of ${FULL_QUESTION_BATCH}`), TIMEOUT);
+          await activeSession.sendLiteralText("1".repeat(FULL_QUESTION_BATCH));
+        },
+        JSON.stringify(questions.map((entry, index) => ({ question: entry.question, answer: `Keep ${index + 1}` }))),
+      );
+      // The question list passes its byte cap, so both lists show the same
+      // first eight and last seven items, with the same gap marker between.
+      const list = (item: (index: number) => string) =>
+        `[${[...[0, 1, 2, 3, 4, 5, 6, 7].map(item), "...[5 omitted]...", ...[13, 14, 15, 16, 17, 18, 19].map(item)].join(",")}]`;
+      expect(firstPriorResult(body)).toEqual([
+        `prior_tool_result[0].tool_call_id: ${QUESTION_CALL.id}`,
+        "prior_tool_result[0].tool: ask_user_question",
+        `prior_tool_result[0].user_answer: ${list((index) => `"Keep ${index + 1}"`)}`,
+        `prior_tool_result[0].questions_untrusted: ${list((index) => JSON.stringify(longQuestion(index)))}`,
+      ]);
+      expect(jsonStrings(JSON.parse(body)).flatMap((text) => text.split("\n")))
+        .toContain("prior_tool_result_evidence_incomplete: true");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "compaction keeps the answer to a question asked through toolbox as the user's words",
     async () => {
       expect(await compactedRulesAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS)).toEqual([ANSWER_RULE]);

@@ -2127,6 +2127,19 @@ test "a question's result gives each question with its answer, in order" {
     const unasked = (try answeredQuestions(arena, "[{\"answer\":\"Run tests\"}]")).?;
     try std.testing.expectEqualStrings("", unasked[0].question);
     try std.testing.expect(try answeredQuestions(arena, "(user cancelled the question)") == null);
+    // A question that is not a string makes the text no answer list.
+    try std.testing.expect(try answeredQuestions(arena, "[{\"question\":5,\"answer\":\"Run tests\"}]") == null);
+    // An empty list is a list of no answers.
+    try std.testing.expectEqual(@as(usize, 0), (try answeredQuestions(arena, "[]")).?.len);
+    // A full batch of 20 reads whole, in order.
+    var full: std.Io.Writer.Allocating = .init(arena);
+    try full.writer.writeByte('[');
+    for (0..20) |n| try full.writer.print("{s}{{\"question\":\"Q{d}?\",\"answer\":\"A{d}\"}}", .{ if (n == 0) "" else ",", n, n });
+    try full.writer.writeByte(']');
+    const batch = (try answeredQuestions(arena, full.written())).?;
+    try std.testing.expectEqual(@as(usize, 20), batch.len);
+    try std.testing.expectEqualStrings("Q19?", batch[19].question);
+    try std.testing.expectEqualStrings("A19", batch[19].answer);
 }
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
