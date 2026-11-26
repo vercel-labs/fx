@@ -10660,6 +10660,7 @@ async function launchFx(
   args: string,
   name: string,
   extraEnv: Record<string, string> = {},
+  size: { width?: number; height?: number } = {},
 ) {
   const stderrPath = join(fixture.root, `${name}-stderr.log`);
   writeFileSync(stderrPath, "");
@@ -10668,8 +10669,8 @@ async function launchFx(
     cwd: fixture.workspace,
     env: { ...gatewayEnv(fixture.home, gateway), ...extraEnv },
     stderrPath,
-    width: 100,
-    height: 32,
+    width: size.width ?? 100,
+    height: size.height ?? 32,
   });
   await session.waitForComposer(TIMEOUT);
   return { session, stderrPath };
@@ -10722,6 +10723,69 @@ test.skipIf(!tmuxAvailable())(
       // The model sees the interrupted prompt before the note.
       expect(resumed!.body).toContain("Plan the trip.");
       await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+// 12 rows lets the resume handoff and the resent request's note land in the same few frames,
+// so the short screen makes the note push rows off.
+test.skipIf(!tmuxAvailable())(
+  "a crash resume in a short terminal keeps every earlier row in the terminal history",
+  async () => {
+    const answer = "SHORT_RESUME_ANSWER_7310";
+    const fixture = resumeFixture("fx-short-resume-history-");
+    let reached: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (reached = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText(answer);
+      if (body.includes("Plan the trip.")) {
+        let done = 0;
+        for (let step = 1; step <= 3; step += 1) {
+          if (body.includes(`step-${step}`)) done = step;
+        }
+        if (done >= 3) {
+          reached();
+          return new Promise<Response>(() => {});
+        }
+        return fakeShellRun(`short-resume-step-${done + 1}`, `echo step-${done + 1}`);
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      const first = await launchFx(fixture, gateway, "", "first", {}, { width: 100, height: 12 });
+      active = first.session;
+      await active.sendText("Plan the trip.");
+      await inFlight;
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      const second = await launchFx(fixture, gateway, "-c", "second", {}, { width: 100, height: 12 });
+      active = second.session;
+      await active.waitForText(answer, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const scrollback = await active.waitForStableScrollback((s) => s.includes(answer));
+      const expectedRows = [
+        "* session resumed: Plan the trip.",
+        "┃ Plan the trip.",
+        "● Ran echo · 3 calls",
+        "! system: fx stopped before this turn finished",
+        "* session: Resuming the interrupted request",
+        answer,
+      ];
+      let previousIndex = -1;
+      for (const row of expectedRows) {
+        expect(countOccurrences(scrollback, row)).toBe(1);
+        const index = scrollback.indexOf(row);
+        expect(index).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();

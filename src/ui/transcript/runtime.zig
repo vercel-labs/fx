@@ -5086,6 +5086,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "has_painted_transcript",
     "unpainted_resume_hold",
     "resume_handoff_repaint_pending",
+    "resume_handoff_rows",
     "last_visible_transcript_top_row",
     "last_visible_transcript_start_line",
     "last_visible_transcript_partial_skip_rows",
@@ -5213,6 +5214,11 @@ pub const StagedAssistantTail = struct {
     id: u64,
     events: []assistant_presentation.Event,
     alloc: Allocator,
+};
+
+const ResumeHandoffRows = struct {
+    history: u32,
+    screen: u16,
 };
 
 pub const TranscriptRuntime = struct {
@@ -5383,6 +5389,9 @@ pub const TranscriptRuntime = struct {
     /// every drop until then, or until the transcript leaves the screen
     /// (`slotLeftScreen`).
     resume_handoff_repaint_pending: bool = false,
+    /// Live-source rows in history and on screen at handoff, forgotten on reset; early growth
+    /// scrolls them (`a resume that grows before its repaint scrolls the rows it pushes off`).
+    resume_handoff_rows: ?ResumeHandoffRows = null,
     footer_viewport: footer_viewport_runtime.FooterViewport = .{},
     extra_input_rows: u16 = 0,
     footer_reserved_base_rows: u16 = 3,
@@ -5477,6 +5486,7 @@ pub const TranscriptRuntime = struct {
     /// them, because showing it again paints that flow.
     pub fn slotLeftScreen(slot: *TranscriptSlot) void {
         slot.resume_handoff_repaint_pending = false;
+        slot.resume_handoff_rows = null;
     }
 
     /// Frees a transcript that is not on screen.
@@ -8750,6 +8760,7 @@ pub const TranscriptRuntime = struct {
         self.reflow_clear_guard_rows = 0;
         self.resize_history_row_delta = null;
         self.viewport_clear_pending = false;
+        self.resume_handoff_rows = null;
         // Job-control resume (and other full resets) reanchor at row 1. Drop
         // pending clears recorded against the pre-reset footer geometry —
         // e.g. eraseCurrentFrame at owned_top mid-scrollback — or the first
@@ -8934,6 +8945,7 @@ pub const TranscriptRuntime = struct {
 
     pub fn resetTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
         self.publication_projection_invalid = false;
+        self.resume_handoff_rows = null;
         const diagnostic = self.transcriptCommitDiagnostic();
         if (diagnostic.state != .invalid) {
             diagnostics.recordRenderEvent(
@@ -9654,6 +9666,33 @@ pub const TranscriptRuntime = struct {
                         .recovery_progress_compatible = true,
                         .recovery_tracks_semantic_progress = true,
                     };
+                }
+                if (self.resume_handoff_rows) |handoff| {
+                    if (target_offset > handoff.history and
+                        target_offset - handoff.history <= handoff.screen and
+                        self.committed_frame_layout.terminal_cols == self.layout.cols and
+                        self.committed_frame_layout.terminal_rows == self.layout.rows and
+                        !self.viewport_clear_pending and
+                        self.resize_history_row_delta == null)
+                    {
+                        const semantic_rows: u32 = frameInlineScrollBudget(0, target_offset - handoff.history);
+                        return .{
+                            .source_visual_offset = handoff.history,
+                            .target_visual_offset = target_offset,
+                            .semantic_rows = semantic_rows,
+                            .semantic_progress_rows = semantic_rows,
+                            .planned_rows = self.plannedTranscriptRows(
+                                prepared,
+                                handoff.history,
+                                0,
+                                semantic_rows,
+                                semantic_rows,
+                            ),
+                            .source_compatible = true,
+                            .recovery_progress_compatible = true,
+                            .recovery_tracks_semantic_progress = true,
+                        };
+                    }
                 }
                 return .{
                     .target_visual_offset = target_offset,
@@ -10409,7 +10448,7 @@ pub const TranscriptRuntime = struct {
                     self.layout,
                     prepared,
                     projection_area,
-                    accepted_semantic_progress_rows,
+                    scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
                 );
             },
         }
@@ -11708,6 +11747,7 @@ pub const TranscriptRuntime = struct {
             transition.target_flow = &.{};
             var previous_state = self.transcript_commit_state;
             self.transcript_commit_state = .invalid;
+            self.resume_handoff_rows = null;
             previous_state.deinit(alloc);
             self.markTranscriptDirty();
         } else if (commit.stable) {
@@ -11774,14 +11814,22 @@ pub const TranscriptRuntime = struct {
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
             self.resume_handoff_repaint_pending = pending_resume_bytes > 0;
             if (pending_resume_bytes > 0) {
-                self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {
+                    self.invalidateTranscriptAnchor("resume publication retained source handoff");
                     debug_trace.logf(
                         "session",
                         "pending resume flow dropped reason=superseded bytes={d}",
                         .{pending_resume_bytes},
                     );
                 } else {
+                    self.invalidateAnchorKeepingHandoffRows(
+                        alloc,
+                        stable_flow,
+                        transition.visual_offset,
+                        transition.history_visual_offset,
+                        transition.selection,
+                        transition.target_layout.terminal_cols,
+                    );
                     debug_trace.logf(
                         "session",
                         "resume historical flow committed bytes={d}",
@@ -11789,6 +11837,8 @@ pub const TranscriptRuntime = struct {
                     );
                 }
                 self.markTranscriptDirty();
+            } else {
+                self.resume_handoff_rows = null;
             }
             if (!retained_body and !self.fullTranscriptActive()) {
                 self.last_visible_transcript_top_row = transition.selection.top_row;
@@ -11841,6 +11891,7 @@ pub const TranscriptRuntime = struct {
                 self.markTranscriptDirty();
             }
         } else {
+            self.resume_handoff_rows = null;
             const recovery = resolveTranscriptRecoveryCommit(self, transition, result, commit);
             var previous_state = self.transcript_commit_state;
             var presentation_resume_bytes: []u8 = &.{};
@@ -11965,6 +12016,42 @@ pub const TranscriptRuntime = struct {
             self.render_requests.request(.transcript);
         }
         transition.consumed = true;
+    }
+
+    fn invalidateAnchorKeepingHandoffRows(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        committed_flow: []const u8,
+        visual_offset: u32,
+        history_visual_offset: u32,
+        selection: ViewportSelection,
+        cols: u16,
+    ) void {
+        const committed_copy = alloc.dupe(u8, committed_flow) catch |err| {
+            // Falling back to null only skips pre-repaint growth scrolling; the reset still holds.
+            debug_trace.logf("scroll", "resume_handoff_rows_unavailable stage=dupe err={s}", .{@errorName(err)});
+            self.invalidateTranscriptAnchor("resume publication retained source handoff");
+            return;
+        };
+        defer alloc.free(committed_copy);
+
+        self.invalidateTranscriptAnchor("resume publication retained source handoff");
+
+        var live_source = self.prepareTranscriptSource(alloc, null) catch |err| {
+            // Falling back to null only skips pre-repaint growth scrolling; the reset still holds.
+            debug_trace.logf("scroll", "resume_handoff_rows_unavailable stage=prepare err={s}", .{@errorName(err)});
+            return;
+        };
+        defer live_source.deinit(alloc);
+
+        self.resume_handoff_rows = resumeHandoffRows(
+            committed_copy,
+            live_source.bytes,
+            visual_offset,
+            history_visual_offset,
+            selection,
+            cols,
+        );
     }
 
     /// Writes only to the byte buffer for callers that separately append a
@@ -14789,6 +14876,296 @@ test "stable resume publication starts a fresh retained source epoch" {
     try std.testing.expect(facts.recovery_rebase);
 }
 
+const ResumeHandoffPlan = struct {
+    start_line: usize,
+    line_count: usize,
+    facts: TranscriptScrollFacts,
+};
+
+fn resumeHandoffTestRuntime(
+    alloc: Allocator,
+    pending_flow: []const u8,
+    transcript: []const u8,
+) !TranscriptRuntime {
+    const layout: Layout = .{
+        .rows = 8,
+        .cols = 40,
+        .content_bottom = 4,
+        .divider_top_row = 5,
+        .input_row = 6,
+        .divider_bottom_row = 7,
+        .hint_row = 8,
+    };
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+    };
+    errdefer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, pending_flow),
+    );
+    try runtime.notebook.transcript.appendSlice(alloc, transcript);
+    return runtime;
+}
+
+fn commitResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+    start_line: usize,
+    line_count: usize,
+    visual_offset: u32,
+    cursor_col: u16,
+) void {
+    var transition = TranscriptTransition{
+        .scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+            runtime.layout.rows,
+            runtime.owned_top_row,
+        ),
+        .document_append = .{},
+        .materialized_without_append = .{},
+        .target_flow = runtime.notebook.pending_resume_source.?.bytes,
+        .target_flow_owned = false,
+        .target_cache = .empty,
+        .target_cache_unchanged = true,
+        .folded_summary_indices = &.{},
+        .target_layout = .{
+            .layout_id = 17,
+            .owned_top = 1,
+            .owned_band = .{ .top = 1, .bottom = 8 },
+            .body_area = .{ .top = 1, .bottom = 4 },
+            .transcript_area = .{ .top = 1, .bottom = 4 },
+            .footer_area = .{ .top = 5, .bottom = 8 },
+            .solved_frame_height = 8,
+            .terminal_rows = 8,
+            .terminal_cols = 40,
+        },
+        .selection = .{
+            .top_row = 1,
+            .bottom_row = 4,
+            .start_line = start_line,
+            .partial_skip_rows = 0,
+            .line_count = line_count,
+            .last_visible_row = 4,
+        },
+        .visual_offset = visual_offset,
+        .history_visual_offset = visual_offset,
+        .total_visual_rows = @intCast(line_count),
+        .cursor_row = 4,
+        .cursor_col = cursor_col,
+        .replaceable_last_line = false,
+        .replaceable_start = 0,
+        .replaceable_row = 4,
+        .trace_transcript_frame = false,
+        .trace_visible_rows = 4,
+    };
+    defer transition.deinit(alloc);
+    runtime.consumeTranscriptTransition(
+        alloc,
+        &transition,
+        testFrameCommitResult(0, .committed),
+    );
+}
+
+fn planAfterResumeHandoff(
+    alloc: Allocator,
+    runtime: *TranscriptRuntime,
+) !ResumeHandoffPlan {
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer prepared.deinit(alloc);
+    return .{
+        .start_line = prepared.selection.start_line,
+        .line_count = prepared.selection.line_count,
+        .facts = runtime.planTranscriptScroll(&prepared),
+    };
+}
+
+test "a resume that grows before its repaint scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
+test "a compacted resume that grows before its repaint scrolls the retained rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const retained_flow =
+        "tail-1\n" ++
+        "tail-2\n" ++
+        "tail-3\n" ++
+        "tail-final";
+    const full_flow =
+        "old-1\nold-2\nold-3\nold-4\n" ++
+        "old-5\nold-6\nold-7\nold-8\n" ++
+        retained_flow;
+    var runtime = try resumeHandoffTestRuntime(alloc, full_flow, retained_flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 8, 12, 8, 11);
+    try runtime.notebook.transcript.appendSlice(alloc, "\nnew-1\nnew-2");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 2), result.start_line);
+    try std.testing.expectEqual(@as(usize, 6), result.line_count);
+    try std.testing.expectEqual(@as(u32, 2), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 2), result.facts.planned_rows);
+}
+
+test "a resume that grows past its handoff screen before its repaint never scrolls rows it did not show" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    try runtime.notebook.transcript.appendSlice(
+        alloc,
+        "\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14",
+    );
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 10), result.start_line);
+    try std.testing.expectEqual(@as(usize, 14), result.line_count);
+    try std.testing.expectEqual(@as(u32, 10), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), result.facts.planned_rows);
+    try std.testing.expect(result.facts.recovery_rebase);
+}
+
+test "a reset after the resume handoff forgets the handoff rows" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+    runtime.resetTranscriptAnchor("test");
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 0), result.facts.planned_rows);
+    try std.testing.expect(result.facts.recovery_rebase);
+}
+
+test "a resume that grew before its handoff commits scrolls the rows it pushes off" {
+    const alloc = std.testing.allocator;
+    const flow =
+        "line-1\n" ++
+        "line-2\n" ++
+        "line-3\n" ++
+        "line-4\n" ++
+        "line-5\n" ++
+        "line-6";
+    var runtime = try resumeHandoffTestRuntime(alloc, flow, flow);
+    defer runtime.deinit(alloc);
+
+    try runtime.notebook.transcript.appendSlice(alloc, "\nline-7\nline-8\nline-9\nline-10");
+    commitResumeHandoff(alloc, &runtime, 2, 6, 2, 7);
+
+    const result = try planAfterResumeHandoff(alloc, &runtime);
+    try std.testing.expectEqual(@as(usize, 6), result.start_line);
+    try std.testing.expectEqual(@as(usize, 10), result.line_count);
+    try std.testing.expectEqual(@as(u32, 6), result.facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u16, 4), result.facts.planned_rows);
+}
+
+test "resume handoff rows skips wrapped prefix and enforces viewport alignment" {
+    const base = ViewportSelection{
+        .top_row = 1,
+        .bottom_row = 4,
+        .start_line = 0,
+        .partial_skip_rows = 0,
+        .line_count = 4,
+        .last_visible_row = 4,
+    };
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, .{ .history = 3, .screen = 4 }),
+        resumeHandoffRows("a\nb\nc\nd", "a\nb\nc\nd", 3, 3, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, .{ .history = 2, .screen = 4 }),
+        resumeHandoffRows("a\nb\nc", "a\nb\nc\nd\ne", 2, 2, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb\nc", "a\nb\nX", 2, 2, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, .{ .history = 1, .screen = 4 }),
+        resumeHandoffRows("123456\ntail\nend", "tail\nend", 3, 3, base, 5),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("123456\ntail\nend", "tail\nend", 1, 1, base, 5),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb\nc\nd", "a\nb\nc\nd", 4, 3, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("123456\ntail\nend", "il\nend", 3, 3, base, 5),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb", "other", 1, 1, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb", "", 1, 1, base, 10),
+    );
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb", "b", 1, 1, base, 0),
+    );
+    var split = base;
+    split.split_active = true;
+    try std.testing.expectEqual(
+        @as(?ResumeHandoffRows, null),
+        resumeHandoffRows("a\nb", "a\nb", 1, 1, split, 10),
+    );
+}
+
 test "oversized resume publication starts without a prior committed frame" {
     const alloc = std.testing.allocator;
     const layout = invalidationTestLayout();
@@ -15188,6 +15565,38 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
         semantic_rows,
         std.math.maxInt(u32),
     );
+}
+
+fn resumeHandoffRows(
+    committed_flow: []const u8,
+    live_source: []const u8,
+    visual_offset: u32,
+    history_visual_offset: u32,
+    selection: ViewportSelection,
+    cols: u16,
+) ?ResumeHandoffRows {
+    if (visual_offset != history_visual_offset) return null;
+    if (selection.split_active or selection.top_row == 0 or selection.last_visible_row < selection.top_row) {
+        return null;
+    }
+    if (cols == 0 or committed_flow.len == 0 or live_source.len == 0) return null;
+    const screen = selection.last_visible_row - selection.top_row + 1;
+    if (std.mem.startsWith(u8, live_source, committed_flow)) {
+        return .{
+            .history = history_visual_offset,
+            .screen = screen,
+        };
+    }
+    if (live_source.len > committed_flow.len) return null;
+    const prefix_len = committed_flow.len - live_source.len;
+    if (!std.mem.eql(u8, committed_flow[prefix_len..], live_source)) return null;
+    if (prefix_len > 0 and committed_flow[prefix_len - 1] != '\n') return null;
+    const skipped_rows = walkText(1, 1, committed_flow[0..prefix_len], cols).end_row - 1;
+    if (history_visual_offset < skipped_rows) return null;
+    return .{
+        .history = history_visual_offset - skipped_rows,
+        .screen = screen,
+    };
 }
 
 test "a line fx wrote marks the text entry that shows it, and nothing else" {
