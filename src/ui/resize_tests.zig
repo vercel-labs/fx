@@ -77,6 +77,7 @@ pub const Harness = struct {
     shell: TranscriptRuntime,
     metrics: Metrics = .{},
     frame_redraw: bool = false,
+    footer_surface_opening: bool = false,
     last_frame: TestFrameObservation = .{},
 
     pub fn init(alloc: Allocator, cols: u16, rows: u16, footer_rows: u16) !Harness {
@@ -476,6 +477,8 @@ fn solveTestFrame(
     replay_displaced_footer_history: bool,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
 ) !render_engine.frame_fixed_point.FramePlan {
+    const footer_surface_opening = h.footer_surface_opening;
+    h.footer_surface_opening = false;
     var ctx = TestFrameSolveContext{
         .h = h,
         .source = source,
@@ -501,7 +504,7 @@ fn solveTestFrame(
         },
         TestFrameSolveContext.prepareCandidate,
         TestFrameSolveContext.resolveCandidate,
-        false,
+        footer_surface_opening,
         prepared,
     );
 }
@@ -7028,6 +7031,54 @@ test "a slash picker replaced by a smaller footer surface writes no scrollback c
     const replace_bytes = try readEmittedSince(&h, replace_offset);
     defer alloc.free(replace_bytes);
     try std.testing.expect(std.mem.find(u8, replace_bytes, "\x1b[3J") == null);
+}
+
+test "a reprint skipped for an opening surface is paid by the first plain composer frame" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 20, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\nline 08\n" ++
+            "line 09\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\n" ++
+            "line 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try input.edit_state.input.appendSlice(alloc, "/");
+    input.edit_state.cursor = input.edit_state.input.items.len;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(input.deletionState(null).delete(alloc, .character_left, .clear));
+    const opening_offset = try h.file.length(io_mod.getIo());
+    h.footer_surface_opening = true;
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const opening_bytes = try readEmittedSince(&h, opening_offset);
+    defer alloc.free(opening_bytes);
+    try std.testing.expect(std.mem.find(u8, opening_bytes, "\x1b[3J") == null);
+
+    const settled_offset = try h.file.length(io_mod.getIo());
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    const settled_bytes = try readEmittedSince(&h, settled_offset);
+    defer alloc.free(settled_bytes);
+    try std.testing.expect(std.mem.find(u8, settled_bytes, "\x1b[3J") != null);
+    try expectFooterBottomRow(&h, 20);
 }
 
 test "slash picker dismissal resolves transcript extent before layout convergence" {
