@@ -1143,6 +1143,62 @@ test "a lock line whose socket path has an escape is read as its bytes, and its 
     try testing.expect(pathGone(io, leader.folder));
 }
 
+test "a lock line over the limit is kept and traced, even when its record parses" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    try leader.placeStaleSocket();
+    const record = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    defer testing.allocator.free(record);
+    const line = try testing.allocator.alloc(u8, session_manager.max_lock_line_bytes + 1);
+    defer testing.allocator.free(line);
+    @memset(line, ' ');
+    @memcpy(line[0..record.len], record);
+
+    const trace = try takeOverTraced(io, line);
+    defer testing.allocator.free(trace);
+
+    try testing.expect(std.mem.find(u8, trace, "reason=line_too_long") != null);
+    try testing.expect(!pathGone(io, leader.socket));
+    try testing.expect(!pathGone(io, leader.folder));
+}
+
+test "a removal that fails after the socket is unlinked keeps the folder, traces it, and the open goes on" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    try leader.placeStaleSocket();
+    const left_behind = try testing.allocator.print("{s}/left-behind", .{leader.folder});
+    defer testing.allocator.free(left_behind);
+    const file = try std.Io.Dir.cwd().createFile(io, left_behind, .{});
+    file.close(io);
+    const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    defer testing.allocator.free(line);
+
+    const trace = try takeOverTraced(io, line);
+    defer testing.allocator.free(trace);
+
+    try testing.expect(pathGone(io, leader.socket));
+    try testing.expect(!pathGone(io, leader.folder));
+    try testing.expect(std.mem.find(u8, trace, "event=dead_leader_folder_not_removed") != null);
+}
+
+test "a second takeover of the same lock line finds nothing to remove and does not fail" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    try leader.placeStaleSocket();
+    const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    defer testing.allocator.free(line);
+    takeOverDeadLeader(io, line);
+
+    const trace = try takeOverTraced(io, line);
+    defer testing.allocator.free(trace);
+
+    try testing.expect(pathGone(io, leader.folder));
+    try testing.expect(std.mem.find(u8, trace, "reason=folder_missing") != null);
+}
+
 test "a dead leader's folder with no socket left in it is removed" {
     const io = testing.io;
     var leader = try TestLeader.create(io, 0o700);
