@@ -133,6 +133,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn toolContext(
             app: *App,
             agent: *AppAgent,
+            rules_alloc: Allocator,
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
             max_read_file_bytes: usize,
@@ -141,7 +142,17 @@ pub fn Runtime(comptime App: type) type {
             max_command_output_bytes: usize,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
-        ) tool_runtime.Context {
+        ) Allocator.Error!tool_runtime.Context {
+            const authority = childToolAuthority(agent);
+            // The live rules are replaced, and the old ones freed, by the
+            // main loop under `authority_mutex`. A call that waits on an MCP
+            // server or runs a command reads them long after this returns, so
+            // it reads a copy in `rules_alloc`, which ends with the call. A
+            // subagent's rules are its admission's and never change.
+            const live_rules: types.PermissionRuleSet = if (authority == null)
+                try app_permission_runtime.Runtime(App).copyRules(app, rules_alloc)
+            else
+                .{};
             return toolContextWithAuthority(
                 app,
                 agent,
@@ -153,7 +164,8 @@ pub fn Runtime(comptime App: type) type {
                 max_command_output_bytes,
                 gateway_retry_count,
                 gateway_chat_url,
-                childToolAuthority(agent),
+                authority,
+                live_rules,
             );
         }
 
@@ -350,6 +362,7 @@ pub fn Runtime(comptime App: type) type {
                     .grants = admission.grants,
                     .rules = admission.rules,
                 },
+                .{},
             );
         }
 
@@ -365,6 +378,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
             authority: ?ToolAuthorityView,
+            live_rules: types.PermissionRuleSet,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
@@ -385,7 +399,7 @@ pub fn Runtime(comptime App: type) type {
             const permission_rules = if (authority) |snapshot|
                 snapshot.rules
             else
-                app.permission_engine.rules;
+                live_rules;
             const child_capability =
                 if (comptime agents.hasAgentField(App, "session_persistence"))
                     app_session_runtime.Runtime(App).childCapability(agent)
@@ -730,7 +744,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !?[]const u8 {
-            const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            const ctx = try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
             // A wait, or a status that names no agent, concerns every
             // subagent this agent runs, so its row names them as its host
             // lists them now: `waiting for reviewer, builder`.
@@ -767,8 +781,9 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !void {
+            // Releasing a lease reads no permission rule, so it takes none.
             return tool_runtime.release_agent_terminal_lease(
-                toolContext(
+                toolContextWithAuthority(
                     app,
                     agent,
                     ignored_list_entries,
@@ -779,6 +794,8 @@ pub fn Runtime(comptime App: type) type {
                     max_command_output_bytes,
                     gateway_retry_count,
                     gateway_chat_url,
+                    childToolAuthority(agent),
+                    .{},
                 ),
                 session_id,
             );
@@ -797,8 +814,9 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !void {
+            // Stopping commands reads no permission rule, so it takes none.
             return tool_runtime.stop_steering_detached_commands(
-                toolContext(
+                toolContextWithAuthority(
                     app,
                     agent,
                     ignored_list_entries,
@@ -809,6 +827,8 @@ pub fn Runtime(comptime App: type) type {
                     max_command_output_bytes,
                     gateway_retry_count,
                     gateway_chat_url,
+                    childToolAuthority(agent),
+                    .{},
                 ),
                 turn_id,
             );
@@ -830,7 +850,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .active, null);
         }
 
@@ -850,7 +870,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .completed, null);
         }
 
@@ -871,7 +891,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             return formatToolAction(ctx, arena, call, display_target, .denied, label);
         }
 
@@ -896,14 +916,14 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
-            var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            // The outcome holds nothing of the list or the rules, so the copy ends with the check.
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
+            var ctx = tool_runtime.withAdvertisedDynamicToolNames(try toolContext(app, agent, copy.allocator(), ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             ctx.mcp_review_schema_json = mcp_review_schema_json;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
-            // The outcome holds nothing of the list, so the copy ends with the check.
-            var copy = std.heap.ArenaAllocator.init(app.alloc);
-            defer copy.deinit();
             const grants = mergeLiveGrants(app, agent, copy.allocator(), local_grants);
             return if (revalidation) |request| switch (request) {
                 .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
@@ -944,10 +964,13 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(
-                toolContext(
+                try toolContext(
                     app,
                     agent,
+                    copy.allocator(),
                     ignored_list_entries,
                     max_list_entries,
                     max_read_file_bytes,
@@ -962,8 +985,6 @@ pub fn Runtime(comptime App: type) type {
             applyCredentialLease(app, agent, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
-            var copy = std.heap.ArenaAllocator.init(app.alloc);
-            defer copy.deinit();
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
                 admission,
                 arena,
@@ -988,7 +1009,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolCallValidationResult {
-            return tool_runtime.validateToolCall(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
+            return tool_runtime.validateToolCall(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
         }
 
         /// The current definition of a live MCP tool the model called without
@@ -1007,7 +1028,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !?tool_mcp_runtime.SelectedTool {
-            return tool_runtime.resolveUnselectedMcpTool(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name);
+            return tool_runtime.resolveUnselectedMcpTool(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, name);
         }
 
         pub fn checkToolAvailability(
@@ -1024,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !?[]const u8 {
-            return tool_runtime.checkToolAvailability(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
+            return tool_runtime.checkToolAvailability(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), arena, call);
         }
 
         pub fn permissionTargetForCall(
@@ -1042,7 +1063,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) ![]const u8 {
-            const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            const ctx = tool_runtime.withAdvertisedDynamicToolNames(try toolContext(app, agent, arena, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
             return tool_admission.permissionTargetForCall(ctx.admissionInput(), arena, call);
         }
 
@@ -1059,7 +1080,11 @@ pub fn Runtime(comptime App: type) type {
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
-            var ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            // The rules are a copy too, and it ends with the call, which
+            // outlives any command's `fx mcp call` and any wait on an MCP server.
+            var copy = std.heap.ArenaAllocator.init(app.alloc);
+            defer copy.deinit();
+            var ctx = try toolContext(app, agent, copy.allocator(), ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
             applyCredentialLease(app, agent, &ctx, request.credential, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
@@ -1068,8 +1093,6 @@ pub fn Runtime(comptime App: type) type {
             // request, and the copy ends with the call. A command's
             // `fx mcp call` borrows it only while the call runs, since
             // `mcp_call_bridge.unregister` waits for its borrowers.
-            var copy = std.heap.ArenaAllocator.init(app.alloc);
-            defer copy.deinit();
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
             return tool_runtime.executeToolCallAuthorized(ctx, requestForExecution(app, agent, copy.allocator(), request));
@@ -2113,8 +2136,8 @@ fn makeTestContextSnapshot(alloc: Allocator, provider_id: []const u8, content: [
     } };
 }
 
-fn testToolContext(app: *FakeApp) tool_runtime.Context {
-    return Runtime(FakeApp).toolContext(app, app.agent(), &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+fn testToolContext(app: *FakeApp) !tool_runtime.Context {
+    return Runtime(FakeApp).toolContext(app, app.agent(), std.testing.failing_allocator, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 }
 
 const ProjectionBarrier = struct {
@@ -2624,7 +2647,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     };
     try app.permission_engine.allow(alloc, "run_command", "/tmp/workspace::zig build");
 
-    const ctx = testToolContext(&app);
+    const ctx = try testToolContext(&app);
     try std.testing.expectEqualStrings("/tmp/workspace", ctx.workspace_root);
     try std.testing.expectEqualStrings("api-key", ctx.api_key);
     try std.testing.expectEqualStrings("test-model", ctx.model);
@@ -2843,9 +2866,10 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
     _ = app.auth.adoptCredential(alloc, &credential);
     app.selected_provider = .codex;
 
-    const ctx = Runtime(FakeApp).toolContext(
+    const ctx = try Runtime(FakeApp).toolContext(
         &app,
         (&app).agent(),
+        std.testing.failing_allocator,
         &test_ignored_list_entries,
         100,
         1024,
@@ -2881,7 +2905,7 @@ test "app agent runtime tool context combines active settings with live permissi
     defer app.agent().worker.clearActiveAgentTurnSettings();
     app.permission_engine.mode = .auto;
 
-    const ctx = testToolContext(&app);
+    const ctx = try testToolContext(&app);
 
     try std.testing.expectEqual(@as(usize, 8192), ctx.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
@@ -3369,7 +3393,7 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
-    const tool_context = testToolContext(&app);
+    const tool_context = try testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
 }
 
@@ -3805,6 +3829,31 @@ test "subagent tool context uses immutable admission authority" {
         "run_command",
         ctx.permission_grants[0].tool_name,
     );
+}
+
+test "tool context reads a copy of the live permission rules, not the engine's slice" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var live_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("live-rule"),
+        .action = .deny,
+    }};
+    app.permission_engine.rules = .{ .rules = &live_rules };
+    defer app.permission_engine.rules = .{};
+
+    const ctx = try Runtime(FakeApp).toolContext(&app, app.agent(), arena.allocator(), &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expect(ctx.permission_rules.rules.ptr != app.permission_engine.rules.rules.ptr);
+    try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
+    try std.testing.expectEqualStrings("live-rule", ctx.permission_rules.rules[0].pattern);
+
+    // `replaceRules` frees the engine's slice and every string in it.
+    live_rules[0].pattern = @constCast("replaced-rule");
+    try std.testing.expectEqualStrings("live-rule", ctx.permission_rules.rules[0].pattern);
 }
 
 test "app agent runtime settles queued snapshot ownership when prompt admission fails" {

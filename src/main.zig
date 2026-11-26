@@ -2118,7 +2118,11 @@ const App = struct {
 
     /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
     pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+        // The catalog reads the rules after waiting for its lock, by which time
+        // `/allowlist` may have replaced and freed the engine's slice.
+        var rules = try app_permission_runtime.Runtime(App).copyRules(self, alloc);
+        defer rules.deinit(alloc);
+        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, rules), self.context_limits, .unrestricted);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2455,9 +2459,10 @@ const App = struct {
         arena: Allocator,
         call: ToolCall,
     ) !tool_admission.PreparedPermissionStateAction {
-        const ctx = AgentAppRuntime.toolContext(
+        const ctx = try AgentAppRuntime.toolContext(
             self,
             agent,
+            arena,
             &ignored_list_entries,
             max_list_entries,
             max_read_file_bytes,
@@ -8482,7 +8487,7 @@ test "a subagent's tools work under its admission, with no subagent host" {
 
     const Check = struct {
         fn run(admission: *subagent_domain.AdmissionSnapshot, a: *App, agent: *agents.Agent) anyerror!void {
-            const ctx = App.AgentAppRuntime.toolContext(a, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+            const ctx = try App.AgentAppRuntime.toolContext(a, agent, std.testing.failing_allocator, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
             try std.testing.expect(ctx.subagent_host == null);
             try std.testing.expect(ctx.subagent_caller_id == null);
             try std.testing.expectEqual(types.PermissionMode.ask, ctx.permission_mode);
@@ -8501,7 +8506,7 @@ test "a subagent's tools work under its admission, with no subagent host" {
     try App.AgentsAppRuntime.visit(&app, child, &child.agent.child_run.?.admission, Check.run);
 
     // The first instance's own tool context follows its own mode.
-    const main_ctx = App.AgentAppRuntime.toolContext(&app, (&app).screenAgent(), &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    const main_ctx = try App.AgentAppRuntime.toolContext(&app, (&app).screenAgent(), std.testing.failing_allocator, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     try std.testing.expectEqual(types.PermissionMode.yolo, main_ctx.permission_mode);
     try std.testing.expect(main_ctx.worker == &app.main_agent.worker);
     try std.testing.expect(main_ctx.lifecycle_scope.kind == .interactive);
@@ -8712,7 +8717,7 @@ test "subagents' workers and main's worker add approvals while main's worker and
             defer arena.deinit();
             while (self.writing()) {
                 _ = arena.reset(.retain_capacity);
-                const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+                const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, arena.allocator(), &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl()) catch continue;
                 _ = ctx;
                 const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
                 self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));

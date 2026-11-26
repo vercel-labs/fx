@@ -197,6 +197,18 @@ pub fn Runtime(comptime App: type) type {
             return merged;
         }
 
+        /// A copy of the live permission rules in `alloc`, taken under the
+        /// authority lock that replacing them holds. The engine frees the
+        /// rule slice when the rules are replaced, so a reader that keeps the
+        /// slice past this call, across a wait for an MCP server or the life
+        /// of a command, reads freed memory. The caller frees the copy with
+        /// `PermissionRuleSet.deinit`, or with `alloc` when that is an arena.
+        pub fn copyRules(app: anytype, alloc: std.mem.Allocator) !types.PermissionRuleSet {
+            lockAuthority(app);
+            defer unlockAuthority(app);
+            return types.dupePermissionRuleSet(alloc, app.permission_engine.rules);
+        }
+
         /// How many of `agent`'s session approvals still apply, counted under
         /// the authority lock.
         pub fn liveGrantCount(app: anytype, agent: anytype) usize {
