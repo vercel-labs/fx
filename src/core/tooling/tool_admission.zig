@@ -2591,14 +2591,24 @@ fn interactivePermissionRequest(
                 .amendment_allowed = true,
             };
         }
+        const encoded_cwd: ?[]const u8 = if (std.mem.eql(u8, context.resolved_cwd, input.workspace_root))
+            null
+        else
+            (try text_utils.encodeTerminalSafe(
+                arena,
+                context.resolved_cwd,
+                permission_request.max_tool_arguments_preview_bytes,
+            )).bytes;
         return .{
             .label = try tool_presentation.formatRunCommandPermissionLabel(
                 arena,
                 context.command,
+                encoded_cwd,
             ),
             .command = try command_environment.formatApprovalCommand(
                 arena,
                 context.environment,
+                encoded_cwd,
                 context.command,
             ),
             .amendment_allowed = true,
@@ -2989,6 +2999,37 @@ test "interactive command approval keeps activity projection out of permission r
         "# shell.run profile=user shell=",
     ));
     try std.testing.expect(std.mem.endsWith(u8, approval_command, "\n" ++ raw_command));
+}
+
+test "interactive command approval names a cwd outside the workspace root" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+
+    const in_root = try interactivePermissionRequest(input, arena, .{
+        .id = "in-root",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch ./marker\"}",
+    }, null);
+    try std.testing.expect(std.mem.find(u8, in_root.label, " @ ") == null);
+    try std.testing.expect(std.mem.find(u8, in_root.command.?, "cwd=") == null);
+
+    const elsewhere = try interactivePermissionRequest(input, arena, .{
+        .id = "elsewhere",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch ./marker\",\"cwd\":\"/\"}",
+    }, null);
+    try std.testing.expectEqualStrings("shell.run touch ./marker @ /", elsewhere.label);
+    const header_end = std.mem.findScalar(u8, elsewhere.command.?, '\n') orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.endsWith(u8, elsewhere.command.?[0..header_end], " cwd=/"));
+    try std.testing.expect(std.mem.endsWith(u8, elsewhere.command.?, "\ntouch ./marker"));
 }
 
 test "terminal exec timeout and profile omission share user grants while clean stays isolated" {

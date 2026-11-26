@@ -101,27 +101,32 @@ pub fn commandFromPermissionIdentity(identity: []const u8) []const u8 {
     return rest[shell_len + 2 ..];
 }
 
+/// `encoded_cwd` is the terminal-safe directory the command runs in, or null
+/// when it runs in the workspace root.
 pub fn formatApprovalCommand(
     alloc: std.mem.Allocator,
     environment: Environment,
+    encoded_cwd: ?[]const u8,
     command: []const u8,
 ) ![]u8 {
+    const cwd_prefix: []const u8 = if (encoded_cwd != null) " cwd=" else "";
+    const cwd = encoded_cwd orelse "";
     return switch (environment) {
         .legacy => alloc.print(
-            "# shell.run profile=omitted (legacy)\n{s}",
-            .{command},
+            "# shell.run profile=omitted (legacy){s}{s}\n{s}",
+            .{ cwd_prefix, cwd, command },
         ),
         .workspace_clean => alloc.print(
-            "# shell.run profile=clean workspace=root-fixed\n{s}",
-            .{command},
+            "# shell.run profile=clean workspace=root-fixed{s}{s}\n{s}",
+            .{ cwd_prefix, cwd, command },
         ),
         .clean => |path| alloc.print(
-            "# shell.run profile=clean shell={s}\n{s}",
-            .{ path, command },
+            "# shell.run profile=clean shell={s}{s}{s}\n{s}",
+            .{ path, cwd_prefix, cwd, command },
         ),
         .user => |path| alloc.print(
-            "# shell.run profile=user shell={s}\n{s}",
-            .{ path, command },
+            "# shell.run profile=user shell={s}{s}{s}\n{s}",
+            .{ path, cwd_prefix, cwd, command },
         ),
     };
 }

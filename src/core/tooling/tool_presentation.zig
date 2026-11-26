@@ -856,10 +856,13 @@ fn isPathTokenByte(byte: u8) bool {
     };
 }
 
+/// `encoded_cwd` is the terminal-safe directory the command runs in, or null
+/// when it runs in the workspace root.
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatRunCommandPermissionLabel(
     alloc: Allocator,
     command: []const u8,
+    encoded_cwd: ?[]const u8,
 ) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
@@ -870,6 +873,9 @@ pub fn formatRunCommandPermissionLabel(
         max_run_command_activity_bytes,
     );
     const suffix = try commandApprovalLabelSuffix(scratch, "shell", command);
+    if (encoded_cwd) |cwd| {
+        return alloc.print("shell.run {s} @ {s}{s}", .{ encoded.bytes, cwd, suffix });
+    }
     return alloc.print("shell.run {s}{s}", .{ encoded.bytes, suffix });
 }
 
@@ -1262,7 +1268,7 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     if (isCapturedCommandCall(registry, call, args)) {
         const command = tool_args.optionalStringArg(args, "command") orelse
             return try alloc.dupe(u8, call.name);
-        return formatRunCommandPermissionLabel(alloc, command);
+        return formatRunCommandPermissionLabel(alloc, command, null);
     }
     const spec = registry.lookup(call.name) orelse return try alloc.dupe(u8, call.name);
     if (file_mutation_contract.isToolName(call.name)) {
