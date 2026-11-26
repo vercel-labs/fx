@@ -6,7 +6,7 @@
 
 test {
     _ = @import("acp/jsonrpc.zig");
-    _ = @import("acp/leader.zig");
+    _ = @import("acp/takeover.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
     _ = @import("core/agent/assistant_presentation.zig");

@@ -11,6 +11,7 @@ const acp_types = @import("types.zig");
 const client_info = @import("client_info.zig");
 const sessions = @import("sessions.zig");
 const leader_mod = @import("leader.zig");
+const takeover_mod = @import("takeover.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
@@ -2933,7 +2934,7 @@ fn startLeader(state: *ServerState) void {
         leader.stop(io);
         return;
     };
-    store.manager.setLockWon(leader_mod.takeOverDeadLeader);
+    store.manager.setLockWon(takeover_mod.takeOverDeadLeader);
     host.leader = leader;
 }
 

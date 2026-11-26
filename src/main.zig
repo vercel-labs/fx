@@ -5420,6 +5420,7 @@ test {
     _ = @import("acp/prompt.zig");
     _ = @import("acp/server.zig");
     _ = @import("acp/leader.zig");
+    _ = @import("acp/takeover.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
     _ = @import("protocol/spec/schemas.zig");
