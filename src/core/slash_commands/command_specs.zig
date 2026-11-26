@@ -15,7 +15,6 @@ pub const TopLevelKind = enum {
     issue,
     login,
     logout,
-    setup,
     status,
     permissions,
     mcp,
@@ -81,21 +80,13 @@ pub const SlashKind = enum {
     version,
 };
 
-/// The release that drops every old spelling fx still reads with a warning,
-/// such as `fx setup`, `--sessions-v2`, and `/allowlist user`. The CLI shape
-/// check fails once fx's version reaches it, so they come out on time.
-pub const old_spelling_removal = "0.0.18";
-/// What every warning about an old spelling says.
-pub const deprecated_until = "is deprecated and stops working in fx " ++ old_spelling_removal;
-
 pub const OptionDoc = struct {
     flag: []const u8,
     description: []const u8,
     /// Set for a removed spelling: help omits it, and the parser rejects it
     /// with this hint, such as "use --resume <id>".
     replacement: ?[]const u8 = null,
-    /// Help omits it, but the parser still reads it: a deprecated spelling
-    /// that keeps working with a warning, such as `--sessions-v2`.
+    /// Help omits it, but the parser still reads it, such as `--connect`.
     hidden: bool = false,
     /// The fixed values the flag takes, which `fx completion` offers. A value
     /// written in the flag itself, such as `--period <today|7d|month>`, needs no
@@ -144,9 +135,6 @@ pub const TopLevelSpec = struct {
     subcommands: []const SubcommandDoc = &.{},
     details: []const []const u8 = &.{},
     hidden_from_top_level_help: bool = false,
-    /// Set on a deprecated command: the spelling that replaces it. Running the
-    /// command prints a warning that names it.
-    replaced_by: ?[]const u8 = null,
     /// The name help shows after `fx `, when it isn't `token`: a command
     /// reached only through an alias, such as `--resume`.
     help_title: ?[]const u8 = null,
@@ -1407,17 +1395,6 @@ fn renderSlashEntries(alloc: Allocator, registry: SlashRegistry, welcome_only: b
     return try out.toOwnedSlice();
 }
 
-/// The warning a deprecated command prints before it runs, or null for a
-/// current command. Caller owns the returned text.
-pub fn deprecationWarning(alloc: Allocator, registry: TopLevelRegistry, kind: TopLevelKind) !?[]u8 {
-    for (registry.specs) |spec| {
-        if (spec.kind != kind) continue;
-        const replacement = spec.replaced_by orelse return null;
-        return try alloc.print("fx {s} " ++ deprecated_until ++ "; use {s}\n", .{ spec.token, replacement });
-    }
-    return null;
-}
-
 fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
     for (registry.specs) |spec| {
         if (spec.kind == kind) return spec;
@@ -1738,7 +1715,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
-    // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
+    // `fx login --api-key` replaced the removed `fx setup`.
     try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") == null);
     try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok] [--api-key]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
@@ -2090,14 +2067,6 @@ test "top-level specs keep unique tokens and aliases" {
             try std.testing.expectEqual(@as(usize, 1), topLevelTokenOccurrences(registry, alias));
         }
     }
-}
-
-test "a deprecated command warns with its replacement and a current one does not" {
-    const alloc = std.testing.allocator;
-    const warning = (try deprecationWarning(alloc, testTopLevelRegistry(), .setup)).?;
-    defer alloc.free(warning);
-    try std.testing.expectEqualStrings("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n", warning);
-    try std.testing.expect((try deprecationWarning(alloc, testTopLevelRegistry(), .login)) == null);
 }
 
 test "top-level help index covers visible commands once" {

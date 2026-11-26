@@ -34,6 +34,9 @@ const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_memory = @import("../gateway/token_pass_memory.zig");
+const token_pass_check = @import("../app/token_pass_check.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const execution_process_provider = @import("../execution/process_provider.zig");
@@ -90,7 +93,6 @@ pub const Command = union(enum) {
     issue: []const [:0]const u8,
     login: []const [:0]const u8,
     logout: []const [:0]const u8,
-    setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
@@ -832,7 +834,6 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
@@ -941,7 +942,7 @@ pub fn parseInteractiveLaunch(
                         if (parseResumeArgs(alloc, resume_line, invocation.top_level_alias)) |parsed_target| {
                             var unused = parsed_target;
                             unused.deinit(alloc);
-                        } else |resume_err| if (removedResumeHint(resume_err) != null) return resume_err;
+                        } else |resume_err| if (removedSpellingHint(resume_err) != null) return resume_err;
                     }
                     return err;
                 };
@@ -980,6 +981,7 @@ pub fn parseInteractiveLaunch(
             .print_flag => return error.PrintFlagUseAsk,
             .unknown_flag => return error.UnknownLaunchFlag,
             .command_typo => return error.UnknownCommandTypo,
+            .removed_setup => return error.RemovedSetupCommand,
             .prompt => {
                 // Read the whole line again so launch flags may also follow
                 // the prompt, as in `fx "fix the bug" --model x`.
@@ -1040,13 +1042,18 @@ const LaunchWord = enum {
     /// A near miss for a command name, such as `stauts`, or a flag name
     /// typed without its dashes, such as `version`.
     command_typo,
+    /// `fx setup`, a removed spelling that names its replacement.
+    removed_setup,
     prompt,
 };
 
 /// Decides what plain `fx` does with a first argument that isn't a command.
+const removed_setup_word = "setup";
+
 fn classifyLaunchWord(command_catalog: CommandCatalog, word: []const u8) LaunchWord {
     // `fx -- "-x"` lets a prompt start with a dash.
     if (std.mem.eql(u8, word, "--")) return .prompt;
+    if (std.mem.eql(u8, word, removed_setup_word)) return .removed_setup;
     if (word.len > 0 and word[0] == '-') {
         if (isVersionFlag(word)) return .command_line;
         if (isPrintFlag(word)) return .print_flag;
@@ -1228,6 +1235,65 @@ fn writeHostManagedAuthResult(deps: RunDeps) !void {
     try writeStdout(deps, "\n");
 }
 
+const team_credits_poll_ms: u64 = 10;
+
+const TokenPassLoginNotice = struct {
+    active: bool = false,
+    line: ?[]u8 = null,
+
+    fn deinit(self: *TokenPassLoginNotice, alloc: Allocator) void {
+        if (self.line) |line| alloc.free(line);
+        self.* = .{};
+    }
+};
+
+const CliTeamCreditsTask = struct {
+    alloc: Allocator,
+    provider: gateway_provider.CreditsProvider,
+    credential: ?[]const u8,
+    credential_source: credentials.Source,
+    tenant: ?[]const u8,
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    snapshot: output_contracts.CreditsSnapshot = .{},
+
+    fn run(self: *CliTeamCreditsTask) void {
+        self.snapshot = self.provider.fetch(self.alloc, .{
+            .credential = self.credential,
+            .credential_source = self.credential_source,
+            .tenant = self.tenant,
+            .cancel_flag = &self.cancel,
+        });
+        self.done.store(true, .release);
+    }
+};
+
+fn catalogHasTokenPassMarks(entries: []const model_catalog.ModelCatalogEntry) bool {
+    for (entries) |entry| {
+        if (entry.token_pass) return true;
+    }
+    return false;
+}
+
+fn saveCliTokenPassAnswer(
+    alloc: Allocator,
+    credential: credentials.Credential,
+    answer: token_pass.Answer,
+) void {
+    const home = io_mod.homeDir() orelse return;
+    const named = token_pass_check.name(
+        alloc,
+        credential.source,
+        credential.token,
+        credential.accountId(),
+        credential.gatewayTeam(),
+    ) orelse return;
+    const id = named.saved_as orelse return;
+    token_pass_memory.save(alloc, home, &id, answer) catch |err| {
+        debug_trace.logf("token_pass", "saved answer not written err={s}", .{@errorName(err)});
+    };
+}
+
 fn activateProviderSelection(
     alloc: Allocator,
     cfg: Config,
@@ -1235,8 +1301,9 @@ fn activateProviderSelection(
     target: model_provider.ProviderId,
     caller: ProviderActivationCaller,
     exact_source: ?credentials.Source,
+    out_token_pass: ?*TokenPassLoginNotice,
 ) !bool {
-    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
+    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source, out_token_pass) catch |err| {
         switch (err) {
             error.CredentialStorageUnavailable,
             error.CredentialTemporarilyUnavailable,
@@ -1295,6 +1362,7 @@ fn activateProviderSelectionFallible(
     target: model_provider.ProviderId,
     caller: ProviderActivationCaller,
     exact_source: ?credentials.Source,
+    out_token_pass: ?*TokenPassLoginNotice,
 ) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
@@ -1409,6 +1477,28 @@ fn activateProviderSelectionFallible(
         });
         return false;
     };
+    var credits_task: CliTeamCreditsTask = undefined;
+    var credits_future: ?std.Io.Future(void) = null;
+    if (comptime !builtin.single_threaded) {
+        if (out_token_pass != null and target == .gateway and credential != null) {
+            if (cfg.provider_set.select(.gateway).credits) |credits_provider| {
+                credits_task = .{
+                    .alloc = alloc,
+                    .provider = credits_provider,
+                    .credential = credential.?.token,
+                    .credential_source = credential.?.source,
+                    .tenant = credential.?.gatewayTeam(),
+                };
+                credits_future = io_mod.getIo().concurrent(CliTeamCreditsTask.run, .{&credits_task}) catch null;
+            }
+        }
+    }
+    defer if (credits_future) |*future| {
+        credits_task.cancel.store(true, .seq_cst);
+        future.await(io_mod.getIo());
+        credits_task.snapshot.deinit(alloc);
+    };
+
     const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
         .access = if (cfg.auth_mode == .host_managed)
             .host_managed
@@ -1474,6 +1564,45 @@ fn activateProviderSelectionFallible(
         },
         .outcome => {},
     }
+    if (out_token_pass) |dest| {
+        if (target == .gateway and credential != null) {
+            var credits_snapshot: ?output_contracts.CreditsSnapshot = null;
+            defer if (credits_snapshot) |*snapshot| snapshot.deinit(alloc);
+            if (credits_future) |*future| {
+                const deadline = io_mod.awakeMilliTimestamp() + auth_runtime.default_team_credits_wait_ms;
+                while (!credits_task.done.load(.acquire)) {
+                    if (io_mod.awakeMilliTimestamp() >= deadline) {
+                        credits_task.cancel.store(true, .seq_cst);
+                        break;
+                    }
+                    // Poll the concurrent credits task until it finishes or hits the wait budget (RULES.md R2.3).
+                    io_mod.sleep(team_credits_poll_ms * std.time.ns_per_ms);
+                }
+                const finished_in_time = credits_task.done.load(.acquire);
+                future.await(io_mod.getIo());
+                credits_future = null;
+                if (finished_in_time) {
+                    credits_snapshot = credits_task.snapshot;
+                } else {
+                    credits_task.snapshot.deinit(alloc);
+                }
+            }
+            const catalog_has_marks = catalogHasTokenPassMarks(loaded.catalog.items);
+            const credits_answer = if (credits_snapshot) |snapshot| token_pass_check.answerOf(snapshot) else null;
+            const remaining = if (credits_snapshot) |snapshot|
+                if (snapshot.token_pass) |credit| credit.remaining else null
+            else
+                null;
+            if (credits_answer orelse (if (catalog_has_marks) token_pass.Answer.has_pass else null)) |answer| {
+                saveCliTokenPassAnswer(alloc, credential.?.*, answer);
+            }
+            const notice = token_pass.resolveTeamNotice(credits_answer, remaining, catalog_has_marks);
+            dest.* = .{
+                .active = notice == .active,
+                .line = try token_pass.formatTeamNotice(alloc, notice, .plain),
+            };
+        }
+    }
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
@@ -1496,7 +1625,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
             return usage_failure;
         }
-        if (removedResumeHint(err)) |hint| {
+        if (removedSpellingHint(err)) |hint| {
             try writeStderr(deps, hint);
             return usage_failure;
         }
@@ -1693,6 +1822,8 @@ fn runNonInteractiveWithDeps(
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
             };
+            var token_pass_notice: TokenPassLoginNotice = .{};
+            defer token_pass_notice.deinit(alloc);
             if (!try activateProviderSelection(
                 alloc,
                 cfg,
@@ -1700,14 +1831,24 @@ fn runNonInteractiveWithDeps(
                 login_provider,
                 .provider_login,
                 if (login_provider == .gateway) .fx_login else null,
+                if (login_provider == .gateway) &token_pass_notice else null,
             )) return .handled_failure;
             retryKeptSignOuts(alloc, cfg, deps, login_provider);
-            try writeStdout(deps, switch (login_provider) {
-                .gateway => "Signed in to Vercel.\nAI Gateway access may still require billing or API setup for the selected account.\n",
-                .codex => "Signed in with Codex.\n",
-                .grok => "Signed in with Grok.\n",
-                .configured => "Configured providers use settings.json authentication.\n",
-            });
+            switch (login_provider) {
+                .gateway => {
+                    try writeStdout(deps, "Signed in to Vercel.\n");
+                    if (!token_pass_notice.active) {
+                        try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
+                    }
+                    if (token_pass_notice.line) |line| {
+                        try writeStdout(deps, line);
+                        try writeStdout(deps, "\n");
+                    }
+                },
+                .codex => try writeStdout(deps, "Signed in with Codex.\n"),
+                .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+                .configured => try writeStdout(deps, "Configured providers use settings.json authentication.\n"),
+            }
             return .handled_success;
         },
         .logout => |rest| {
@@ -1853,6 +1994,8 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, message);
                 return .handled_failure;
             };
+            var token_pass_notice: TokenPassLoginNotice = .{};
+            defer token_pass_notice.deinit(alloc);
             if (!try activateProviderSelection(
                 alloc,
                 cfg,
@@ -1860,7 +2003,12 @@ fn runNonInteractiveWithDeps(
                 .gateway,
                 .provider_login,
                 .fx_login,
+                &token_pass_notice,
             )) return .handled_failure;
+            if (token_pass_notice.line) |line| {
+                try writeStdout(deps, line);
+                try writeStdout(deps, "\n");
+            }
             return .handled_success;
         },
         .provider => |rest| {
@@ -1872,26 +2020,11 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
                 return usage_failure;
             };
-            const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
+            const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null, null) catch |err| switch (err) {
                 error.UnknownConfiguredProvider => return usage_failure,
                 else => return err,
             };
             return if (activated) .handled_success else .handled_failure;
-        },
-        .setup => |rest| {
-            if (try command_specs.deprecationWarning(alloc, cfg.command_catalog, .setup)) |warning| {
-                defer alloc.free(warning);
-                try writeStderr(deps, warning);
-            }
-            if (rest.len != 0) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return usage_failure;
-            }
-            if (cfg.auth_mode == .host_managed) {
-                try writeHostManagedAuthResult(deps);
-                return .handled_success;
-            }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx setup")) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -2561,8 +2694,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
 }
 
 /// Reads and stores an AI Gateway API key. `command` names the command in
-/// failure messages: `fx login` for `fx login --api-key`, `fx setup` for the
-/// deprecated spelling.
+/// failure messages, such as `fx login`.
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -5360,14 +5492,15 @@ fn resumeFlagTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
     return .{ .id = try alloc.dupe(u8, id) };
 }
 
-/// The hint for a removed resume spelling, or null for any other error.
-fn removedResumeHint(err: anyerror) ?[]const u8 {
+/// The hint for a removed spelling, such as `fx resume`, or null for any other error.
+fn removedSpellingHint(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.RemovedResumeLast => "fx: --resume-last was removed; use fx --resume last\n",
         error.RemovedResumeIdAlias => "fx: --resume-<id> was removed; use fx --resume <id>\n",
         error.RemovedResumeCommand => "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n",
         error.RemovedResumeIdFlag => "fx session resume: --id was removed; use fx session resume <id>\n",
         error.RemovedResumeLastFlag => "fx session resume: --resume --last was removed; use fx session resume last\n",
+        error.RemovedSetupCommand => "fx: fx setup was removed; use fx login vercel --api-key\n",
         else => null,
     };
 }
@@ -5492,10 +5625,6 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("issue"), @constCast("flaky") })) {
         .issue => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("setup")})) {
-        .setup => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {
@@ -6289,8 +6418,30 @@ test "removed resume spellings fail with a hint" {
     };
     for (cases) |case| {
         try std.testing.expectError(case.err, parseResumeArgs(std.testing.allocator, case.args, case.top_level_alias));
-        try std.testing.expect(removedResumeHint(case.err) != null);
+        try std.testing.expect(removedSpellingHint(case.err) != null);
     }
+}
+
+test "removed setup exits 2 with a hint that names its replacement, without a terminal" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("setup"), @constCast("extra") },
+        cfg,
+        capture.deps(),
+    );
+
+    switch (result) {
+        .handled_exit => |code| try std.testing.expectEqual(output_contracts.usage_exit_code, code),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqualStrings("fx: fx setup was removed; use fx login vercel --api-key\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
 }
 
 test "parse resume args accepts an operand on the top-level resume flag" {
@@ -6674,7 +6825,7 @@ test "runIfRequested version flags reject extra args" {
     }
 }
 
-test "setup is a paste-only stored-key adapter" {
+test "login --api-key is a paste-only stored-key adapter" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     var cfg = testConfig();
@@ -6682,7 +6833,7 @@ test "setup is a paste-only stored-key adapter" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6696,7 +6847,7 @@ test "setup is a paste-only stored-key adapter" {
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
 }
 
-test "setup delegates secure input to an interactive host store" {
+test "login --api-key delegates secure input to an interactive host store" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
     capture.setup_interactive_store = true;
@@ -6705,7 +6856,7 @@ test "setup delegates secure input to an interactive host store" {
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{@constCast("setup")},
+        &.{ @constCast("login"), @constCast("--api-key") },
         cfg,
         capture.deps(),
     );
@@ -6716,31 +6867,7 @@ test "setup delegates secure input to an interactive host store" {
     try std.testing.expect(!capture.setup_value_matched);
 }
 
-test "setup preserves the disabled secret-store failure" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_store_disabled = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expectEqualStrings(
-        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" ++
-            "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
-        capture.stderr.written(),
-    );
-}
-
-test "login --api-key stores a pasted key like setup, without the deprecation warning" {
+test "login --api-key stores a pasted key without a warning" {
     for ([_][]const [:0]const u8{
         &.{"--api-key"},
         &.{ "vercel", "--api-key" },
@@ -6905,15 +7032,15 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
             .summary = "Show injected help",
         },
         .{
-            .kind = .setup,
+            .kind = .status,
             .token = "start",
             .usage = "start",
-            .summary = "Run injected setup",
+            .summary = "Run injected start",
         },
     };
     const help_groups = [_]command_specs.TopLevelHelpGroup{
         .{ .entries = &.{
-            .{ .kind = .setup, .usage = "start" },
+            .{ .kind = .status, .usage = "start" },
             .{ .kind = .help, .usage = "guide" },
         } },
     };
@@ -6926,7 +7053,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
 
     try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-?")}));
     switch (parse(command_catalog, &.{@constCast("start")})) {
-        .setup => {},
+        .status => {},
         else => return error.TestExpectedEqual,
     }
 

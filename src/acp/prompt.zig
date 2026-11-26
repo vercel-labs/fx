@@ -1041,6 +1041,7 @@ const AcpElicitationResponderContext = struct {
             .capabilities = capabilities,
             .callback = respondToAcpMcpInput,
             .continuation_terminal = finishAcpUrlElicitations,
+            .declined_notice = tellAcpMcpDeclined,
         };
     }
 };
@@ -1170,10 +1171,37 @@ pub fn handlePrompt(
     captured_permission_mode: PermissionMode,
     usage_total: *types.Usage,
 ) !TerminalOutcome {
+    return handlePromptWithInputId(state, alloc, msg, captured_mode, captured_permission_mode, usage_total, null);
+}
+
+fn withdrawUnusedV2Input(session: *server.ActiveSessionState, maybe_id: ?u64) void {
+    if (comptime !server.has_v2_session_store) return;
+    const id = maybe_id orelse return;
+    const v2 = session.v2 orelse return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    v2.recordInputWithdrawn(id) catch |err| {
+        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
+    };
+}
+
+pub fn handlePromptWithInputId(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    captured_mode: []const u8,
+    captured_permission_mode: PermissionMode,
+    usage_total: *types.Usage,
+    v2_input_id: ?u64,
+) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
+    var unused_v2_input_id = v2_input_id;
+    errdefer withdrawUnusedV2Input(session, unused_v2_input_id);
     if (!try server.selectCredentialForProvider(state, session.provider)) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
@@ -1185,17 +1213,23 @@ pub fn handlePrompt(
         } };
     }
     if (!ultrafastPromptAllowed(state, session)) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
             .message = "Ultrafast mode requires a verified compatible Gateway model",
         } };
     }
 
-    const params = msg.params_raw orelse return .{
-        .rpc_error = .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing params",
-        },
+    const params = msg.params_raw orelse {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return .{
+            .rpc_error = .{
+                .code = ErrorCode.invalid_params,
+                .message = "Missing params",
+            },
+        };
     };
 
     var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
@@ -1214,33 +1248,56 @@ pub fn handlePrompt(
         params,
         next_image_id,
         state.cfg.host_attachments,
-    ) catch |err| return promptInputFailure(err);
+    ) catch |err| {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
+        return promptInputFailure(err);
+    };
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
-            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
-            prompt_input.captureImagesInline(alloc) catch |err|
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.PromptImagesTooLarge);
+            }
+            prompt_input.captureImagesInline(alloc) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
             if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
-            if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
+            if (comptime host_target.is_wasm) {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
+                return promptInputFailure(error.UnsupportedPromptImage);
+            }
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             // Captured into a temporary folder; the turn keeps the bytes
             // (D44).
             const snapshot_dir = try session_store.imageSnapshotTempDir(alloc, &temporary_snapshot_dir);
             defer alloc.free(snapshot_dir);
-            prompt_input.captureImages(alloc, snapshot_dir) catch |err|
+            prompt_input.captureImages(alloc, snapshot_dir) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
-            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
+            };
+            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err| {
+                withdrawUnusedV2Input(session, unused_v2_input_id);
+                unused_v2_input_id = null;
                 return promptInputFailure(err);
+            };
         }
     }
     const prompt_text = prompt_input.text;
 
     if (prompt_input.continue_recovery and prompt_text.len != 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1249,6 +1306,8 @@ pub fn handlePrompt(
         };
     }
     if (!prompt_input.continue_recovery and prompt_text.len == 0) {
+        withdrawUnusedV2Input(session, unused_v2_input_id);
+        unused_v2_input_id = null;
         return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
@@ -1416,6 +1475,7 @@ pub fn handlePrompt(
     defer sign_in.deinit(alloc);
     var job: worker_runtime.QueuedPrompt = .{
         .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+        .input_id = unused_v2_input_id,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
@@ -1465,6 +1525,7 @@ pub fn handlePrompt(
     };
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session);
+    unused_v2_input_id = null;
     const first_turn = agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -2443,7 +2504,13 @@ fn takeSteeringBoundary(
     }
     // An ACP client's steering is the user's own.
     const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
-    for (drained.texts, messages) |text, *message| message.* = .{ .text = text };
+    for (drained.texts, messages, 0..) |text, *message, index| {
+        const v2_input_id: ?u64 = if (comptime server.has_v2_session_store)
+            (if (index < drained.v2_input_ids.len) drained.v2_input_ids[index] else null)
+        else
+            null;
+        message.* = .{ .text = text, .input_id = v2_input_id };
+    }
     return .{ .continue_turn = messages };
 }
 
@@ -3682,9 +3749,13 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         try journal.appendProgress(ctx.alloc, ctx.state.alloc, session.session_id, checkpoint, session.model);
         // Only the progress right before a request can yield; a compaction
         // or a paused retry finishes where it is.
-        if (checkpoint.outstanding_reservation and checkpoint.cause != .compaction_prepared and
-            journal.yieldsAt(io_mod.milliTimestamp()))
-        {
+        const kind: libfx_journal.QuiesceKind = if (!checkpoint.outstanding_reservation)
+            .other
+        else if (checkpoint.cause == .compaction_prepared)
+            .compaction
+        else
+            .request;
+        if (journal.yieldsAt(io_mod.milliTimestamp(), kind)) {
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
@@ -3937,6 +4008,15 @@ const AcpInputResponse = struct {
         self.* = undefined;
     }
 };
+
+/// A question fx declined, said by the two paths `pushContextNotice` chooses between: an ACP v1 notice for a client that
+/// advertised them, else an operational message. A repeat is not dropped, so each refused call is told.
+fn tellAcpMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const responder: *AcpElicitationResponderContext = @ptrCast(@alignCast(raw_ctx));
+    const ctx = responder.acp;
+    if (ctx.state.client_notices) return ctx.sendNotice(text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+    pushSystemNotice(@ptrCast(ctx), text) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
+}
 
 fn respondToAcpMcpInput(
     raw_ctx: *anyopaque,
@@ -5377,6 +5457,14 @@ test "stripAnsiAlloc returns the original slice for clean text and strips escape
     defer alloc.free(stripped);
     try std.testing.expectEqualStrings("red and [link](https://example.com)", stripped);
     try std.testing.expect(std.mem.find(u8, stripped, "\x1b") == null);
+}
+
+test "stripAnsiAlloc drops an escape with intermediate bytes whole" {
+    const alloc = std.testing.allocator;
+    // Command output that resets its style as `tput sgr0` does.
+    const stripped = try stripAnsiAlloc(alloc, "Build failed\x1b(B\x1b[m\n");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("Build failed\n", stripped);
 }
 
 test "stripAnsiAlloc converts OSC-8 hyperlinks with params and BEL terminators" {

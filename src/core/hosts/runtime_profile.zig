@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_target = @import("target.zig");
 
 pub const Profile = struct {
     cooperative_agent: bool,
@@ -79,6 +80,8 @@ pub const wasm = Profile{
     .js_host_url_open = true,
     .js_host_workspace = true,
 };
+
+pub const host: Profile = if (host_target.is_wasm) wasm else native;
 
 test "apps without a host profile retain native capabilities" {
     const App = struct {};

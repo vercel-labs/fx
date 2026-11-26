@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
@@ -651,6 +652,22 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            // While fx waits to restart for an upgrade, a prompt sent now
+            // would be lost with the process, and the restart waits for an
+            // empty composer, so the text stays where it is. `/quit` still
+            // quits.
+            // A host that never upgrades itself has no restart to wait for.
+            if (comptime runtime_profile.allows(App, .auto_upgrade) and @hasField(App, "upgrader") and @hasField(@FieldType(App, "upgrader"), "restart_waits")) {
+                if (app.upgrader.restart_waits and !submitsQuit(app)) {
+                    debug_trace.logf("input", "submit held reason=upgrade_restart_waits input_bytes={d}", .{app.input_runtime.edit_state.input.items.len});
+                    try app.writeDomainNotice(.{
+                        .topic = "upgrade",
+                        .tone = .neutral,
+                        .body = "fx restarts for the upgrade once the running turns stop and the prompt is empty; send this after the restart",
+                    }, true);
+                    return;
+                }
+            }
             if (comptime agents.hasAgentField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(agents.screenAgentOf(app).worker), "compactionActivitySnapshot")) {
                     const observed = agents.screenAgentOf(app).worker.compactionActivitySnapshot();
@@ -1029,6 +1046,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             var command_end: usize = 1;
             while (command_end < text.len and !std.ascii.isWhitespace(text[command_end])) : (command_end += 1) {}
             return app.slashRegistry().lookup(text[0..command_end]);
+        }
+
+        /// Whether the composer holds exactly `/quit` (or an alias of it),
+        /// which still runs while fx waits to restart for an upgrade.
+        fn submitsQuit(app: *App) bool {
+            const text = std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n");
+            return command_specs.matchesSlashExact(app.slashRegistry(), text, .quit);
         }
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {

@@ -517,7 +517,7 @@ test "crash panic segfault message names the program counter when the handler ha
     var buf: [segfault_msg_bytes]u8 = undefined;
     const message = segfaultMessage(&buf, 0x1234, "Segmentation fault", &ctx);
     var expected_buf: [segfault_msg_bytes]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
         "Segmentation fault at address 0x1234 (pc 0x0, handleSegfault-0x{x})",
         .{@intFromPtr(&handleSegfault)},
@@ -546,7 +546,7 @@ test "crash panic segfault message fits the longest name and two full addresses"
     var buf: [segfault_msg_bytes]u8 = undefined;
     const message = try formatSegfault(&buf, std.math.maxInt(usize), "General protection exception", std.math.maxInt(usize));
     try std.testing.expect(std.mem.startsWith(u8, message, "General protection exception at address 0xffffffffffffffff"));
-    try std.testing.expect(std.mem.indexOf(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
+    try std.testing.expect(std.mem.find(u8, message, "(pc 0xffffffffffffffff, handleSegfault+0x") != null);
 }
 
 test "crash panic saves the record when a FIFO sits at the temporary path" {

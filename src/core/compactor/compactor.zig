@@ -35,7 +35,6 @@ const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -47,6 +46,9 @@ pub const Call = model.Call;
 pub const TextSink = progress.TextSink;
 pub const CallError = model.CallError;
 pub const Reply = model.Reply;
+pub const FailureReason = model.FailureReason;
+pub const ProviderCall = model.ProviderCall;
+pub const ProviderReply = model.ProviderReply;
 
 // Compaction notes: the `context_compaction` trace scope and the bounded
 // events `/trace` shows.
@@ -71,6 +73,8 @@ pub const parsePercent = settings.parsePercent;
 // Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;
 pub const replacesPriorContext = checkpoint.replacesPriorContext;
+pub const ProviderBlock = checkpoint.ProviderBlock;
+pub const providerBlock = checkpoint.providerBlock;
 
 // Saved turns (M1, M2, ...), tool calls (T1, T2, ...) and earlier
 // compactions (L1, L2, ...).
@@ -145,6 +149,10 @@ pub const Request = struct {
     progress: ?Progress = null,
     /// Extra instructions for the summary, such as the user's PreCompact hooks gave; null for none.
     instructions: ?[]const u8 = null,
+    /// The runtime context the conversation was sent with, one system
+    /// message text each. A provider block keeps it, so the turns after the
+    /// block go on after the same instructions.
+    runtime_context: []const []const u8 = &.{},
 };
 
 /// Owns everything it points to except the turns it shares with
@@ -208,9 +216,29 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     try Progress.report(request.progress, .summarizing);
     trace.log(false, "room after compaction after_tokens={d} fixed_tokens={any} kept_tokens={d} kept_used={d} compacted_tokens={d}", .{ request.size.afterTokens(), request.size.fixed_tokens, chosen.kept_tokens, chosen.kept_used, request.size.compactedTokens(chosen.kept_used) });
 
-    const earlier = try earlierFrom(out, request.records, chosen.earlier);
-    const turns = try turnsFrom(out, chosen.older, request.append_messages);
+    var chosen_window = chosen;
+    var earlier = try earlierFrom(out, request.records, chosen.earlier);
+    var turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
+    if (caller.bindsReasoning()) {
+        if (caller.compactsWithProvider()) {
+            const provider_window = try window.atTurnStart(out, request.history, request.active, chosen);
+            const provider_turns = try turnsFrom(out, provider_window.older, request.append_messages);
+            if (try compactWithProvider(alloc, request, arena, provider_window, earlier, provider_turns)) |result| return result;
+            if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        } else {
+            // Overflow recovery has no request the provider could compact.
+            trace.failure(trace_ctx, .provider_block_failed, "model={s} reason=no_request; fx writes its own summary and keeps no turns", .{caller.model});
+        }
+        // fx's own summary keeps no turn after it: the newest turns' reasoning
+        // would follow a summary the provider never read before it
+        // (`tests/tla/compaction/ProviderCompaction.tla` Commit).
+        chosen_window = try window.chooseEverything(out, request.history, request.active, request.size, .{ .provider = caller.provider, .model = caller.model }) orelse return error.NothingToCompact;
+        earlier = try earlierFrom(out, request.records, chosen_window.earlier);
+        turns = try turnsFrom(out, chosen_window.older, request.append_messages);
+        if (turns.len == 0) return error.NothingToCompact;
+    }
+    const chosen_fx = chosen_window;
     var counter: progress.Counter = .{};
     if (request.progress) |reported| if (reported.written_fn) |written| {
         counter.sink = .{ .context = reported.context, .written_fn = written, .asked_fn = reported.asked_fn };
@@ -222,18 +250,18 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .trace_ctx = trace_ctx,
         .on_text = if (counts) counter.textSink() else null,
     };
-    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
+    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen_fx.earlier != null, request.records != null });
     // The caller's allocator, so the summary gives its working memory back
     // when it is done instead of keeping it in this result.
     var summary = try summarize.compact(alloc, .{
         .model = caller.model,
         .earlier = earlier,
         .turns = turns,
-        .last_turn_open = chosen.splitsLastTurn(),
-        .kept = try turnsFrom(out, chosen.kept, request.append_messages),
+        .last_turn_open = chosen_fx.splitsLastTurn(),
+        .kept = try turnsFrom(out, chosen_fx.kept, request.append_messages),
         .max_prompt_tokens = request.size.summaryRequestTokens(),
         .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
-        .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
+        .max_text_tokens = request.size.compactedTokens(chosen_fx.kept_used),
         .counter = if (counts) &counter else null,
         .instructions = request.instructions,
     }, summarizer.model(), request.records);
@@ -244,14 +272,100 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .arena = arena,
         .checkpoint = .{
             .summary = try checkpoint.encode(out, summary.compacted),
-            .removed_turn_count = chosen.cut.turns,
+            .removed_turn_count = chosen_fx.cut.turns,
             .compaction_count = latestCompactionCount(request.history) + 1,
         },
         .model_text = try out.dupe(u8, summary.text),
-        .retained_history = chosen.retained_history,
-        .cut = chosen.cut,
+        .retained_history = chosen_fx.retained_history,
+        .cut = chosen_fx.cut,
         .tool_count = summary.compacted.tool_count,
     };
+}
+
+/// Asks the conversation's own model for its compaction block over the older
+/// part, sent exactly as before, or over everything the agent was about to
+/// send when the turn in progress is compacted too. The block replaces the
+/// older part and the kept turns follow it unchanged
+/// (`tests/tla/compaction/ProviderCompaction.tla` KeepCompaction and
+/// WholeCompaction). The checkpoint also holds fx's exact text of the same
+/// turns, written without asking any model, which every other model reads.
+/// Null when the provider writes no block; nothing is saved but the turn and
+/// tool call records.
+fn compactWithProvider(
+    alloc: Allocator,
+    request: Request,
+    arena: *std.heap.ArenaAllocator,
+    chosen: window.Window,
+    earlier: ?summarize.Compacted,
+    turns: []const summarize.Turn,
+) !?Result {
+    const out = arena.allocator();
+    const caller = request.caller;
+    const trace_ctx = request.trace_ctx;
+    var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
+    var exact = try summarize.compact(alloc, .{
+        .model = caller.model,
+        .earlier = earlier,
+        .turns = turns,
+        .last_turn_open = chosen.splitsLastTurn(),
+        .kept = try turnsFrom(out, chosen.kept, request.append_messages),
+        .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
+        .notes = false,
+    }, summarizer.model(), request.records);
+    defer exact.deinit();
+    const older: ?[]const types.ChatMessage = if (chosen.splitsLastTurn()) null else older: {
+        // What the agent's request sends before the kept turns: the newest
+        // checkpoint, where its context starts, then the older raw turns.
+        var sent_turns: std.ArrayList(types.HistoryTurn) = .empty;
+        if (newestCheckpoint(request.history)) |turn| try sent_turns.append(out, turn);
+        try sent_turns.appendSlice(out, chosen.older);
+        var messages: std.ArrayList(types.ChatMessage) = .empty;
+        try request.append_messages(out, &messages, sent_turns.items);
+        break :older messages.items;
+    };
+    trace.info(trace_ctx, .provider_start, "model={s} path=provider_block whole={} older_messages={any}", .{ caller.model, older == null, if (older) |messages| messages.len else null });
+    // The row moves while the provider writes its block, as it does while a
+    // summary request waits (`src/core/output/compaction_progress.zig`).
+    if (request.progress) |reported| if (reported.asked_fn) |asked| asked(reported.context);
+    const reply = try caller.vtable.compact_with_provider.?(caller.context, out, .{ .older = older, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx });
+    const block = switch (reply) {
+        .block => |block| block,
+        .failed => |failure| {
+            trace.failure(trace_ctx, .provider_block_failed, "model={s} reason={s} {s}; fx writes its own summary and keeps no turns", .{ caller.model, @tagName(failure.reason), failure.detail });
+            return null;
+        },
+    };
+    var payload = exact.compacted;
+    payload.provider = .{
+        .provider = block.provider,
+        .model = caller.model,
+        .text = block.text,
+        .parts_json = block.parts_json,
+        .kept_turns = chosen.retained_history.len,
+        .runtime_context = request.runtime_context,
+    };
+    trace.info(trace_ctx, .provider_completed, "model={s} path=provider_block text_bytes={d} parts_bytes={d} turns={d} tools={d}", .{ caller.model, block.text.len, block.parts_json.len, exact.compacted.turn_count, exact.compacted.tool_count });
+    return .{
+        .arena = arena,
+        .checkpoint = .{
+            .summary = try checkpoint.encode(out, payload),
+            .removed_turn_count = chosen.cut.turns,
+            .compaction_count = latestCompactionCount(request.history) + 1,
+        },
+        .model_text = try out.dupe(u8, exact.text),
+        .retained_history = chosen.retained_history,
+        .cut = chosen.cut,
+        .tool_count = exact.compacted.tool_count,
+    };
+}
+
+fn newestCheckpoint(history: []const types.HistoryTurn) ?types.HistoryTurn {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        if (history[index] == .compacted_summary) return history[index];
+    }
+    return null;
 }
 
 fn latestCompactionCount(history: []const types.HistoryTurn) usize {
@@ -335,26 +449,15 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             .output = content,
             .saved_output = savedOutputHandle(message.tool_result_memory, content),
             .failed = message.tool_result_status == .failure,
-            .answers = if (std.mem.eql(u8, message.tool_name orelse "", question_tool)) try questionAnswers(arena, content) else &.{},
+            .answers = if (message.user_answer) try questionAnswers(arena, content) else &.{},
         } }),
     }
 }
 
-/// The tool that asks the user questions. Its result lists each question
-/// with the user's answer.
-const question_tool = "ask_user_question";
-
 /// The user's answers in a question tool's result. None when the result does
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
-    const Answered = struct { answer: []const u8 };
-    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return &.{},
-    };
-    const answers = try arena.alloc([]const u8, answered.len);
-    for (answers, answered) |*answer, item| answer.* = item.answer;
-    return answers;
+    return try types.questionAnswers(arena, output) orelse &.{};
 }
 
 test "a question's result gives the user's answers, not the questions" {
@@ -369,14 +472,18 @@ test "a question's result gives the user's answers, not the questions" {
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "The user dismissed the question.")).len);
     try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "[{\"question\":\"Push it?\"}]")).len);
 
-    // Only the question tool's result carries answers into the turn.
+    // Only a result marked as the user's answer (`types.isUserAnswer`)
+    // carries answers into the turn.
     const result = "[{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]";
     var items: std.ArrayList(summarize.Item) = .empty;
-    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = question_tool, .content = result });
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = "ask_user_question", .content = result, .user_answer = true });
     try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "s", .tool_name = "shell", .content = result });
+    // A question asked through toolbox: its result goes back as toolbox's.
+    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "t", .tool_name = "toolbox", .content = result, .user_answer = true });
     try std.testing.expectEqual(@as(usize, 1), items.items[0].tool_result.answers.len);
     try std.testing.expectEqualStrings("Legitimate, push", items.items[0].tool_result.answers[0]);
     try std.testing.expectEqual(@as(usize, 0), items.items[1].tool_result.answers.len);
+    try std.testing.expectEqual(@as(usize, 1), items.items[2].tool_result.answers.len);
 }
 
 test "a message fx sent the model on its own is a note for the summary, never the user's words" {
@@ -487,6 +594,40 @@ test "the notes count keeps its laws on fuzzed replies" {
             "T1\u{2013}T999:\nRules:\nFacts:\nDecisions:\nStatus:\nOpen:\nEarlier:\n",
         }) ++ @import("fuzz_corpus").compaction_progress.*),
     });
+}
+
+test "a checkpoint's provider block survives a round trip on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzProviderBlock, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "fx-compactor-v1\n{\"entries\":[],\"used\":[],\"earlier\":\"\",\"turns\":[],\"provider\":{\"provider\":\"gateway\",\"model\":\"anthropic/claude-fable-5.2\",\"text\":\"sum\",\"parts_json\":\"[]\",\"kept_turns\":3,\"runtime_context\":[\"ctx\"]}}",
+            "fx-compactor-v1\n{\"earlier\":\"e\",\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[{}]\"}}",
+            "fx-compactor-v1\n{\"provider\":null}",
+            "fx-compactor-v1\n{",
+            "plain summary",
+        }) ++ @import("fuzz_corpus").checkpoint_provider_block.*),
+    });
+}
+
+/// A provider block a saved checkpoint holds reads back unchanged after fx
+/// writes it again, and another model still gets fx's text for it.
+fn fuzzProviderBlock(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [4096]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const payload = try checkpoint.parse(arena, bytes) orelse return;
+    const block = payload.provider orelse return;
+    const encoded = try checkpoint.encode(arena, payload);
+    const kept = (try checkpoint.providerBlock(arena, encoded)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(block.provider, kept.provider);
+    try std.testing.expectEqualStrings(block.model, kept.model);
+    try std.testing.expectEqualStrings(block.text, kept.text);
+    try std.testing.expectEqualStrings(block.parts_json, kept.parts_json);
+    try std.testing.expectEqual(block.kept_turns, kept.kept_turns);
+    try std.testing.expectEqual(block.runtime_context.len, kept.runtime_context.len);
+    for (block.runtime_context, kept.runtime_context) |a, b| try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect((try checkpoint.modelText(arena, encoded)) != null);
 }
 
 test {

@@ -28,6 +28,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const json_depth = @import("../shared/json_depth.zig");
 const shared_servers = @import("shared_servers.zig");
+const dropped_tools = @import("dropped_tools.zig");
 const owner_core = @import("owner_core.zig");
 const share_key = @import("share_key.zig");
 
@@ -113,6 +114,10 @@ pub const Status = struct {
     /// the words, so `publish` copies them into the snapshot and `statusesNow` copies them into each caller's
     /// allocator, like the other strings.
     tools_error: ?[]const u8 = null,
+    /// How many tools of the list fx left out of what the model gets, by reason, for a server that is `ready`: the ones
+    /// the engine skipped (`mcp.tools.Store.addPage`) and the ones the host's reading refuses (`dropped_tools`). Plain
+    /// counts, so every copy of a `Status` carries them as it is.
+    dropped: mcp.tools.Dropped = .{},
     needs_login: bool = false,
     signed_in: bool = false,
     /// A login is under way: from `/mcp login` until it signs in, fails,
@@ -547,6 +552,10 @@ pub const Runtime = struct {
         /// next is the one it had before, not a sign-in. Only the moments after the refusal count:
         /// see `refusalRecent`.
         refused_new_ms: ?i64 = null,
+        /// What `dropped_tools` counted in the list whose `fingerprint` is `dropped_key`, so a list is read once and
+        /// not at every status snapshot.
+        dropped_here: mcp.tools.Dropped = .{},
+        dropped_key: ?u64 = null,
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -2444,6 +2453,10 @@ pub const Runtime = struct {
             }
             // The engine lends the words until its next refusal.
             if (o.state == .ready and !o.needs_login) o.tools_error = if (st.list_refusal) |words| try a.dupe(u8, words) else null;
+            if (o.state == .ready) {
+                o.dropped = st.dropped;
+                o.dropped.merge(r.hostDropped(i, s.name));
+            }
             if (r.instructionsOf(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2571,6 +2584,22 @@ pub const Runtime = struct {
             return;
         };
         return r.engine.needTools(name);
+    }
+
+    /// What the host's reading refuses in server `name`'s list now, counted again only when the list changed. A count
+    /// that ran out of memory is left for the next snapshot to try again.
+    fn hostDropped(r: *Runtime, i: usize, name: []const u8) mcp.tools.Dropped {
+        const list = r.toolListOf(name) catch return .{};
+        const key = list.fingerprint();
+        const flags = &r.flags[i];
+        if (flags.dropped_key == key) return flags.dropped_here;
+        flags.dropped_here = dropped_tools.count(r.gpa, list) catch |err| {
+            debug_trace.logf("mcp", "MCP left-out tools not counted server={s} err={s}", .{ name, @errorName(err) });
+            flags.dropped_key = null;
+            return .{};
+        };
+        flags.dropped_key = key;
+        return flags.dropped_here;
     }
 
     fn toolListOf(r: *Runtime, name: []const u8) engine.Error!*const mcp.tools.List {
@@ -3403,6 +3432,64 @@ fn statusAfterListing(r: *Runtime, arena: Allocator, want_refused: bool) !Status
         std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
     }
     return status;
+}
+
+/// A 2025 server in sh whose first tool list keeps one tool and has two the host leaves out: a second tool named
+/// `echo`, which the engine skips, and one whose `description` is not text, which the host's reading refuses. It then
+/// says its tools changed, and every later list keeps all its tools.
+const leaving_out_server_script =
+    \\#!/bin/sh
+    \\n=0
+    \\while IFS= read -r line; do
+    \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    \\  case "$line" in
+    \\    *'"method":"server/discover"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
+    \\    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\    *'"method":"tools/list"'*)
+    \\      n=$((n + 1))
+    \\      if [ "$n" = 1 ]; then
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"odd","description":7,"inputSchema":{"type":"object"}}]}}\n' "$id"
+    \\        printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+    \\      else
+    \\        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes","inputSchema":{"type":"object"}}]}}\n' "$id"
+    \\      fi ;;
+    \\  esac
+    \\done
+    \\
+;
+
+test "tools fx leaves out of a list show in the status by reason, and a later list that keeps them all clears it" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = leaving_out_server_script, .flags = .{ .permissions = .executable_file } });
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The engine skipped the second `echo`, and the host's reading refuses `odd`: two tools are left out, for two reasons.
+    try testing.expectEqual(@as(usize, 2), (try r.tools(a, "fake", null)).tools.len);
+    var status = (try r.statuses(a))[0];
+    try testing.expectEqual(State.ready, status.state);
+    try testing.expectEqual(@as(usize, 2), status.tools);
+    try testing.expectEqual(@as(u32, 2), status.dropped.total());
+    try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.repeated_name)]);
+    try testing.expectEqual(@as(u32, 1), status.dropped.counts[@backingInt(mcp.tools.Drop.unusable)]);
+
+    // The server says its tools changed: the next list keeps every tool, and the status says nothing is left out.
+    for (0..600) |_| {
+        _ = try r.tools(a, "fake", null);
+        status = (try r.statuses(a))[0];
+        if (status.dropped.total() == 0) break;
+        // A sleep that ends early only polls sooner, and the loop is bounded.
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expectEqual(@as(u32, 0), status.dropped.total());
+    try testing.expectEqual(@as(usize, 1), status.tools);
 }
 
 test "a refused tool list shows in the status beside the older list still served, and a good list clears it" {

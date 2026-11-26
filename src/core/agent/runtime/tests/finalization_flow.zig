@@ -2200,6 +2200,97 @@ test "common Stop steer submitted during the hook joins the turn for every final
     }
 }
 
+/// Runs one turn the way the worker loop starts it, with `deps` taking its
+/// steering and the mail its hand-off posts from that worker.
+fn runTurnOnWorker(alloc: std.mem.Allocator, gateway: *FakeGateway, deps: *FakeAgentRuntimeDeps) !void {
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "user prompt"));
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+    defer worker_runtime.freeWorkItem(alloc, work);
+    deps.steering_worker = &worker;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.cancel_flag = &worker.worker_cancel_requested;
+    var job = fixture.job();
+    job.turn_id = work.prompt.turn_id;
+    try runFakePrompt(gateway, deps, config, job);
+    worker.finishProcessing();
+}
+
+const empty_reply_nudge_text = "Your last reply had no text and no tool call";
+
+test "an empty reply gives way to mail that lands while it waits, so no nudge goes out" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{ .{ .finish_reason = .other }, .{ .content = "Seen" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.handoff_wait = .{ .mail = try ownedWorkerPrompt(alloc, "CHILD_REPORT"), .answer = .joined };
+
+    try runTurnOnWorker(alloc, &gateway, &deps);
+
+    // One wait, no longer than a second, and the report is the second request.
+    try std.testing.expectEqual(@as(usize, 1), deps.handoff_wait_calls);
+    try std.testing.expectEqual(@as(i64, 1000), deps.handoff_wait_bound_ms);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{"CHILD_REPORT"});
+    try std.testing.expect(std.mem.find(u8, gateway.request_bodies.items[1], empty_reply_nudge_text) == null);
+}
+
+test "an empty reply whose mail does not land within the bound goes on to the nudge as before" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{ .{ .finish_reason = .other }, .{ .content = "Answer" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.handoff_wait = .{ .answer = .timed_out };
+
+    try runTurnOnWorker(alloc, &gateway, &deps);
+
+    try std.testing.expectEqual(@as(usize, 1), deps.handoff_wait_calls);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{empty_reply_nudge_text});
+}
+
+test "an empty reply with no mail in the hand-off, or no hand-off, nudges with no wait" {
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, wait: ?FakeAgentRuntimeDeps.HandoffWait, calls: usize };
+    const cases = [_]Case{
+        .{ .name = "a hand-off with nothing for the agent", .wait = .{ .answer = .none }, .calls = 1 },
+        .{ .name = "a host with no hand-off", .wait = null, .calls = 0 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        var gateway = FakeGateway.init(alloc, &.{ .{ .finish_reason = .other }, .{ .content = "Answer" } });
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        deps.handoff_wait = case.wait;
+
+        try runTurnOnWorker(alloc, &gateway, &deps);
+
+        try std.testing.expectEqual(case.calls, deps.handoff_wait_calls);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try expectBodyContainsInOrder(&gateway, 1, &.{empty_reply_nudge_text});
+    }
+}
+
+test "a second empty reply waits for nothing, because the nudge's check closed the turn to mail" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{ .{ .finish_reason = .other }, .{ .finish_reason = .other } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.handoff_wait = .{ .answer = .none };
+
+    try runTurnOnWorker(alloc, &gateway, &deps);
+
+    // Only the first empty reply asked the hand-off; the second ended the turn.
+    try std.testing.expectEqual(@as(usize, 1), deps.handoff_wait_calls);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+}
+
 test "common Stop does not run for silent-tool auto-continuation" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{
@@ -3321,4 +3412,60 @@ test "a PostModelRequest hook sees a failed model request" {
     defer alloc.free(post);
     try std.testing.expect(std.mem.find(u8, post, "\"outcome\":\"") != null);
     try std.testing.expect(std.mem.find(u8, post, "\"outcome\":\"completed\"") == null);
+}
+
+test "eb03: full turn carries job.input_id to UserTurn.input_id and steering boundary input_id to PersistedSteering.input_id" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        next_id: u64 = 10,
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const id = self.next_id;
+            self.next_id += 1;
+            return id;
+        }
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var hook_state = HookState{};
+    worker.accepted_input_hooks = .{
+        .ctx = &hook_state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "user prompt"));
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+    defer worker_runtime.freeWorkItem(alloc, work);
+
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "First answer" }, .{ .content = "Updated answer" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.steering_worker = &worker;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.cancel_flag = &worker.worker_cancel_requested;
+    var job = work.prompt;
+    job.grants = &.{};
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = SteerDuringStop{ .alloc = alloc, .worker = &worker };
+    try lifecycle_runtime.registerStop(.{ .name = "steer-during-stop", .ctx = &handler, .run = SteerDuringStop.run });
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        config,
+        job,
+        testLifecycleContext(lifecycle_runtime.freeze(), alloc, fixture.workspace_root),
+    );
+    worker.finishProcessing();
+
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    try std.testing.expectEqual(@as(?u64, 10), deps.history_turns.items[0].assistant.user.input_id);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items[0].assistant.execution.steering.len);
+    try std.testing.expectEqual(@as(?u64, 11), deps.history_turns.items[0].assistant.execution.steering[0].input_id);
 }

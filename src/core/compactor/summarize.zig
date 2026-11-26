@@ -113,6 +113,11 @@ pub const Request = struct {
     last_part: bool = true,
     /// Extra instructions for the summary, such as the user's PreCompact hooks gave; null for none.
     instructions: ?[]const u8 = null,
+    /// False asks no model: the turns are saved and written out with their
+    /// user messages, final replies and tool lines exact, and no notes, and
+    /// the previous compaction is not folded away. The provider's own block
+    /// stands for the turns; this text is what any other model reads.
+    notes: bool = true,
 };
 
 /// What the model is asked. A `Model` sends it as one system message and one
@@ -203,7 +208,7 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
     const system_tokens = tokens(&.{try summarySystem(fold_state.allocator(), request.instructions)});
     var earlier = request.earlier;
     var fold: ?Fold = null;
-    if (store) |saved| if (request.earlier) |before| if (before.saved and foldable(before)) {
+    if (request.notes) if (store) |saved| if (request.earlier) |before| if (before.saved and foldable(before)) {
         const folded = try foldPrevious(fold_state.allocator(), before, saved);
         earlier = folded.earlier;
         fold = folded.fold;
@@ -499,7 +504,7 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
     sort_utils.sort(lint.Record, turn_records.items, {}, byNumber);
 
     var written: ledger.Written = .{};
-    if (plan.needsModel()) notes: {
+    if (request.notes and plan.needsModel()) notes: {
         const known = try plan.known(scratch);
         const first = askFirstNotes(alloc, out, scratch, plan, request, model, known) catch |err| switch (err) {
             error.Cancelled, error.OutOfMemory => |fatal| return fatal,

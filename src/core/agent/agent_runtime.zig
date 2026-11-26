@@ -56,6 +56,7 @@ test {
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
+    _ = @import("runtime/tests/assistant_tail_flow.zig");
     _ = @import("runtime/agent.zig");
     _ = @import("runtime/cache_warming.zig");
     _ = @import("runtime/cache_warmer.zig");

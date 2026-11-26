@@ -905,7 +905,7 @@ fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
     if (refusal == null and file == .profile) try testing.expect(try project_config.misspelledKey(a, after) == null);
     // The load path's bounded scan never finds a misspelling the edit's complete scan misses.
     if (before) |text| {
-        var bounded = project_config.parseProfileDocument(a, text) catch return;
+        var bounded = project_config.parseProfileDocument(a, text, null) catch return;
         defer bounded.deinit(a);
         if (bounded.diagnostic) |d| {
             if (d.cause == .suspicious_server_key) try testing.expect(try project_config.misspelledKey(a, text) != null);

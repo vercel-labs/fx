@@ -127,6 +127,8 @@ pub fn appendToolResultContent(
         .tool_result_status = result_status,
         .tool_result_memory = result_memory,
         .tool_result_created_at_ms = io_mod.milliTimestamp(),
+        // `tool_call` is the call that ran, which a toolbox run carries.
+        .user_answer = try types.isUserAnswer(arena, tool_call.name, result_status, content),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);

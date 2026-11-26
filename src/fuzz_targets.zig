@@ -9,6 +9,7 @@ test {
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/auth/oauth_session.zig");
@@ -77,6 +78,7 @@ test {
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
     _ = @import("gateway/tool_call_ids.zig");
+    _ = @import("gateway/vercel_protocol.zig");
     _ = @import("main.zig");
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/capabilities/toolbox.zig");

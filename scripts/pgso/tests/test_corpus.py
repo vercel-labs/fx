@@ -62,6 +62,7 @@ VERIFICATION_E2E_TESTS = (
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "mcp-verbs.test.ts",
+    "mcp-subagent-bridge.test.ts",
     "hooks-cli.test.ts",
     "hooks-ask.test.ts",
     "tui-hooks.test.ts",
@@ -70,6 +71,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-transcript-window.test.ts",
     "tui-full-detail.test.ts",
     "compaction-policy.test.ts",
+    "provider-compaction.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-permissions-panel.test.ts",
     "tui-effort-menu.test.ts",
@@ -429,7 +431,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(37, len(corpus.scenarios))
-        self.assertEqual(78, len(corpus.candidate_scenarios))
+        self.assertEqual(80, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

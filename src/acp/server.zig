@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
@@ -8,6 +9,12 @@ const host_target = @import("../core/hosts/target.zig");
 const hooks_host = @import("../core/hooks_host/hooks_host.zig");
 const runtime_user_hooks = @import("../core/agent/runtime/user_hooks.zig");
 const runtime_lifecycle = @import("../core/agent/runtime/lifecycle.zig");
+const runtime_profile = @import("../core/hosts/runtime_profile.zig");
+
+/// Only hosts with `durable_sessions` enabled open an fx v2 session store.
+/// Every wasm surface sets `.durable_sessions = false`, so v2 accepted-input
+/// records and notices compile out of all wasm builds under that shared rule.
+pub const has_v2_session_store = runtime_profile.host.durable_sessions;
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -324,6 +331,7 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    v2_input_id: ?u64 = null,
     /// The usage of every turn the prompt ran, its own and each report turn
     /// after it. The response reports it. Written by the prompt's own thread.
     usage: types.Usage = .{},
@@ -965,7 +973,9 @@ fn destroyActiveSession(state: *ServerState) void {
     active.session_rt.deinit(state.alloc);
     // Before the session closes: a start capture still running uses it.
     active.turn_capture.deinit();
-    if (active.v2) |v2| v2.close();
+    if (comptime has_v2_session_store) {
+        if (active.v2) |v2| v2.close();
+    }
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
@@ -1806,10 +1816,49 @@ fn handleRequestCancellation(
     if (parsed.value != .object) return;
     const value = parsed.value.object.get("requestId") orelse return;
     const requested = requestIdFromValue(value) orelse return;
-    const active = state.active_prompt orelse return;
-    const active_id = active.msg.id orelse return;
-    if (!requestIdsEqual(active_id, requested)) return;
-    handleCancel(state, true);
+    if (state.active_prompt) |active| {
+        if (active.msg.id) |active_id| {
+            if (requestIdsEqual(active_id, requested)) {
+                handleCancel(state, true);
+                return;
+            }
+        }
+    }
+    const session = if (state.active_session) |*active| active else return;
+    if (state.cfg.minimal_kernel) return;
+    const withdrawn = withdrawn: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const queued = session.steering.findQueuedRequest(requested) orelse {
+            debug_trace.logf("acp", "event=cancel_steering_not_queued", .{});
+            break :withdrawn false;
+        };
+        if (comptime has_v2_session_store) {
+            if (queued.v2_input_id) |input_id| {
+                if (session.v2) |v2| {
+                    v2.recordInputWithdrawn(input_id) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ input_id, @errorName(err) });
+                        break :withdrawn false;
+                    };
+                }
+            }
+        }
+        if (!session.steering.withdrawRequest(state.alloc, requested)) {
+            debug_trace.logf("acp", "event=cancel_steering_not_queued", .{});
+            break :withdrawn false;
+        }
+        break :withdrawn true;
+    };
+    if (!withdrawn) return;
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    acp_types.writeSteeringPromptResponse(&response.writer, .cancelled, .dropped) catch |err| {
+        debug_trace.logf("acp", "event=cancel_steering_response_encode_failed err={s}", .{@errorName(err)});
+        return;
+    };
+    state.writer.writeResponse(alloc, requested, response.written()) catch |err| {
+        debug_trace.logf("acp", "event=cancel_steering_response_failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn libfxSessionId(alloc: Allocator, msg: *const jsonrpc.Message) !std.json.Parsed(std.json.Value) {
@@ -1884,9 +1933,9 @@ fn handleKernelWithdraw(
     const withdrawn = withdrawn: {
         active.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer active.session_write_mutex.unlock(io_mod.getIo());
-        if (!active.steering.withdraw(state.alloc, id.string)) break :withdrawn false;
+        if (!active.steering.hasInput(id.string)) break :withdrawn false;
         if (active.journal) |*journal| try journal.append(alloc, active.session_id, .{ .input_withdrawn = id.string });
-        break :withdrawn true;
+        break :withdrawn active.steering.withdraw(state.alloc, id.string);
     };
     try state.writer.writeResponse(alloc, msg.id, if (withdrawn) "{\"result\":\"withdrawn\"}" else "{\"result\":\"already_placed\"}");
 }
@@ -1920,6 +1969,8 @@ pub fn takeSteering(
     close_if_empty: bool,
 ) Allocator.Error!libfx_steering.Drained {
     const active = if (state.active_session) |*session| session else return .{ .texts = &.{}, .request_ids = &.{} };
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
     return active.steering.takeAll(state.alloc, result_alloc, close_if_empty);
 }
 
@@ -1928,6 +1979,35 @@ fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
         .code = ErrorCode.invalid_request,
         .message = "Prompt already in progress",
     });
+}
+
+fn writeSteeringEnqueueError(
+    state: *ServerState,
+    alloc: Allocator,
+    id: ?jsonrpc.RequestId,
+    err: libfx_steering.EnqueueError,
+) !void {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SteeringNotActive => unreachable,
+        error.EmptySteeringMessage => state.writer.writeError(alloc, id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text cannot be empty",
+        }),
+        error.SteeringMessageTooLarge => state.writer.writeError(alloc, id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Steering prompt text exceeds the 64 KiB limit",
+        }),
+        error.SteeringQueueFull => state.writer.writeError(alloc, id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Steering queue is full",
+        }),
+    };
+}
+
+fn sessionInputsDurable(session: *const ActiveSessionState) bool {
+    const journal = session.journal orelse return false;
+    return journal.inputs_durable;
 }
 
 /// Joins a `session/prompt` that sets `_meta.fx.steer` to the running turn at
@@ -1955,7 +2035,7 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
     };
     defer alloc.free(text);
     const session = if (state.active_session) |*active| active else unreachable;
-    session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
+    session.steering.validateEnqueue(text.len) catch |err| switch (err) {
         error.SteeringNotActive => {
             // The running turn already stopped taking input. Let it answer,
             // then run this prompt as the next turn instead of rejecting it.
@@ -1963,19 +2043,49 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
             reapActivePrompt(state, true);
             return startPrompt(state, alloc, msg);
         },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.EmptySteeringMessage => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Steering prompt text cannot be empty",
-        }),
-        error.SteeringMessageTooLarge => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Steering prompt text exceeds the 64 KiB limit",
-        }),
-        error.SteeringQueueFull => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Steering queue is full",
-        }),
+        else => return writeSteeringEnqueueError(state, alloc, msg.id, err),
+    };
+
+    const enqueue_result: struct { err: ?libfx_steering.EnqueueError, accepted_id: ?u64 } = blk: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        const accepted_id: ?u64 = if (comptime !has_v2_session_store) null else accept_blk: {
+            if (!sessionInputsDurable(session)) {
+                if (session.v2) |v2| {
+                    break :accept_blk v2.recordInputAccepted(text) catch |err| err_blk: {
+                        debug_trace.logf("session", "event=input_accepted_write_failed surface=acp kind=steer bytes={d} err={s}", .{ text.len, @errorName(err) });
+                        break :err_blk null;
+                    };
+                }
+            }
+            break :accept_blk null;
+        };
+        session.steering.enqueueRequestWithV2Id(state.alloc, text, msg.id, accepted_id) catch |err| {
+            if (comptime has_v2_session_store) {
+                if (err != error.SteeringNotActive) {
+                    if (accepted_id) |id| {
+                        if (session.v2) |v2| v2.recordInputWithdrawn(id) catch |w_err| {
+                            debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(w_err) });
+                        };
+                    }
+                }
+            }
+            break :blk .{ .err = err, .accepted_id = accepted_id };
+        };
+        break :blk .{ .err = null, .accepted_id = accepted_id };
+    };
+    if (enqueue_result.err) |err| switch (err) {
+        error.SteeringNotActive => {
+            debug_trace.logf("acp", "steering prompt arrived after the turn closed input; starting next turn", .{});
+            reapActivePrompt(state, true);
+            return startPromptWithInputId(
+                state,
+                alloc,
+                msg,
+                if (comptime has_v2_session_store) enqueue_result.accepted_id else null,
+            );
+        },
+        else => return writeSteeringEnqueueError(state, alloc, msg.id, err),
     };
     debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
 }
@@ -2599,6 +2709,29 @@ fn handleKernelSteer(
 }
 
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+    return startPromptWithInputId(state, alloc, msg, null);
+}
+
+fn startPromptWithInputId(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+    v2_input_id: ?u64,
+) !void {
+    var unused_v2_input_id = v2_input_id;
+    errdefer if (comptime has_v2_session_store) {
+        if (unused_v2_input_id) |id| {
+            if (state.active_session) |*active_session| {
+                if (active_session.v2) |v2| {
+                    active_session.session_write_mutex.lockUncancelable(io_mod.getIo());
+                    defer active_session.session_write_mutex.unlock(io_mod.getIo());
+                    v2.recordInputWithdrawn(id) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_write_failed surface=acp id={d} err={s}", .{ id, @errorName(err) });
+                    };
+                }
+            }
+        }
+    };
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
     const active = try alloc.create(ActivePrompt);
@@ -2609,6 +2742,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .msg = try cloneMessage(alloc, msg),
         .mode = session.mode,
         .permission_mode = session.permission_mode,
+        .v2_input_id = if (comptime has_v2_session_store) unused_v2_input_id else null,
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
@@ -2616,11 +2750,13 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     session.cancel_flag.store(false, .seq_cst);
     session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
+        unused_v2_input_id = null;
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
         active.alloc.destroy(active);
     } else {
         active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
+        unused_v2_input_id = null;
         state.active_prompt = active;
     }
 }
@@ -2701,13 +2837,14 @@ fn notificationTargetsActiveSession(
 }
 
 fn promptWorkerMain(active: *ActivePrompt) void {
-    const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
+    const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePromptWithInputId(
         active.state,
         active.alloc,
         &active.msg,
         active.mode,
         active.permission_mode,
         &active.usage,
+        if (comptime has_v2_session_store) active.v2_input_id else null,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -2718,13 +2855,27 @@ fn promptWorkerMain(active: *ActivePrompt) void {
                 @errorName(err),
         },
     };
-    const finished_steering: ?libfx_steering.Finished = if (active.state.active_session) |*session|
-        session.steering.finishTurn(active.state.alloc, active.alloc, "turn_finished") catch |err| blk: {
+    const finished_steering: ?libfx_steering.Finished = if (active.state.active_session) |*session| blk: {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        if (comptime has_v2_session_store) {
+            if (session.v2) |v2| {
+                var chunk_buf: [32]u64 = undefined;
+                var cursor: usize = 0;
+                while (true) {
+                    const ids = session.steering.collectV2InputIdsChunk(&cursor, &chunk_buf);
+                    if (ids.len == 0) break;
+                    v2.recordInputsWithdrawn(ids) catch |err| {
+                        debug_trace.logf("session", "event=input_withdrawn_batch_failed surface=acp count={d} err={s}", .{ ids.len, @errorName(err) });
+                    };
+                }
+            }
+        }
+        break :blk session.steering.finishTurn(active.state.alloc, active.alloc, "turn_finished") catch |err| {
             debug_trace.logf("acp", "failed to collect steering prompts at turn end err={s}", .{@errorName(err)});
             break :blk null;
-        }
-    else
-        null;
+        };
+    } else null;
     defer if (finished_steering) |finished| finished.deinit(active.alloc);
     active.reapable.store(true, .seq_cst);
     publishPromptOutcome(active, outcome) catch {};
@@ -5640,4 +5791,364 @@ test "ACP rejects refreshed Codex tokens for another account" {
         false,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
+}
+
+test "eb03: ACP steering records input_accepted unless session journal declares inputs_durable" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    var store = try session_adapter.Store.open(alloc, home_path);
+    defer store.deinit(alloc);
+    var model = "m".*;
+    const v2 = try session_adapter.Session.create(alloc, &store, "/tmp", .acp, .{
+        .preferences = .{ .provider = .gateway, .model = &model, .effort = .auto, .fast_mode = false },
+        .language = session_runtime.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "steer-durable.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, v2.id()),
+        .v2 = v2,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    try v2.beginTurn();
+    state.active_session.?.steering.open(alloc);
+
+    // Case 1: no libfx journal -> writes input_accepted.
+    var msg_plain = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/prompt",
+        .params_raw = try alloc.print(
+            "{{\"sessionId\":\"{s}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"no journal steer\"}}],\"_meta\":{{\"fx\":{{\"steer\":true}}}}}}",
+            .{state.active_session.?.session_id},
+        ),
+    };
+    defer alloc.free(msg_plain.params_raw.?);
+    try handleSteeringPrompt(&state, alloc, &msg_plain);
+
+    // Case 2: journal with inputs_durable == false -> writes input_accepted.
+    state.active_session.?.journal = .{ .writer = &state.writer, .inputs_durable = false };
+    var msg_non_durable = jsonrpc.Message{
+        .id = .{ .integer = 2 },
+        .method = "session/prompt",
+        .params_raw = try alloc.print(
+            "{{\"sessionId\":\"{s}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"non-durable journal steer\"}}],\"_meta\":{{\"fx\":{{\"steer\":true}}}}}}",
+            .{state.active_session.?.session_id},
+        ),
+    };
+    defer alloc.free(msg_non_durable.params_raw.?);
+    try handleSteeringPrompt(&state, alloc, &msg_non_durable);
+
+    // Case 3: journal with inputs_durable == true -> writes nothing to v2, still queues steer.
+    state.active_session.?.journal.?.inputs_durable = true;
+    var msg_durable = jsonrpc.Message{
+        .id = .{ .integer = 3 },
+        .method = "session/prompt",
+        .params_raw = try alloc.print(
+            "{{\"sessionId\":\"{s}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"durable journal steer\"}}],\"_meta\":{{\"fx\":{{\"steer\":true}}}}}}",
+            .{state.active_session.?.session_id},
+        ),
+    };
+    defer alloc.free(msg_durable.params_raw.?);
+    try handleSteeringPrompt(&state, alloc, &msg_durable);
+
+    var pending = try v2.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), pending.texts.len);
+    try std.testing.expectEqualStrings("no journal steer", pending.texts[0]);
+    try std.testing.expectEqualStrings("non-durable journal steer", pending.texts[1]);
+
+    try std.testing.expect(state.active_session.?.steering.findQueuedRequest(.{ .integer = 3 }) != null);
+    try std.testing.expectEqual(@as(?u64, null), state.active_session.?.steering.findQueuedRequest(.{ .integer = 3 }).?.v2_input_id);
+}
+
+test "eb03: handleKernelWithdraw writes input_withdrawn before modifying memory" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const FailingWriter = struct {
+        fail_writes: bool = true,
+        frames: std.ArrayList(u8) = .empty,
+
+        fn write(raw: ?*anyopaque, line: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.fail_writes) return error.BrokenPipe;
+            try self.frames.appendSlice(std.testing.allocator, line);
+        }
+    };
+    var capture = FailingWriter{};
+    defer capture.frames.deinit(alloc);
+    const writer = jsonrpc.Writer.initCallback(&capture, FailingWriter.write);
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = writer,
+    };
+    state.cfg.minimal_kernel = true;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, "s-withdraw"),
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+        .journal = .{ .writer = &state.writer },
+    };
+    defer destroyActiveSession(&state);
+    state.active_session.?.steering.open(alloc);
+    try state.active_session.?.steering.enqueueInput(alloc, "keep until written", "in_1");
+
+    var withdraw_msg = jsonrpc.Message{
+        .id = .{ .integer = 7 },
+        .method = "libfx/withdraw",
+        .params_raw = "{\"sessionId\":\"s-withdraw\",\"id\":\"in_1\"}",
+    };
+    // Journal append fails: memory must remain unchanged.
+    try std.testing.expectError(error.BrokenPipe, handleKernelWithdraw(&state, arena, &withdraw_msg));
+    try std.testing.expect(state.active_session.?.steering.hasInput("in_1"));
+
+    // Journal append succeeds: input_withdrawn is written and memory is removed.
+    capture.fail_writes = false;
+    try handleKernelWithdraw(&state, arena, &withdraw_msg);
+    try std.testing.expect(!state.active_session.?.steering.hasInput("in_1"));
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "input_withdrawn") != null);
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"result\":\"withdrawn\"") != null);
+}
+
+test "eb03: $/cancel_request withdraws queued steer, records input_withdrawn, and replies dropped" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    var store = try session_adapter.Store.open(alloc, home_path);
+    defer store.deinit(alloc);
+    var model = "m".*;
+    const v2 = try session_adapter.Session.create(alloc, &store, "/tmp", .acp, .{
+        .preferences = .{ .provider = .gateway, .model = &model, .effort = .auto, .fast_mode = false },
+        .language = session_runtime.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    const input_id = try v2.recordInputAccepted("cancel me");
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "cancel-steer.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, v2.id()),
+        .v2 = v2,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    try v2.beginTurn();
+    state.active_session.?.steering.open(alloc);
+    try state.active_session.?.steering.enqueueRequestWithV2Id(alloc, "cancel me", .{ .integer = 99 }, input_id);
+
+    handleRequestCancellation(&state, alloc, "{\"requestId\":99}");
+    try std.testing.expect(state.active_session.?.steering.findQueuedRequest(.{ .integer = 99 }) == null);
+
+    var pending = try v2.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
+
+    try capture.sync(io_mod.getIo());
+    var read_file = try tmp.dir.openFile(io_mod.getIo(), "cancel-steer.jsonl", .{});
+    defer read_file.close(io_mod.getIo());
+    const out = try io_mod.readFileToEnd(alloc, &read_file, 16 * 1024);
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.find(u8, out, "\"id\":99") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"steering\":\"dropped\"") != null);
+}
+
+test "eb03: turn end withdraws queued v2 steering ids in chunks even when active.alloc fails" {
+    if (comptime host_target.is_wasm) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    var store = try session_adapter.Store.open(alloc, home_path);
+    defer store.deinit(alloc);
+    var model = "m".*;
+    const v2 = try session_adapter.Session.create(alloc, &store, "/tmp", .acp, .{
+        .preferences = .{ .provider = .gateway, .model = &model, .effort = .auto, .fast_mode = false },
+        .language = session_runtime.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("initial turn") },
+        .assistant = @constCast("initial reply"),
+    } }, session_runtime.ConversationLanguage.default());
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "chunk-withdraw.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.cfg.auth_mode = .host_managed;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, v2.id()),
+        .v2 = v2,
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    try v2.beginTurn();
+    state.active_session.?.steering.open(alloc);
+
+    const queued_count: usize = 40;
+    for (0..queued_count) |i| {
+        var text_buf: [24]u8 = undefined;
+        const text = try std.mem.print(&text_buf, "steer-{d}", .{i});
+        const input_id = try v2.recordInputAccepted(text);
+        try state.active_session.?.steering.enqueueRequestWithV2Id(alloc, text, .{ .integer = @intCast(i + 100) }, input_id);
+    }
+
+    var active = ActivePrompt{
+        .state = &state,
+        .alloc = std.testing.failing_allocator,
+        .msg = .{
+            .id = .{ .integer = 1 },
+            .method = "session/prompt",
+            .params_raw = null,
+        },
+        .mode = "default",
+        .permission_mode = .ask,
+    };
+    promptWorkerMain(&active);
+
+    var pending = try v2.pendingAcceptedInputs(alloc);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.ids.len);
+}
+
+test "eb03: $/cancel_request traces unqueued steering cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cancel-trace.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "acp");
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "cancel-unqueued.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.minimal_kernel = false;
+    state.active_session = .{
+        .session_id = try alloc.dupe(u8, "s-trace"),
+        .model = try alloc.dupe(u8, "m"),
+        .mode = "default",
+        .workspace_root = "/tmp",
+        .api_key = &.{},
+        .agent_step_limit = 1,
+        .max_tool_result_bytes = 1024,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = session_runtime.SessionRuntime.init(10),
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    defer destroyActiveSession(&state);
+    state.active_session.?.steering.open(alloc);
+
+    handleRequestCancellation(&state, alloc, "{\"requestId\":404}");
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=cancel_steering_not_queued") != null);
 }
