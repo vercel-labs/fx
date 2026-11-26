@@ -43,7 +43,7 @@ var process_token_len: usize = 0;
 var program_name_buffer: [max_program_name_bytes]u8 = undefined;
 var program_name_len: usize = 0;
 
-pub fn isValidToken(token: []const u8) bool {
+fn isValidToken(token: []const u8) bool {
     if (token.len < min_token_bytes or token.len > max_token_bytes) return false;
     for (token) |byte| {
         if (!isTokenByte(byte)) return false;
@@ -139,7 +139,7 @@ pub const Command = struct {
 
 /// Returns the full report in `buffer`, or null when the command cannot be
 /// reported. The returned slice borrows `buffer`.
-pub fn encodeReport(buffer: *[max_sequence_bytes]u8, command: Command, token: []const u8) ?[]const u8 {
+fn encodeReport(buffer: *[max_sequence_bytes]u8, command: Command, token: []const u8) ?[]const u8 {
     if (!isReportableCommand(command) or !isValidToken(token)) return null;
     var sink = newSequence(buffer);
     const fields_written = appendPidAndTime(&sink, command.pid, command.time_s) and
@@ -151,7 +151,7 @@ pub fn encodeReport(buffer: *[max_sequence_bytes]u8, command: Command, token: []
 
 /// Returns a report that removes the record for this pid. The returned slice
 /// borrows `buffer`.
-pub fn encodeClear(buffer: *[max_sequence_bytes]u8, pid: u32, time_s: i64, token: []const u8) ?[]const u8 {
+fn encodeClear(buffer: *[max_sequence_bytes]u8, pid: u32, time_s: i64, token: []const u8) ?[]const u8 {
     if (!isPidAndTimeValid(pid, time_s) or !isValidToken(token)) return null;
     var sink = newSequence(buffer);
     const fields_written = appendPidAndTime(&sink, pid, time_s) and sink.append(":clear=1");

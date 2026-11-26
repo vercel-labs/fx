@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
-import { readTapeFrames, stdoutFrames, type TapeFrame } from "./render-lab/tape";
+import { stdoutFrames, type TapeFrame } from "./render-lab/tape";
 import { rootSessionIds, waitForRootTurnCommitted } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
@@ -100,20 +100,6 @@ function programResumeReports(tapePath: string): string[] {
   return reportsIn(stdoutFrames(tapePath));
 }
 
-async function waitForProgramResumeReports(tapePath: string, count: number): Promise<void> {
-  const deadline = Date.now() + TIMEOUT;
-  while (Date.now() < deadline) {
-    if (existsSync(tapePath)) {
-      const reports = reportsIn(
-        readTapeFrames(tapePath, { ignoreTruncatedTail: true }).filter((frame) => frame.kind === 1),
-      );
-      if (reports.length >= count) return;
-    }
-    await Bun.sleep(25);
-  }
-  throw new Error(`the tape at ${tapePath} never held ${count} OSC 7577 report(s)`);
-}
-
 function parseReport(report: string, token: string): Record<string, string> {
   const macAt = report.indexOf(":mac=");
   expect(macAt).toBeGreaterThan(0);
@@ -146,7 +132,7 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText(FIRST_PROMPT);
       await session.waitForText(FIRST_ANSWER, TIMEOUT);
       await session.waitForPane(turnSettled, TIMEOUT);
-      await waitForProgramResumeReports(fixture.tape, 1);
+      await waitForRootTurnCommitted(fixture.home, 0, TIMEOUT);
 
       const sessionIds = rootSessionIds(fixture.home);
       expect(sessionIds).toHaveLength(1);
@@ -210,7 +196,7 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText(SECOND_PROMPT);
       await session.waitForText(SECOND_ANSWER, TIMEOUT);
       await session.waitForPane(turnSettled, TIMEOUT);
-      await waitForProgramResumeReports(fixture.tape, 1);
+      await waitForRootTurnCommitted(fixture.home, 0, TIMEOUT);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
