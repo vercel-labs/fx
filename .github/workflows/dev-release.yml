@@ -198,10 +198,10 @@ jobs:
           # Runs go one at a time and each builds for minutes before this
           # step, so the read sees the previous run's write unless the CDN
           # serves a copy past that age.
-          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || {
-            echo "::warning::could not read dev.json; only main's newest commit may replace it"
-            CURRENT_SHA=""
-          }
+          CURRENT_SHA=$(curl -fsS --max-time 30 https://releases.fx.sh/dev.json | jq -r '.commit // empty') || CURRENT_SHA=""
+          if [ -z "$CURRENT_SHA" ]; then
+            echo "::warning::could not read a commit from dev.json; only main's newest commit may replace it"
+          fi
           CURRENT_KNOWN=false
           if [ -n "$CURRENT_SHA" ] && git cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null; then
             CURRENT_KNOWN=true
@@ -219,7 +219,11 @@ jobs:
             # main's newest commit may replace it.
             MAIN_SHA=$(git ls-remote origin refs/heads/main | cut -f1)
             if [ "$MAIN_SHA" != "$RELEASE_SHA" ]; then
-              echo "dev.json commit '${CURRENT_SHA}' is not in the history of ${RELEASE_SHA}, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+              if [ -z "$CURRENT_SHA" ]; then
+                echo "dev.json could not be read, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+              else
+                echo "dev.json commit ${CURRENT_SHA} is not in the history of ${RELEASE_SHA}, and main advanced to ${MAIN_SHA}; leaving dev.json unchanged"
+              fi
               exit 0
             fi
           fi
