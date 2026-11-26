@@ -8746,14 +8746,19 @@ pub const TranscriptRuntime = struct {
     fn footerCloseStrandsTranscript(
         self: *const TranscriptRuntime,
         footer_shrank: bool,
+        footer: render_engine.frame_layout.FooterMeasurement,
         footer_area: render_engine.frame_layout.FrameRect,
+        footer_surface_opening: bool,
         selection: ?ViewportSelection,
         source_visual_rows: u32,
     ) bool {
         const shown = selection orelse return false;
         const rows_above_viewport = shown.start_line > 0 or shown.partial_skip_rows > 0;
         const rows_above_footer = @as(u32, self.layout.rows) -| @as(u32, footer_area.height());
+        const plain_composer = footer.picker_rows == 0 and footer.banner_rows == 0;
         return footer_shrank and
+            plain_composer and
+            !footer_surface_opening and
             self.has_committed_frame and
             self.committed_frame_layout.terminal_cols == self.layout.cols and
             self.resize_history_row_delta == null and
@@ -8761,6 +8766,10 @@ pub const TranscriptRuntime = struct {
             footer_area.bottom < self.layout.rows and
             rows_above_viewport and
             source_visual_rows >= rows_above_footer;
+    }
+
+    fn footerShrank(self: *const TranscriptRuntime, footer_area: render_engine.frame_layout.FrameRect) bool {
+        return footer_area.height() < self.committed_frame_layout.footer_area.height();
     }
 
     pub fn solveFrameWithFooterCloseReset(
@@ -8771,16 +8780,15 @@ pub const TranscriptRuntime = struct {
         input: render_engine.frame_layout.SolveInput,
         prepare_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout) anyerror!render_engine.frame_fixed_point.CandidatePreparation,
         resolve_candidate: *const fn (*Context, render_engine.frame_layout.FrameLayout, render_engine.frame_scroll_plan.FrameScrollPlan) anyerror!render_engine.frame_fixed_point.CandidateResolution,
-        footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        footer_surface_opening: bool,
         prepared: *const ?transcript_painter.PreparedTranscriptSurfacePaint,
     ) !render_engine.frame_fixed_point.FramePlan {
         const plan = try render_engine.frame_fixed_point.solve(Context, ctx, input, prepare_candidate, resolve_candidate);
-        const footer_shrank = footer_reservation_changed and !replay_displaced_footer_history;
+        const footer_shrank = self.footerShrank(plan.layout.footer_area);
         const selection = if (prepared.*) |*paint| paint.selection else null;
         const source_rows = if (prepared.*) |*paint| paint.sourceTotalVisualRows() else 0;
-        if (!self.footerCloseStrandsTranscript(footer_shrank, plan.layout.footer_area, selection, source_rows)) return plan;
-        debug_trace.logf("scroll", "footer_close_reset footer_bottom={d} terminal_rows={d} source_visual_rows={d}", .{ plan.layout.footer_area.bottom, self.layout.rows, source_rows });
+        if (!self.footerCloseStrandsTranscript(footer_shrank, input.footer, plan.layout.footer_area, footer_surface_opening, selection, source_rows)) return plan;
+        debug_trace.logf("scroll", "footer_close_reset footer_bottom={d} terminal_rows={d} source_visual_rows={d} committed_footer_rows={d} footer_picker_rows={d} footer_banner_rows={d} footer_surface_opening={any}", .{ plan.layout.footer_area.bottom, self.layout.rows, source_rows, self.committed_frame_layout.footer_area.height(), input.footer.picker_rows, input.footer.banner_rows, footer_surface_opening });
         // Pinned by resize_tests.zig "a footer surface closed after transcript growth leaves the composer on the bottom row".
         try self.requestTerminalReset(metrics);
         var reset_input = input;
@@ -8799,6 +8807,9 @@ pub const TranscriptRuntime = struct {
         const footer: render_engine.frame_layout.FrameRect = .{ .top = 9, .bottom = 11 };
         const bottom_footer: render_engine.frame_layout.FrameRect = .{ .top = 18, .bottom = 20 };
         const fills_gap: u32 = 24;
+        const plain: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 3, .min_rows = 1, .max_rows = 3 };
+        const picker: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 12, .min_rows = 1, .max_rows = 12, .picker_rows = 8 };
+        const notice: render_engine.frame_layout.FooterMeasurement = .{ .natural_rows = 4, .min_rows = 1, .max_rows = 4, .banner_rows = 1 };
         var shell = TranscriptRuntime{
             .layout = .{
                 .rows = 20,
@@ -8812,31 +8823,31 @@ pub const TranscriptRuntime = struct {
             .has_committed_frame = true,
             .committed_frame_layout = .{ .terminal_cols = 100 },
         };
-        try std.testing.expect(shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
 
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(false, footer, above, fills_gap));
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, null, fills_gap));
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, bottom_footer, above, fills_gap));
-        const at_top: ViewportSelection = .{
-            .top_row = 1,
-            .bottom_row = 8,
-            .start_line = 0,
-            .partial_skip_rows = 0,
-            .line_count = 8,
-        };
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, at_top, fills_gap));
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, above, 10));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(false, plain, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, null, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, bottom_footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, picker, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, notice, footer, false, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, true, above, fills_gap));
+        var at_top = above;
+        at_top.start_line = 0;
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, at_top, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, 10));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, 16));
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, false, above, 17));
 
         shell.has_committed_frame = false;
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
         shell.has_committed_frame = true;
 
         shell.committed_frame_layout.terminal_cols = 80;
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
         shell.committed_frame_layout.terminal_cols = 100;
 
         shell.resize_history_row_delta = 3;
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
         shell.resize_history_row_delta = null;
 
         shell.pending_resize_observation = .{
@@ -8846,10 +8857,17 @@ pub const TranscriptRuntime = struct {
             .result = .unavailable,
             .phase = .live,
         };
-        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
         shell.pending_resize_observation = null;
 
-        try std.testing.expect(shell.footerCloseStrandsTranscript(true, footer, above, fills_gap));
+        const grown: render_engine.frame_layout.FrameRect = .{ .top = 7, .bottom = 11 };
+        shell.committed_frame_layout.footer_area = footer;
+        try std.testing.expect(!shell.footerShrank(grown));
+        try std.testing.expect(!shell.footerCloseStrandsTranscript(shell.footerShrank(grown), plain, grown, false, above, fills_gap));
+        shell.committed_frame_layout.footer_area = grown;
+        try std.testing.expect(shell.footerShrank(footer));
+
+        try std.testing.expect(shell.footerCloseStrandsTranscript(true, plain, footer, false, above, fills_gap));
     }
 
     pub fn requestTerminalResetAfterResize(
