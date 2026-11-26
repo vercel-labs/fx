@@ -3604,6 +3604,60 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     );
   }
 
+  // A form fx refuses (here a field that looks like a secret) is declined, and the user is told why, in fx's
+  // words alone: the form's own fields and values stay out of the notice.
+  for (const surface of ["TUI", "Ask"] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `${surface} tells the user that fx declined a form it refuses, and declines it`,
+      async () => {
+        const sentinel = "S10_SECRET_SENTINEL_7f3c";
+        const declined = "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+        const root = createRoot(`${surface.toLowerCase()}-secret-form`, MODERN_FIXTURE, {
+          mode: "mrtr_secret_required",
+          expectedElicitation: "both",
+        });
+        const activeGateway = startToolGateway(`${surface} declined form complete.`);
+        gateway = activeGateway;
+        const stderrPath = join(root.root, "stderr.log");
+        const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+        tui = await TmuxSession.create({
+          isolated: true,
+          ...(surface === "Ask"
+            ? {
+                cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the secret form fixture.")}`,
+                remainOnExit: true,
+              }
+            : { stderrPath }),
+          cwd: root.workspace,
+          width: 200,
+          height: 38,
+          env: fixtureEnv(root, activeGateway),
+        });
+        if (surface === "TUI") {
+          await tui.waitForComposer(15_000);
+          await tui.sendText("Call the secret form fixture.");
+        }
+        await tui.waitForText(`${surface} declined form complete.`, 30_000);
+        const screen = await tui.captureFullScrollback();
+        const told = screen.split(declined).length - 1;
+        expect(told, screen).toBe(1);
+        expect(screen).not.toContain(sentinel);
+        expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain(sentinel);
+        // The form was declined: the call did not go on, and the server never saw the secret.
+        expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after elicitation");
+        const wire = readWire(root.wireLogPath);
+        expect(JSON.stringify(wire)).not.toContain(sentinel);
+        expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+        if (surface === "TUI") expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await tui.kill();
+        tui = null;
+        await expectFixtureProcessesExited(wire);
+      },
+      40_000,
+    );
+  }
+
   for (const surface of ["TUI", "Ask"] as const) {
     test.skipIf(!tmuxAvailable())(
       `${surface} preserves exact form values across local label collisions`,
@@ -5837,7 +5891,7 @@ describe("fx mcp call", () => {
       tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_SAVED") && turnSettled(pane), 30_000);
       await tui.waitForComposer(10_000);
       expect(await tui.captureFullScrollback()).toContain(`└ Used ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
@@ -5937,7 +5991,7 @@ describe("fx mcp call", () => {
 
       // The session goes on.
       await tui.sendText("Go on.");
-      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_AFTER_CANCEL") && turnSettled(pane), 10_000);
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);

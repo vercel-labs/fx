@@ -4,7 +4,7 @@
 
 <!-- release:start -->
 
-**Subagents are more reliable. The tool view is refreshed, with one short row per call. Shell commands run 3.1× to 4.8× faster, about 24 to 37 ms instead of about 115 ms.**
+**Subagents are more reliable. The tool view is refreshed, with one short row per call. Shell commands run 3.1× to 4.8× faster.**
 
 ### Improvements
 
@@ -16,7 +16,7 @@
 - A toolbox call's row names its tool while its arguments stream in.
 - The compaction row shows how much of the summary is written and counts its own time.
 - Ctrl+O opens at once after a compaction.
-- Shell commands run 3.1× to 4.8× faster with an MCP server configured, about 24 to 37 ms instead of about 115 ms.
+- Shell commands run 3.1× to 4.8× faster with an MCP server configured.
 - `shell` can wait up to 5 minutes for a command when the model asks.
 - Long command output keeps its newest lines.
 - Shell results send the model an output handle only when the output was cut, so later requests carry less.

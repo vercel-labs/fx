@@ -74,6 +74,10 @@ pub const AutoUpgrade = struct {
     install_mutex: std.Io.Mutex = .init,
 
     relaunch_request: ?RelaunchRequest = null,
+    /// Main loop only. Ctrl+G accepted the upgrade while turns ran: they
+    /// stop at their next step boundary, and fx exits for the relaunch once
+    /// none runs (`app_upgrade_runtime` `collectUpgradeFacts`).
+    restart_waits: bool = false,
 
     pub fn configure_channel(self: *AutoUpgrade, selected: update_target.Channel) void {
         self.selected_channel = selected;
@@ -158,9 +162,16 @@ pub const AutoUpgrade = struct {
         self.relaunch_request = request;
     }
 
+    /// The relaunch the exit runs, consumed once. An exit while the restart
+    /// still waits for turns to stop is not that restart (`/quit`, Ctrl+D,
+    /// a signal): it quits, so the prepared relaunch is dropped.
     pub fn takeRelaunchRequest(self: *AutoUpgrade) ?RelaunchRequest {
         const request = self.relaunch_request;
         self.relaunch_request = null;
+        if (self.restart_waits) {
+            if (request != null) debug_trace.logf("upgrade", "event=relaunch_dropped reason=exit_while_restart_waits", .{});
+            return null;
+        }
         return request;
     }
 
@@ -532,6 +543,16 @@ test "relaunch request owns its path and previous revision and is consumed once"
         "1111111111111111111111111111111111111111",
         request.previousRevision().?,
     );
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+}
+
+test "an exit while the restart waits for turns drops the relaunch" {
+    var au = AutoUpgrade{};
+    try au.requestRelaunch("/tmp/fx");
+    au.restart_waits = true;
+    try std.testing.expect(au.takeRelaunchRequest() == null);
+    // Dropped, not kept for a later exit.
+    au.restart_waits = false;
     try std.testing.expect(au.takeRelaunchRequest() == null);
 }
 

@@ -86,6 +86,9 @@ jobs:
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
+      - name: Model-check web_fetch DNS cancellation
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/web_fetch_dns/check.sh design-b design-a
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -120,6 +123,9 @@ jobs:
 
       - name: Walk fx ask turns along the malformed tool call model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/malformed.ts --self-check
+
+      - name: Walk fx along the web_fetch DNS model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun test ./tests/tla/drivers/web_fetch_dns/
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -862,10 +868,11 @@ jobs:
           TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
 
   # The subagent steering, stop-then-message, main-mail and wait-nudge models, the
-  # session-write and live sessions models, and the drivers that run a built fx
-  # along them. Only the design configs and the session witnesses run here; the
-  # planted bugs and fx's old defects stay local (both check.sh scripts with no
-  # arguments): they measure the checks, not the code.
+  # session-write, live sessions, and accepted-input models, and the drivers
+  # that run a built fx along them. Only the design configs and the session
+  # witnesses run here; the planted bugs, simulations, and fx's old defects stay
+  # local (both check.sh scripts with no arguments): they measure the checks, not
+  # the code.
   tla-subagent:
     name: TLA+ subagent and session-write models
     needs: [build, ci-need]
@@ -891,7 +898,13 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.14"
-      - name: Model-check subagent messages, session writes, and live sessions, and drive fx along the models
+      - name: Install tmux
+        if: needs.ci-need.outputs.subagent == 'true'
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+      - name: Model-check subagent messages, session writes, live sessions, and accepted input, and drive fx along the models
         if: needs.ci-need.outputs.subagent == 'true'
         run: |
           set -euo pipefail
@@ -900,13 +913,14 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           export TLA2TOOLS_JAR="$jar"
           tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep main-mail main-mail-acp main-mail-handoff quiet-relay quiet-relay-deep wait-nudge
-          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan
+          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted live-holds live-simulate live-witness-stale live-witness-idle-parent live-witness-open-fails-on-scan accepted-design-a accepted-design-a2 accepted-design-b
           bun tests/tla/drivers/subagent/driver.ts
           bun test ./tests/tla/drivers/subagent/stop-message.test.ts
           bun test ./tests/tla/drivers/subagent/main-mail.test.ts
           bun test ./tests/tla/drivers/subagent/quiet-relay.test.ts
           bun test ./tests/tla/drivers/session/write.test.ts
           bun test ./tests/tla/drivers/session/live.test.ts
+          bun test ./tests/tla/drivers/session/accepted-input.test.ts
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})

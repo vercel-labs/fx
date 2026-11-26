@@ -1140,6 +1140,7 @@ const AskContext = struct {
                 .capabilities = self.mcp_elicitation_capabilities,
                 .legacy_url_manual_completion = true,
                 .callback = respondToAskMcpInput,
+                .declined_notice = tellAskMcpDeclined,
             };
         }
         return tc;
@@ -1791,7 +1792,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     // while the turn runs, and waits for it only when fx has none.
     var token_pass_run: ?token_pass_check.Check = null;
     defer if (token_pass_run) |*check| check.finish(alloc, "ask_finished");
-    const token_pass_source: ?credentials.Source = if (ctx.provider == .gateway and cfg.auth_mode != .host_managed) ctx.credential_source else null;
+    // Unit tests share the real provider bundles, so a test's check would ask
+    // AI Gateway, and a request it walked away from frees into the test
+    // allocator after the test ended.
+    const token_pass_source: ?credentials.Source = if (comptime std_builtin.is_test)
+        null
+    else if (ctx.provider == .gateway and cfg.auth_mode != .host_managed)
+        ctx.credential_source
+    else
+        null;
     if (token_pass_source) |source| {
         if (token_pass_check.name(alloc, source, ctx.api_key, ctx.account_id, ctx.gateway_team)) |named| {
             token_pass_run = .{ .named = named, .home = io_mod.homeDir() };
@@ -2787,6 +2796,7 @@ fn executeToolCallAuthorized(
     request: agent_runtime.ToolExecutionRequest,
 ) !ToolExecutionResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try markQuestionBreak(ctx, request.call_allocator, request.call);
     var tool_ctx = ctx.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
     tool_ctx.root_user_messages = request.root_user_messages;
@@ -2803,6 +2813,20 @@ fn executeToolCallAuthorized(
     };
     captureToolExecutionResult(ctx, request, result);
     return result;
+}
+
+/// Breaks the raw and JSON text after a question, direct or through toolbox,
+/// as a tool start does in `pushToolLifecycle`: a question starts no visible
+/// tool (`startToolVisibleLifecycle`), and `fx ask` never shows one, so the
+/// reply after it is a new paragraph. A question never runs in a parallel
+/// batch, so only this thread writes the break; other calls touch no state.
+fn markQuestionBreak(ctx: *AskContext, call_allocator: Allocator, call: ToolCall) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(call_allocator);
+    defer scratch_state.deinit();
+    const carried = try toolbox.carriedCall(scratch_state.allocator(), call.name, call.arguments_json);
+    const ran_name = if (carried) |carried_call| carried_call.name else call.name;
+    if (!std.mem.eql(u8, ran_name, types.user_question_tool_name)) return;
+    if (ctx.raw_has_output) ctx.raw_boundary_pending = true;
 }
 
 fn captureToolExecutionError(
@@ -3677,6 +3701,14 @@ fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
         listed = true;
     }
     if (listed) try ctx.writeStderr(". Approve with fx mcp approve <name> before retrying.\n");
+}
+
+/// A question fx declined, as a warning in the transcript, where `fx ask` shows its other notices. The responder
+/// exists only for a terminal, and a terminal has a presenter.
+fn tellAskMcpDeclined(raw_ctx: *anyopaque, text: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const presenter = ctx.presenter orelse return;
+    presenter.pushNotice(.{ .topic = "mcp", .tone = .warning, .body = text }) catch |err| debug_trace.logf("mcp", "MCP declined-question notice not sent err={s}", .{@errorName(err)});
 }
 
 fn respondToAskMcpInput(
@@ -7903,6 +7935,30 @@ test "ask usage survives normal and typed error result capture" {
     }
 }
 
+test "fx ask in a test build asks AI Gateway for no Token Pass credits" {
+    const alloc = std.testing.allocator;
+    const CountingCredits = struct {
+        var calls: std.atomic.Value(usize) = .init(0);
+
+        fn fetch(_: ?*anyopaque, _: Allocator, _: gateway_provider.CreditsLookupInput) output_contracts.CreditsSnapshot {
+            _ = calls.fetchAdd(1, .seq_cst);
+            return .{};
+        }
+    };
+    CountingCredits.calls.store(0, .seq_cst);
+    var cfg = testConfig();
+    cfg.provider_set.gateway.credits = .{ .fetch_fn = CountingCredits.fetch };
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    deps.stdout_is_tty = TestTty.no;
+
+    try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, &.{ "--json", "--no-save", "hello" }, cfg, deps));
+    try std.testing.expectEqual(@as(usize, 0), CountingCredits.calls.load(.seq_cst));
+}
+
 /// A saved ask whose first two turns each leave a report to start the next
 /// turn, as a subagent's report does, and whose last turn ends as `ending`.
 const TestRunUsage = struct {
@@ -9311,6 +9367,50 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     defer parsed.deinit();
     try std.testing.expectEqualStrings(source_output, parsed.value.object.get("output").?.string);
     try std.testing.expectEqualStrings("final answer", parsed.value.object.get("final_output").?.string);
+}
+
+test "a question starts a new paragraph in raw and JSON output, as a tool does" {
+    const alloc = std.testing.allocator;
+    const question = "{\"questions\":[{\"question\":\"Choose next step?\",\"options\":[{\"label\":\"Run tests\"},{\"label\":\"Stop\"}]}]}";
+    const calls = [_]ToolCall{
+        .{ .id = "ask_1", .name = "ask_user_question", .arguments_json = question },
+        .{ .id = "ask_1", .name = "toolbox", .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":" ++ question ++ "}" },
+    };
+    for ([_]OutputMode{ .raw, .json }) |mode| {
+        for (calls) |call| {
+            var stdout_capture: TestCapture = .{};
+            defer stdout_capture.deinit(alloc);
+            var stderr_capture: TestCapture = .{};
+            defer stderr_capture.deinit(alloc);
+            var ctx = AskContext.init(
+                alloc,
+                testConfig(),
+                testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+                "/tmp/workspace",
+            );
+            defer ctx.deinit();
+            ctx.output_mode = mode;
+            const deps = agentRuntimeDeps(&ctx);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            try deps.push_text(deps.ctx, .{ .assistant_source = "One question first." });
+            _ = try executeToolCallAuthorized(@ptrCast(&ctx), .{
+                .call_allocator = arena,
+                .result_allocator = arena,
+                .call = call,
+                .authority = .ordinary,
+                .session_grants = &.{},
+                .advertised_dynamic_tool_names = &.{},
+                .max_tool_result_bytes = 4096,
+            });
+            try deps.push_text(deps.ctx, .{ .assistant_source = "Done after the question." });
+
+            const written = if (mode == .json) ctx.assistant_output.items else stdout_capture.bytes.items;
+            try std.testing.expectEqualStrings("One question first.\n\nDone after the question.", written);
+        }
+    }
 }
 
 test "CLI response restart preserves completed output and removes only the failed JSON preview" {

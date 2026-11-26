@@ -259,7 +259,7 @@ pub fn finishAssistantTerminalWithExecution(
     const context_execution = try finalization.persistedExecution(projection_arena.allocator(), execution);
     const completed_summary = summary.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = @constCast(assistant_text),
         .provider_replay = replay,
         .execution = context_execution,
@@ -385,4 +385,46 @@ test "a save that fails keeps the turn's call records, and the next save places 
     try std.testing.expectEqual(@as(usize, 1), saved.model_calls.len);
     try std.testing.expectEqualStrings("gen-1", saved.model_calls[0].generation_id.?);
     try std.testing.expectEqual(@as(usize, 1), saved.model_calls[0].after_tool_step_count);
+}
+
+test "eb03: finishAssistantTerminalWithExecution carries job.input_id to UserTurn.input_id" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var runtime_deps = fake.deps();
+
+    var guard = TurnFinalizationGuard.init(&runtime_deps, 7, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer guard.deinit();
+    var summary = TurnSummaryAccumulator.init(0, "hello");
+    var trace: PromptFinishTrace = .{ .ctx = .{} };
+    const job: QueuedPrompt = .{
+        .turn_id = 7,
+        .input_id = 88,
+        .prompt = @constCast("hello"),
+        .images = &.{},
+        .model = @constCast("model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    try finishAssistantTerminalWithExecution(
+        &runtime_deps,
+        &guard,
+        job,
+        .{},
+        &summary,
+        "done",
+        .completed,
+        .completed,
+        &trace,
+        "completed",
+        null,
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.history_turns.items.len);
+    try std.testing.expectEqual(@as(?u64, 88), fake.history_turns.items[0].assistant.user.input_id);
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_event_count);
+    try std.testing.expectEqual(@as(?u64, 88), fake.finish_user_input_id);
 }

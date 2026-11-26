@@ -15,7 +15,7 @@
 (* is still open when a launch opens the session is ended `crash` by the   *)
 (* session manager. The writer lock lets one process write the session.    *)
 (*                                                                         *)
-(* A process ends in one of three ways:                                    *)
+(* A process ends in one of four ways:                                     *)
 (* - Quit: /quit or Ctrl+C twice. It cancels the request first, as Esc     *)
 (*   does, so nothing resumes.                                             *)
 (* - Close: SIGHUP or SIGTERM, from a closed window, a logout, or a        *)
@@ -24,6 +24,14 @@
 (*   `closing`, saves the record it returns, which is marked clean, and    *)
 (*   exits.                                                                *)
 (* - Kill: SIGKILL or a crash, at any moment.                              *)
+(* - Relaunch: Ctrl+G installs an upgrade and restarts fx (Upgrade). A     *)
+(*   running turn stops at its next save before a model request once the   *)
+(*   turn is in the log (src/core/quiesce/): fx saves the record marked    *)
+(*   clean, marks the turn as yielded, and re-execs (Relaunch). The next   *)
+(*   launch continues that turn with no note to the model. While the       *)
+(*   restart waits, a new message is held. Proposed only: fx today         *)
+(*   refuses Ctrl+G while a turn runs. If that save does not land, the     *)
+(*   turn goes on, and the next save asks again (YieldSaveFails).          *)
 (*                                                                         *)
 (* Policy selects fx's behavior:                                           *)
 (* - "today" saves no record, and a close dies as a kill does. A launch    *)
@@ -56,7 +64,8 @@ CONSTANTS
 
 Bugs == {"none", "no_closing", "no_clear", "send_before_save",
          "reset_on_resume", "resume_answered", "resume_cancelled",
-         "ignore_age", "no_lock"}
+         "ignore_age", "no_lock", "yield_unclean", "yield_first",
+         "yield_unsaved"}
 
 Procs == {1, 2}
 Reqs  == 1..MaxReq
@@ -123,9 +132,16 @@ VARIABLES
     fate,      \* what became of each request
     answered,  \* the request's final answer was saved
     seen,      \* deaths with the current model request's send in flight
-    stranded   \* a launch left a request it could have resumed
+    stranded,  \* a launch left a request it could have resumed
+    \* Ctrl+G: whether a restart waits for the running turn to stop
+    \* (pending), the request a relaunch left for the next launch to
+    \* continue, 0 for none (yielded), and whether a launch failed to
+    \* continue one (lost).
+    up
 
-vars == <<turn, lock, wall, ps, faults, fate, answered, seen, stranded>>
+vars == <<turn, lock, wall, ps, faults, fate, answered, seen, stranded, up>>
+
+NoUpgrade == [pending |-> FALSE, yielded |-> 0, lost |-> FALSE]
 
 TypeOK ==
     /\ turn \in Turns /\ lock \subseteq Procs /\ wall \in Days
@@ -135,6 +151,7 @@ TypeOK ==
     /\ answered \in [Reqs -> BOOLEAN]
     /\ seen \in 0..CrashLoopAfter
     /\ stranded \in BOOLEAN
+    /\ up \in [pending: BOOLEAN, yielded: 0..MaxReq, lost: BOOLEAN]
 
 -----------------------------------------------------------------------------
 (* Derived values.                                                         *)
@@ -177,6 +194,7 @@ Init ==
     /\ ps = [p \in Procs |-> OffProc]
     /\ faults = 0 /\ fate = [r \in Reqs |-> "none"]
     /\ answered = [r \in Reqs |-> FALSE] /\ seen = 0 /\ stranded = FALSE
+    /\ up = NoUpgrade
 
 \* The launch opens the session, the manager ends an open turn as a crash,
 \* and fx decides whether to continue it. Planted defect no_lock: a second
@@ -220,31 +238,34 @@ Launch(p) ==
                          /\ ps' = [ps EXCEPT ![p] = [pc |-> "save", req |-> t.req,
                                        cont |-> TRUE, md |-> c, q |-> "none",
                                        auto |-> TRUE, old |-> isOld, fresh |-> FALSE]]
+    \* A relaunch's request goes on in this launch, at once or after asking.
+    /\ up' = [up EXCEPT !.yielded = 0,
+                        !.lost = @ \/ (up.yielded # 0 /\ ~(resumable /\ t.req = up.yielded))]
     /\ UNCHANGED <<wall, faults, fate, answered, seen>>
 
 -----------------------------------------------------------------------------
 (* The user.                                                               *)
 
 \* A new message, written to the log with its first send. A request left
-\* interrupted is given up.
+\* interrupted is given up. While a restart waits, fx holds it.
 Prompt(p) ==
     LET r == NextReq IN
-    /\ ps[p].pc = "idle" /\ Holds(p) /\ r <= MaxReq
+    /\ ps[p].pc = "idle" /\ Holds(p) /\ r <= MaxReq /\ ~up.pending
     /\ fate' = [fate EXCEPT ![r] = "open",
                             ![Cur] = IF Cur > 0 /\ @ = "open" THEN "cancel" ELSE @]
     /\ ps' = [ps EXCEPT ![p] = [OffProc EXCEPT !.pc = "save", !.req = r, !.cont = TRUE]]
     /\ seen' = 0
-    /\ UNCHANGED <<turn, lock, wall, faults, answered, stranded>>
+    /\ UNCHANGED <<turn, lock, wall, faults, answered, stranded, up>>
 
 \* "continue" after a launch that did not resume: a new turn for the same
 \* request, sent because the user asked, even when its answer was saved.
 UserContinue(p) ==
-    /\ ps[p].pc = "idle" /\ Holds(p)
+    /\ ps[p].pc = "idle" /\ Holds(p) /\ ~up.pending
     /\ Cur > 0 /\ turn.st = "crash" /\ fate[Cur] = "open"
     /\ ps' = [ps EXCEPT ![p] = [OffProc EXCEPT !.pc = "save", !.req = Cur,
                                                !.cont = TRUE, !.md = Count(turn.rec)]]
     /\ answered' = [answered EXCEPT ![Cur] = FALSE]
-    /\ UNCHANGED <<turn, lock, wall, faults, fate, seen, stranded>>
+    /\ UNCHANGED <<turn, lock, wall, faults, fate, seen, stranded, up>>
 
 \* Enter at a question, or after fixing what a request waits on: send again.
 \* Answering the crash-loop question starts the count over (recovery.zig
@@ -254,7 +275,7 @@ Enter(p) ==
     /\ ps[p].pc \in {"ask", "need"}
     /\ ps' = [ps EXCEPT ![p].pc = "save", ![p].q = "none", ![p].auto = FALSE,
                         ![p].md = IF loop THEN 0 ELSE @, ![p].fresh = loop]
-    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded, up>>
 
 \* The request ends as cancelled: its turn, written now if it was not yet.
 Cancelled(p) ==
@@ -269,10 +290,10 @@ Esc(p) ==
     /\ fate' = [fate EXCEPT ![ps[p].req] = "cancel"]
     /\ ps' = [ps EXCEPT ![p] = Idle(ps[p].req)]
     /\ seen' = 0
-    /\ UNCHANGED <<lock, wall, faults, answered, stranded>>
+    /\ UNCHANGED <<lock, wall, faults, answered, stranded, up>>
 
 \* /quit cancels a running request first, as Esc does; a turn whose answer
-\* is saved commits.
+\* is saved commits. A restart that waited goes with the process.
 Quit(p) ==
     LET pc == ps[p].pc IN
     /\ pc # "off"
@@ -286,29 +307,32 @@ Quit(p) ==
     /\ ps' = [ps EXCEPT ![p] = OffProc]
     /\ lock' = lock \ {p}
     /\ seen' = IF pc \in {"idle", "off"} THEN seen ELSE 0
+    /\ up' = [up EXCEPT !.pending = FALSE]
     /\ UNCHANGED <<wall, faults, answered, stranded>>
 
 -----------------------------------------------------------------------------
 (* fx's own steps.                                                         *)
 
 \* Save the record and send. Today saves nothing. Planted defect
-\* send_before_save: the send goes out first.
+\* send_before_save: the send goes out first. While a restart waits, a
+\* turn already in the log stops here instead (Relaunch).
 Save(p) ==
     /\ ps[p].pc = "save" /\ Holds(p)
+    /\ ~(up.pending /\ (~ps[p].cont \/ Bug = "yield_first"))
     /\ IF Bug = "send_before_save"
           THEN /\ ps' = [ps EXCEPT ![p].pc = "late"]
                /\ UNCHANGED turn
           ELSE /\ ps' = [ps EXCEPT ![p].pc = "flight", ![p].cont = FALSE, ![p].fresh = FALSE]
                /\ turn' = Written(p, IF Today THEN NoRec ELSE SendRec(p))
     /\ seen' = IF ps[p].fresh /\ Bug # "send_before_save" THEN 0 ELSE seen
-    /\ UNCHANGED <<lock, wall, faults, fate, answered, stranded>>
+    /\ UNCHANGED <<lock, wall, faults, fate, answered, stranded, up>>
 
 LateSave(p) ==
     /\ ps[p].pc = "late"
     /\ turn' = Written(p, SendRec(p))
     /\ ps' = [ps EXCEPT ![p].pc = "flight", ![p].cont = FALSE, ![p].fresh = FALSE]
     /\ seen' = IF ps[p].fresh THEN 0 ELSE seen
-    /\ UNCHANGED <<lock, wall, faults, fate, answered, stranded>>
+    /\ UNCHANGED <<lock, wall, faults, fate, answered, stranded, up>>
 
 \* The response arrives whole: tool calls to run, or the final answer. The
 \* request is finished, so its record is cleared before the response's
@@ -324,7 +348,7 @@ Respond(p) ==
           /\ ps' = [ps EXCEPT ![p] = [@ EXCEPT !.pc = "final", !.auto = FALSE]]
     \* The model request that crashed fx got its answer.
     /\ seen' = 0
-    /\ UNCHANGED <<lock, wall, faults, fate, stranded>>
+    /\ UNCHANGED <<lock, wall, faults, fate, stranded, up>>
 
 \* The turn with the final answer commits.
 Finish(p) ==
@@ -333,13 +357,13 @@ Finish(p) ==
     /\ fate' = [fate EXCEPT ![Cur] = "ok"]
     /\ ps' = [ps EXCEPT ![p] = Idle(Cur)]
     /\ seen' = 0
-    /\ UNCHANGED <<lock, wall, faults, answered, stranded>>
+    /\ UNCHANGED <<lock, wall, faults, answered, stranded, up>>
 
 \* The tools finish and the turn's next request starts with a new module.
 ToolsDone(p) ==
     /\ ps[p].pc = "tools"
     /\ ps' = [ps EXCEPT ![p].pc = "save"]
-    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded, up>>
 
 \* A failure the module waits out, and the retry when the wait ends.
 Fail(p) ==
@@ -349,12 +373,12 @@ Fail(p) ==
                                  !.at = wall]
     /\ ps' = [ps EXCEPT ![p].pc = "wait"]
     /\ faults' = faults + 1
-    /\ UNCHANGED <<lock, wall, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<lock, wall, fate, answered, seen, stranded, up>>
 
 Retry(p) ==
     /\ ps[p].pc = "wait"
     /\ ps' = [ps EXCEPT ![p].pc = "save"]
-    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<turn, lock, wall, faults, fate, answered, seen, stranded, up>>
 
 \* A failure only the user can fix, such as an expired sign-in.
 NeedFail(p) ==
@@ -365,7 +389,7 @@ NeedFail(p) ==
                                  !.at = wall]
     /\ ps' = [ps EXCEPT ![p].pc = "need", ![p].q = "other"]
     /\ faults' = faults + 1
-    /\ UNCHANGED <<lock, wall, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<lock, wall, fate, answered, seen, stranded, up>>
 
 -----------------------------------------------------------------------------
 (* The world.                                                              *)
@@ -377,6 +401,7 @@ Kill(p) ==
     /\ ps' = [ps EXCEPT ![p] = OffProc]
     /\ lock' = lock \ {p}
     /\ faults' = faults + 1
+    /\ up' = [up EXCEPT !.pending = FALSE]
     /\ UNCHANGED <<turn, wall, fate, answered, stranded>>
 
 \* SIGHUP, SIGTERM, or a terminal that hangs up. fx saves the running
@@ -399,6 +424,7 @@ Close(p) ==
     /\ ps' = [ps EXCEPT ![p] = OffProc]
     /\ lock' = lock \ {p}
     /\ faults' = faults + 1
+    /\ up' = [up EXCEPT !.pending = FALSE]
     /\ UNCHANGED <<wall, fate, answered, stranded>>
 
 \* A day passes.
@@ -406,14 +432,74 @@ Day ==
     /\ wall = 0 /\ CanFault
     /\ wall' = 1
     /\ faults' = faults + 1
-    /\ UNCHANGED <<turn, lock, ps, fate, answered, seen, stranded>>
+    /\ UNCHANGED <<turn, lock, ps, fate, answered, seen, stranded, up>>
+
+-----------------------------------------------------------------------------
+(* Ctrl+G.                                                                 *)
+
+\* An upgrade is ready and the user presses Ctrl+G. fx refuses while the
+\* request asks or waits for the user; otherwise the restart waits for the
+\* running turn to stop (app_upgrade_runtime.zig). Today refuses while a
+\* turn runs, so only the proposed design has this step.
+Upgrade(p) ==
+    /\ Proposed /\ ~up.pending /\ Holds(p)
+    /\ ps[p].pc \in {"idle", "save", "flight", "late", "wait", "tools", "final"}
+    /\ up' = [up EXCEPT !.pending = TRUE]
+    /\ UNCHANGED <<turn, lock, wall, ps, faults, fate, answered, seen, stranded>>
+
+\* The restart: with nothing running, or with the turn stopped at its save
+\* before a model request once the turn is in the log (quiesce.zig). The
+\* save records the module's state marked clean, as a close does, and the
+\* turn stays open with the yield marker for the next launch to continue.
+\* Planted defect yield_unclean: the record is saved as a death. Planted
+\* defect yield_first: the turn stops at its prompt's first send, before
+\* it reaches the log.
+Relaunch(p) ==
+    LET boundary == ps[p].pc = "save" /\ (~ps[p].cont \/ Bug = "yield_first")
+        saves == boundary /\ ~ps[p].cont
+    IN
+    /\ up.pending /\ Holds(p) /\ CanFault
+    /\ ps[p].pc = "idle" \/ boundary
+    /\ turn' = IF saves
+                  THEN [turn EXCEPT !.rec = [SendRec(p) EXCEPT !.clean = Bug # "yield_unclean"],
+                                    !.at = wall]
+                  ELSE turn
+    \* The save records an answer to the crash-loop question too.
+    /\ seen' = IF saves /\ ps[p].fresh THEN 0 ELSE seen
+    /\ ps' = [ps EXCEPT ![p] = OffProc]
+    /\ lock' = lock \ {p}
+    /\ faults' = faults + 1
+    /\ up' = [up EXCEPT !.pending = FALSE, !.yielded = IF boundary THEN ps[p].req ELSE 0]
+    /\ UNCHANGED <<wall, fate, answered, stranded>>
+
+\* The restart's save does not land, as a failed disk write can make it:
+\* the turn goes on, and its send goes out with the record of a send in
+\* flight that its earlier write left, as Save does. The restart still
+\* waits, and the next save asks again (orchestrator.zig yieldTurn,
+\* request_recovery.zig closeForYield). Planted defect yield_unsaved: the
+\* turn stops anyway and is marked yielded, so the next launch reads a
+\* send in flight and counts a death that no crash caused.
+YieldSaveFails(p) ==
+    /\ Proposed /\ up.pending /\ Holds(p) /\ CanFault
+    /\ ps[p].pc = "save" /\ ~ps[p].cont
+    /\ turn' = Written(p, SendRec(p))
+    /\ seen' = IF ps[p].fresh THEN 0 ELSE seen
+    /\ faults' = faults + 1
+    /\ IF Bug = "yield_unsaved"
+          THEN /\ ps' = [ps EXCEPT ![p] = OffProc]
+               /\ lock' = lock \ {p}
+               /\ up' = [up EXCEPT !.pending = FALSE, !.yielded = ps[p].req]
+          ELSE /\ ps' = [ps EXCEPT ![p].pc = "flight", ![p].cont = FALSE, ![p].fresh = FALSE]
+               /\ UNCHANGED <<lock, up>>
+    /\ UNCHANGED <<wall, fate, answered, stranded>>
 
 Next ==
     \/ \E p \in Procs :
           \/ Launch(p) \/ Prompt(p) \/ UserContinue(p) \/ Enter(p) \/ Esc(p)
           \/ Quit(p) \/ Save(p) \/ LateSave(p) \/ Respond(p) \/ Finish(p)
           \/ ToolsDone(p) \/ Fail(p) \/ Retry(p) \/ NeedFail(p)
-          \/ Kill(p) \/ Close(p)
+          \/ Kill(p) \/ Close(p) \/ Upgrade(p) \/ Relaunch(p)
+          \/ YieldSaveFails(p)
     \/ Day
 
 Spec == Init /\ [][Next]_vars
@@ -449,5 +535,9 @@ OldAsks == \A p \in Procs : AutoSend(p) => ~ps[p].old
 Working(p) == ps[p].pc \in {"ask", "save", "flight", "late", "wait", "need",
                              "tools", "final"}
 OneWorker == Cardinality({p \in Procs : Working(p)}) <= 1
+
+\* A turn that stopped for an upgrade's restart goes on at the next launch:
+\* its request is still the newest turn's, and the launch continues it.
+YieldContinues == ~up.lost
 
 =============================================================================

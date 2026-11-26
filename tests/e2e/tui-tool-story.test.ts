@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
@@ -107,7 +108,17 @@ const REFUSED_REQUESTS: StoryStep[] = [
 const REFUSED_LAST: StoryStep[] = [
   { at: 0, calls: [sh("printf done")] },
   { at: 1, calls: [REFUSED_REQUESTS[0].calls![0]] },
-  { at: 2, text: "I could not list the folder." },
+  // The reply's words show a second before its stream ends, so the row's
+  // reason, which shows at the turn's end, comes after them.
+  {
+    at: 2,
+    response: () => {
+      const held = heldFakeGatewayFinalText();
+      held.send("I could not list the folder.");
+      setTimeout(() => held.release(""), 1_000);
+      return held.response;
+    },
+  },
 ];
 
 // Two commands fail, the last of them too.
@@ -199,6 +210,24 @@ const PRINTED_CODE_THEN_FAILED: StoryStep[] = [
   { at: 1, text: "The file is missing." },
 ];
 
+// A check that prints two counts, then a heading and the lines it found
+// under it, and fails because it found them.
+const LISTED_THEN_FAILED: StoryStep[] = [
+  {
+    at: 0,
+    calls: [sh("echo 'staged: 2' && echo 'left over: 0' && echo 'Tracked personal paths found:' && ! grep -rn createWindow desktop/src && echo surface-ok && sh build.sh && echo build-ok")],
+  },
+  { at: 1, text: "The check found the paths." },
+];
+
+// Three commands that fail with their messages between escape sequences: a
+// style reset as `tput sgr0` writes it, and OSC 8 links that end with ST and
+// with BEL.
+const ESCAPED_MESSAGES: StoryStep[] = [
+  { at: 0, calls: [sh("sh styled-build.sh"), sh("sh linked-check.sh"), sh("sh bel-linked-check.sh")] },
+  { at: 3, text: "The build and both checks failed." },
+];
+
 const SUBAGENTS: StoryStep[] = [
   {
     at: 0,
@@ -281,24 +310,29 @@ async function runStory(
     height?: number;
     settings?: Record<string, unknown>;
     childReply?: (task: string) => string | Promise<string>;
+    /** Record the bytes fx writes to the returned `tape`. */
+    record?: boolean;
   },
 ) {
   const root = createStoryRoot(options.settings);
   roots.push(root);
   const gateway = startStoryGateway(steps, options.childReply);
   gateways.push(gateway);
+  const tape = options.record ? join(root.root, "live.fxtape") : undefined;
   const session = await TmuxSession.create({
     cwd: root.workspace,
-    env: storyEnv(root, gateway),
+    env: tape ? { ...storyEnv(root, gateway), FX_RECORD: tape } : storyEnv(root, gateway),
     width: options.width ?? 110,
     height: options.height ?? 60,
   });
   sessions.push(session);
   await session.waitForComposer();
   await session.sendText(options.prompt);
-  await session.waitForText(options.finalText, TIMEOUT);
+  // The reply's last words show before its turn ends, and the turn-end rows
+  // and the saved turn come after them.
+  await session.waitForPane((pane) => pane.includes(options.finalText) && turnSettled(pane), TIMEOUT);
   const pane = await session.waitForComposer(TIMEOUT);
-  return { root, gateway, session, pane };
+  return { root, gateway, session, pane, tape };
 }
 
 function paneLines(pane: string): string[] {
@@ -844,7 +878,7 @@ test.skipIf(!tmuxAvailable())(
     const running = "● Running +6, tail, sh check.sh, sh wait.sh · 12 calls";
     expect(paneLines(await session.waitForText(running, TIMEOUT))).toContain(running);
     writeFileSync(join(root.workspace, "released"), "");
-    await session.waitForText("The desktop app has two source files.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The desktop app has two source files.") && turnSettled(pane), TIMEOUT);
     const ran = "● Ran +6, tail, sh check.sh, sh wait.sh · 12 calls ✓";
     const expectRow = (pane: string, row: string) => {
       expect(paneLines(pane).filter((line) => line.includes(" calls"))).toEqual([row]);
@@ -987,7 +1021,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("save the notes in a session");
     // While the wait runs, its row names the same programs.
     await session.waitForText("Waiting for cat, sleep, printf", TIMEOUT);
-    await session.waitForText("The session saved the notes.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The session saved the notes.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // The session's row names the programs of its launch command, and says
       // it ran once the check found the command ended; the document's text
@@ -1046,7 +1080,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("write the files");
-    await session.waitForText("The files are written.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The files are written.") && turnSettled(pane), TIMEOUT);
     const expectNames = (lines: string[]) => {
       // Each row names its file, and two files with one name stay two rows.
       expect(treeRows(group(lines, /^● Wrote files/))).toEqual([
@@ -1083,15 +1117,83 @@ test.skipIf(!tmuxAvailable())(
     });
     const lines = paneLines(pane);
     // The reason is ls's own message, not a printed line that names "error",
-    // without the words that say who spoke, and at most 40 columns.
+    // without the words that say who spoke, and whole on a row with room.
     const row = lines.find((line) => /^● Exited \d+ printf, ls · /.test(line));
     expect(row).toBeDefined();
     const reason = row!.replace(/^● Exited \d+ printf, ls · /, "").replace(/ ✗$/, "");
-    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such f…)$/);
-    expect([...reason].length).toBeLessThanOrEqual(40);
+    expect(reason).toMatch(/^(No such file or directory|cannot access 'missing-file': No such file or directory)$/);
     expect(lines.some((line) => line.includes("error_code") || line.includes('get("error")'))).toBe(false);
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed check says the heading of the list it printed, live and after resume",
+  async () => {
+    // On a narrow row the command names fewer of its steps so the reason
+    // stays in view, and the reason clips at the edge.
+    const rows: Array<[number, string]> = [
+      [110, "● Exited 1 echo, grep, echo +2 more · Tracked personal paths found"],
+      [48, "● Exited 1 echo +4 more · Tracked personal path…"],
+    ];
+    const failedRow = (pane: string) => paneLines(pane).find((line) => line.startsWith("● Exited 1 "));
+    for (const [width, want] of rows) {
+      const { root, gateway, session, pane } = await runStory(LISTED_THEN_FAILED, {
+        prompt: "check the tracked paths",
+        finalText: "The check found the paths.",
+        width,
+      });
+      expect(failedRow(pane)).toBe(want);
+
+      await session.kill();
+      sessions.splice(sessions.indexOf(session), 1);
+      const resumed = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: root.workspace,
+        env: storyEnv(root, gateway),
+        width,
+        height: 60,
+      });
+      sessions.push(resumed);
+      await resumed.waitForText("The check found the paths.", TIMEOUT);
+      expect(failedRow(await resumed.waitForComposer(TIMEOUT))).toBe(want);
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a failed command's reason leaves out the escape sequences around its message, live and after resume",
+  async () => {
+    const finalText = "The build and both checks failed.";
+    const { root, gateway, session, pane, tape } = await runStory(ESCAPED_MESSAGES, {
+      prompt: "run the build and the checks",
+      finalText,
+      record: true,
+    });
+    const want = [
+      "├ Exited 1 sh styled-build.sh · Build failed",
+      "├ Exited 1 sh linked-check.sh · Problems found",
+      "└ Exited 1 sh bel-linked-check.sh · Problems found",
+    ];
+    const failedRows = (lines: string[]) => lines.filter((line) => /^[├└] Exited 1 /.test(line));
+    expect(failedRows(paneLines(pane))).toEqual(want);
+    // None of the output's escapes reaches the terminal, not even as bytes
+    // the terminal would hide.
+    const noOutputEscapes = (recorded: string) => {
+      const bytes = readFileSync(recorded).toString("latin1");
+      for (const escape of ["\x1b(B", "\x1b)0", "\x1b#8", "\x1b%G", "file:///x"]) expect(bytes).not.toContain(escape);
+    };
+    noOutputEscapes(tape!);
+
+    await session.kill();
+    sessions.splice(sessions.indexOf(session), 1);
+    const resumedTape = join(root.root, "resumed.fxtape");
+    const { lines } = await resumeStory(root, gateway, finalText, resumedTape, { ready: /^ {2}Ran 3 commands /m });
+    expect(failedRows(lines)).toEqual(want);
+    noOutputEscapes(resumedTape);
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -1226,7 +1328,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("ask the reviewer");
     await session.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), TIMEOUT);
     sendRead!();
-    await session.waitForText("The reviewer is done.", TIMEOUT);
+    await session.waitForPane((pane) => pane.includes("The reviewer is done.") && turnSettled(pane), TIMEOUT);
 
     const expectOwnLine = (lines: string[]) => {
       // Main's calls share a group; the report is a line of its own after

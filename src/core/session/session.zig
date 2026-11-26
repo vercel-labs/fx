@@ -12,9 +12,11 @@ const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const compactor = @import("../compactor/compactor.zig");
+const model_provider = @import("../config/model_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -103,6 +105,11 @@ pub fn withoutSupersededResumes(history: []const HistoryTurn) []const HistoryTur
     return history[0..end];
 }
 
+/// Whether a prompt is the text fx sends for a resumed request.
+pub fn isResumePrompt(text: []const u8) bool {
+    return std.mem.eql(u8, text, resumed_request_prompt);
+}
+
 /// Whether a turn is a resume fx sent for a request it stopped. Its saved
 /// text is always `resumed_request_prompt`; the projection picks the note.
 fn isResumeTurn(turn: HistoryTurn) bool {
@@ -111,7 +118,7 @@ fn isResumeTurn(turn: HistoryTurn) bool {
         .interrupted => |entry| entry.user.text,
         .compacted_summary => return false,
     };
-    return std.mem.eql(u8, text, resumed_request_prompt);
+    return isResumePrompt(text);
 }
 
 /// A resume that ran nothing before fx resumed the request again: the later
@@ -151,6 +158,14 @@ pub const resumed_request_notice: core_types.SemanticNotice = .{
     .topic = "session",
     .tone = .neutral,
     .body = "Resuming the interrupted request",
+};
+
+/// What the transcript shows, in place of `resumed_request_notice`, when a
+/// turn that stopped for an upgrade's restart goes on after it.
+pub const continued_turn_notice: core_types.SemanticNotice = .{
+    .topic = "upgrade",
+    .tone = .neutral,
+    .body = "continuing the turn after the upgrade",
 };
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
@@ -1728,10 +1743,39 @@ pub const SessionRuntime = struct {
         };
     }
 
+    /// The newest turn, taken out of the history (`takeNewestTurn`), and
+    /// whether it was loaded without writer provenance.
+    pub const TakenTurn = struct {
+        turn: HistoryTurn,
+        unversioned: bool,
+    };
+
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
         self.disarmCacheWarming("history_cleared");
         self.agent.clearHistory(alloc);
         self.unversioned_history_len = 0;
+    }
+
+    /// Takes the newest turn out of the history, for a turn that continues
+    /// it in its place. The caller owns the turn: it frees it with
+    /// `freeHistoryTurn`, or gives it back with `returnNewestTurn`. Null when
+    /// the history is empty.
+    pub fn takeNewestTurn(self: *SessionRuntime) ?TakenTurn {
+        const turn = self.agent.history.pop() orelse return null;
+        const len = self.agent.history.items.len;
+        const unversioned = self.unversioned_history_len > len;
+        // The turn that takes its place is this process's own.
+        self.unversioned_history_len = @min(self.unversioned_history_len, len);
+        self.disarmCacheWarming("history_turn_taken");
+        return .{ .turn = turn, .unversioned = unversioned };
+    }
+
+    /// Puts back the turn `takeNewestTurn` took, when what was to continue
+    /// it could not start. Only right after the take: nothing may have been
+    /// appended since, so the history still has room for it.
+    pub fn returnNewestTurn(self: *SessionRuntime, taken: TakenTurn) void {
+        self.agent.history.appendAssumeCapacity(taken.turn);
+        if (taken.unversioned) self.unversioned_history_len = self.agent.history.items.len;
     }
 
     pub fn historyLen(self: *const SessionRuntime) usize {
@@ -2246,6 +2290,47 @@ test "active context projects checkpoint before retained raw tail" {
     try std.testing.expectEqualStrings("later assistant", messages.items[4].content.?);
 }
 
+test "the turns a provider block kept send another model's reasoning as text, the last one too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const claude: core_types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "anthropic/claude-fable-5.2" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"c\"}]" };
+    const gpt: core_types.ProviderReplay = .{ .source = .{ .provider = .gateway, .model = "openai/gpt-6.1-sol" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"g\"}]" };
+    const block: HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("fx-compactor-v1\n{\"earlier\":\"e\",\"provider\":{\"provider\":\"gateway\",\"model\":\"openai/gpt-6.1-sol\",\"parts_json\":\"[]\",\"kept_turns\":2}}"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    // GPT's block kept two of Claude's turns, the newest one last in the
+    // history, which fx projects on its own.
+    const kept = [_]HistoryTurn{
+        block,
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept one") }, .assistant = @constCast("a"), .provider_replay = claude } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept two") }, .assistant = @constCast("b"), .provider_replay = claude } },
+    };
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendHistoryChatMessages(arena, &messages, &kept);
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expectEqualStrings("openai/gpt-6.1-sol", messages.items[0].provider_replay.?.source.model);
+    try std.testing.expect(messages.items[2].provider_replay == null);
+    try std.testing.expect(messages.items[4].provider_replay == null);
+
+    // The block's own model keeps its reasoning in a kept turn, and a turn
+    // written after the block keeps its own.
+    const later = [_]HistoryTurn{
+        block,
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept one") }, .assistant = @constCast("a"), .provider_replay = gpt } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("kept two") }, .assistant = @constCast("b"), .provider_replay = claude } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("after") }, .assistant = @constCast("c"), .provider_replay = claude } },
+    };
+    messages = .empty;
+    try appendHistoryChatMessages(arena, &messages, &later);
+    try std.testing.expectEqual(@as(usize, 7), messages.items.len);
+    try std.testing.expect(messages.items[2].provider_replay != null);
+    try std.testing.expect(messages.items[4].provider_replay == null);
+    try std.testing.expectEqualStrings("anthropic/claude-fable-5.2", messages.items[6].provider_replay.?.source.model);
+}
+
 test "active context rejects corrupt retained-tail accounting" {
     const history = [_]HistoryTurn{
         .{ .assistant = .{
@@ -2426,11 +2511,25 @@ fn appendExecutionMemoryMessages(
     }
 }
 
+/// The tool a saved result's call ran: the one a toolbox run carries, else
+/// the call's own name, or the result's name when the step has no call with
+/// its id. Borrows `calls`, `result`, or `arena`.
+fn savedRanToolName(arena: Allocator, calls: []const core_types.ToolCall, result: core_types.PersistedToolResult) Allocator.Error![]const u8 {
+    for (calls) |call| {
+        if (!std.mem.eql(u8, call.id, result.tool_call_id)) continue;
+        const carried = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return call.name;
+        return carried.name;
+    }
+    return result.tool_name;
+}
+
 pub fn appendExecutionMemoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
     var steering_index: usize = 0;
     var note_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
@@ -2465,6 +2564,12 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_result_memory = toolResultMemory(result),
                 // A turn resumed from its checkpoint keeps each result's time.
                 .tool_result_created_at_ms = if (result.created_at_ms > 0) result.created_at_ms else null,
+                .user_answer = try core_types.isUserAnswer(
+                    scratch_state.allocator(),
+                    try savedRanToolName(scratch_state.allocator(), step.tool_calls, result),
+                    result.status,
+                    result.output,
+                ),
             });
         }
         for (step.tool_results) |result| {
@@ -2489,6 +2594,64 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
+    }
+}
+
+test "a rebuilt turn marks the user's answers by the call that ran, as the live turn did" {
+    const alloc = std.testing.allocator;
+    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    // fx's own notes, which the question tool saves as a success.
+    const cancelled = "(user cancelled the question)";
+    const not_available = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
+    const invalid = "(ask_user_question: invalid arguments; provide {questions})";
+    const direct_args = "{\"questions\":[]}";
+    const toolbox_args = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}";
+    const saved = struct {
+        fn result(id: []const u8, name: []const u8, status: core_types.PersistedToolStatus, output: []const u8) core_types.PersistedToolResult {
+            return .{ .tool_call_id = @constCast(id), .tool_name = @constCast(name), .status = status, .output = @constCast(output), .output_bytes = output.len, .stored_output_bytes = output.len };
+        }
+    }.result;
+    var calls = [_]core_types.ToolCall{
+        .{ .id = "direct", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "failed", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "search", .name = "toolbox", .arguments_json = "{\"search\":\"ask_user_question\"}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+        .{ .id = "direct-cancelled", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-cancelled", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "direct-not-available", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-not-available", .name = "toolbox", .arguments_json = toolbox_args },
+        .{ .id = "direct-invalid", .name = "ask_user_question", .arguments_json = direct_args },
+        .{ .id = "toolbox-invalid", .name = "toolbox", .arguments_json = toolbox_args },
+    };
+    var results = [_]core_types.PersistedToolResult{
+        saved("direct", "ask_user_question", .success, answers),
+        saved("toolbox", "toolbox", .success, answers),
+        saved("failed", "ask_user_question", .failure, answers),
+        saved("search", "toolbox", .success, answers),
+        saved("read", "read_file", .success, answers),
+        // A result whose call the step lacks keeps its own name's reading.
+        saved("unpaired", "ask_user_question", .success, answers),
+        // A note is never the user's answer, though the tool saves it as a success.
+        saved("direct-cancelled", "ask_user_question", .success, cancelled),
+        saved("toolbox-cancelled", "toolbox", .success, cancelled),
+        saved("direct-not-available", "ask_user_question", .success, not_available),
+        saved("toolbox-not-available", "toolbox", .success, not_available),
+        saved("direct-invalid", "ask_user_question", .success, invalid),
+        saved("toolbox-invalid", "toolbox", .success, invalid),
+        saved("unpaired-cancelled", "ask_user_question", .success, cancelled),
+    };
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+
+    try appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = steps[0..] });
+
+    const user_answers = [_]bool{ true, true, false, false, false, true, false, false, false, false, false, false, false };
+    try std.testing.expectEqual(@as(usize, 1 + user_answers.len), messages.items.len);
+    for (messages.items[1..], results, user_answers) |rebuilt, result, user_answer| {
+        try std.testing.expectEqualStrings(result.tool_name, rebuilt.tool_name.?);
+        try std.testing.expectEqual(user_answer, rebuilt.user_answer);
     }
 }
 
@@ -2629,7 +2792,14 @@ fn appendHistoryRangeChatMessages(
     end: usize,
     trailing_projection: InterruptedChatProjection,
 ) !void {
+    // A range can start after the block, such as the trailing turn.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var kept = try keptBefore(scratch.allocator(), history, start);
     for (history[start..end], start..) |turn, index| {
+        const strip_for = if (turn == .compacted_summary) null else if (kept) |*after| after.next() else null;
+        const first_message = messages.items.len;
+        defer if (strip_for) |model| keepOnlyReplayOf(messages.items[first_message..], model);
         if (isSupersededResume(history, index)) continue;
         const interrupted_projection: InterruptedChatProjection = if (isResumedLater(history, index))
             .steering_continuation
@@ -2640,15 +2810,7 @@ fn appendHistoryRangeChatMessages(
         else
             null;
         switch (turn) {
-            .compacted_summary => |entry| {
-                const text = try formatCompactedContinuationMessage(alloc, entry.summary);
-                errdefer alloc.free(text);
-                try messages.append(alloc, .{
-                    .role = .user,
-                    .content = text,
-                    .context_origin = .handoff,
-                });
-            },
+            .compacted_summary => |entry| kept = try appendCompactedSummaryChatMessage(alloc, messages, entry.summary),
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
@@ -2710,6 +2872,82 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
         .thai => ConversationLanguage.literal("und-Thai"),
         .latin => ConversationLanguage.literal("und-Latn"),
     };
+}
+
+/// The whole turns a provider block kept right after it, and the model that
+/// wrote the block: their reasoning from any other model goes as text.
+const KeptAfterBlock = struct {
+    model: []const u8,
+    left: usize,
+
+    /// The block's model for the next raw turn while it is a kept one.
+    fn next(self: *KeptAfterBlock) ?[]const u8 {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return self.model;
+    }
+};
+
+/// What the newest provider block before `start` still keeps from `start` on.
+fn keptBefore(arena: Allocator, history: []const HistoryTurn, start: usize) !?KeptAfterBlock {
+    var index = start;
+    var raw: usize = 0;
+    while (index > 0) {
+        index -= 1;
+        const entry = switch (history[index]) {
+            .compacted_summary => |entry| entry,
+            else => {
+                raw += 1;
+                continue;
+            },
+        };
+        const block = (try compactor.providerBlock(arena, entry.summary)) orelse return null;
+        return .{ .model = block.model, .left = block.kept_turns -| raw };
+    }
+    return null;
+}
+
+/// Sends `projected`'s reasoning from any model but `model` as text: it
+/// followed what a block of `model` replaced, and only `model` reads that
+/// block (ProviderCompaction.tla KeptAfterBlock). The replay is borrowed, so
+/// nothing is freed.
+fn keepOnlyReplayOf(projected: []core_types.ChatMessage, model: []const u8) void {
+    for (projected) |*sent| {
+        const replay = sent.provider_replay orelse continue;
+        if (!std.mem.eql(u8, replay.source.model, model)) sent.provider_replay = null;
+    }
+}
+
+/// Appends a checkpoint as a request sends it. A provider's compaction block
+/// goes to the model that wrote it in place of the compacted turns, and any
+/// other model gets fx's exact text of them instead
+/// (`types.projectProviderReplay`). Otherwise fx's text is a user message.
+/// Returns what a provider block kept.
+fn appendCompactedSummaryChatMessage(alloc: Allocator, messages: *std.ArrayList(core_types.ChatMessage), summary: []const u8) !?KeptAfterBlock {
+    const text = try formatCompactedContinuationMessage(alloc, summary);
+    errdefer alloc.free(text);
+    if (std.mem.find(u8, summary, "\"provider\":{") != null) block: {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const block = (try compactor.providerBlock(scratch.allocator(), summary)) orelse break :block;
+        const provider = model_provider.parse(block.provider) orelse break :block;
+        const content = try alloc.dupe(u8, block.text);
+        errdefer alloc.free(content);
+        const model = try alloc.dupe(u8, block.model);
+        errdefer alloc.free(model);
+        const parts = try alloc.dupe(u8, block.parts_json);
+        errdefer alloc.free(parts);
+        try messages.append(alloc, .{
+            .role = .assistant,
+            .content = content,
+            .provider_replay = .{ .source = .{ .provider = provider, .model = model }, .parts_json = parts },
+            .replay_fallback = text,
+            .context_origin = .handoff,
+        });
+        return .{ .model = model, .left = block.kept_turns };
+    }
+    try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .handoff });
+    return null;
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
@@ -5004,4 +5242,29 @@ test "a resume closed before it ran anything stays out of every later request" {
     var found_caveat = false;
     for (texts) |text| found_caveat = found_caveat or std.mem.eql(u8, text, resumed_request_prompt);
     try std.testing.expect(found_caveat);
+}
+
+test "the newest turn can be taken out and given back" {
+    const alloc = std.testing.allocator;
+    var runtime = SessionRuntime.init(8);
+    defer runtime.deinit(alloc);
+    try runtime.appendAssistantHistoryTurn(alloc, "first", "one");
+    try runtime.appendAssistantHistoryTurn(alloc, "second", "two");
+    runtime.unversioned_history_len = 2;
+
+    const taken = runtime.takeNewestTurn().?;
+    try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
+    try std.testing.expect(taken.unversioned);
+    try std.testing.expectEqual(@as(usize, 1), runtime.unversionedHistoryEnd());
+    try std.testing.expectEqualStrings("second", taken.turn.assistant.user.text);
+
+    runtime.returnNewestTurn(taken);
+    try std.testing.expectEqual(@as(usize, 2), runtime.historyLen());
+    try std.testing.expectEqual(@as(usize, 2), runtime.unversionedHistoryEnd());
+
+    const again = runtime.takeNewestTurn().?;
+    freeHistoryTurn(alloc, again.turn);
+    const first = runtime.takeNewestTurn().?;
+    freeHistoryTurn(alloc, first.turn);
+    try std.testing.expect(runtime.takeNewestTurn() == null);
 }
