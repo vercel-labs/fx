@@ -31,6 +31,7 @@ import {
   turnSettled,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
+import { logLines, onlySessionId } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -929,6 +930,79 @@ async function expectResumedFullTranscriptQuestion() {
   expect(prompt).toBeGreaterThan(full.indexOf("● Read first.txt"));
   expect(full[prompt + 1]).toBe("     Run tests");
   expect(full.some((row) => row.startsWith("● Asked"))).toBe(false);
+}
+
+const ANSWER_REVIEWED_COMMAND = "rm -f stale-fixture.txt";
+const ANSWER_REVIEWED_DONE = "Reviewed after the answer.";
+
+/// Answers a question with "Run tests", then runs a command that auto mode
+/// reviews, and returns that review's request.
+async function reviewRequestAfterAnswer(
+  questionCall: { id: string; name: string; input: object },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario([
+    outerToolCalls([questionCall]),
+    outerToolCalls([{ id: "reviewed_1", name: "shell", input: { request: { action: "run", command: ANSWER_REVIEWED_COMMAND } } }]),
+    outerText(ANSWER_REVIEWED_DONE),
+  ], "input", {}, "auto", undefined, {}, settings);
+  writeFileSync(join(ctx.root.workspace, "stale-fixture.txt"), "stale\n");
+  await ctx.session.sendText("Ask me, then clean up.");
+  await answerQuestions(ctx.session, 1);
+  await ctx.session.waitForText(ANSWER_REVIEWED_DONE, TIMEOUT);
+  await assertProcessAliveAndClean(ctx);
+  const reviews = ctx.gateway.classifierRequests.filter((request) => request.body.includes(ANSWER_REVIEWED_COMMAND));
+  expect(reviews).toHaveLength(1);
+  return reviews[0]!.body;
+}
+
+function jsonStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(jsonStrings);
+  if (value && typeof value === "object") return Object.values(value).flatMap(jsonStrings);
+  return [];
+}
+
+// The review's lines for the first earlier result: its tool, then its
+// content as the user's answer or as untrusted text.
+function firstPriorResult(body: string) {
+  return jsonStrings(JSON.parse(body))
+    .flatMap((text) => text.split("\n"))
+    .filter((line) => line.startsWith("prior_tool_result[0]."));
+}
+
+const ANSWER_RULE = 'R1 (M1): "Run tests"';
+const ANSWER_SUMMARY = `Turn 1\nIn between: asked which step comes next.\nT1: the user chose to run tests\n\nRules:\n- ${ANSWER_RULE}`;
+
+/// Answers a question with "Run tests", adds two plain turns, compacts the
+/// conversation with a summary whose one rule quotes that answer, and
+/// returns the rules the saved checkpoint keeps.
+async function compactedRulesAfterAnswer(
+  questionCall: { id: string; name: string; input: object },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario([
+    outerToolCalls([questionCall]),
+    outerText("Answer noted."),
+    outerText("Second reply."),
+    outerText("Third reply."),
+    outerText(ANSWER_SUMMARY),
+  ], "input", {}, "auto", undefined, {}, settings);
+  await ctx.session.sendText("Ask me which step comes next.");
+  await answerQuestions(ctx.session, 1);
+  for (const [prompt, reply] of [["Ask me which step comes next.", "Answer noted."], ["Second request.", "Second reply."], ["Third request.", "Third reply."]]) {
+    if (prompt !== "Ask me which step comes next.") await ctx.session.sendText(prompt!);
+    await waitForGridState(ctx.session, `${reply} settled`, (grid) => grid.some((row) => row.includes(reply!)) && turnSettled(grid.join("\n")), TIMEOUT);
+  }
+  const id = onlySessionId(ctx.root.home);
+  await ctx.session.sendText("/compact");
+  await waitForGridState(ctx.session, "compaction saved", () => logLines(ctx.root.home, id).some((line) => line.kind === "compacted"), TIMEOUT);
+  await assertProcessAliveAndClean(ctx);
+  // Four requests for the turns and one for the summary.
+  expect(ctx.gateway.requests).toHaveLength(5);
+  const compacted = logLines(ctx.root.home, id).find((line) => line.kind === "compacted") as unknown as { data: { summary: string } };
+  const payload = JSON.parse(compacted.data.summary.slice("fx-compactor-v1\n".length));
+  return payload.entries.map((entry: { text: string }) => entry.text);
 }
 
 /// Reads three files around answered questions, then checks the rows the turn
@@ -3959,6 +4033,42 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       // question's does, not with a row for the question's call.
       const full = await fullTranscriptRows(session!, CANCELLED_NOTICE);
       expect(full.at(-2)).toBe(`${CANCELLED_NOTICE} · What can fx do differently?`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "the auto-mode review reads the answer to a question asked through toolbox as the user's answer",
+    async () => {
+      const prior = firstPriorResult(await reviewRequestAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS));
+      expect(prior).toContain("prior_tool_result[0].tool: toolbox");
+      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "the auto-mode review reads the answer to a direct question as the user's answer",
+    async () => {
+      const prior = firstPriorResult(await reviewRequestAfterAnswer(QUESTION_CALL));
+      expect(prior).toContain("prior_tool_result[0].tool: ask_user_question");
+      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "compaction keeps the answer to a question asked through toolbox as the user's words",
+    async () => {
+      expect(await compactedRulesAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS)).toEqual([ANSWER_RULE]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "compaction keeps the answer to a direct question as the user's words",
+    async () => {
+      expect(await compactedRulesAfterAnswer(QUESTION_CALL)).toEqual([ANSWER_RULE]);
     },
     TIMEOUT * 2,
   );

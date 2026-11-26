@@ -2044,7 +2044,31 @@ pub const ChatMessage = struct {
     /// provider's compaction block stands for, which only the model that
     /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
     replay_fallback: ?[]const u8 = null,
+    /// The user's own answer to a question fx asked, which the security
+    /// review and compaction take as the user's words. Set from the call
+    /// that ran (`isUserAnswer`), where the result is made and where a saved
+    /// turn is rebuilt, so a question asked through toolbox counts too. Never
+    /// saved or sent to a provider.
+    user_answer: bool = false,
 };
+
+/// The tool that asks the user questions.
+pub const user_question_tool_name = "ask_user_question";
+
+/// Whether a result with `status` is the user's own answer to a question fx
+/// asked. `ran_tool` is the tool that ran: for a toolbox run, the one it
+/// carries, not `toolbox`, the name its result goes back under.
+pub fn isUserAnswer(ran_tool: []const u8, status: ?PersistedToolStatus) bool {
+    return std.mem.eql(u8, ran_tool, user_question_tool_name) and status != .failure;
+}
+
+test "only a question that did not fail gives the user's answer" {
+    try std.testing.expect(isUserAnswer("ask_user_question", .success));
+    try std.testing.expect(isUserAnswer("ask_user_question", null));
+    try std.testing.expect(!isUserAnswer("ask_user_question", .failure));
+    try std.testing.expect(!isUserAnswer("toolbox", .success));
+    try std.testing.expect(!isUserAnswer("shell", .success));
+}
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
 pub fn projectProviderReplay(

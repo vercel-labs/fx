@@ -7797,6 +7797,30 @@ test "parallel result assembly emits context notices in call order" {
     try std.testing.expectEqualStrings("second context notice", deps.context_notices.items[1]);
 }
 
+test "a question's result is the user's answer, also when toolbox ran it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = runtime_tool_batch.StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const cases = [_]struct { call: ToolCall, failed: bool = false, user_answer: bool }{
+        .{ .call = .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{}" }, .user_answer = true },
+        // The call fx runs for a toolbox run, whose result goes back as toolbox's.
+        .{ .call = .{ .id = "carried", .name = "ask_user_question", .arguments_json = "{}", .carried_by = "toolbox" }, .user_answer = true },
+        .{ .call = .{ .id = "failed", .name = "ask_user_question", .arguments_json = "{}" }, .failed = true, .user_answer = false },
+        .{ .call = .{ .id = "search", .name = "toolbox", .arguments_json = "{\"search\":\"files\"}" }, .user_answer = false },
+        .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{}" }, .user_answer = false },
+    };
+    for (cases) |case| {
+        try runtime_tool_batch.appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, case.call, answers, null, .{ .increment_error = case.failed });
+        const message = suffix.items[suffix.items.len - 1];
+        try std.testing.expectEqualStrings(case.call.calledName(), message.tool_name.?);
+        try std.testing.expectEqual(case.user_answer, message.user_answer);
+    }
+}
+
 test "child live authority refresh denies the next tool action before execution" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{

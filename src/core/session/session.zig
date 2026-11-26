@@ -12,6 +12,7 @@ const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -2510,11 +2511,25 @@ fn appendExecutionMemoryMessages(
     }
 }
 
+/// The tool a saved result's call ran: the one a toolbox run carries, else
+/// the call's own name, or the result's name when the step has no call with
+/// its id. Borrows `calls`, `result`, or `arena`.
+fn savedRanToolName(arena: Allocator, calls: []const core_types.ToolCall, result: core_types.PersistedToolResult) Allocator.Error![]const u8 {
+    for (calls) |call| {
+        if (!std.mem.eql(u8, call.id, result.tool_call_id)) continue;
+        const carried = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return call.name;
+        return carried.name;
+    }
+    return result.tool_name;
+}
+
 pub fn appendExecutionMemoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     execution: core_types.ExecutionMemory,
 ) !void {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
     var steering_index: usize = 0;
     var note_index: usize = 0;
     for (execution.tool_steps, 0..) |step, step_index| {
@@ -2549,6 +2564,7 @@ pub fn appendExecutionMemoryChatMessages(
                 .tool_result_memory = toolResultMemory(result),
                 // A turn resumed from its checkpoint keeps each result's time.
                 .tool_result_created_at_ms = if (result.created_at_ms > 0) result.created_at_ms else null,
+                .user_answer = core_types.isUserAnswer(try savedRanToolName(scratch_state.allocator(), step.tool_calls, result), result.status),
             });
         }
         for (step.tool_results) |result| {
@@ -2573,6 +2589,44 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
+    }
+}
+
+test "a rebuilt turn marks the user's answers by the call that ran, as the live turn did" {
+    const alloc = std.testing.allocator;
+    const answers = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    const saved = struct {
+        fn result(id: []const u8, name: []const u8, status: core_types.PersistedToolStatus) core_types.PersistedToolResult {
+            return .{ .tool_call_id = @constCast(id), .tool_name = @constCast(name), .status = status, .output = @constCast(answers), .output_bytes = answers.len, .stored_output_bytes = answers.len };
+        }
+    }.result;
+    var calls = [_]core_types.ToolCall{
+        .{ .id = "direct", .name = "ask_user_question", .arguments_json = "{\"questions\":[]}" },
+        .{ .id = "toolbox", .name = "toolbox", .arguments_json = "{\"run\":\"ask_user_question\",\"arguments\":{\"questions\":[]}}" },
+        .{ .id = "failed", .name = "ask_user_question", .arguments_json = "{\"questions\":[]}" },
+        .{ .id = "search", .name = "toolbox", .arguments_json = "{\"search\":\"ask_user_question\"}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+    };
+    var results = [_]core_types.PersistedToolResult{
+        saved("direct", "ask_user_question", .success),
+        saved("toolbox", "toolbox", .success),
+        saved("failed", "ask_user_question", .failure),
+        saved("search", "toolbox", .success),
+        saved("read", "read_file", .success),
+        // A result whose call the step lacks keeps its own name's reading.
+        saved("unpaired", "ask_user_question", .success),
+    };
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = calls[0..], .tool_results = results[0..] }};
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+
+    try appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = steps[0..] });
+
+    const user_answers = [_]bool{ true, true, false, false, false, true };
+    try std.testing.expectEqual(@as(usize, 1 + user_answers.len), messages.items.len);
+    for (messages.items[1..], results, user_answers) |rebuilt, result, user_answer| {
+        try std.testing.expectEqualStrings(result.tool_name, rebuilt.tool_name.?);
+        try std.testing.expectEqual(user_answer, rebuilt.user_answer);
     }
 }
 

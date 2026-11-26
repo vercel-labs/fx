@@ -21,7 +21,6 @@ const min_evidence_match_bytes: usize = 4;
 const min_evidence_run_bytes: usize = 40;
 /// How far into each end of one source fx looks for such a run.
 const max_evidence_run_search_bytes: usize = 16 * 1024;
-const user_answer_tool_name = "ask_user_question";
 const unproven_caution_rationale = "Cleared: the review named no harm with quoted evidence.";
 const unconfirmed_caution_rationale = "Cleared: a second review did not confirm the caution.";
 
@@ -225,7 +224,7 @@ pub fn selectPriorToolResults(
             .tool_call_id = tool_call_id,
             .tool_name = message.tool_name orelse "unknown",
             .content = content,
-            .user_answer = isUserAnswerResult(message),
+            .user_answer = message.user_answer,
         });
     }
     std.mem.reverse(PriorToolResultEntry, selected.items);
@@ -233,12 +232,6 @@ pub fn selectPriorToolResults(
         .entries = try selected.toOwnedSlice(arena),
         .older_entries_omitted = older_entries_omitted,
     };
-}
-
-fn isUserAnswerResult(message: types.ChatMessage) bool {
-    const name = message.tool_name orelse return false;
-    return std.mem.eql(u8, name, user_answer_tool_name) and
-        message.tool_result_status != .failure;
 }
 
 pub const ProvenBindings = struct {
@@ -2383,18 +2376,22 @@ test "prior tool result evidence is byte bounded unmasked and terminal safe" {
 
 test "question tool answers are user answers in review evidence" {
     const pending_calls = [_]types.ToolCall{.{ .id = "pending", .name = "shell", .arguments_json = "{}" }};
+    // Marked as fx marks a result where it makes it (`types.isUserAnswer`).
     const messages = [_]types.ChatMessage{
-        .{ .role = .tool, .content = "ANSWERED", .tool_call_id = "ask-1", .tool_name = "ask_user_question", .tool_result_status = .success },
-        .{ .role = .tool, .content = "ASK_FAILED", .tool_call_id = "ask-2", .tool_name = "ask_user_question", .tool_result_status = .failure },
+        .{ .role = .tool, .content = "ANSWERED", .tool_call_id = "ask-1", .tool_name = "ask_user_question", .tool_result_status = .success, .user_answer = types.isUserAnswer("ask_user_question", .success) },
+        .{ .role = .tool, .content = "ASK_FAILED", .tool_call_id = "ask-2", .tool_name = "ask_user_question", .tool_result_status = .failure, .user_answer = types.isUserAnswer("ask_user_question", .failure) },
         .{ .role = .tool, .content = "FILE_TEXT", .tool_call_id = "read-1", .tool_name = "read_file" },
+        // A question asked through toolbox: its result goes back as toolbox's.
+        .{ .role = .tool, .content = "TOOLBOX_ANSWERED", .tool_call_id = "ask-3", .tool_name = "toolbox", .tool_result_status = .success, .user_answer = types.isUserAnswer("ask_user_question", .success) },
         .{ .role = .assistant, .tool_calls = &pending_calls },
     };
     const selected = try selectPriorToolResults(std.testing.allocator, &messages, "pending");
     defer std.testing.allocator.free(selected.entries);
-    try std.testing.expectEqual(@as(usize, 3), selected.entries.len);
+    try std.testing.expectEqual(@as(usize, 4), selected.entries.len);
     try std.testing.expect(selected.entries[0].user_answer);
     try std.testing.expect(!selected.entries[1].user_answer);
     try std.testing.expect(!selected.entries[2].user_answer);
+    try std.testing.expect(selected.entries[3].user_answer);
 
     var rendered = try renderPriorToolResult(std.testing.allocator, 0, selected.entries[0]);
     defer rendered.deinit(std.testing.allocator);
