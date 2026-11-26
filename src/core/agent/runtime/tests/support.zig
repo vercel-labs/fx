@@ -586,6 +586,7 @@ pub const FakeAgentRuntimeDeps = struct {
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_presentation_text: ?[]u8 = null,
+    finish_user_input_id: ?u64 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -1069,7 +1070,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .continue_turn => |owned| blk: {
                 defer worker_runtime.freeSteeringMessages(self.alloc, owned);
                 const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
-                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author, .input_id = message.input_id };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,
@@ -1861,10 +1862,14 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
                 switch (finished.turn) {
                     .assistant => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
                         self.finish_assistant_text = try self.alloc.dupe(u8, entry.assistant);
                     },
-                    .interrupted => self.interrupted_event_count += 1,
+                    .interrupted => |entry| {
+                        self.finish_user_input_id = entry.user.input_id;
+                        self.interrupted_event_count += 1;
+                    },
                     .compacted_summary => {},
                 }
                 try self.record("event:finish_prompt", .{});

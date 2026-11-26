@@ -35,6 +35,7 @@ import {
   fakeGatewayToolCall,
   fakeShellRun,
   hasEmptyComposer,
+  isComposerLine,
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
@@ -46,7 +47,8 @@ import {
   turnSettled,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
-import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
+import { commandReplays, logLines, onlySessionId, rootSessionIds, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const UPGRADE_TIMEOUT = TIMEOUT * 2;
@@ -10814,8 +10816,8 @@ test.skipIf(!tmuxAvailable())(
 );
 
 /// A gateway that holds every request for `prompt` and its resumes, so each
-/// launch dies with a send in flight, and answers other requests.
-function holdingGateway(prompt: string) {
+/// launch dies with a send in flight, and answers other requests with `other`.
+function holdingGateway(prompt: string, other: (body: string) => Response = () => fakeGatewayFinalText("UNRELATED")) {
   let notify: () => void = () => {};
   let held = 0;
   const gateway = startDynamicFakeGateway(async (body) => {
@@ -10824,7 +10826,7 @@ function holdingGateway(prompt: string) {
       notify();
       return new Promise<Response>(() => {});
     }
-    return fakeGatewayFinalText("UNRELATED");
+    return other(body);
   });
   const heldAtLeast = async (count: number) => {
     const deadline = Date.now() + TIMEOUT;
@@ -10952,6 +10954,72 @@ test.skipIf(!tmuxAvailable())(
       expect(replayed).toContain("Resuming the interrupted request");
       expect(replayed).not.toContain(RESUME_NOTE);
       expect(readFileSync(last.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+/// The gateway's answer to a request that has no credit left to run on.
+function outOfCredits(): Response {
+  return new Response(JSON.stringify({
+    error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." },
+  }), { status: 402, headers: { "content-type": "application/json" } });
+}
+
+test.skipIf(!tmuxAvailable())(
+  "an Enter that reaches no waiting request does not answer a later request's question",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-early-enter-");
+    let payments = 0;
+    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.", (body) => {
+      if (!body.includes("Pay me.")) return fakeGatewayFinalText("UNRELATED");
+      payments += 1;
+      return payments === 1 ? outOfCredits() : fakeGatewayFinalText("PAID_ANSWER_5521");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      // Two crashes with the send in flight, so the next resume asks first.
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Crash me.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGKILL");
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGKILL");
+
+      // "1" picks the picker's retry, and the Enter right after it reaches
+      // the composer while the status still says the request waits.
+      const tracePath = join(fixture.root, "third-trace.log");
+      const third = await launchFx(fixture, gateway, "", "third", { FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "recovery" });
+      active = third.session;
+      await active.sendText("Pay me.");
+      await active.waitForPane(
+        (pane) => pane.includes("Out of credits. What should fx do?") && pane.includes("I added credits, retry"),
+        TIMEOUT,
+      );
+      await active.sendKeys("1 Enter");
+      await active.waitForText("PAID_ANSWER_5521", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(payments).toBe(2);
+
+      // The crashed request, resumed in the same fx, still asks first.
+      await active.sendText("/resume");
+      await waitForSessionPicker(active);
+      await active.sendKeys("Enter");
+      await active.waitForText("This request crashed fx twice · Enter to retry, Esc to cancel", TIMEOUT);
+      expect(held()).toBe(2);
+      // The user's own Enter answers it.
+      await active.sendKeys("Enter");
+      await heldAtLeast(3);
+      await active.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
+      // The early Enter did reach the request's continue, and the resumed
+      // request dropped it.
+      expect(readFileSync(tracePath, "utf8")).toMatch(/event=answer_dropped .*event=user_continue origin=start/);
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
       gateway.stop();
@@ -11377,6 +11445,645 @@ test.skipIf(!tmuxAvailable())(
     } finally {
       await active?.kill();
       gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+const RESTORE_SINGULAR_NOTICE =
+  "1 prompt you sent before fx stopped was not delivered. It is back in the composer.";
+const RESTORE_PLURAL_NOTICE =
+  "2 prompts you sent before fx stopped were not delivered. They are back in the composer.";
+const SWITCH_SINGULAR_NOTICE =
+  "1 queued prompt was not sent. It comes back when you reopen this session.";
+
+function hasQueuedRow(pane: string, marker: string): boolean {
+  return pane
+    .split("\n")
+    .some((line) => line.includes(marker) && line.trimStart().startsWith("┋"));
+}
+
+async function waitForQueuedRow(
+  session: TmuxSession,
+  marker: string,
+  timeoutMs = TIMEOUT,
+): Promise<string> {
+  return session.waitForPane((pane) => hasQueuedRow(pane, marker), timeoutMs);
+}
+
+function composerBlockLines(pane: string): string[] {
+  const lines = pane.split("\n");
+  const lastIndex = lines.findLastIndex((line) => isComposerLine(line));
+  if (lastIndex < 0) return [];
+  let startIndex = lastIndex;
+  while (startIndex > 0 && isComposerLine(lines[startIndex - 1]!)) {
+    startIndex -= 1;
+  }
+  return lines.slice(startIndex, lastIndex + 1).map((line) => {
+    const trimmedStart = line.trimStart();
+    if (trimmedStart.startsWith("┃ ")) return trimmedStart.slice(2).trimEnd();
+    if (trimmedStart.startsWith("┃")) return trimmedStart.slice(1).trimEnd();
+    if (trimmedStart.startsWith("❯ ")) return trimmedStart.slice(2).trimEnd();
+    if (trimmedStart.startsWith("> ")) return trimmedStart.slice(2).trimEnd();
+    return trimmedStart.slice(1).trimEnd();
+  });
+}
+
+function composerText(pane: string): string {
+  return composerBlockLines(pane).join("\n");
+}
+
+function writeStalledMcpConfig(home: string, url: string) {
+  writeFileSync(
+    join(home, ".fx", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        fixture: {
+          type: "http",
+          url,
+          headers: { "X-Workspace": "one" },
+          startup_timeout_ms: 5_000,
+          operation_timeout_ms: 30_000,
+        },
+      },
+    }),
+  );
+}
+
+async function launchQueuingFx(
+  fixture: ReturnType<typeof resumeFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  args: string,
+  name: string,
+  extraEnv: Record<string, string | undefined> = {},
+  waitEmptyComposer = true,
+) {
+  const stderrPath = join(fixture.root, `${name}-stderr.log`);
+  writeFileSync(stderrPath, "");
+  const session = await TmuxSession.create({
+    cmd: `${FX_BIN} ${args}`.trim(),
+    cwd: fixture.workspace,
+    env: {
+      ...gatewayEnv(fixture.home, gateway),
+      FX_PERMISSION_MODE: "full-access",
+      FX_SOUND: "0",
+      ...extraEnv,
+    },
+    stderrPath,
+    width: 120,
+    height: 40,
+  });
+  if (waitEmptyComposer) {
+    await session.waitForComposer(TIMEOUT);
+  }
+  return { session, stderrPath };
+}
+
+async function waitForResumedPaneSettled(
+  session: TmuxSession,
+  historyMarker: string,
+  resumeRequested: (() => boolean) | null,
+  resumedReplyMarker: string,
+  waitForRestore = false,
+  timeoutMs = TIMEOUT,
+): Promise<{ pane: string; scrollback: string }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pane = await session.capturePane();
+    const hasComposer = pane.split("\n").some(isComposerLine);
+    const hasHistory = pane.includes(historyMarker);
+    const resumeDone =
+      resumeRequested === null ||
+      (resumeRequested() && pane.includes(resumedReplyMarker) && turnSettled(pane));
+    if (hasComposer && hasHistory && resumeDone && turnSettled(pane)) {
+      const scrollback = await session.captureFullScrollback();
+      if (
+        !waitForRestore ||
+        (composerText(pane).length > 0 && scrollback.includes("back in the composer"))
+      ) {
+        return { pane, scrollback };
+      }
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Timed out waiting for resumed session to settle.\nLast pane:\n${await session.capturePane()}`,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a prompt typed while an MCP call runs comes back in the composer after fx is killed",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-mcp-kill-");
+    const mcpFixture = startModernMcpHttpFixture("stall_call");
+    writeStalledMcpConfig(fixture.home, mcpFixture.url);
+
+    const p1 = "Start the stalled MCP call.";
+    const p2 = "QUEUED_DURING_MCP_CALL";
+    const resumedMarker = "RESUMED_OK_MCP_KILL";
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText(resumedMarker);
+      }
+      if (body.includes("call_mcp")) return fakeGatewayFinalText("MCP_DONE");
+      if (body.includes("select_mcp")) {
+        return fakeGatewayToolCall("call_mcp", "toolbox", {
+          run: "mcp_fixture_echo",
+          arguments: { text: "hello" },
+        });
+      }
+      if (body.includes(p1)) {
+        return fakeGatewayToolCall("select_mcp", "toolbox", {
+          open: "mcp_fixture_echo",
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchQueuingFx(fixture, gateway, "", "first")).session;
+      await active.sendText(p1);
+      await waitForCondition(
+        () => mcpFixture.requests.some((req) => req.message.method === "tools/call"),
+        "MCP tools/call held",
+      );
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(fixture, gateway, "-c", "second", {}, false);
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        p1,
+        () => resumeReqCount > 0,
+        resumedMarker,
+        true,
+      );
+
+      expect(resumed.scrollback).toContain(RESTORE_SINGULAR_NOTICE);
+      expect(composerText(resumed.pane)).toBe(p2);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      mcpFixture.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "two prompts typed during a compaction come back in order after fx is killed",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-compact-kill-");
+    writeFileSync(join(fixture.workspace, "seed-notes.txt"), "seed notes\n");
+
+    const seedAnswer = (n: number) =>
+      `COMPACT_SEED_HEAD_${n}\n` +
+      "compaction history alpha beta gamma delta sample line\n".repeat(200) +
+      `COMPACT_SEED_TAIL_${n}`;
+    const p2 = "COMPACT_QUEUED_FIRST";
+    const p3 = "COMPACT_QUEUED_SECOND";
+    const resumedMarker = "RESUMED_OK_COMPACT_KILL";
+    let seedTurn = 0;
+    let summaryHeld = false;
+    let releaseSummary: (() => void) | null = null;
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText(resumedMarker);
+      }
+      const parsed = JSON.parse(body) as {
+        toolChoice?: { type?: string };
+        tools?: unknown[];
+      };
+      const isSummary =
+        parsed.toolChoice?.type === "none" &&
+        Array.isArray(parsed.tools) &&
+        parsed.tools.length === 0;
+      if (isSummary) {
+        summaryHeld = true;
+        return new Promise<Response>((resolve) => {
+          releaseSummary = () => resolve(fakeGatewayFinalText("COMPACT_SUMMARY_DONE"));
+        });
+      }
+      const nextSeed = seedTurn + 1;
+      if (body.includes(`seed-read-${nextSeed}`)) {
+        seedTurn = nextSeed;
+        return fakeGatewayFinalText(seedAnswer(nextSeed));
+      }
+      if (body.includes(`Seed turn ${nextSeed}`)) {
+        return fakeGatewayToolCall(`seed-read-${nextSeed}`, "read_file", {
+          path: "seed-notes.txt",
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchQueuingFx(fixture, gateway, "", "first")).session;
+      for (const n of [1, 2, 3]) {
+        await active.sendText(`Seed turn ${n}`);
+        await active.waitForPane(
+          (pane) => pane.includes(`COMPACT_SEED_TAIL_${n}`) && hasEmptyComposer(pane) && turnSettled(pane),
+          TIMEOUT,
+        );
+      }
+
+      await active.sendText("/compact");
+      await waitForCondition(() => summaryHeld, "compaction summary held at gateway");
+      await active.waitForPane((pane) => /Compacting/.test(pane), TIMEOUT);
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      active.sendLiteralImmediate(p3);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p3);
+
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(fixture, gateway, "-c", "second", {}, false);
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        "COMPACT_SEED_TAIL_3",
+        null,
+        resumedMarker,
+        true,
+      );
+
+      expect(resumed.scrollback).toContain(RESTORE_PLURAL_NOTICE);
+      expect(composerText(resumed.pane)).toBe(`${p2}\n\n${p3}`);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      releaseSummary?.();
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "steering typed during a shell command comes back after fx is killed",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-shell-kill-");
+    const p1 = "Run the sleeping command.";
+    const p2 = "STEER_QUEUED_DURING_SHELL";
+    const resumedMarker = "RESUMED_OK_SHELL_KILL";
+    let shellRequested = false;
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText(resumedMarker);
+      }
+      if (body.includes("shell-hold-call")) return fakeGatewayFinalText("SHELL_DONE");
+      if (body.includes(p1)) {
+        shellRequested = true;
+        return fakeShellRun("shell-hold-call", "sleep 30", {
+          yield_time_ms: 30_000,
+          timeout_ms: 60_000,
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = (
+        await launchQueuingFx(fixture, gateway, "", "first", {
+          FX_TEST_STEER_YIELD_GRACE_MS: "600000",
+        })
+      ).session;
+
+      await active.sendText(p1);
+      await waitForCondition(() => shellRequested, "shell tool requested");
+      await active.waitForPane((pane) => pane.includes("Running sleep 30"), TIMEOUT);
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(fixture, gateway, "-c", "second", {}, false);
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        p1,
+        () => resumeReqCount > 0,
+        resumedMarker,
+        true,
+      );
+
+      expect(resumed.scrollback).toContain(RESTORE_SINGULAR_NOTICE);
+      expect(composerText(resumed.pane)).toBe(p2);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a delivered prompt does not come back after fx is killed",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-delivered-kill-");
+    const startPath = join(fixture.workspace, "started");
+    const releasePath = join(fixture.workspace, "release");
+    writeFileSync(
+      join(fixture.workspace, "check.sh"),
+      "printf started > started\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf done\n",
+    );
+
+    const p1 = "Run the gated shell script.";
+    const p2 = "DELIVERED_STEERING_PROMPT";
+    const deliveredReply = "DELIVERED_STEERING_ANSWER";
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText("UNEXPECTED_RESUME");
+      }
+      if (body.includes(p2)) return fakeGatewayFinalText(deliveredReply);
+      if (body.includes("deliver-shell-call")) return fakeGatewayFinalText("SHELL_FINISHED");
+      if (body.includes(p1)) {
+        return fakeShellRun("deliver-shell-call", "sh check.sh", {
+          yield_time_ms: 30_000,
+          timeout_ms: 60_000,
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = (
+        await launchQueuingFx(fixture, gateway, "", "first", {
+          FX_TEST_STEER_YIELD_GRACE_MS: "600000",
+        })
+      ).session;
+
+      await active.sendText(p1);
+      await waitForCondition(() => existsSync(startPath), "gated shell script started");
+      await active.waitForPane((pane) => pane.includes("Running sh check.sh"), TIMEOUT);
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      writeFileSync(releasePath, "go");
+      await active.waitForPane(
+        (pane) => pane.includes(deliveredReply) && hasEmptyComposer(pane) && turnSettled(pane),
+        TIMEOUT,
+      );
+      const id = sessionIdFromHome(fixture.home);
+      await waitForCondition(
+        () =>
+          savedText(fixture.home, id).includes(p2) &&
+          logLines(fixture.home, id).some((line: any) => line.kind === "turn_committed"),
+        "delivered prompt saved in session log",
+      );
+
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(fixture, gateway, "-c", "second", {}, false);
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        deliveredReply,
+        null,
+        "UNEXPECTED_RESUME",
+      );
+
+      expect(resumeReqCount).toBe(0);
+      expect(hasEmptyComposer(resumed.pane)).toBe(true);
+      expect(composerText(resumed.pane)).toBe("");
+      expect(resumed.scrollback).not.toContain("was not delivered");
+      expect(resumed.scrollback).not.toContain("back in the composer");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a retracted prompt does not come back after fx is killed",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-retract-kill-");
+    const mcpFixture = startModernMcpHttpFixture("stall_call");
+    writeStalledMcpConfig(fixture.home, mcpFixture.url);
+
+    const p1 = "Start the stalled MCP call before retract.";
+    const p2 = "RETRACTED_DURING_MCP_CALL";
+    const resumedMarker = "RESUMED_OK_RETRACT_KILL";
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText(resumedMarker);
+      }
+      if (body.includes("call_mcp")) return fakeGatewayFinalText("MCP_DONE");
+      if (body.includes("select_mcp")) {
+        return fakeGatewayToolCall("call_mcp", "toolbox", {
+          run: "mcp_fixture_echo",
+          arguments: { text: "hello" },
+        });
+      }
+      if (body.includes(p1)) {
+        return fakeGatewayToolCall("select_mcp", "toolbox", {
+          open: "mcp_fixture_echo",
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchQueuingFx(fixture, gateway, "", "first")).session;
+      await active.sendText(p1);
+      await waitForCondition(
+        () => mcpFixture.requests.some((req) => req.message.method === "tools/call"),
+        "MCP tools/call held",
+      );
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      await active.sendKeys("Up");
+      await active.waitForPane(
+        (pane) => !hasQueuedRow(pane, p2) && composerText(pane) === p2,
+        TIMEOUT,
+      );
+
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(fixture, gateway, "-c", "second", {}, false);
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        p1,
+        () => resumeReqCount > 0,
+        resumedMarker,
+      );
+
+      expect(hasEmptyComposer(resumed.pane)).toBe(true);
+      expect(composerText(resumed.pane)).toBe("");
+      expect(resumed.scrollback).not.toContain(p2);
+      expect(resumed.scrollback).not.toContain("was not delivered");
+      expect(resumed.scrollback).not.toContain("back in the composer");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      mcpFixture.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a queued prompt left by /new comes back when its session is reopened",
+  async () => {
+    const fixture = resumeFixture("fx-eb03-new-switch-");
+    const mcpFixture = startModernMcpHttpFixture("stall_call");
+    writeStalledMcpConfig(fixture.home, mcpFixture.url);
+
+    const p1 = "Start the stalled MCP call before /new.";
+    const p2 = "QUEUED_LEFT_BY_NEW";
+    let inResume = false;
+    let resumeReqCount = 0;
+
+    const gateway = startDynamicFakeGateway((body) => {
+      if (inResume) {
+        resumeReqCount += 1;
+        return fakeGatewayFinalText("UNEXPECTED_RESUME");
+      }
+      if (body.includes("call_mcp")) return fakeGatewayFinalText("MCP_DONE");
+      if (body.includes("select_mcp")) {
+        return fakeGatewayToolCall("call_mcp", "toolbox", {
+          run: "mcp_fixture_echo",
+          arguments: { text: "hello" },
+        });
+      }
+      if (body.includes(p1)) {
+        return fakeGatewayToolCall("select_mcp", "toolbox", {
+          open: "mcp_fixture_echo",
+        });
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      const first = await launchQueuingFx(fixture, gateway, "", "first");
+      active = first.session;
+      await active.sendText(p1);
+      await waitForCondition(
+        () => mcpFixture.requests.some((req) => req.message.method === "tools/call"),
+        "MCP tools/call held",
+      );
+      await waitForCondition(
+        () => existsSync(storeRoot(fixture.home)) && rootSessionIds(fixture.home).length === 1,
+        "first session written to disk",
+      );
+      const firstSessionId = rootSessionIds(fixture.home)[0]!;
+
+      active.sendLiteralImmediate(p2);
+      active.sendKeysImmediate(["Enter"]);
+      await waitForQueuedRow(active, p2);
+
+      await active.sendText("/new");
+      await waitForCondition(
+        () => logLines(fixture.home, firstSessionId).some((line: any) => line.kind === "turn_interrupted"),
+        "first session interrupted on /new",
+      );
+      await active.waitForPane(
+        (pane) =>
+          pane.includes("Run /help for commands") &&
+          !pane.includes(p1) &&
+          !hasQueuedRow(pane, p2) &&
+          hasEmptyComposer(pane) &&
+          turnSettled(pane),
+        TIMEOUT,
+      );
+      const afterNewScrollback = await active.captureFullScrollback();
+      expect(afterNewScrollback).toContain(SWITCH_SINGULAR_NOTICE);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      inResume = true;
+      const second = await launchQueuingFx(
+        fixture,
+        gateway,
+        `--resume ${firstSessionId}`,
+        "second",
+        {},
+        false,
+      );
+      active = second.session;
+      const resumed = await waitForResumedPaneSettled(
+        active,
+        p1,
+        null,
+        "UNEXPECTED_RESUME",
+        true,
+      );
+
+      expect(resumed.scrollback).toContain(RESTORE_SINGULAR_NOTICE);
+      expect(composerText(resumed.pane)).toBe(p2);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      mcpFixture.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }
   },

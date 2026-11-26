@@ -28,6 +28,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
 const io_mod = @import("../../shared/io.zig");
 const quiesce = @import("../../quiesce/quiesce.zig");
 const host_target = @import("../../hosts/target.zig");
+const runtime_profile = @import("../../hosts/runtime_profile.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
@@ -365,6 +366,7 @@ fn append_steering_guidance(
         try within_turn_suffix.append(arena, .{
             .role = .user,
             .content = try framedMessage(arena, message.author, message.text),
+            .input_id = message.input_id,
         });
         if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
     }
@@ -4325,7 +4327,7 @@ fn persistPromptBeforeCapture(
         const execution = runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages) catch |err| break :saved err;
         const logged = finalization.loggedExecution(arena, execution) catch |err| break :saved err;
         append(deps.ctx, .{
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .execution = logged,
         }) catch |err| break :saved err;
         return;
@@ -4355,7 +4357,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .execution = try finalization.loggedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -4512,7 +4514,7 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.persistedExecution(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = finalization.savedExecution(execution) orelse projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4694,7 +4696,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
@@ -6024,7 +6026,17 @@ fn restorePromptAfterTerminalFailure(
     if (prompt.len == 0) return;
     restore(deps.ctx, prompt) catch |err| {
         debug_trace.logf("agent", "failed to restore terminal-failure prompt err={s}", .{@errorName(err)});
+        return;
     };
+    if (comptime runtime_profile.host.durable_sessions) {
+        if (job.input_id) |input_id| {
+            if (deps.withdraw_accepted_input) |withdraw| {
+                withdraw(deps.ctx, input_id) catch |err| {
+                    debug_trace.logf("agent", "failed to withdraw restored terminal-failure prompt err={s}", .{@errorName(err)});
+                };
+            }
+        }
+    }
 }
 
 // A cancelled or stall-stopped turn's durable checkpoint dies with it;
@@ -8965,7 +8977,7 @@ fn processQueuedPromptLoop(
                     agent.compaction_requested = false;
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -10681,7 +10693,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
                 .saved_execution = finalization.savedExecution(finish_execution),
@@ -13762,7 +13774,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author, .input_id = job.input_id },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
         .saved_execution = finalization.savedExecution(execution_memory),
@@ -13926,4 +13938,157 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "eb03: append_steering_guidance carries SteeringMessage.input_id onto ChatMessage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    const guidance = [_]worker_runtime.SteeringMessage{
+        .{ .text = @constCast("steer one"), .author = .user, .input_id = 33 },
+        .{ .text = @constCast("child note"), .author = .child, .input_id = null },
+    };
+    try append_steering_guidance(arena, &suffix, &guidance);
+    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    try std.testing.expectEqual(@as(?u64, 33), suffix.items[0].input_id);
+    try std.testing.expectEqual(@as(?u64, null), suffix.items[1].input_id);
+}
+
+test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and restorePromptAfterTerminalFailure" {
+    const support = @import("tests/support.zig");
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        piece_ids: [4]?u64 = @splat(null),
+        piece_count: usize = 0,
+        checkpoint_ids: [2]?u64 = @splat(null),
+        checkpoint_count: usize = 0,
+        withdrawn_id: ?u64 = null,
+        restored_count: usize = 0,
+
+        fn appendPiece(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.piece_ids[self.piece_count] = progress.user.input_id;
+            self.piece_count += 1;
+        }
+        fn setCheckpoint(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoint_ids[self.checkpoint_count] = checkpoint.user.input_id;
+            self.checkpoint_count += 1;
+        }
+        fn clearCheckpoint(_: *anyopaque) !void {}
+        fn restorePrompt(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.restored_count += 1;
+        }
+        fn withdrawInput(raw: *anyopaque, id: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.withdrawn_id = id;
+        }
+    };
+
+    var fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer fake.deinit();
+    var capture = Capture{};
+    var test_deps = fake.deps();
+    test_deps.ctx = &capture;
+    test_deps.append_turn_piece = Capture.appendPiece;
+    test_deps.recovery_checkpoint = .{
+        .set = Capture.setCheckpoint,
+        .clear = Capture.clearCheckpoint,
+    };
+    test_deps.restore_failed_prompt = Capture.restorePrompt;
+    test_deps.withdraw_accepted_input = Capture.withdrawInput;
+
+    var guard = TurnFinalizationGuard.init(&test_deps, 10, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer guard.deinit();
+
+    const job: QueuedPrompt = .{
+        .turn_id = 10,
+        .input_id = 64,
+        .prompt = @constCast("run check"),
+        .images = &.{},
+        .model = @constCast("gateway/model"),
+        .api_key = @constCast("key"),
+        .permission_mode = .auto,
+        .history = &.{},
+        .grants = &.{},
+    };
+    const call = types.ToolCall{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    };
+    const msgs = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &.{call} }};
+
+    persistPromptBeforeCapture(&test_deps, &guard, job, &.{});
+    try appendRunningToolCalls(&test_deps, &guard, job, &msgs, &.{call});
+    try persistRecoveryCheckpointWithAction(
+        &test_deps,
+        &guard,
+        job,
+        &.{},
+        "",
+        "gateway/model",
+        false,
+        false,
+        0,
+        false,
+        .network_interrupted,
+        .retrying_request,
+        .none,
+        .{},
+        .keep,
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var compaction_source: CompactionSource = .{
+        .deps = &test_deps,
+        .finalization = &guard,
+        .arena = arena_state.allocator(),
+        .job = job,
+        .current_turn_messages = &.{},
+        .route_model = "gateway/model",
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .consumed_attempts = 0,
+        .tool_evidence = .none,
+        .trace_ctx = .{},
+    };
+    try CompactionSource.persist(&compaction_source);
+
+    try std.testing.expectEqual(@as(usize, 3), capture.piece_count);
+    for (0..3) |i| try std.testing.expectEqual(@as(?u64, 64), capture.piece_ids[i]);
+    try std.testing.expectEqual(@as(usize, 2), capture.checkpoint_count);
+    for (0..2) |i| try std.testing.expectEqual(@as(?u64, 64), capture.checkpoint_ids[i]);
+
+    var fixture = support.PromptFixture{};
+    restorePromptAfterTerminalFailure(&test_deps, job, fixture.config());
+    try std.testing.expectEqual(@as(usize, 1), capture.restored_count);
+    try std.testing.expectEqual(@as(?u64, 64), capture.withdrawn_id);
+
+    var notice_fake = support.FakeAgentRuntimeDeps.init(alloc);
+    defer notice_fake.deinit();
+    var notice_deps = notice_fake.deps();
+    var notice_guard = TurnFinalizationGuard.init(&notice_deps, 11, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, "/tmp"));
+    defer notice_guard.deinit();
+    var summary = runtime_telemetry.TurnSummaryAccumulator.init(0, job.prompt);
+    var stop_state: CommonStopState = .{};
+    var trace: runtime_finalization.PromptFinishTrace = .{ .ctx = .{} };
+    try finishFailedTurnWithNotice(
+        &notice_deps,
+        &notice_guard,
+        arena_state.allocator(),
+        job,
+        &.{},
+        &summary,
+        &stop_state,
+        &trace,
+        "notice text",
+        "failed_notice",
+    );
+    try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
+    try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
+    try std.testing.expectEqual(@as(?u64, 64), notice_fake.finish_user_input_id);
 }
