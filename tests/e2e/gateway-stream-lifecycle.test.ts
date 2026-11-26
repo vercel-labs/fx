@@ -6941,6 +6941,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           // The wait started before the limit, so it still runs to its
           // 5 second ceiling and asks the model to check the command.
           expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_first_wait");
           expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
@@ -6952,6 +6953,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           at(body, 3);
           // Already past the limit, the wait runs its whole yield as well.
           expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[3]! - arrivals[2]!).toBeLessThanOrEqual(10_000);
           const later = shellResult(body, "shell_quiet_later_wait");
           expect(later.state).toBe("running");
           expect(later.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS + 5_000);
@@ -6984,6 +6986,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           arrivals[1] = Date.now();
           // The run waits its full 3.5 second yield past the quiet limit.
           expect(arrivals[1]! - arrivals[0]!).toBeGreaterThanOrEqual(3_500);
+          expect(arrivals[1]! - arrivals[0]!).toBeLessThanOrEqual(8_500);
           const crossed = shellResult(body, "shell_quiet_long_run");
           expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
@@ -7028,6 +7031,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           // The wait runs its full 5 second ceiling; QUIET-B came ~1 s in, so
           // quiet_ms restarted there and still crossed the limit by the end.
           expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_reset_wait");
           expect(crossed.state).toBe("running");
           expect(crossed.output_delta).toContain("QUIET-B");
@@ -7070,6 +7074,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           arrivals[2] = Date.now();
           // A yield shorter than the time left ends at the yield.
           expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const short = shellResult(body, "shell_quiet_short_wait");
           expect(short.state).toBe("running");
           expect(short.quiet_ms!).toBeLessThan(limitMs);
@@ -7079,6 +7084,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         (body) => {
           arrivals[3] = Date.now();
           expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[3]! - arrivals[2]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_silent_wait");
           expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(limitMs);
@@ -7210,6 +7216,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         (body) => {
           at(body, 1);
           expect(arrivals[1]! - arrivals[0]!).toBeGreaterThanOrEqual(3_500);
+          expect(arrivals[1]! - arrivals[0]!).toBeLessThanOrEqual(8_500);
           const runResult = shellResult(body, "eb30_quiet_run");
           expect(runResult.state).toBe("running");
           expect(runResult.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
@@ -7234,6 +7241,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         (body) => {
           at(body, 4);
           expect(arrivals[4]! - arrivals[3]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[4]! - arrivals[3]!).toBeLessThanOrEqual(10_000);
           const waitResult = shellResult(body, "eb30_quiet_interact");
           expect(waitResult.state).toBe("running");
           expect(waitResult.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
@@ -16801,6 +16809,7 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     expect(failures, context).toEqual([]);
     expect(result.code, context).toBe(0);
     expect(state.childWait1Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait1Ms, context).toBeLessThanOrEqual(10_000);
     // One note, which names the subagent and the command.
     expect(state.relayTurns.length, context).toBe(1);
     expect(state.relayTurns[0]).toContain('"agent":"worker"');
@@ -16894,7 +16903,9 @@ test("a subagent command that prints and goes quiet again is relayed again", asy
     const context = relayContext(result, tracePath);
     // Both waits ran to their 5 s ceiling, and each spell sent one note.
     expect(state.childWait1Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait1Ms, context).toBeLessThanOrEqual(10_000);
     expect(state.childWait2Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait2Ms, context).toBeLessThanOrEqual(10_000);
     expect(state.childWait2Delta, context).toContain("QUIET-AGAIN-B");
     expect(state.relayTurns.length, context).toBe(2);
     expect(failures, context).toEqual([]);
@@ -17007,6 +17018,7 @@ test("main's own quiet command gets the notice and no relay, since main has no p
     expect(result.code, context).toBe(0);
     expect(parseAskJson(result.stdout).output).toContain("QUIET-MAIN-DONE");
     expect(mainWaitMs, context).toBeGreaterThanOrEqual(5_000);
+    expect(mainWaitMs, context).toBeLessThanOrEqual(10_000);
     expect(mainWaitResult?.state, context).toBe("running");
     expect(mainWaitResult?.quiet_ms ?? 0, context).toBeGreaterThanOrEqual(RELAY_QUIET_MS);
     expect(mainWaitResult?.quiet_notice, context).toContain("still working or has hung");

@@ -5067,6 +5067,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(pane).toContain("TUI_MAIN_SAW_RELAY");
         await until("the child's first wait to finish", () => childWait1Ms >= 0, 15_000);
         expect(childWait1Ms).toBeGreaterThanOrEqual(5_000);
+        expect(childWait1Ms).toBeLessThanOrEqual(10_000);
       }, () => {}, false, { FX_TEST_SHELL_QUIET_NOTICE_MS: "3000" });
     },
     TIMEOUT,

@@ -40,7 +40,12 @@ fn capturedWaitPollMs() i64 {
 /// tests set with `FX_TEST_SHELL_QUIET_NOTICE_MS`. Read when a wait or a
 /// result needs it, since `Runtime.init` also runs at compile time as a
 /// default field value.
+var test_quiet_limit_ms: ?u64 = null;
+
 fn quietLimitMs() u64 {
+    if (builtin.is_test) {
+        if (test_quiet_limit_ms) |ms| return ms;
+    }
     return quiet_notice.limitFromValue(io_mod.getenv("FX_TEST_SHELL_QUIET_NOTICE_MS"));
 }
 
@@ -801,6 +806,14 @@ pub const Runtime = struct {
             if (terminal) break;
             if (input.cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) {
+                    const now_ms = io_mod.milliTimestamp();
+                    if (quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms)) {
+                        debug_trace.logf(
+                            "managed-execution",
+                            "event=quiet_crossing_dropped reason=cancelled execution={s} quiet_ms={d}",
+                            .{ entry.execution_id, quiet_notice.quietMs(now_ms, last_output_ms) },
+                        );
+                    }
                     entry.cancel.store(true, .seq_cst);
                     self.joinEntry(entry);
                     const prepared = try self.prepareSnapshot(
@@ -1147,7 +1160,17 @@ pub const Runtime = struct {
             if (preempted) return error.WaitPreempted;
             if (terminal) break;
             if (cancel_flag) |flag| {
-                if (flag.load(.seq_cst)) return error.Cancelled;
+                if (flag.load(.seq_cst)) {
+                    const now_ms = io_mod.milliTimestamp();
+                    if (quiet_notice.crossedAt(quiet_wait, now_ms, last_output_ms, limit_ms)) {
+                        debug_trace.logf(
+                            "managed-execution",
+                            "event=quiet_crossing_dropped reason=cancelled execution={s} quiet_ms={d}",
+                            .{ execution_id, quiet_notice.quietMs(now_ms, last_output_ms) },
+                        );
+                    }
+                    return error.Cancelled;
+                }
             }
             const now_ms = io_mod.milliTimestamp();
             if (steerYieldDue(tool_yield_flag, wait_started_ms, now_ms, yield_grace_ms)) {
@@ -2433,6 +2456,92 @@ test "a command that ends before its yield time never reaches the test hold" {
     }
     try std.testing.expectEqual(@as(u32, 0), timed_yield_holds);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+}
+
+test "cancelling a run or wait past the quiet limit traces the dropped crossing without command text" {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_path);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ tmp_path, "trace.log" });
+    defer alloc.free(trace_path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "managed-execution");
+    defer debug_trace.resetForTest();
+    defer debug_trace.shutdown();
+
+    test_quiet_limit_ms = 100;
+    defer test_quiet_limit_ms = null;
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    const CancelAfterQuiet = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            io_mod.sleep(160 * std.time.ns_per_ms);
+            flag.store(true, .seq_cst);
+        }
+    };
+
+    var run_cancel = std.atomic.Value(bool).init(false);
+    const run_thread = try std.Thread.spawn(.{}, CancelAfterQuiet.run, .{&run_cancel});
+    var run_input = StartCapturedInput{
+        .execution_id = "managed-cancel-run-quiet",
+        .command = "sleep 30",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 5_000,
+        .cancel_flag = &run_cancel,
+    };
+    run_input.authority = testAuthority(run_input);
+    var run_cancelled = try runtime.startCaptured(alloc, run_input);
+    run_thread.join();
+    defer run_cancelled.deinit(alloc);
+    try std.testing.expect(!run_cancelled.snapshot.quiet_crossed);
+    try runtime.commitDelivery(run_cancelled.snapshot.execution_id, run_cancelled.reservation_id);
+
+    var start_input = StartCapturedInput{
+        .execution_id = "managed-cancel-wait-quiet",
+        .command = "sleep 30",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 10_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    };
+    start_input.authority = testAuthority(start_input);
+    var started = try runtime.startCaptured(alloc, start_input);
+    const wait_execution_id = started.snapshot.execution_id;
+    try runtime.commitDelivery(wait_execution_id, started.reservation_id);
+    defer started.deinit(alloc);
+
+    var wait_cancel = std.atomic.Value(bool).init(false);
+    const wait_thread = try std.Thread.spawn(.{}, CancelAfterQuiet.run, .{&wait_cancel});
+    try std.testing.expectError(
+        error.Cancelled,
+        runtime.waitOrYield(alloc, wait_execution_id, 5_000, &wait_cancel, null),
+    );
+    wait_thread.join();
+
+    var stopped = try runtime.stop(alloc, wait_execution_id, true);
+    defer stopped.deinit(alloc);
+    try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=quiet_crossing_dropped reason=cancelled execution=managed-cancel-run-quiet quiet_ms=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=quiet_crossing_dropped reason=cancelled execution=managed-cancel-wait-quiet quiet_ms=") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "sleep 30") == null);
 }
 
 test "captured run returns when its command ends without waiting out the poll" {
