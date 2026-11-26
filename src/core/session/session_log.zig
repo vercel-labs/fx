@@ -2189,6 +2189,7 @@ pub const OpenMode = enum {
 pub const CommitPosition = session_replay.CommitPosition;
 
 test {
+    _ = history_snapshot;
     _ = session_replay;
     _ = session_permission_state;
 }

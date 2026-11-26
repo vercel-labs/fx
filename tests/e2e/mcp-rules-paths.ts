@@ -50,8 +50,11 @@ export interface PathsOptions {
   readOnly?: boolean;
   /** The small server never starts (it exits at once). */
   down?: boolean;
-  /** More servers in the profile: `keyed` is held for a variable that is not set, and `locked` answers every request with a 401. */
-  extraServers?: Array<"keyed" | "locked">;
+  /**
+   * More servers in the profile: `keyed` is held for a variable that is not set, `locked` answers every request with a 401,
+   * `linear` is held for a variable that is not set, and `linear_dev` runs the small server's fixture, so its name has `linear`'s as a prefix.
+   */
+  extraServers?: Array<"keyed" | "locked" | "linear" | "linear_dev">;
   /** An extra scratch folder name. */
   label?: string;
   /** Run only these built-in steps, each as `<path>:<tool>` (default: all of them). */
@@ -158,6 +161,12 @@ export async function runPaths(options: PathsOptions): Promise<PathsRun> {
         ? { keyed: { type: "http", url: "https://keyed.example/mcp", bearer_token_env: NOT_SET_VARIABLE } }
         : {}),
       ...(locked ? { locked: { type: "http", url: `http://127.0.0.1:${locked.port}/mcp` } } : {}),
+      ...(options.extraServers?.includes("linear")
+        ? { linear: { type: "http", url: "https://linear.example/mcp", bearer_token_env: NOT_SET_VARIABLE } }
+        : {}),
+      ...(options.extraServers?.includes("linear_dev")
+        ? { linear_dev: { type: "local", command: [process.execPath, fixture], enabled: true } }
+        : {}),
     } }),
   );
   writeFileSync(

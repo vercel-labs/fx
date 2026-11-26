@@ -2570,3 +2570,59 @@ test "TurnFinalizationGuard runs PostTurnEnd after failed finish prompt publicat
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hook_capture.outcomes[0]);
     try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .completed), hook_capture.dispositions[0]);
 }
+
+test "eb03: full turn carries job.input_id to UserTurn.input_id and steering boundary input_id to PersistedSteering.input_id" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        next_id: u64 = 10,
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const id = self.next_id;
+            self.next_id += 1;
+            return id;
+        }
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var hook_state = HookState{};
+    worker.accepted_input_hooks = .{
+        .ctx = &hook_state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "user prompt"));
+    const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+    defer worker_runtime.freeWorkItem(alloc, work);
+
+    var gateway = FakeGateway.init(alloc, &.{ .{ .content = "First answer" }, .{ .content = "Updated answer" } });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    deps.steering_worker = &worker;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.cancel_flag = &worker.worker_cancel_requested;
+    var job = work.prompt;
+    job.grants = &.{};
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = SteerDuringStop{ .alloc = alloc, .worker = &worker };
+    try lifecycle_runtime.registerStop(.{ .name = "steer-during-stop", .ctx = &handler, .run = SteerDuringStop.run });
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        config,
+        job,
+        testLifecycleContext(lifecycle_runtime.freeze(), alloc, fixture.workspace_root),
+    );
+    worker.finishProcessing();
+
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    try std.testing.expectEqual(@as(?u64, 10), deps.history_turns.items[0].assistant.user.input_id);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items[0].assistant.execution.steering.len);
+    try std.testing.expectEqual(@as(?u64, 11), deps.history_turns.items[0].assistant.execution.steering[0].input_id);
+}
