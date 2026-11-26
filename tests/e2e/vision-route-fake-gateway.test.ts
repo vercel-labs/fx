@@ -1085,7 +1085,11 @@ describe("Vision route fake Gateway", () => {
 
         const json = parseFxJson(result);
         expect(json.output).toContain("Recovered after required Vision rejection");
-        expect(json.tool_calls).toContainEqual({ name: "read_file", status: "error" });
+        expect(json.tool_calls).toContainEqual({
+          name: "read_file",
+          status: "error",
+          reason: "Only Vision can be called while attached images are pending.",
+        });
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
         expect(gateway.chatRequests).toHaveLength(5);
         expect(gateway.chatRequests[0].body).toContain('"toolChoice":{"type":"required"}');
@@ -1601,7 +1605,11 @@ describe("Vision route fake Gateway", () => {
         const firstJson = parseFxJson(first);
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(firstJson.output).toContain("Gemini recovered after rejected Vision");
-        expect(firstJson.tool_calls).toContainEqual({ name: "vision", status: "error" });
+        expect(firstJson.tool_calls).toContainEqual({
+          name: "vision",
+          status: "error",
+          reason: "Vision is unavailable for this request.",
+        });
         expect(first.stderr).not.toContain("Inspecting images");
         expect(first.stderr).not.toContain("Vision is unavailable right now");
         expect(gateway.chatRequests).toHaveLength(2);

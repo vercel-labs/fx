@@ -4779,7 +4779,8 @@ describe("effect-aware command permissions", () => {
 
         expect(Buffer.concat(stdoutChunks).toString()).toBe("");
         const stderr = Buffer.concat(stderrChunks).toString();
-        expect(stderr).toContain("Running printf cancelled >");
+        expect(stderr).toContain('Reviewing shell: printf cancelled > "./classifier-cancel-must-not-exist.txt"');
+        expect(stderr).not.toContain("Running ");
         expect(stderr).not.toContain("Auto agent couldn’t approve because");
         expect(stderr).not.toContain("permission required");
         expect(existsSync(marker)).toBe(false);

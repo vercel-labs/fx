@@ -7030,6 +7030,55 @@ test "execution cancellation closes every later streamed tool action" {
     }
 }
 
+test "processQueuedPrompt provider_executed search releases execution_started once before terminal" {
+    const alloc = std.testing.allocator;
+    const provider_call: ToolCall = .{
+        .id = "provider_search_1",
+        .name = "exa_search",
+        .arguments_json = "{\"query\":\"zig\"}",
+        .provider_result = "{\"results\":[]}",
+        .provenance = .provider_executed,
+    };
+    const calls = [_]ToolCall{provider_call};
+    for ([_]bool{ true, false }) |streamed| {
+        const starts: []const ToolCall = if (streamed) &calls else &.{};
+        const completions = [_]FakeCompletion{
+            .{
+                .tool_calls = &calls,
+                .streamed_tool_starts = starts,
+            },
+            .{ .content = "Done" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+        var started_count: usize = 0;
+        var started_index: ?usize = null;
+        var terminal_index: ?usize = null;
+        for (deps.lifecycle_events.items, 0..) |event, idx| {
+            switch (event) {
+                .execution_started => |started| if (std.mem.eql(u8, started.id.call_id, provider_call.id)) {
+                    started_count += 1;
+                    started_index = idx;
+                },
+                .terminal => |term| if (std.mem.eql(u8, term.id.call_id, provider_call.id)) {
+                    terminal_index = idx;
+                },
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), started_count);
+        try std.testing.expect(started_index != null and terminal_index != null);
+        try std.testing.expect(started_index.? < terminal_index.?);
+        try expectSingleTerminalOutcome(deps.lifecycle_events.items, provider_call.id, .completed);
+    }
+}
+
 test "processQueuedPrompt interruption persists staged feedback from a completed sibling" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

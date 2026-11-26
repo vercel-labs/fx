@@ -215,6 +215,7 @@ describe("generic permission typed errors", () => {
             category: "rejected",
             code: "rejected",
           },
+          reason: "Tool access was denied by configured policy",
         });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
@@ -275,7 +276,8 @@ describe("generic permission typed errors", () => {
           timeoutMs: TIMEOUT,
         });
         const json = parseFxJson(result);
-        expect(result.stderr).toBe('Running touch "./denied-marker.txt"\n');
+        expect(result.stderr).toBe("Refused shell: Tool access was denied by configured policy\n");
+        expect(result.stderr).not.toContain("Running ");
         expect(json.tool_calls).toContainEqual({
           name: "shell",
           status: "error",
@@ -284,6 +286,7 @@ describe("generic permission typed errors", () => {
             category: "rejected",
             code: "rejected",
           },
+          reason: "Tool access was denied by configured policy",
         });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
