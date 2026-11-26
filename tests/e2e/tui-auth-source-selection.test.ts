@@ -3399,7 +3399,7 @@ tmuxTest(
     const refused = await session.captureFullScrollback();
     expect(refused).toContain("not allowed for this team");
     expect(refused).toContain("Vercel team example-internal-team");
-    expect(refused).toContain("press Esc twice, run /login, choose another team, and send it again");
+    expect(refused).toContain("Wrong team? Press Esc twice, run /login, choose another team, and send it again");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

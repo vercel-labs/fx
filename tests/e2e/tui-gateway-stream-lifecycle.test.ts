@@ -3678,7 +3678,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       // The provider's reason showed once, while the picker was up.
-      expect(countOccurrences(scrollback, "credit_card_required")).toBe(1);
+      expect(countOccurrences(scrollback.replace(/\s+/g, " "), "Buy credits to use AI Gateway.")).toBe(1);
+      // The HTTP code row shows only in Ctrl+O, not in the compact scrollback.
+      expect(scrollback).not.toContain("credit_card_required");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,

@@ -62,13 +62,13 @@ pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
     return try out.toOwnedSlice();
 }
 
+fn httpErrorTitle(status_code: u16) []const u8 {
+    return if (status_code == 401 or status_code == 403) "API access denied" else "API request failed";
+}
+
 pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
     const status_code = @backingInt(status);
-    const title = if (status_code == 401 or status_code == 403)
-        "API access denied"
-    else
-        "API request failed";
-    return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
+    return formatHttpDiagnostic(alloc, status, detail, httpErrorTitle(status_code), max_published_error_bytes);
 }
 
 pub const HttpErrorNotice = struct {
@@ -93,7 +93,7 @@ pub fn formatHttpErrorNotice(alloc: Allocator, status: std.http.Status, detail: 
     const code = if (fields) |found| found.code else null;
     const provider = if (error_object) |object| (stringField(object, "provider") orelse providerFromGatewayMessage(message)) else null;
 
-    const title = if (status_code == 401 or status_code == 403) "API access denied" else "API request failed";
+    const title = httpErrorTitle(status_code);
     const body_source = message orelse (if (error_object == null and detail.len > 0) detail else title);
     var body = try sanitizeExternalText(alloc, body_source, max_published_error_bytes);
     errdefer alloc.free(body);
@@ -133,8 +133,8 @@ fn errorCodeAndMessage(error_object: std.json.ObjectMap) CodeAndMessage {
     const code = stringField(error_object, "code") orelse
         stringField(error_object, "type") orelse
         if (param_object) |param| stringField(param, "name") else null;
-    const message = stringField(error_object, "message") orelse
-        if (param_object) |param| stringField(param, "message") else null;
+    const message = nonEmptyText(stringField(error_object, "message")) orelse
+        if (param_object) |param| nonEmptyText(stringField(param, "message")) else null;
     return .{ .code = code, .message = message };
 }
 
@@ -276,6 +276,15 @@ test "a Token Pass 403 names what to do next" {
     );
     defer alloc.free(other_status);
     try std.testing.expect(std.mem.find(u8, other_status, "spends only Token Pass") == null);
+}
+
+test "formatHttpErrorNotice falls back to the param when the message is empty" {
+    const alloc = std.testing.allocator;
+    const notice = try formatHttpErrorNotice(alloc, .forbidden,
+        \\{"error":{"message":"","param":{"message":"Restricted."}}}
+    );
+    defer notice.deinit(alloc);
+    try std.testing.expectEqualStrings("Restricted.", notice.body);
 }
 
 pub fn formatMarkedLine(alloc: Allocator, marker_prefix: []const u8, message: []const u8, cols: u16) ![]u8 {

@@ -5198,11 +5198,7 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
         )
     else
         "fx sent this request for this login's Vercel team.\n└ Wrong team? Press Esc twice, run /login, choose another team, and send it again.";
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
+    try deps.pushWarningNotice(message);
 }
 
 const UserAnswer = enum { resend, cancelled, switch_model };
@@ -10655,7 +10651,7 @@ fn processQueuedPromptLoop(
             try deps.push_text(deps.ctx, .{ .operational = "\n" });
             continue;
         }
-        try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
+        try runtime_assistant_stream.emitProviderLengthNotice(deps, disposition);
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
         const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
             try deps.agent_stream_provider.projectReplay(arena, provider_replay, &.{}, true, !terminal_provider_completion)

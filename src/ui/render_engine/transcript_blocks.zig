@@ -1878,12 +1878,8 @@ const max_full_url_cells: usize = 40;
 /// Host of a notice URL, or the URL itself when it has no host. Userinfo is
 /// dropped, so the shown host is the one the link opens.
 fn urlHost(url: []const u8) []const u8 {
-    const scheme_end = std.mem.find(u8, url, "://") orelse return url;
-    const rest = url[scheme_end + "://".len ..];
-    var authority_end: usize = 0;
-    while (authority_end < rest.len and rest[authority_end] != '/' and rest[authority_end] != '?' and rest[authority_end] != '#') : (authority_end += 1) {}
-    var host = rest[0..authority_end];
-    if (std.mem.findLast(u8, host, "@")) |at| host = host[at + 1 ..];
+    const authority = text_utils.urlAuthority(url) orelse return url;
+    const host = url[authority.host_start..authority.end];
     return if (host.len == 0) url else host;
 }
 

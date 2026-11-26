@@ -657,8 +657,7 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     stream_ctx.recordSemanticBoundary();
 }
 
-pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
-    _ = arena;
+pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
     try hooks.pushWarningNotice("The response hit the provider's length limit and may be incomplete.");
 }
@@ -2328,10 +2327,7 @@ test "emitProviderLengthNotice emits exact length notice" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .length_limited);
+    try emitProviderLengthNotice(&hooks, .length_limited);
 
     try std.testing.expectEqual(@as(usize, 1), capture.notices.items.len);
     try std.testing.expectEqualStrings("The response hit the provider's length limit and may be incomplete.", capture.notices.items[0]);
@@ -2343,10 +2339,7 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     defer capture.deinit(alloc);
     const hooks = capture.hooks();
 
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-
-    try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
+    try emitProviderLengthNotice(&hooks, .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
 }
