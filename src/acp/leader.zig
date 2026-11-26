@@ -368,6 +368,7 @@ const KeepReason = enum {
     folder_unsafe,
     folder_mode,
     folder_owner,
+    entry_not_socket,
 };
 
 const Record = struct {
@@ -419,6 +420,7 @@ pub fn takeOverDeadLeader(io: std.Io, old_line: []const u8) void {
         .opened => |opened| {
             var leader = opened;
             defer leader.close();
+            if (socketEntryKeepReason(io, leader.folder.dir)) |reason| return keepFolder(reason);
             removeLeaderFiles(io, &leader, path.name);
         },
     }
@@ -575,11 +577,22 @@ fn ownerKeepReason(owner: ?std.c.uid_t, expected: std.c.uid_t) ?KeepReason {
     return if (actual == expected) null else .folder_owner;
 }
 
+/// The reason to keep the folder when its entry `s` exists and is not a socket.
+/// The entry is read without following links, so a link of that name keeps it too.
+fn socketEntryKeepReason(io: std.Io, dir: std.Io.Dir) ?KeepReason {
+    const stat = dir.statFile(io, socket_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return .entry_not_socket,
+    };
+    return if (stat.kind == .unix_domain_socket) null else .entry_not_socket;
+}
+
 /// Unlinks the leader's socket, then removes its folder. A failure is traced,
 /// and the other step still runs.
 fn removeLeaderFiles(io: std.Io, leader: *LeaderFolder, name: []const u8) void {
-    leader.folder.dir.deleteFile(io, socket_name) catch |err| {
-        debug_trace.logf("acp", "event=dead_leader_socket_not_removed err={s}", .{@errorName(err)});
+    leader.folder.dir.deleteFile(io, socket_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => debug_trace.logf("acp", "event=dead_leader_socket_not_removed err={s}", .{@errorName(err)}),
     };
     leader.base.dir.deleteDir(io, name) catch |err| {
         debug_trace.logf("acp", "event=dead_leader_folder_not_removed err={s}", .{@errorName(err)});
@@ -1051,4 +1064,30 @@ test "a lock line that does not parse keeps every folder" {
     takeOverDeadLeader(io, "not a record\n");
 
     try testing.expect(!pathGone(io, leader.socket));
+}
+
+test "a plain file named s in a leader's folder is kept, even when its pid is gone" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    try leader.placeSocketFile(io);
+    const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    defer testing.allocator.free(line);
+
+    takeOverDeadLeader(io, line);
+
+    try testing.expect(!pathGone(io, leader.socket));
+    try testing.expect(!pathGone(io, leader.folder));
+}
+
+test "a dead leader's folder with no socket left in it is removed" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    defer testing.allocator.free(line);
+
+    takeOverDeadLeader(io, line);
+
+    try testing.expect(pathGone(io, leader.folder));
 }
