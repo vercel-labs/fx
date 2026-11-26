@@ -1360,12 +1360,12 @@ test "turn file mutation denial state is local and does not retain approvals" {
     try root_denials.rememberHumanDenial(
         std.testing.allocator,
         action_a,
-        .{ .decision = .once, .human_approval = .once },
+        .{ .decision = .once, .human_approval = .{ .kind = .once, .shell_epoch = 0 } },
     );
     try root_denials.rememberHumanDenial(
         std.testing.allocator,
         action_a,
-        .{ .decision = .always, .human_approval = .always },
+        .{ .decision = .always, .human_approval = .{ .kind = .always, .shell_epoch = 0 } },
     );
     try root_denials.rememberHumanDenial(
         std.testing.allocator,

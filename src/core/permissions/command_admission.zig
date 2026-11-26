@@ -94,16 +94,26 @@ pub const ToolExecutionAuthority = union(enum) {
     vision_paths: VisionPathExecutionAuthority,
 };
 
-pub const HumanApprovalProvenance = enum {
+pub const HumanApprovalKind = enum {
     none,
     once,
     always,
 };
 
+/// How a person answered a permission prompt, and the shell approval epoch the
+/// answer was given under. A run-time recheck judges the approval by that
+/// epoch, so a refresh after the answer asks again.
+pub const HumanApprovalProvenance = struct {
+    kind: HumanApprovalKind,
+    shell_epoch: u64,
+};
+
+pub const no_human_approval: HumanApprovalProvenance = .{ .kind = .none, .shell_epoch = 0 };
+
 pub const PermissionOutcome = struct {
     decision: types.ToolPermissionDecision = .policy_denied,
     execution_authority: ?ToolExecutionAuthority = null,
-    human_approval: HumanApprovalProvenance = .none,
+    human_approval: HumanApprovalProvenance = no_human_approval,
     denial_reason: ?types.ToolPermissionDenialReason = null,
     requirement: ?PermissionRequirement = null,
     tool_failure: ?[]const u8 = null,

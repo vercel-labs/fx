@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
 const cache_warmer = @import("../cache_warmer.zig");
@@ -1364,11 +1365,11 @@ pub const FakeAgentRuntimeDeps = struct {
             .human_approval = if (permission_index < self.permission_human_approvals.len)
                 self.permission_human_approvals[permission_index]
             else if (decision == .once)
-                .once
+                .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() }
             else if (decision == .always)
-                .always
+                .{ .kind = .always, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() }
             else
-                .none,
+                command_admission.no_human_approval,
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,

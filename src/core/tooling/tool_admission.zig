@@ -1677,6 +1677,7 @@ fn exactApprovalLocalGrants(
     call: ToolCall,
     local_grants: []const PermissionGrant,
     authority: command_admission.ToolExecutionAuthority,
+    shell_epoch: u64,
 ) ![]const PermissionGrant {
     switch (authority) {
         .file_mutation => |authorization| {
@@ -1700,7 +1701,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (targets.items, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
-                    .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
+                    .shell_epoch = shell_epoch,
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(permission_name),
@@ -1724,7 +1725,7 @@ fn exactApprovalLocalGrants(
             @memcpy(grants[0..local_grants.len], local_grants);
             for (vision_authority.targets, grants[local_grants.len..]) |target, *grant| {
                 grant.* = .{
-                    .shell_epoch = shell_snapshot.processOwner().approvalEpoch(),
+                    .shell_epoch = shell_epoch,
                     .tool_name = try arena.dupe(
                         u8,
                         permissions.permissionNameForTool(call.name),
@@ -1756,13 +1757,14 @@ pub fn revalidateLiveActionPermissionOutcome(
     authority: command_admission.ToolExecutionAuthority,
     human_approval: command_admission.HumanApprovalProvenance,
 ) !command_admission.PermissionOutcome {
-    const revalidation_grants = if (human_approval != .none)
+    const revalidation_grants = if (human_approval.kind != .none)
         try exactApprovalLocalGrants(
             input,
             arena,
             call,
             local_grants,
             authority,
+            human_approval.shell_epoch,
         )
     else
         local_grants;
@@ -1823,11 +1825,11 @@ pub fn revalidateLiveActionPermissionOutcome(
             break :blk refreshed;
         },
     };
-    if (human_approval != .none and
+    if (human_approval.kind != .none and
         outcome.tool_failure == null and
         !outcome.decision.isDenied())
     {
-        outcome.decision = switch (human_approval) {
+        outcome.decision = switch (human_approval.kind) {
             .once => .once,
             .always => .always,
             .none => unreachable,
@@ -1989,7 +1991,7 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 .execution_authority = if (response.decision.isDenied()) null else .{
                     .file_mutation = authorization,
                 },
-                .human_approval = humanApprovalProvenance(response.decision),
+                .human_approval = humanApprovalProvenance(response.decision, shell_snapshot.processOwner().approvalEpoch()),
             };
             if (response.decision == .deny) {
                 outcome.denial_reason = .user_denied;
@@ -2191,7 +2193,7 @@ fn permissionOutcomeForResponse(
         response.decision,
         source,
     );
-    outcome.human_approval = humanApprovalProvenance(response.decision);
+    outcome.human_approval = humanApprovalProvenance(response.decision, shell_snapshot.processOwner().approvalEpoch());
     if (response.decision == .deny) outcome.denial_reason = .user_denied;
     outcome.feedback = try copyPermissionFeedback(arena, response);
     return outcome;
@@ -2199,11 +2201,15 @@ fn permissionOutcomeForResponse(
 
 fn humanApprovalProvenance(
     decision: ToolPermissionDecision,
+    shell_epoch: u64,
 ) command_admission.HumanApprovalProvenance {
-    return switch (decision) {
-        .once => .once,
-        .always => .always,
-        .deny, .policy_denied, .permission_required => .none,
+    return .{
+        .kind = switch (decision) {
+            .once => .once,
+            .always => .always,
+            .deny, .policy_denied, .permission_required => .none,
+        },
+        .shell_epoch = shell_epoch,
     };
 }
 
@@ -2225,8 +2231,9 @@ fn promptPermissionOutcome(
         .auto_review_result = auto_review_result,
     };
     const prompter = input.permission_prompter orelse return unavailable;
+    // The offer exists before the person answers, so it carries the epoch of the prompt.
     const grant_offer = if (try isRunCommandCall(input, arena, call))
-        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary)
+        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, shell_snapshot.processOwner().approvalEpoch())
     else
         null;
     var response = prompter.request(
@@ -3241,7 +3248,7 @@ test "Vision path admission retains the canonical execution targets" {
         .ask,
         &.{},
         outcome.execution_authority.?,
-        .once,
+        .{ .kind = .once, .shell_epoch = 0 },
     );
     try std.testing.expectEqual(ToolPermissionDecision.once, revalidated.decision);
     const revalidated_authority = switch (revalidated.execution_authority orelse
@@ -3268,7 +3275,7 @@ test "Vision path admission retains the canonical execution targets" {
         .ask,
         &.{},
         outcome.execution_authority.?,
-        .once,
+        .{ .kind = .once, .shell_epoch = 0 },
     );
     try std.testing.expect(replaced.decision.isDenied());
     try std.testing.expect(replaced.execution_authority == null);
@@ -4183,6 +4190,7 @@ test "exact command approval remains valid across live authority revalidation" {
         call,
         &.{},
         .ordinary,
+        shell_snapshot.processOwner().approvalEpoch(),
     );
     var targets = try permissionTargetsForCall(input, arena, call);
     defer targets.deinit(arena);
@@ -4200,9 +4208,6 @@ test "exact command approval remains valid across live authority revalidation" {
 }
 
 test "exact command approval records the shell epoch it was made under" {
-    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
-    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
-    shell_snapshot.processOwner().markDirty(.user_reload);
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -4218,16 +4223,13 @@ test "exact command approval records the shell epoch it was made under" {
         .name = "shell",
         .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
     };
-    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary);
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary, 1);
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
     try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
 }
 
 test "vision approval grants record the shell epoch they were made under" {
-    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
-    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
-    shell_snapshot.processOwner().markDirty(.user_reload);
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -4243,10 +4245,68 @@ test "vision approval grants record the shell epoch they were made under" {
         .identity = std.mem.zeroes(file_mutation_contract.FileIdentity),
     }};
     const call: ToolCall = .{ .id = "vision-epoch", .name = "vision", .arguments_json = "{}" };
-    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .{ .vision_paths = .{ .targets = &targets } });
+    const grants = try exactApprovalLocalGrants(input, arena, call, &.{}, .{ .vision_paths = .{ .targets = &targets } }, 1);
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
     try std.testing.expectEqual(@as(u64, 1), grants[0].shell_epoch);
+}
+
+test "a one-time shell approval answered before a refresh asks again when it is rechecked" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const call: ToolCall = .{
+        .id = "answered-before-refresh",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf approved > marker.txt\"}",
+    };
+    const owner = shell_snapshot.processOwner();
+    const answer: command_admission.HumanApprovalProvenance = .{ .kind = .once, .shell_epoch = owner.approvalEpoch() };
+
+    const before_refresh = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, answer);
+    try std.testing.expectEqual(ToolPermissionDecision.once, before_refresh.decision);
+
+    owner.markDirty(.user_reload);
+    const after_refresh = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, answer);
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, after_refresh.decision);
+}
+
+test "a one-time non-shell approval answered before a refresh stays allowed when it is rechecked" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    const call: ToolCall = .{
+        .id = "glob-answered-before-refresh",
+        .name = "glob_files",
+        .arguments_json = "{\"pattern\":\"*.zig\"}",
+    };
+    const owner = shell_snapshot.processOwner();
+    const answer: command_admission.HumanApprovalProvenance = .{ .kind = .once, .shell_epoch = owner.approvalEpoch() };
+
+    const before_refresh = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, answer);
+    try std.testing.expect(!before_refresh.decision.isDenied());
+
+    owner.markDirty(.user_reload);
+    const after_refresh = try revalidateLiveActionPermissionOutcome(input, arena, call, .ask, &.{}, .ordinary, answer);
+    try std.testing.expect(!after_refresh.decision.isDenied());
 }
 
 const test_review_tool_calls = [_]ToolCall{

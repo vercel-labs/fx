@@ -2748,7 +2748,7 @@ fn rejectPermissionForLiveAuthority(
     outcome.denial_reason = .policy_denied;
     outcome.execution_authority = null;
     outcome.feedback = null;
-    outcome.human_approval = .none;
+    outcome.human_approval = command_admission.no_human_approval;
 }
 
 const PreparationClassifierContext = struct {
@@ -12577,7 +12577,7 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 permission_result = maybe_revalidated.?;
-                if (exact_human_approval != .once) {
+                if (exact_human_approval.kind != .once) {
                     exact_human_approval = permission_result.human_approval;
                 }
             }

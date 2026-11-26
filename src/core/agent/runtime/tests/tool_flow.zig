@@ -33,6 +33,7 @@ const runtime_tool_contracts = @import("../tool_contracts.zig");
 const runtime_tool_presentation = @import("../tool_presentation.zig");
 const runtime_telemetry = @import("../telemetry.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
+const shell_snapshot = @import("../../../terminal/shell_snapshot.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
@@ -1235,7 +1236,7 @@ test "shell lifecycle resolves one display target before execution" {
             return .{
                 .decision = .once,
                 .execution_authority = .ordinary,
-                .human_approval = .once,
+                .human_approval = .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() },
             };
         }
     };
@@ -7662,7 +7663,7 @@ test "child live authority allow to ask requires current approval before effect"
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     hooks.permission_decisions = &.{ .once, .once };
-    hooks.permission_human_approvals = &.{ .none, .once };
+    hooks.permission_human_approvals = &.{ command_admission.no_human_approval, .{ .kind = .once, .shell_epoch = shell_snapshot.processOwner().approvalEpoch() } };
     hooks.permission_wait_index = 1;
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "approved result" } }};
 
