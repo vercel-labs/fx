@@ -727,6 +727,8 @@ pub const State = struct {
     };
 
     fn runSessionSet(self: *State, owner: *agents.Agent, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
+        // Like startVerbs, this path needs the native MCP host and its owner thread.
+        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         var context: SessionVerbs = .{ .state = self, .owner = owner };
         const a = std.heap.c_allocator;
         var out: std.Io.Writer.Allocating = .init(a);
