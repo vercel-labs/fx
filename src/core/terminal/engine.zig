@@ -10,7 +10,9 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const checkpoint_schema_revision: u16 = 4;
+/// The newest checkpoint revision this fx reads. `Grid.checkpointRevision`
+/// picks the one a checkpoint is written as.
+pub const checkpoint_schema_revision: u16 = checkpoint_escape_intermediate_revision;
 const checkpoint_legacy_revision: u16 = 1;
 /// The first revision that saves the cells a last-column character replaced.
 const checkpoint_last_column_revision: u16 = 3;
@@ -2200,6 +2202,16 @@ pub const Grid = struct {
         return owned;
     }
 
+    /// The revision `checkpointPayload` writes, which the envelope must name:
+    /// the oldest one that holds this state. An fx from before revision four
+    /// cannot restore a revision four checkpoint, and without an exact raw
+    /// journal it loses the screen, so only a checkpoint taken inside an
+    /// escape with intermediate bytes uses it (R3.5).
+    pub fn checkpointRevision(self: Grid) u16 {
+        if (self.state == .escape_intermediate) return checkpoint_escape_intermediate_revision;
+        return checkpoint_last_column_revision;
+    }
+
     /// Serialize all bounded terminal state. The durable store owns cursor
     /// anchoring and wraps these opaque bytes in its checkpoint envelope.
     pub fn checkpointPayload(self: Grid, alloc: Allocator) ![]u8 {
@@ -2207,7 +2219,7 @@ pub const Grid = struct {
         var encoder = CheckpointEncoder.init(alloc);
         errdefer encoder.deinit();
         try encoder.bytes(checkpoint_magic);
-        try encoder.int(u16, checkpoint_schema_revision);
+        try encoder.int(u16, self.checkpointRevision());
         try encodeGridState(&encoder, self);
         return encoder.finish();
     }
@@ -4289,12 +4301,42 @@ test "a byte that ends no escape ends ESC ( and is read as input" {
     try testing.expect(g.cellAt(2, 2).?.style.fg.eql(.{ .indexed = 1 }));
 }
 
-test "a checkpoint inside ESC ( restores the escape, and revision three cannot hold it" {
+/// Whether fx before revision four accepts the payload's revision: one to
+/// three, as its `supportsCheckpointRevision` did.
+fn readableBeforeRevisionFour(payload: []const u8) bool {
+    const revision = std.mem.readInt(u16, payload[4..6], .little);
+    return revision >= 1 and revision <= 3;
+}
+
+test "a checkpoint outside ESC ( is revision three, which fx before revision four reads" {
+    const outputs = [_][]const u8{ "plain", "A\x1b(B", "\x1b", "\x1b[2;", "\x1b]8;;https://e", "\xe7\x95" };
+    for (outputs) |output| {
+        var live = try Grid.init(testing.allocator, 8, 1);
+        defer live.deinit();
+        try live.feed(output);
+        // fx before revision four decodes only the states up to `dcs`.
+        try testing.expect(@backingInt(live.state) <= @backingInt(State.dcs));
+        try testing.expectEqual(@as(u16, 3), live.checkpointRevision());
+        const payload = try live.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(payload);
+        try testing.expect(readableBeforeRevisionFour(payload));
+
+        var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+        defer restored.deinit();
+        const repeated = try restored.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(repeated);
+        try testing.expectEqualSlices(u8, payload, repeated);
+    }
+}
+
+test "a checkpoint inside ESC ( is revision four and restores the escape" {
     var live = try Grid.init(testing.allocator, 8, 1);
     defer live.deinit();
     try live.feed("A\x1b(");
+    try testing.expectEqual(@as(u16, 4), live.checkpointRevision());
     const payload = try live.checkpointPayload(testing.allocator);
     defer testing.allocator.free(payload);
+    try testing.expect(!readableBeforeRevisionFour(payload));
     var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
     defer restored.deinit();
     try live.feed("BC");
@@ -4311,16 +4353,6 @@ test "a checkpoint inside ESC ( restores the escape, and revision three cannot h
     defer testing.allocator.free(revision_three);
     std.mem.writeInt(u16, revision_three[4..6], 3, .little);
     try testing.expectError(error.InvalidEngineCheckpoint, Grid.restoreCheckpoint(testing.allocator, revision_three));
-
-    // A revision three checkpoint of any other state still restores.
-    const ended = try testing.allocator.dupe(u8, expected);
-    defer testing.allocator.free(ended);
-    std.mem.writeInt(u16, ended[4..6], 3, .little);
-    var restored_ended = try Grid.restoreCheckpoint(testing.allocator, ended);
-    defer restored_ended.deinit();
-    const repeated = try restored_ended.checkpointPayload(testing.allocator);
-    defer testing.allocator.free(repeated);
-    try testing.expectEqualSlices(u8, expected, repeated);
 }
 
 test "CAN and SUB cancel partial CSI and OSC parser state" {

@@ -2342,7 +2342,7 @@ const Session = struct {
         const payload_len = std.math.cast(u32, payload.len) orelse
             return error.CheckpointTooLarge;
         const envelope = contracts.CheckpointEnvelope{
-            .engine_schema_revision = terminal_engine.checkpoint_schema_revision,
+            .engine_schema_revision = self.engine.checkpointRevision(),
             .applied_cursor = applied_cursor,
             .payload_len = payload_len,
             .checksum = contracts.checkpoint_checksum(payload),
@@ -4491,14 +4491,37 @@ test "resize recovery never reflows raw output at final dimensions" {
     try session.engine.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings("abcd", row.items);
 
-    // The previous revision ends before the flag for saved last-column
-    // cells, which this session does not have.
+    // Outside an escape, the checkpoint names revision three in its envelope
+    // and its payload, which fx before revision four restores too.
+    const revision_three: u16 = 3;
+    {
+        var written = (try session.durable.load_checkpoint(alloc)).?;
+        defer written.deinit(alloc);
+        try std.testing.expectEqual(revision_three, written.envelope.engine_schema_revision);
+        try std.testing.expectEqual(revision_three, std.mem.readInt(u16, written.payload[4..6], .little));
+    }
+    try session.durable.store_checkpoint(.{
+        .engine_schema_revision = revision_three,
+        .applied_cursor = session.durable.output_cursor(),
+        .payload_len = @intCast(live_payload.len),
+        .checksum = contracts.checkpoint_checksum(live_payload),
+    }, live_payload, 5);
+    try std.testing.expect(!session.durable.record.raw_replay_exact);
+    var revision_three_recovered = try reconstructEngine(alloc, &session.durable);
+    defer revision_three_recovered.deinit();
+    const revision_three_payload = try revision_three_recovered.checkpointPayload(alloc);
+    defer alloc.free(revision_three_payload);
+    try std.testing.expectEqualSlices(u8, live_payload, revision_three_payload);
+
+    // Revision two ends before the flag for saved last-column cells, which
+    // this session does not have.
+    const revision_two: u16 = 2;
     try std.testing.expectEqual(@as(u8, 0), live_payload[live_payload.len - 1]);
     const legacy_payload = try alloc.dupe(u8, live_payload[0 .. live_payload.len - 1]);
     defer alloc.free(legacy_payload);
-    std.mem.writeInt(u16, legacy_payload[4..6], terminal_engine.checkpoint_schema_revision - 1, .little);
+    std.mem.writeInt(u16, legacy_payload[4..6], revision_two, .little);
     try session.durable.store_checkpoint(.{
-        .engine_schema_revision = terminal_engine.checkpoint_schema_revision - 1,
+        .engine_schema_revision = revision_two,
         .applied_cursor = session.durable.output_cursor(),
         .payload_len = @intCast(legacy_payload.len),
         .checksum = contracts.checkpoint_checksum(legacy_payload),
@@ -4538,6 +4561,47 @@ test "resize recovery never reflows raw output at final dimensions" {
         contracts.ScreenRecovery{ .unavailable = .unsupported_schema },
         reopened.facts().screen_recovery,
     );
+}
+
+test "a checkpoint inside ESC ( names revision four and restores the escape" {
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-charset-checkpoint");
+    var session = try Session.init(
+        alloc,
+        .{ .context = null, .update_fn = ignoreWorkUpdate },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+            .dimensions = .{ .rows = 1, .columns = 8 },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    try session.durable.append("A\x1b(", 2);
+    var feed = try session.engine.feedMode("A\x1b(", .native_live);
+    feed.deinit(alloc);
+    try session.checkpointLocked(session.durable.output_cursor(), 3);
+    {
+        var written = (try session.durable.load_checkpoint(alloc)).?;
+        defer written.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 4), written.envelope.engine_schema_revision);
+        try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, written.payload[4..6], .little));
+    }
+
+    var recovered = try reconstructEngine(alloc, &session.durable);
+    defer recovered.deinit();
+    var recovered_feed = try recovered.feedMode("BC", .journal_replay);
+    recovered_feed.deinit(alloc);
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(alloc);
+    try recovered.rowTextTrimmed(1, &row);
+    try std.testing.expectEqualStrings("AC", row.items);
 }
 
 test "native protocol replies are independent of either durable write lease" {
