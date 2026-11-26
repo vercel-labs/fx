@@ -150,6 +150,7 @@ function opsFor(label: string, t: Model, now: number): Op[] {
     case "Finish": return [{ op: "finish", now }];
     case "Begin": return [{ op: "begin", now, ceiling: t.ceil * TickMs }];
     case "Poll": return [{ op: "poll", now }];
+    case "Steer": return [{ op: "steer", now }];
     case "Tick": return [];
     default: throw new Error(`no mapping for model action ${label}`);
   }
@@ -276,7 +277,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       expect("waiting", t.waiting, real.waiting);
       expect("quiet ticks", t.quiet, Math.min(Math.floor(real.quiet_ms / TickMs), QSat));
       if (t.waiting) expect("armed", t.armed, real.armed);
-      if (step.label !== "Poll") return;
+      if (step.label !== "Poll" && step.label !== "Steer") return;
       const ended = s.waiting && !t.waiting;
       expect("wait ended", ended ? t.result.end : null, real.end);
       if (!ended) return;
@@ -323,6 +324,11 @@ if (options.selfCheck) {
   const source = readFileSync(module, "utf8");
   const mutants = [
     { name: "never arms a wait on new output", target: "if (!due) next.armed = true;", planted: "if (!due) next.armed = wait.armed;" },
+    {
+      name: "ends a wait early at the quiet crossing",
+      target: "if (elapsedMs(wait.started_ms, now_ms) >= wait.ceiling_ms) {",
+      planted: "if (next.armed and due) return .{ .wait = next, .end = .ceiling, .crossed = true };\n    if (elapsedMs(wait.started_ms, now_ms) >= wait.ceiling_ms) {",
+    },
     {
       name: "reports a crossing for an unarmed wait",
       target: "return wait.armed and noticeDue(quietMs(now_ms, last_output_ms), limit_ms);",

@@ -79,6 +79,17 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
             result.ended_armed = armed;
             result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
         }
+    } else if (is(op.op, "steer")) {
+        const wait = lab.wait orelse {
+            result.@"error" = "no wait is open";
+            return;
+        };
+        const crossed = if (lab.running) quiet_notice.crossedAt(wait, op.now, lab.last_output_ms, lab.limit_ms) else false;
+        lab.wait = null;
+        result.end = "steer";
+        result.crossed = crossed;
+        result.ended_armed = wait.armed;
+        result.times = quiet_notice.timesFor(lab.running, op.now, lab.started_ms, lab.last_output_ms, lab.limit_ms);
     } else {
         result.@"error" = "unknown op";
     }

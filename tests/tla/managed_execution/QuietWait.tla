@@ -1,17 +1,17 @@
 ------------------------------ MODULE QuietWait ------------------------------
 (***************************************************************************)
 (* A wait on a running shell command and the quiet notice                  *)
-(* (src/core/execution/quiet_notice.zig, driven by Runtime.wait and        *)
+(* (src/core/execution/quiet_notice.zig, driven by Runtime.run and         *)
 (* Runtime.waitOrYield in src/core/execution/managed_execution.zig, and    *)
 (* written by formatSnapshotRaw in src/tools/shell/shell.zig).             *)
 (*                                                                         *)
 (* A command may print nothing for a long time: it may have hung, or it    *)
 (* may be a server or watcher at rest. fx never stops it and never cuts a  *)
-(* requested wait short for quiet. A wait ends only at its ceiling or when *)
-(* the command finishes. A result for a running command that has been      *)
-(* quiet for Limit carries a notice that asks the model to check it, and a *)
-(* wait that ends past the limit after seeing the command under it reports *)
-(* one crossing per quiet spell.                                           *)
+(* requested wait short for quiet. A wait ends only at its ceiling, at a   *)
+(* steering yield, or when the command finishes. A result for a running    *)
+(* command that has been quiet for Limit carries a notice that asks the    *)
+(* model to check it, and a wait that ends past the limit after seeing the *)
+(* command under it reports one crossing per quiet spell.                  *)
 (*                                                                         *)
 (* Time is a discrete clock. quiet counts ticks since the last output, or  *)
 (* since the start, and saturates past Limit. The worker thread's output   *)
@@ -20,13 +20,14 @@
 (* and output never holds the clock back (strong fairness on Tick).        *)
 (*                                                                         *)
 (* Bug plants one defect for the mutation configs:                         *)
-(*   notice_any_quiet  the notice shows for any quiet time                 *)
-(*   notice_when_done  the notice shows on a finished command              *)
-(*   end_at_crossing   a wait ends early at the quiet crossing             *)
-(*   cross_unarmed     an unarmed wait reports a crossing                  *)
-(*   never_cross       a wait never reports a crossing                     *)
-(*   no_rearm          output during a wait does not arm it                *)
-(*   ceiling_late      a wait runs one tick past its ceiling               *)
+(*   notice_any_quiet   the notice shows for any quiet time                *)
+(*   notice_when_done   the notice shows on a finished command             *)
+(*   end_at_crossing    a wait ends early at the quiet crossing            *)
+(*   cross_unarmed      an unarmed wait reports a crossing                 *)
+(*   never_cross        a wait never reports a crossing                    *)
+(*   steer_never_cross  a steering yield never reports a crossing          *)
+(*   no_rearm           output during a wait does not arm it               *)
+(*   ceiling_late       a wait runs one tick past its ceiling              *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -36,12 +37,13 @@ CONSTANTS
     Bug
 
 Bugs == {"none", "notice_any_quiet", "notice_when_done", "end_at_crossing",
-         "cross_unarmed", "never_cross", "no_rearm", "ceiling_late"}
+         "cross_unarmed", "never_cross", "steer_never_cross", "no_rearm",
+         "ceiling_late"}
 
 ASSUME /\ Limit \in 1..6 /\ MaxCeil \in 0..12 /\ Bug \in Bugs
 
 QSat == Limit + 1
-Ends == {"none", "ceiling", "done"}
+Ends == {"none", "ceiling", "steer", "done"}
 
 VARIABLES
     cmd,          \* "running" or "done"
@@ -162,12 +164,31 @@ Poll ==
                                 output |-> outDuring, waitAge |-> waitAge, ceil |-> ceil]
     /\ UNCHANGED <<cmd, quiet, ceil, waitAge, under, outDuring>>
 
+\* A steering yield ends an open wait on a running command at any time,
+\* using quiet_notice.crossedAt for the crossing flag.
+Steer ==
+    /\ waiting /\ cmd = "running"
+    /\ LET c == IF Bug = "steer_never_cross" THEN FALSE
+                ELSE IF Bug = "cross_unarmed" THEN Due
+                ELSE armed /\ Due
+       IN /\ waiting' = FALSE
+          /\ polled' = TRUE
+          /\ spellCrosses' =
+                IF c THEN (IF spellCrosses < 2 THEN spellCrosses + 1 ELSE 2)
+                ELSE spellCrosses
+          /\ result' = [end |-> "steer", running |-> TRUE,
+                        quietDue |-> Due, notice |-> Notice(TRUE),
+                        crossed |-> c, armed |-> armed, under |-> under,
+                        output |-> outDuring, waitAge |-> waitAge, ceil |-> ceil]
+    /\ UNCHANGED <<cmd, quiet, ceil, waitAge, armed, under, outDuring>>
+
 Next ==
     \/ Output
     \/ Finish
     \/ Tick
     \/ \E c \in 0..MaxCeil : Begin(c)
     \/ Poll
+    \/ Steer
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ SF_vars(Tick)
 
@@ -179,9 +200,11 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ SF_vars(Tick)
 NoticeRule ==
     result.end # "none" => (result.notice <=> (result.running /\ result.quietDue))
 
-\* (a) A running command's wait ends only at its ceiling.
+\* (a) A running command's wait never ends early for quiet: it ends at its
+\* ceiling or at a steering yield.
 NoEarlyEnd ==
-    (result.end # "none" /\ result.running) => (result.end = "ceiling" /\ result.waitAge = result.ceil)
+    (result.end # "none" /\ result.running) =>
+        (result.end = "steer" \/ (result.end = "ceiling" /\ result.waitAge = result.ceil))
 
 \* (b) A crossing is reported only when the wait saw the command under the
 \* limit and the command is running past the limit at the end.

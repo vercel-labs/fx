@@ -3,15 +3,15 @@
 //
 //   sessions   60 quiet sessions alive at once, near the runtime's 64, each
 //              result with its time fields, then each stopped
-//   flood      50 MB of output while 5 s waits run, then quiet: the wait after
+//   flood      200 MB of output while 5 s waits run, then quiet: the wait after
 //              the flood reports the notice at its ceiling
 //   rearm      a command that prints a line when signaled at each wait's start;
-//              multiple 5 s waits in a row, each begun past the limit,
-//              re-armed by the new line, and crossing again at its ceiling
+//              100 5 s waits in a row, each begun past the limit, re-armed by
+//              the new line, and crossing again at its ceiling
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/managed_execution/stress.ts
-//   bun tests/tla/drivers/managed_execution/stress.ts --rounds 10
+//   bun tests/tla/drivers/managed_execution/stress.ts --rounds 300
 //
 // Exit codes: 0 every check held, 1 a check failed, 2 a harness failure.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -30,7 +30,7 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-const options = { sessions: option("--sessions", 60), rounds: option("--rounds", 5), floodMb: option("--flood-mb", 50) };
+const options = { sessions: option("--sessions", 60), rounds: option("--rounds", 100), floodMb: option("--flood-mb", 200) };
 
 function contentText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -154,8 +154,8 @@ async function sessions(out: string): Promise<string[]> {
 
 async function flood(out: string): Promise<string[]> {
   const { fakeGatewayToolCall } = await targetHelpers();
-  const limitMs = 1_000;
-  const maxWaits = 16;
+  const limitMs = 150;
+  const maxWaits = 30;
   let step = 0;
   let sessionId = "";
   let waitStarted = 0;
@@ -212,7 +212,7 @@ async function flood(out: string): Promise<string[]> {
 
 async function rearm(out: string): Promise<string[]> {
   const { fakeGatewayToolCall } = await targetHelpers();
-  const limitMs = 1_000;
+  const limitMs = 150;
   let step = 0;
   let sessionId = "";
   let waitStarted = 0;
