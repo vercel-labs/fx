@@ -17,7 +17,10 @@
 # stream-before-reparses.cfg shows that design reparsed streamed pieces. Each
 # stream-mutant-*.cfg plants one bug that its property must catch, and each
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
-# behaviors with more calls and rebuilds.
+# behaviors with more calls and rebuilds. stream-continue.cfg must pass with
+# Ctrl+G yields and their continuations on; each stream-continue-mutant-*.cfg
+# plants one read-back bug, and each stream-continue-witness-*.cfg must be
+# violated.
 #
 # SessionWrite models how a session's writes list the compactor's records
 # (D50) when they run on more than one thread. session-write.cfg must pass
@@ -35,6 +38,17 @@
 # and two subagents. Each live-witness-*.cfg must be violated, and each
 # live-mutant-*.cfg plants one bug that its property must catch.
 #
+# AcceptedInput models accepted user prompts across crashes, restarts,
+# withdrawals, and session switches for fx before the fix ("current"), the
+# landed Design A2 (log records + atomic batch of normal item and delivered
+# marker, restoring to composer before writing withdrawn), and rejected
+# designs A (single-line carrier item) and B (atomic pending file + carrier
+# item). accepted-current-survives shows fx before the fix loses accepted
+# prompts on a crash; accepted-design-a, accepted-design-a2, and
+# accepted-design-b must pass; the six accepted-mutant-* configs must fail on
+# their planted bugs; accepted-simulate-ideal and accepted-simulate-nonideal
+# run random behaviors. Pass `accepted` to run only the AcceptedInput checks.
+#
 # Run the real binary along the models and have TLC check every run:
 #   bun test ../drivers/session/
 #
@@ -45,7 +59,21 @@ cd "$(dirname "$0")"
 # shellcheck source=../lib/tlc.sh
 . ../lib/tlc.sh
 
+if [ "$#" -gt 0 ]; then
+    expanded=""
+    for arg in "$@"; do
+        if [ "$arg" = "accepted" ]; then
+            expanded="$expanded accepted-current-survives accepted-design-a accepted-design-a2 accepted-design-b accepted-mutant-a-two-lines accepted-mutant-a-show-before-write accepted-mutant-b-no-dedupe accepted-mutant-a-withdraw-after-drop accepted-mutant-a2-marker-later accepted-mutant-a2-withdraw-before-composer accepted-simulate-ideal accepted-simulate-nonideal"
+        else
+            expanded="$expanded $arg"
+        fi
+    done
+    # shellcheck disable=SC2086
+    set -- $expanded
+fi
+
 sim="-simulate num=${SIM_RUNS:-20000} -depth 40 -seed 1"
+sim_accepted="-simulate num=${SIM_RUNS:-20000} -depth 20 -seed 1"
 tlc_verdicts "$@" <<EOF
 ShellSession holds -
 ShellSession witness-saved-empty-status NoSavedEmptyStatus
@@ -80,6 +108,12 @@ TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-witness-failed-commit NeverCommittedAfterFailure
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+TurnStream stream-continue -
+TurnStream stream-continue-mutant-copies ReadsEachPieceOnce
+TurnStream stream-continue-mutant-reader-drops ReadsNoneLost
+TurnStream stream-continue-witness-extends NeverExtends
+TurnStream stream-continue-witness-copy NeverCopiedAfterYield
+TurnStream stream-continue-simulate simulate $sim
 SessionWrite session-write -
 SessionWrite session-write-today NoStaleRemoval
 SessionWrite session-write-today-loss ClearedWereListed
@@ -100,4 +134,16 @@ LiveSessions live-mutant-closed-child AgentsAsLogged
 LiveSessions live-mutant-parent-state AgentsAsLogged
 LiveSessions live-mutant-recent-is-live ProbeSound
 LiveSessions live-simulate simulate -simulate num=${SIM_RUNS:-20000} -depth 60 -seed 1
+AcceptedInput accepted-current-survives AcceptedSurvives
+AcceptedInput accepted-design-a -
+AcceptedInput accepted-design-a2 -
+AcceptedInput accepted-design-b -
+AcceptedInput accepted-mutant-a-two-lines NeverDeliveredTwice
+AcceptedInput accepted-mutant-a-show-before-write AcceptedSurvives
+AcceptedInput accepted-mutant-b-no-dedupe NeverDeliveredTwice
+AcceptedInput accepted-mutant-a-withdraw-after-drop WithdrawnStaysGone
+AcceptedInput accepted-mutant-a2-marker-later DeliveredNeverRestored
+AcceptedInput accepted-mutant-a2-withdraw-before-composer AcceptedSurvives
+AcceptedInput accepted-simulate-ideal simulate $sim_accepted
+AcceptedInput accepted-simulate-nonideal simulate $sim_accepted
 EOF

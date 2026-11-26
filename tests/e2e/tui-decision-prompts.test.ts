@@ -28,8 +28,10 @@ import {
   TITLE_GENERATION_MARKER,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
+import { logLines, onlySessionId } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -166,6 +168,20 @@ function outerToolCalls(calls: Array<{ id: string; name: string; input: object }
   );
 }
 
+// Each call arrives as a provider streams it: its start, its arguments, and
+// then the whole call.
+function streamedToolCalls(calls: Array<{ id: string; name: string; input: object }>) {
+  return sse([
+    ...calls.flatMap((call) => [
+      { type: "tool-input-start", id: call.id, toolName: call.name },
+      { type: "tool-input-delta", id: call.id, delta: JSON.stringify(call.input) },
+      { type: "tool-input-end", id: call.id },
+      { type: "tool-call", toolCallId: call.id, toolName: call.name, input: call.input },
+    ]),
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+}
+
 function outerCommandCall() {
   return outerToolCalls([
     {
@@ -253,31 +269,40 @@ function outerFittingCommandCall() {
   ]);
 }
 
-function outerQuestionCall() {
-  return outerToolCalls([
-    {
-      id: "question_outer_1",
-      name: "ask_user_question",
-      input: {
-        questions: [
+const QUESTION_CALL = {
+  id: "question_outer_1",
+  name: "ask_user_question",
+  input: {
+    questions: [
+      {
+        question: QUESTION_PROMPT,
+        options: [
           {
-            question: QUESTION_PROMPT,
-            options: [
-              {
-                label: "Inspect repo state",
-                description: "Review local files first.",
-              },
-              {
-                label: "Run tests",
-                description: "Start with verification.",
-              },
-            ],
+            label: "Inspect repo state",
+            description: "Review local files first.",
+          },
+          {
+            label: "Run tests",
+            description: "Start with verification.",
           },
         ],
       },
-    },
-  ]);
+    ],
+  },
+};
+
+function outerQuestionCall() {
+  return outerToolCalls([QUESTION_CALL]);
 }
+
+// The same question asked through toolbox, as the model asks it when
+// `tool_placement.ask_user_question` is `toolbox`.
+const TOOLBOX_QUESTION_SETTINGS = { tool_placement: { ask_user_question: "toolbox" } };
+const TOOLBOX_QUESTION_CALL = {
+  id: QUESTION_CALL.id,
+  name: "toolbox",
+  input: { run: QUESTION_CALL.name, arguments: QUESTION_CALL.input },
+};
 
 const TALL_QUESTION_PROMPT = "Who should relay events to the chat panes?";
 const TALL_QUESTION_DESCRIPTION =
@@ -603,6 +628,7 @@ function startFakeGateway(
 function createIsolatedRoot(
   permissionMode: "ask" | "auto" = "ask",
   permission: Record<string, unknown> = {},
+  settings: Record<string, unknown> = {},
 ) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-decision-e2e-")));
   const home = join(root, "home");
@@ -611,7 +637,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission }),
+    JSON.stringify({ permission_mode: permissionMode, permission, ...settings }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -647,8 +673,9 @@ async function launchScenario(
   permissionMode: "ask" | "auto" = "ask",
   classifierDecision: ClassifierDecision = () => "clear",
   permission: Record<string, unknown> = {},
+  settings: Record<string, unknown> = {},
 ) {
-  const root = createIsolatedRoot(permissionMode, permission);
+  const root = createIsolatedRoot(permissionMode, permission, settings);
   const gateway = startFakeGateway(responses, classifierDecision);
   gateways.push(gateway);
   const tracePath = join(root.root, "trace.log");
@@ -783,6 +810,231 @@ async function resolveApprovalWithDeny(activeSession: TmuxSession) {
 async function resolveQuestionWithSecondOption(activeSession: TmuxSession) {
   await activeSession.sendKeys("Down");
   await activeSession.sendKeys("Enter");
+}
+
+const ORDER_PROMPT = "Read files and ask me.";
+const ORDER_DONE = "Done after the question.";
+const ORDER_SUMMARY = "Explored 3 files";
+const ORDER_FILES = ["first.txt", "second.txt", "third.txt"];
+
+function readCall(id: string, path: string) {
+  return { id, name: "read_file", input: { path } };
+}
+
+// The rows from the prompt to the final answer, without blank rows, so a live
+// screen and a resumed one compare row for row.
+function answeredQuestionRows(grid: string[]) {
+  const rows = grid.map((row) => row.trimEnd()).filter((row) => row !== "");
+  const start = rows.indexOf(`┃ ${ORDER_PROMPT}`);
+  const end = rows.findIndex((row) => row.includes(ORDER_DONE));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start, end + 1);
+}
+
+function hasOrderSummary(grid: string[]) {
+  return grid.some((row) => row.includes(ORDER_SUMMARY));
+}
+
+// Answers each question as it opens. An open question lists its first option,
+// and each answered one keeps its prompt row, so question n is open when n
+// prompt rows and the first option show.
+async function answerQuestions(activeSession: TmuxSession, count: number) {
+  for (let answered = 0; answered < count; answered++) {
+    await waitForGridState(
+      activeSession,
+      `question ${answered + 1} open`,
+      (grid) =>
+        grid.filter((row) => row.includes(QUESTION_PROMPT)).length > answered &&
+        grid.some((row) => row.includes("Inspect repo state")),
+      TIMEOUT,
+    );
+    await resolveQuestionWithSecondOption(activeSession);
+  }
+}
+
+// Quits fx and starts it again on the same profile with `--resume last`.
+async function resumeLastSession(ctx: Awaited<ReturnType<typeof launchScenario>>) {
+  await ctx.session.sendText("/quit");
+  expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  await ctx.session.kill();
+  return TmuxSession.create({
+    cmd: `env -u VERCEL_OIDC_TOKEN ${FX_BIN} --resume last 2>${ctx.stderrPath}`,
+    cwd: ctx.root.workspace,
+    env: definedStringEnv(fakeGatewayEnv(ctx.root, ctx.gateway)),
+    width: 120,
+    height: 40,
+  });
+}
+
+const CANCELLED_NOTICE = "▪ Cancelled";
+
+// The rows from the prompt to the cancelled turn's notice, without blank rows.
+function cancelledQuestionRows(grid: string[]) {
+  const rows = grid.map((row) => row.trimEnd()).filter((row) => row !== "");
+  const start = rows.indexOf(`┃ ${ORDER_PROMPT}`);
+  const end = rows.findIndex((row) => row.includes(CANCELLED_NOTICE));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return rows.slice(start, end + 1);
+}
+
+function hasCancelledNotice(grid: string[]) {
+  return grid.some((row) => row.includes(CANCELLED_NOTICE));
+}
+
+/// Reads a file, cancels the question that follows with Esc at its prompt,
+/// then checks the rows the turn leaves, live and again after `--resume last`.
+async function expectCancelledQuestionRows(
+  responses: GatewayResponse[],
+  expected: { live: string[]; resumed: string[] },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario(responses, "input", {}, "auto", undefined, {}, settings);
+  for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
+  await ctx.session.sendText(ORDER_PROMPT);
+  await waitForGridState(
+    ctx.session,
+    "question open",
+    (grid) => grid.some((row) => row.includes(QUESTION_PROMPT)) && grid.some((row) => row.includes("Inspect repo state")),
+    TIMEOUT,
+  );
+  await ctx.session.sendKeys("Escape");
+  const live = await waitForGridState(ctx.session, "live cancelled question", hasCancelledNotice, TIMEOUT);
+  expect(cancelledQuestionRows(live)).toEqual(expected.live);
+  await assertProcessAliveAndClean(ctx);
+
+  session = await resumeLastSession(ctx);
+  const resumed = await waitForGridState(session, "resumed cancelled question", hasCancelledNotice, TIMEOUT);
+  expect(cancelledQuestionRows(resumed)).toEqual(expected.resumed);
+  expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+}
+
+// The full transcript's rows without blank rows, read once it shows `until`.
+async function fullTranscriptRows(active: TmuxSession, until: string) {
+  await active.sendKeys("C-o");
+  const full = await waitForGridState(
+    active,
+    "full transcript",
+    (grid) => grid.some((row) => row.includes("esc close")) && grid.some((row) => row.includes(until)),
+    TIMEOUT,
+  );
+  return full.map((row) => row.trimEnd()).filter((row) => row !== "");
+}
+
+// After resume, the full transcript shows the answered question as a direct
+// one does, not an "Asked" row.
+async function expectResumedFullTranscriptQuestion() {
+  const full = await fullTranscriptRows(session!, ORDER_DONE);
+  const prompt = full.indexOf(`  1) ${QUESTION_PROMPT}`);
+  expect(prompt).toBeGreaterThan(full.indexOf("● Read first.txt"));
+  expect(full[prompt + 1]).toBe("     Run tests");
+  expect(full.some((row) => row.startsWith("● Asked"))).toBe(false);
+}
+
+const ANSWER_REVIEWED_COMMAND = "rm -f stale-fixture.txt";
+const ANSWER_REVIEWED_DONE = "Reviewed after the answer.";
+
+/// Answers a question with "Run tests", then runs a command that auto mode
+/// reviews, and returns that review's request.
+async function reviewRequestAfterAnswer(
+  questionCall: { id: string; name: string; input: object },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario([
+    outerToolCalls([questionCall]),
+    outerToolCalls([{ id: "reviewed_1", name: "shell", input: { request: { action: "run", command: ANSWER_REVIEWED_COMMAND } } }]),
+    outerText(ANSWER_REVIEWED_DONE),
+  ], "input", {}, "auto", undefined, {}, settings);
+  writeFileSync(join(ctx.root.workspace, "stale-fixture.txt"), "stale\n");
+  await ctx.session.sendText("Ask me, then clean up.");
+  await answerQuestions(ctx.session, 1);
+  await ctx.session.waitForText(ANSWER_REVIEWED_DONE, TIMEOUT);
+  await assertProcessAliveAndClean(ctx);
+  const reviews = ctx.gateway.classifierRequests.filter((request) => request.body.includes(ANSWER_REVIEWED_COMMAND));
+  expect(reviews).toHaveLength(1);
+  // The model gets the answer as the result of the call it made, by that
+  // call's name, as it did before fx marked the answer for the review.
+  const sent = (JSON.parse(ctx.gateway.requests[1]!.body) as { prompt: Array<{ content: unknown }> }).prompt
+    .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, unknown>> : [])
+    .filter((part) => part.type === "tool-result" && part.toolCallId === questionCall.id);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    toolName: questionCall.name,
+    output: { type: "text", value: `[{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]` },
+  });
+  return reviews[0]!.body;
+}
+
+function jsonStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(jsonStrings);
+  if (value && typeof value === "object") return Object.values(value).flatMap(jsonStrings);
+  return [];
+}
+
+// The review's lines for the first earlier result: its tool, then its
+// content as the user's answer or as untrusted text.
+function firstPriorResult(body: string) {
+  return jsonStrings(JSON.parse(body))
+    .flatMap((text) => text.split("\n"))
+    .filter((line) => line.startsWith("prior_tool_result[0]."));
+}
+
+const ANSWER_RULE = 'R1 (M1): "Run tests"';
+const ANSWER_SUMMARY = `Turn 1\nIn between: asked which step comes next.\nT1: the user chose to run tests\n\nRules:\n- ${ANSWER_RULE}`;
+
+/// Answers a question with "Run tests", adds two plain turns, compacts the
+/// conversation with a summary whose one rule quotes that answer, and
+/// returns the rules the saved checkpoint keeps.
+async function compactedRulesAfterAnswer(
+  questionCall: { id: string; name: string; input: object },
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario([
+    outerToolCalls([questionCall]),
+    outerText("Answer noted."),
+    outerText("Second reply."),
+    outerText("Third reply."),
+    outerText(ANSWER_SUMMARY),
+  ], "input", {}, "auto", undefined, {}, settings);
+  await ctx.session.sendText("Ask me which step comes next.");
+  await answerQuestions(ctx.session, 1);
+  for (const [prompt, reply] of [["Ask me which step comes next.", "Answer noted."], ["Second request.", "Second reply."], ["Third request.", "Third reply."]]) {
+    if (prompt !== "Ask me which step comes next.") await ctx.session.sendText(prompt!);
+    await waitForGridState(ctx.session, `${reply} settled`, (grid) => grid.some((row) => row.includes(reply!)) && turnSettled(grid.join("\n")), TIMEOUT);
+  }
+  const id = onlySessionId(ctx.root.home);
+  await ctx.session.sendText("/compact");
+  await waitForGridState(ctx.session, "compaction saved", () => logLines(ctx.root.home, id).some((line) => line.kind === "compacted"), TIMEOUT);
+  await assertProcessAliveAndClean(ctx);
+  // Four requests for the turns and one for the summary.
+  expect(ctx.gateway.requests).toHaveLength(5);
+  const compacted = logLines(ctx.root.home, id).find((line) => line.kind === "compacted") as unknown as { data: { summary: string } };
+  const payload = JSON.parse(compacted.data.summary.slice("fx-compactor-v1\n".length));
+  return payload.entries.map((entry: { text: string }) => entry.text);
+}
+
+/// Reads three files around answered questions, then checks the rows the turn
+/// leaves, live and again after `--resume last`.
+async function expectAnsweredQuestionOrder(
+  responses: GatewayResponse[],
+  expected: string[],
+  questions = 1,
+  settings: Record<string, unknown> = {},
+) {
+  const ctx = await launchScenario(responses, "input", {}, "auto", undefined, {}, settings);
+  for (const name of ORDER_FILES) writeFileSync(join(ctx.root.workspace, name), `${name}\n`);
+  await ctx.session.sendText(ORDER_PROMPT);
+  await answerQuestions(ctx.session, questions);
+  const live = await waitForGridState(ctx.session, "live answered question order", hasOrderSummary, TIMEOUT);
+  expect(answeredQuestionRows(live)).toEqual(expected);
+  await assertProcessAliveAndClean(ctx);
+
+  session = await resumeLastSession(ctx);
+  const resumed = await waitForGridState(session, "resumed answered question order", hasOrderSummary, TIMEOUT);
+  expect(answeredQuestionRows(resumed)).toEqual(answeredQuestionRows(live));
+  expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
 }
 
 async function waitForPaneState(
@@ -1147,7 +1399,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await expectQuestionSelection(ctx.session, 1, "Inspect repo state");
 
       await resolveQuestionWithSecondOption(ctx.session);
-      const finalPane = await ctx.session.waitForText("Valid question continued.", TIMEOUT);
+      const finalPane = await ctx.session.waitForPane((pane) => pane.includes("Valid question continued.") && turnSettled(pane), TIMEOUT);
       expect(finalPane).toContain(VALID_QUESTION_PREAMBLE);
       expect(finalPane).not.toContain("SyntaxError");
       expect(finalPane).not.toContain("Request failed");
@@ -1183,7 +1435,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
 
       await ctx.session.sendText("Run the malformed question fixture.");
-      const pane = await ctx.session.waitForText("Malformed question recovered.", TIMEOUT);
+      const pane = await ctx.session.waitForPane((pane) => pane.includes("Malformed question recovered.") && turnSettled(pane), TIMEOUT);
       expect(pane).toContain("I need one detail before continuing.");
       expect(pane).not.toContain(QUESTION_PROMPT);
       expect(pane).not.toContain(APPROVAL_PROMPT);
@@ -3712,5 +3964,216 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "calls after an answered question draw below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerQuestionCall(),
+        outerToolCalls([readCall("read_2", "second.txt")]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question asked through toolbox draws as a direct one, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([TOOLBOX_QUESTION_CALL]),
+        outerToolCalls([readCall("read_2", "second.txt")]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ], 1, TOOLBOX_QUESTION_SETTINGS);
+      await expectResumedFullTranscriptQuestion();
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question streamed through toolbox draws as a direct one, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        streamedToolCalls([readCall("read_1", "first.txt")]),
+        streamedToolCalls([TOOLBOX_QUESTION_CALL]),
+        streamedToolCalls([readCall("read_2", "second.txt")]),
+        streamedToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ], 1, TOOLBOX_QUESTION_SETTINGS);
+      await expectResumedFullTranscriptQuestion();
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a question asked through toolbox and cancelled at its prompt leaves the rows of a direct one, live and after resume",
+    async () => {
+      await expectCancelledQuestionRows([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([TOOLBOX_QUESTION_CALL]),
+      ], {
+        live: [`┃ ${ORDER_PROMPT}`, "● Read first.txt", CANCELLED_NOTICE],
+        resumed: [`┃ ${ORDER_PROMPT}`, "● Read first.txt", `${CANCELLED_NOTICE} · What can fx do differently?`],
+      }, TOOLBOX_QUESTION_SETTINGS);
+      // The full transcript ends the turn with its notice, as a direct
+      // question's does, not with a row for the question's call.
+      const full = await fullTranscriptRows(session!, CANCELLED_NOTICE);
+      expect(full.at(-2)).toBe(`${CANCELLED_NOTICE} · What can fx do differently?`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "the auto-mode review reads the answer to a question asked through toolbox as the user's answer",
+    async () => {
+      const prior = firstPriorResult(await reviewRequestAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS));
+      expect(prior).toContain("prior_tool_result[0].tool: toolbox");
+      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "the auto-mode review reads the answer to a direct question as the user's answer",
+    async () => {
+      const prior = firstPriorResult(await reviewRequestAfterAnswer(QUESTION_CALL));
+      expect(prior).toContain("prior_tool_result[0].tool: ask_user_question");
+      expect(prior).toContain(`prior_tool_result[0].user_answer: [{"question":"${QUESTION_PROMPT}","answer":"Run tests"}]`);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "compaction keeps the answer to a question asked through toolbox as the user's words",
+    async () => {
+      expect(await compactedRulesAfterAnswer(TOOLBOX_QUESTION_CALL, TOOLBOX_QUESTION_SETTINGS)).toEqual([ANSWER_RULE]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "compaction keeps the answer to a direct question as the user's words",
+    async () => {
+      expect(await compactedRulesAfterAnswer(QUESTION_CALL)).toEqual([ANSWER_RULE]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "prose before the calls after an answered question keeps them below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerQuestionCall(),
+        sse([
+          { type: "text-delta", id: "prose_1", delta: "Reading the second file." },
+          { type: "tool-call", toolCallId: "read_2", toolName: "read_file", input: { path: "second.txt" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "  Reading the second file.",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "calls after each of two answered questions draw below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerQuestionCall(),
+        outerToolCalls([readCall("read_2", "second.txt")]),
+        outerToolCalls([{ ...QUESTION_CALL, id: "question_outer_2" }]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read third.txt",
+        `  ${ORDER_DONE}`,
+      ], 2);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "streamed calls after an answered question draw below it, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        streamedToolCalls([readCall("read_1", "first.txt")]),
+        streamedToolCalls([QUESTION_CALL]),
+        streamedToolCalls([readCall("read_2", "second.txt")]),
+        streamedToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read second.txt, third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a call before the question in the same step stays above the answered question, live and after resume",
+    async () => {
+      await expectAnsweredQuestionOrder([
+        outerToolCalls([readCall("read_1", "first.txt")]),
+        outerToolCalls([readCall("read_2", "second.txt"), QUESTION_CALL]),
+        outerToolCalls([readCall("read_3", "third.txt")]),
+        outerText(ORDER_DONE),
+      ], [
+        `┃ ${ORDER_PROMPT}`,
+        "● Read first.txt, second.txt",
+        `  1) ${QUESTION_PROMPT}`,
+        "     Run tests",
+        "● Read third.txt",
+        `  ${ORDER_DONE}`,
+      ]);
+    },
+    TIMEOUT * 2,
   );
 });

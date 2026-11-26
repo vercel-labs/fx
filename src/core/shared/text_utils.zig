@@ -1398,35 +1398,72 @@ fn cutShortSecretStart(text: []const u8, floor: usize, end: usize) ?usize {
     return earliest;
 }
 
+/// What a redacted value is shown as.
+const redacted_marker = "[redacted]";
+
+/// Where a URL's authority is, from after "://" to the first '/', '?', or
+/// '#', and where its host starts (`urlUserInfoEnd`).
+pub const UrlAuthority = struct {
+    start: usize,
+    host_start: usize,
+    end: usize,
+};
+
+/// Null for text with no "://".
+pub fn urlAuthority(url: []const u8) ?UrlAuthority {
+    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
+    const start = scheme_end + "://".len;
+    const end = firstDelimiter(url, start, "/?#");
+    return .{ .start = start, .host_start = urlUserInfoEnd(url, start, end), .end = end };
+}
+
+/// Where a user name and password that start at `start` end, in a URL whose
+/// authority may end at `end`: after the last '@' before it, as a browser
+/// reads them, so a password with an unescaped '@' stays in them. `start`
+/// when there is no '@'.
+fn urlUserInfoEnd(url: []const u8, start: usize, end: usize) usize {
+    return if (std.mem.findScalarLast(u8, url[start..end], '@')) |at| start + at + 1 else start;
+}
+
+/// `redactUrlForDisplay` for a URL whose host the caller cannot trust, which
+/// also redacts what comes before the last '@' after the scheme: a '/', '?',
+/// or '#' in a password ends the authority before its '@'. Caller owns the
+/// result.
+pub fn redactUrlWithNoHost(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
+    const redacted = try redactUrlForDisplay(alloc, raw_url);
+    const start = if (urlAuthority(redacted)) |authority| authority.start else 0;
+    const user_info_end = urlUserInfoEnd(redacted, start, redacted.len);
+    if (user_info_end == start) return redacted;
+    defer alloc.free(redacted);
+    return std.mem.concat(alloc, u8, &.{ redacted[0..start], redacted_marker ++ "@", redacted[user_info_end..] });
+}
+
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
-    const scheme_end = std.mem.find(u8, raw_url, "://");
+    const authority = urlAuthority(raw_url);
     var query_search_start: usize = 0;
-    if (scheme_end) |end| {
-        const authority_start = end + "://".len;
-        const authority_end = firstDelimiter(raw_url, authority_start, "/?#");
-        if (std.mem.findScalar(u8, raw_url[authority_start..authority_end], '@')) |at| {
-            out.writer.writeAll(raw_url[0..authority_start]) catch return error.OutOfMemory;
-            out.writer.writeAll("[redacted]@") catch return error.OutOfMemory;
-            out.writer.writeAll(raw_url[authority_start + at + 1 .. authority_end]) catch return error.OutOfMemory;
+    if (authority) |parts| {
+        if (parts.host_start > parts.start) {
+            out.writer.writeAll(raw_url[0..parts.start]) catch return error.OutOfMemory;
+            out.writer.writeAll(redacted_marker ++ "@") catch return error.OutOfMemory;
+            out.writer.writeAll(raw_url[parts.host_start..parts.end]) catch return error.OutOfMemory;
         } else {
-            out.writer.writeAll(raw_url[0..authority_end]) catch return error.OutOfMemory;
+            out.writer.writeAll(raw_url[0..parts.end]) catch return error.OutOfMemory;
         }
-        query_search_start = authority_end;
+        query_search_start = parts.end;
     }
 
-    if (scheme_end == null) query_search_start = 0;
     const query_marker = std.mem.findScalarPos(u8, raw_url, query_search_start, '?') orelse {
-        if (scheme_end == null) {
+        if (authority == null) {
             out.writer.writeAll(raw_url) catch return error.OutOfMemory;
         } else {
             out.writer.writeAll(raw_url[query_search_start..]) catch return error.OutOfMemory;
         }
         return out.toOwnedSlice() catch return error.OutOfMemory;
     };
-    if (scheme_end == null) {
+    if (authority == null) {
         out.writer.writeAll(raw_url[0 .. query_marker + 1]) catch return error.OutOfMemory;
     } else {
         out.writer.writeAll(raw_url[query_search_start .. query_marker + 1]) catch return error.OutOfMemory;
@@ -1441,7 +1478,7 @@ pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{
         if (equals < segment_end) {
             out.writer.writeByte('=') catch return error.OutOfMemory;
             if (sensitiveUrlQueryKey(raw_url[segment_start..equals])) {
-                out.writer.writeAll("[redacted]") catch return error.OutOfMemory;
+                out.writer.writeAll(redacted_marker) catch return error.OutOfMemory;
             } else {
                 out.writer.writeAll(raw_url[equals + 1 .. segment_end]) catch return error.OutOfMemory;
             }
@@ -3057,6 +3094,36 @@ test "redactUrlForDisplay masks credential-like query values" {
         "https://[redacted]@example.com/docs?safe=ok&token=[redacted]&X-Amz-%43redential=[redacted]&X-Amz-Signature=[redacted]",
         redacted,
     );
+}
+
+test "redactUrlForDisplay hides a password that holds an unescaped @" {
+    const alloc = std.testing.allocator;
+    const redacted = try redactUrlForDisplay(alloc, "https://user:p@ss@example.com/docs?token=abc");
+    defer alloc.free(redacted);
+    try std.testing.expectEqualStrings("https://[redacted]@example.com/docs?token=[redacted]", redacted);
+
+    // An '@' in the path is not part of the authority.
+    const path = try redactUrlForDisplay(alloc, "https://example.com/@user/post");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("https://example.com/@user/post", path);
+}
+
+test "redactUrlWithNoHost hides a user name and password that hold a '/', '?', or '#'" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { url: []const u8, shown: []const u8 }{
+        .{ .url = "https://user:pass?x@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:pa/ss@127.0.0.1/x", .shown = "https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:pa#ss@host/", .shown = "https://[redacted]@host/" },
+        .{ .url = "https://user:p@ss@127.0.0.1/x?token=abc", .shown = "https://[redacted]@127.0.0.1/x?token=[redacted]" },
+        .{ .url = "https://user:secret@/docs", .shown = "https://[redacted]@/docs" },
+        .{ .url = "user:secret@agentclientprotocol.com/docs", .shown = "[redacted]@agentclientprotocol.com/docs" },
+        .{ .url = "file://srv/share/x", .shown = "file://srv/share/x" },
+    };
+    for (cases) |case| {
+        const shown = try redactUrlWithNoHost(alloc, case.url);
+        defer alloc.free(shown);
+        try std.testing.expectEqualStrings(case.shown, shown);
+    }
 }
 
 test "redactUrlForDisplay preserves benign keys containing sig" {

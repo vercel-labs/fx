@@ -369,7 +369,9 @@ pub const Delivery = union(enum) {
 /// `QueueFull`: the receiving agent's queue already holds
 /// `agent_frame.queue_cap` messages from other agents. Only a message is
 /// refused this way, never a report.
-pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull };
+/// `ReceiverRestarting`: the receiving agent stops its turn for fx's restart
+/// and takes no message before fx exits; the sender puts it in its report.
+pub const PostReportError = error{ OutOfMemory, AgentGone, QueueFull, ReceiverRestarting };
 
 pub const ProgressSink = struct {
     context: *anyopaque,
@@ -2313,7 +2315,7 @@ pub const Runtime = struct {
                 .result = try mailArrivedText(roster_arena.allocator(), senders, read),
                 .subagents = waited_for,
             }),
-            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
+            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = nudgedWaitResult(worker.yield_requested.load(.seq_cst)), .subagents = waited_for }),
             .stopped => error.Cancelled,
         };
     }
@@ -2961,7 +2963,11 @@ pub const Runtime = struct {
             .child_id = options.caller_id,
             .text = text,
             .user_typed = typed,
-        } }) catch |err| return self.refuse(alloc, if (err == error.QueueFull) .{ .queue_full = .parent } else .{ .no_parent = .unreachable_now });
+        } }) catch |err| return self.refuse(alloc, switch (err) {
+            error.QueueFull => .{ .queue_full = .parent },
+            error.ReceiverRestarting => .{ .no_parent = .restarting },
+            else => .{ .no_parent = .unreachable_now },
+        });
         debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
@@ -3743,6 +3749,24 @@ fn callToolResult(runtime: *Runtime, arena: Allocator, input: model_contract.Req
         .timestamp_ms = 1,
         .caller_worker = worker,
     });
+}
+
+/// What a `wait` that a nudge ended returns: a subagent's turn ended without
+/// a report, or fx asked the caller's turn to stop for an upgrade's restart
+/// while its subagents keep working (`WorkerRuntime.requestYield`).
+fn nudgedWaitResult(restarting: bool) []const u8 {
+    return if (restarting)
+        "fx is restarting for an upgrade, so this wait ends here. The subagents keep working, and their reports arrive after the restart."
+    else
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.";
+}
+
+test "a wait that the upgrade's restart ends says the reports come after it" {
+    try std.testing.expect(std.mem.find(u8, nudgedWaitResult(true), "reports arrive after the restart") != null);
+    try std.testing.expectEqualStrings(
+        "A subagent's turn ended without a report. Call status to see where things stand, or wait again.",
+        nudgedWaitResult(false),
+    );
 }
 
 fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
@@ -7834,6 +7858,11 @@ fn postFull(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
     return error.QueueFull;
 }
 
+/// A sink whose receiver stops its turn for fx's restart.
+fn postRestarting(_: ?*anyopaque, _: *Runtime, _: Delivery) PostReportError!void {
+    return error.ReceiverRestarting;
+}
+
 /// A sink that posts into a real worker queue, as the app's, `fx ask`'s and
 /// ACP's do, so the cap on messages is that queue's own.
 fn postToWorker(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
@@ -7901,6 +7930,10 @@ test "every refusal the host returns tells the model what happened and what to d
     try checkRefusalSentence(&problems, "the parent is gone", "no_parent", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-10", null));
     runtime.report_sink = .{ .context = null, .post_fn = postFull };
     try checkRefusalSentence(&problems, "the parent's queue is full", "queue_full", try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11", null));
+    runtime.report_sink = .{ .context = null, .post_fn = postRestarting };
+    const restarting = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-11r", null);
+    try checkRefusalSentence(&problems, "the parent restarts for an upgrade", "no_parent", restarting);
+    if (std.mem.find(u8, restarting, "restarting for an upgrade") == null) try problems.print(alloc, "the parent restarts for an upgrade: the refusal does not name the restart: {s}\n", .{restarting});
     runtime.report_sink = sink;
 
     // A subagent that is being closed.

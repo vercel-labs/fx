@@ -347,7 +347,7 @@ test("the user talks to the parent while its subagent works, and a stop ends the
     await tui.waitForStableComposer(15000);
     await tui.sendText("STEERING_START");
     // The parent's turn ends with the receipt while its subagent works.
-    await tui.waitForText("START_SENT", 10000);
+    await tui.waitForPane((pane) => pane.includes("START_SENT") && turnSettled(pane), 10000);
     await tui.waitForPane(() => childRequests === 1, 10000);
     await tui.waitForPane(() => work().spawns === 1, 10000);
     const original = work();
@@ -1593,7 +1593,7 @@ describe("gateway stream lifecycle", () => {
       });
       await session.waitForStableComposer(15_000);
       await session.sendText("!echo bang-routing-probe");
-      await session.waitForText("BANG_PROMPT_ROUTED", 15_000);
+      await session.waitForPane((pane) => pane.includes("BANG_PROMPT_ROUTED") && turnSettled(pane), 15_000);
       expect(gateway.requests).toHaveLength(1);
       await session.sendText("/quit");
       await session.waitForPane(() => session!.paneStatus().dead, 10_000);
@@ -7019,7 +7019,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(result.quiet_notice).toBeUndefined();
   }
 
-  test("a quiet shell command ends an interact at the quiet limit and asks the model to check it", async () => {
+  test("a quiet shell command runs an interact to its requested time and asks the model to check it", async () => {
     const arrivals: number[] = [];
     let sessionId = "";
     const at = (body: string, index: number) => {
@@ -7044,13 +7044,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(started.quiet_ms!).toBeLessThan(QUIET_LIMIT_MS);
           expect(started.quiet_notice).toBeUndefined();
           sessionId = started.session_id ?? "";
-          return shellInteract("shell_quiet_first_wait", sessionId, 20_000);
+          return shellInteract("shell_quiet_first_wait", sessionId, 5_000);
         },
         (body) => {
           at(body, 2);
-          // The wait started before the limit, so it ends when the quiet
-          // time crosses it, long before its 20 second yield.
-          expect(arrivals[2]! - arrivals[1]!).toBeLessThan(10_000);
+          // The wait started before the limit, so it still runs to its
+          // 5 second ceiling and asks the model to check the command.
+          expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_first_wait");
           expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
@@ -7060,12 +7061,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         },
         (body) => {
           at(body, 3);
-          // Already past the limit, the wait runs its whole yield, so a
-          // model that waits again is not woken at once.
-          expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(4_900);
+          // Already past the limit, the wait runs its whole yield as well.
+          expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[3]! - arrivals[2]!).toBeLessThanOrEqual(10_000);
           const later = shellResult(body, "shell_quiet_later_wait");
           expect(later.state).toBe("running");
-          expect(later.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS + 4_900);
+          expect(later.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS + 5_000);
           expect(later.quiet_notice).toContain("still working or has hung");
           return shellStop("shell_quiet_stop", sessionId);
         },
@@ -7080,7 +7081,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }, 60_000);
 
-  test("a quiet shell command ends a long run at the quiet limit and asks the model to check it", async () => {
+  test("a long run waits its requested time and still asks the model to check a quiet command", async () => {
     const arrivals: number[] = [];
     let sessionId = "";
     await runQuietFixture(
@@ -7089,16 +7090,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       [
         () => {
           arrivals[0] = Date.now();
-          return fakeShellRun("shell_quiet_long_run", "sleep 30", { profile: "clean", yield_time_ms: 20_000 });
+          return fakeShellRun("shell_quiet_long_run", "sleep 30", { profile: "clean", yield_time_ms: 3_500 });
         },
         (body) => {
           arrivals[1] = Date.now();
-          // The run ends when the quiet time crosses the limit, long before
-          // its 20 second yield.
-          expect(arrivals[1]! - arrivals[0]!).toBeLessThan(10_000);
+          // The run waits its full 3.5 second yield past the quiet limit.
+          expect(arrivals[1]! - arrivals[0]!).toBeGreaterThanOrEqual(3_500);
+          expect(arrivals[1]! - arrivals[0]!).toBeLessThanOrEqual(8_500);
           const crossed = shellResult(body, "shell_quiet_long_run");
           expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(crossed.running_ms!).toBeGreaterThanOrEqual(3_500);
           expect(crossed.quiet_notice).toContain("still working or has hung");
           sessionId = crossed.session_id ?? "";
           return shellStop("shell_quiet_long_run_stop", sessionId);
@@ -7113,7 +7115,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }, 60_000);
 
-  test("a quiet shell command's limit restarts at new output", async () => {
+  test("a quiet shell command's quiet time restarts at new output while the wait runs its ceiling", async () => {
+    const arrivals: number[] = [];
     let resetSession = "";
     await runQuietFixture(
       "shell-quiet-reset",
@@ -7126,19 +7129,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             { profile: "clean", yield_time_ms: 200 },
           ),
         (body) => {
+          arrivals[1] = Date.now();
           const started = shellResult(body, "shell_quiet_reset_run");
           expect(started.state).toBe("running");
           expect(started.quiet_notice).toBeUndefined();
           resetSession = started.session_id ?? "";
-          return shellInteract("shell_quiet_reset_wait", resetSession, 20_000);
+          return shellInteract("shell_quiet_reset_wait", resetSession, 5_000);
         },
         (body) => {
-          // QUIET-B came about 1 second in, before the limit, so the wait
-          // ended at the limit after it, not 1.5 seconds in.
+          arrivals[2] = Date.now();
+          // The wait runs its full 5 second ceiling; QUIET-B came ~1 s in, so
+          // quiet_ms restarted there and still crossed the limit by the end.
+          expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_reset_wait");
+          expect(crossed.state).toBe("running");
           expect(crossed.output_delta).toContain("QUIET-B");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
-          expect(crossed.running_ms!).toBeGreaterThanOrEqual(2_300);
+          expect(crossed.running_ms!).toBeGreaterThanOrEqual(5_000);
+          expect(crossed.running_ms! - crossed.quiet_ms!).toBeGreaterThanOrEqual(800);
           expect(crossed.quiet_notice).toContain("still working or has hung");
           return shellStop("shell_quiet_reset_stop", resetSession);
         },
@@ -7151,7 +7160,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
   }, 60_000);
 
-  test("a quiet shell command that never printed counts from its start, and a short yield ends at the yield", async () => {
+  test("a quiet shell command that never printed counts from its start, and waits run their requested time", async () => {
     // A longer limit than the other quiet tests, so the shortest wait an
     // interact takes, 5 seconds, ends well before it.
     const limitMs = 8_000;
@@ -7174,17 +7183,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         (body) => {
           arrivals[2] = Date.now();
           // A yield shorter than the time left ends at the yield.
-          expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(4_900);
+          expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[2]! - arrivals[1]!).toBeLessThanOrEqual(10_000);
           const short = shellResult(body, "shell_quiet_short_wait");
           expect(short.state).toBe("running");
           expect(short.quiet_ms!).toBeLessThan(limitMs);
           expect(short.quiet_notice).toBeUndefined();
-          return shellInteract("shell_quiet_silent_wait", silentSession, 20_000);
+          return shellInteract("shell_quiet_silent_wait", silentSession, 5_000);
         },
         (body) => {
           arrivals[3] = Date.now();
-          expect(arrivals[3]! - arrivals[2]!).toBeLessThan(10_000);
+          expect(arrivals[3]! - arrivals[2]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[3]! - arrivals[2]!).toBeLessThanOrEqual(10_000);
           const crossed = shellResult(body, "shell_quiet_silent_wait");
+          expect(crossed.state).toBe("running");
           expect(crossed.quiet_ms!).toBeGreaterThanOrEqual(limitMs);
           expect(crossed.quiet_ms).toBe(crossed.running_ms);
           expect(crossed.quiet_notice).toContain("still working or has hung");
@@ -7292,6 +7304,68 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         () => fakeGatewayFinalText("Terminal session checked."),
       ],
       "Terminal session checked.",
+    );
+  }, 60_000);
+
+  test("a silent command's run and interact wait at least their requested yield past the quiet limit", async () => {
+    const arrivals: number[] = [];
+    let firstSession = "";
+    let secondSession = "";
+    const at = (body: string, index: number) => {
+      arrivals[index] = Date.now();
+      return body;
+    };
+    await runQuietFixture(
+      "shell-quiet-esteban-requested-yield",
+      ["ask", "--json", "--yolo", "--no-save", "Run silent commands past the quiet limit."],
+      [
+        (body) => {
+          at(body, 0);
+          return fakeShellRun("eb30_quiet_run", "sleep 30", { profile: "clean", yield_time_ms: 3_500 });
+        },
+        (body) => {
+          at(body, 1);
+          expect(arrivals[1]! - arrivals[0]!).toBeGreaterThanOrEqual(3_500);
+          expect(arrivals[1]! - arrivals[0]!).toBeLessThanOrEqual(8_500);
+          const runResult = shellResult(body, "eb30_quiet_run");
+          expect(runResult.state).toBe("running");
+          expect(runResult.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(runResult.running_ms!).toBeGreaterThanOrEqual(3_500);
+          expect(runResult.quiet_ms).toBe(runResult.running_ms);
+          expect(runResult.quiet_notice).toContain("still working or has hung");
+          firstSession = runResult.session_id ?? "";
+          return shellStop("eb30_quiet_stop_1", firstSession);
+        },
+        (body) => {
+          expect(shellResult(body, "eb30_quiet_stop_1").state).toBe("stopped");
+          return fakeShellRun("eb30_quiet_run_2", "sleep 30", { profile: "clean", yield_time_ms: 200 });
+        },
+        (body) => {
+          at(body, 3);
+          const started = shellResult(body, "eb30_quiet_run_2");
+          expect(started.state).toBe("running");
+          expect(started.quiet_ms!).toBeLessThan(QUIET_LIMIT_MS);
+          secondSession = started.session_id ?? "";
+          return shellInteract("eb30_quiet_interact", secondSession, 5_000);
+        },
+        (body) => {
+          at(body, 4);
+          expect(arrivals[4]! - arrivals[3]!).toBeGreaterThanOrEqual(5_000);
+          expect(arrivals[4]! - arrivals[3]!).toBeLessThanOrEqual(10_000);
+          const waitResult = shellResult(body, "eb30_quiet_interact");
+          expect(waitResult.state).toBe("running");
+          expect(waitResult.quiet_ms!).toBeGreaterThanOrEqual(QUIET_LIMIT_MS);
+          expect(waitResult.running_ms!).toBeGreaterThanOrEqual(5_000);
+          expect(waitResult.quiet_ms).toBe(waitResult.running_ms);
+          expect(waitResult.quiet_notice).toContain("still working or has hung");
+          return shellStop("eb30_quiet_stop_2", secondSession);
+        },
+        (body) => {
+          expect(shellResult(body, "eb30_quiet_stop_2").state).toBe("stopped");
+          return fakeGatewayFinalText("Requested yield checked.");
+        },
+      ],
+      "Requested yield checked.",
     );
   }, 60_000);
 
@@ -13452,7 +13526,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       child.release("CHILD_REPORT_TEXT");
       await tui.waitForPane(() => /event=mail_posted .*mail=report delivery=joined/.test(trace()), 10000);
       parentHold.release!();
-      await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_REPORT_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(childRequests).toBe(1);
       expect(parentBodies).toHaveLength(3);
@@ -13575,7 +13649,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_HANDOFF_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_HANDOFF_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(childRequests()).toBe(1);
       // The report takes the nudge's place, as one that waited in the
@@ -13625,7 +13699,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         10000,
       );
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_MESSAGE_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_MESSAGE_ALL_DONE") && turnSettled(pane), 10000);
 
       const next = parentBodies[2]!;
       expect(next).toContain("CHILD_MESSAGE_TEXT");
@@ -13717,7 +13791,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       secondHold.release!();
       await tui.waitForText("Continue with a follow-up prompt if needed.", 10000);
       writeFileSync(paths.release, "");
-      await tui.waitForText("EMPTY_SECOND_REPORT_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_SECOND_REPORT_DONE") && turnSettled(pane), 10000);
 
       expect(parentBodies).toHaveLength(4);
       expect(parentBodies[3]).toContain("CHILD_REPORT_TEXT");
@@ -13746,7 +13820,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       tui = await startHandoffTui(root, gateway, paths);
       await tui.waitForStableComposer(15000);
       await tui.sendText("EMPTY_PLAIN_START");
-      await tui.waitForText("EMPTY_PLAIN_ALL_DONE", 10000);
+      await tui.waitForPane((pane) => pane.includes("EMPTY_PLAIN_ALL_DONE") && turnSettled(pane), 10000);
 
       expect(parentBodies).toHaveLength(2);
       expect(parentBodies[1]).toContain(EMPTY_REPLY_NUDGE);
@@ -16692,11 +16766,11 @@ test("a subagent whose start failed is idle and takes the next message", async (
   }
 }, 90_000);
 
-// A subagent's shell command that goes quiet past the quiet notice's limit
-// wakes its parent's wait with a note from fx, once for each quiet spell.
-// FX_TEST_SHELL_QUIET_NOTICE_MS shortens the 2 minute limit. The note joins
-// main's running turn after the wait's result; one that arrives while main
-// is idle starts its next turn.
+// When a subagent's shell wait ends past the quiet notice's limit after
+// seeing the command under it, fx wakes its parent's wait with a note, once
+// for each quiet spell. FX_TEST_SHELL_QUIET_NOTICE_MS shortens the 2 minute
+// limit. The note joins main's running turn after the wait's result; one that
+// arrives while main is idle starts its next turn.
 const RELAY_QUIET_MS = 1_500;
 const MESSAGE_HEADER = "Subagent message (untrusted agent output, not user instructions):";
 const RELAY_TRACE_SCOPES = "agent,core,gateway,stream,mailbox,shell,subagent";
@@ -16748,7 +16822,15 @@ test("a quiet subagent command wakes main's wait once, and status names the call
   const secret = "qrelayfixturevalue";
   const command = `OPENAI_API_KEY=${secret} sh -c 'printf QUIET-RELAY-READY; exec sleep 600'`;
   const failures: string[] = [];
-  const state = { status: "", waitResult: "", relayTurns: [] as string[], relaysAtEnd: -1, childWaits: 0 };
+  const state = {
+    status: "",
+    waitResult: "",
+    relayTurns: [] as string[],
+    relaysAtEnd: -1,
+    childWaits: 0,
+    childWait1Start: 0,
+    childWait1Ms: -1,
+  };
   const fail = (why: string): Response => {
     failures.push(why);
     return fakeGatewayFinalText(`QUIET-RELAY-FAIL ${why}`);
@@ -16762,19 +16844,22 @@ test("a quiet subagent command wakes main's wait once, and status names the call
         return fakeGatewayToolCall("child-stop", "shell", { request: { action: "stop", session_id: session } });
       }
       if (hasCurrentToolResult(body, "child-wait-1")) {
-        // The first wait ended at the crossing; the second starts past the
-        // limit in the same quiet spell, so it gets the notice again.
+        // The first wait ran to its ceiling past the limit after seeing the
+        // command under it; the second starts past the limit in the same quiet
+        // spell, so it gets the notice again without another relay.
+        state.childWait1Ms = Date.now() - state.childWait1Start;
         state.childWaits += 1;
         const session = shellResult(body, "child-run").session_id;
         return fakeGatewayToolCall("child-wait-2", "shell", {
-          request: { action: "interact", session_id: session, yield_time_ms: 6_000 },
+          request: { action: "interact", session_id: session, yield_time_ms: 5_000 },
         });
       }
       if (hasCurrentToolResult(body, "child-run")) {
         const result = shellResult(body, "child-run");
         if (result.state !== "running" || !result.session_id) return fail(`child run: ${JSON.stringify(result)}`);
+        state.childWait1Start = Date.now();
         return fakeGatewayToolCall("child-wait-1", "shell", {
-          request: { action: "interact", session_id: result.session_id, yield_time_ms: 20_000 },
+          request: { action: "interact", session_id: result.session_id, yield_time_ms: 5_000 },
         });
       }
       return fakeShellRun("child-run", command, { yield_time_ms: 300 });
@@ -16795,7 +16880,7 @@ test("a quiet subagent command wakes main's wait once, and status names the call
       if (isQuietRelay(latest) && !state.relayTurns.includes(latest)) state.relayTurns.push(latest);
       // Status once the subagent is in its second wait: between two calls
       // it has no current call to name. The pause after the gateway sends
-      // that wait lets fx start it; the wait lasts 6 s.
+      // that wait lets fx start it; the wait lasts 5 s.
       return (async () => {
         const deadline = Date.now() + 10_000;
         while (state.childWaits === 0 && Date.now() < deadline) await Bun.sleep(25);
@@ -16833,6 +16918,8 @@ test("a quiet subagent command wakes main's wait once, and status names the call
     expect(state.waitResult, context).toContain("A report or message arrived. It follows this result.");
     expect(failures, context).toEqual([]);
     expect(result.code, context).toBe(0);
+    expect(state.childWait1Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait1Ms, context).toBeLessThanOrEqual(10_000);
     // One note, which names the subagent and the command.
     expect(state.relayTurns.length, context).toBe(1);
     expect(state.relayTurns[0]).toContain('"agent":"worker"');
@@ -16850,10 +16937,19 @@ test("a quiet subagent command wakes main's wait once, and status names the call
 test("a subagent command that prints and goes quiet again is relayed again", async () => {
   const root = createFixtureRoot("quiet-relay-again");
   const tracePath = join(root.root, "trace.log");
-  // A first spell from the start, output at 3 s, then a second spell.
-  const command = "sh -c 'printf QUIET-AGAIN-A; sleep 3; printf QUIET-AGAIN-B; exec sleep 600'";
+  // A first spell during the first 5 s wait, output at 7 s during the second
+  // wait, then a second spell past the limit by the end of the second wait.
+  const command = "sh -c 'printf QUIET-AGAIN-A; sleep 7; printf QUIET-AGAIN-B; exec sleep 600'";
   const failures: string[] = [];
-  const state = { relayTurns: [] as string[], relaysAtEnd: -1 };
+  const state = {
+    relayTurns: [] as string[],
+    relaysAtEnd: -1,
+    childWait1Start: 0,
+    childWait1Ms: -1,
+    childWait2Start: 0,
+    childWait2Ms: -1,
+    childWait2Delta: "",
+  };
   const fail = (why: string): Response => {
     failures.push(why);
     return fakeGatewayFinalText(`QUIET-AGAIN-FAIL ${why}`);
@@ -16863,17 +16959,22 @@ test("a subagent command that prints and goes quiet again is relayed again", asy
       const session = hasToolResultAnywhere(body, "child-run") ? shellResult(body, "child-run").session_id : undefined;
       if (hasCurrentToolResult(body, "child-stop")) return fakeGatewayFinalText("QUIET-AGAIN-CHILD-DONE");
       if (hasCurrentToolResult(body, "child-wait-2")) {
+        state.childWait2Ms = Date.now() - state.childWait2Start;
+        state.childWait2Delta = shellResult(body, "child-wait-2").output_delta ?? "";
         return fakeGatewayToolCall("child-stop", "shell", { request: { action: "stop", session_id: session } });
       }
       if (hasCurrentToolResult(body, "child-wait-1")) {
+        state.childWait1Ms = Date.now() - state.childWait1Start;
+        state.childWait2Start = Date.now();
         return fakeGatewayToolCall("child-wait-2", "shell", {
-          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+          request: { action: "interact", session_id: session, yield_time_ms: 5_000 },
         });
       }
       if (hasCurrentToolResult(body, "child-run")) {
         if (!session) return fail("child run has no session");
+        state.childWait1Start = Date.now();
         return fakeGatewayToolCall("child-wait-1", "shell", {
-          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+          request: { action: "interact", session_id: session, yield_time_ms: 5_000 },
         });
       }
       return fakeShellRun("child-run", command, { yield_time_ms: 300 });
@@ -16910,7 +17011,12 @@ test("a subagent command that prints and goes quiet again is relayed again", asy
       timeoutMs: 40_000,
     });
     const context = relayContext(result, tracePath);
-    // One note for each quiet spell, each its own turn of main's.
+    // Both waits ran to their 5 s ceiling, and each spell sent one note.
+    expect(state.childWait1Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait1Ms, context).toBeLessThanOrEqual(10_000);
+    expect(state.childWait2Ms, context).toBeGreaterThanOrEqual(5_000);
+    expect(state.childWait2Ms, context).toBeLessThanOrEqual(10_000);
+    expect(state.childWait2Delta, context).toContain("QUIET-AGAIN-B");
     expect(state.relayTurns.length, context).toBe(2);
     expect(failures, context).toEqual([]);
     expect(result.code, context).toBe(0);
@@ -16931,7 +17037,7 @@ test("a subagent command that ends before the quiet limit is never relayed", asy
       if (hasCurrentToolResult(body, "child-run")) {
         const session = shellResult(body, "child-run").session_id;
         return fakeGatewayToolCall("child-wait", "shell", {
-          request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+          request: { action: "interact", session_id: session, yield_time_ms: 5_000 },
         });
       }
       // Ends at about half the limit.
@@ -16984,16 +17090,22 @@ test("a subagent command that ends before the quiet limit is never relayed", asy
 test("main's own quiet command gets the notice and no relay, since main has no parent", async () => {
   const root = createFixtureRoot("quiet-relay-main");
   const tracePath = join(root.root, "trace.log");
+  let mainWaitStart = 0;
+  let mainWaitMs = -1;
+  let mainWaitResult: ShellResult | null = null;
   const gateway = startDynamicFakeGateway((body) => {
     if (hasCurrentToolResult(body, "main-stop")) return fakeGatewayFinalText("QUIET-MAIN-DONE");
     if (hasCurrentToolResult(body, "main-wait")) {
+      mainWaitMs = Date.now() - mainWaitStart;
+      mainWaitResult = shellResult(body, "main-wait");
       const session = shellResult(body, "main-run").session_id;
       return fakeGatewayToolCall("main-stop", "shell", { request: { action: "stop", session_id: session } });
     }
     if (hasCurrentToolResult(body, "main-run")) {
       const session = shellResult(body, "main-run").session_id;
+      mainWaitStart = Date.now();
       return fakeGatewayToolCall("main-wait", "shell", {
-        request: { action: "interact", session_id: session, yield_time_ms: 20_000 },
+        request: { action: "interact", session_id: session, yield_time_ms: 5_000 },
       });
     }
     return fakeShellRun("main-run", "sh -c 'printf QUIET-MAIN; exec sleep 600'", { yield_time_ms: 300 });
@@ -17015,8 +17127,13 @@ test("main's own quiet command gets the notice and no relay, since main has no p
     const context = relayContext(result, tracePath);
     expect(result.code, context).toBe(0);
     expect(parseAskJson(result.stdout).output).toContain("QUIET-MAIN-DONE");
+    expect(mainWaitMs, context).toBeGreaterThanOrEqual(5_000);
+    expect(mainWaitMs, context).toBeLessThanOrEqual(10_000);
+    expect(mainWaitResult?.state, context).toBe("running");
+    expect(mainWaitResult?.quiet_ms ?? 0, context).toBeGreaterThanOrEqual(RELAY_QUIET_MS);
+    expect(mainWaitResult?.quiet_notice, context).toContain("still working or has hung");
     const trace = readFileSync(tracePath, "utf8");
-    // The crossing happened, and nothing was posted or dropped for it.
+    // The crossing happened at the wait's end, and nothing was posted or dropped for it.
     expect(trace, context).toContain("event=quiet_crossing");
     expect(trace, context).not.toContain("event=quiet_note_");
   } finally {

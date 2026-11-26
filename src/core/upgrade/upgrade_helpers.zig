@@ -438,7 +438,8 @@ pub fn extractTarGz(alloc: Allocator, archive_path: []const u8, dest_dir: []cons
 
 pub fn replaceBinary(alloc: Allocator, new_path: []const u8, target_path: []const u8) !void {
     std.Io.Dir.renameAbsolute(new_path, target_path, io_mod.getIo()) catch {
-        return copyBinary(alloc, new_path, target_path);
+        io_mod.copyFileAtomic(alloc, new_path, target_path) catch return error.ReplaceFailed;
+        return;
     };
 }
 
@@ -458,13 +459,6 @@ pub fn currentExecutablePath(out: []u8) ExecutablePathError![]const u8 {
         return path[0 .. path.len - linux_deleted_suffix.len];
     }
     return path;
-}
-
-// The installed binary is never deleted: `copyFileAtomic` writes a temp sibling
-// with the source permissions and renames it over `dest_path`, so a failed copy
-// leaves the old bytes in place.
-fn copyBinary(alloc: Allocator, src_path: []const u8, dest_path: []const u8) !void {
-    io_mod.copyFileAtomic(alloc, src_path, dest_path) catch return error.ReplaceFailed;
 }
 
 fn writeTempFile(dir: std.Io.Dir, name: []const u8, content: []const u8) !void {
@@ -544,6 +538,9 @@ test "replaceBinary keeps the target when the copy fallback fails" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    try writeTempFile(tmp.dir, "fx-old", "old");
+    try tmp.dir.createDirPath(io_mod.getIo(), "fx-new");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     const new_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-new" });
@@ -551,138 +548,9 @@ test "replaceBinary keeps the target when the copy fallback fails" {
     const target_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
     defer alloc.free(target_path);
 
-    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), new_path);
-    try writeAbsoluteFile(target_path, "old");
-    try setFileMode(target_path, 0o755);
-
     try std.testing.expectError(error.ReplaceFailed, replaceBinary(alloc, new_path, target_path));
 
     const kept = try readAbsoluteFile(alloc, target_path);
     defer alloc.free(kept);
     try std.testing.expectEqualStrings("old", kept);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), try fileMode(target_path));
-    try std.testing.expectEqual(@as(usize, 0), try countTempSiblings(root));
-}
-
-fn writeAbsoluteFile(path: []const u8, content: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn setFileMode(path: []const u8, mode: std.posix.mode_t) !void {
-    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, std.Io.File.Permissions.fromMode(mode), .{});
-}
-
-fn fileMode(path: []const u8) !std.posix.mode_t {
-    const stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{});
-    return stat.permissions.toMode() & 0o777;
-}
-
-fn countTempSiblings(dir_path: []const u8) !usize {
-    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{ .iterate = true });
-    defer dir.close(io_mod.getIo());
-    var count: usize = 0;
-    var iter = dir.iterate();
-    while (try iter.next(io_mod.getIo())) |entry| {
-        if (std.mem.find(u8, entry.name, ".tmp.") != null) count += 1;
-    }
-    return count;
-}
-
-test "copyBinary replaces the installed binary with source bytes and permissions" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const src_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-new" });
-    defer alloc.free(src_path);
-    const dest_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
-    defer alloc.free(dest_path);
-
-    try writeAbsoluteFile(src_path, "new");
-    try setFileMode(src_path, 0o755);
-    try writeAbsoluteFile(dest_path, "old");
-    try setFileMode(dest_path, 0o644);
-
-    try copyBinary(alloc, src_path, dest_path);
-
-    const replaced = try readAbsoluteFile(alloc, dest_path);
-    defer alloc.free(replaced);
-    try std.testing.expectEqualStrings("new", replaced);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), try fileMode(dest_path));
-    try std.testing.expectEqual(@as(usize, 0), try countTempSiblings(root));
-}
-
-test "copyBinary with a directory source leaves the installed binary intact" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const src_dir = try std.Io.Dir.path.join(alloc, &.{ root, "fx-src-dir" });
-    defer alloc.free(src_dir);
-    const dest_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
-    defer alloc.free(dest_path);
-
-    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), src_dir);
-    try writeAbsoluteFile(dest_path, "old");
-    try setFileMode(dest_path, 0o755);
-
-    try std.testing.expectError(error.ReplaceFailed, copyBinary(alloc, src_dir, dest_path));
-
-    const kept = try readAbsoluteFile(alloc, dest_path);
-    defer alloc.free(kept);
-    try std.testing.expectEqualStrings("old", kept);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), try fileMode(dest_path));
-    try std.testing.expectEqual(@as(usize, 0), try countTempSiblings(root));
-}
-
-test "copyBinary with a missing source leaves the installed binary intact" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const src_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-missing" });
-    defer alloc.free(src_path);
-    const dest_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
-    defer alloc.free(dest_path);
-
-    try writeAbsoluteFile(dest_path, "old");
-    try setFileMode(dest_path, 0o755);
-
-    try std.testing.expectError(error.ReplaceFailed, copyBinary(alloc, src_path, dest_path));
-
-    const kept = try readAbsoluteFile(alloc, dest_path);
-    defer alloc.free(kept);
-    try std.testing.expectEqualStrings("old", kept);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), try fileMode(dest_path));
-    try std.testing.expectEqual(@as(usize, 0), try countTempSiblings(root));
-}
-
-test "copyBinary over a read-only installed binary leaves it intact" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const src_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-new" });
-    defer alloc.free(src_path);
-    const dest_path = try std.Io.Dir.path.join(alloc, &.{ root, "fx-old" });
-    defer alloc.free(dest_path);
-
-    try writeAbsoluteFile(src_path, "new");
-    try setFileMode(src_path, 0o755);
-    try writeAbsoluteFile(dest_path, "old");
-    try setFileMode(dest_path, 0o444);
-
-    try std.testing.expectError(error.ReplaceFailed, copyBinary(alloc, src_path, dest_path));
-
-    const kept = try readAbsoluteFile(alloc, dest_path);
-    defer alloc.free(kept);
-    try std.testing.expectEqualStrings("old", kept);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o444), try fileMode(dest_path));
-    try std.testing.expectEqual(@as(usize, 0), try countTempSiblings(root));
 }

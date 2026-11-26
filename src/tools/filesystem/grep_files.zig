@@ -150,10 +150,10 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     return result;
 }
 
-// Only `tests/e2e/tui-interrupt-recovery.test.ts` sets
-// `FX_TEST_GREP_RELEASE`: a finished search then waits until the file it
-// names exists, so the test can cancel the turn while the tool is still
-// running. The libfx artifacts leave it out.
+// Only tests set `FX_TEST_GREP_RELEASE`, such as
+// `tests/e2e/tui-interrupt-recovery.test.ts`: a finished search then waits
+// until the file it names exists, so the test can cancel the turn while the
+// tool is still running. The libfx artifacts leave it out.
 fn holdForTest() void {
     if (comptime build_options.libfx) return;
     const release_path = io_mod.getenvAbsolutePath("FX_TEST_GREP_RELEASE") orelse return;

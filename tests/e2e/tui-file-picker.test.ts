@@ -28,6 +28,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const HAS_TMUX = tmuxAvailable();
@@ -1704,7 +1705,7 @@ describe("@ file picker", () => {
       await active.waitForText("Review @nested/deep/", TIMEOUT);
       await active.sendLiteral(" now");
       await active.sendKeys("Enter");
-      await active.waitForText("TYPED_PATH_PROMPT_OK", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("TYPED_PATH_PROMPT_OK") && turnSettled(pane), TIMEOUT);
       expect(gateway?.requests).toHaveLength(1);
       expect(gateway?.requests[0]?.body).toContain("Review @nested/deep/ now");
 
@@ -1902,7 +1903,7 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("@./missing/recovered.txt");
       await active.sendLiteral(" Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
       await active.sendKeys("Enter");
-      await active.waitForText("PRESENTED_PICKER_OK", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("PRESENTED_PICKER_OK") && turnSettled(pane), TIMEOUT);
       await active.waitForStableComposer(TIMEOUT);
       expect(gateway?.requests).toHaveLength(1);
       expect(gateway!.requests[0]!.body).toContain("@./missing/recovered.txt Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
@@ -1955,7 +1956,7 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("@~/Desktop/note.txt");
       await active.sendLiteral(" Reply briefly.");
       await active.sendKeys("Enter");
-      await active.waitForText("FUZZY_HOME_OK", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("FUZZY_HOME_OK") && turnSettled(pane), TIMEOUT);
       await active.waitForStableComposer(TIMEOUT);
       expect(gateway.requests).toHaveLength(1);
       expect(gateway.requests[0]!.body).toContain("@~/Desktop/note.txt Reply briefly.");

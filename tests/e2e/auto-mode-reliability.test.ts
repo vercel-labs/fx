@@ -3011,7 +3011,7 @@ describe("lean auto mode reliability", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the marker command.");
-      await activeSession.waitForText("retried review traced", TIMEOUT);
+      await activeSession.waitForPane((pane) => pane.includes("retried review traced") && turnSettled(pane), TIMEOUT);
       expect(existsSync(marker)).toBe(true);
 
       const report = await runTrace(activeSession, root.root);

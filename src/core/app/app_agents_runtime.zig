@@ -335,8 +335,9 @@ const Urgency = enum(u2) {
 /// first. A finished turn counts as idle.
 pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
 
-/// An agent that restarting fx, as an upgrade does, would stop, and what it
-/// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
+/// An agent that restarting fx, as an upgrade does, would stop while it
+/// waits for the user, and what it waits for (`Runtime.needsUserElsewhere`).
+/// `doing` is never `.working` or `.idle`.
 pub const BusyAgent = struct { name: []const u8, doing: Busiest };
 
 /// One subagent as `/trace` shows it (`Runtime.traceRows`): what the agent
@@ -371,6 +372,13 @@ fn busyAs(state: InstanceState) ?Busiest {
         .working => .working,
         .finished, .idle, .failed, .stopped => null,
     };
+}
+
+/// What `state` waits for the user for, or null when it does not: what
+/// `busyAs` says, without its working case.
+fn waitsForUserAs(state: InstanceState) ?Busiest {
+    const busy = busyAs(state) orelse return null;
+    return if (busy == .working) null else busy;
 }
 
 /// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
@@ -563,8 +571,11 @@ pub const ReportPost = struct {
     idle: bool = false,
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
+    /// Who started the turn that sent a message, read while that turn ran
+    /// (`messageStartedBy`).
+    started_by: ?subagent_reports.StartedBy = null,
 
-    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
+    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
         errdefer handoff_alloc.destroy(post);
         const agent, const child_id, const work_id, const text = switch (delivery) {
@@ -589,6 +600,7 @@ pub const ReportPost = struct {
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
             .idle = delivery == .report and delivery.report.idle,
+            .started_by = if (delivery == .message) started_by else null,
         };
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
@@ -620,12 +632,12 @@ pub const ReportPost = struct {
     }
 };
 
-test "a message's hand-off keeps its own copy of what the user typed" {
+test "a message's hand-off keeps its own copy of what the user typed, and who started its turn" {
     var host: subagent_tool_host.Runtime = undefined;
     var first = "tell main hi".*;
     var second = "and bye".*;
     const lines = [_][]const u8{ &first, &second };
-    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
+    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } }, .user);
     defer post.destroy();
     // The sender's buffers change once the post is made.
     @memset(&first, 'x');
@@ -633,27 +645,32 @@ test "a message's hand-off keeps its own copy of what the user typed" {
     try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
     try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
     try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
+    try std.testing.expectEqual(@as(?subagent_reports.StartedBy, .user), post.started_by);
 }
 
 test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
     // Only the host's address is kept, so any will do.
     var host: subagent_tool_host.Runtime = undefined;
     const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
-    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } }, .user);
     defer post.destroy();
     try std.testing.expectEqual(@as(usize, 2), post.dropped);
     try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
     try std.testing.expectEqual(end, post.end);
     try std.testing.expect(!post.idle);
-    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } });
+    // Only a message carries who started its turn; a report has `end` for that.
+    try std.testing.expect(post.started_by == null);
+    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } }, null);
     defer idle.destroy();
     try std.testing.expect(idle.idle);
 }
 
 /// Queues a host's delivery for the main loop, without waiting.
-/// `AgentGone` once the app is shutting down; a report then stays owed.
-pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {
-    const post = try ReportPost.create(host, delivery);
+/// `started_by` is who started the turn that sends a message, from
+/// `messageStartedBy`; a report ignores it. `AgentGone` once the app is
+/// shutting down; a report then stays owed.
+pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery, started_by: ?subagent_reports.StartedBy) subagent_tool_host.PostReportError!void {
+    const post = try ReportPost.create(host, delivery, started_by);
     handoffs.mutex.lockUncancelable(io_mod.getIo());
     defer handoffs.mutex.unlock(io_mod.getIo());
     if (handoffs.closed) {
@@ -1686,24 +1703,120 @@ pub fn Runtime(comptime App: type) type {
             return busyAs(most) orelse .idle;
         }
 
-        /// The first open agent other than the one on screen that is busy:
-        /// a turn going or queued, an approval or a question open, or a
-        /// request only the user can continue. Restarting fx would stop it.
-        /// Null when every other agent is idle. Its name may use `buf`.
-        /// Main loop only: it reads every agent's prompts.
-        pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
+        /// Whether a turn of any agent `busiest` reads began or went on since
+        /// the last call, which clears each (`WorkerRuntime.takeBeganWork`).
+        /// Main loop only.
+        pub fn takeBeganWork(app: *App) bool {
+            var began = false;
+            if (firstOpen(app)) began = app.main_agent.worker.takeBeganWork() or began;
+            for (app.child_agents.items) |child| {
+                began = child.agent.worker.takeBeganWork() or began;
+            }
+            return began;
+        }
+
+        /// The first open agent other than the one on screen that waits for
+        /// the user: an approval or a question open, or a request only the
+        /// user can continue. An upgrade's restart waits for a working agent
+        /// to stop between steps, but not for the user. Null when none
+        /// waits. Its name may use `buf`. Main loop only: it reads every
+        /// agent's prompts.
+        pub fn needsUserElsewhere(app: *App, buf: []u8) ?BusyAgent {
             if (app.agent_on_screen != null and firstOpen(app)) {
-                if (busyAs(stateOf(app, null))) |doing| {
+                if (waitsForUserAs(stateOf(app, null))) |doing| {
                     return .{ .name = noteName(app, null, buf), .doing = doing };
                 }
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                if (busyAs(stateOf(app, child))) |doing| {
+                if (waitsForUserAs(stateOf(app, child))) |doing| {
                     return .{ .name = noteName(app, child, buf), .doing = doing };
                 }
             }
             return null;
+        }
+
+        /// The first open agent other than the one on screen whose queued
+        /// work an upgrade's restart would drop: main or another instance,
+        /// which hold their queues while they yield (`requestYields`). A
+        /// subagent's queue runs, and the restart waits for it
+        /// (`anyTurnRunning`). Null when none holds any. Its name may use
+        /// `buf`. Main loop only.
+        pub fn queuedWorkElsewhere(app: *App, buf: []u8) ?[]const u8 {
+            if (app.agent_on_screen != null and firstOpen(app) and app.main_agent.worker.queuedPromptCount() > 0) {
+                return noteName(app, null, buf);
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen or child.agent.role != .instance) continue;
+                if (child.agent.worker.queuedPromptCount() > 0) return noteName(app, child, buf);
+            }
+            return null;
+        }
+
+        /// Asks the running turns of the main agent and of other instances
+        /// to stop at their next step boundary, and holds their queued work,
+        /// for an upgrade's restart (`WorkerRuntime.requestYield`). Subagents
+        /// keep working: the restart waits until they finish
+        /// (`anyTurnRunning`), so an upgrade loses none of their work.
+        pub fn requestYields(app: *App) void {
+            app.main_agent.worker.requestYield();
+            for (app.child_agents.items) |child| {
+                if (child.agent.role == .instance) child.agent.worker.requestYield();
+            }
+        }
+
+        /// Whether any agent's worker runs work now or holds events the main
+        /// loop has not applied, such as a finished turn's history, a
+        /// subagent has work queued, or a child's report or hand-off waits
+        /// for the main loop to deliver it. An upgrade's restart waits until
+        /// none does.
+        pub fn anyTurnRunning(app: *App) bool {
+            if (app.main_agent.worker.isProcessing() or app.main_agent.worker.hasPendingEvents()) return true;
+            for (app.child_agents.items) |child| {
+                const worker = &child.agent.worker;
+                if (worker.isProcessing() or worker.hasPendingEvents()) return true;
+                // Only instances hold their queued work, so a subagent's runs.
+                if (child.agent.role == .subagent and worker.queuedPromptCount() > 0) return true;
+            }
+            return deliveriesPending(app);
+        }
+
+        /// Whether a subagent runs work, has work queued, or holds events
+        /// the main loop has not applied. Main loop only.
+        pub fn anySubagentWorking(app: *App) bool {
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent) continue;
+                const worker = &child.agent.worker;
+                if (worker.isProcessing() or worker.hasPendingEvents() or worker.queuedPromptCount() > 0) return true;
+            }
+            return false;
+        }
+
+        /// Whether a child's report or a hand-off waits for the main loop to
+        /// deliver it (`takePosts`).
+        fn deliveriesPending(app: *App) bool {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            return app.child_handoffs.posts.items.len > 0 or app.child_handoffs.reports.items.len > 0;
+        }
+
+        /// Logs the work each agent still holds as fx exits for an upgrade's
+        /// restart. After Ctrl+G's checks only reports can be here: queued
+        /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
+        /// the wait stays in the composer, and a message is refused
+        /// (`reserveMessagePlace`, `WorkerRuntime.postMailWith`). Each report
+        /// stays owed in its child's log and comes again after the restart.
+        pub fn logHeldWork(app: *App) void {
+            var name_buf: [32]u8 = undefined;
+            const main_queued = app.main_agent.worker.queuedPromptCount();
+            if (firstOpen(app) and main_queued > 0) {
+                debug_trace.logf("upgrade", "event=held_work_dropped agent={s} prompts={d} reason=upgrade_restart", .{ noteName(app, null, &name_buf), main_queued });
+            }
+            for (app.child_agents.items) |child| {
+                const queued = child.agent.worker.queuedPromptCount();
+                if (queued == 0) continue;
+                debug_trace.logf("upgrade", "event=held_work_dropped agent={s} prompts={d} reason=upgrade_restart", .{ noteName(app, child, &name_buf), queued });
+            }
         }
 
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
@@ -2854,6 +2967,10 @@ pub fn Runtime(comptime App: type) type {
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
                 break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
             };
+            // An agent that stops its turn for fx's restart takes no message
+            // before fx exits, and nothing saves one across it, so the
+            // sender hears at once and puts it in its report, which is kept.
+            if (receiver.worker.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
             // The receiver outlives the sender's call: a tree closes its
             // subagents' threads before the agents that started them.
             if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
@@ -2868,6 +2985,29 @@ pub fn Runtime(comptime App: type) type {
             receiver.worker.releaseAgentMessage();
         }
 
+        /// Who started the turn that sends a message from child `child_id`
+        /// of `host`, or from `host`'s owner when `from_owner`, as the host
+        /// that runs the sender knows it. Read on the sender's thread while
+        /// that turn runs: once the main loop takes the post, the turn may
+        /// have ended. A post made after a pass took its posts waits for the
+        /// next pass, and the same pass can handle the turn's end first
+        /// (`tests/e2e/tui-host-switch.test.ts` "a subagent's message says
+        /// the user started its turn when that turn ends before the main loop
+        /// delivers the message").
+        pub fn messageStartedBy(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool, child_id: []const u8) ?subagent_reports.StartedBy {
+            if (!from_owner) return host.turnStartedBy(child_id);
+            const sender_host, const sender = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                const owner = ownerOf(app, host) orelse return null;
+                const child = hostedOf(app, owner) orelse return null;
+                break :blk .{ hostOf(app, child) orelse return null, child };
+            };
+            // The sender is mid-call, so its agent and the host that runs it
+            // outlive this read.
+            return sender_host.turnStartedBy(sender.id);
+        }
+
         fn deliverReport(app: *App, post: *ReportPost) !void {
             const message = post.kind == .message;
             const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
@@ -2877,15 +3017,6 @@ pub fn Runtime(comptime App: type) type {
                 break :blk hostedOf(app, owner) orelse return error.AgentGone;
             } else null;
             const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
-            // Who started the turn that sent a message, from the host that
-            // runs the sender. That turn is still going: posts are taken
-            // each pass before the children's events, its end among them.
-            const started_by: ?subagent_reports.StartedBy = if (!message)
-                null
-            else if (owner_child) |child|
-                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
-            else
-                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -2898,14 +3029,30 @@ pub fn Runtime(comptime App: type) type {
                     .end = post.end,
                     .idle = post.idle,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, post.started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },
             };
             defer app.alloc.free(text);
-            try app.postAgentMessage(target, text, .child, if (message) .message else .report);
+            app.postAgentMessage(target, text, .child, if (message) .message else .report) catch |err| {
+                // A message that came after its receiver began to stop for
+                // fx's restart is not kept across it.
+                if (err == error.ReceiverRestarting) try noteMessageDroppedForRestart(app, sender, text.len);
+                return err;
+            };
             debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
+        }
+
+        /// Tells the user that a subagent's message came while fx waits to
+        /// restart and that fx restarts without it. The trace names its
+        /// size, never its text.
+        fn noteMessageDroppedForRestart(app: *App, sender: []const u8, bytes: usize) !void {
+            debug_trace.logf("upgrade", "event=held_work_dropped kind=message bytes={d} reason=upgrade_restart", .{bytes});
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            const body = try app.alloc.print("a message from {s} came while fx waits to restart, so fx restarts without it", .{sender});
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "upgrade", .tone = .neutral, .body = body }, true);
         }
 
         /// Takes every waiting hand-off. Runs on the main loop each pass,

@@ -1251,11 +1251,42 @@ fn openSnapshotFileNoFollow(path: []const u8) !std.Io.File {
 
     var parent = try openDirectoryNoFollow(parent_path);
     defer parent.close(io_mod.getIo());
-    return parent.openFile(io_mod.getIo(), name, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| return unsafeSnapshotPathError(err);
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return parent.openFile(io_mod.getIo(), name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| return unsafeSnapshotPathError(err);
+    }
+
+    var name_buf: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    if (name.len > std.Io.Dir.max_name_bytes) return error.NameTooLong;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+
+    // Nonblocking open prevents a FIFO at the snapshot path from hanging until a writer opens it.
+    var flags: std.posix.O = .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    };
+    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+    if (@hasField(std.posix.O, "NOCTTY")) flags.NOCTTY = true;
+
+    const fd = std.posix.openat(parent.handle, name_buf[0..name.len :0], flags, 0) catch |err| switch (err) {
+        error.NoDevice => return error.NotRegularFile,
+        else => return unsafeSnapshotPathError(err),
+    };
+    var file = std.Io.File{
+        .handle = fd,
+        .flags = .{ .nonblocking = true },
+    };
+    errdefer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch |err| return unsafeSnapshotPathError(err);
+    if (stat.kind != .file) return error.NotRegularFile;
+    try makeVisionRegularFileBlocking(&file);
+    return file;
 }
 
 pub fn loadVerifiedSnapshot(
@@ -1319,6 +1350,58 @@ pub fn loadVerifiedSnapshot(
         .bytes = try bytes.toOwnedSlice(alloc),
         .media_type = detected,
     };
+}
+
+/// Streams a captured snapshot file to check existence, regular-file safety,
+/// media type header, and SHA-256 without retaining file bytes in memory.
+pub fn verifySnapshotFile(
+    snapshot_path: []const u8,
+    expected_sha256: []const u8,
+    expected_media_type: []const u8,
+) bool {
+    verifySnapshotFileErr(snapshot_path, expected_sha256, expected_media_type) catch return false;
+    return true;
+}
+
+fn verifySnapshotFileErr(
+    snapshot_path: []const u8,
+    expected_sha256: []const u8,
+    expected_media_type: []const u8,
+) !void {
+    if (expected_sha256.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+    var file = try openSnapshotFileNoFollow(snapshot_path);
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.nlink != 1) return error.NotRegularFile;
+    const size = std.math.cast(usize, stat.size) orelse return error.ImageTooLarge;
+    if (size == 0 or size > max_image_bytes) return error.ImageTooLarge;
+
+    var hasher = Sha256.init(.{});
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &read_buf);
+    var transfer_buf: [transfer_buffer_bytes]u8 = undefined;
+    var header_buf: [64]u8 = undefined;
+    var header_len: usize = 0;
+    var total_read: usize = 0;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&transfer_buf);
+        if (n == 0) break;
+        if (n > max_image_bytes - total_read) return error.ImageTooLarge;
+        if (header_len < header_buf.len) {
+            const take = @min(n, header_buf.len - header_len);
+            @memcpy(header_buf[header_len .. header_len + take], transfer_buf[0..take]);
+            header_len += take;
+        }
+        total_read += n;
+        hasher.update(transfer_buf[0..n]);
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual);
+    const actual_hex = std.fmt.bytesToHex(actual, .lower);
+    if (!std.mem.eql(u8, actual_hex[0..], expected_sha256)) return error.ImageSnapshotCorrupt;
+    const detected = detectMediaTypeFromBytes(header_buf[0..header_len]) orelse
+        return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, expected_media_type)) return error.ImageSnapshotMediaTypeMismatch;
 }
 
 /// Keeps a captured snapshot's verified bytes on the attachment itself, as
@@ -4954,4 +5037,20 @@ test "200 bounded children stopped early leave no process behind" {
         stopped += 1;
     }
     try std.testing.expectEqual(@as(usize, 200), stopped);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "eb03: verifySnapshotFile rejects a FIFO without blocking" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const fifo_path = try alloc.printSentinel("{s}/snap.fifo", .{root}, 0);
+    defer alloc.free(fifo_path);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
+    const fake_sha: [snapshot_digest_hex_len]u8 = @splat('0');
+    try std.testing.expect(!verifySnapshotFile(fifo_path, &fake_sha, "image/png"));
 }

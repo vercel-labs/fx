@@ -15,13 +15,14 @@
 //! fail where the slot's thread would spawn, after the work is saved, so a test
 //! can see what a failed start leaves behind
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a subagent whose start
-//! failed is idle and takes the next message"). Only those tests set the
+//! failed is idle and takes the next message"). Only tests set the
 //! controls, so the libfx artifacts leave them out.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
 /// How long a message waits for a starting work's turn to begin before it
 /// goes to the child's next turn. A start takes milliseconds; the limit only
@@ -114,7 +115,7 @@ pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) vo
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ files.release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "start child={s}", .{child_id}) catch return;
-    end_test_controls.writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + end_test_controls.max_hold_ms;
     while (!cancel.load(.seq_cst) and !end_test_controls.pathExists(files.release) and !end_test_controls.pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);

@@ -17,7 +17,9 @@
 # zero_bound is a bound that never captures; full_witness is not a rule: it
 # shows a command does run with the full startup once the bound is reached;
 # tests/tla/drivers/terminal/capture.ts runs the built binary along it.
-# TerminalLifecycle: hosted terminal processes across fx exits and crashes.
+# TerminalLifecycle: hosted terminal processes across fx exits and crashes, and a
+# start whose caller has not indexed the terminal yet, which the other calls of
+# its process must not see.
 #
 # Each design config must pass every invariant and liveness property with
 # deadlock checking on. Each <Model>-<mutation>.cfg enables one broken rule,
@@ -58,4 +60,6 @@ ShellSnapshotCapture ShellSnapshotCapture-restore_exported ZdotdirAsLogin -deadl
 ShellSnapshotCapture ShellSnapshotCapture-old_unbounded CapturesBounded -deadlock
 ShellSnapshotCapture ShellSnapshotCapture-zero_bound FullOnlyAfterRecapture -deadlock
 ShellSnapshotCapture ShellSnapshotCapture-full_witness NoFullRun -deadlock
+TerminalLifecycle TerminalLifecycle-list_in_flight NoIndexBeforeStartReturns -deadlock
+TerminalLifecycle TerminalLifecycle-end_at_return NoIndexBeforeStartReturns -deadlock
 EOF

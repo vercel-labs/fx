@@ -23,7 +23,7 @@ const AUTH_ENV_KEYS = [
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
 ] as const;
-const DEFAULT_UNSET_ENV_KEYS = [
+export const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
   "FX_TEST_GATEWAY_CHAT_URL",
   "FX_TEST_GATEWAY_MODELS_URL",
@@ -41,6 +41,30 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_RECORD_INPUT",
   "FX_MCP_CALL_SOCKET",
   "FX_MCP_CALL_TOKEN",
+  // fx reads its test holds in release builds, so a hold left there would
+  // stop every test's fx at it. A test that sets one passes it in `env`.
+  "FX_TEST_REPORT_DELIVERY_HELD",
+  "FX_TEST_REPORT_DELIVERY_RELEASE",
+  "FX_TEST_SESSION_WRITE_HELD",
+  "FX_TEST_SESSION_WRITE_RELEASE",
+  "FX_TEST_SHELL_YIELD_HELD",
+  "FX_TEST_SHELL_YIELD_RELEASE",
+  "FX_TEST_SUBAGENT_CLOSE_HELD",
+  "FX_TEST_SUBAGENT_CLOSE_RELEASE",
+  "FX_TEST_SUBAGENT_END_HELD",
+  "FX_TEST_SUBAGENT_END_RELEASE",
+  "FX_TEST_SUBAGENT_PUBLISH_HELD",
+  "FX_TEST_SUBAGENT_PUBLISH_RELEASE",
+  "FX_TEST_SUBAGENT_SETTLE_HELD",
+  "FX_TEST_SUBAGENT_SETTLE_RELEASE",
+  "FX_TEST_SUBAGENT_START_HELD",
+  "FX_TEST_SUBAGENT_START_RELEASE",
+  "FX_TEST_WORKSPACE_CAPTURE_START_HELD",
+  "FX_TEST_WORKSPACE_CAPTURE_START_RELEASE",
+  "FX_TEST_GREP_RELEASE",
+  "FX_TEST_ACP_PROMPT_TERMINAL_READY",
+  "FX_TEST_ACP_PROMPT_REAP_READY",
+  "FX_TEST_ACP_PROMPT_RELEASE",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -60,6 +84,11 @@ export function terminalFixtureShell(): string {
   }
   throw new Error("terminal fixtures require Bash or zsh");
 }
+
+/// The tmux option that starts a server with no config file, so a developer's
+/// tmux.conf cannot change a test's server. It acts only when the call starts
+/// the server: a server that already runs keeps the config it loaded.
+export const TMUX_NO_CONFIG = ["-f", "/dev/null"] as const;
 
 const TMUX_RAW_PASTE_FLAGS = (() => {
   try {
@@ -640,17 +669,26 @@ export function startDynamicFakeGateway(
 
 // Serves a fake update channel whose "new" artifact is a wrapper script that
 // logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
-// tests can drive the handoff without shipping a second binary.
+// tests can drive the handoff without shipping a second binary. The relaunched
+// fx, which the fake upgrade installs, runs with `relaunchEnv`'s variables,
+// such as its own FX_RECORD tape.
 export function startUpgradeServer(
   root: string,
   argvLogPath: string,
   options: {
     revision?: string;
+    relaunchEnv?: Record<string, string>;
   } = {},
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
   const archivePath = join(root, "fx.tar.gz");
+  const relaunchExports = Object.entries(options.relaunchEnv ?? {})
+    .map(([name, value]) => {
+      if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`relaunchEnv name ${name} is not a shell variable name`);
+      return `export ${name}=${shellQuote(value)}\n`;
+    })
+    .join("");
   mkdirSync(artifactDir);
   const script = `#!/bin/sh
 {
@@ -660,7 +698,7 @@ export function startUpgradeServer(
   done
   printf '\\n'
 } >> ${shellQuote(argvLogPath)}
-exec ${shellQuote(FX_BIN)} "$@"
+${relaunchExports}exec ${shellQuote(FX_BIN)} "$@"
 `;
   writeFileSync(wrapperPath, script);
   chmodSync(wrapperPath, 0o755);
@@ -816,7 +854,7 @@ export class TmuxSession {
     const tmuxCommand = gatedLaunch
       ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
       : observedCmd;
-    const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
+    const tmuxPrefix = [...(resolvedSocketName ? ["-L", resolvedSocketName] : []), ...TMUX_NO_CONFIG];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
       try {
@@ -1361,6 +1399,21 @@ export class TmuxSession {
     } catch {
       return { dead: true, status: this.recordedExitStatus() };
     }
+  }
+
+  /// The pane's `remain-on-exit-format`, the text tmux expands into its
+  /// "Pane is dead" row. Throws on a tmux error, and when tmux finds no pane:
+  /// `display-message` then still exits 0, with an empty `pane_id`.
+  remainOnExitFormat(): string {
+    const target = `${this.name}:0.0`;
+    const raw = execFileSync(
+      "tmux",
+      this.tmuxArgs(["display-message", "-t", target, "-p", "#{pane_id}|#{remain-on-exit-format}"]),
+      { stdio: "pipe", encoding: "utf-8" },
+    ).replace(/\n$/, "");
+    const separator = raw.indexOf("|");
+    if (separator <= 0) throw new Error(`tmux found no pane ${target}: ${JSON.stringify(raw)}`);
+    return raw.slice(separator + 1);
   }
 
   isPaneAlive(): boolean {

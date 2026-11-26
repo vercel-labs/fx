@@ -3,6 +3,7 @@ const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
+const json_decode = @import("json_decode.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -1452,9 +1453,9 @@ pub const ToolResultMemory = struct {
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
     terminal_action_presentation: ?TerminalActionPresentation = null,
-    /// Set on a running shell result whose wait ended when its command
-    /// crossed the quiet limit (`src/core/execution/quiet_notice.zig`), for
-    /// the note fx relays to a subagent's parent. Only the tool's end event
+    /// Set on a running shell result whose wait ended past the quiet limit
+    /// after seeing the command under it (`src/core/execution/quiet_notice.zig`),
+    /// for the note fx relays to a subagent's parent. Only the tool's end event
     /// reads it; the session never saves it.
     quiet_crossing: ?QuietCrossing = null,
     /// A `subagent` message that made a new subagent, so its row reads
@@ -1481,6 +1482,9 @@ pub const PersistedSteering = struct {
     text: []u8,
     assistant_prefix: ?[]u8 = null,
     after_tool_step_count: usize,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// An instruction file a context note delivered: its absolute path and a
@@ -1967,6 +1971,9 @@ pub const UserTurn = struct {
     /// line holding it says; 0 when unknown. For display only: nothing saves
     /// it, and the model never sees it.
     sent_at_ms: i64 = 0,
+    /// In-memory only: links to `input_accepted` so `Session.writePieces`
+    /// appends `input_delivered` in the same batch; never written into item JSON.
+    input_id: ?u64 = null,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -2039,12 +2046,68 @@ pub const ChatMessage = struct {
     /// prompt caching and the model honors such markers, and ignores it
     /// otherwise.
     cache_breakpoint: bool = false,
+    /// In-memory only: links steering to `input_accepted` until persisted into
+    /// `PersistedSteering.input_id`. Never sent to providers or written to JSON.
+    input_id: ?u64 = null,
     /// What a request to any model but the replay's own sends in place of
     /// this message, as a user message: fx's exact text of the turns a
     /// provider's compaction block stands for, which only the model that
     /// wrote it can read (`tests/tla/compaction/ProviderCompaction.tla` Wire).
     replay_fallback: ?[]const u8 = null,
+    /// The user's own answer to a question fx asked, which the security
+    /// review and compaction take as the user's words. Set from the call
+    /// that ran and its result (`isUserAnswer`), where the result is made and
+    /// where a saved turn is rebuilt, so a question asked through toolbox
+    /// counts too and fx's note for a cancelled question never does. Never
+    /// saved or sent to a provider.
+    user_answer: bool = false,
 };
+
+/// The tool that asks the user questions.
+pub const user_question_tool_name = "ask_user_question";
+
+/// The user's answers in a question tool's result, which lists each answered
+/// question. Null for any other text, such as fx's note that the user
+/// cancelled the question or that no one could answer it. The answers borrow
+/// `arena`.
+pub fn questionAnswers(arena: std.mem.Allocator, output: []const u8) std.mem.Allocator.Error!?[]const []const u8 {
+    const Answered = struct { answer: []const u8 };
+    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const answers = try arena.alloc([]const u8, answered.len);
+    for (answers, answered) |*answer, item| answer.* = item.answer;
+    return answers;
+}
+
+/// Whether a result with `status` and `output` is the user's own answer to a
+/// question fx asked: one that lists the user's answers (`questionAnswers`).
+/// `ran_tool` is the tool that ran: for a toolbox run, the one it carries,
+/// not `toolbox`, the name its result goes back under.
+pub fn isUserAnswer(alloc: std.mem.Allocator, ran_tool: []const u8, status: ?PersistedToolStatus, output: []const u8) std.mem.Allocator.Error!bool {
+    if (!std.mem.eql(u8, ran_tool, user_question_tool_name) or status == .failure) return false;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    return try questionAnswers(scratch.allocator(), output) != null;
+}
+
+test "only a question's listed answers are the user's answer" {
+    const alloc = std.testing.allocator;
+    const answered = "[{\"question\":\"Choose next step?\",\"answer\":\"Run tests\"}]";
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", .success, answered));
+    try std.testing.expect(try isUserAnswer(alloc, "ask_user_question", null, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .failure, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "toolbox", .success, answered));
+    try std.testing.expect(!try isUserAnswer(alloc, "shell", .success, answered));
+    // fx's own notes, which the question tool returns as a success.
+    for ([_][]const u8{
+        "(user cancelled the question)",
+        "(ask_user_question is only available in the interactive shell; ask the user freeform instead)",
+        "(ask_user_question: invalid arguments; provide {questions})",
+        "[{\"question\":\"Choose next step?\"}]",
+    }) |note| try std.testing.expect(!try isUserAnswer(alloc, "ask_user_question", .success, note));
+}
 
 /// Returns a caller-owned shallow projection only when incompatible replay exists.
 pub fn projectProviderReplay(
@@ -2846,6 +2909,9 @@ pub const AssistantHistoryTurn = struct {
 pub const RecoveryResume = struct {
     record: ?[32]u8 = null,
     stale: bool = false,
+    /// The request continues a turn that stopped between steps for the
+    /// host's restart (`recovery.zig` `Start.continues`).
+    continues: bool = false,
 };
 
 pub const RecoveryRecordWrite = union(enum) {
@@ -2879,6 +2945,10 @@ pub const InterruptedHistoryTurn = struct {
     /// rather than the turn failing or being cancelled. Only a session's
     /// replay sets it, and nothing saves it.
     stopped_by_exit: bool = false,
+    /// fx stopped the turn between steps for an upgrade's restart
+    /// (`turn_yielded`), and a later turn goes on from it. Only a session's
+    /// replay sets it, and nothing saves it.
+    yielded: bool = false,
 };
 
 pub const CompactedSummaryHistoryTurn = struct {
@@ -3319,6 +3389,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
                 .stopped_by_exit = entry.stopped_by_exit,
+                .yielded = entry.yielded,
             } };
         },
     };
@@ -3538,6 +3609,7 @@ pub fn dupePersistedSteering(
             .text = text,
             .assistant_prefix = assistant_prefix,
             .after_tool_step_count = item.after_tool_step_count,
+            .input_id = item.input_id,
         };
         copied += 1;
     }
@@ -3943,10 +4015,12 @@ test "dupeHistoryTurn keeps a turn fx stopped as stopped" {
         .user = .{ .text = @constCast("go") },
         .terminal_reason = .failed,
         .stopped_by_exit = true,
+        .yielded = true,
     } };
     const copy = try dupeHistoryTurn(alloc, source);
     defer freeHistoryTurn(alloc, copy);
     try std.testing.expect(copy.interrupted.stopped_by_exit);
+    try std.testing.expect(copy.interrupted.yielded);
     try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
 }
 
@@ -4137,6 +4211,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .work_id = work_id,
         .author = user.author,
         .sent_at_ms = user.sent_at_ms,
+        .input_id = user.input_id,
     };
 }
 
