@@ -185,8 +185,9 @@ const Summary = struct {
 
 const PresentationGroup = struct {
     anchor_index: usize,
-    /// How many user messages come before the group's first row.
-    user_messages_before: usize = 0,
+    /// How many entries that break a group (`breaksPresentationGroup`) come
+    /// before the group's first row.
+    breaks_before: usize = 0,
     status_indices: std.ArrayList(usize) = .empty,
     summary: Summary = .{},
 
@@ -1011,26 +1012,26 @@ noinline fn findByte(text: []const u8, byte: u8) ?usize {
 /// Keeps printable text on one line: drops escape sequences and control
 /// bytes, folds whitespace runs to one space, caps the length, and writes
 /// what remains terminal-safe, so a C1 control or an invalid UTF-8 byte shows
-/// as its visible escape.
+/// as its visible escape. Text cut at the cap ends with "…".
 fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(scratch);
     var index: usize = 0;
     var pending_space = false;
-    while (index < text.len and out.written().len < max_bytes) {
+    var cut = false;
+    while (index < text.len) {
         const byte = text[index];
         if (byte == 0x1b) {
-            index += 1;
-            if (index < text.len and text[index] == '[') {
-                index += 1;
-                while (index < text.len and (text[index] < 0x40 or text[index] > 0x7e)) : (index += 1) {}
-            }
-            index += 1;
+            index = display_width.ansiSequenceEnd(text, index);
             continue;
         }
         if (byte < 0x20 or byte == 0x7f or byte == ' ') {
             pending_space = out.written().len > 0;
             index += 1;
             continue;
+        }
+        if (out.written().len >= max_bytes) {
+            cut = true;
+            break;
         }
         if (pending_space) try out.writer.writeByte(' ');
         pending_space = false;
@@ -1046,7 +1047,84 @@ fn storySafeLine(scratch: std.mem.Allocator, text: []const u8, max_bytes: usize)
         const need: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else 2;
         if (written.len - (end - 1) < need) written = written[0 .. end - 1];
     }
-    return terminalSafeText(scratch, written);
+    const safe = try terminalSafeText(scratch, written);
+    return if (cut) std.mem.concat(scratch, u8, &.{ safe, "…" }) else safe;
+}
+
+test "a reason cut at its byte cap ends with an ellipsis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = 8;
+    try std.testing.expectEqualStrings("abcdefgh", try storySafeLine(a, "abcdefgh", cap));
+    try std.testing.expectEqualStrings("abcdefgh…", try storySafeLine(a, "abcdefghi", cap));
+    // Spaces and escape sequences after the cap show nothing, so the text
+    // is whole.
+    try std.testing.expectEqualStrings("abcdefgh", try storySafeLine(a, "abcdefgh  \x1b[0m\n", cap));
+    // A character the cap would split goes whole.
+    try std.testing.expectEqualStrings("abcdefg…", try storySafeLine(a, "abcdefg找到", cap));
+
+    // On a wide row, a command's message longer than the cap shows its
+    // first story_reason_max_bytes bytes, then "…".
+    const alloc = std.testing.allocator;
+    const long: [story_reason_max_bytes + 20]u8 = @splat('a');
+    const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh check.sh\n", .class = .tool_status } }};
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh check.sh\"}", 1, &long)};
+    details[0].command_display = @constCast("sh check.sh");
+    const painted = try paintedGroupForTest(alloc, &entries, &details, 250);
+    defer alloc.free(painted);
+    const text = try visibleLinesForTest(alloc, painted, 250);
+    defer alloc.free(text);
+    const want_reason: [story_reason_max_bytes]u8 = @splat('a');
+    try std.testing.expectEqualStrings("● Exited 1 sh check.sh · " ++ want_reason ++ "…", firstLineForTest(text));
+}
+
+test "a failed command's reason leaves out escapes with intermediate bytes and OSC links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = story_reason_max_bytes;
+    // `tput sgr0` writes ESC ( B ESC [ m. The others pick a character set,
+    // fill the screen with a test pattern, and switch to UTF-8. The last one
+    // is cut off at the end.
+    for ([_][]const u8{ "Build failed\x1b(B\x1b[m", "\x1b)0Build failed", "\x1b#8Build failed", "\x1b%GBuild failed", "\x1b$(BBuild failed", "Build failed\x1b(" }) |line| {
+        try std.testing.expectEqualStrings("Build failed", try storySafeLine(a, line, cap));
+    }
+    // An OSC 8 link shows only its text, whether ST or BEL ends it. A link
+    // cut off at the end hides the rest of the line, as a terminal does.
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "\x1b]8;;file:///x\x07Problems found\x1b]8;;\x07", cap));
+    try std.testing.expectEqualStrings("Problems found", try storySafeLine(a, "Problems found\x1b]8;;file:///x", cap));
+
+    // The row is the same live and after resume, and a list's heading in a
+    // link, or before a style reset, still heads its list.
+    const alloc = std.testing.allocator;
+    const Probe = struct { result: []const u8, reason: []const u8 };
+    for ([_]Probe{
+        .{ .result = "{\"output_delta\":\"\\u001b%G\\u001b)0\\u001b#8Build failed\\u001b(B\\u001b[m\\n\",\"exit_code\":1}", .reason = "Build failed" },
+        .{ .result = "\x1b]8;;file:///x\x1b\\Problems found\x1b]8;;\x1b\\\n", .reason = "Problems found" },
+        .{ .result = "\x1b]8;;file:///x\x07Problems found:\x1b]8;;\x07\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+        .{ .result = "Problems found:\x1b(B\x1b[m\nsrc/a.zig\nsrc/b.zig\n", .reason = "Problems found" },
+    }) |probe| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh build.sh\n", .class = .tool_status } }};
+        var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh build.sh\"}", 1, probe.result)};
+        details[0].command_display = @constCast("sh build.sh");
+        errdefer std.debug.print("result: {f}\n", .{text_utils.terminalSafe(probe.result)});
+        const want = try std.mem.concat(alloc, u8, &.{ "● Exited 1 sh build.sh · ", probe.reason });
+        defer alloc.free(want);
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, want);
+
+        // No escape from the output reaches the row's bytes (R4.6).
+        var projection = try build(alloc, &entries, &details, 120);
+        defer projection.deinit(alloc);
+        const row = projection.entry_actions.items[0].override.bytes;
+        var index: usize = 0;
+        while (index < row.len) {
+            if (skipSgrSequence(row, &index)) continue;
+            try std.testing.expect(row[index] != 0x1b);
+            index += 1;
+        }
+    }
 }
 
 /// A string or whole-number field of a JSON object; `.other` for any other
@@ -1397,7 +1475,7 @@ const StoryTally = struct {
                     } else {
                         self.tool_opens += 1;
                     }
-                } else if (std.mem.eql(u8, name, "web_search") or isProviderSearchName(name)) {
+                } else if (isWebSearchName(name)) {
                     self.web_searches += 1;
                 } else if (std.mem.eql(u8, name, "web_fetch")) {
                     self.web_reads += 1;
@@ -1773,8 +1851,11 @@ test "a command check row keeps one verb while its command runs" {
     try std.testing.expectEqualStrings("● Sent input to fx-cloud run zig build test · 2 calls ✓", std.mem.trim(u8, sent, "\n"));
 }
 
-fn isProviderSearchName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
+/// fx's own web search, or a provider's that a header counts as one. A
+/// provider's search under its own tool name, such as `exa_search`, counts
+/// as a search.
+fn isWebSearchName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "web_search_preview") or std.mem.eql(u8, name, "google_search");
 }
 
 fn pluralWord(count: usize, singular: []const u8, plural_form: []const u8) []const u8 {
@@ -2115,6 +2196,9 @@ const StoryRowKind = enum {
     /// wherever it is: one row that names the source by its short name and
     /// each search once.
     output_search,
+    /// Every fetch of a web page on one host in the group, wherever it is:
+    /// one row that names each page once, then the host.
+    fetch,
     /// The same subagent: its messages, status, and close.
     subagent,
     /// A subagent wait or status that names no agent, keyed by its action.
@@ -2211,13 +2295,14 @@ const StoryRow = struct {
     joined_calls: usize = 0,
 };
 
-/// The name a call adds to a `.read`, `.search`, `.more_output`, or
-/// `.output_search` row: the file's path, the pattern after the search key's
-/// tool name, the output's source, or the search after the source.
+/// The name a call adds to a `.read`, `.search`, `.more_output`,
+/// `.output_search`, or `.fetch` row: the file's path, the pattern after the
+/// search key's tool name, the output's source, the search after the source,
+/// or the page's URL after its host.
 fn storyRowName(identity: StoryIdentity) ?[]const u8 {
     return switch (identity.kind) {
         .read, .more_output => identity.key,
-        .search => if (findByte(identity.key, 0)) |at| identity.key[at + 1 ..] else identity.key,
+        .search, .fetch => if (findByte(identity.key, 0)) |at| identity.key[at + 1 ..] else identity.key,
         .output_search => outputSearchQuery(identity.key),
         else => null,
     };
@@ -2256,11 +2341,11 @@ fn storySearchTool(key: []const u8) []const u8 {
     return if (findByte(key, 0)) |at| key[0..at] else key;
 }
 
-/// Whether a row names several files, patterns, sources, or searches, so its
-/// text lists them.
+/// Whether a row names several files, patterns, sources, searches, or pages,
+/// so its text lists them.
 fn rowListsNames(row: *const StoryRow) bool {
     return switch (row.identity.kind) {
-        .read, .search, .more_output, .output_search => row.names.items.len > 1,
+        .read, .search, .more_output, .output_search, .fetch => row.names.items.len > 1,
         else => false,
     };
 }
@@ -2801,12 +2886,41 @@ fn moreOutputSource(phrase: []const u8) ?[]const u8 {
     return if (source.len == 0) null else source;
 }
 
+/// An http or https URL's host and port, after its user name and password,
+/// and its path, without its query and fragment.
+const UrlParts = struct { host: []const u8, path: []const u8 };
+
+/// Null when a row cannot name the host: another scheme, no host, a port
+/// that is not a number, or a control byte or a backslash in the authority,
+/// where a browser and fx's fetch read the host differently.
+fn urlParts(url: []const u8) ?UrlParts {
+    const authority = text_utils.urlAuthority(url) orelse return null;
+    const scheme = url[0 .. authority.start - "://".len];
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return null;
+    for (url[authority.start..authority.end]) |byte| if (byte < 0x20 or byte == 0x7f or byte == '\\') return null;
+    const host = url[authority.host_start..authority.end];
+    if (!hostHasNumericPort(host)) return null;
+    const after_host = url[authority.end..];
+    return .{ .host = host, .path = after_host[0 .. std.mem.findAny(u8, after_host, "?#") orelse after_host.len] };
+}
+
+/// "example.com", "example.com:8443", or "[::1]:8080".
+fn hostHasNumericPort(host: []const u8) bool {
+    const name_end = if (std.mem.startsWith(u8, host, "["))
+        (std.mem.findScalar(u8, host, ']') orelse return false) + 1
+    else
+        std.mem.findScalar(u8, host, ':') orelse host.len;
+    if (name_end == 0 or std.mem.eql(u8, host[0..name_end], "[]")) return false;
+    const port = host[name_end..];
+    if (port.len == 0) return true;
+    if (port.len == 1 or port[0] != ':') return false;
+    for (port[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 /// A web page's host, such as "example.com" for "https://example.com/a".
 fn urlHost(url: []const u8) ?[]const u8 {
-    const at = std.mem.find(u8, url, "://") orelse return null;
-    const rest = url[at + 3 ..];
-    const host = rest[0 .. std.mem.findAny(u8, rest, "/?#") orelse rest.len];
-    return if (host.len > 0) host else null;
+    return (urlParts(url) orelse return null).host;
 }
 
 /// A file's name, without the folders before it.
@@ -2915,23 +3029,55 @@ fn sharedSavedOutputIdentity(
     }
     const search = try read_tool_result_presentation.outputSearch(scratch, arguments_json) orelse return null;
     const noun = read_tool_result_presentation.savedOutputNoun(search.handle);
-    // An output no call names goes by core's noun for it, and by its handle
-    // in full, so two such outputs stay apart.
-    const name = try savedOutputName(scratch, search.handle, searchedOutputSource(phrase, noun, search.quoted_query), details, output_sources) orelse
-        OutputSourceName{ .full = search.handle, .short = noun };
-    return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ name.full, "\x00", name.short, "\x00", search.quoted_query }) };
+    const output = try searchedOutputName(scratch, search.handle, searchedOutputSource(phrase, noun, search.quoted_query), details, output_sources);
+    return .{ .kind = .output_search, .key = try std.mem.concat(scratch, u8, &.{ output.full, "\x00", output.short, "\x00", try rowQuotedQuery(scratch, search.quoted_query) }) };
 }
 
-/// The short name a `.more_output` or `.output_search` row shows for a
-/// source, after the first 0 byte in its key.
+/// A web search's saved results, since the search tool's name is fx's own.
+const web_results_label = "web results";
+
+const output_search_marker = " for ";
+
+/// The output a row of searches looks in, in full and as the row names it,
+/// such as "github.com output" or "web results". An output no call names
+/// goes by its handle in full, so two such outputs stay apart.
+fn searchedOutputName(
+    scratch: std.mem.Allocator,
+    handle: []const u8,
+    phrase_source: ?[]const u8,
+    details: []const ToolDetailRecord,
+    output_sources: *const OutputSources,
+) !OutputSourceName {
+    if (output_sources.get(handle)) |index| {
+        const tool = details[index].tool_name;
+        if (isWebSearchName(tool) or tooling_presentation.isProviderSearchAlias(tool)) return .{ .full = handle, .short = web_results_label };
+    }
+    const name = try savedOutputName(scratch, handle, phrase_source, details, output_sources) orelse
+        OutputSourceName{ .full = handle, .short = read_tool_result_presentation.savedOutputNoun(handle) };
+    return .{ .full = name.full, .short = try std.mem.concat(scratch, u8, &.{ name.short, " output" }) };
+}
+
+/// Core quotes a search in straight quotes (`quotedQuery` in
+/// src/core/tooling/read_tool_result_presentation.zig). One that holds a
+/// straight quote goes in curly quotes, so its own quotes stay apart from
+/// the row's.
+fn rowQuotedQuery(scratch: std.mem.Allocator, quoted_query: []const u8) ![]const u8 {
+    if (quoted_query.len < 2) return quoted_query;
+    const query = quoted_query[1 .. quoted_query.len - 1];
+    if (findByte(query, '"') == null) return quoted_query;
+    return std.mem.concat(scratch, u8, &.{ "\u{201C}", query, "\u{201D}" });
+}
+
+/// What a `.more_output` row shows for a source, or a `.output_search` row
+/// for its output, after the first 0 byte in its key.
 fn moreOutputShortName(key: []const u8) []const u8 {
     const source = outputSearchSource(key);
     return if (findByte(source, 0)) |at| source[at + 1 ..] else source;
 }
 
 /// The part of a `.output_search` key that searches of one output share:
-/// the source in full, a 0 byte, and its short name. The whole key for any
-/// other key.
+/// the output's source in full, a 0 byte, and the row's name for the output
+/// (`searchedOutputName`). The whole key for any other key.
 fn outputSearchSource(key: []const u8) []const u8 {
     const first = findByte(key, 0) orelse return key;
     const second = std.mem.findScalarPos(u8, key, first + 1, 0) orelse return key;
@@ -2984,7 +3130,7 @@ fn savedReadVerb(scratch: std.mem.Allocator, row: *const StoryRow, fallback: []c
 /// "Searched github.com output for ": what a row of searches of one saved
 /// output says before the searches.
 fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u8) ![]const u8 {
-    return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), searched_output_marker });
+    return std.mem.concat(scratch, u8, &.{ verb, " ", try terminalSafeText(scratch, moreOutputShortName(key)), output_search_marker });
 }
 
 /// What a row of reads of saved output names after its verb, such as
@@ -2992,7 +3138,7 @@ fn outputSearchHead(scratch: std.mem.Allocator, verb: []const u8, key: []const u
 fn savedOutputRowTarget(scratch: std.mem.Allocator, identity: StoryIdentity) ![]const u8 {
     const source = try terminalSafeText(scratch, moreOutputShortName(identity.key));
     return switch (identity.kind) {
-        .output_search => std.mem.concat(scratch, u8, &.{ source, searched_output_marker, outputSearchQuery(identity.key) }),
+        .output_search => std.mem.concat(scratch, u8, &.{ source, output_search_marker, outputSearchQuery(identity.key) }),
         else => std.mem.concat(scratch, u8, &.{ more_output_marker, source }),
     };
 }
@@ -3091,6 +3237,106 @@ test "searches of one saved output share one row that names the source by its sh
     errdefer std.debug.print("wide: {s}\n", .{wide_row});
     try std.testing.expectEqualStrings("● Searched github.com output for +1, \" fx\", \"検索語\"", wide_row);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide_row) <= 54);
+}
+
+test "a group that searches the web, fetches two pages, and searches the saved results keeps its header" {
+    const alloc = std.testing.allocator;
+    const handle = "result-a228d.txt";
+    const refused = "http://127.0.0.1/protocol/v1/prompt-turn";
+    const denied = "https://agentclientprotocol.com/protocol/v1/slash-commands";
+    const entries = [_]TranscriptEntry{
+        fetchEntryForTest(1, "● Searched Agent Client Protocol prompt turn\n"),
+        fetchEntryForTest(2, "● Failed " ++ refused ++ ": web_fetch refuses private network addresses\n"),
+        fetchEntryForTest(3, "● Denied " ++ denied ++ "\n"),
+        fetchEntryForTest(4, "● Searched saved output for \"\"url\":\"https://agentclientprotocol.com\"\n"),
+    };
+    const search = ToolDetailRecord{ .entry_id = 4, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\":\\\"https://agentclientprotocol.com\"}"), .outcome = .completed };
+    const Case = struct { tool: []const u8, header: []const u8 };
+    const cases = [_]Case{
+        .{ .tool = "exa_search", .header = "● Searched · 1 denied" },
+        .{ .tool = "web_search", .header = "● Searched the web, searched · 1 denied" },
+    };
+    for (cases) |case| {
+        const web_search = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast(case.tool), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol prompt turn\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+        const text = try groupTextForTest(alloc, &entries, &.{ web_search, fetchDetailForTest(2, refused, .failed), fetchDetailForTest(3, denied, .denied), search });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ case.tool, text });
+        try std.testing.expectEqualStrings(case.header, firstLineForTest(text));
+        try std.testing.expect(std.mem.find(u8, text, "└ Searched web results for “\"url\":\"https://agentclientprotocol.com”") != null);
+    }
+}
+
+test "a search of a web search's saved results names them web results, and a search with a straight quote goes in curly quotes" {
+    const alloc = std.testing.allocator;
+    const handle = "result-a228d.txt";
+    const search = ToolDetailRecord{
+        .entry_id = 1,
+        .tool_name = @constCast("read_tool_result"),
+        .activity_kind = .read,
+        // The search starts with a straight quote.
+        .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\":\\\"https://agentclientprotocol.com\"}"),
+        .outcome = .completed,
+    };
+    // Core names no source for a web search's results, and quotes the
+    // search in straight quotes.
+    const searched = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"url\":\"https://agentclientprotocol.com\"\n", .class = .tool_status } };
+    for ([_][]const u8{ "exa_search", "web_search", "web_search_preview" }) |tool| {
+        const web_search = ToolDetailRecord{ .entry_id = 90, .tool_name = @constCast(tool), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol slash commands\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+        const text = try groupTextForTest(alloc, &.{searched}, &.{ web_search, search });
+        defer alloc.free(text);
+        errdefer std.debug.print("{s}:\n{s}\n", .{ tool, text });
+        try std.testing.expectEqualStrings("● Searched web results for “\"url\":\"https://agentclientprotocol.com”", std.mem.trim(u8, text, "\n"));
+    }
+    const web_search = ToolDetailRecord{ .entry_id = 90, .tool_name = @constCast("exa_search"), .activity_kind = .read, .arguments_json = @constCast("{\"query\":\"Agent Client Protocol\"}"), .outcome = .completed, .result_handle = @constCast(handle) };
+    var running = search;
+    running.outcome = null;
+    const searching = TranscriptEntry{ .raw_bytes = .{ .id = 1, .bytes = "● Searching saved output for \"\"url\":\"https://agentclientprotocol.com\"\n", .class = .tool_status } };
+    const running_text = try groupTextForTest(alloc, &.{searching}, &.{ web_search, running });
+    defer alloc.free(running_text);
+    try std.testing.expectEqualStrings("● Searching web results for “\"url\":\"https://agentclientprotocol.com”", std.mem.trim(u8, running_text, "\n"));
+
+    // Searches of one output that hold a straight quote go in curly quotes,
+    // and one without keeps core's straight quotes, whatever the output.
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, row: []const u8 };
+    const notes = ToolDetailRecord{ .entry_id = 91, .tool_name = @constCast("read_file"), .activity_kind = .read, .arguments_json = @constCast("{\"path\":\"/w/notes.md\"}"), .outcome = .completed, .result_handle = @constCast("result-2222.txt") };
+    const mcp = ToolDetailRecord{ .entry_id = 92, .tool_name = @constCast("mcp_linear_list_issues"), .activity_kind = .mcp, .arguments_json = @constCast("{}"), .outcome = .completed, .result_handle = @constCast("result-3333.txt") };
+    const cases = [_]Case{
+        .{
+            .entries = &.{
+                .{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"url\"\"\n", .class = .tool_status } },
+                .{ .raw_bytes = .{ .id = 2, .bytes = "● Searched saved output for \"docs\"\n", .class = .tool_status } },
+            },
+            .details = &.{
+                web_search,
+                .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"\\\"url\\\"\"}"), .outcome = .completed },
+                .{ .entry_id = 2, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"" ++ handle ++ "\",\"query\":\"docs\"}"), .outcome = .completed },
+            },
+            .row = "● Searched web results for “\"url\"”, \"docs\"",
+        },
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched /w/notes.md output for \"say \"hi\"\"\n", .class = .tool_status } }},
+            .details = &.{ notes, .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-2222.txt\",\"query\":\"say \\\"hi\\\"\"}"), .outcome = .completed } },
+            .row = "● Searched notes.md output for “say \"hi\"”",
+        },
+        // An output no call in view saved keeps core's noun.
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched saved output for \"\"a\"\"\n", .class = .tool_status } }},
+            .details = &.{.{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-9999.txt\",\"query\":\"\\\"a\\\"\"}"), .outcome = .completed }},
+            .row = "● Searched saved output for “\"a\"”",
+        },
+        // An MCP tool's output keeps the name core gives it.
+        .{
+            .entries = &.{.{ .raw_bytes = .{ .id = 1, .bytes = "● Searched mcp_linear_list_issues output for \"bug\"\n", .class = .tool_status } }},
+            .details = &.{ mcp, .{ .entry_id = 1, .tool_name = @constCast("read_tool_result"), .activity_kind = .read, .arguments_json = @constCast("{\"handle\":\"result-3333.txt\",\"query\":\"bug\"}"), .outcome = .completed } },
+            .row = "● Searched mcp_linear_list_issues output for \"bug\"",
+        },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, case.details);
+        defer alloc.free(text);
+        errdefer std.debug.print("rows:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
 }
 
 test "a search of a long command's saved output names the command by the short form its own row shows" {
@@ -3214,6 +3460,329 @@ test "a cancelled look into saved output names what it read as its running row d
         try std.testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, "\n"), header));
         try std.testing.expect(std.mem.find(u8, row, notice) != null);
     }
+}
+
+const fetch_host_separator = " · ";
+
+/// The verb a row's phrase opens with, such as "Fetched" or "Failed". Null
+/// for a phrase with nothing after its verb, or `fx ask`'s "Failed: …".
+fn phraseVerb(phrase: []const u8) ?[]const u8 {
+    const space = findByte(phrase, ' ') orelse return null;
+    if (space == 0 or space + 1 == phrase.len) return null;
+    for (phrase[0..space]) |byte| if (!std.ascii.isAlphabetic(byte)) return null;
+    return phrase[0..space];
+}
+
+/// A `web_fetch` call's `url`, or for a call without one, such as a toolbox
+/// run whose arguments still stream in or one that failed before it started,
+/// the URL core's row names after its verb.
+fn fetchedUrl(scratch: std.mem.Allocator, entry: TranscriptEntry, record: *const ToolDetailRecord) !?[]const u8 {
+    if (!std.mem.eql(u8, record.tool_name, "web_fetch")) return null;
+    if (storyArgString(scratch, record, "url")) |url| return std.mem.trim(u8, url, " \t\r\n");
+    const status = try entryStatus(scratch, entry) orelse return null;
+    const phrase = if (splitFailedPhrase(status, record)) |split| split.row else status;
+    const verb = phraseVerb(phrase) orelse return null;
+    const after_verb = phrase[verb.len + 1 ..];
+    return after_verb[0 .. findByte(after_verb, ' ') orelse after_verb.len];
+}
+
+/// A fetched page's name: the last part of its URL's path, or the host when
+/// the path has none.
+fn fetchPageName(parts: UrlParts) []const u8 {
+    return pathFileName(parts.path) orelse parts.host;
+}
+
+/// Null for a path of one part or none.
+fn pathLastTwoParts(path: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    const last_slash = std.mem.findScalarLast(u8, trimmed, '/') orelse return null;
+    const parent_slash = std.mem.findScalarLast(u8, trimmed[0..last_slash], '/') orelse return null;
+    return trimmed[parent_slash + 1 ..];
+}
+
+/// The names a row gives its pages, in order. Pages whose names are the same
+/// add the part of the path before it, as in "v1/prompt-turn,
+/// v2/prompt-turn".
+fn fetchPageNames(scratch: std.mem.Allocator, urls: []const []const u8) ![]const []const u8 {
+    const names = try scratch.alloc([]const u8, urls.len);
+    for (urls, names) |url, *name| {
+        name.* = if (urlParts(url)) |parts| fetchPageName(parts) else try text_utils.redactUrlWithNoHost(scratch, url);
+    }
+    const shown = try scratch.dupe([]const u8, names);
+    for (urls, names, shown, 0..) |url, name, *show, index| {
+        const clashes = for (names, 0..) |other, other_index| {
+            if (other_index != index and std.mem.eql(u8, other, name)) break true;
+        } else false;
+        if (!clashes) continue;
+        const parts = urlParts(url) orelse continue;
+        show.* = pathLastTwoParts(parts.path) orelse name;
+    }
+    return shown;
+}
+
+/// What a fetch row names after its verb, terminal-safe: the page and its
+/// host, the host alone for a URL with no path, or the redacted URL when the
+/// row cannot name its host.
+fn fetchTargetText(scratch: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const parts = urlParts(url) orelse return terminalSafeText(scratch, try text_utils.redactUrlWithNoHost(scratch, url));
+    const host = try terminalSafeText(scratch, parts.host);
+    const page = fetchPageName(parts);
+    if (std.mem.eql(u8, page, parts.host)) return host;
+    return try std.mem.concat(scratch, u8, &.{ try terminalSafeText(scratch, page), fetch_host_separator, host });
+}
+
+fn fetchKeyHost(key: []const u8) []const u8 {
+    return key[0 .. findByte(key, 0) orelse key.len];
+}
+
+/// A fetch that ran or still runs joins its host's row. One that failed, was
+/// denied, or was cancelled keeps its own, as a file read does, and so does
+/// one whose host the row cannot name. The key is the host, a 0 byte, and
+/// the URL.
+fn fetchIdentity(scratch: std.mem.Allocator, entry: TranscriptEntry, detail: ?*const ToolDetailRecord, identity: StoryIdentity) !StoryIdentity {
+    const record = detail orelse return identity;
+    if (storyCallFailed(detail)) return identity;
+    if (record.outcome) |outcome| if (outcome != .completed) return identity;
+    const url = try fetchedUrl(scratch, entry, record) orelse return identity;
+    const parts = urlParts(url) orelse return identity;
+    return .{ .kind = .fetch, .key = try std.mem.concat(scratch, u8, &.{ parts.host, "\x00", url }) };
+}
+
+/// A fetch row in place of core's URL. Core's live row adds the final URL,
+/// size, status, time, and cache state, which a resumed row lacks, so this
+/// row reads the same both ways. The verb is core's.
+fn fetchRowPhrase(scratch: std.mem.Allocator, phrase: []const u8, row: *const StoryRow) !?[]const u8 {
+    const record = row.detail orelse return null;
+    const url = try fetchedUrl(scratch, row.entry, record) orelse return null;
+    const verb = phraseVerb(phrase) orelse return null;
+    return try std.mem.concat(scratch, u8, &.{ verb, " ", try fetchTargetText(scratch, url) });
+}
+
+/// Core's live row of a completed fetch of `url`: the final URL, size,
+/// status, time, and cache state after it, dimmed
+/// (`formatWebFetchCompletion` in src/core/agent/runtime/tool_presentation.zig).
+fn liveFetchStatusForTest(comptime url: []const u8) []const u8 {
+    return "● Fetched\x1b[0m \x1b[38;5;245m" ++ url ++ "\x1b[0m \x1b[38;5;245m| " ++ url ++ " | 48213 bytes | HTTP 200 | 412ms | fetched | artifact stored\x1b[0m\n";
+}
+
+fn fetchDetailForTest(entry_id: u32, comptime url: []const u8, outcome: ?types.ToolOutcomeKind) ToolDetailRecord {
+    return .{ .entry_id = entry_id, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = @constCast("{\"url\":\"" ++ url ++ "\"}"), .outcome = outcome };
+}
+
+fn fetchEntryForTest(id: u32, status: []const u8) TranscriptEntry {
+    return .{ .raw_bytes = .{ .id = id, .bytes = status, .class = .tool_status } };
+}
+
+test "a fetch row names the page and its host, the same live and after a resume, in every state" {
+    const alloc = std.testing.allocator;
+    const url = "https://agentclientprotocol.com/protocol/v1/prompt-turn";
+    const turn_ended = TranscriptEntry{ .raw_bytes = .{ .id = 99, .bytes = "  2s", .class = .turn_summary } };
+    var streaming = fetchDetailForTest(1, url, null);
+    streaming.arguments_json = null;
+    streaming.streaming = true;
+    var unstarted = fetchDetailForTest(1, url, .failed);
+    unstarted.arguments_json = null;
+    const failed_status = "● Failed " ++ url ++ ": web_fetch target returned HTTP 404\n";
+    const Case = struct { entries: []const TranscriptEntry, detail: ToolDetailRecord, row: []const u8 };
+    const cases = [_]Case{
+        // Core's live row adds the final URL, size, status, time, and cache
+        // state, and a resumed row has none of them.
+        .{ .entries = &.{fetchEntryForTest(1, liveFetchStatusForTest(url))}, .detail = fetchDetailForTest(1, url, .completed), .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetched " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, .completed), .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetching " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, null), .row = "● Fetching prompt-turn · agentclientprotocol.com" },
+        // Before its arguments arrive, the row reads the URL core names.
+        .{ .entries = &.{fetchEntryForTest(1, "● Fetching " ++ url ++ "\n")}, .detail = streaming, .row = "● Fetching prompt-turn · agentclientprotocol.com" },
+        // A failure says why only when the turn ended on it.
+        .{ .entries = &.{fetchEntryForTest(1, failed_status)}, .detail = fetchDetailForTest(1, url, .failed), .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{ fetchEntryForTest(1, failed_status), turn_ended }, .detail = fetchDetailForTest(1, url, .failed), .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com · web_fetch target returned HTTP 404" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Failed " ++ url ++ "\n")}, .detail = unstarted, .row = "● Couldn't fetch prompt-turn · agentclientprotocol.com" },
+        .{ .entries = &.{fetchEntryForTest(1, "● Denied " ++ url ++ "\n")}, .detail = fetchDetailForTest(1, url, .denied), .row = "● Denied prompt-turn · agentclientprotocol.com" },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, &.{case.detail});
+        defer alloc.free(text);
+        errdefer std.debug.print("{s} =>\n{s}\n", .{ case.entries[0].raw_bytes.bytes, text });
+        try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+    }
+
+    // A cancelled fetch's row and the notice under it name the page the
+    // same way.
+    const cancelled = try groupTextForTest(alloc, &.{fetchEntryForTest(1, "▪ Cancelled " ++ url ++ cancellation_follow_up ++ "\n")}, &.{fetchDetailForTest(1, url, .cancelled)});
+    defer alloc.free(cancelled);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{cancelled});
+    try std.testing.expectEqualStrings("● Cancelled prompt-turn · agentclientprotocol.com", firstLineForTest(cancelled));
+    try std.testing.expect(std.mem.find(u8, cancelled, "▪ Cancelled prompt-turn · agentclientprotocol.com" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "https://") == null);
+}
+
+test "a fetch row names the last part of the URL's path, or the host for a URL with no path, terminal-safe" {
+    const alloc = std.testing.allocator;
+    const Case = struct { url: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .url = "https://agentclientprotocol.com", .row = "● Fetched agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com/?tab=1#top", .row = "● Fetched agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com/protocol/v1/prompt-turn/?tab=1#top", .row = "● Fetched prompt-turn · agentclientprotocol.com" },
+        .{ .url = "https://agentclientprotocol.com:8443/docs#intro", .row = "● Fetched docs · agentclientprotocol.com:8443" },
+        // A user name and password never show.
+        .{ .url = "https://user:secret@agentclientprotocol.com/docs", .row = "● Fetched docs · agentclientprotocol.com" },
+        .{ .url = " https://agentclientprotocol.com/docs\n", .row = "● Fetched docs · agentclientprotocol.com" },
+        // An escape sequence in the URL shows as text.
+        .{ .url = "https://agentclientprotocol.com/a\x1b[31mred", .row = "● Fetched a\\x1b[31mred · agentclientprotocol.com" },
+        .{ .url = "https://bücher.example/katalog", .row = "● Fetched katalog · bücher.example" },
+        .{ .url = "agentclientprotocol.com/docs", .row = "● Fetched agentclientprotocol.com/docs" },
+    };
+    for (cases) |case| {
+        const arguments = try alloc.print("{{\"url\":{f}}}", .{std.json.fmt(case.url, .{})});
+        defer alloc.free(arguments);
+        const status = try std.mem.concat(alloc, u8, &.{ "● Fetched ", std.mem.trim(u8, case.url, " \n"), "\n" });
+        defer alloc.free(status);
+        const detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = arguments, .outcome = .completed };
+        const text = try groupTextForTest(alloc, &.{fetchEntryForTest(1, status)}, &.{detail});
+        defer alloc.free(text);
+        errdefer std.debug.print("{s} =>\n{s}\n", .{ case.url, text });
+        try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+    }
+}
+
+test "a fetch row never shows a user name or password, with or without the call's arguments" {
+    const alloc = std.testing.allocator;
+    const Case = struct { url: []const u8, row: []const u8 };
+    const cases = [_]Case{
+        .{ .url = "https://user:secret@/docs", .row = "● Couldn't fetch https://[redacted]@/docs" },
+        .{ .url = "user:secret@agentclientprotocol.com/docs", .row = "● Couldn't fetch [redacted]@agentclientprotocol.com/docs" },
+        // The '/' ends the authority before the '@', so "user" reads as a
+        // host and "pa" as its port.
+        .{ .url = "https://user:pa/ss@127.0.0.1/x", .row = "● Couldn't fetch https://[redacted]@127.0.0.1/x" },
+        .{ .url = "https://user:pass?x@host/", .row = "● Couldn't fetch https://[redacted]@host/" },
+        .{ .url = "https://user:pa#ss@host/", .row = "● Couldn't fetch https://[redacted]@host/" },
+        .{ .url = "https://user:p@ss@127.0.0.1/x", .row = "● Couldn't fetch x · 127.0.0.1" },
+        .{ .url = "https://user:secret@agentclientprotocol.com/docs?token=abc", .row = "● Couldn't fetch docs · agentclientprotocol.com" },
+        .{ .url = "ftp://user:secret@agentclientprotocol.com/x", .row = "● Couldn't fetch ftp://[redacted]@agentclientprotocol.com/x" },
+        // A browser reads this host as evil.test, and fx's fetch as
+        // example.com.
+        .{ .url = "https://evil.test\\@example.com/spoof", .row = "● Couldn't fetch https://[redacted]@example.com/spoof" },
+        .{ .url = "https://agentclientprotocol.com:abc/x", .row = "● Couldn't fetch https://agentclientprotocol.com:abc/x" },
+        .{ .url = "https://agent\x00client.com/x", .row = "● Couldn't fetch https://agent\\x00client.com/x" },
+        .{ .url = "file://srv/share/x", .row = "● Couldn't fetch file://srv/share/x" },
+        .{ .url = "javascript://agentclientprotocol.com/%0aalert(1)", .row = "● Couldn't fetch javascript://agentclientprotocol.com/%0aalert(1)" },
+    };
+    const credentials = [_][]const u8{ "secret", "user:", "pa/ss", "p@ss", "pass", "pa#ss" };
+    for (cases) |case| {
+        const arguments = try alloc.print("{{\"url\":{f}}}", .{std.json.fmt(case.url, .{})});
+        defer alloc.free(arguments);
+        const status = try alloc.print("● Failed {f}: web_fetch refuses credential-bearing URLs\n", .{text_utils.terminalSafe(case.url)});
+        defer alloc.free(status);
+        // A call that failed before it started has no arguments, so its row
+        // reads the URL core names.
+        for ([_]?[]u8{ arguments, null }) |arguments_json| {
+            const detail = ToolDetailRecord{ .entry_id = 1, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = arguments_json, .outcome = .failed };
+            const text = try groupTextForTest(alloc, &.{fetchEntryForTest(1, status)}, &.{detail});
+            defer alloc.free(text);
+            errdefer std.debug.print("{s} =>\n{s}\n", .{ case.url, text });
+            try std.testing.expectEqualStrings(case.row, firstLineForTest(text));
+            for (credentials) |credential| try std.testing.expect(std.mem.find(u8, text, credential) == null);
+        }
+    }
+
+    // A cancelled fetch's notice hides them too.
+    const cancelled = try groupTextForTest(alloc, &.{fetchEntryForTest(1, "▪ Cancelled https://user:secret@/docs" ++ cancellation_follow_up ++ "\n")}, &.{fetchDetailForTest(1, "https://user:secret@/docs", .cancelled)});
+    defer alloc.free(cancelled);
+    errdefer std.debug.print("cancelled:\n{s}\n", .{cancelled});
+    try std.testing.expectEqualStrings("● Cancelled https://[redacted]@/docs", firstLineForTest(cancelled));
+    try std.testing.expect(std.mem.find(u8, cancelled, "▪ Cancelled https://[redacted]@/docs" ++ cancellation_follow_up) != null);
+    try std.testing.expect(std.mem.find(u8, cancelled, "secret") == null);
+}
+
+test "fetches from one host share a row that names each page once, and another host keeps its own" {
+    const alloc = std.testing.allocator;
+    const site = "https://agentclientprotocol.com/protocol/v1/";
+    const prompt_turn = site ++ "prompt-turn";
+    const slash = site ++ "slash-commands";
+    const prompt_turn_v2 = "https://agentclientprotocol.com/protocol/v2/prompt-turn";
+    const other = "https://docs.example.dev/guide/install";
+    const Case = struct { entries: []const TranscriptEntry, details: []const ToolDetailRecord, rows: []const u8 };
+    var streaming = fetchDetailForTest(2, slash, null);
+    streaming.arguments_json = null;
+    streaming.streaming = true;
+    const cases = [_]Case{
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(slash)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, slash, .completed) },
+            .rows = "● Fetched prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+        // Another host keeps its own row, and a page fetched again shows once.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(other)), fetchEntryForTest(3, liveFetchStatusForTest(slash)), fetchEntryForTest(4, liveFetchStatusForTest(prompt_turn)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, other, .completed), fetchDetailForTest(3, slash, .completed), fetchDetailForTest(4, prompt_turn, .completed) },
+            .rows = "● Read web pages\n├ Fetched slash-commands, prompt-turn · agentclientprotocol.com\n└ Fetched install · docs.example.dev",
+        },
+        // Two pages with one name add the part of the path before it.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, liveFetchStatusForTest(prompt_turn_v2)), fetchEntryForTest(3, liveFetchStatusForTest(slash)) },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, prompt_turn_v2, .completed), fetchDetailForTest(3, slash, .completed) },
+            .rows = "● Fetched v1/prompt-turn, v2/prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+        // One page fetched twice counts its calls, as a joined row does.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetched " ++ prompt_turn ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, prompt_turn, .completed) },
+            .rows = "● Fetched prompt-turn · agentclientprotocol.com · 2 calls",
+        },
+        // While the newest page still loads, the row says what it does.
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetching " ++ slash ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), fetchDetailForTest(2, slash, null) },
+            .rows = "● Fetching prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+        .{
+            .entries = &.{ fetchEntryForTest(1, liveFetchStatusForTest(prompt_turn)), fetchEntryForTest(2, "● Fetching " ++ slash ++ "\n") },
+            .details = &.{ fetchDetailForTest(1, prompt_turn, .completed), streaming },
+            .rows = "● Fetching prompt-turn, slash-commands · agentclientprotocol.com",
+        },
+    };
+    for (cases) |case| {
+        const text = try groupTextForTest(alloc, case.entries, case.details);
+        defer alloc.free(text);
+        errdefer std.debug.print("rows:\n{s}\n", .{text});
+        try std.testing.expectEqualStrings(case.rows, std.mem.trim(u8, text, "\n"));
+    }
+}
+
+test "a narrow row of fetched pages leaves out the oldest pages first, and one too narrow for a page clips at its end" {
+    const alloc = std.testing.allocator;
+    const site = "https://agentclientprotocol.com/protocol/v1/";
+    const pages = [_][]const u8{ "overview", "initialization", "prompt-turn", "slash-commands" };
+    var entries: [pages.len]TranscriptEntry = undefined;
+    var details: [pages.len]ToolDetailRecord = undefined;
+    var status_bufs: [pages.len][128]u8 = undefined;
+    var json_bufs: [pages.len][128]u8 = undefined;
+    for (pages, 0..) |page, index| {
+        const id: u32 = @intCast(index + 1);
+        entries[index] = fetchEntryForTest(id, try std.mem.print(&status_bufs[index], "● Fetched {s}{s}\n", .{ site, page }));
+        details[index] = .{ .entry_id = id, .tool_name = @constCast("web_fetch"), .activity_kind = .read, .arguments_json = try std.mem.print(&json_bufs[index], "{{\"url\":\"{s}{s}\"}}", .{ site, page }), .outcome = .completed };
+    }
+    const Case = struct { cols: u16, row: []const u8 };
+    const cases = [_]Case{
+        .{ .cols = 120, .row = "● Fetched overview, initialization, prompt-turn, slash-commands · agentclientprotocol.com" },
+        .{ .cols = 72, .row = "● Fetched +2, prompt-turn, slash-commands · agentclientprotocol.com" },
+        .{ .cols = 60, .row = "● Fetched +3, slash-commands · agentclientprotocol.com" },
+    };
+    for (cases) |case| {
+        const painted = try paintedGroupForTest(alloc, &entries, &details, case.cols);
+        defer alloc.free(painted);
+        const text = try visibleLinesForTest(alloc, painted, case.cols);
+        defer alloc.free(text);
+        errdefer std.debug.print("cols {d}:\n{s}\n", .{ case.cols, text });
+        try std.testing.expectEqualStrings(case.row, std.mem.trim(u8, text, "\n"));
+    }
+
+    // A lone page too wide for its row clips at its end, on one line.
+    const lone = try paintedGroupForTest(alloc, entries[2..3], details[2..3], 30);
+    defer alloc.free(lone);
+    const lone_text = try visibleLinesForTest(alloc, lone, 30);
+    defer alloc.free(lone_text);
+    errdefer std.debug.print("lone:\n{s}\n", .{lone_text});
+    try std.testing.expectEqualStrings("● Fetched prompt-turn · agent…", std.mem.trim(u8, lone_text, "\n"));
 }
 
 /// A read row by the file's name and the lines it read, such as
@@ -3511,48 +4080,53 @@ test "a read row links to the file core read, never to the symlink the model nam
     try std.testing.expect(std.mem.find(u8, painted, "\x1b]8;") == null);
 }
 
-/// The text of a row that names several files, patterns, sources, or
-/// searches: what they did, how many older names do not fit, then the
-/// newest names that fit in `cols` after the row's two-column connector,
-/// oldest first, such as "Read +3, c.zig, d.zig". The last name is the
-/// newest call's, which may still run. At least one name shows; the row
-/// clips it when even that one is too wide. Ctrl+O shows every call.
+/// The text of a row that names several files, patterns, sources, searches,
+/// or pages: what they did, how many older names do not fit, then the newest
+/// names that fit in `cols` after the row's two-column connector, oldest
+/// first, such as "Read +3, c.zig, d.zig", and for pages their host after
+/// them. The last name is the newest call's, which may still run. At least
+/// one name shows; the row clips it when even that one is too wide. Ctrl+O
+/// shows every call.
 fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) !StoryRowText {
     const kind = row.identity.kind;
     // A row of reads or searches stands for every call it names, so it says
     // what they did, even while the newest still runs. A row of reads of
-    // saved output says what its newest call does, as that call's own row
-    // does.
+    // saved output or of fetches says what its newest call does, as that
+    // call's own row does.
     const head = switch (kind) {
         .read => "Read ",
         .more_output => try std.mem.concat(scratch, u8, &.{ try savedReadVerb(scratch, row, "Read"), " ", more_output_marker }),
         .output_search => try outputSearchHead(scratch, try savedReadVerb(scratch, row, "Searched"), row.identity.key),
+        .fetch => try std.mem.concat(scratch, u8, &.{ phraseVerb(try entryStatus(scratch, row.entry) orelse "") orelse "Fetched", " " }),
         else => if (std.mem.eql(u8, storySearchTool(row.identity.key), "glob_files")) "Matched " else "Searched ",
     };
+    const tail = if (kind == .fetch) try std.mem.concat(scratch, u8, &.{ fetch_host_separator, try terminalSafeText(scratch, fetchKeyHost(row.identity.key)) }) else "";
 
     const budget: usize = if (cols > 2) cols - 2 else 1;
     const names = row.names.items;
+    const page_names = if (kind == .fetch) try fetchPageNames(scratch, names) else names;
     const pieces = try scratch.alloc([]const u8, names.len);
-    for (names, pieces) |name, *piece| {
+    for (names, page_names, pieces) |name, page_name, *piece| {
         var text: std.Io.Writer.Allocating = .init(scratch);
         switch (kind) {
             .read => try writeFileName(&text.writer, name, .{ .resolved = readLink(row, name) }),
             .more_output => try writeTerminalSafe(&text.writer, moreOutputShortName(name)),
             // Core quotes a search terminal-safe.
             .output_search => try text.writer.writeAll(name),
+            .fetch => try writeTerminalSafe(&text.writer, page_name),
             else => try writeTerminalSafe(&text.writer, name),
         }
         piece.* = text.written();
     }
     // The most names, counted from the newest, whose row fits.
-    const head_width = display_width.visibleWidthIgnoringAnsi(head);
+    const frame_width = display_width.visibleWidthIgnoringAnsi(head) + display_width.visibleWidthIgnoringAnsi(tail);
     var shown: usize = 0;
     var names_width: usize = 0;
     while (shown < names.len) {
         const piece_width = display_width.visibleWidthIgnoringAnsi(pieces[names.len - shown - 1]) + @as(usize, if (shown > 0) 2 else 0);
         const left_out = names.len - shown - 1;
         const count_width: usize = if (left_out == 0) 0 else display_width.visibleWidthIgnoringAnsi(try countNote(scratch, "+", left_out, ", "));
-        if (shown > 0 and head_width + count_width + names_width + piece_width > budget) break;
+        if (shown > 0 and frame_width + count_width + names_width + piece_width > budget) break;
         names_width += piece_width;
         shown += 1;
     }
@@ -3564,6 +4138,7 @@ fn nameListRowText(scratch: std.mem.Allocator, row: *const StoryRow, cols: u16) 
         if (position > 0) try body.writer.writeAll(", ");
         try body.writer.writeAll(piece);
     }
+    try body.writer.writeAll(tail);
     return .{ .display = body.written(), .body = body.written(), .suffix = "" };
 }
 
@@ -4272,7 +4847,7 @@ fn collectStoryRows(
             try unshown.put(scratch, entry_id, {});
             continue :calls;
         };
-        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try storyIdentity(scratch, detail)))));
+        const identity = try savedOutputIdentity(scratch, entry, detail, details, output_sources, try streamingSubagentIdentity(scratch, entry, detail, try streamingToolboxIdentity(scratch, entry, detail, try statusFileIdentity(scratch, entry, detail, try fetchIdentity(scratch, entry, detail, try storyIdentity(scratch, detail))))));
         // A call whose arguments have not arrived yet waits in the row it
         // will most likely join, and shows once they arrive.
         if (identity.kind == .single) if (detail) |record| if (record.outcome == null and (!storyHasArgs(record) or joinsByArgument(record))) {
@@ -4379,10 +4954,10 @@ fn collectStoryRows(
 /// A finished row that says the same as an earlier row of its group joins
 /// that row, which then counts the calls of both, so a repeat shows once and
 /// the other rows keep their order. A row still running or that failed keeps
-/// its own, and so does a row for a file, a saved output, or a pattern, whose
-/// calls already share a row: two files with the same name stay two rows. A
-/// subagent's report keeps its own line, and so does a subagent wait or
-/// status, whose row tells what main did while its subagents worked.
+/// its own, and so does a row for a file, a saved output, a pattern, or a
+/// host, whose calls already share a row: two files with the same name stay
+/// two rows. A subagent's report keeps its own line, and so does a subagent
+/// wait or status, whose row tells what main did while its subagents worked.
 fn joinRepeatedRows(scratch: std.mem.Allocator, rows: *std.ArrayList(StoryRow)) !void {
     // Where the first row with each key went among the kept rows.
     var firsts: std.StringHashMapUnmanaged(usize) = .empty;
@@ -4411,7 +4986,7 @@ fn repeatKey(scratch: std.mem.Allocator, row: *const StoryRow) !?[]const u8 {
     const record = row.detail orelse return null;
     if (record.activity_kind == .subagent and !isSubagentMessage(scratch, record)) return null;
     switch (row.identity.kind) {
-        .read, .more_output, .search, .edit, .subagent_wait => return null,
+        .read, .more_output, .search, .fetch, .edit, .subagent_wait => return null,
         // A command, read, search, or change whose arguments do not name
         // what it ran or touched may not be the same call, so it keeps its
         // own row, and so does any call with no usable arguments.
@@ -4531,8 +5106,8 @@ fn sessionRunRow(rows: []StoryRow, follow_up: *const ToolDetailRecord) ?*StoryRo
 }
 
 /// Whether a call with `identity` joins the row of an earlier call with
-/// `row`. Every read shares one row, every search with the same tool, and
-/// every search of the same saved output.
+/// `row`. Every read shares one row, every search with the same tool, every
+/// search of the same saved output, and every fetch from the same host.
 /// A bare subagent wait or status says what main did while its subagents
 /// worked, so it keeps a row of its own; later calls with the same action
 /// join it with their latest state, and a status and a wait stay apart, so
@@ -4543,6 +5118,7 @@ fn sharesStoryRow(row: StoryIdentity, identity: StoryIdentity) bool {
         .read, .more_output => true,
         .search => std.mem.eql(u8, storySearchTool(row.key), storySearchTool(identity.key)),
         .output_search => std.mem.eql(u8, outputSearchSource(row.key), outputSearchSource(identity.key)),
+        .fetch => std.mem.eql(u8, fetchKeyHost(row.key), fetchKeyHost(identity.key)),
         else => std.mem.eql(u8, row.key, identity.key),
     };
 }
@@ -4556,6 +5132,9 @@ const StoryRowText = struct {
     suffix: []const u8,
     /// Why the row's latest call failed, in one short line, or "".
     reason: []const u8 = "",
+    /// The phrase with fewer of its command's steps named, each one narrower
+    /// than the one before, which a failed row tries so its reason fits.
+    fewer_steps: []const []const u8 = &.{},
 };
 
 /// One row's phrase: the recorded status of its latest call, then how many
@@ -4605,6 +5184,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
     const agent_phrase = if (row.detail) |record| try subagentRowPhrase(scratch, full_phrase, record, row.starts) else null;
     const named_phrase = if (try savedReadRowPhrase(scratch, row)) |saved|
         saved
+    else if (try fetchRowPhrase(scratch, full_phrase, row)) |fetch|
+        fetch
     else if (try readRowPhrase(scratch, full_phrase, row, merged_read)) |read|
         read
     else if (try editRowPhrase(scratch, full_phrase, row)) |edit|
@@ -4645,6 +5226,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         try std.mem.concat(scratch, u8, &.{ phrase, " in ", try searchFolderNames(scratch, row.search_paths.items) })
     else
         phrase;
+    const fewer_steps: []const []const u8 = if (reason.len > 0) try fewerStepPhrases(scratch, display, full_phrase, row, style.text_style) else &.{};
     if (row.received_messages > 0) {
         const note = try countNote(scratch, " · ", row.received_messages, pluralWord(row.received_messages, " message", " messages"));
         return .{ .display = try std.mem.concat(scratch, u8, &.{ display, note }), .body = display, .suffix = note, .reason = reason };
@@ -4663,6 +5245,8 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .read, .more_output => try countNote(scratch, " · ", row.count, " parts"),
         .search => if (many_folders) "" else try countNote(scratch, " ×", row.count, ""),
         .output_search => try countNote(scratch, " ×", row.count, ""),
+        // One page fetched again, which a joined row counts the same way.
+        .fetch => try countNote(scratch, " · ", row.count, " calls"),
         .edit => try countNote(scratch, " · ", row.count, if (row.writes == 0) " edits" else if (row.writes == row.count) " writes" else " changes"),
         .single, .subagent, .subagent_wait, .commands => "",
     };
@@ -4671,6 +5255,7 @@ fn storyRowText(scratch: std.mem.Allocator, row: *const StoryRow, style: Summary
         .body = display,
         .suffix = suffix,
         .reason = reason,
+        .fewer_steps = fewer_steps,
     };
 }
 
@@ -4838,7 +5423,8 @@ fn storyOutputLines(scratch: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// reports an error or a failure, such as "Error: timed out" or
 /// "main.c:3: error: ...", else the last line where one of `programs`, the
 /// programs the command ran, or its shell reports, such as "sed: 1: ...",
-/// else the first line that names an error or a failure, else the last line.
+/// else the first line that names an error or a failure, else the heading of
+/// the list the output ends with (lastListHeading), else the last line.
 /// "error" or "fail" inside a longer name, such as "error_code", counts as
 /// neither, so a command that prints code does not read as its own error.
 fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
@@ -4857,7 +5443,149 @@ fn verdictLine(text: []const u8, programs: []const []const u8) ?[]const u8 {
         }
         if (programReports(trimmed, programs)) reported = trimmed;
     }
-    return reported orelse named orelse lastNonEmptyLine(text);
+    return reported orelse named orelse lastListHeading(text) orelse lastNonEmptyLine(text);
+}
+
+/// The fewest lines a list has under its heading.
+const list_heading_min_lines = 2;
+
+/// The words of the heading the output's last list has, without its colon,
+/// such as "Tracked paths found" for "Tracked paths found:" and the paths
+/// under it. A heading counts when list_heading_min_lines or more lines
+/// follow it and none of them ends a sentence, so a closing summary such as
+/// "2 files need formatting." stays the reason. A line that looks like code
+/// or a key heads nothing: one that is indented, holds "(" or "=", or has the
+/// line after it indented under it, as YAML's "spec:", Python's "if x:", and
+/// a help text's "Options:" do. Escape sequences count for nothing, so a
+/// colored heading counts. Null when the output ends with no such list.
+fn lastListHeading(text: []const u8) ?[]const u8 {
+    var lines_after: usize = 0;
+    var next_indented = false;
+    var lines = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const shown = shownLine(line) orelse continue;
+        if (lines_after >= list_heading_min_lines and !next_indented) if (headingWords(line, shown)) |words| return words;
+        if (std.mem.findScalar(u8, ".!?", line[shown.last]) != null) return null;
+        lines_after += 1;
+        next_indented = shown.indented;
+    }
+    return null;
+}
+
+/// A line as the screen shows it, with its escape sequences left out.
+const ShownLine = struct {
+    /// Whether it starts with a space or a tab.
+    indented: bool,
+    /// Whether it holds "(" or "=", as code does.
+    code_like: bool,
+    /// Where its last byte that is not a space is.
+    last: usize,
+};
+
+/// Null for a line that shows nothing but spaces.
+fn shownLine(line: []const u8) ?ShownLine {
+    var shown: ShownLine = .{ .indented = false, .code_like = false, .last = 0 };
+    var shows_text = false;
+    var at_start = true;
+    var index: usize = 0;
+    while (index < line.len) {
+        const byte = line[index];
+        if (byte == 0x1b) {
+            index = display_width.ansiSequenceEnd(line, index);
+            continue;
+        }
+        if (at_start) shown.indented = byte == ' ' or byte == '\t';
+        at_start = false;
+        if (byte == '(' or byte == '=') shown.code_like = true;
+        if (byte != ' ' and byte != '\t' and byte != '\r') {
+            shown.last = index;
+            shows_text = true;
+        }
+        index += 1;
+    }
+    return if (shows_text) shown else null;
+}
+
+/// The words before a heading's colon. Null for a line that heads no list.
+fn headingWords(line: []const u8, shown: ShownLine) ?[]const u8 {
+    if (line[shown.last] != ':' or shown.indented or shown.code_like) return null;
+    const words = std.mem.trimEnd(u8, line[0..shown.last], " \t");
+    return if (shownLine(words) == null) null else words;
+}
+
+/// What a check of tracked files printed before it exited 1, in a real
+/// session: two counts, then a heading and the lines it found.
+const tracked_paths_output_for_test =
+    \\staged: 58
+    \\left over: 0
+    \\Tracked personal paths found:
+    \\src/core/workspace_trust/workspace_trust.zig:172:    try expectSessionOnly(scopeFor("/Users/example/", places));
+    \\src/core/workspace_trust/workspace_trust.zig:175:    try expectSaved(scopeFor("/Users/example/code", places), "/Users/example/code");
+    \\src/core/workspace_trust/workspace_trust.zig:179:    const places: Places = .{ .profile = "/Users/example/.fx" };
+    \\src/core/workspace_trust/workspace_trust.zig:180:    try expectSessionOnly(scopeFor("/Users/example/.fx", places));
+    \\src/core/workspace_trust/workspace_trust.zig:181:    try expectSessionOnly(scopeFor("/Users/example/.fx/sessions", places));
+    \\src/core/workspace_trust/workspace_trust.zig:186:    try expectSaved(scopeFor("/Users/example/.fxx", .{ .profile = "/Users/example/.fx" }), "/Users/example/.fxx");
+    \\src/core/workspace_trust/workspace_trust.zig:194:    const start = "/Users/example/Downloads/x";
+    \\src/core/workspace_trust/workspace_trust.zig:199:    try std.testing.expectEqualStrings("/Users/example/code/r", keyFor("/Users/example/code/r/src", "/Users/example/code/r", places));
+    \\src/core/workspace_trust/workspace_trust.zig:201:    try std.testing.expectEqualStrings("/Users/example", keyFor("/Users/example/x", "/Users/example", .{}));
+    \\src/core/workspace_trust/workspace_trust.zig:208:    try std.testing.expectEqualStrings("/Users/example/.fx/x", keyFor("/Users/example/.fx/x", "/elsewhere/main", .{ .profile = "/Users/example/.fx" }));
+    \\src/core/workspace_trust/workspace_trust.zig:209:    try std.testing.expectEqualStrings("/elsewhere/main", keyFor("/Users/example/code/r", "/elsewhere/main", home_places));
+    \\src/core/workspace_trust/workspace_trust.zig:256:    try expectCover(.special_folder, coverFor("/Users/example/.fx", "/Users/example/.fx", .session_only, home_places));
+    \\
+;
+
+test "a failed command that reports no error says the heading of the list it printed" {
+    const programs = [_][]const u8{ "git", "echo", "check-public-surface.sh" };
+    try std.testing.expectEqualStrings("Tracked personal paths found", verdictLine(tracked_paths_output_for_test, &programs).?);
+    // The heading of the list the output ends with, without its colon.
+    try std.testing.expectEqualStrings("Unused files", verdictLine("Missing files:\na.zig\nUnused files :\nb.zig\nc.zig", &.{}).?);
+    // A last line that ends in a colon heads nothing, so it stays the
+    // reason as it is, and an earlier heading stands.
+    try std.testing.expectEqualStrings("left over:", verdictLine("checked 3 files\nleft over:", &.{}).?);
+    try std.testing.expectEqualStrings("Missing files", verdictLine("Missing files:\na.zig\nleft over:\n\n", &.{}).?);
+    // A colon alone heads nothing.
+    try std.testing.expectEqualStrings("done", verdictLine(":\na.zig\ndone", &.{}).?);
+}
+
+test "an error line, a program's own line, or a named failure comes before a list's heading" {
+    try std.testing.expectEqualStrings("error: expected type", verdictLine("Changed files:\nsrc/a.zig\nerror: expected type\nsrc/b.zig", &.{}).?);
+    try std.testing.expectEqualStrings("sed: 1: bad command", verdictLine("Matches:\na.txt\nsed: 1: bad command\nb.txt", &.{"sed"}).?);
+    try std.testing.expectEqualStrings("2 tests failed", verdictLine("Slow tests:\nparse\n2 tests failed\nrender", &.{}).?);
+}
+
+test "a failed command's reason is a list's heading only for a list the output ends with, never for code, keys, or a summary" {
+    const alloc = std.testing.allocator;
+    const Probe = struct { output: []const u8, reason: []const u8 };
+    for ([_]Probe{
+        .{ .output = tracked_paths_output_for_test, .reason = "Tracked personal paths found" },
+        // A closing summary after the list stays the reason, as before.
+        .{ .output = "Checking files:\na.zig ok\nb.zig ok\n2 files need formatting.\n", .reason = "2 files need formatting." },
+        // One line under a colon is no list.
+        .{ .output = "Downloading:\n100%\n", .reason = "100%" },
+        // A key with its values indented under it, as in YAML.
+        .{ .output = "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n  - name: app\n", .reason = "- name: app" },
+        // Code: a line with "(", and a line with its block indented under it.
+        .{ .output = "def f():\n    if x:\n        return 1\n", .reason = "return 1" },
+        // A help text's options, indented under their heading.
+        .{ .output = "Usage: tool [options]\nOptions:\n  -h, --help     Show help\n  -v, --verbose  Print more\n", .reason = "-v, --verbose Print more" },
+        // A list indented under its heading, like the options above.
+        .{ .output = "Problems:\n  src/a.zig\n  src/b.zig\n", .reason = "src/b.zig" },
+        // An indented line, or one with "(" or "=", heads nothing either.
+        .{ .output = "Report\n  Totals:\na.zig 3\nb.zig 4\n", .reason = "b.zig 4" },
+        .{ .output = "Matches (2):\nsrc/a.zig\nsrc/b.zig\n", .reason = "src/b.zig" },
+        .{ .output = "total=2 files:\nsrc/a.zig\nsrc/b.zig\n", .reason = "src/b.zig" },
+        .{ .output = "\x1b[1mProblems found:\x1b[0m\nsrc/a.zig:3: x\nsrc/b.zig:9: y\n", .reason = "Problems found" },
+        .{ .output = "Problems found:\r\nsrc/a.zig\r\nsrc/b.zig\r\n", .reason = "Problems found" },
+        .{ .output = "🚨 Problems found:\nsrc/a.zig\nsrc/b.zig\n", .reason = "🚨 Problems found" },
+    }) |probe| {
+        const entries = [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh check.sh\n", .class = .tool_status } }};
+        var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh check.sh\"}", 1, probe.output)};
+        details[0].command_display = @constCast("sh check.sh");
+        const want = try std.mem.concat(alloc, u8, &.{ "● Exited 1 sh check.sh · ", probe.reason });
+        defer alloc.free(want);
+        errdefer std.debug.print("output:\n{s}\n", .{probe.output});
+        try expectLiveAndResumedRowsForTest(alloc, &entries, &details, want);
+    }
 }
 
 const FailureWord = enum { none, names, reports };
@@ -4992,11 +5720,10 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
     } else null;
     // The row's own status already says how a command ended, such as
     // "Exited 2" or "Timed out", so the reason is only its line of output,
-    // by its message alone and short; Ctrl+O shows the whole output.
+    // by its message alone; Ctrl+O shows the whole output.
     const text = line orelse return null;
     const safe = try storySafeLine(scratch, if (is_command) commandMessage(text) else firstSentence(text), story_reason_max_bytes);
-    if (safe.len == 0) return null;
-    return if (is_command) try clipSummary(scratch, safe, command_reason_max_cols) else safe;
+    return if (safe.len == 0) null else safe;
 }
 
 /// The text after the first "error" or "fatal" label in `line`, such as
@@ -5026,9 +5753,6 @@ fn afterErrorLabel(line: []const u8) ?[]const u8 {
     }
     return null;
 }
-
-/// The most columns a failed command's reason takes on its row.
-const command_reason_max_cols = 40;
 
 /// An error line's message without the words before it that say who spoke
 /// and where, so "ls: missing-file: No such file or directory" is "No such
@@ -5356,15 +6080,19 @@ fn writeGroupBlock(
 }
 
 /// What the row of the cancelled call `entry_id` names it by in the compact
-/// row's words, such as "github.com output for "npx"" or "using Fixture to echo".
-/// Null for a call whose row keeps core's name.
+/// row's words, such as "github.com output for "npx"", "prompt-turn ·
+/// agentclientprotocol.com", or "using Fixture to echo". Null for a call
+/// whose row keeps core's name.
 fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_id: u32) !?[]const u8 {
     const row = for (rows) |*candidate| {
         if (candidate.entry_id == entry_id) break candidate;
     } else return null;
-    const phrase = try savedReadRowPhrase(scratch, row) orelse
-        try mcpRowPhrase(scratch, try entryStatus(scratch, row.entry) orelse return null, row) orelse
-        return null;
+    const phrase = try savedReadRowPhrase(scratch, row) orelse named: {
+        const status = try entryStatus(scratch, row.entry) orelse return null;
+        break :named try fetchRowPhrase(scratch, status, row) orelse
+            try mcpRowPhrase(scratch, status, row) orelse
+            return null;
+    };
     return withoutPrefix(phrase, cancelled_label ++ " ");
 }
 
@@ -5374,22 +6102,103 @@ fn cancelledCallName(scratch: std.mem.Allocator, rows: []const StoryRow, entry_i
 fn clipStoryRow(scratch: std.mem.Allocator, lead: []const u8, row: *const StoryRow, text: *const StoryRowText, mark: []const u8, cols: u16, style: SummaryStyle) ![]const u8 {
     if (text.reason.len == 0) return clipStoryPhrase(scratch, lead, row, text, mark, cols, style);
     // A failed row says why after its phrase, in the failure style, and
-    // before its mark.
-    // The reason clips first, and a row with no room for it drops it;
-    // Ctrl+O still shows the call's whole error.
+    // before its mark. A command's row names fewer of its steps until its
+    // whole reason fits, then the reason clips at the edge. A row with no
+    // room for the reason drops it and keeps its steps; Ctrl+O still shows
+    // the call's whole error.
     const mark_width = display_width.visibleWidthIgnoringAnsi(mark);
     if (cols <= mark_width * 2) return clipStoryPhrase(scratch, lead, row, text, mark, cols, style);
-    const phrase = try clipStoryPhrase(scratch, lead, row, text, "", @intCast(cols - mark_width), style);
-    const used = display_width.visibleWidthIgnoringAnsi(phrase) + mark_width;
+    const phrase_cols: u16 = @intCast(cols - mark_width);
     const separator = " · ";
-    if (used + separator.len + story_reason_min_cols > cols) return std.mem.concat(scratch, u8, &.{ phrase, mark });
-    const reason = try clipSummary(scratch, text.reason, @intCast(cols - used - display_width.visibleWidthIgnoringAnsi(separator)));
+    const separator_width = display_width.visibleWidthIgnoringAnsi(separator);
+    const reason_width = display_width.visibleWidthIgnoringAnsi(text.reason);
+    const all_steps = try clipStoryPhrase(scratch, lead, row, text, "", phrase_cols, style);
+    var phrase = all_steps;
+    var fewer = text.*;
+    for (text.fewer_steps) |body| {
+        if (display_width.visibleWidthIgnoringAnsi(phrase) + mark_width + separator_width + reason_width <= cols) break;
+        fewer.body = body;
+        phrase = try clipStoryPhrase(scratch, lead, row, &fewer, "", phrase_cols, style);
+    }
+    const used = display_width.visibleWidthIgnoringAnsi(phrase) + mark_width;
+    if (used + separator_width + story_reason_min_cols > cols) return std.mem.concat(scratch, u8, &.{ all_steps, mark });
+    const reason = try clipSummary(scratch, text.reason, @intCast(cols - used - separator_width));
     return std.mem.concat(scratch, u8, &.{ phrase, style.text_style, separator, try inFailureStyle(scratch, reason, style), mark });
 }
 
 /// The fewest cells a failed row gives its reason; with less room the row
 /// leaves the reason out.
 const story_reason_min_cols = 8;
+
+test "a failed command's reason takes the row's free width, and its steps make room for it first" {
+    const alloc = std.testing.allocator;
+    const command = "cd /Users/example/fx && git add -- src/a.zig src/b.zig && echo \"staged: $(git diff --cached --name-only | wc -l | tr -d ' ')\" && echo \"left over: $(git status --porcelain | grep -v '^[AM] ' | wc -l | tr -d ' ')\" && ./scripts/check-public-surface.sh && echo public-surface-ok && ./scripts/check-workspace-trust-boundary.sh && echo boundary-ok && zig fmt --check src/ && echo fmt-ok && python3 -m scripts.check_cli_shape";
+    const arguments = try std.json.Stringify.valueAlloc(alloc, .{ .action = "run", .command = command }, .{});
+    defer alloc.free(arguments);
+    const result = try std.json.Stringify.valueAlloc(alloc, .{ .state = "completed", .exit_code = 1, .output_delta = tracked_paths_output_for_test }, .{});
+    defer alloc.free(result);
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 " ++ command ++ "\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Read notes.md\n", .class = .tool_status } },
+    };
+    var details = [_]ToolDetailRecord{ storyCommandDetail(1, arguments, 1, result), storyReadDetailForTest(2, "notes.md") };
+    details[0].command_display = @constCast(command);
+    const whole = "├ Exited 1 git add, echo, check-public-surface.sh +6 more · Tracked personal paths found";
+    const Width = struct { cols: u16, row: []const u8 };
+    for ([_]Width{
+        .{ .cols = 200, .row = whole },
+        .{ .cols = 120, .row = whole },
+        .{ .cols = 80, .row = "├ Exited 1 git add, echo +7 more · Tracked personal paths found" },
+        .{ .cols = 50, .row = "├ Exited 1 git add +8 more · Tracked personal pat…" },
+        // The reason keeps exactly story_reason_min_cols columns, and one
+        // column less drops it.
+        .{ .cols = 37, .row = "├ Exited 1 git add +8 more · Tracked…" },
+        // With no room for the reason even after one step, the row keeps
+        // its steps, as it did before the reason had the free width.
+        .{ .cols = 36, .row = "├ Exited 1 git add, echo, check-pub…" },
+        .{ .cols = 30, .row = "├ Exited 1 git add, echo, che…" },
+    }) |width| {
+        // Live, where the calls share one presentation group, and resumed,
+        // where none has one.
+        for ([_]bool{ true, false }) |live| {
+            var shown = details;
+            if (live) for (&shown) |*detail| {
+                detail.presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 1 };
+            };
+            const painted = try paintedGroupForTest(alloc, &entries, &shown, width.cols);
+            defer alloc.free(painted);
+            const text = try visibleLinesForTest(alloc, painted, width.cols);
+            defer alloc.free(text);
+            errdefer std.debug.print("{d} columns, live {}:\n{s}\n", .{ width.cols, live, text });
+            var lines = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+            _ = lines.next();
+            try std.testing.expectEqualStrings(width.row, lines.next().?);
+            try std.testing.expectEqualStrings("└ Read notes.md", lines.next().?);
+        }
+    }
+}
+
+test "a failed command's reason of wide and combining characters clips at the edge without splitting one" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 1 sh check.sh paths\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "  2s", .class = .turn_summary } },
+    };
+    var details = [_]ToolDetailRecord{storyCommandDetail(1, "{\"action\":\"run\",\"command\":\"sh check.sh paths\"}", 1, "Cafe\u{301} 找到的路径:\na.zig\nb.zig")};
+    details[0].command_display = @constCast("sh check.sh paths");
+    const Width = struct { cols: u16, row: []const u8 };
+    for ([_]Width{
+        .{ .cols = 46, .row = "● Exited 1 sh check.sh paths · Cafe\u{301} 找到的路径" },
+        .{ .cols = 40, .row = "● Exited 1 sh check.sh paths · Cafe\u{301} 找…" },
+    }) |width| {
+        const painted = try paintedGroupForTest(alloc, &entries, &details, width.cols);
+        defer alloc.free(painted);
+        const text = try visibleLinesForTest(alloc, painted, width.cols);
+        defer alloc.free(text);
+        errdefer std.debug.print("{d} columns:\n{s}\n", .{ width.cols, text });
+        try std.testing.expectEqualStrings(width.row, firstLineForTest(text));
+    }
+}
 
 /// A row's phrase and merge note clipped to `cols` behind `lead`, with
 /// `mark` after them, as clipStoryRow writes a row with no reason.
@@ -6518,6 +7327,21 @@ fn shortenCommandPhrase(
     launch_command: ?[]const u8,
     base_style: []const u8,
 ) !?[]const u8 {
+    const parts = try shortPhraseParts(scratch, phrase, detail, launch_command) orelse return null;
+    return try formatShortPhrase(scratch, parts, base_style);
+}
+
+/// A command row's label, such as "Exited 1 ", and its command's short form.
+const ShortPhrase = struct { label: []const u8, short: ShortCommand };
+
+/// The label and short form shortenCommandPhrase writes. Null when the row
+/// keeps its full command.
+fn shortPhraseParts(
+    scratch: std.mem.Allocator,
+    phrase: []const u8,
+    detail: ?*const ToolDetailRecord,
+    launch_command: ?[]const u8,
+) !?ShortPhrase {
     const record = detail orelse return null;
     if (record.activity_kind != .command) return null;
     const display = record.command_display orelse return null;
@@ -6529,7 +7353,27 @@ fn shortenCommandPhrase(
     // command.
     const source = storyArgString(scratch, record, "command") orelse launch_command orelse display;
     const short = try shortCommandSteps(scratch, source, display) orelse return null;
-    return try std.mem.concat(scratch, u8, &.{ label, try formatShortCommand(scratch, short, base_style) });
+    return .{ .label = label, .short = short };
+}
+
+fn formatShortPhrase(scratch: std.mem.Allocator, parts: ShortPhrase, base_style: []const u8) ![]const u8 {
+    return std.mem.concat(scratch, u8, &.{ parts.label, try formatShortCommand(scratch, parts.short, base_style) });
+}
+
+/// The phrases of a row that shows its command's short form, `shown`, with
+/// one step fewer named each time, down to one: "Exited 1 git add, echo +7
+/// more", then "Exited 1 git add +8 more", for "Exited 1 git add, echo,
+/// check-public-surface.sh +6 more". Empty for any other row.
+fn fewerStepPhrases(scratch: std.mem.Allocator, shown: []const u8, full_phrase: []const u8, row: *const StoryRow, base_style: []const u8) ![]const []const u8 {
+    var parts = try shortPhraseParts(scratch, full_phrase, row.detail, row.launch_command) orelse return &.{};
+    if (!std.mem.eql(u8, shown, try formatShortPhrase(scratch, parts, base_style))) return &.{};
+    var phrases: std.ArrayList([]const u8) = .empty;
+    while (parts.short.steps.len > 1) {
+        parts.short.steps = parts.short.steps[0 .. parts.short.steps.len - 1];
+        parts.short.more += 1;
+        try phrases.append(scratch, try formatShortPhrase(scratch, parts, base_style));
+    }
+    return phrases.items;
 }
 
 /// Shell-highlight the command portion of a command phrase ("Running <cmd>",
@@ -7238,6 +8082,23 @@ fn statusDetail(
     return detailForEntry(details, detail_indices, entry_id, null);
 }
 
+/// Whether the calls of one presentation group before and after `entry` take
+/// separate rows. Core keeps a turn's group open across a message the user
+/// sends while it runs, across a notice the main screen shows in the middle
+/// of it, such as `✓ Context compacted`, and across a line fx writes between
+/// steps, such as the empty-reply nudge, but the calls after any of them
+/// belong below it, not in the row above it. A notice that only Ctrl+O shows
+/// draws nothing between the rows, so it keeps them together. So does the
+/// model's own text between calls of one step.
+fn breaksPresentationGroup(entry: TranscriptEntry) bool {
+    return switch (entry) {
+        .user_turn => true,
+        .semantic_notice => transcript_blocks.isEntryVisibleInCompactPresentation(entry),
+        .assistant_turn => |turn| turn.operational and !isTransparentCompactEntry(entry),
+        else => false,
+    };
+}
+
 /// Fills `projection` with every entry's action. The caller owns the state
 /// it works in and frees it.
 fn fillProjection(
@@ -7280,13 +8141,10 @@ fn fillProjection(
 
     @memset(presentation_group_indices, null);
 
-    // A message the user sends while a turn runs joins that turn, so the
-    // calls after it share the turn's group. Their rows belong after the
-    // message, not above it, so they start a new group.
-    var user_messages: usize = 0;
+    var group_breaks: usize = 0;
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
-        if (entry == .user_turn) user_messages += 1;
+        if (breaksPresentationGroup(entry)) group_breaks += 1;
         if (mode == .compact and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, stats);
@@ -7294,9 +8152,9 @@ fn fillProjection(
         const group_id = presentationGroupId(detail) orelse continue;
 
         const result = try presentation_group_by_id.getOrPut(alloc, group_id);
-        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].user_messages_before != user_messages) {
+        if (!result.found_existing or presentation_groups.items[result.value_ptr.*].breaks_before != group_breaks) {
             result.value_ptr.* = presentation_groups.items.len;
-            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .user_messages_before = user_messages });
+            try presentation_groups.append(alloc, .{ .anchor_index = entry_index, .breaks_before = group_breaks });
         }
         const group_index = result.value_ptr.*;
         const group = &presentation_groups.items[group_index];
@@ -7516,6 +8374,126 @@ fn fillProjection(
     }
 
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
+}
+
+/// A notice both the main screen and Ctrl+O show, as the second entry.
+fn shownNoticeForTest(topic: []const u8, tone: types.NoticeTone, body: []const u8) TranscriptEntry {
+    return .{ .semantic_notice = .{ .id = 2, .topic = topic, .tone = tone, .body = body, .visibility = .compact_and_full } };
+}
+
+/// Three reads of one presentation group, as core gives a turn's silent
+/// steps, with `middle` after the first.
+fn readsAroundForTest(middle: TranscriptEntry) struct { entries: [4]TranscriptEntry, details: [3]ToolDetailRecord } {
+    var details = [_]ToolDetailRecord{
+        storyReadDetailForTest(1, "a.txt"),
+        storyReadDetailForTest(3, "b.txt"),
+        storyReadDetailForTest(4, "c.txt"),
+    };
+    for (&details) |*detail| detail.presentation_group_id = .{ .turn_id = 2, .anchor_step_id = 3 };
+    return .{
+        .entries = .{
+            .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.txt\n", .class = .tool_status } },
+            middle,
+            .{ .raw_bytes = .{ .id = 3, .bytes = "● Read b.txt\n", .class = .tool_status } },
+            .{ .raw_bytes = .{ .id = 4, .bytes = "● Read c.txt\n", .class = .tool_status } },
+        },
+        .details = details,
+    };
+}
+
+/// Checks the main screen's rows for `readsAroundForTest(middle)`.
+fn expectReadRowsForTest(alloc: std.mem.Allocator, middle: TranscriptEntry, expected: []const u8) !void {
+    const reads = readsAroundForTest(middle);
+    const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(expected, std.mem.trim(u8, text, "\n"));
+}
+
+/// Text as the second entry, as the pacer commits it. The caller frees its
+/// segments.
+fn textEntryForTest(alloc: std.mem.Allocator, text: []const u8, operational: bool) !TranscriptEntry {
+    var segments: transcript_blocks.AssistantTurnSegments = .{};
+    try segments.text.appendSlice(alloc, text);
+    return .{ .assistant_turn = .{ .id = 2, .operational = operational, .segments = segments } };
+}
+
+test "a notice the main screen shows in the middle of a turn starts a new row for the calls after it" {
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "compaction", .middle = shownNoticeForTest("", .success, "Context compacted (10s)") },
+        .{ .name = "provider reason while fx waits", .middle = shownNoticeForTest("system", .warning, "API access denied · HTTP 403") },
+        .{ .name = "effort chosen during the turn", .middle = shownNoticeForTest("", .neutral, "Next turn will use reasoning effort high for acme/thinker") },
+        .{ .name = "Vision outage", .middle = shownNoticeForTest("vision", .@"error", "Tip: Vision is unavailable right now.") },
+        .{ .name = "message the user sent", .middle = .{ .user_turn = .{ .id = 2, .turn = .{ .text = @constCast("Read the rest too.") } } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt\n● Read b.txt, c.txt");
+        const reads = readsAroundForTest(case.middle);
+        var projection = try build(alloc, &reads.entries, &reads.details, 120);
+        defer projection.deinit(alloc);
+        // The middle line draws between the two rows.
+        try std.testing.expect(projection.entry_actions.items[1] == .keep);
+        try std.testing.expect(projection.entry_actions.items[2] == .override);
+        try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    }
+}
+
+test "a notice the main screen hides keeps the calls around it in one row" {
+    // A model call's line shows only in Ctrl+O, between every two steps.
+    const alloc = std.testing.allocator;
+    const Case = struct { name: []const u8, middle: TranscriptEntry };
+    const cases = [_]Case{
+        .{ .name = "Ctrl+O only", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "model call", .tone = .neutral, .body = "21:25:41 · thinker · 0.0 s", .visibility = .full_only } } },
+        .{ .name = "hidden by a display clear", .middle = .{ .semantic_notice = .{ .id = 2, .topic = "", .tone = .success, .body = "Context compacted (10s)", .visibility = .compact_and_full, .inline_hidden = true } } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt, b.txt, c.txt");
+    }
+}
+
+test "a line fx writes between steps starts a new row for the calls after it" {
+    // One line from each place in orchestrator.zig that writes one with
+    // `push_text(.operational)`.
+    const alloc = std.testing.allocator;
+    const Case = struct { site: []const u8, line: []const u8 };
+    const cases = [_]Case{
+        .{ .site = "image catalog down", .line = "fx couldn't connect to the AI Gateway to load the model catalog, so images from tools aren't reaching the model until it loads. Check your network connection or firewall." },
+        .{ .site = "malformed tool call retry", .line = "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again." },
+        .{ .site = "length-limited resend", .line = "The reply ran out of output tokens before any text. Retrying with a higher limit." },
+        .{ .site = "empty-reply nudge", .line = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue." },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("site: {s}\n", .{case.site});
+        var middle = try textEntryForTest(alloc, case.line, true);
+        defer middle.assistant_turn.segments.deinit(alloc);
+        try expectReadRowsForTest(alloc, middle, "● Read a.txt\n● Read b.txt, c.txt");
+    }
+}
+
+test "the model's text between calls of one group keeps them in one row" {
+    // Core ends the group at the model's own text between steps, so text
+    // in the middle of one group is the model's text between calls of one
+    // step. Only a line fx wrote is marked.
+    const alloc = std.testing.allocator;
+    var middle = try textEntryForTest(alloc, "provider bridge", false);
+    defer middle.assistant_turn.segments.deinit(alloc);
+    try expectReadRowsForTest(alloc, middle, "● Read a.txt, b.txt, c.txt");
+}
+
+test "Ctrl+O still gives each call around a notice its own line, in order" {
+    const alloc = std.testing.allocator;
+    const reads = readsAroundForTest(shownNoticeForTest("", .success, "Context compacted (10s)"));
+    var expanded = try buildExpandedStyledInterruptible(alloc, &reads.entries, &reads.details, 120, null);
+    defer expanded.deinit(alloc);
+    const actions = expanded.entry_actions.items;
+    try std.testing.expect(actions[1] == .keep);
+    for ([_]usize{ 0, 2, 3 }, [_][]const u8{ "a.txt", "b.txt", "c.txt" }) |index, path| {
+        try std.testing.expect(actions[index] == .override);
+        try std.testing.expect(std.mem.find(u8, actions[index].override.bytes, path) != null);
+    }
 }
 
 /// Leads each visible turn summary with its turn's recap. A function of its
@@ -8538,7 +9516,7 @@ test "a toolbox run of a built-in tool reads as a direct call of it, by the tool
     const cases = [_]Case{
         // A run that failed before it started has only its streamed row,
         // which core names for the tool it runs, with no arguments.
-        .{ .status = "● Failed http://127.0.0.1/page\n", .tool_name = "web_fetch", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't fetch http://127.0.0.1/page" },
+        .{ .status = "● Failed http://127.0.0.1/page\n", .tool_name = "web_fetch", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't fetch page · 127.0.0.1" },
         .{ .status = "● Failed zig release notes\n", .tool_name = "web_search", .activity_kind = .read, .arguments_json = null, .outcome = .failed, .row = "● Couldn't search zig release notes" },
         // A run that started, live or on resume, has that tool's arguments.
         .{ .status = "● Failed notes.txt\n", .tool_name = "read_file", .activity_kind = .read, .arguments_json = "{\"path\":\"notes.txt\"}", .outcome = .failed, .row = "● Couldn't read notes.txt" },
@@ -12717,6 +13695,38 @@ fn checkStoryRows(input: []const u8) !void {
         } };
     }
 
+    // Some calls become fetches of a fuzzed URL, with or without their
+    // arguments, under core's live row. Inputs that end before here keep
+    // every row as it was.
+    const url_pieces = [_][]const u8{
+        "https://", "http://",     "user:pw@", "agentclientprotocol.com", ":8443", "/", "//", "protocol",
+        "v1",       "prompt-turn", "?q=1",     "#top",                    "...",
+        "…",
+        "[::1]",    "%2F",
+    };
+    const fetch_verbs = [_][]const u8{ "Fetching", "Fetched", "Failed", "Denied", "Cancelled" };
+    for (0..count) |index| {
+        if (fuzz.byte() % 4 != 3) continue;
+        var url: std.Io.Writer.Allocating = .init(arena);
+        const piece_count = 1 + fuzz.byte() % 8;
+        for (0..piece_count) |_| {
+            if (fuzz.byte() % 4 == 0) try url.writer.writeAll(fuzz.chunk(12)) else try url.writer.writeAll(url_pieces[fuzz.byte() % url_pieces.len]);
+        }
+        var arguments: std.Io.Writer.Allocating = .init(arena);
+        try arguments.writer.writeAll("{\"url\":");
+        std.json.Stringify.value(url.written(), .{}, &arguments.writer) catch try arguments.writer.writeAll("\"\"");
+        try arguments.writer.writeByte('}');
+        details[index].tool_name = @constCast("web_fetch");
+        details[index].activity_kind = .read;
+        details[index].arguments_json = if (fuzz.byte() % 3 == 0) null else arguments.written();
+        const shown = try arena.print("{f}", .{text_utils.terminalSafe(url.written())});
+        entries[index] = .{ .raw_bytes = .{
+            .id = @intCast(index + 1),
+            .bytes = try arena.print("● {s} {s} | {s} | 120 bytes | HTTP 200 | 9ms | fetched\n", .{ fetch_verbs[fuzz.byte() % fetch_verbs.len], shown, shown }),
+            .class = .tool_status,
+        } };
+    }
+
     var projection = try build(alloc, entries[0 .. count + 1], details[0..count], cols);
     defer projection.deinit(alloc);
     for (projection.entry_actions.items) |action| {
@@ -13445,7 +14455,7 @@ test "a failed command's reason is the error it reports, not code it printed" {
     try std.testing.expect(std.mem.find(u8, text, "error_code") == null);
 }
 
-test "a failed command's reason is its message alone, at most 40 columns" {
+test "a failed command's reason is its message alone, whole when the row has room" {
     try std.testing.expectEqualStrings("No such file or directory", commandMessage("ls: missing-file: No such file or directory"));
     try std.testing.expectEqualStrings("expected type", commandMessage("src/main.zig:3:5: error: expected type"));
     try std.testing.expectEqualStrings("bad value", commandMessage("ValueError: bad value"));
@@ -13471,7 +14481,7 @@ test "a failed command's reason is its message alone, at most 40 columns" {
     try std.testing.expectEqualStrings("2 tests failed", commandMessage("2 tests failed"));
     try std.testing.expectEqualStrings("error:", commandMessage("error:"));
 
-    // On a row, the message is cut at 40 columns.
+    // On a row with room for it, the message shows whole.
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "● Exited 128 git status\n", .class = .tool_status } },
@@ -13481,8 +14491,6 @@ test "a failed command's reason is its message alone, at most 40 columns" {
     const text = try groupTextForTest(alloc, &entries, &details);
     defer alloc.free(text);
     errdefer std.debug.print("group:\n{s}\n", .{text});
-    const reason = "not a git repository (or any of the par…";
-    try std.testing.expectEqual(@as(usize, command_reason_max_cols), display_width.visibleWidthIgnoringAnsi(reason));
-    try std.testing.expect(std.mem.find(u8, text, "· " ++ reason) != null);
+    try std.testing.expect(std.mem.find(u8, text, "· not a git repository (or any of the parent directories): .git") != null);
     try std.testing.expect(std.mem.find(u8, text, "fatal:") == null);
 }

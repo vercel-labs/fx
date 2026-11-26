@@ -1113,7 +1113,7 @@ describe("ultrafast fake Gateway", () => {
           await session.sendKeys("Escape");
           await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
           await session.sendText("Return the Settings disabled marker.");
-          await session.waitForText("Settings disabled Ultra", TIMEOUT);
+          await session.waitForPane((pane) => pane.includes("Settings disabled Ultra") && turnSettled(pane), TIMEOUT);
           const settled = await session.waitForStableComposer(TIMEOUT);
           expect(settled).not.toContain("⚡︎");
           expect(await session.captureFullScrollback()).toContain("Settings disabled Ultra");
