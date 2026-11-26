@@ -103,6 +103,7 @@
     {"name": "secret_pieces", "module": "fx", "test": "maskSecretPieces masks every piece of a wrapped value and keeps other bytes on fuzzed rows", "iterations": 400000},
     {"name": "bash_call_text", "module": "fx", "test": "bash calls sent as JSON text decode or are refused on arbitrary bytes", "iterations": 250000},
     {"name": "gateway_json_decode", "module": "fx", "test": "gateway JSON body decode stays bounded and round-trips gzip on fuzzed bytes", "iterations": 20000},
-    {"name": "edit_blocks", "module": "fx", "test": "edit blocks are refused or decode, and decode back the same, on fuzzed text", "iterations": 500000}
+    {"name": "edit_blocks", "module": "fx", "test": "edit blocks are refused or decode, and decode back the same, on fuzzed text", "iterations": 500000},
+    {"name": "bash_results", "module": "fx", "test": "the bash results keep their laws on fuzzed output, split however it arrives", "iterations": 120000}
   ]
 }

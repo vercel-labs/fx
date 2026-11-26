@@ -5461,6 +5461,7 @@ test {
     _ = @import("core/tool_bridge/tool_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/bash_session/bash_session.zig");
+    _ = @import("core/bash_results/bash_results.zig");
     _ = @import("tools/bash/bash.zig");
     _ = @import("builtins/bash_tools.zig");
     _ = @import("core/mcp_host/verbs.zig");

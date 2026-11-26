@@ -9,6 +9,7 @@ test {
     _ = @import("acp/mcp_servers.zig");
     _ = @import("builtins/context.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/bash_results/bash_results.zig");
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/auth/oauth_session.zig");

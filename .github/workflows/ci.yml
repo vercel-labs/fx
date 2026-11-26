@@ -69,6 +69,9 @@ jobs:
       - name: Check bash session boundary
         run: ./scripts/check-bash-session-boundary.sh
 
+      - name: Check bash results boundary
+        run: ./scripts/check-bash-results-boundary.sh
+
       - name: Check tool bridge boundary
         run: ./scripts/check-tool-bridge-boundary.sh
 
@@ -1077,6 +1080,7 @@ jobs:
             benchmarks/startup.sh
             scripts/check-agents-boundary.sh
             scripts/check-bash-session-boundary.sh
+            scripts/check-bash-results-boundary.sh
             scripts/check-tool-bridge-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
