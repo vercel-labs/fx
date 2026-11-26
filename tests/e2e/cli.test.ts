@@ -5550,6 +5550,60 @@ describe("cli: ask success", () => {
     TIMEOUT,
   );
 
+  // `fx ask` shows no question, so the reply after one starts a new paragraph,
+  // as it does after any other tool.
+  const ASK_QUESTION = { questions: [{ question: "Choose next step?", options: [{ label: "Run tests" }, { label: "Stop" }] }] };
+  for (const [placement, settings, call] of [
+    ["direct", {}, { name: "ask_user_question", input: ASK_QUESTION }],
+    ["toolbox", { tool_placement: { ask_user_question: "toolbox" } }, { name: "toolbox", input: { run: "ask_user_question", arguments: ASK_QUESTION } }],
+  ] as const) {
+    for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+      test(
+        `fx ask ${label} starts a new paragraph after a ${placement} question`,
+        async () => {
+          const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-question-break-"));
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          const gateway = startFakeGateway([
+            fakeGatewaySse([
+              { type: "text-delta", id: "prose_1", delta: "One question first." },
+              { type: "tool-call", toolCallId: "ask_1", toolName: call.name, input: call.input },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+            ]),
+            fakeGatewayFinalText("Done after the question."),
+          ]);
+          try {
+            mkdirSync(join(home, ".fx"), { recursive: true });
+            mkdirSync(workspace);
+            writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
+
+            const result = await runFx(["ask", ...flags, "--auto", "--no-save", "Ask me, then finish."], {
+              cwd: realpathSync(workspace),
+              env: {
+                HOME: realpathSync(home),
+                AI_GATEWAY_API_KEY: "fake-question-break-key",
+                VERCEL_OIDC_TOKEN: undefined,
+                FX_GATEWAY_BASE_URL: gateway.baseUrl,
+                FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+                FX_MODEL: FAKE_GATEWAY_MODEL,
+                FX_AUTO_UPGRADE: "0",
+              },
+              timeoutMs: TIMEOUT,
+            });
+
+            expect(result.code, result.stderr).toBe(0);
+            const output = label === "--json" ? JSON.parse(result.stdout).output : result.stdout;
+            expect(output).toBe("One question first.\n\nDone after the question.");
+          } finally {
+            gateway.stop();
+            rmSync(root, { recursive: true, force: true });
+          }
+        },
+        TIMEOUT,
+      );
+    }
+  }
+
   test(
     "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
     async () => {
