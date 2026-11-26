@@ -5835,6 +5835,9 @@ test {
     _ = @import("tools/web/content.zig");
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
+    _ = @import("tools/filesystem/grep_files.zig");
+    _ = @import("tools/filesystem/glob_files.zig");
+    _ = @import("core/workspace/grep_search.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");

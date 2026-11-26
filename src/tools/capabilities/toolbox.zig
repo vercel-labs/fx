@@ -339,7 +339,7 @@ fn smallServerTools(ctx: tool_dispatch.DispatchContext, server: []const u8) tool
         .limit = small_server_tools + 1,
         .load_schemas = false,
         .schemas_in_result = true,
-    }, ctx.mcp_permission_rules, limits, ctx.mcp_access, ctx.cancel_flag) catch |err| switch (err) {
+    }, ctx.permission_rules, limits, ctx.mcp_access, ctx.cancel_flag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
         else => return null,

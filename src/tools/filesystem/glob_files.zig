@@ -8,6 +8,9 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const tool_files = @import("../../core/workspace/tool_files.zig");
+const permissions = @import("../../core/permissions/permissions.zig");
+const workspace_access = @import("../../core/workspace/workspace_access.zig");
+const types = @import("../../core/shared/types.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -138,9 +141,17 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
         };
         const candidate_files = listing.files;
         completeness = .of(listing);
+        const search_deny = permissions.SearchDeny.init(
+            ctx.permission_rules,
+            ctx.access_scope orelse workspace_access.AccessScope.primaryOnly(ctx.workspace_root),
+            "glob_files",
+        );
+        const hidden: ?tool_files.FileFilter = if (search_deny) |*deny| deny.filter() else null;
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
         for (candidate_files) |candidate| {
             if (!compiled_pattern.matchesPath(candidate)) continue;
+            if (hidden) |filter| if (candidateHidden(filter, &path_buffer, root.absolute, candidate)) continue;
 
             match_count += 1;
             if (input.mode == .count) continue;
@@ -209,6 +220,14 @@ fn formatMatches(
     try completeness.writeNotes(&out.writer);
 
     return try out.toOwnedSlice();
+}
+
+/// Whether `filter` hides `candidate`, a path below `root`. A path too long to name is hidden, as
+/// it could not be read either.
+fn candidateHidden(filter: tool_files.FileFilter, buffer: []u8, root: []const u8, candidate: []const u8) bool {
+    var fba = std.heap.FixedBufferAllocator.init(buffer);
+    const absolute = std.Io.Dir.path.join(fba.allocator(), &.{ root, candidate }) catch return true;
+    return filter.hides(absolute);
 }
 
 const SearchRoot = struct {
@@ -967,5 +986,39 @@ fn runGitForTest(alloc: Allocator, cwd: []const u8, args: []const []const u8) !v
     switch (result.term) {
         .exited => |code| if (code != 0) return error.SkipZigTest,
         else => return error.SkipZigTest,
+    }
+}
+
+test "glob_files leaves out files a deny rule covers when the search starts above them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const secret = try writeTempFile(alloc, &tmp, "secret/k.txt", "secret\n");
+    defer alloc.free(secret);
+    const open = try writeTempFile(alloc, &tmp, "src/a.txt", "open\n");
+    defer alloc.free(open);
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("glob"), .pattern = @constCast("secret/**"), .action = .deny },
+    };
+    const ctx = tool_dispatch.DispatchContext{
+        .allocator = alloc,
+        .scratch_allocator = alloc,
+        .workspace_root = workspace,
+        .permission_rules = .{ .rules = &rules },
+    };
+
+    inline for (.{ "**/*.txt", "secret/*" }) |pattern| {
+        var input = Input{
+            .pattern = try alloc.dupe(u8, pattern),
+            .path = try alloc.dupe(u8, "."),
+        };
+        defer input.deinit(alloc);
+        var result = try call(ctx, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
+        defer result.deinit(alloc);
+        const body = result.success;
+        try std.testing.expect(std.mem.find(u8, body, "secret/k.txt") == null);
+        if (std.mem.eql(u8, pattern, "**/*.txt")) try std.testing.expect(std.mem.find(u8, body, "src/a.txt") != null);
     }
 }

@@ -330,7 +330,9 @@ pub const DispatchContext = struct {
     toolbox_mcp_servers: []const []const u8 = &.{},
     /// The built-in tools the toolbox menu lists, by name.
     toolbox_behind: []const []const u8 = &.{},
-    mcp_permission_rules: core_types.PermissionRuleSet = .{},
+    /// The rules this call is held to: none in full access. Search tools check each file they reach
+    /// against them, and the MCP tools decide by them.
+    permission_rules: core_types.PermissionRuleSet = .{},
     context_notice_ctx: ?*anyopaque = null,
     on_context_notice: ?ContextNoticeSinkFn = null,
     inner_usage_sink: ?*?core_types.ToolUsage = null,

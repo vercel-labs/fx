@@ -12,6 +12,7 @@ const vision_contracts = @import("../agent/runtime/vision_contracts.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const types = @import("../shared/types.zig");
+const tool_files = @import("../workspace/tool_files.zig");
 
 pub const PermissionMode = types.PermissionMode;
 pub const ToolPermissionDecision = types.ToolPermissionDecision;
@@ -1108,6 +1109,36 @@ pub fn ruleDecisionFor(alloc: std.mem.Allocator, rules: types.PermissionRuleSet,
 
     return evaluateRulesetForTool(rules.rules, permission, tool_name, pattern) orelse .none;
 }
+
+/// What `grep_files` and `glob_files` check for each file they reach. Their own permission target
+/// is only the folder a search starts from, so a deny rule for a folder below it, or for a file a
+/// link points to, needs this check.
+pub const SearchDeny = struct {
+    rules: types.PermissionRuleSet,
+    access_scope: workspace_access.AccessScope,
+    tool_name: []const u8,
+
+    /// Null when no deny rule applies to `tool_name`, so a search without one checks nothing per file.
+    pub fn init(rules: types.PermissionRuleSet, access_scope: workspace_access.AccessScope, tool_name: []const u8) ?SearchDeny {
+        const permission = permissionNameForTool(tool_name);
+        for (rules.rules) |rule| {
+            if (rule.action == .deny and ruleMatchesPermission(rule.permission, permission, tool_name)) {
+                return .{ .rules = rules, .access_scope = access_scope, .tool_name = tool_name };
+            }
+        }
+        return null;
+    }
+
+    /// Valid while `self` is.
+    pub fn filter(self: *const SearchDeny) tool_files.FileFilter {
+        return .{ .context = self, .hides_fn = hides };
+    }
+
+    fn hides(context: *const anyopaque, absolute_path: []const u8) bool {
+        const self: *const SearchDeny = @ptrCast(@alignCast(context));
+        return fileTargetRuleDecision(self.rules, self.access_scope.primary_directory, self.tool_name, absolute_path) == .deny;
+    }
+};
 
 pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permission: []const u8, pattern: []const u8, fallback: RuleDecision) RuleDecision {
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
@@ -3598,4 +3629,23 @@ test "a shell refresh resets remembered command grants only" {
     shell_snapshot.processOwner().recordShellGrant(command);
     try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
     try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
+}
+
+test "a search tool hides the files its own deny rules cover" {
+    var grep_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("grep"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("grep"), .pattern = @constCast("secret/**"), .action = .deny },
+    };
+    var read_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("read"), .pattern = @constCast("secret/**"), .action = .deny },
+    };
+    const scope = workspace_access.AccessScope.primaryOnly("/tmp/ws");
+
+    const deny = SearchDeny.init(.{ .rules = &grep_rules }, scope, "grep_files").?;
+    const filter = deny.filter();
+    try std.testing.expect(filter.hides("/tmp/ws/secret/k.txt"));
+    try std.testing.expect(!filter.hides("/tmp/ws/src/a.txt"));
+
+    try std.testing.expect(SearchDeny.init(.{ .rules = &read_rules }, scope, "grep_files") == null);
+    try std.testing.expect(SearchDeny.init(.{}, scope, "grep_files") == null);
 }
