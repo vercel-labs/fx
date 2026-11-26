@@ -3229,7 +3229,7 @@ test "network call record writes the generation, served-by, and effort the reque
     const w = try TestWriter.create();
     defer w.destroy();
     var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
-    call.setModel("anthropic/claude-opus-4.8");
+    call.setModel("provider/model-a");
     call.setGenerationId("gen_01JC7P5XQ2M8VZ");
     call.setServedBy("bedrock");
     call.setEffort("high");
@@ -3249,7 +3249,7 @@ test "network call record leaves out the generation, served-by, and effort when 
     const w = try TestWriter.create();
     defer w.destroy();
     var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_700_000_000_123, .status = 200 };
-    call.setModel("anthropic/claude-opus-4.8");
+    call.setModel("provider/model-a");
     try w.records.begin("network_call");
     try writeNetworkCallFields(&w.records, &call);
     try w.records.end();
