@@ -4598,6 +4598,8 @@ const TtySteeringCancelTest = struct {
     client: terminal_client.Runtime,
     runtime: managed_execution.Runtime,
     yield_flag: std.atomic.Value(bool),
+    /// The call's user-cancel flag; null for a call that nobody cancels.
+    cancel: ?*std.atomic.Value(bool),
 
     fn init(self: *TtySteeringCancelTest) !void {
         const host = @import("../../core/hosts/host.zig");
@@ -4607,6 +4609,7 @@ const TtySteeringCancelTest = struct {
         const alloc = std.testing.allocator;
         self.alloc = alloc;
         self.yield_flag = .init(true);
+        self.cancel = null;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
         self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
@@ -4711,6 +4714,7 @@ const TtySteeringCancelTest = struct {
         ctx.tool_call_id = "steered-tty-call";
         ctx.execution_authority = .{ .run_command = authority };
         ctx.tool_yield_flag = if (steered) &self.yield_flag else null;
+        ctx.cancel_flag = self.cancel;
         ctx.output_chunk_lifecycle_id = .{ .turn_id = turn_id, .call_id = "steered-tty-call" };
         const result = try tool_dispatch.dispatchAuthorizedToolCall(
             ctx,
@@ -5262,6 +5266,148 @@ test "start in flight: a sync during a start that waits for exit does not double
 
 test "start in flight, steered: a sync during a start that waits for exit does not double its output" {
     try caseWideWindow(steered_mode);
+}
+
+/// The command of a terminal that prints a marker once it runs, then stays
+/// idle. `exec` leaves no child behind.
+const ready_idle_command = "printf READY; exec sleep 30";
+
+const EarlyFailure = enum {
+    /// The instance shuts down between the start and `registerTty`, so
+    /// `registerTty` refuses with `RuntimeStopping`.
+    register_fails,
+    /// The user cancels the call while it waits for the command.
+    wait_cancelled,
+};
+
+const RecordedShell = struct {
+    pid: std.posix.pid_t,
+    closed: bool,
+};
+
+/// The shell's pid and whether its lifecycle is closed, from the terminal's
+/// durable record.
+fn recordedShell(t: *TtySteeringCancelTest, session_id: []const u8) !RecordedShell {
+    const name = try t.alloc.print("record-{s}.json", .{session_id});
+    defer t.alloc.free(name);
+    const path = try std.Io.Dir.path.join(t.alloc, &.{
+        ".fx", "sessions", TtySteeringCancelTest.owner_session_id, "terminal", "state", name,
+    });
+    defer t.alloc.free(path);
+    const bytes = try t.tmp.dir.readFileAlloc(std.testing.io, path, t.alloc, .limited(1024 * 1024));
+    defer t.alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.alloc, bytes, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object;
+    const pid_text = (record.get("pid") orelse return error.TestMissingPid).string;
+    const lifecycle = (record.get("lifecycle") orelse return error.TestUnexpectedResult).string;
+    return .{
+        .pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10),
+        .closed = std.mem.eql(u8, lifecycle, "closed"),
+    };
+}
+
+fn processGone(pid: std.posix.pid_t) bool {
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
+    return false;
+}
+
+fn processGoneWithin(pid: std.posix.pid_t, timeout_ms: i64) bool {
+    const deadline = io_mod.milliTimestamp() + timeout_ms;
+    while (io_mod.milliTimestamp() < deadline) {
+        if (processGone(pid)) return true;
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+    return processGone(pid);
+}
+
+/// Waits until the terminal client runs a request, which here is the call's
+/// own wait. The client moves a request from its queue to its active table in
+/// two steps, and a cancel that lands between them finds the request in
+/// neither, so a test that cancels a wait lets the wait start first.
+fn waitForActiveRequest(t: *TtySteeringCancelTest) !void {
+    const zio = io_mod.getIo();
+    const deadline = io_mod.milliTimestamp() + StartGate.max_wait_ms;
+    while (io_mod.milliTimestamp() < deadline) {
+        t.client.mutex.lockUncancelable(zio);
+        const active = t.client.active_count;
+        t.client.mutex.unlock(zio);
+        if (active != 0) return;
+        io_mod.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.TestStartGateTimedOut;
+}
+
+/// A steered tty `run` whose path after `start` returned fails at `failure`.
+/// The call must return a failure, close the terminal, end the in-flight
+/// mark and register nothing, so no hidden terminal and no process is left.
+fn caseFailsAfterStart(failure: EarlyFailure) !void {
+    if (comptime builtin.target.os.tag == .wasi) return;
+    var t: TtySteeringCancelTest = undefined;
+    try t.init();
+    defer t.deinit();
+    t.yield_flag.store(false, .release);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    t.cancel = &cancel_flag;
+    StartGate.arm(null, false, true);
+    defer StartGate.disarm();
+    var start = StartCall{
+        .t = &t,
+        .command = ready_idle_command,
+        .yield_ms = steered_mode.yield_ms,
+        .steered = true,
+    };
+    defer start.deinit();
+    const start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start});
+    defer start_thread.join();
+    defer StartGate.releaseAll();
+
+    // The registry's start returned and the command runs; the call holds
+    // before it waits for the command and indexes the terminal.
+    try StartGate.waitFor(&StartGate.shell_held);
+    const session_id = StartGate.id();
+    try waitForTerminalOutput(&t, session_id, "READY");
+    switch (failure) {
+        .register_fails => {
+            t.runtime.shutdown();
+            t.yield_flag.store(true, .release);
+        },
+        .wait_cancelled => {},
+    }
+    StartGate.release_shell.set(std.testing.io);
+    if (failure == .wait_cancelled) {
+        try waitForActiveRequest(&t);
+        cancel_flag.store(true, .seq_cst);
+    }
+    try StartGate.waitFor(&start.returned);
+
+    // The call failed. A cancel may come back as the dispatcher's own error.
+    errdefer std.debug.print("start result: {?s} failure: {?}\n", .{ start.body, start.failure });
+    if (start.failure) |err| {
+        try std.testing.expectEqual(EarlyFailure.wait_cancelled, failure);
+        try std.testing.expectEqual(error.Cancelled, err);
+    } else {
+        const body = start.body orelse return error.TestUnexpectedResult;
+        const code: []const u8 = switch (failure) {
+            .register_fails => "RuntimeStopping",
+            .wait_cancelled => "cancelled",
+        };
+        try std.testing.expect(std.mem.find(u8, body, code) != null);
+    }
+    // It left nothing behind: no registered terminal, no hidden one, no process.
+    try std.testing.expect(t.runtime.stateFor(session_id) == null);
+    try std.testing.expect(!t.client.backend.?.store.is_starting(session_id));
+    const shell = try recordedShell(&t, session_id);
+    try std.testing.expect(shell.closed);
+    try std.testing.expect(processGoneWithin(shell.pid, 5_000));
+}
+
+test "start in flight: a steered run whose registerTty fails ends the mark and closes the terminal" {
+    try caseFailsAfterStart(.register_fails);
+}
+
+test "start in flight: a steered run whose wait is cancelled ends the mark and closes the terminal" {
+    try caseFailsAfterStart(.wait_cancelled);
 }
 
 test "a stop failure counts as busy only for a retryable capacity refusal" {
