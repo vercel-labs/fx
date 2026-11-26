@@ -21,11 +21,15 @@ pub var test_hold: if (builtin.is_test) ?*const fn () void else void = if (built
 /// Called by a captured run once its yield time has passed, before it
 /// returns its command running.
 pub fn holdTimedYield() void {
-    if (comptime build_options.libfx) return;
+    // A test build takes the hook before it reads `build_options`, because a
+    // test compile can reach this file without that module: the nested build
+    // of "streamed presentation preserves ANSI OSC 8 code fence and table
+    // spans" in `src/core/agent/runtime/assistant_stream.zig`.
     if (builtin.is_test) {
         if (test_hold) |hold| hold();
         return;
     }
+    if (comptime build_options.libfx) return;
     const held = io_mod.getenvAbsolutePath("FX_TEST_SHELL_YIELD_HELD") orelse return;
     const release = io_mod.getenvAbsolutePath("FX_TEST_SHELL_YIELD_RELEASE") orelse return;
     // A marker that cannot be written skips the hold; the test that set the
