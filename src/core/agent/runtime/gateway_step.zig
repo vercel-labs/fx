@@ -89,7 +89,7 @@ pub fn streamModelCompletion(
         .failed => |value| .{ .id = call.id, .error_name = @tagName(value.kind), .cancelled = request.cancel_flag.load(.seq_cst) },
     } });
 
-    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx, request.credential.secret());
+    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx, request.credential.secret(), request.provider_options.reasoning);
     return switch (result) {
         .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
         .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
@@ -118,6 +118,7 @@ fn recordProviderResultMetric(
     result: agent_stream_provider.Result,
     trace_ctx: TraceContext,
     credential: ?[]const u8,
+    sent_effort: ?types.ReasoningEffort,
 ) void {
     const completion: types.ModelCompletion = switch (result) {
         .completed => |value| value.completion,
@@ -141,6 +142,7 @@ fn recordProviderResultMetric(
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
     const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
+    const effort_label: []const u8 = if (sent_effort) |*effort| effort.label() else "";
     const error_message: ?[]u8 = if (failure) |value| if (value.http_status) |status| if (value.detail) |detail|
         traceErrorMessage(std.heap.c_allocator, status, detail, credential) catch null
     else
@@ -164,6 +166,11 @@ fn recordProviderResultMetric(
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
             .provider_stop_reason = completion.finish_reason_raw.slice(),
             .error_message = error_message orelse "",
+        },
+        .{
+            .generation_id = completion.generation_id orelse "",
+            .served_by = completion.resolved_provider orelse "",
+            .effort = effort_label,
         },
     );
 }
