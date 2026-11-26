@@ -1199,6 +1199,30 @@ test "a second takeover of the same lock line finds nothing to remove and does n
     try testing.expect(std.mem.find(u8, trace, "reason=folder_missing") != null);
 }
 
+test "a lock record parses or is refused on fuzzed bytes, and what parses writes back the same" {
+    try testing.fuzz({}, fuzzLockRecord, .{ .corpus = &(@import("fuzz_seed").slices(.{
+        "{\"socket\":\"/tmp/fx-leader-0123456789abcdef/s\",\"pid\":4242}\n",
+        "{\"pid\":-1,\"socket\":\"/x/s\"}",
+        "{\"socket\":\"/tmp/a\\\"b/s\",\"pid\":7}",
+        "not a record",
+        "[]",
+    }) ++ @import("fuzz_corpus").lock_record.*) });
+}
+
+fn fuzzLockRecord(_: void, smith: *testing.Smith) anyerror!void {
+    var input: [max_record_bytes]u8 = undefined;
+    const len = smith.slice(&input);
+    var buffer: [max_record_bytes]u8 = undefined;
+    const record = parseRecord(&buffer, input[0..len]) catch return;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeRecord(&out.writer, record.socket, record.pid);
+    var again_buffer: [max_record_bytes]u8 = undefined;
+    const again = try parseRecord(&again_buffer, out.writer.buffered());
+    try testing.expectEqualStrings(record.socket, again.socket);
+    try testing.expectEqual(record.pid, again.pid);
+}
+
 test "a dead leader's folder with no socket left in it is removed" {
     const io = testing.io;
     var leader = try TestLeader.create(io, 0o700);
