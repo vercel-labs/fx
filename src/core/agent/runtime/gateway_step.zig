@@ -8,6 +8,7 @@ const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
+const diagnostics = @import("../../workspace/diagnostics.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const observation = @import("observation.zig");
 
@@ -112,6 +113,22 @@ const ObservedEvents = struct {
     }
 };
 
+/// The trace facts of a settled call. The reply's generation ID and provider
+/// are kept only as text a saved record accepts, and the effort label borrows
+/// from `sent_effort`, which the caller keeps for the call.
+fn gatewayCallFacts(completion: types.ModelCompletion, sent_effort: *const ?types.ReasoningEffort) runtime_telemetry.GatewayCallFacts {
+    return .{
+        .generation_id = checkedText(completion.generation_id),
+        .served_by = checkedText(completion.resolved_provider),
+        .effort = if (sent_effort.*) |*effort| effort.label() else "",
+    };
+}
+
+fn checkedText(text: ?[]const u8) []const u8 {
+    const value = text orelse return "";
+    return if (types.validModelCallText(value)) value else "";
+}
+
 fn recordProviderResultMetric(
     model: []const u8,
     started_at_ms: i64,
@@ -142,7 +159,6 @@ fn recordProviderResultMetric(
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
     const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
-    const effort_label: []const u8 = if (sent_effort) |*effort| effort.label() else "";
     const error_message: ?[]u8 = if (failure) |value| if (value.http_status) |status| if (value.detail) |detail|
         traceErrorMessage(std.heap.c_allocator, status, detail, credential) catch null
     else
@@ -167,12 +183,32 @@ fn recordProviderResultMetric(
             .provider_stop_reason = completion.finish_reason_raw.slice(),
             .error_message = error_message orelse "",
         },
-        .{
-            .generation_id = completion.generation_id orelse "",
-            .served_by = completion.resolved_provider orelse "",
-            .effort = effort_label,
-        },
+        gatewayCallFacts(completion, &sent_effort),
     );
+}
+
+test "a reply's generation ID and served-by reach the trace only as valid text" {
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+    const long_provider: [300]u8 = @splat('p');
+    const forged: agent_stream_provider.Result = .{ .completed = .{ .completion = .{
+        .generation_id = "gen_\x1b[2J",
+        .resolved_provider = &long_provider,
+    } } };
+    const valid: agent_stream_provider.Result = .{ .completed = .{ .completion = .{
+        .generation_id = "gen_01JC7P5XQ2M8VZ000000000001",
+        .resolved_provider = "bedrock",
+    } } };
+    recordProviderResultMetric("test/model", 0, forged, .{}, null, null);
+    recordProviderResultMetric("test/model", 0, valid, .{}, null, null);
+
+    var calls: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
+    const count = diagnostics.snapshotNetworkCalls(&calls);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("", calls[0].generationId());
+    try std.testing.expectEqualStrings("", calls[0].servedBy());
+    try std.testing.expectEqualStrings("gen_01JC7P5XQ2M8VZ000000000001", calls[1].generationId());
+    try std.testing.expectEqualStrings("bedrock", calls[1].servedBy());
 }
 
 test "gateway request scratch is released across success failure cancellation and retries" {

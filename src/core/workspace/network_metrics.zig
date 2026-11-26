@@ -538,6 +538,9 @@ const text_fields = [_]TextField{
     .{ .set = NetworkCall.setProviderStopReason, .get = NetworkCall.providerStopReason, .limit = max_stop_reason_len },
     .{ .set = NetworkCall.setGatewaySchemaDiagnostic, .get = NetworkCall.gatewaySchemaDiagnostic, .limit = max_gateway_schema_diagnostic_len },
     .{ .set = NetworkCall.setGatewayRequestShape, .get = NetworkCall.gatewayRequestShape, .limit = max_gateway_request_shape_len },
+    .{ .set = NetworkCall.setGenerationId, .get = NetworkCall.generationId, .limit = max_generation_id_len },
+    .{ .set = NetworkCall.setServedBy, .get = NetworkCall.servedBy, .limit = max_served_by_len },
+    .{ .set = NetworkCall.setEffort, .get = NetworkCall.effort, .limit = max_effort_len },
 };
 
 test "network call text cuts end on a UTF-8 boundary" {
