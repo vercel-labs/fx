@@ -804,6 +804,17 @@ const TestLeader = struct {
         file.close(io);
     }
 
+    /// A socket file that no process listens on, as a dead leader leaves it.
+    fn placeStaleSocket(self: TestLeader) !void {
+        const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        if (fd < 0) return error.TestSocketFailed;
+        defer _ = std.c.close(fd);
+        var address = std.mem.zeroes(posix.sockaddr.un);
+        address.family = posix.AF.UNIX;
+        @memcpy(address.path[0..self.socket.len], self.socket);
+        if (std.c.bind(fd, @ptrCast(&address), @sizeOf(@TypeOf(address))) != 0) return error.TestBindFailed;
+    }
+
     fn destroy(self: TestLeader, io: std.Io) void {
         // A test may already have removed the folder; the cleanup must not fail.
         std.Io.Dir.cwd().deleteTree(io, self.folder) catch {};
@@ -825,7 +836,9 @@ const BusyListener = struct {
             switch (connectOnce(socket)) {
                 .alive => |fd| try busy.held.append(testing.allocator, fd),
                 .busy => return busy,
-                .dead, .unknown => return error.TestListenerNotBusy,
+                // macOS refuses a connect to a full queue instead of reporting it busy.
+                .dead => if (builtin.os.tag != .linux and busy.held.items.len > 0) return busy else return error.TestListenerNotBusy,
+                .unknown => return error.TestListenerNotBusy,
             }
         }
         return error.TestListenerNotBusy;
@@ -881,7 +894,7 @@ test "a socket that accepts a connection is alive" {
     try testing.expectEqual(Probe.alive, probeSocket(io, leader.socket_path));
 }
 
-test "a socket whose queue stays full is unknown after probe_timeout_ms" {
+test "a socket whose queue stays full is unknown after probe_timeout_ms on Linux and dead at once on macOS" {
     const io = testing.io;
     var leader = try TestLeader.create(io, 0o700);
     defer leader.destroy(io);
@@ -895,9 +908,10 @@ test "a socket whose queue stays full is unknown after probe_timeout_ms" {
         try testing.expectEqual(Probe.unknown, probe);
         try testing.expect(elapsed_ms >= probe_timeout_ms);
     } else {
-        // macOS may refuse a full queue at once, which reads as dead. The live
-        // pid check keeps such a folder, so only "not alive" is pinned here.
-        try testing.expect(probe != .alive);
+        // macOS refuses a connect to a full queue at once, so the probe reads
+        // it as dead without waiting. Only a live pid keeps such a folder there.
+        try testing.expectEqual(Probe.dead, probe);
+        try testing.expect(elapsed_ms < probe_timeout_ms);
     }
 }
 
@@ -905,7 +919,7 @@ test "a dead leader's socket and folder are removed" {
     const io = testing.io;
     var leader = try TestLeader.create(io, 0o700);
     defer leader.destroy(io);
-    try leader.placeSocketFile(io);
+    try leader.placeStaleSocket();
     const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
     defer testing.allocator.free(line);
 
@@ -960,13 +974,15 @@ test "a socket that answers keeps its folder, even when its pid is gone" {
     try testing.expect(pathGone(io, socket_copy));
 }
 
-test "a socket whose queue stays full keeps its folder" {
+test "a socket whose queue stays full keeps its folder (dead pid on Linux, live pid on macOS)" {
     const io = testing.io;
     var leader = try TestLeader.create(io, 0o700);
     defer leader.destroy(io);
     var busy = try BusyListener.start(io, leader.socket);
     defer busy.stop(io);
-    const line = try recordBytes(testing.allocator, leader.socket, no_process_pid);
+    // On macOS a full queue reads as refused, which is dead, so only a live pid keeps this folder.
+    const pid: i64 = if (builtin.os.tag == .linux) no_process_pid else @intCast(std.c.getpid());
+    const line = try recordBytes(testing.allocator, leader.socket, pid);
     defer testing.allocator.free(line);
 
     takeOverDeadLeader(io, line);
