@@ -8047,14 +8047,17 @@ fn statusDetail(
 
 /// Whether the calls of one presentation group before and after `entry` take
 /// separate rows. Core keeps a turn's group open across a message the user
-/// sends while it runs and across a notice the main screen shows in the
-/// middle of it, such as `✓ Context compacted`, but the calls after either
+/// sends while it runs, across a notice the main screen shows in the middle
+/// of it, such as `✓ Context compacted`, and across a line fx writes between
+/// steps, such as the empty-reply nudge, but the calls after any of them
 /// belong below it, not in the row above it. A notice that only Ctrl+O shows
-/// draws nothing between the rows, so it keeps them together.
+/// draws nothing between the rows, so it keeps them together. So does the
+/// model's own text between calls of one step.
 fn breaksPresentationGroup(entry: TranscriptEntry) bool {
     return switch (entry) {
         .user_turn => true,
         .semantic_notice => transcript_blocks.isEntryVisibleInCompactPresentation(entry),
+        .assistant_turn => |turn| turn.operational and !isTransparentCompactEntry(entry),
         else => false,
     };
 }
@@ -8361,6 +8364,22 @@ fn readsAroundForTest(middle: TranscriptEntry) struct { entries: [4]TranscriptEn
     };
 }
 
+/// Checks the main screen's rows for `readsAroundForTest(middle)`.
+fn expectReadRowsForTest(alloc: std.mem.Allocator, middle: TranscriptEntry, expected: []const u8) !void {
+    const reads = readsAroundForTest(middle);
+    const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(expected, std.mem.trim(u8, text, "\n"));
+}
+
+/// Text as the second entry, as the pacer commits it. The caller frees its
+/// segments.
+fn textEntryForTest(alloc: std.mem.Allocator, text: []const u8, operational: bool) !TranscriptEntry {
+    var segments: transcript_blocks.AssistantTurnSegments = .{};
+    try segments.text.appendSlice(alloc, text);
+    return .{ .assistant_turn = .{ .id = 2, .operational = operational, .segments = segments } };
+}
+
 test "a notice the main screen shows in the middle of a turn starts a new row for the calls after it" {
     const alloc = std.testing.allocator;
     const Case = struct { name: []const u8, middle: TranscriptEntry };
@@ -8373,10 +8392,8 @@ test "a notice the main screen shows in the middle of a turn starts a new row fo
     };
     for (cases) |case| {
         errdefer std.debug.print("case: {s}\n", .{case.name});
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt\n● Read b.txt, c.txt");
         const reads = readsAroundForTest(case.middle);
-        const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
-        defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Read a.txt\n● Read b.txt, c.txt", std.mem.trim(u8, text, "\n"));
         var projection = try build(alloc, &reads.entries, &reads.details, 120);
         defer projection.deinit(alloc);
         // The middle line draws between the two rows.
@@ -8396,11 +8413,37 @@ test "a notice the main screen hides keeps the calls around it in one row" {
     };
     for (cases) |case| {
         errdefer std.debug.print("case: {s}\n", .{case.name});
-        const reads = readsAroundForTest(case.middle);
-        const text = try groupTextForTest(alloc, &reads.entries, &reads.details);
-        defer alloc.free(text);
-        try std.testing.expectEqualStrings("● Read a.txt, b.txt, c.txt", std.mem.trim(u8, text, "\n"));
+        try expectReadRowsForTest(alloc, case.middle, "● Read a.txt, b.txt, c.txt");
     }
+}
+
+test "a line fx writes between steps starts a new row for the calls after it" {
+    // One line from each place in orchestrator.zig that writes one with
+    // `push_text(.operational)`.
+    const alloc = std.testing.allocator;
+    const Case = struct { site: []const u8, line: []const u8 };
+    const cases = [_]Case{
+        .{ .site = "image catalog down", .line = "fx couldn't connect to the AI Gateway to load the model catalog, so images from tools aren't reaching the model until it loads. Check your network connection or firewall." },
+        .{ .site = "malformed tool call retry", .line = "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again." },
+        .{ .site = "length-limited resend", .line = "The reply ran out of output tokens before any text. Retrying with a higher limit." },
+        .{ .site = "empty-reply nudge", .line = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue." },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("site: {s}\n", .{case.site});
+        var middle = try textEntryForTest(alloc, case.line, true);
+        defer middle.assistant_turn.segments.deinit(alloc);
+        try expectReadRowsForTest(alloc, middle, "● Read a.txt\n● Read b.txt, c.txt");
+    }
+}
+
+test "the model's text between calls of one group keeps them in one row" {
+    // Core ends the group at the model's own text between steps, so text
+    // in the middle of one group is the model's text between calls of one
+    // step. Only a line fx wrote is marked.
+    const alloc = std.testing.allocator;
+    var middle = try textEntryForTest(alloc, "provider bridge", false);
+    defer middle.assistant_turn.segments.deinit(alloc);
+    try expectReadRowsForTest(alloc, middle, "● Read a.txt, b.txt, c.txt");
 }
 
 test "Ctrl+O still gives each call around a notice its own line, in order" {

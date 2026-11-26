@@ -1376,6 +1376,11 @@ pub fn Runtime(comptime App: type) type {
                                     app.shell.markAssistantAttemptStart();
                                 }
                             },
+                            .operational_text_shown => {
+                                if (comptime @hasDecl(@TypeOf(app.shell), "markOperationalText")) {
+                                    app.shell.markOperationalText();
+                                }
+                            },
                             .attempt_restart => |fallback| {
                                 if (!try replaceRestartedAttempt(app)) {
                                     try handlers.append_text(handlers.ctx, fallback);

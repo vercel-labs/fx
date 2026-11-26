@@ -1088,7 +1088,8 @@ const NOTICE_HANDOFF = "Facts:\nF1: NOTICE_ROWS_HANDOFF_51aa: the user asked to 
 const NOTICE_AUTO_CONTEXT_WINDOW = 67_000 + 8192;
 const NOTICE_CLOCK = /\((?:\d+h)?(?:\d+m)?\d+s\)/g;
 
-type NoticeMiddle = "overflow" | "auto" | "provider-error" | "effort";
+type NoticeMiddle = "overflow" | "auto" | "provider-error" | "effort" | "empty-reply";
+const NOTICE_EMPTY_REPLY = "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.";
 
 /// The rows from the turn's prompt to its answer, without blank rows and
 /// with clocks as `(Ns)`, so live and resumed screens compare row for row.
@@ -1141,6 +1142,10 @@ async function readAroundNotice(middle: NoticeMiddle) {
     ...(middle === "provider-error" ? [() => Response.json({ error: {
       type: "invalid_request_error", message: NOTICE_REJECTION,
     } }, { status: 403 })] : []),
+    // No text and no call, with a reason the AI SDK folds into `other`.
+    ...(middle === "empty-reply" ? [() => fakeGatewaySse([
+      { type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" } },
+    ])] : []),
     middle === "effort"
       ? async () => {
         await secondReadReleased;
@@ -1299,6 +1304,19 @@ describe.skipIf(!tmuxAvailable())("tui: tool rows around a notice in the middle 
       `  ${NOTICE_DONE}`,
     ]);
     expectFullTranscriptOrder(fullRows, ["● Read a.txt", "Next turn will use reasoning effort high", "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
+    expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
+  }, 120_000);
+
+  test("empty reply: the calls after fx asked the model to continue draw below that line, and share one row after resume", async () => {
+    const { liveRows, fullRows, resumedRows } = await readAroundNotice("empty-reply");
+    expect(liveRows).toEqual([
+      `┃ ${NOTICE_PROMPT}`,
+      "● Read a.txt",
+      `  ${NOTICE_EMPTY_REPLY}`,
+      "● Read b.txt, c.txt",
+      `  ${NOTICE_DONE}`,
+    ]);
+    expectFullTranscriptOrder(fullRows, ["● Read a.txt", "The model stopped without a reply", "● Read b.txt", "● Read c.txt", NOTICE_DONE]);
     expect(resumedRows).toEqual([`┃ ${NOTICE_PROMPT}`, "● Read a.txt, b.txt, c.txt", `  ${NOTICE_DONE}`]);
   }, 120_000);
 });
