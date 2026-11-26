@@ -7,7 +7,7 @@
 //! still holds it, so a test can look at the list, the trace, and message
 //! admission in that gap every time
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message to a subagent
-//! whose close is not written yet is refused"). Only that test sets the
+//! whose close is not written yet is refused"). Only tests set the
 //! controls, so the libfx artifacts leave them out. A build that sets neither
 //! control reads one environment variable per close and does nothing more.
 //!
@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
+const hold_marker = @import("../shared/hold_marker.zig");
 
 var holds = std.atomic.Value(u32).init(0);
 
@@ -45,7 +46,7 @@ pub fn holdWrite(child_id: []const u8) void {
     const own_release = std.mem.print(&own_buf, "{s}.{d}", .{ release, n }) catch return;
     var contents_buf: [256]u8 = undefined;
     const contents = std.mem.print(&contents_buf, "close_write child={s}", .{child_id}) catch return;
-    end_test_controls.writeMarker(marker, contents) catch return;
+    hold_marker.write(marker, contents) catch return;
     const deadline = io_mod.milliTimestamp() + end_test_controls.max_hold_ms;
     while (!end_test_controls.pathExists(release) and !end_test_controls.pathExists(own_release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);

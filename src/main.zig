@@ -5685,6 +5685,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/shared/history_range.zig");
+    _ = @import("core/shared/hold_marker.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/cli/doctor_probes.zig");
     _ = @import("core/cli/doctor_child_status.zig");
