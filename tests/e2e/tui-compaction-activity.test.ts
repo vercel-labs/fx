@@ -407,7 +407,12 @@ async function foldedReadAfterReopen(trigger: "auto" | "overflow") {
     await live.sendText(PROMPT);
     const liveRows = turnRows(await live.waitForPane((pane) => finished(pane, DONE) && /Explored \d files/.test(pane), 30_000));
     expect(bodies.some((entry) => entry.phase === "turn" && entry.summary)).toBe(true);
-    expect(liveRows).toContain("● Read a.txt, b.txt, c.txt");
+    // Live, the compaction's row splits the reads in two. fx saves no such
+    // row, so after reopen the reads are one row.
+    const liveAt = (row: string) => liveRows.indexOf(row);
+    expect(liveAt("● Read a.txt L1-1000")).toBeGreaterThanOrEqual(0);
+    expect(liveAt("✓ Context compacted (")).toBeGreaterThan(liveAt("● Read a.txt L1-1000"));
+    expect(liveAt("● Read b.txt, c.txt")).toBeGreaterThan(liveAt("✓ Context compacted ("));
     expect(liveRows).toContain("Explored 3 files");
     phase = "next";
     await live.sendText("Next live turn.");
