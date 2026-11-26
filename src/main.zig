@@ -3,6 +3,7 @@ const agents = @import("core/agents/agents.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const self_exe = @import("core/shared/self_exe.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
@@ -165,6 +166,7 @@ const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
 const ui_program_status = @import("ui/terminal/program_status.zig");
+const ui_program_resume = @import("ui/terminal/program_resume.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -566,8 +568,36 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn hasProgramResumeToken() bool {
+        return ui_program_resume.keptToken() != null;
+    }
+
+    pub fn putProgramResumeToken(environ: *std.process.Environ.Map) !bool {
+        return ui_program_resume.putToken(environ);
+    }
+
+    pub fn programResumeToken() ?[]const u8 {
+        return ui_program_resume.keptToken();
+    }
+
+    /// The name the terminal runs to resume: the bare name fx was started with,
+    /// else the path of this binary written into `buffer`.
+    pub fn programResumeExecutable(buffer: []u8) ?[]const u8 {
+        if (ui_program_resume.programName()) |name| return name;
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        return self_exe.pathForPeerReexec(fixed.allocator()) catch null;
+    }
+
     pub fn writeProgramStatus(self: *Self, report: []const u8) void {
         self.shell.writeProgramStatus(&self.metrics, report);
+    }
+
+    pub fn writeProgramResume(self: *Self, report: []const u8) void {
+        self.shell.writeProgramResume(&self.metrics, report);
+    }
+
+    pub fn clearProgramResume(self: *Self) void {
+        SessionAppRuntime.clearProgramResume(self);
     }
 
     alloc: Allocator,
@@ -603,6 +633,7 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     program_status: ui_program_status.Reporter = .{},
+    program_resume: ui_program_resume.Reporter = .{},
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
@@ -3601,6 +3632,7 @@ const App = struct {
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
+        SessionAppRuntime.reportProgramResume(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -4014,6 +4046,9 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
+    // Before any mode reads the environment or starts a program, so none inherits the terminal's token.
+    ui_program_resume.takeToken(c_envp);
+    if (c_argc > 0) ui_program_resume.rememberProgramName(c_argv[0]);
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
     // Before any mode runs, since terminal helpers write under fx's folder too.

@@ -421,6 +421,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    // A quit the user chose removes the terminal's resume record. An upgrade
+    // relaunch keeps it, since the process and its pid continue. A hang-up or a
+    // signal never reaches this line.
+    if (comptime !cooperative and @hasDecl(App, "clearProgramResume")) {
+        if (relaunch_request == null) app.clearProgramResume();
+    }
     var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
         !cooperative and relaunch_request == null,
     );
@@ -456,10 +462,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 argc += 1;
             }
             const argv_slice = argv[0..argc];
+            var relaunch_environ: ?std.process.Environ.Map = if (comptime @hasDecl(App, "putProgramResumeToken"))
+                relaunchEnvironWithResumeToken(App, alloc)
+            else
+                null;
+            defer if (relaunch_environ) |*environ| environ.deinit();
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv_slice },
+                .{
+                    .argv = argv_slice,
+                    .environ_map = if (relaunch_environ) |*environ| environ else null,
+                },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
@@ -541,6 +555,33 @@ fn writeUpgradeRelaunchFailure(
         .{ types.plainErrorText(@errorName(err), &words), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
+}
+
+/// The environment the relaunch starts with: the current one plus the program
+/// resume token the App keeps. Null when there is no token, or when the copy or
+/// the put fails, so the relaunch then starts with the process environment alone.
+fn relaunchEnvironWithResumeToken(comptime App: type, alloc: Allocator) ?std.process.Environ.Map {
+    if (comptime @hasDecl(App, "hasProgramResumeToken")) {
+        if (!App.hasProgramResumeToken()) return null;
+    }
+    var environ = io_mod.cloneEnvironMap(alloc) catch |err| {
+        traceResumeTokenDropped(err);
+        return null;
+    };
+    const put = App.putProgramResumeToken(&environ) catch |err| {
+        environ.deinit();
+        traceResumeTokenDropped(err);
+        return null;
+    };
+    if (!put) {
+        environ.deinit();
+        return null;
+    }
+    return environ;
+}
+
+fn traceResumeTokenDropped(err: anyerror) void {
+    debug_trace.logf("core", "upgrade relaunch keeps no program resume token err={s}", .{@errorName(err)});
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -916,11 +957,18 @@ const TestCapture = struct {
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
     upgrade_previous_revision: ?[]const u8 = null,
+    /// Whether `TestApp` reports a program resume token to the relaunch.
+    resume_token_kept: bool = true,
+    program_resume_clears: usize = 0,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
     replace_arg_bufs: [5][128]u8 = undefined,
     replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
+    replace_has_environ: bool = false,
+    replace_token_buf: [128]u8 = undefined,
+    /// Null when the replace options carried no OSC7577_TOKEN.
+    replace_token_len: ?usize = null,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -962,6 +1010,11 @@ const TestCapture = struct {
 
     fn replaceArg(self: *const TestCapture, index: usize) []const u8 {
         return self.replace_arg_bufs[index][0..self.replace_arg_lens[index]];
+    }
+
+    fn replaceToken(self: *const TestCapture) ?[]const u8 {
+        const len = self.replace_token_len orelse return null;
+        return self.replace_token_buf[0..len];
     }
 };
 
@@ -1010,6 +1063,15 @@ fn replaceProcessForTest(
         }
         @memcpy(capture.replace_arg_bufs[index][0..arg.len], arg);
         capture.replace_arg_lens[index] = arg.len;
+    }
+    capture.replace_has_environ = options.environ_map != null;
+    capture.replace_token_len = null;
+    if (options.environ_map) |environ| {
+        if (environ.get("OSC7577_TOKEN")) |value| {
+            if (value.len > capture.replace_token_buf.len) return error.SystemResources;
+            @memcpy(capture.replace_token_buf[0..value.len], value);
+            capture.replace_token_len = value.len;
+        }
     }
     return capture.replace_error;
 }
@@ -1078,6 +1140,20 @@ const TestApp = struct {
             request.previous_revision_len = @intCast(revision.len);
         }
         return request;
+    }
+
+    pub fn hasProgramResumeToken() bool {
+        return active_capture.?.resume_token_kept;
+    }
+
+    pub fn putProgramResumeToken(environ: *std.process.Environ.Map) !bool {
+        if (!active_capture.?.resume_token_kept) return false;
+        try environ.put("OSC7577_TOKEN", "fake-token-for-relaunch-test");
+        return true;
+    }
+
+    pub fn clearProgramResume(_: *TestApp) void {
+        active_capture.?.program_resume_clears += 1;
     }
 
     pub fn closeOnHangup(_: *TestApp) void {
@@ -1376,6 +1452,61 @@ test "app entry carries the previous revision through upgrade relaunch" {
         "1111111111111111111111111111111111111111",
         capture.replaceArg(4),
     );
+}
+
+test "app entry relaunch passes the program resume token in its environment" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    _ = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expect(capture.replace_has_environ);
+    try std.testing.expectEqualStrings(
+        "fake-token-for-relaunch-test",
+        capture.replaceToken() orelse return error.TestUnexpectedResult,
+    );
+}
+
+test "app entry relaunch keeps the process environment without a program resume token" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.resume_token_kept = false;
+
+    _ = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expect(!capture.replace_has_environ);
+}
+
+test "app entry clears the program resume record on a normal interactive exit" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+
+    _ = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(usize, 0), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.program_resume_clears);
+}
+
+test "app entry upgrade relaunch keeps the program resume record" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    _ = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 0), capture.program_resume_clears);
 }
 
 test "app entry never relaunches without a validated handoff" {
