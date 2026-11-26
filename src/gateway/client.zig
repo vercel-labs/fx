@@ -4345,7 +4345,7 @@ const FailureDetail = struct {
     }
 
     fn replace(self: *FailureDetail, alloc: std.mem.Allocator, text: []const u8) !void {
-        const masked = try maskedCredentialCopy(alloc, std.mem.trim(u8, text, " \r\n\t"), self.credential);
+        const masked = try text_utils.maskSecretValues(alloc, std.mem.trim(u8, text, " \r\n\t"), &.{self.credential});
         defer alloc.free(masked);
         const kept = text_utils.utf8PrefixByBytes(masked, provider_failure_detail_max_bytes);
         if (kept.len == 0) return;
@@ -4354,12 +4354,6 @@ const FailureDetail = struct {
         self.text = owned;
     }
 };
-
-/// `text` with every copy of `credential` masked, as sent and as JSON
-/// escapes it. The caller owns the result.
-fn maskedCredentialCopy(alloc: std.mem.Allocator, text: []const u8, credential: []const u8) ![]u8 {
-    return text_utils.maskSecretValues(alloc, text, &.{credential});
-}
 
 fn replaceProviderFailureDetail(alloc: std.mem.Allocator, current: *FailureDetail, text: []const u8) !void {
     try current.replace(alloc, text);

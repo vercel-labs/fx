@@ -15,7 +15,6 @@ const secret = @import("../core/auth/secret.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
-const sort_utils = @import("../core/shared/sort_utils.zig");
 const Allocator = std.mem.Allocator;
 
 /// fx's own bounds, for a connection whose settings name none.
@@ -83,19 +82,13 @@ pub const Headers = struct {
         self.* = .{};
     }
 
-    /// The bearer token and every header value, longest first, in a list
-    /// the caller frees.
+    /// The bearer token and every header value, in a list the caller frees.
     fn secrets(self: *const Headers, alloc: Allocator, token: ?[]const u8) Allocator.Error![]const []const u8 {
         const token_count: usize = if (token != null) 1 else 0;
         const list = try alloc.alloc([]const u8, token_count + self.owned);
         if (token) |value| list[0] = value;
         for (self.list[0..self.owned], list[token_count..]) |header, *slot| slot.* = header.value;
-        sort_utils.sort([]const u8, list, {}, longerFirst);
         return list;
-    }
-
-    fn longerFirst(_: void, a: []const u8, b: []const u8) bool {
-        return a.len > b.len;
     }
 
     /// `detail` with the bearer token and every header value replaced by
@@ -426,7 +419,7 @@ pub fn parseModelIds(alloc: Allocator, body: []const u8) Allocator.Error!ModelsR
     return .{ .ids = ids };
 }
 
-test "Headers lists exactly the secrets the request sent, longest first, on every allocation failure" {
+test "Headers lists exactly the secrets the request sent, on every allocation failure" {
     const Check = struct {
         fn run(alloc: Allocator) !void {
             var storage = [_]std.http.Header{
@@ -436,8 +429,8 @@ test "Headers lists exactly the secrets the request sent, longest first, on ever
             };
             const Case = struct { token: ?[]const u8, owned: usize, expected: []const []const u8 };
             const cases = [_]Case{
-                .{ .token = "token-1234", .owned = 2, .expected = &.{ "abc-def-ghi", "token-1234", "abc" } },
-                .{ .token = null, .owned = 2, .expected = &.{ "abc-def-ghi", "abc" } },
+                .{ .token = "token-1234", .owned = 2, .expected = &.{ "token-1234", "abc", "abc-def-ghi" } },
+                .{ .token = null, .owned = 2, .expected = &.{ "abc", "abc-def-ghi" } },
                 .{ .token = "token-1234", .owned = 0, .expected = &.{"token-1234"} },
                 .{ .token = null, .owned = 0, .expected = &.{} },
             };
