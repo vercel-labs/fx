@@ -16,7 +16,7 @@
 // is called. The lock file, the folders, the session log, and each process's exit
 // are the evidence: each observation is something the driver did, or the binary
 // wrote.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { binary, targetHelpers, targetModule, worktree } from "../../lib/context";
 import { LeaderFixture } from "../leader/harness";
@@ -211,6 +211,17 @@ class Run {
     const state = existsSync(dirname(socket)) ? "present" : "gone";
     this.evidence.push({ op: "folder", proc: name, folder: dirname(socket), state });
     this.observations.push({ op: "folder", proc: name, arg: state });
+  }
+
+  /// Replaces the socket of a killed process with a plain file of the same name, so
+  /// its folder's entry is no longer a socket. Nothing else in the folder changes.
+  plainEntry(name: Proc) {
+    const socket = this.sockets.get(name);
+    if (!socket) throw new Error(`no socket is known for ${name}`);
+    rmSync(socket);
+    writeFileSync(socket, "");
+    this.evidence.push({ op: "plain", proc: name, socket });
+    this.observations.push({ op: "plain", proc: name });
   }
 
   /// Replaces the lock line with a record that names a pid the run did not start.
@@ -474,6 +485,25 @@ const PLANS: Plan[] = [
       await r.exit("p1");
     },
     tamper: (observations) => observations.map((o) => (o.op === "folder" ? { ...o, arg: "gone" } : o)),
+  },
+  {
+    name: "p8-kill-then-plain-entry-then-load",
+    expect: { rules: "ACCEPTED", today: "ACCEPTED" },
+    responses: (h) => [() => h.fakeGatewayFinalText("FIRST_DONE")],
+    run: async (r) => {
+      await r.start("p1");
+      await r.newSession("p1");
+      await r.prompt("p1", FIRST);
+      r.readLock();
+      await r.kill("p1");
+      r.plainEntry("p1");
+      r.readLock();
+      await r.start("p2");
+      await r.load("p2");
+      r.readLock();
+      r.folder("p1");
+      await r.exit("p2");
+    },
   },
 ];
 

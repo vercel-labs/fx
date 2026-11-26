@@ -30,6 +30,8 @@ const ROWS: Row[] = [
   { config: "AcpTakeover-restore-question", expect: "QuestionOwnedByHolder" },
   { config: "AcpTakeover-continue-turn", expect: "CallsAreAsked" },
   { config: "AcpTakeover-line-by-other", expect: "LineWrittenByHolder" },
+  { config: "AcpTakeover-remove-plain", expect: "NoPlainEntryRemoved" },
+  { config: "AcpTakeover-probe-first", expect: "NoProbeOfFailedFolder" },
   { config: "AcpTakeover-witness-busy", expect: "NoBusyLoad" },
   { config: "AcpTakeover-witness-repair", expect: "NoRepairedTurn" },
   { config: "AcpTakeover-witness-cleanup", expect: "NoDeadFolderRemoved" },

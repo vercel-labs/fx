@@ -9,7 +9,8 @@
 (* process killed, and then whether its pid is gone or taken by another    *)
 (* process; a process exited; a read of the lock file, which names the     *)
 (* process, none, or a process the driver did not start (other); the lock  *)
-(* line the driver forged; a folder present or gone; a turn the session    *)
+(* line the driver forged; a folder present or gone; a plain file the     *)
+(* driver put in place of a dead process's socket; a turn the session    *)
 (* log shows as interrupted; the count of model requests; and a permission *)
 (* question the client received.                                           *)
 (*                                                                         *)
@@ -66,6 +67,7 @@ ClientStep(o) ==
       [] o.op = "exit" -> Exit(P(o.proc))
       [] o.op = "read" -> ReadLock(o.proc)
       [] o.op = "forge" -> Forge
+      [] o.op = "plain" -> PlainEntry(P(o.proc))
       [] o.op = "folder" -> FolderIs(P(o.proc), o.arg)
       [] o.op = "interrupted" -> (turn = "interrupted" /\ UNCHANGED vars)
       [] o.op = "calls" -> (calls = o.arg /\ UNCHANGED vars)
@@ -80,7 +82,7 @@ Hidden ==
     \/ \E p \in Procs :
         \/ Load(p) \/ Take(p) \/ Write(p) \/ Clear(p) \/ Unlock(p)
         \/ UnclearedRelease(p) \/ Repair(p) \/ PidFree(p)
-    \/ \E h \in Procs : \E q \in Procs : Clean(h, q)
+    \/ \E h \in Procs : \E q \in Procs : Clean(h, q) \/ Probe(h, q)
 
 TraceNext ==
     \/ /\ i < Len(TraceLog)

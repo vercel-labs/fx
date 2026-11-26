@@ -43,12 +43,14 @@ ASSUME MaxAsks \in Nat \ {0}
 ASSUME Mutation \in {"none", "today", "remove_live", "remove_no_lock",
                      "remove_on_timeout", "two_holders", "restore_grant",
                      "restore_queue", "restore_question", "continue_turn",
-                     "line_by_other"}
+                     "line_by_other", "probe_first", "remove_plain"}
 
 VARIABLES
     st,            \* "new", "alive", "dead" (killed), "gone" (exited cleanly)
     sock,          \* the process's leader socket listens
     folder,        \* "none", "made", "gone": the process's socket folder
+    entry,         \* "missing", "socket", "plain": the folder's entry named s
+    probed,        \* the holder probed the dead process's socket and it refused
     reused,        \* the dead process's pid now belongs to another process
     holders,       \* the processes that hold the session's lock
     line,          \* the process the lock line names, or NoProc
@@ -71,15 +73,18 @@ VARIABLES
     okLine,        \* ghost: every write of the lock line was by a holder
     okFolder,      \* ghost: every removal of a folder was by a holder
     removedLive,   \* ghost: a folder was removed while its process was alive
-    removedTimeout \* ghost: a folder was removed after a probe timeout
+    removedTimeout, \* ghost: a folder was removed after a probe timeout
+    removedPlain,  \* ghost: a folder was removed while its entry was a plain file
+    probedFailed   \* ghost: a folder was probed while its folder checks failed
 
-procVars  == <<st, sock, folder, reused>>
+procVars  == <<st, sock, folder, reused, entry, probed>>
 lockVars  == <<holders, line>>
 loadVars  == <<loading, asked, busyOut>>
 memVars   == <<grant, grantOwner, queue, queueOwner, question, questionOwner>>
 turnVars  == <<turn, turnOwner, calls, asks>>
 folVars   == <<fol, folConn>>
-ghostVars == <<crashes, okLine, okFolder, removedLive, removedTimeout>>
+ghostVars == <<crashes, okLine, okFolder, removedLive, removedTimeout,
+               removedPlain, probedFailed>>
 vars      == <<procVars, lockVars, loadVars, memVars, turnVars, folVars, ghostVars>>
 
 Live(p) == st[p] = "alive"
@@ -88,10 +93,14 @@ Gone(p) == st[p] \in {"dead", "gone"}
 \* The next holder may remove the folder that the lock line names: the
 \* process it names is dead, its socket refuses, its pid is gone, and its
 \* folder is still there. Only a process other than the holder is named.
+\* The folder checks of the takeover: a folder of this session's leader shape
+\* that is still there, with a socket entry or none. A plain file named s fails.
+FolderChecked(q) == folder[q] = "made" /\ entry[q] \in {"socket", "missing"}
+
 Cleanable(h) ==
     \E q \in Procs :
         /\ line = q /\ q # h
-        /\ folder[q] = "made" /\ st[q] = "dead"
+        /\ FolderChecked(q) /\ st[q] = "dead"
         /\ ~sock[q] /\ ~reused[q]
 
 Init ==
@@ -99,6 +108,8 @@ Init ==
     /\ sock = [p \in Procs |-> FALSE]
     /\ folder = [p \in Procs |-> "none"]
     /\ reused = [p \in Procs |-> FALSE]
+    /\ entry = [p \in Procs |-> "missing"]
+    /\ probed = [p \in Procs |-> FALSE]
     /\ holders = {}
     /\ line = NoProc
     /\ loading = [p \in Procs |-> FALSE]
@@ -121,6 +132,8 @@ Init ==
     /\ okFolder = TRUE
     /\ removedLive = FALSE
     /\ removedTimeout = FALSE
+    /\ removedPlain = FALSE
+    /\ probedFailed = FALSE
 
 -----------------------------------------------------------------------------
 \* A process starts: it makes its folder and listens, before any session.
@@ -129,7 +142,8 @@ Start(p) ==
     /\ st' = [st EXCEPT ![p] = "alive"]
     /\ sock' = [sock EXCEPT ![p] = TRUE]
     /\ folder' = [folder EXCEPT ![p] = "made"]
-    /\ UNCHANGED <<reused, lockVars, loadVars, memVars, turnVars, folVars, ghostVars>>
+    /\ entry' = [entry EXCEPT ![p] = "socket"]
+    /\ UNCHANGED <<reused, probed, lockVars, loadVars, memVars, turnVars, folVars, ghostVars>>
 
 \* A client loads the session on a live process, once.
 Load(p) ==
@@ -172,8 +186,8 @@ Crash(p) ==
     /\ fol' = IF folConn = p THEN "closed" ELSE fol
     /\ folConn' = IF folConn = p THEN NoProc ELSE folConn
     /\ crashes' = 1
-    /\ UNCHANGED <<folder, line, loadVars, memVars, turnVars, okLine, okFolder,
-                   removedLive, removedTimeout>>
+    /\ UNCHANGED <<folder, entry, probed, line, loadVars, memVars, turnVars, okLine,
+                   okFolder, removedLive, removedTimeout, removedPlain, probedFailed>>
 
 \* A process that holds no lock exits cleanly: it removes its own folder and
 \* socket. Its socket's clients are closed.
@@ -182,18 +196,19 @@ Exit(p) ==
     /\ st' = [st EXCEPT ![p] = "gone"]
     /\ sock' = [sock EXCEPT ![p] = FALSE]
     /\ folder' = [folder EXCEPT ![p] = "gone"]
+    /\ entry' = [entry EXCEPT ![p] = "missing"]
     /\ \E r \in BOOLEAN : reused' = [reused EXCEPT ![p] = r]
     /\ fol' = IF folConn = p THEN "closed" ELSE fol
     /\ folConn' = IF folConn = p THEN NoProc ELSE folConn
-    /\ UNCHANGED <<lockVars, loadVars, memVars, turnVars, crashes, okLine,
-                   okFolder, removedLive, removedTimeout>>
+    /\ UNCHANGED <<probed, lockVars, loadVars, memVars, turnVars, crashes, okLine,
+                   okFolder, removedLive, removedTimeout, removedPlain, probedFailed>>
 
 \* The unrelated process that took the dead pid exits.
 PidFree(p) ==
     /\ reused[p] /\ Gone(p)
     /\ reused' = [reused EXCEPT ![p] = FALSE]
-    /\ UNCHANGED <<st, sock, folder, lockVars, loadVars, memVars, turnVars,
-                   folVars, ghostVars>>
+    /\ UNCHANGED <<st, sock, folder, entry, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, ghostVars>>
 
 \* The holder writes its own line, once its socket listens, unless the
 \* folder of a dead process is still there to remove first.
@@ -239,9 +254,10 @@ UnclearedRelease(h) ==
 Clean(h, q) ==
     /\ Mutation # "today"
     /\ h \in holders /\ line = q /\ q # h
-    /\ folder[q] = "made" /\ st[q] = "dead" /\ ~sock[q] /\ ~reused[q]
+    /\ FolderChecked(q) /\ probed[q] /\ st[q] = "dead" /\ ~sock[q] /\ ~reused[q]
     /\ folder' = [folder EXCEPT ![q] = "gone"]
-    /\ UNCHANGED <<st, sock, reused, lockVars, loadVars, memVars, turnVars,
+    /\ entry' = [entry EXCEPT ![q] = "missing"]
+    /\ UNCHANGED <<st, sock, reused, probed, lockVars, loadVars, memVars, turnVars,
                    folVars, ghostVars>>
 
 \* The running turn of the holder asks a permission question.
@@ -305,6 +321,32 @@ Connect ==
     /\ UNCHANGED <<procVars, lockVars, loadVars, memVars, turnVars, ghostVars>>
 
 -----------------------------------------------------------------------------
+\* The holder probes a dead process's socket, once its pid is gone. The probe
+\* comes after the folder checks, so a folder that fails them is never probed.
+Probe(h, q) ==
+    /\ h \in holders /\ line = q /\ q # h
+    /\ st[q] = "dead" /\ ~sock[q] /\ ~reused[q]
+    /\ (FolderChecked(q) \/ Mutation = "probe_first")
+    /\ probed' = [probed EXCEPT ![q] = TRUE]
+    /\ probedFailed' = (probedFailed \/ ~FolderChecked(q))
+    /\ UNCHANGED <<st, sock, folder, entry, reused, lockVars, loadVars, memVars,
+                   turnVars, folVars, crashes, okLine, okFolder, removedLive,
+                   removedTimeout, removedPlain>>
+
+\* Something other than fx replaces a dead process's socket with a plain file.
+PlainEntry(q) ==
+    /\ st[q] = "dead" /\ folder[q] = "made" /\ entry[q] = "socket"
+    /\ entry' = [entry EXCEPT ![q] = "plain"]
+    /\ UNCHANGED <<st, sock, folder, reused, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, ghostVars>>
+
+\* Something other than fx removes a dead process's socket, leaving no entry.
+SocketGone(q) ==
+    /\ st[q] = "dead" /\ folder[q] = "made" /\ entry[q] = "socket"
+    /\ entry' = [entry EXCEPT ![q] = "missing"]
+    /\ UNCHANGED <<st, sock, folder, reused, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, ghostVars>>
+
 \* Planted bugs. Each is one broken rule, and check.sh names the property
 \* that catches it.
 
@@ -314,8 +356,9 @@ RemoveLive(h) ==
     /\ h \in holders /\ line = h /\ folder[h] = "made"
     /\ folder' = [folder EXCEPT ![h] = "gone"]
     /\ removedLive' = TRUE
-    /\ UNCHANGED <<st, sock, reused, lockVars, loadVars, memVars, turnVars, folVars,
-                   crashes, okLine, okFolder, removedTimeout>>
+    /\ UNCHANGED <<st, sock, reused, entry, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, crashes, okLine, okFolder, removedTimeout,
+                   removedPlain, probedFailed>>
 
 \* Remove a dead process's folder from a process that holds no lock.
 RemoveNoLock(p, q) ==
@@ -325,8 +368,9 @@ RemoveNoLock(p, q) ==
     /\ folder[q] = "made" /\ st[q] = "dead" /\ ~sock[q] /\ ~reused[q]
     /\ folder' = [folder EXCEPT ![q] = "gone"]
     /\ okFolder' = FALSE
-    /\ UNCHANGED <<st, sock, reused, lockVars, loadVars, memVars, turnVars, folVars,
-                   crashes, okLine, removedLive, removedTimeout>>
+    /\ UNCHANGED <<st, sock, reused, entry, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, crashes, okLine, removedLive, removedTimeout,
+                   removedPlain, probedFailed>>
 
 \* Remove a folder whose process is alive but whose probe timed out.
 RemoveOnTimeout(h, q) ==
@@ -335,8 +379,21 @@ RemoveOnTimeout(h, q) ==
     /\ folder[q] = "made" /\ st[q] = "alive" /\ sock[q]
     /\ folder' = [folder EXCEPT ![q] = "gone"]
     /\ removedTimeout' = TRUE
-    /\ UNCHANGED <<st, sock, reused, lockVars, loadVars, memVars, turnVars, folVars,
-                   crashes, okLine, okFolder, removedLive>>
+    /\ UNCHANGED <<st, sock, reused, entry, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, crashes, okLine, okFolder, removedLive,
+                   removedPlain, probedFailed>>
+
+\* Remove the folder of a dead process whose entry is a plain file, not a socket.
+RemovePlain(h, q) ==
+    /\ Mutation = "remove_plain"
+    /\ h \in holders /\ line = q /\ q # h
+    /\ folder[q] = "made" /\ entry[q] = "plain" /\ st[q] = "dead"
+    /\ ~sock[q] /\ ~reused[q]
+    /\ folder' = [folder EXCEPT ![q] = "gone"]
+    /\ removedPlain' = TRUE
+    /\ UNCHANGED <<st, sock, reused, entry, probed, lockVars, loadVars, memVars,
+                   turnVars, folVars, crashes, okLine, okFolder, removedLive,
+                   removedTimeout, probedFailed>>
 
 \* A process that holds no lock empties the lock line.
 ClearByOther(p) ==
@@ -344,7 +401,8 @@ ClearByOther(p) ==
     /\ Live(p) /\ p \notin holders /\ line # NoProc
     /\ line' = NoProc /\ okLine' = FALSE
     /\ UNCHANGED <<procVars, holders, loadVars, memVars, turnVars, folVars,
-                   crashes, okFolder, removedLive, removedTimeout>>
+                   crashes, okFolder, removedLive, removedTimeout, removedPlain,
+                   probedFailed>>
 
 -----------------------------------------------------------------------------
 Next ==
@@ -356,6 +414,7 @@ Next ==
         \/ Ask(p) \/ Answer(p)
         \/ \E q \in Procs :
             \/ Clean(p, q) \/ RemoveNoLock(p, q) \/ RemoveOnTimeout(p, q)
+            \/ Probe(p, q) \/ RemovePlain(p, q) \/ PlainEntry(q) \/ SocketGone(q)
     \/ Connect
 
 \* Weak fairness: a loader that can take the lock does, and a finished
@@ -363,7 +422,7 @@ Next ==
 Fairness ==
     /\ \A p \in Procs : WF_vars(Load(p)) /\ WF_vars(Take(p)) /\ WF_vars(Busy(p))
     /\ \A p \in Procs : WF_vars(Repair(p)) /\ WF_vars(PidFree(p))
-    /\ \A h, q \in Procs : WF_vars(Clean(h, q))
+    /\ \A h, q \in Procs : WF_vars(Probe(h, q)) /\ WF_vars(Clean(h, q))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 SafetySpec == Init /\ [][Next]_vars
@@ -375,6 +434,8 @@ TypeOK ==
     /\ st \in [Procs -> {"new", "alive", "dead", "gone"}]
     /\ sock \in [Procs -> BOOLEAN]
     /\ folder \in [Procs -> {"none", "made", "gone"}]
+    /\ entry \in [Procs -> {"missing", "socket", "plain"}]
+    /\ probed \in [Procs -> BOOLEAN]
     /\ reused \in [Procs -> BOOLEAN]
     /\ holders \subseteq Procs
     /\ line \in Procs \cup {NoProc}
@@ -390,6 +451,7 @@ TypeOK ==
     /\ crashes \in 0..1
     /\ okLine \in BOOLEAN /\ okFolder \in BOOLEAN
     /\ removedLive \in BOOLEAN /\ removedTimeout \in BOOLEAN
+    /\ removedPlain \in BOOLEAN /\ probedFailed \in BOOLEAN
 
 \* Lock only: at most one process holds the session.
 AtMostOneHolder == Cardinality(holders) <= 1
@@ -408,6 +470,12 @@ NoLiveFolderRemoved == ~removedLive
 
 \* Folder cleanup never removes a folder after a probe timeout.
 NoRemovalAfterTimeout == ~removedTimeout
+
+\* Folder cleanup never removes a folder whose entry is a plain file.
+NoPlainEntryRemoved == ~removedPlain
+
+\* The probe of a dead process's socket runs only after its folder checks pass.
+NoProbeOfFailedFolder == ~probedFailed
 
 \* A grant belongs to the current holder, never to a dead holder.
 GrantOwnedByHolder == holders = {} \/ ~grant \/ grantOwner \in holders
@@ -429,13 +497,14 @@ FollowerOnLiveSocket ==
 \* Liveness and action properties.
 
 \* A dead holder's folder, named by the lock line, is removed by the next load
-\* that takes the lock (not in today). A load that ends busy is the client's
-\* to retry; the property needs a load that is waiting for the lock.
+\* that takes the lock (not in today), unless its entry is no longer a socket:
+\* then the folder is kept, and the obligation ends. A load that ends busy is the
+\* client's to retry; the property needs a load that is waiting for the lock.
 DeadFolderRemoved ==
     \A q \in Procs :
-        ((line = q /\ folder[q] = "made" /\ st[q] = "dead" /\ ~reused[q])
+        ((line = q /\ FolderChecked(q) /\ st[q] = "dead" /\ ~reused[q])
             /\ \E p \in Procs : loading[p])
-            ~> (folder[q] = "gone")
+            ~> (folder[q] = "gone" \/ ~FolderChecked(q))
 
 \* A loader either holds the lock or ends busy, or its process has ended.
 LoadResolves ==

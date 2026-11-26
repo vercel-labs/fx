@@ -221,6 +221,8 @@ AcpTakeover AcpTakeover-restore-queue QueueOwnedByHolder
 AcpTakeover AcpTakeover-restore-question QuestionOwnedByHolder
 AcpTakeover AcpTakeover-continue-turn CallsAreAsked
 AcpTakeover AcpTakeover-line-by-other LineWrittenByHolder
+AcpTakeover AcpTakeover-remove-plain NoPlainEntryRemoved
+AcpTakeover AcpTakeover-probe-first NoProbeOfFailedFolder
 AcpTakeover AcpTakeover-witness-busy NoBusyLoad
 AcpTakeover AcpTakeover-witness-repair NoRepairedTurn
 AcpTakeover AcpTakeover-witness-cleanup NoDeadFolderRemoved
