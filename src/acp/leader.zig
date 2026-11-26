@@ -11,6 +11,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
+const session_manager = @import("session_manager");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -352,8 +353,16 @@ const probe_timeout_ms: i64 = 200;
 /// The pause between two connection attempts to the same socket.
 const probe_retry_ms: u64 = 10;
 const nonblock_flag: c_int = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
-/// The most bytes a takeover parses from a lock line. The session passes no more.
-const max_record_bytes: usize = 1024;
+/// The most bytes of a lock line a takeover takes as a record. The session owns
+/// the limit: a longer line reaches the takeover one byte past it.
+const max_record_bytes = session_manager.max_lock_line_bytes;
+/// What a record adds around its socket path: its JSON, the pid, and the newline.
+const record_framing_bytes = 64;
+/// A record writes each byte of its socket path as at most six bytes (`\u00XX`).
+const longest_record_bytes = 6 * max_socket_path_bytes + record_framing_bytes;
+comptime {
+    if (max_record_bytes < longest_record_bytes) @compileError("the lock line limit cannot hold a leader record");
+}
 
 const Probe = enum { alive, dead, unknown };
 
@@ -369,6 +378,7 @@ const KeepReason = enum {
     folder_mode,
     folder_owner,
     entry_not_socket,
+    line_too_long,
 };
 
 const Record = struct {
@@ -407,20 +417,22 @@ const OpenResult = union(enum) {
 /// every failure is traced.
 pub fn takeOverDeadLeader(io: std.Io, old_line: []const u8) void {
     if (old_line.len == 0) return;
-    const record = parseRecord(old_line) catch return keepFolder(.unreadable_record);
+    if (old_line.len > max_record_bytes) return keepFolder(.line_too_long);
+    var buffer: [max_record_bytes]u8 = undefined;
+    const record = parseRecord(&buffer, old_line) catch return keepFolder(.unreadable_record);
     const path = leaderPathOf(record.socket) orelse return keepFolder(.not_leader_socket);
     if (!isDeadPid(record.pid)) return keepFolder(.live_pid);
-    switch (probeSocket(io, record.socket)) {
-        .dead => {},
-        .alive => return keepFolder(.probe_alive),
-        .unknown => return keepFolder(.probe_unknown),
-    }
     switch (openLeaderFolder(io, path)) {
         .kept => |reason| return keepFolder(reason),
         .opened => |opened| {
             var leader = opened;
             defer leader.close();
             if (socketEntryKeepReason(io, leader.folder.dir)) |reason| return keepFolder(reason);
+            switch (probeSocket(io, record.socket)) {
+                .dead => {},
+                .alive => return keepFolder(.probe_alive),
+                .unknown => return keepFolder(.probe_unknown),
+            }
             removeLeaderFiles(io, &leader, path.name);
         },
     }
@@ -430,9 +442,10 @@ fn keepFolder(reason: KeepReason) void {
     debug_trace.logf("acp", "event=dead_leader_kept reason={s}", .{@tagName(reason)});
 }
 
-fn parseRecord(old_line: []const u8) !Record {
-    var buffer: [max_record_bytes]u8 = undefined;
-    var fallback = std.heap.FixedBufferAllocator.init(&buffer);
+/// The strings of the record that need decoding are stored in `buffer`, which
+/// the caller owns, so they outlive this call.
+fn parseRecord(buffer: *[max_record_bytes]u8, old_line: []const u8) !Record {
+    var fallback = std.heap.FixedBufferAllocator.init(buffer);
     return json_decode.parseFromSliceLeaky(Record, fallback.allocator(), old_line, .{ .ignore_unknown_fields = true });
 }
 
@@ -594,6 +607,7 @@ fn removeLeaderFiles(io: std.Io, leader: *LeaderFolder, name: []const u8) void {
         error.FileNotFound => {},
         else => debug_trace.logf("acp", "event=dead_leader_socket_not_removed err={s}", .{@errorName(err)}),
     };
+    // deleteDir removes only an empty folder, so a file left inside keeps it.
     leader.base.dir.deleteDir(io, name) catch |err| {
         debug_trace.logf("acp", "event=dead_leader_folder_not_removed err={s}", .{@errorName(err)});
         return;
@@ -1078,6 +1092,55 @@ test "a plain file named s in a leader's folder is kept, even when its pid is go
 
     try testing.expect(!pathGone(io, leader.socket));
     try testing.expect(!pathGone(io, leader.folder));
+}
+
+/// Runs one takeover with debug tracing into a temporary file, and returns the
+/// trace the caller frees.
+fn takeOverTraced(io: std.Io, line: []const u8) ![]u8 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(dir_path);
+    const trace_path = try testing.allocator.print("{s}/trace.log", .{dir_path});
+    defer testing.allocator.free(trace_path);
+    try debug_trace.configureForTest(testing.allocator, trace_path);
+    defer debug_trace.resetForTest();
+    takeOverDeadLeader(io, line);
+    return tmp.dir.readFileAlloc(io, "trace.log", testing.allocator, .limited(1 << 16));
+}
+
+test "a symlinked leader folder is refused before its socket is probed" {
+    const io = testing.io;
+    var fake: FakeRunner = .{};
+    const leader = try Leader.start(testing.allocator, io, null, .{ .context = &fake, .run = FakeRunner.run });
+    defer leader.stop(io);
+    var link = try TestLeader.create(io, 0o700);
+    defer link.destroy(io);
+    try std.Io.Dir.cwd().deleteDir(io, link.folder);
+    try std.Io.Dir.cwd().symLink(io, leader.folder_path, link.folder, .{});
+    const line = try recordBytes(testing.allocator, link.socket, no_process_pid);
+    defer testing.allocator.free(line);
+
+    const trace = try takeOverTraced(io, line);
+    defer testing.allocator.free(trace);
+
+    try testing.expect(std.mem.find(u8, trace, "reason=folder_unsafe") != null);
+    try testing.expect(std.mem.find(u8, trace, "reason=probe_alive") == null);
+    try testing.expect(!pathGone(io, leader.socket_path));
+}
+
+test "a lock line whose socket path has an escape is read as its bytes, and its folder is removed" {
+    const io = testing.io;
+    var leader = try TestLeader.create(io, 0o700);
+    defer leader.destroy(io);
+    try leader.placeStaleSocket();
+    const line = try testing.allocator.print("{{\"socket\":\"{s}/\\u0073\",\"pid\":{d}}}", .{ leader.folder, no_process_pid });
+    defer testing.allocator.free(line);
+
+    takeOverDeadLeader(io, line);
+
+    try testing.expect(pathGone(io, leader.socket));
+    try testing.expect(pathGone(io, leader.folder));
 }
 
 test "a dead leader's folder with no socket left in it is removed" {

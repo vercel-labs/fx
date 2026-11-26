@@ -39,6 +39,7 @@ pub const Child = fold.Child;
 pub const Diagnostic = diag.Event;
 pub const DiagnosticKind = diag.Kind;
 pub const Diagnostics = diag.Sink;
+pub const max_lock_line_bytes = session_mod.max_lock_line_bytes;
 pub const Page = session_mod.Page;
 pub const Entry = session_mod.Entry;
 pub const Cursor = session_mod.Cursor;

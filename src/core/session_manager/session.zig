@@ -32,11 +32,12 @@ pub const default_snapshot_every_bytes: u64 = 64 << 10;
 
 /// Runs right after this process wins a session's lock, with the bytes the
 /// previous holder left in it (empty when none). It runs before this process
-/// writes its own record.
+/// writes its own record. A longer lock reaches it with one byte past
+/// `max_lock_line_bytes`, so the hook can refuse the line.
 pub const LockWon = *const fn (io: std.Io, old_line: []const u8) void;
 
-/// The most bytes of a lock that a `LockWon` hook receives.
-const max_lock_line_bytes = 1024;
+/// The most bytes of a lock's line that a `LockWon` hook takes as a record.
+pub const max_lock_line_bytes: usize = 1024;
 
 pub const Options = struct {
     /// How long `openResume` retries a held flock before Busy.
@@ -1380,7 +1381,7 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     };
     errdefer s.closeFile(lock);
     if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
-    notifyLockWon(env, lock);
+    notifyLockWon(env, lock, options.id);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1430,11 +1431,15 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
 }
 
 /// Hands the bytes that a previous holder left in the lock to the hook, when
-/// this process has one.
-fn notifyLockWon(env: *const Env, lock: storage.File) void {
+/// this process has one. A lock that cannot be read is reported and the hook is
+/// not called, so the previous holder's folder stays where it is.
+fn notifyLockWon(env: *const Env, lock: storage.File, id: []const u8) void {
     const won = env.options.lock_won orelse return;
-    var old_line: [max_lock_line_bytes]u8 = undefined;
-    const read = env.s.readAt(lock, &old_line, 0) catch 0;
+    var old_line: [max_lock_line_bytes + 1]u8 = undefined;
+    const read = env.s.readAt(lock, &old_line, 0) catch {
+        diag.report(env.diagnostics, .{ .kind = .leader_lock_not_read, .session_id = id });
+        return;
+    };
     won(env.s.io, old_line[0..read]);
 }
 
