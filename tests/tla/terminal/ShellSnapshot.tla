@@ -32,6 +32,10 @@
 (* here are one command text.                                               *)
 (* "reload_per_command" is the behavior without a snapshot: dotfiles run   *)
 (* on every call.                                                           *)
+(* Both sessions run at MaxGen 2: at MaxGen 3 TLC reported 57 million      *)
+(* total states at its liveness check and did not finish within about 53   *)
+(* minutes. Not explored: traces with three shell generations, so a bug    *)
+(* that needs three refreshes to show is not checked.                      *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
