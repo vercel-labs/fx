@@ -9,7 +9,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
-const session_manager = @import("session_manager");
+const session_adapter = @import("../core/session/session_adapter.zig");
 const leader_mod = @import("leader.zig");
 
 const testing = std.testing;
@@ -37,7 +37,7 @@ const probe_retry_ms: u64 = 10;
 const nonblock_flag: c_int = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 /// The most bytes of a lock line a takeover takes as a record. The session owns
 /// the limit: a longer line reaches the takeover one byte past it.
-const max_record_bytes = session_manager.max_lock_line_bytes;
+const max_record_bytes = session_adapter.lock_line_limit_bytes;
 /// What a record adds around its socket path: its JSON, the pid, and the newline.
 const record_framing_bytes = 64;
 /// A record writes each byte of its socket path as at most six bytes (`\u00XX`).
@@ -639,7 +639,7 @@ test "a lock line over the limit is kept and traced, even when its record parses
     try leader.placeStaleSocket();
     const record = try leader_mod.recordBytes(testing.allocator, leader.socket, no_process_pid);
     defer testing.allocator.free(record);
-    const line = try testing.allocator.alloc(u8, session_manager.max_lock_line_bytes + 1);
+    const line = try testing.allocator.alloc(u8, session_adapter.lock_line_limit_bytes + 1);
     defer testing.allocator.free(line);
     @memset(line, ' ');
     @memcpy(line[0..record.len], record);
