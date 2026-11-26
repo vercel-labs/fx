@@ -713,11 +713,14 @@ fn pathContainsComponentSequence(
         while (index < path.len and !std.Io.Dir.path.isSep(path[index])) : (index += 1) {}
         if (start == index) break;
         const component = path[start..index];
-        if (std.mem.eql(u8, component, expected[matched])) {
+        // Compared without regard to case: macOS volumes open `.GIT/Hooks`
+        // for `.git/hooks`, and a component that does not exist yet keeps
+        // the spelling it was typed with.
+        if (std.ascii.eqlIgnoreCase(component, expected[matched])) {
             matched += 1;
             if (matched == expected.len) return true;
         } else {
-            matched = if (std.mem.eql(u8, component, expected[0])) 1 else 0;
+            matched = if (std.ascii.eqlIgnoreCase(component, expected[0])) 1 else 0;
         }
     }
     return false;
@@ -6797,6 +6800,11 @@ test "automatic trusted-root write keeps persistence targets on reviewer path" {
         ".git/config",
         ".ssh/authorized_keys",
         "Library/LaunchAgents/com.fx.smoke.plist",
+        ".GIT/Hooks/Pre-Commit",
+        ".Git/CONFIG",
+        ".SSH/Authorized_Keys",
+        "library/launchagents/com.fx.smoke.plist",
+        ".BASHRC",
     };
     for (relative_targets, 0..) |relative_target, index| {
         const target_path = try std.Io.Dir.path.join(arena, &.{ workspace, relative_target });
