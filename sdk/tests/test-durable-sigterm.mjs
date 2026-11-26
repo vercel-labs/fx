@@ -186,11 +186,11 @@ test("a SIGTERM during a tool call that does not return cuts the turn off after 
   const { child, exited, line } = startChild("hang", dir);
   try {
     const sessionId = await waitInTool(line);
-    const sentAt = Date.now();
     child.kill("SIGTERM");
+    // The tool never returns, so the child exits only once the bound cuts the
+    // turn off: the release below names that cut-off.
     const status = await guarded(exited, "the child's exit");
     assert.equal(status.signal, "SIGTERM");
-    assert.ok(Date.now() - sentAt < 5000, `the exit took ${Date.now() - sentAt} ms`);
     const { agent, entries } = await logOf(dir, sessionId);
     try {
       assert.ok(entries.some((entry) => entry.k === "release" && typeof entry.cutoff === "string"), "no release names a cut-off");

@@ -41,9 +41,9 @@
 // that hands one worker's process off (agent.handOff()): the asked worker
 // takes no new work, its turn yields at the save before its next model
 // request, or the bound cuts it off as the deadline does, and the other
-// worker continues the turn.
-// CI runs 100 walks of it: a walk reaches Yield only when the host asks the
-// worker that runs the tool, before the tool ends.
+// worker continues the turn. A walk reaches Yield only when the host asks the
+// worker that runs the tool before the tool ends, so in this graph every other
+// step goes toward the nearest Yield (stepsToYield below).
 //
 // Each walk starts two agents, A and B, on one World directory, each in a
 // server of its own: a worker thread, session-process.mjs, with its own
@@ -507,6 +507,34 @@ let steps = 0;
 const successors = (id) => [...(graph.next.get(id) ?? [])].filter((to) => to !== id);
 const actOf = (id) => graph.states.get(id).act;
 
+// How many steps each state of the handoff graph is from a Yield, counted
+// back from every state a Yield reaches.
+const stepsToYield = new Map();
+if (graphName === "handoff") {
+  const before = new Map();
+  for (const [from, targets] of graph.next) {
+    for (const to of targets) {
+      if (to === from) continue;
+      if (!before.has(to)) before.set(to, []);
+      before.get(to).push(from);
+    }
+  }
+  let ring = [...graph.states.keys()].filter((id) => graph.states.get(id).act?.name === "Yield");
+  for (const id of ring) stepsToYield.set(id, 0);
+  while (ring.length > 0) {
+    const next = [];
+    for (const id of ring) {
+      for (const from of before.get(id) ?? []) {
+        if (stepsToYield.has(from)) continue;
+        stepsToYield.set(from, stepsToYield.get(id) + 1);
+        next.push(from);
+      }
+    }
+    ring = next;
+  }
+}
+let yields = 0;
+
 for (let walk = 1; walk <= walks; walk += 1) {
   const code = await harness();
   const path = [];
@@ -527,13 +555,18 @@ for (let walk = 1; walk <= walks; walk += 1) {
           // sends the message back and lets the session go.
           if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none" && !graph.states.get(to).asked?.[act.w]) continue;
           let option = options.find((item) => sameAct(item.act, act));
-          if (!option) options.push(option = { act, fresh: false });
+          if (!option) options.push(option = { act, fresh: false, toYield: Infinity });
           if (!covered.has(`${from}>${to}`)) option.fresh = true;
+          option.toYield = Math.min(option.toYield, stepsToYield.get(to) ?? Infinity);
         }
       }
       if (options.length === 0) break;
       const fresh = options.filter((option) => option.fresh);
-      const pool = fresh.length > 0 ? fresh : options;
+      let pool = fresh.length > 0 ? fresh : options;
+      if (stepsToYield.size > 0 && random() < 0.5) {
+        const nearest = Math.min(...options.map((option) => option.toYield));
+        if (nearest < Infinity) pool = options.filter((option) => option.toYield === nearest);
+      }
       const { act } = pool[Math.floor(random() * pool.length)];
       const expectedEpoch = act.name === "Claim" || act.name === "Deadline"
         ? Math.max(...[...current].flatMap((from) => successors(from).filter((to) => sameAct(actOf(to), act)).map((to) => graph.states.get(to).epoch[act.w])))
@@ -542,6 +575,7 @@ for (let walk = 1; walk <= walks; walk += 1) {
       await code.perform(act, expectedEpoch);
       path.push(`${act.name}(${act.w})`);
       steps += 1;
+      if (act.name === "Yield") yields += 1;
       // The states the step can reach, and the edges to each.
       const allowed = new Set();
       const reached = new Map();
@@ -602,6 +636,6 @@ if (hooks && !process.exitCode) {
     process.exitCode = 1;
   }
 }
-if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
+if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})${stepsToYield.size > 0 ? `; ${yields} yields` : ""}`);
 // An agent a failed walk left mid-turn keeps timers alive; nothing more runs.
 process.exit(process.exitCode ?? 0);
