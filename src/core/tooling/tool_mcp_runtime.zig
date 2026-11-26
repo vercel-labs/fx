@@ -51,11 +51,44 @@ const LiveViewProvider = struct {
 pub const ServerFilter = struct {
     context: *const anyopaque,
     allows_fn: *const fn (*const anyopaque, []const u8) bool,
+    enabled_fn: ?*const fn (*const anyopaque, []const u8, bool) bool = null,
 
     pub fn allows(self: ServerFilter, server: []const u8) bool {
         return self.allows_fn(self.context, server);
     }
+
+    pub fn allowsEnabled(self: ServerFilter, server: []const u8, configured_enabled: bool) bool {
+        if (!self.allows(server)) return false;
+        return if (self.enabled_fn) |enabled| enabled(self.context, server, configured_enabled) else configured_enabled;
+    }
 };
+
+test "MCP server filters keep scope separate from temporary enabled choices" {
+    const Filter = struct {
+        enabled: ?bool = null,
+
+        fn allows(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "server");
+        }
+
+        fn enabledFor(raw: *const anyopaque, _: []const u8, configured: bool) bool {
+            const filter: *const @This() = @ptrCast(@alignCast(raw));
+            return filter.enabled orelse configured;
+        }
+    };
+    var state: Filter = .{};
+    const filter: ServerFilter = .{ .context = &state, .allows_fn = Filter.allows, .enabled_fn = Filter.enabledFor };
+    try std.testing.expect(filter.allowsEnabled("server", true));
+    try std.testing.expect(!filter.allowsEnabled("server", false));
+    state.enabled = true;
+    try std.testing.expect(filter.allowsEnabled("server", false));
+    try std.testing.expect(!filter.allowsEnabled("other", true));
+    state.enabled = false;
+    try std.testing.expect(!filter.allowsEnabled("server", true));
+    const legacy: ServerFilter = .{ .context = &state, .allows_fn = Filter.allows };
+    try std.testing.expect(legacy.allowsEnabled("server", true));
+    try std.testing.expect(!legacy.allowsEnabled("server", false));
+}
 
 pub const Access = union(enum) {
     unrestricted,
@@ -68,6 +101,7 @@ pub const Access = union(enum) {
         admission_authority_generation: u64,
         live: LiveViewProvider,
         action_authority_generation: u64 = 0,
+        session_filter: ?ServerFilter = null,
     },
 
     pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {

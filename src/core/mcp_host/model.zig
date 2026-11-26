@@ -99,9 +99,9 @@ pub const Catalog = struct {
     }
 
     /// Follows `Runtime.reload`, on the thread that called it: a server that
-    /// kept running keeps its list, and the rest start without one. When a
-    /// server the catalog knew went or was replaced, every binding and
-    /// subagent view made before stops matching, as with a new host.
+    /// kept running keeps its list, and the rest start without one. Removing
+    /// or changing a saved definition invalidates prior bindings and views;
+    /// temporary admission changes leave unrelated views intact.
     pub fn reload(c: *Catalog, done: runtime_mod.Reloaded) Allocator.Error!void {
         const servers = c.runtime.servers();
         std.debug.assert(servers.len == done.kept.len);
@@ -121,7 +121,7 @@ pub const Catalog = struct {
         c.gpa.free(c.lists);
         c.servers = servers;
         c.lists = lists;
-        if (done.dropped) _ = c.generation.fetchAdd(2, .acq_rel);
+        if (done.definitions_changed) _ = c.generation.fetchAdd(2, .acq_rel);
     }
 
     fn currentGeneration(c: *const Catalog) u64 {
@@ -177,13 +177,13 @@ pub const Catalog = struct {
 
     pub fn hasTool(c: *Catalog, name: []const u8, access: Access) bool {
         if (!c.mayAllow(access)) return false;
-        c.ensure(name, null) catch return false;
+        c.ensureForAccess(name, null, access) catch return false;
         return c.allows(access, name);
     }
 
     pub fn validateTool(c: *Catalog, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) !tool_mcp_runtime.ValidationResult {
         if (!c.mayAllow(access)) return .not_available;
-        try c.ensure(name, null);
+        try c.ensureForAccess(name, null, access);
         if (!c.allows(access, name)) return .not_available;
         tools_feature.validateArguments(arena, arguments_json, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -204,7 +204,7 @@ pub const Catalog = struct {
         if (!c.mayAllow(options.access)) return error.McpAccessDenied;
         if (options.expected_binding) |b| if (b.runtime_generation != c.currentGeneration()) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.currentGeneration()) return error.McpAuthorityChanged;
-        try c.ensureCurrent(name, options.cancel_flag);
+        try c.ensureCurrent(name, options.cancel_flag, options.access);
         const server, const tool, const transport, const how, const input_schema = found: {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
@@ -273,9 +273,9 @@ pub const Catalog = struct {
             } else return .{ .model_output = try tool_search.renderServerNotFound(alloc) };
         }
         // Every server starts at once, then each list is waited for.
-        for (servers) |s| if (searched(request, s)) c.runtime.prepare(s.name) catch {};
-        for (servers) |s| if (searched(request, s)) try c.refresh(s.name, cancel);
-        if (try c.renderUnavailable(alloc, request)) |output| return .{ .model_output = output };
+        for (servers) |s| if (searched(request, s) and c.allowsServer(access, s)) c.runtime.prepare(s.name) catch {};
+        for (servers) |s| if (searched(request, s) and c.allowsServer(access, s)) try c.refresh(s.name, cancel);
+        if (try c.renderUnavailableForAccess(alloc, request, access)) |output| return .{ .model_output = output };
 
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();
@@ -296,19 +296,20 @@ pub const Catalog = struct {
         var matched: std.ArrayList(usize) = .empty;
         defer matched.deinit(alloc);
         var result = try tool_search.rank(alloc, candidates.items, request, limits, if (open) &matched else null);
-        if (open and matched.items.len == 0) result.model_output = try c.withUnavailableLocked(alloc, result.model_output);
+        if (open and matched.items.len == 0) result.model_output = try c.withUnavailableLocked(alloc, result.model_output, access);
         return result;
     }
 
     /// `page` saying why each searched server whose list failed, needs a
     /// login, or is held was skipped.
-    fn withUnavailableLocked(c: *Catalog, alloc: Allocator, page: []u8) ![]u8 {
+    fn withUnavailableLocked(c: *Catalog, alloc: Allocator, page: []u8, access: Access) ![]u8 {
         var reasons: std.ArrayList([]const u8) = .empty;
         defer {
             for (reasons.items) |reason| alloc.free(reason);
             reasons.deinit(alloc);
         }
         for (c.servers, c.lists) |s, l| {
+            if (!c.allowsServer(access, s)) continue;
             try reasons.ensureUnusedCapacity(alloc, 1);
             reasons.appendAssumeCapacity(try c.unavailableText(alloc, s, l) orelse continue);
         }
@@ -327,7 +328,7 @@ pub const Catalog = struct {
     ) !?tool_mcp_runtime.ToolSchemaResult {
         if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
         if (!c.mayAllow(access)) return null;
-        try c.ensure(name, cancel);
+        try c.ensureForAccess(name, cancel, access);
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         const found = c.findLocked(name) orelse {
@@ -358,8 +359,8 @@ pub const Catalog = struct {
         cancel: Cancel,
     ) !selected_schema.AlwaysLoadedTools {
         const servers = c.currentServers();
-        for (servers) |s| if (s.always_loaded) c.runtime.prepare(s.name) catch {};
-        for (servers) |s| if (s.always_loaded) try c.refresh(s.name, cancel);
+        for (servers) |s| if (s.always_loaded and c.allowsServer(access, s)) c.runtime.prepare(s.name) catch {};
+        for (servers) |s| if (s.always_loaded and c.allowsServer(access, s)) try c.refresh(s.name, cancel);
         var loaded: selected_schema.AlwaysLoaded = .init(limits);
         errdefer loaded.deinit(alloc);
         c.mutex.lockUncancelable(c.io);
@@ -441,6 +442,16 @@ pub const Catalog = struct {
         owner_id: []const u8,
         parent_id: []const u8,
     ) !access_policy.View {
+        return c.snapshotAccessViewFiltered(alloc, owner_id, parent_id, null);
+    }
+
+    pub fn snapshotAccessViewFiltered(
+        c: *Catalog,
+        alloc: Allocator,
+        owner_id: []const u8,
+        parent_id: []const u8,
+        filter: ?tool_mcp_runtime.ServerFilter,
+    ) !access_policy.View {
         var servers: std.ArrayList(access_policy.ServerIdentity) = .empty;
         var tools: std.ArrayList(access_policy.ToolIdentity) = .empty;
         errdefer {
@@ -455,6 +466,7 @@ pub const Catalog = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         for (c.servers, c.lists) |s, l| {
+            if (filter) |f| if (!f.allowsEnabled(s.name, s.configured_enabled)) continue;
             // The runtime may have moved on to a reload the catalog hasn't
             // taken yet; a server it no longer has is left out.
             const status = statusOf(statuses, s.name) orelse continue;
@@ -535,28 +547,32 @@ pub const Catalog = struct {
 
     /// Loads the lists that could hold `name`, until one does.
     fn ensure(c: *Catalog, name: []const u8, cancel: Cancel) !void {
+        return c.ensureForAccess(name, cancel, .unrestricted);
+    }
+
+    fn ensureForAccess(c: *Catalog, name: []const u8, cancel: Cancel, access: Access) !void {
         if (c.known(name)) return;
-        try c.load(name, cancel);
+        try c.load(name, cancel, access);
     }
 
     /// `ensure` before a call: a list its server may have changed since is
     /// loaded again first, so a tool the server took away is refused unsent.
     /// Only calls wait for this; showing the model a list a moment old is
     /// harmless, as its calls come here.
-    fn ensureCurrent(c: *Catalog, name: []const u8, cancel: Cancel) !void {
+    fn ensureCurrent(c: *Catalog, name: []const u8, cancel: Cancel, access: Access) !void {
         if (c.upToDate(name)) return;
-        try c.load(name, cancel);
+        try c.load(name, cancel, access);
     }
 
-    fn load(c: *Catalog, name: []const u8, cancel: Cancel) !void {
+    fn load(c: *Catalog, name: []const u8, cancel: Cancel, access: Access) !void {
         const servers = c.currentServers();
         switch (c.ownerOf(servers, name)) {
-            .server => |i| if (servers[i].held == null) try c.refresh(servers[i].name, cancel),
+            .server => |i| if (servers[i].held == null and c.allowsServer(access, servers[i])) try c.refresh(servers[i].name, cancel),
             .gone => {},
             // No list has held this name, so it can't say which server does: any server whose name prefixes it may,
             // and each is loaded until one does.
             .unknown => for (servers) |s| {
-                if (s.held != null or !tool_names.matchesServer(name, s.name)) continue;
+                if (s.held != null or !c.allowsServer(access, s) or !tool_names.matchesServer(name, s.name)) continue;
                 try c.refresh(s.name, cancel);
                 if (c.known(name)) return;
             },
@@ -633,12 +649,31 @@ pub const Catalog = struct {
     /// the subagent was made still counts
     /// (tests/tla/mcp_host/SubagentAccess.tla NotNarrower).
     fn allowsLocked(c: *const Catalog, access: Access, server: usize, name: []const u8) bool {
-        if (!c.mayAllow(access)) return false;
+        if (!c.allowsServer(access, c.servers[server])) return false;
         return switch (access) {
             .scoped => |scope| scope.captured.tool(name) != null or
                 scope.captured.server(c.servers[server].name) != null,
-            .servers => |filter| filter.allows(c.servers[server].name),
             else => true,
+        };
+    }
+
+    /// Availability narrows the consumer's authority before any discovery starts.
+    fn allowsServer(c: *const Catalog, access: Access, server: config.Server) bool {
+        if (!c.mayAllow(access)) return false;
+        return switch (access) {
+            .unrestricted => server.configured_enabled,
+            .disabled => false,
+            .servers => |filter| filter.allowsEnabled(server.name, server.configured_enabled),
+            .scoped => |scope| scoped: {
+                const enabled = if (scope.session_filter) |filter|
+                    filter.allowsEnabled(server.name, server.configured_enabled)
+                else
+                    server.configured_enabled;
+                if (!enabled) break :scoped false;
+                if (scope.captured.server(server.name) != null) break :scoped true;
+                for (scope.captured.tools) |tool| if (std.mem.eql(u8, tool.server_name, server.name)) break :scoped true;
+                break :scoped false;
+            },
         };
     }
 
@@ -810,11 +845,15 @@ pub const Catalog = struct {
     /// The answer for a search that names a server needing a login, or one
     /// that is down.
     fn renderUnavailable(c: *Catalog, alloc: Allocator, request: tool_mcp_runtime.SearchRequest) !?[]u8 {
+        return c.renderUnavailableForAccess(alloc, request, .unrestricted);
+    }
+
+    fn renderUnavailableForAccess(c: *Catalog, alloc: Allocator, request: tool_mcp_runtime.SearchRequest, access: Access) !?[]u8 {
         const named = request.server orelse request.query.raw;
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         for (c.servers, c.lists) |s, l| {
-            if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
+            if (!c.allowsServer(access, s) or !tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
                 const how = signIn(c.runtime.options.slash_commands, s.source);
                 const refused = try c.runtime.refusedLogin(alloc, s.name);
@@ -829,7 +868,7 @@ pub const Catalog = struct {
         }
         const name = request.server orelse return null;
         for (c.servers, c.lists) |s, l| {
-            if (!std.mem.eql(u8, s.name, name) or l.state != .failed) continue;
+            if (!c.allowsServer(access, s) or !std.mem.eql(u8, s.name, name) or l.state != .failed) continue;
             return try tool_search.writeServerFailure(alloc, s.name, l.failure orelse "the server is unavailable");
         }
         return null;
@@ -1067,6 +1106,136 @@ const login_words = @import("login_words.zig");
 const tool_lookup = @import("../mcp/tool_lookup.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+
+test "temporary MCP admission preserves unrelated views but raw edits while held invalidate them" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "toggled", .command = f.server },
+        .{ .name = "kept", .command = f.server },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    try testing.expect(c.hasTool("mcp_kept_echo", .unrestricted));
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
+    defer view.deinit(testing.allocator);
+    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    const generation = c.currentGeneration();
+
+    configs[0].session_enabled = false;
+    const off = try r.reload(&configs, &f.inherited);
+    try testing.expect(!off.definitions_changed);
+    try c.reload(off);
+    try testing.expectEqual(generation, c.currentGeneration());
+    try testing.expect(c.hasTool("mcp_kept_echo", child));
+    configs[0].session_enabled = true;
+    try c.reload(try r.reload(&configs, &f.inherited));
+    try testing.expectEqual(generation, c.currentGeneration());
+    try testing.expect(c.hasTool("mcp_kept_echo", child));
+
+    configs[0].session_enabled = false;
+    try c.reload(try r.reload(&configs, &f.inherited));
+    configs[0].args = &.{"changed"};
+    const edited = try r.reload(&configs, &f.inherited);
+    try testing.expect(edited.definitions_changed);
+    try c.reload(edited);
+    try testing.expect(generation != c.currentGeneration());
+    try testing.expect(!c.hasTool("mcp_kept_echo", child));
+    configs[0].session_enabled = true;
+    try c.reload(try r.reload(&configs, &f.inherited));
+    try testing.expect(!c.hasTool("mcp_toggled_echo", child));
+
+    const enabled_generation = c.currentGeneration();
+    configs[0].enabled = false;
+    const raw_enabled = try r.reload(&configs, &f.inherited);
+    try testing.expect(raw_enabled.definitions_changed);
+    try c.reload(raw_enabled);
+    try testing.expect(enabled_generation != c.currentGeneration());
+
+    const environment_generation = c.currentGeneration();
+    try f.inherited.put("MCP_REVIEW_DEFINITION", "changed");
+    const environment = try r.reload(&configs, &f.inherited);
+    try testing.expect(environment.definitions_changed);
+    try c.reload(environment);
+    try testing.expect(environment_generation != c.currentGeneration());
+}
+
+test "temporary MCP session filters isolate defaults and stop discovery before startup" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "fake", .command = f.server, .always_loaded = true },
+        .{ .name = "off", .command = f.server, .enabled = false, .session_enabled = true, .always_loaded = true },
+        .{ .name = "project", .command = f.server, .source = .workspace, .workspace_admission = .pending, .session_enabled = true },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Gate = struct {
+        enabled: ?bool = false,
+
+        fn allows(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn enabledFor(raw: *const anyopaque, _: []const u8, configured: bool) bool {
+            const gate: *const @This() = @ptrCast(@alignCast(raw));
+            return gate.enabled orelse configured;
+        }
+    };
+    var gate: Gate = .{};
+    const filter: tool_mcp_runtime.ServerFilter = .{ .context = &gate, .allows_fn = Gate.allows, .enabled_fn = Gate.enabledFor };
+    const access: Access = .{ .servers = filter };
+    const query = try lexical_relevance.prepare("echo");
+    try testing.expect(!c.hasTool("mcp_fake_echo", access));
+    try testing.expect((try c.toolSchema(a, "mcp_fake_echo", .{}, .{}, access, null)) == null);
+    try testing.expectEqual(@as(usize, 0), (try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, access, null)).selected_tools.len);
+    const always = try c.snapshotAlwaysLoadedTools(a, .{}, .{}, access, null);
+    try testing.expectEqual(@as(usize, 0), always.tools.len);
+    for (try r.statuses(a)) |status| if (!std.mem.eql(u8, status.name, "project")) try testing.expectEqual(runtime_mod.State.idle, status.state);
+
+    gate.enabled = true;
+    try testing.expect(c.hasTool("mcp_fake_echo", access));
+    try testing.expect(c.hasTool("mcp_off_echo", access));
+    try testing.expect(!c.hasTool("mcp_project_echo", access));
+    try testing.expect(!c.hasTool("mcp_off_echo", .unrestricted));
+    const binding = (try c.toolSchema(a, "mcp_off_echo", .{}, .{}, access, null)).?.selected.mcp_binding.?;
+    const generation = c.currentGeneration();
+    var view = try c.snapshotAccessViewFiltered(testing.allocator, "child", "parent", filter);
+    defer view.deinit(testing.allocator);
+    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined, .session_filter = filter } };
+    try testing.expect(c.hasTool("mcp_off_echo", child));
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.success, (try c.callTool(a, "mcp_off_echo", "{}", 4096, .{ .access = child })).?.status);
+
+    gate.enabled = false;
+    try testing.expectEqual(generation, c.currentGeneration());
+    try testing.expect(!c.hasTool("mcp_off_echo", child));
+    try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_off_echo", "{}", 4096, .{ .access = child, .expected_binding = binding }));
+    try testing.expect((try c.validateTool(a, "mcp_off_echo", "{}", child)) == .not_available);
+    try testing.expect((try c.snapshotToolDefinition(a, "mcp_off_echo", binding, .{}, .{}, child)) == .unavailable);
+    var disabled_view = try c.snapshotAccessViewFiltered(testing.allocator, "child", "parent", filter);
+    defer disabled_view.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), disabled_view.servers.len);
+    try testing.expectEqual(@as(usize, 0), disabled_view.tools.len);
+    try testing.expectEqual(@as(usize, 0), (try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, child, null)).selected_tools.len);
+    try testing.expect(c.hasTool("mcp_fake_echo", .unrestricted));
+
+    gate.enabled = null;
+    try testing.expect(c.hasTool("mcp_fake_echo", access));
+    try testing.expect(!c.hasTool("mcp_off_echo", access));
+}
 
 test "a subagent made before its parent's server starts may use the server's tools" {
     var f: Fixture = undefined;

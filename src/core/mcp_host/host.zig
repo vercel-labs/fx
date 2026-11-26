@@ -25,7 +25,11 @@ pub const signalServersForExit = runtime_mod.signalServersForExit;
 pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
 
+pub const SessionSetting = struct { name: []const u8, enabled: ?bool };
+
 pub const Extras = struct {
+    /// Admission needed by the live root sessions; borrowed for the load only.
+    session_settings: []const SessionSetting = &.{},
     /// The questions fx's UI on this surface can ask.
     questions: elicitation.Capabilities = .{},
     /// Gets sign-in notices.

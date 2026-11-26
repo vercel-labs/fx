@@ -108,6 +108,11 @@ const Context = struct {
                 .captured = view,
                 .admission_authority_generation = self.admission.authority_generation,
                 .live = .{ .context = self, .resolve_fn = resolveLiveMcpView },
+                .session_filter = switch (self.config.tool_context.mcp_access) {
+                    .servers => |filter| filter,
+                    .scoped => |scope| scope.session_filter,
+                    else => null,
+                },
             } }
         else
             .disabled;

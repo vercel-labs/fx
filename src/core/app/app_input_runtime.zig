@@ -2091,13 +2091,18 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// On the list and on a server's screen, typing goes to the composer,
-        /// which filters the servers or the server's tools. On a
+        /// Space toggles the list's selected server; other typing filters the
+        /// servers or the open server's tools in the composer. On a
         /// confirmation any printable byte means no, like `[y/N]`. Control
         /// bytes pass, so Ctrl+C and Ctrl+J/K still work.
         fn routeMcpHostMenuByte(app: *App, byte: u8) !bool {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
-            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            if (app.mcp.host_menu.screen == .list) {
+                if (byte != ' ') return false;
+                try app.mcpHostMenuKey(.space);
+                return true;
+            }
             if (app.mcp.host_menu.screen == .server and byte != '\r') return false;
             if (byte == '\r') {
                 try app.mcpHostMenuKey(.enter);
@@ -16235,4 +16240,32 @@ test "app input bridge loads the most recent durable history in chronological or
     try std.testing.expectEqual(@as(usize, 100), app.input_runtime.composer_history.count());
     try std.testing.expectEqualStrings("prompt-1", app.input_runtime.composer_history.entryText(0).?);
     try std.testing.expectEqualStrings("prompt-100", app.input_runtime.composer_history.entryText(99).?);
+}
+
+test "MCP list Space is consumed as a shortcut but detail spaces remain filter text" {
+    const menu = @import("../mcp_host/host.zig").menu;
+    const Mcp = struct {
+        host_menu: menu.State = .{},
+        pub fn hostMenuActive(self: *const @This()) bool {
+            return self.host_menu.active;
+        }
+    };
+    const App = struct {
+        mcp: Mcp = .{},
+        input_runtime: struct { text_scalar: text_scalar.State = .{} } = .{},
+        last_key: ?menu.Key = null,
+        pub fn mcpHostMenuKey(self: *@This(), key: menu.Key) !void {
+            self.last_key = key;
+        }
+    };
+    var app: App = .{};
+    try std.testing.expect(!try Runtime(App).routeMcpHostMenuByte(&app, ' '));
+    app.mcp.host_menu.active = true;
+    try std.testing.expect(try Runtime(App).routeMcpHostMenuByte(&app, ' '));
+    try std.testing.expectEqual(menu.Key.space, app.last_key.?);
+    app.last_key = null;
+    try std.testing.expect(!try Runtime(App).routeMcpHostMenuByte(&app, 'd'));
+    app.mcp.host_menu.screen = .server;
+    try std.testing.expect(!try Runtime(App).routeMcpHostMenuByte(&app, ' '));
+    try std.testing.expect(app.last_key == null);
 }

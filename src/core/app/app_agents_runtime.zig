@@ -3259,6 +3259,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn closeInstance(app: *App, child: *ChildAgent) !void {
             try closeTree(app, &child.agent, child, nextInstanceAfter(app, child), child.id);
             dropHosted(app, child);
+            if (comptime @hasField(App, "mcp")) app.mcp.host_reload_requested.store(true, .release);
         }
 
         /// Closes the first instance and every subagent in its tree, as
@@ -3277,6 +3278,8 @@ pub fn Runtime(comptime App: type) type {
             app.main_screen = .{};
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             app.instances.first_open = false;
+            first.mcp_overrides.clear(std.heap.c_allocator);
+            if (comptime @hasField(App, "mcp")) app.mcp.host_reload_requested.store(true, .release);
             app.permission_state.authority_mutex.unlock(io_mod.getIo());
         }
 
@@ -3740,6 +3743,7 @@ pub fn Runtime(comptime App: type) type {
             agent.approval_prompt.deinit(app.alloc);
             agent.question_prompt.deinit(app.alloc);
             app_permission_runtime.Runtime(App).deinitSessionGrants(app, agent);
+            agent.mcp_overrides.deinit(std.heap.c_allocator);
             agent.change_tracker.deinit(std.heap.c_allocator);
             for (agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
             agent.diff_entries.deinit(std.heap.c_allocator);

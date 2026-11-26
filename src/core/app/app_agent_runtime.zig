@@ -237,7 +237,7 @@ pub fn Runtime(comptime App: type) type {
         /// carries, never on main's messages to it. Hiding a tool from the model does
         /// not stop a call to it; `childLiveToolAuthority` refuses any tool
         /// outside the admission.
-        fn applyChildToolContext(app: *App, ctx: *tool_runtime.Context, run: *agents.ChildRun) void {
+        fn applyChildToolContext(app: *App, agent: *AppAgent, ctx: *tool_runtime.Context, run: *agents.ChildRun) void {
             ctx.session_grants = run.admission.grants;
             ctx.permission_state_override = &run.admission.permission_state;
             ctx.advertised_dynamic_tool_names = run.admission.integration_names;
@@ -246,6 +246,7 @@ pub fn Runtime(comptime App: type) type {
                     .captured = view,
                     .admission_authority_generation = run.admission.authority_generation,
                     .live = .{ .context = run, .resolve_fn = resolveChildLiveMcpView },
+                    .session_filter = sessionMcpFilter(agent),
                 } }
             else
                 .disabled;
@@ -538,10 +539,12 @@ pub fn Runtime(comptime App: type) type {
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(agent);
             // An instance whose profile names its MCP servers uses only those.
             // A subagent's run replaces this with its own view below.
-            if (instanceMcpProfile(agent)) |profile| {
+            if (comptime agents.hasAgentField(App, "mcp_overrides")) {
+                ctx.mcp_access = .{ .servers = sessionMcpFilter(agent).? };
+            } else if (instanceMcpProfile(agent)) |profile| {
                 ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(profile), .allows_fn = profileAllowsMcpServer } };
             }
-            if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
+            if (childRun(agent)) |run| applyChildToolContext(app, agent, &ctx, run);
             return ctx;
         }
 
@@ -558,6 +561,23 @@ pub fn Runtime(comptime App: type) type {
             var kept: std.ArrayList([]const u8) = .empty;
             for (names) |name| if (profiles.allowsMcpServer(value, name)) try kept.append(arena, name);
             return kept.items;
+        }
+
+        fn sessionMcpFilter(agent: *const AppAgent) ?tool_mcp_runtime.ServerFilter {
+            if (comptime !agents.hasAgentField(App, "mcp_overrides")) return null;
+            return .{ .context = agent, .allows_fn = sessionProfileAllowsMcp, .enabled_fn = sessionAllowsMcp };
+        }
+
+        fn sessionProfileAllowsMcp(raw: *const anyopaque, server: []const u8) bool {
+            const agent: *const AppAgent = @ptrCast(@alignCast(raw));
+            const profile = instanceMcpProfile(agent) orelse return true;
+            return profiles.allowsMcpServer(profile, server);
+        }
+
+        fn sessionAllowsMcp(raw: *const anyopaque, server: []const u8, configured_enabled: bool) bool {
+            if (comptime !agents.hasAgentField(App, "mcp_overrides")) return configured_enabled;
+            const agent: *const AppAgent = @ptrCast(@alignCast(raw));
+            return agent.allowsSessionMcp(server, configured_enabled);
         }
 
         /// Whether the instance profile at `raw` allows MCP server `server`.
@@ -1328,7 +1348,11 @@ pub fn Runtime(comptime App: type) type {
             defer toolbox_arena_state.deinit();
             if (comptime @hasDecl(App, "mcpServerNames")) {
                 const toolbox_arena = toolbox_arena_state.allocator();
-                config.toolbox_mcp_servers = try allowedMcpServers(toolbox_arena, try app.mcpServerNames(toolbox_arena), instanceMcpProfile(agent));
+                const server_names = if (comptime @hasDecl(App, "mcpServerNamesForAgent"))
+                    try app.mcpServerNamesForAgent(agent, toolbox_arena)
+                else
+                    try app.mcpServerNames(toolbox_arena);
+                config.toolbox_mcp_servers = try allowedMcpServers(toolbox_arena, server_names, instanceMcpProfile(agent));
             }
             if (comptime @hasField(App, "toolbox_behind")) config.toolbox_behind = app.toolbox_behind.slice();
             // A subagent is shown only the built-in tools its run was admitted

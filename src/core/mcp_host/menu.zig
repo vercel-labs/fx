@@ -18,6 +18,8 @@ pub const Choice = enum {
     logout,
     approve,
     reject,
+    enable,
+    disable,
     remove,
 
     pub fn label(c: Choice) []const u8 {
@@ -26,20 +28,34 @@ pub const Choice = enum {
             .logout => "Log out",
             .approve => "Approve",
             .reject => "Reject",
+            .enable => "Enable for this session",
+            .disable => "Disable for this session",
             .remove => "Remove",
         };
     }
 
     /// The `/mcp` verb it runs.
     pub fn verb(c: Choice) []const u8 {
-        return @tagName(c);
+        return switch (c) {
+            .enable, .disable => "set",
+            else => @tagName(c),
+        };
     }
 
-    /// Remove, approve, and reject ask first; login and logout are quick to undo.
+    /// The argument after the server name, when the verb needs one.
+    pub fn value(c: Choice) ?[]const u8 {
+        return switch (c) {
+            .enable => "on",
+            .disable => "off",
+            else => null,
+        };
+    }
+
+    /// Remove, approve, and reject ask first; the other actions are reversible.
     pub fn asks(c: Choice) bool {
         return switch (c) {
             .remove, .approve, .reject => true,
-            .login, .logout => false,
+            .login, .logout, .enable, .disable => false,
         };
     }
 
@@ -57,7 +73,7 @@ pub const Row = struct {
     target: ?[]const u8 = null,
 };
 
-pub const max_choices = 4;
+pub const max_choices = 5;
 
 /// The choices a server offers: its next step first, Remove last.
 pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
@@ -79,9 +95,21 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
         out[n] = .reject;
         n += 1;
     }
+    if (toggleChoice(row)) |choice| {
+        out[n] = choice;
+        n += 1;
+    }
     out[n] = .remove;
     n += 1;
     return out[0..n];
+}
+
+pub fn toggleChoice(row: Row) ?Choice {
+    return switch (row.status.state) {
+        .waiting_for_approval, .rejected, .unsupported, .missing_env, .invalid_env => null,
+        .disabled => .enable,
+        else => .disable,
+    };
 }
 
 /// Servers match by name, as fx's other menus match, and the list keeps its
@@ -98,6 +126,7 @@ const ServerMatches = struct {
 /// What the menu knows of the open server's tools.
 pub const Tools = union(enum) {
     loading,
+    disabled,
     needs_login,
     needs_approval,
     failed: []const u8,
@@ -176,10 +205,10 @@ pub fn showsError(row: Row) bool {
     return row.status.last_error != null and !row.status.needs_login;
 }
 
-/// The tools as the screen tells them: a server that needs a login or an
-/// approval says so, rather than as a failure, even while a load is still on
-/// its way.
+/// Disabled servers hide even cached tools. A server that needs a login or
+/// approval says so, rather than as a failure, while a load is still on its way.
 pub fn toolsFor(row: Row, tools: Tools) Tools {
+    if (row.status.state == .disabled) return .disabled;
     if (tools == .ready) return tools;
     if (row.status.state == .waiting_for_approval) return .needs_approval;
     return if (row.status.needs_login) .needs_login else tools;
@@ -195,7 +224,7 @@ pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) L
         .choices = choices(row, &buf).len,
         // A blank, then the heading or the reason there are no tools.
         .gap = 2,
-        .tools = toolCount(tools, filter),
+        .tools = toolCount(toolsFor(row, tools), filter),
         .window = window,
     };
 }
@@ -250,7 +279,7 @@ pub const State = struct {
 };
 
 /// ← and → only choose between yes and no on a question asked on its row.
-pub const Key = enum { up, down, left, right, enter, escape };
+pub const Key = enum { up, down, left, right, enter, escape, space };
 
 pub const Effect = union(enum) {
     none,
@@ -351,6 +380,12 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .up => s.select(view.rows[i -| 1].status.name),
                 .down => s.select(view.rows[@min(i + 1, view.rows.len - 1)].status.name),
                 .left, .right => {},
+                .space => {
+                    const row = view.rows[i];
+                    const choice = toggleChoice(row) orelse return .none;
+                    s.select(row.status.name);
+                    return .{ .run = .{ .choice = choice, .server = row.status.name } };
+                },
                 .enter => {
                     const name = view.rows[i].status.name;
                     s.select(name);
@@ -371,7 +406,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .down => if (s.cursor + 1 < l.selectable()) {
                     s.cursor += 1;
                 },
-                .left, .right => {},
+                .left, .right, .space => {},
                 .enter => {
                     var buf: [max_choices]Choice = undefined;
                     const cs = choices(r, &buf);
@@ -424,7 +459,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     s.confirm = null;
                     s.answer_no = false;
                 },
-                .up, .down => {},
+                .up, .down, .space => {},
             }
             return .none;
         },
@@ -669,15 +704,83 @@ fn choiceList(r: Row, buf: *[max_choices]Choice) []const Choice {
 
 test "a server's choices start with its next step and end with Remove" {
     var b: [max_choices]Choice = undefined;
-    try testing.expectEqualSlices(Choice, &.{ .login, .remove }, choiceList(testRow("a", .failed, .{ .needs_login = true }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .logout, .remove }, choiceList(testRow("a", .ready, .{ .signed_in = true }), &b));
-    try testing.expectEqualSlices(Choice, &.{.remove}, choiceList(testRow("a", .ready, .{}), &b));
+    try testing.expectEqualSlices(Choice, &.{ .login, .disable, .remove }, choiceList(testRow("a", .failed, .{ .needs_login = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .logout, .disable, .remove }, choiceList(testRow("a", .ready, .{ .signed_in = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .disable, .remove }, choiceList(testRow("a", .ready, .{}), &b));
     try testing.expectEqualSlices(Choice, &.{ .approve, .reject, .remove }, choiceList(testRow("a", .waiting_for_approval, .{ .source = .workspace }), &b));
     try testing.expectEqualSlices(Choice, &.{ .approve, .remove }, choiceList(testRow("a", .rejected, .{ .source = .workspace }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .reject, .remove }, choiceList(testRow("a", .idle, .{ .source = .workspace, .transport = .stdio }), &b));
-    try testing.expectEqualSlices(Choice, &.{ .login, .logout, .reject, .remove }, choiceList(testRow("a", .retrying, .{ .source = .workspace, .needs_login = true, .signed_in = true }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .reject, .disable, .remove }, choiceList(testRow("a", .idle, .{ .source = .workspace, .transport = .stdio }), &b));
+    try testing.expectEqualSlices(Choice, &.{ .login, .logout, .reject, .disable, .remove }, choiceList(testRow("a", .retrying, .{ .source = .workspace, .needs_login = true, .signed_in = true }), &b));
     try testing.expect(Choice.remove.asks() and Choice.approve.asks() and Choice.reject.asks());
     try testing.expect(!Choice.login.asks() and !Choice.logout.asks());
+}
+
+test "session toggles use the set verb and an explicit value" {
+    try testing.expectEqualStrings("Enable for this session", Choice.enable.label());
+    try testing.expectEqualStrings("Disable for this session", Choice.disable.label());
+    try testing.expectEqualStrings("set", Choice.enable.verb());
+    try testing.expectEqualStrings("set", Choice.disable.verb());
+    try testing.expectEqualStrings("on", Choice.enable.value().?);
+    try testing.expectEqualStrings("off", Choice.disable.value().?);
+    try testing.expect(!Choice.enable.asks() and !Choice.disable.asks());
+    try testing.expect(!Choice.enable.asksOnRow() and !Choice.disable.asksOnRow());
+    for ([_]Choice{ .login, .logout, .approve, .reject, .remove }) |choice| {
+        try testing.expectEqualStrings(@tagName(choice), choice.verb());
+        try testing.expect(choice.value() == null);
+    }
+}
+
+test "session toggles follow the effective state without replacing held actions" {
+    var b: [max_choices]Choice = undefined;
+    try testing.expectEqualSlices(Choice, &.{ .enable, .remove }, choiceList(testRow("a", .disabled, .{}), &b));
+    try testing.expectEqualSlices(Choice, &.{ .reject, .enable, .remove }, choiceList(testRow("a", .disabled, .{ .source = .workspace }), &b));
+    for ([_]runtime.State{ .idle, .connecting, .ready, .retrying, .failed }) |state| {
+        try testing.expectEqualSlices(Choice, &.{ .disable, .remove }, choiceList(testRow("a", state, .{}), &b));
+    }
+    for ([_]runtime.State{ .waiting_for_approval, .rejected, .unsupported, .missing_env, .invalid_env }) |state| {
+        for (choiceList(testRow("a", state, .{ .source = .workspace }), &b)) |choice| {
+            try testing.expect(choice != .enable and choice != .disable);
+        }
+    }
+}
+
+test "session toggles run immediately and keep the server open" {
+    for ([_]runtime.State{ .ready, .disabled }, [_]Choice{ .disable, .enable }) |state, choice| {
+        const r = testRow("docs", state, .{});
+        var s: State = .{ .active = true, .screen = .server };
+        const view: View = .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .loading, "", 9) };
+        const effect = press(&s, view, .enter);
+        try testing.expectEqual(choice, effect.run.choice);
+        try testing.expectEqualStrings("docs", effect.run.server);
+        try testing.expectEqual(Screen.server, s.screen);
+        try testing.expect(s.confirm == null);
+    }
+}
+
+test "disabling a server hides cached tools from its layout and selection" {
+    const tools = [_]Tool{
+        .{ .name = "cached_read", .description = "Read a document" },
+        .{ .name = "cached_write", .description = "Write a document" },
+    };
+    const cached: Tools = .{ .ready = &tools };
+    var rows = [_]Row{testRow("docs", .ready, .{})};
+    var s: State = .{ .active = true, .screen = .server };
+    s.select("docs");
+    const before = viewOf(&s, &rows, "", cached, &.{});
+    try testing.expectEqual(@as(usize, 2), before.layout.tools);
+    s.cursor = before.layout.selectable() - 1;
+
+    rows[0].status.state = .disabled;
+    try testing.expect(toolsFor(rows[0], cached) == .disabled);
+    const after = viewOf(&s, &rows, "", cached, &.{});
+    try testing.expectEqual(@as(usize, 0), after.layout.tools);
+    try testing.expectEqual(after.layout.choices, after.layout.selectable());
+    try testing.expectEqual(Effect.none, settle(&s, after));
+    try testing.expectEqual(after.layout.choices - 1, s.cursor);
+    for (0..4) |_| _ = press(&s, after, .down);
+    try testing.expectEqual(after.layout.choices - 1, s.cursor);
+    filterChanged(&s, viewOf(&s, &rows, "cached", cached, &.{}), true);
+    try testing.expectEqual(@as(usize, 0), s.cursor);
 }
 
 test "the filter matches server names and tools as every menu does" {
@@ -767,11 +870,12 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     try testing.expectEqualStrings("linear", run.run.server);
 
     _ = press(&s, view, .down);
+    _ = press(&s, view, .down);
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     try testing.expectEqual(Screen.confirm, s.screen);
     // Nothing moves while the confirmation is open, and Esc cancels it.
     _ = press(&s, view, .up);
-    try testing.expectEqual(@as(usize, 1), s.cursor);
+    try testing.expectEqual(@as(usize, 2), s.cursor);
     _ = press(&s, view, .escape);
     try testing.expectEqual(Screen.server, s.screen);
     _ = press(&s, view, .enter);
@@ -785,7 +889,7 @@ test "on a server, the next step is selected, and asking actions confirm first" 
 
 test "a question on its row chooses yes or no with left and right" {
     const r = testRow("linear", .failed, .{ .needs_login = true });
-    var s: State = .{ .active = true, .screen = .server, .cursor = 1 };
+    var s: State = .{ .active = true, .screen = .server, .cursor = 2 };
     const view: View = .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .needs_login, "", 9) };
     _ = press(&s, view, .enter);
     try testing.expectEqual(Screen.confirm, s.screen);
@@ -818,8 +922,8 @@ test "the selection moves on from the choices through the tools, and the screen 
     const layout = serverLayout(r, .{ .ready = &tools }, "", 8);
     // http, file, status, and a blank.
     try testing.expectEqual(@as(usize, 4), layout.lead);
-    try testing.expectEqual(@as(usize, 2), layout.choices);
-    try testing.expectEqual(@as(usize, 38), layout.lines());
+    try testing.expectEqual(@as(usize, 3), layout.choices);
+    try testing.expectEqual(@as(usize, 39), layout.lines());
     var s: State = .{ .active = true, .screen = .server };
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);
@@ -830,7 +934,7 @@ test "the selection moves on from the choices through the tools, and the screen 
     // Enter on a tool does nothing.
     try testing.expectEqual(Effect.none, press(&s, view, .enter));
     for (0..40) |_| _ = press(&s, view, .down);
-    try testing.expectEqual(@as(usize, 31), s.cursor);
+    try testing.expectEqual(@as(usize, 32), s.cursor);
     try testing.expectEqual(layout.lines() - layout.shown(), s.top);
     for (0..40) |_| _ = press(&s, view, .up);
     try testing.expectEqual(@as(usize, 0), s.top);
@@ -884,5 +988,36 @@ test "a server that goes away takes its screen back to the list" {
     const r = testRow("linear", .ready, .{});
     s = .{ .active = true, .screen = .server, .cursor = 3 };
     _ = settle(&s, .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .loading, "", 9) });
-    try testing.expectEqual(@as(usize, 0), s.cursor);
+    try testing.expectEqual(@as(usize, 1), s.cursor);
+}
+
+test "MCP list Space toggles the filtered selection without opening its server" {
+    var rows = [_]Row{ testRow("alpha", .ready, .{}), testRow("docs", .disabled, .{}) };
+    var state: State = .{};
+    open(&state);
+    state.select("alpha");
+    var buf: [2]Row = undefined;
+    const enabled = press(&state, viewOf(&state, &rows, "doc", .loading, &buf), .space);
+    try testing.expectEqual(Choice.enable, enabled.run.choice);
+    try testing.expectEqualStrings("docs", enabled.run.server);
+    try testing.expectEqualStrings("docs", state.selectedName());
+    try testing.expectEqual(Screen.list, state.screen);
+    try testing.expect(state.confirm == null);
+    rows[1].status.state = .ready;
+    const disabled = press(&state, viewOf(&state, &rows, "doc", .loading, &buf), .space);
+    try testing.expectEqual(Choice.disable, disabled.run.choice);
+    try testing.expectEqualStrings("docs", disabled.run.server);
+    try testing.expectEqual(Screen.list, state.screen);
+    try testing.expectEqual(Effect.none, press(&state, viewOf(&state, &rows, "missing", .loading, &buf), .space));
+}
+
+test "MCP list Space cannot approve or toggle a held server" {
+    for ([_]runtime.State{ .waiting_for_approval, .rejected, .unsupported, .missing_env, .invalid_env }) |status| {
+        const rows = [_]Row{testRow("project", status, .{ .source = .workspace })};
+        var state: State = .{};
+        open(&state);
+        try testing.expectEqual(Effect.none, press(&state, .{ .rows = &rows }, .space));
+        try testing.expectEqual(Screen.list, state.screen);
+        try testing.expect(state.confirm == null);
+    }
 }

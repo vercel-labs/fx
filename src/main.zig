@@ -1180,6 +1180,7 @@ const App = struct {
         main_agent.session.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         app_permission_runtime.Runtime(App).deinitSessionGrants(self, main_agent);
+        main_agent.mcp_overrides.deinit(std.heap.c_allocator);
         main_agent.approval_prompt.deinit(self.alloc);
         main_agent.question_prompt.deinit(self.alloc);
 
@@ -1978,7 +1979,7 @@ const App = struct {
     /// in a shell.
     pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
         _ = self.refreshMcpHostFromFiles(self.screenAgent());
-        try self.mcp.runVerbs(io_mod.homeDir() orelse "", self.workspace_root, rest);
+        try self.mcp.runSessionVerbs(self.screenAgent(), io_mod.homeDir() orelse "", self.workspace_root, rest);
     }
 
     /// From any thread: a warning for the notice row, such as a question fx declined.
@@ -1991,16 +1992,18 @@ const App = struct {
     }
 
     pub fn refreshMcpCompletion(self: *App) void {
-        self.mcp.refreshCompletion();
+        self.mcp.refreshCompletion(self.screenAgent());
     }
 
     pub fn openMcpHostMenu(self: *App) void {
         _ = self.refreshMcpHostFromFiles(self.screenAgent());
+        self.mcp.selectSession(self.screenAgent());
         self.mcp.openHostMenu();
     }
 
     /// The composer's text is the menu's filter.
     pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
+        self.mcp.selectSession(self.screenAgent());
         const was = self.mcp.host_menu.screen;
         try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.homeDir() orelse "", self.workspace_root);
         try self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state);
@@ -2016,6 +2019,7 @@ const App = struct {
     }
 
     pub fn refreshMcpHostStatus(self: *App) void {
+        self.mcp.selectSession(self.screenAgent());
         if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
     }
 
@@ -2024,6 +2028,7 @@ const App = struct {
     }
 
     pub fn refreshMcpHostMenu(self: *App) void {
+        self.mcp.selectSession(self.screenAgent());
         const was = self.mcp.host_menu.screen;
         const changed = self.mcp.refreshHostMenu(self.input_runtime.edit_state.input.items);
         self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state) catch |err|
@@ -2032,12 +2037,12 @@ const App = struct {
     }
 
     pub fn applyMcpHostReload(self: *App, agent: *agents.Agent) void {
-        _ = self.mcp.refreshHost(self.alloc, io_mod.homeDir(), self.workspace_root, self.toolRegistry(agent), .requested);
+        _ = app_mcp_runtime.SessionControls(App).refreshHost(self, self.toolRegistry(agent), .requested);
         self.mcp.signInAfterAdd();
     }
 
     fn refreshMcpHostFromFiles(self: *App, agent: *agents.Agent) bool {
-        return self.mcp.refreshHost(self.alloc, io_mod.homeDir(), self.workspace_root, self.toolRegistry(agent), .files);
+        return app_mcp_runtime.SessionControls(App).refreshHost(self, self.toolRegistry(agent), .files);
     }
 
     /// Before `agent`'s prompt: loads the MCP config again when it changed
@@ -2048,6 +2053,10 @@ const App = struct {
     pub fn refreshMcpHostForPrompt(self: *App, agent: *agents.Agent) bool {
         if (AgentsAppRuntime.anyWorkGoing(self)) return false;
         return self.refreshMcpHostFromFiles(agent);
+    }
+
+    pub fn mcpServerNamesForAgent(self: *App, agent: *agents.Agent, alloc: Allocator) ![]const []const u8 {
+        return self.mcp.serverNamesForAgent(agent, alloc);
     }
 
     pub fn mcpServerNames(self: *App, alloc: Allocator) ![]const []const u8 {
@@ -2116,9 +2125,12 @@ const App = struct {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+    pub fn snapshotMcpDefinitionForAgent(self: *App, agent: *agents.Agent, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+        return tool_runtime.snapshotMcpDefinition(AgentAppRuntime.toolContext(self, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl()), alloc, name, known);
+    }
+
+    pub fn snapshotMcpToolNamesForSession(self: *App, alloc: Allocator, owner_id: []const u8) ![][]u8 {
+        return app_mcp_runtime.SessionControls(App).snapshotToolNames(self, alloc, owner_id);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2131,7 +2143,7 @@ const App = struct {
         owner_id: []const u8,
         parent_id: []const u8,
     ) !?mcp_access_policy.View {
-        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id);
+        return app_mcp_runtime.SessionControls(App).snapshotAccessView(self, alloc, owner_id, parent_id);
     }
 
     pub fn snapshotModelToolProjection(
@@ -9426,4 +9438,17 @@ test "a theme change leaves hidden agents alone while a scrollback handoff is pe
     App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
 
     try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;136;192;208mshown") != null);
+}
+
+test "MCP completion selects the current session before its early return" {
+    var app: App = undefined;
+    app.main_agent = .{};
+    app.screen_owner = null;
+    app.mcp = .{};
+    var closed_owner: agents.Agent = .{};
+    app.mcp.session_owner = &closed_owner;
+    app.mcp.host_completion_at_ms = 123;
+    app.refreshMcpCompletion();
+    try std.testing.expectEqual(&app.main_agent, app.mcp.session_owner.?);
+    try std.testing.expectEqual(@as(i64, 0), app.mcp.host_completion_at_ms);
 }

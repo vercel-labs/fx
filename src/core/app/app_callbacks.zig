@@ -1090,6 +1090,9 @@ pub fn Bindings(comptime App: type) type {
         fn agentSnapshotMcpDefinition(ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            if (comptime @hasDecl(App, "snapshotMcpDefinitionForAgent")) {
+                return app.snapshotMcpDefinitionForAgent(agent, arena, name, known);
+            }
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) {
                 return app.snapshotMcpDefinition(arena, name, known, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent).mode);
             }

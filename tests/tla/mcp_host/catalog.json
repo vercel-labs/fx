@@ -7,6 +7,13 @@
     "repair": []
   },
   {
+    "module": "SessionToggles",
+    "smoke": "SessionToggles.cfg",
+    "stress": "SessionToggles.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
     "module": "Credentials",
     "smoke": "Credentials.cfg",
     "stress": "Credentials.stress.cfg",
