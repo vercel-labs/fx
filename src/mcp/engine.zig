@@ -94,6 +94,9 @@ pub const Status = struct {
     /// `last_error` do not change. The words are lent from the server's buffer until its next refused page, so a
     /// reader that keeps them copies them.
     list_refusal: ?[]const u8 = null,
+    /// How many tools of the list the server serves fx left out, by reason (`Server.droppedTools`). Plain counts: it
+    /// holds no words and copies like a number.
+    dropped: tools.Dropped = .{},
     /// How the last process ended, and the last stdout line that answered
     /// nothing since the server was last ready, until it starts again.
     exit: ?process.Exit,
@@ -226,6 +229,7 @@ pub const Engine = struct {
             .tools = if (slot.server) |s| s.toolList().len() else 0,
             .last_error = slot.last_error,
             .list_refusal = if (slot.server) |s| s.listRefusal() else null,
+            .dropped = if (slot.server) |s| s.droppedTools() else .{},
             .exit = if (slot.server) |s| s.exitStatus() else null,
             .stray_line = if (slot.server) |s| s.strayLine() else null,
         };

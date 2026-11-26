@@ -668,6 +668,20 @@ pub fn refusedShort(s: Status) []const u8 {
     return if (s.tools == 0) tool_list_refused else newer_list_refused;
 }
 
+/// Why fx left tools out of a server's list, in words: the one reason they share, or that there is more than one.
+/// `show`, its JSON and the `/mcp` screen all say it this way.
+fn droppedWhy(d: @FieldType(Status, "dropped")) []const u8 {
+    return if (d.single()) |why| why.words() else "more than one reason";
+}
+
+/// How many tools fx left out of the server's list and why, as `show` and the `/mcp` screen say it after "left
+/// out": `1 tool: a field is written twice`. Null when fx kept every tool.
+pub fn droppedText(arena: Allocator, s: Status) Allocator.Error!?[]const u8 {
+    const n = s.dropped.total();
+    if (n == 0) return null;
+    return try arena.print("{d} tool{s}: {s}", .{ n, if (n == 1) "" else "s", droppedWhy(s.dropped) });
+}
+
 /// The line `show` adds after the status when fx refused the server's tool list: the fixed reason, and, when
 /// an older accepted list is still served, that it is. Nothing for a list fx accepted.
 fn writeListRefusal(w: *Writer, s: Status) !void {
@@ -748,6 +762,19 @@ fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
     try jw.write(s.last_error);
     try jw.objectField("tools_error");
     try jw.write(s.tools_error);
+    // Null when fx kept every tool of the list; else how many it left out and the one reason they share, or that
+    // there is more than one.
+    try jw.objectField("tools_left_out");
+    if (s.dropped.total() == 0) {
+        try jw.write(null);
+    } else {
+        try jw.beginObject();
+        try jw.objectField("count");
+        try jw.write(s.dropped.total());
+        try jw.objectField("reason");
+        try jw.write(droppedWhy(s.dropped));
+        try jw.endObject();
+    }
 }
 
 /// What loading the config skipped, so a server never vanishes without a reason.
@@ -821,6 +848,7 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         try w.print("{s}\n", .{try safe(arena, name)});
         try w.print("  status     {s}\n", .{try statusText(arena, status)});
         try writeListRefusal(w, status);
+        if (try droppedText(arena, status)) |left_out| try w.print("  left out   {s}\n", .{left_out});
         if (status.version) |v| try w.print("  version    {s}\n", .{try safe(arena, v)});
         try w.print("  transport  {s}\n", .{@tagName(status.transport)});
         if (server.url) |u| try w.print("  url        {s}\n", .{try safe(arena, u)});
@@ -1546,7 +1574,7 @@ test "list lines up its columns and keeps hostile names inert" {
     var json: Writer.Allocating = .init(a);
     try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools":2}]}
+        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools_error":null,"tools_left_out":null,"tools":2}]}
         \\
     , json.written());
 }
@@ -1575,7 +1603,7 @@ test "a refused tool list shows in the status, the JSON and a line of show, and 
     var json: Writer.Allocating = .init(a);
     try writeListJson(&json.writer, statuses[0..2], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools":3}]}
+        \\{"servers":[{"name":"none","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":0},{"name":"older","source":"profile","file":"/h/.fx/mcp.json","transport":"stdio","status":"ready","error":null,"tools_error":"\"tools\" is not a list","tools_left_out":null,"tools":3}]}
         \\
     , json.written());
 
@@ -1720,4 +1748,39 @@ test "the menu's words for a status are the list's, except that an idle server n
             }
         }
     }
+}
+
+test "tools fx left out are said once, in the same words, by show's line and the JSON, and kept tools say nothing" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kept: Status = .{ .name = "kept", .source = .profile, .transport = .stdio, .state = .ready, .tools = 3 };
+    try testing.expect((try droppedText(a, kept)) == null);
+
+    var one = kept;
+    one.dropped.add(.repeated_field, 1);
+    try testing.expectEqualStrings("1 tool: a field is written twice", (try droppedText(a, one)).?);
+    var two = kept;
+    two.dropped.add(.over_limit, 2);
+    try testing.expectEqualStrings("2 tools: a limit on size or nesting is passed", (try droppedText(a, two)).?);
+    var mixed = kept;
+    mixed.dropped.add(.unnamed, 1);
+    mixed.dropped.add(.unusable, 2);
+    try testing.expectEqualStrings("3 tools: more than one reason", (try droppedText(a, mixed)).?);
+
+    // The JSON names the same count and reason, and is null for a list that kept every tool.
+    one.name = "one";
+    mixed.name = "mixed";
+    const statuses = [_]Status{ kept, one, mixed };
+    var json: Writer.Allocating = .init(a);
+    try writeListJson(&json.writer, &statuses, .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json.written(), .{});
+    const servers = parsed.object.get("servers").?.array.items;
+    try testing.expect(servers[0].object.get("tools_left_out").? == .null);
+    const left_one = servers[1].object.get("tools_left_out").?.object;
+    try testing.expectEqual(@as(i64, 1), left_one.get("count").?.integer);
+    try testing.expectEqualStrings("a field is written twice", left_one.get("reason").?.string);
+    const left_mixed = servers[2].object.get("tools_left_out").?.object;
+    try testing.expectEqual(@as(i64, 3), left_mixed.get("count").?.integer);
+    try testing.expectEqualStrings("more than one reason", left_mixed.get("reason").?.string);
 }

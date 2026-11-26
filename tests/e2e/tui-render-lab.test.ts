@@ -8,7 +8,7 @@ import {
   analyzeRun,
   readQuiescence,
 } from "./render-lab/analyzer";
-import { renderLabPaneCommand } from "./render-lab/index";
+import { renderLabPaneCommand, renderLabSessionArgs } from "./render-lab/index";
 import type { RenderLabFrame, RenderLabManifest } from "./render-lab/types";
 import { DEFAULT_UNSET_ENV_KEYS, tmuxAvailable } from "./tmux-helpers";
 
@@ -138,6 +138,36 @@ test("native render-lab scenarios require explicit opt-in", () => {
 
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain("FX_RENDER_LAB_NATIVE=1");
+});
+
+test.skipIf(SKIP)("a render-lab tmux server ignores the developer's tmux config", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-tmux-config-test-"));
+  // render-lab reads the whole scrollback, so a short history would cut it.
+  const hostileConfig = "set -g history-limit 1\nset -g remain-on-exit-format 'HOSTILE'\n";
+  writeFileSync(join(outDir, ".tmux.conf"), hostileConfig);
+  mkdirSync(join(outDir, ".config", "tmux"), { recursive: true });
+  writeFileSync(join(outDir, ".config", "tmux", "tmux.conf"), hostileConfig);
+  const socket = `fx-render-lab-config-${process.pid}-${Date.now().toString(36)}`;
+  const referenceSocket = `${socket}-ref`;
+  const state = (socketName: string) => execFileSync(
+    "tmux",
+    ["-L", socketName, "display-message", "-p", "-t", "render-lab", "#{history-limit}|#{remain-on-exit-format}"],
+    { encoding: "utf8" },
+  ).trim();
+  try {
+    execFileSync("tmux", ["-L", socket, ...renderLabSessionArgs("render-lab", 80, 24, outDir, "sleep 30")], {
+      env: { ...process.env, HOME: outDir, XDG_CONFIG_HOME: join(outDir, ".config") },
+    });
+    // tmux's defaults, from a server that loads no config at all.
+    execFileSync("tmux", ["-L", referenceSocket, "-f", "/dev/null", "new-session", "-d", "-s", "render-lab", "sleep 30"]);
+    expect(state(socket)).toBe(state(referenceSocket));
+  } finally {
+    for (const socketName of [socket, referenceSocket]) {
+      try {
+        execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+      } catch {}
+    }
+  }
 });
 
 test("a render-lab pane starts without the names TmuxSession clears and keeps its own values", () => {
