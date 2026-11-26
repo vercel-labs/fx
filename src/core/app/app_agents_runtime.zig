@@ -1840,8 +1840,6 @@ pub fn Runtime(comptime App: type) type {
             return count;
         }
 
-        /// Whether `child` is a subagent of `owner` that has a turn going or a
-        /// result waiting for the main loop.
         fn ownSubagentWorking(app: *App, owner: @TypeOf(agents.screenAgentOf(app)), child: *ChildAgent) bool {
             return child.agent.role == .subagent and
                 ownerOf(app, hostOf(app, child)) == owner and
@@ -1858,8 +1856,7 @@ pub fn Runtime(comptime App: type) type {
             return deliveriesPending(app);
         }
 
-        /// Whether the agent on screen still has a turn of its own, or of its
-        /// own subagents, going. Main loop only.
+        /// Main loop only.
         pub fn screenWorkGoing(app: *App) bool {
             return turnInFlight(agents.screenAgentOf(app)) or screenSubagentsWorking(app);
         }

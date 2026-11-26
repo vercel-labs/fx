@@ -75,7 +75,7 @@ pub const State = struct {
     fn queue(
         self: *State,
         notification: Notification,
-        presentation_pending: bool,
+        turn_end_held: bool,
     ) bool {
         return switch (notification.kind) {
             .turn_end => blk: {
@@ -86,7 +86,7 @@ pub const State = struct {
                 } else {
                     self.pending_turn_end_success +|= 1;
                 }
-                break :blk !presentation_pending;
+                break :blk !turn_end_held;
             },
             .attention_required => blk: {
                 self.pending_attention_required +|= 1;
@@ -101,14 +101,17 @@ pub const State = struct {
 
     fn takeReady(
         self: *State,
-        presentation_pending: bool,
+        turn_end_held: bool,
     ) ReadyNotifications {
         const ready = ReadyNotifications{
-            .turn_end_success = if (presentation_pending) 0 else @min(self.pending_turn_end_success, 1),
-            .turn_end_error = if (presentation_pending) 0 else @min(self.pending_turn_end_error, 1),
+            .turn_end_success = if (turn_end_held) 0 else @min(self.pending_turn_end_success, 1),
+            .turn_end_error = if (turn_end_held) 0 else @min(self.pending_turn_end_error, 1),
             .attention_required = self.pending_attention_required,
         };
-        if (!presentation_pending) {
+        if (!turn_end_held) {
+            const merged = (self.pending_turn_end_success - ready.turn_end_success) +
+                (self.pending_turn_end_error - ready.turn_end_error);
+            if (merged > 0) debug_trace.logf("notifications", "turn-end cues merged count={d} reason=one_cue_per_run", .{merged});
             self.pending_turn_end_success = 0;
             self.pending_turn_end_error = 0;
         }

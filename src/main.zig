@@ -903,7 +903,7 @@ const App = struct {
     }
 
     /// Plays turn-end cues once the reply is shown and the work on screen is done.
-    pub fn releaseHeldNotifications(self: *App) void {
+    fn releaseHeldNotifications(self: *App) void {
         NotificationAppRuntime.presentationFinished(self);
     }
 
