@@ -414,10 +414,12 @@ if (durabilityKind !== "local") {
     await holding;
     holds.delete("phi2-1");
     // Without a bound, the first hand-off waits on a step that never returns;
-    // the second one's bound cuts it off, as SIGTERM's does after a deploy's.
+    // the second one's bound cuts it off, as SIGTERM's does after a deploy's,
+    // and a third, longer bound leaves that cut-off where it is.
     const unbounded = first.handOff();
-    await first.handOff({ within: 20 });
-    await unbounded;
+    const bounded = first.handOff({ within: 20 });
+    const longer = first.handOff({ within: 600_000 });
+    await Promise.all([unbounded, bounded, longer]);
     assert.deepEqual(events, ["session.handoff"]);
     const { text, result } = await textOf(turn);
     assert.equal(result.stopReason, "end_turn");

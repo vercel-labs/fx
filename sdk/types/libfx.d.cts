@@ -920,7 +920,7 @@ export interface FxAgent {
   checkpoint(): Promise<Uint8Array>;
   /** The request handler a deployment mounts for queue deliveries; it delivers to whichever agent in the process a message names. */
   wakeHandler(): (request: Request) => Promise<Response>;
-  /** Stops every turn this process runs at its next safe point, so another process continues it, and sends new work to other processes. A turn that reaches no safe point within `within` milliseconds is cut off as at its deadline. Resolves once this process let go of its sessions. */
+  /** Stops every turn this process runs at its next safe point, so another process continues it, and sends new work to other processes. A turn that reaches no safe point within `within` milliseconds, from 0 to 2147483647, is cut off as at its deadline; when several calls give a bound, the earliest cut-off holds. Resolves once this process let go of its sessions. */
   handOff(options?: { within?: number }): Promise<void>;
   /** Waits for the turns this process is running, then lets their sessions go. */
   close(): Promise<void>;

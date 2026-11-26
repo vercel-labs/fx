@@ -133,7 +133,7 @@ export type {
 
 /** Options for `createFxAgent()` on Node.js. */
 export type FxNodeAgentOptions = FxAgentOptions & FxNodeBackendOptions & {
-  /** On SIGTERM, hand off this agent's turns (`agent.handOff()`) before the process exits. `true`, the default, bounds the wait at 250 ms; `{ within }` sets the bound in milliseconds; `false` turns it off. */
+  /** On SIGTERM, hand off this agent's turns (`agent.handOff()`) before the process exits. `true`, the default, bounds the wait at 250 ms; `{ within }` sets the bound in milliseconds, from 0 to 2147483647; `false` turns it off. */
   handOffOnSigterm?: boolean | { within?: number };
 };
 

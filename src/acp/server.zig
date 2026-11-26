@@ -2760,7 +2760,9 @@ fn startPromptWithInputId(
 
     session.turn_cancel.store(false, .seq_cst);
     session.cancel_flag.store(false, .seq_cst);
-    session.yield_requested.store(false, .seq_cst);
+    if (session.yield_requested.swap(false, .seq_cst)) {
+        debug_trace.logf("session", "event=libfx_yield_request_cleared session={s} reason=new_prompt", .{session.session_id});
+    }
     session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         unused_v2_input_id = null;

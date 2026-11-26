@@ -441,6 +441,7 @@ function createRuntime(options) {
     steering.length = 0;
     steeringBytes = 0;
     steeringHandoff = false;
+    if (yieldRequested && options.traceWasi) console.error("fx host cleared a yield request as a prompt opened or closed");
     yieldRequested = false;
   }
 
