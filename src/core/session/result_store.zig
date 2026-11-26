@@ -3,7 +3,6 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const tool_result_cut_marker = @import("../shared/tool_result_cut_marker.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -67,86 +66,64 @@ pub const ResultReader = struct {
 
 pub fn prepare(
     alloc: Allocator,
-    result_dir: ?[]const u8,
+    result_dir: []const u8,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (result_dir) |dir| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .legacy_dir = dir },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
+    if (output_bytes > large_result_threshold_bytes or
+        durable_output.len > inline_cap)
+    {
+        return prepareStoredResult(
             alloc,
-            .{ .legacy_dir = dir },
+            .{ .legacy_dir = result_dir },
             tool_call_id,
             tool_name,
             output_bytes,
             durable_output,
         );
     }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareExternallyBackedInlineResult(
+        alloc,
+        .{ .legacy_dir = result_dir },
+        tool_call_id,
+        tool_name,
+        output_bytes,
+        durable_output,
+    );
 }
 
 pub fn prepareManaged(
     alloc: Allocator,
-    capability: ?*session_child_store.SessionChildCapability,
+    capability: *session_child_store.SessionChildCapability,
     tool_call_id: []const u8,
     tool_name: []const u8,
     output_bytes: usize,
     durable_output: []const u8,
     inline_cap: usize,
 ) !PreparedResult {
-    if (capability) |managed| {
-        if (output_bytes > large_result_threshold_bytes or
-            durable_output.len > inline_cap)
-        {
-            return prepareStoredResult(
-                alloc,
-                .{ .managed = managed },
-                tool_call_id,
-                tool_name,
-                output_bytes,
-                durable_output,
-            );
-        }
-        return prepareExternallyBackedInlineResult(
+    if (output_bytes > large_result_threshold_bytes or
+        durable_output.len > inline_cap)
+    {
+        return prepareStoredResult(
             alloc,
-            .{ .managed = managed },
+            .{ .managed = capability },
             tool_call_id,
             tool_name,
             output_bytes,
             durable_output,
         );
     }
-    const capped = try cappedInlineOutput(alloc, tool_name, durable_output, inline_cap);
-    return .{
-        .model_output = capped,
-        .memory = .{
-            .output_bytes = output_bytes,
-            .stored_output_bytes = durable_output.len,
-            .truncated = capped.len < durable_output.len,
-        },
-    };
+    return prepareExternallyBackedInlineResult(
+        alloc,
+        .{ .managed = capability },
+        tool_call_id,
+        tool_name,
+        output_bytes,
+        durable_output,
+    );
 }
 
 fn prepareExternallyBackedInlineResult(
@@ -639,19 +616,6 @@ pub fn deleteManaged(
     };
 }
 
-fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
-    const marker = try alloc.print(
-        tool_result_cut_marker.cut_marker_format,
-        .{ tool_name, text.len, max_bytes },
-    );
-    defer alloc.free(marker);
-    if (text.len <= max_bytes) return try alloc.dupe(u8, text);
-    const prefix_cap = if (max_bytes > marker.len) max_bytes - marker.len else 0;
-    const prefix_len = text_utils.utf8BackwardBoundary(text, prefix_cap);
-    if (prefix_len == 0) return try alloc.dupe(u8, marker);
-    return try std.mem.concat(alloc, u8, &.{ text[0..prefix_len], marker });
-}
-
 pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(text, max_bytes));
 }
@@ -1064,29 +1028,8 @@ test "saved preparation externalizes small results" {
     try std.testing.expect(std.mem.find(u8, stored, "\ndone\n") != null);
 }
 
-test "a capped inline result ends with the cut marker written from its shared words" {
+test "a stored preview keeps complete codepoints" {
     const alloc = std.testing.allocator;
-    const text = text_utils.repeat("x", 300);
-    const capped = try cappedInlineOutput(alloc, "grep_files", text, 128);
-    defer alloc.free(capped);
-    const marker = tool_result_cut_marker.cut_marker_start ++ "grep_files: original 300 bytes; cap is 128" ++ tool_result_cut_marker.cut_marker_end;
-    try std.testing.expect(std.mem.endsWith(u8, capped, marker));
-    try std.testing.expect(capped.len <= 128);
-}
-
-test "inline cap and stored preview keep complete codepoints" {
-    const alloc = std.testing.allocator;
-
-    const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
-    for ([_]usize{ 128, 129 }) |cap| {
-        const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
-        defer alloc.free(prepared.model_output);
-        const marker_start = std.mem.find(u8, prepared.model_output, "\n... [tool result truncated").?;
-        const prefix = prepared.model_output[0..marker_start];
-        try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
-        try std.testing.expect(std.mem.endsWith(u8, prefix, "\xc3\xa9"));
-    }
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
