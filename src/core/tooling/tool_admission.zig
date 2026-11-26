@@ -11,6 +11,7 @@ const command_lex = @import("../shell_command/command_lex.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const diff_mod = @import("../output/diff.zig");
@@ -697,7 +698,34 @@ fn sensitiveAutoWriteTarget(path: []const u8) bool {
         pathContainsComponentSequence(path, &.{".zshrc"}) or
         pathContainsComponentSequence(path, &.{".bashrc"}) or
         pathContainsComponentSequence(path, &.{".bash_profile"}) or
-        pathContainsComponentSequence(path, &.{".profile"});
+        pathContainsComponentSequence(path, &.{".profile"}) or
+        profileRootContains(path);
+}
+
+/// fx's own folder, `~/.fx` or `$FX_HOME`, holds the permission mode, the
+/// permission rules, and the review model, so a write there changes what
+/// later sessions allow, whether or not the file exists yet.
+fn profileRootContains(path: []const u8) bool {
+    const home = io_mod.homeDir() orelse return false;
+    var buf: [3 * std.Io.Dir.max_path_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const alloc = fba.allocator();
+    const parent = profile_paths.rootParent(home);
+    const name = profile_paths.rootName();
+    const typed_root = std.Io.Dir.path.join(alloc, &.{ parent, name }) catch return true;
+    // The target path has its symlinks resolved, so compare against the resolved folder.
+    const root = io_mod.realpathAlloc(alloc, typed_root) catch blk: {
+        const real_parent = io_mod.realpathAlloc(alloc, parent) catch parent;
+        break :blk std.Io.Dir.path.join(alloc, &.{ real_parent, name }) catch return true;
+    };
+
+    var path_parts = std.mem.tokenizeScalar(u8, path, std.Io.Dir.path.sep);
+    var root_parts = std.mem.tokenizeScalar(u8, root, std.Io.Dir.path.sep);
+    while (root_parts.next()) |root_part| {
+        const part = path_parts.next() orelse return false;
+        if (!std.ascii.eqlIgnoreCase(part, root_part)) return false;
+    }
+    return true;
 }
 
 fn pathContainsComponentSequence(
@@ -6817,6 +6845,61 @@ test "automatic trusted-root write keeps persistence targets on reviewer path" {
         );
         try std.testing.expectEqual(index + 1, fake.calls);
         try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    }
+}
+
+test "automatic write reviews new files in fx's own folder in any spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+
+    // The last target is the control: a new file elsewhere in the home folder.
+    const targets = [_]struct { path: []const u8, reviews: usize }{
+        .{ .path = ".fx/settings.json", .reviews = 1 },
+        .{ .path = ".FX/skills/demo/SKILL.md", .reviews = 2 },
+        .{ .path = "notes.txt", .reviews = 2 },
+    };
+    for (targets) |target| {
+        const target_path = try std.Io.Dir.path.join(arena, &.{ home, target.path });
+        const arguments_json = try arena.print(
+            "{{\"path\":\"{s}\",\"content\":\"test\\n\"}}",
+            .{target_path},
+        );
+        _ = try requestPermissionOutcome(
+            input,
+            arena,
+            .{ .id = target.path, .name = "write_file", .arguments_json = arguments_json },
+            .auto,
+            &.{},
+        );
+        try std.testing.expectEqual(target.reviews, fake.calls);
     }
 }
 
