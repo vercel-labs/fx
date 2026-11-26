@@ -37,6 +37,9 @@
 (* one_session*.cfg). Not explored: three generations with two sessions,   *)
 (* or with three commands; three commands with one session at MaxGen 3 did *)
 (* not finish in 11 minutes.                                               *)
+(* A question is asked in one step and answered in another. The epoch is   *)
+(* read when the question is asked, so a refresh while the question is     *)
+(* open leaves the answer on the old epoch, and the next call asks again.  *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -49,7 +52,7 @@ ASSUME Mutation \in {"none", "no_single_flight", "free_while_leased",
                      "stale_grant", "reload_per_command", "notice_repeat",
                      "use_partial", "clear_dirty_late", "keep_broken",
                      "shared_command_epoch", "recheck_restamps",
-                     "store_stamps_current"}
+                     "store_stamps_current", "stamp_at_answer"}
 
 Gens    == 1..MaxGen
 NoGen   == 0
@@ -92,13 +95,14 @@ VARIABLES
     auth,         \* how each command was authorized
     authEpoch,    \* epoch a command's approval relies on, as its recheck compares it
     answered,     \* epoch the person's approval was given under; never rewritten
+    asked,        \* epoch the question was shown under; the answer records it
     pending,      \* remembered answer not yet written to its session's grant
     cgen,         \* generation leased by a running command
     runEpoch      \* epoch a command executed under
 
 snapVars  == <<owner, active, capGen, inflight, nextGen, genEpoch, completed, freed, broken>>
 countVars == <<loads, triggers, fullRuns, failEpisodes, notices, noticeShown>>
-cmdVars   == <<pc, auth, authEpoch, answered, pending, cgen, runEpoch>>
+cmdVars   == <<pc, auth, authEpoch, answered, asked, pending, cgen, runEpoch>>
 vars      == <<snapVars, countVars, cmdVars, epoch, dirty, leases, grant, sharedEpoch>>
 
 \* A remembered grant or a one-time answer that the run-time recheck judges.
@@ -106,7 +110,7 @@ Approved(c) == auth[c] \in {"grant", "explicit"}
 
 Restamp(c, e) == IF RestampRecheck /\ Approved(c) THEN [authEpoch EXCEPT ![c] = e] ELSE authEpoch
 
-PcStates == {"idle", "admitted", "waiting", "run_snap", "run_full", "done"}
+PcStates == {"idle", "asking", "admitted", "waiting", "run_snap", "run_full", "done"}
 
 TypeOK ==
     /\ owner \in {"empty", "capturing", "ready", "failed"}
@@ -130,6 +134,7 @@ TypeOK ==
     /\ auth \in [Cmds -> {"none", "grant", "explicit"}]
     /\ authEpoch \in [Cmds -> Nat]
     /\ answered \in [Cmds -> Nat]
+    /\ asked \in [Cmds -> Nat]
     /\ pending \in [Cmds -> BOOLEAN]
     /\ cgen \in [Cmds -> 0..MaxGen]
     /\ runEpoch \in [Cmds -> Nat]
@@ -159,6 +164,7 @@ Init ==
     /\ auth = [c \in Cmds |-> "none"]
     /\ authEpoch = [c \in Cmds |-> 0]
     /\ answered = [c \in Cmds |-> 0]
+    /\ asked = [c \in Cmds |-> 0]
     /\ pending = [c \in Cmds |-> FALSE]
     /\ cgen = [c \in Cmds |-> NoGen]
     /\ runEpoch = [c \in Cmds |-> 0]
@@ -179,17 +185,27 @@ AdmitByGrant(c) ==
     /\ auth' = [auth EXCEPT ![c] = "grant"]
     /\ authEpoch' = [authEpoch EXCEPT ![c] = grant[SessOf(c)]]
     /\ answered' = [answered EXCEPT ![c] = grant[SessOf(c)]]
+    /\ asked' = [asked EXCEPT ![c] = grant[SessOf(c)]]
     /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, pending, cgen, runEpoch>>
 
-AdmitExplicit(c) ==
+Ask(c) ==
     /\ pc[c] = "idle"
+    /\ pc' = [pc EXCEPT ![c] = "asking"]
+    /\ asked' = [asked EXCEPT ![c] = epoch]
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, pending, auth, authEpoch, answered, cgen, runEpoch>>
+
+\* The answer comes later, after the question was shown. It keeps the epoch the
+\* question recorded. The stamp bug records the epoch current at the answer.
+Answer(c) ==
+    /\ pc[c] = "asking"
     /\ \E remember \in BOOLEAN :
          pending' = [pending EXCEPT ![c] = remember]
+    /\ LET e == IF Mutation = "stamp_at_answer" THEN epoch ELSE asked[c]
+       IN  /\ authEpoch' = [authEpoch EXCEPT ![c] = e]
+           /\ answered' = [answered EXCEPT ![c] = e]
     /\ pc' = [pc EXCEPT ![c] = "admitted"]
     /\ auth' = [auth EXCEPT ![c] = "explicit"]
-    /\ authEpoch' = [authEpoch EXCEPT ![c] = epoch]
-    /\ answered' = [answered EXCEPT ![c] = epoch]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, cgen, runEpoch>>
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, asked, cgen, runEpoch>>
 
 \* A remembered answer is written to its session's grant in a later step, not
 \* with the answer, so a refresh can land in between. The write keeps the epoch
@@ -201,13 +217,13 @@ Record(c) ==
        IN  /\ grant' = [grant EXCEPT ![SessOf(c)] = e]
            /\ sharedEpoch' = e
     /\ pending' = [pending EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, pc, auth, authEpoch, answered, cgen, runEpoch>>
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, pc, auth, authEpoch, answered, asked, cgen, runEpoch>>
 
 \* A grant-authorized call whose grant predates the current epoch is asked again.
 ReAsk(c) ==
     /\ pc' = [pc EXCEPT ![c] = "idle"]
     /\ auth' = [auth EXCEPT ![c] = "none"]
-    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, authEpoch, answered, pending, cgen, runEpoch>>
+    /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, authEpoch, answered, asked, pending, cgen, runEpoch>>
 
 -----------------------------------------------------------------------------
 (* Snapshot owner.                                                          *)
@@ -234,7 +250,7 @@ StartCapture(c) ==
     /\ pc' = [pc EXCEPT ![c] = "waiting"]
     /\ UNCHANGED <<active, completed, freed, broken, triggers, fullRuns, failEpisodes,
                    notices, noticeShown, epoch, leases, grant, sharedEpoch, auth, authEpoch,
-                   answered, pending, cgen, runEpoch>>
+                   answered, asked, pending, cgen, runEpoch>>
 
 \* Release a replaced generation now, or when its last lease ends.
 Retire(g, f) ==
@@ -286,7 +302,7 @@ Acquire(c) ==
                 /\ pc' = [pc EXCEPT ![c] = "run_snap"]
                 /\ loads' = IF Mutation = "reload_per_command" THEN loads + 1 ELSE loads
                 /\ UNCHANGED <<snapVars, triggers, fullRuns, failEpisodes, notices,
-                               noticeShown, epoch, dirty, grant, sharedEpoch, auth, answered, pending>>
+                               noticeShown, epoch, dirty, grant, sharedEpoch, auth, answered, asked, pending>>
 
 RunFull(c) ==
     /\ Pending(c)
@@ -305,7 +321,7 @@ RunFull(c) ==
                           ELSE notices
             /\ noticeShown' = TRUE
             /\ UNCHANGED <<snapVars, triggers, failEpisodes, epoch, dirty, leases,
-                           grant, sharedEpoch, auth, answered, pending, cgen>>
+                           grant, sharedEpoch, auth, answered, asked, pending, cgen>>
 
 Finish(c) ==
     /\ pc[c] \in {"run_snap", "run_full"}
@@ -318,7 +334,7 @@ Finish(c) ==
             /\ cgen' = [cgen EXCEPT ![c] = NoGen]
        ELSE UNCHANGED <<leases, freed, cgen>>
     /\ UNCHANGED <<owner, active, capGen, inflight, nextGen, genEpoch, completed,
-                   broken, countVars, epoch, dirty, grant, sharedEpoch, auth, authEpoch, answered, pending, runEpoch>>
+                   broken, countVars, epoch, dirty, grant, sharedEpoch, auth, authEpoch, answered, asked, pending, runEpoch>>
 
 \* The restored shell rejected the replay and exited with the failure marker.
 \* The call reruns with the full startup. If the owner still holds that
@@ -347,7 +363,7 @@ ReplayFail(c) ==
                                ELSE freed
                    /\ UNCHANGED <<owner, active, failEpisodes, notices, noticeShown>>
     /\ UNCHANGED <<capGen, inflight, nextGen, genEpoch, completed, triggers,
-                   epoch, dirty, grant, sharedEpoch, auth, authEpoch, answered, pending, runEpoch>>
+                   epoch, dirty, grant, sharedEpoch, auth, authEpoch, answered, asked, pending, runEpoch>>
 
 \* Cancelling a waiting command does not cancel the shared capture.
 Cancel(c) ==
@@ -355,7 +371,7 @@ Cancel(c) ==
     /\ ~pending[c]
     /\ pc' = [pc EXCEPT ![c] = "done"]
     /\ UNCHANGED <<snapVars, countVars, epoch, dirty, leases, grant, sharedEpoch, auth,
-                   authEpoch, answered, pending, cgen, runEpoch>>
+                   authEpoch, answered, asked, pending, cgen, runEpoch>>
 
 \* Dotfile fingerprint changed, /shell reload, or shell.run reload=true.
 MarkDirty ==
@@ -374,7 +390,8 @@ Done ==
 Next ==
     \/ \E c \in Cmds :
           \/ AdmitByGrant(c)
-          \/ AdmitExplicit(c)
+          \/ Ask(c)
+          \/ Answer(c)
           \/ StartCapture(c)
           \/ Acquire(c)
           \/ RunFull(c)
@@ -427,13 +444,12 @@ GrantMatchesEpoch ==
         (pc[c] \in {"run_snap", "run_full"} /\ auth[c] = "grant")
             => authEpoch[c] = runEpoch[c]
 
-\* A one-time or remembered approval runs only in the epoch the person answered
-\* in. The recheck compares that epoch with the current one and never rewrites
-\* the answer.
+\* A one-time or remembered approval runs only in the epoch its question was shown
+\* in. The answer keeps that epoch, and the recheck compares it with the current one.
 ApprovalMatchesAnswer ==
     \A c \in Cmds :
         (pc[c] \in {"run_snap", "run_full"} /\ Approved(c))
-            => runEpoch[c] = answered[c]
+            => runEpoch[c] = asked[c]
 
 \* A remembered answer is written to its grant with the epoch the answer was
 \* given under. (An action property: it is checked on every step.)
