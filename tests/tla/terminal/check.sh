@@ -6,7 +6,8 @@
 # (src/core/terminal/shell_snapshot.zig), shared by the root agent and every
 # subagent: single-flight capture, leases, refresh, and approval epochs.
 # TerminalLifecycle: hosted terminal processes across fx exits and crashes, and a
-# start that has not returned, which the other calls of its process must not see.
+# start whose caller has not indexed the terminal yet, which the other calls of
+# its process must not see.
 #
 # Each design config must pass every invariant and liveness property with
 # deadlock checking on. Each <Model>-<mutation>.cfg enables one broken rule,
@@ -35,4 +36,5 @@ TerminalLifecycle TerminalLifecycle-exit_skips_close OrphansOnlyAfterCrash -dead
 TerminalLifecycle TerminalLifecycle-profile_wide_recover NoWrongEnd -deadlock
 TerminalLifecycle TerminalLifecycle-reattach NoBadInteract -deadlock
 TerminalLifecycle TerminalLifecycle-list_in_flight NoIndexBeforeStartReturns -deadlock
+TerminalLifecycle TerminalLifecycle-end_at_return NoIndexBeforeStartReturns -deadlock
 EOF

@@ -1002,7 +1002,8 @@ const SupportedRegistry = struct {
         // The record is on disk before the registry can find the session, so
         // no other call of this process may see the id until this call returns.
         const in_flight = try self.profile.begin_start(session_id);
-        defer self.profile.end_start(in_flight);
+        var mark_handed_over = false;
+        defer if (!mark_handed_over) self.profile.end_start(in_flight);
         const session = try self.alloc.create(Session);
         var session_owned = true;
         defer if (session_owned) self.alloc.destroy(session);
@@ -1100,10 +1101,12 @@ const SupportedRegistry = struct {
             return self.failure(.start, code, session.id);
         };
         if (returnOutcomeIsTerminal(outcome)) session.finalizeBackend();
-        return session.startResult(outcome, .{
+        const result = try session.startResult(outcome, .{
             .actor = persistence.grant.actor,
             .controls = persistence.grant.controls,
         });
+        mark_handed_over = request.retain_in_flight;
+        return result;
     }
 
     fn write(

@@ -585,9 +585,8 @@ pub const ProfileStore = struct {
         session.registered = true;
     }
 
-    /// Marks `session_id` as a start that has not returned, until `end_start`.
-    /// Returns the profile's own copy of the id, which the caller hands to
-    /// `end_start` and which stays valid until then.
+    /// Marks `session_id` as a start that has not finished, until `end_start`.
+    /// Returns the profile's own copy of the id, which stays valid until then.
     pub fn begin_start(
         self: *ProfileStore,
         session_id: []const u8,
@@ -601,12 +600,14 @@ pub const ProfileStore = struct {
         return owned;
     }
 
-    pub fn end_start(self: *ProfileStore, started: []const u8) void {
+    /// Ends the mark of `session_id`, which may be the store's own copy or
+    /// the id the start's caller received.
+    pub fn end_start(self: *ProfileStore, session_id: []const u8) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         defer self.mutex.unlock(zio);
         for (self.starting.items, 0..) |owned, index| {
-            if (owned.ptr != started.ptr) continue;
+            if (!std.mem.eql(u8, owned, session_id)) continue;
             _ = self.starting.swapRemove(index);
             self.alloc.free(owned);
             return;
