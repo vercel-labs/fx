@@ -304,6 +304,11 @@ pub const AgentRuntimeDeps = struct {
     /// pieces on disk yet. Null on hosts that never resume a request, which
     /// keep no record.
     save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
+    /// Marks the open turn as one that stopped between steps for its host,
+    /// after its record was saved clean, so the next launch continues it as
+    /// the same turn (`tests/tla/recovery/Resume.tla` Relaunch). Null on
+    /// hosts that never stop a turn this way.
+    mark_turn_yielded: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
@@ -370,6 +375,9 @@ pub const AgentRuntimeDeps = struct {
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
+    /// Records `input_withdrawn` when a failed turn hands a queued prompt back
+    /// to the composer so resume does not restore it a second time.
+    withdraw_accepted_input: ?*const fn (ctx: *anyopaque, input_id: u64) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     /// `rejected_token` is the access token the provider just answered 401
