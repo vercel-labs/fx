@@ -221,7 +221,7 @@ async function waitForSettledChild(fixture: Fixture, id: string, children: numbe
 function spawnAsk(fixture: Fixture, gateway: any, args: string[], cwd = fixture.workspace) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
     cwd,
-    env: fxChildEnv(env(fixture, gateway)) as Record<string, string>,
+    env: fxChildEnv({ ...env(fixture, gateway), FX_SOUND: "0" }) as Record<string, string>,
     stdio: "ignore",
   });
   const exited = new Promise((resolve) => child.on("exit", resolve));
