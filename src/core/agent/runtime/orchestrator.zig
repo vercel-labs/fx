@@ -14691,6 +14691,7 @@ test "eb03: UserTurn carries job.input_id in turn-piece writes, checkpoints, and
         &trace,
         "notice text",
         "failed_notice",
+        null,
     );
     try std.testing.expectEqual(@as(usize, 1), notice_fake.history_turns.items.len);
     try std.testing.expectEqual(@as(?u64, 64), notice_fake.history_turns.items[0].assistant.user.input_id);
