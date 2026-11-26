@@ -677,7 +677,7 @@ fn hostGeneration(
     mcp_view: ?*const mcp_access.View,
 ) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("fx.subagent.host-authority.v3\x00");
+    hash.update("fx.subagent.host-authority.v4\x00");
     for (tools) |tool| hashString(&hash, tool);
     for (integrations) |integration| hashString(&hash, integration);
     for (rules.rules) |rule| {
@@ -688,6 +688,7 @@ fn hostGeneration(
     for (grants) |grant| {
         hashString(&hash, grant.tool_name);
         hashString(&hash, grant.target_path);
+        hashU64(&hash, grant.shell_epoch);
     }
     hashU64(&hash, permission_state.version);
     hashU64(&hash, permission_state.next_generation);
@@ -1924,4 +1925,15 @@ test "a child's integrations follow the mode it runs in, not its host's: a deny 
     defer in_full.deinit(alloc);
     try std.testing.expectEqual(types.PermissionMode.yolo, in_full.permission_mode);
     try std.testing.expectEqual(@as(usize, 2), in_full.integrations.len);
+}
+
+test "a host generation changes when only a grant's shell epoch changes" {
+    const tools = [_][]const u8{"read_file"};
+    const rules: types.PermissionRuleSet = .{};
+    const state: session_permission_state.State = .{};
+    const made_at_zero = [_]types.PermissionGrant{.{ .tool_name = @constCast("bash"), .target_path = @constCast("npm test"), .shell_epoch = 0 }};
+    const made_at_one = [_]types.PermissionGrant{.{ .tool_name = @constCast("bash"), .target_path = @constCast("npm test"), .shell_epoch = 1 }};
+
+    try std.testing.expect(hostGeneration(&tools, &.{}, rules, &made_at_zero, state, null) !=
+        hostGeneration(&tools, &.{}, rules, &made_at_one, state, null));
 }
