@@ -381,7 +381,12 @@ pub fn Bindings(comptime App: type) type {
                     .asked = if (comptime @hasDecl(@TypeOf(agent.worker), "askedCompactionActivity")) askedCompactionActivity else null,
                 } else null,
                 .append_turn_piece = if (comptime agents.hasAgentField(App, "session_persistence"))
-                    if (agent.session_persistence.v2 != null) agentAppendTurnPiece else null
+                    if (agent.session_persistence.v2 != null)
+                        agentAppendTurnPiece
+                    else if (comptime runtime_profile.allows(App, .js_host_sessions))
+                        agentSaveJsHostTurnPiece
+                    else
+                        null
                 else
                     null,
                 .record_usage = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -402,6 +407,10 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .save_recovery_record = if (comptime agents.hasAgentField(App, "session_persistence"))
                     if (agent.session_persistence.v2 != null) agentSaveRecoveryRecord else null
+                else
+                    null,
+                .mark_turn_yielded = if (comptime agents.hasAgentField(App, "session_persistence"))
+                    if (agent.session_persistence.v2 != null) agentMarkTurnYielded else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -1353,9 +1362,19 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).appendTurnPiece(agent, progress);
         }
 
+        fn agentSaveJsHostTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            app_session_runtime.Runtime(App).saveJsHostTurnPiece(appOf(agent), agent, progress);
+        }
+
         fn agentSaveRecoveryRecord(ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             return app_session_runtime.Runtime(App).saveRecoveryRecord(agent, record);
+        }
+
+        fn agentMarkTurnYielded(ctx: *anyopaque) anyerror!void {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).markTurnYielded(agent);
         }
 
         fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {

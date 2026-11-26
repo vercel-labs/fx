@@ -17,7 +17,10 @@
 # stream-before-reparses.cfg shows that design reparsed streamed pieces. Each
 # stream-mutant-*.cfg plants one bug that its property must catch, and each
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
-# behaviors with more calls and rebuilds.
+# behaviors with more calls and rebuilds. stream-continue.cfg must pass with
+# Ctrl+G yields and their continuations on; each stream-continue-mutant-*.cfg
+# plants one read-back bug, and each stream-continue-witness-*.cfg must be
+# violated.
 #
 # SessionWrite models how a session's writes list the compactor's records
 # (D50) when they run on more than one thread. session-write.cfg must pass
@@ -81,6 +84,12 @@ TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-witness-failed-commit NeverCommittedAfterFailure
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+TurnStream stream-continue -
+TurnStream stream-continue-mutant-copies ReadsEachPieceOnce
+TurnStream stream-continue-mutant-reader-drops ReadsNoneLost
+TurnStream stream-continue-witness-extends NeverExtends
+TurnStream stream-continue-witness-copy NeverCopiedAfterYield
+TurnStream stream-continue-simulate simulate $sim
 SessionWrite session-write -
 SessionWrite session-write-today NoStaleRemoval
 SessionWrite session-write-today-loss ClearedWereListed

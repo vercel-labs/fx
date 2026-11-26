@@ -26,6 +26,7 @@ const text_utils = @import("../../shared/text_utils.zig");
 const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
+const quiesce = @import("../../quiesce/quiesce.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
@@ -4595,6 +4596,67 @@ fn persistFinalReplyCheckpoint(
     );
 }
 
+/// Whether a turn asked to stop for its host's restart can stop here: its
+/// request's record is in the session log, and the host marks the turn
+/// as yielded, so the next launch continues it. A host that saves no
+/// session has neither, so its turn goes on to its end, as a turn on a
+/// provider other than the gateway does. The first refused stop of a turn
+/// writes a trace line that says why; the next boundary asks again.
+fn canStopForRestart(
+    deps: *const AgentRuntimeDeps,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    skip_traced: *bool,
+    trace_ctx: TraceContext,
+) bool {
+    const reason: []const u8 = if (deps.mark_turn_yielded == null)
+        "no_turn_marker"
+    else if (!request_recovery.recordSaved())
+        "no_saved_record"
+    else
+        return true;
+    if (!skip_traced.*) {
+        skip_traced.* = true;
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason={s}", .{reason});
+    }
+    return false;
+}
+
+/// Stops the turn between steps for its host, once its request's clean
+/// record is saved: marked clean, as a closing fx saves it, so the next
+/// launch resumes it without counting a death, and the session marks the turn
+/// as yielded, so the launch continues it as the same turn
+/// (`tests/tla/recovery/Resume.tla` Relaunch, NoFalseCrashQuestion).
+/// Its start capture is settled first, so it never lands after the marker.
+/// Only a turn `canStopForRestart` allows gets here. When the clean record does
+/// not land, nothing is marked and it returns false: the request is still
+/// open with its send's record, so the turn goes on and the next boundary
+/// asks again (`Resume.tla` YieldSaveFails). A marker that cannot be written
+/// after a saved record leaves a turn the next launch resumes from that
+/// record, with the resume note: nothing is lost.
+fn yieldTurn(
+    deps: *const AgentRuntimeDeps,
+    request_recovery: *runtime_request_recovery.RequestRecovery,
+    trace_ctx: TraceContext,
+) bool {
+    // The turn's start capture is saved first (D98), so the record and the
+    // marker after it stay the turn's newest items (`interruptedRequest`).
+    if (deps.start_workspace_capture) |capture| capture(deps.ctx, false, .settle);
+    if (!request_recovery.closeForYield()) {
+        debug_trace.eventf("agent", "turn_yield_skipped", trace_ctx, "reason=closing_save_failed", .{});
+        return false;
+    }
+    var marked = false;
+    if (deps.mark_turn_yielded) |mark| {
+        if (mark(deps.ctx)) {
+            marked = true;
+        } else |err| {
+            debug_trace.logf("agent", "event=turn_yield_unmarked err={s} reason=marker_write_failed", .{@errorName(err)});
+        }
+    }
+    debug_trace.eventf("agent", "turn_yielded", trace_ctx, "record_saved=true marked={}", .{marked});
+    return true;
+}
+
 /// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
 /// was ending with. Recovery delivers it as the turn's reply instead of
 /// asking the model again (`tests/tla/durable/Resumption.tla`
@@ -6818,10 +6880,13 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    // A resumed request continues the turn fx stopped: superseded resume
-    // turns are dropped and the stopped turn is projected without its abort
-    // note, as a steering continuation is.
-    const resumed_request = job.recovery_resume != null;
+    // A resumed request continues the turn fx stopped, so the stopped turn is
+    // projected without its abort note, as a steering continuation is, and
+    // superseded resumes are dropped. A turn that continues a yielded one
+    // projects its history as that turn did, so it is a resumed request when
+    // the yielded turn was one. A resume's prompt is the resume prompt, so the
+    // prompt tells us which.
+    const resumed_request = job.recovery_resume != null and (!job.continues_yielded_turn or session_runtime.isResumePrompt(job.prompt));
     const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
     if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
@@ -6922,8 +6987,11 @@ fn processQueuedPromptInner(
         agent,
     ) catch |err| {
         // A turn that yielded stays open for the host to resume, so nothing
-        // it did is finished as a failure.
-        if (err == error.TurnYielded) return err;
+        // it did is finished as a failure, and its trace says it yielded.
+        if (err == error.TurnYielded) {
+            finish_trace.finish("yielded");
+            return err;
+        }
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
             finalization.state == .open)
@@ -8215,7 +8283,16 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     // The turn's first model request resumes the one a previous fx process
     // left unfinished, when there is one.
-    var recovery_resume = job.recovery_resume;
+    // A turn that continues a yielded one sends the request the yield
+    // stopped, so the recovery module shows no retry for it.
+    var recovery_resume: ?types.RecoveryResume = if (job.recovery_resume) |resumed|
+        .{ .record = resumed.record, .stale = resumed.stale, .continues = job.continues_yielded_turn }
+    else
+        null;
+    // Whether this prompt has sent a request yet, for a host that stops the
+    // turn between steps (`src/core/quiesce/`).
+    var turn_quiesce: quiesce.State = .{};
+    var yield_skip_traced = false;
     // The session sends one runtime context ahead of the history; a change
     // joins the conversation instead (D94).
     var runtime_context = try runtime_context_state.State.init(
@@ -9080,6 +9157,23 @@ fn processQueuedPromptLoop(
             } else {
                 // No write goes before this send, so its record goes now.
                 request_recovery.flushRecord();
+            }
+
+            // The turn is saved and its request is next: a host that asked
+            // the turn to stop, as Ctrl+G does, gets it here, once the
+            // prompt has sent its first request. Only the gateway path saves
+            // the turn before its send, so only it stops here, and only when
+            // the next launch can continue it (`canStopForRestart`); any
+            // other turn goes on, and the restart waits for it to end.
+            const stop_requested = if (config.yield_flag) |flag| flag.load(.seq_cst) else false;
+            if (job.provider == .gateway and quiesce.step(&turn_quiesce, .{ .boundary = .{
+                .now_ms = io_mod.milliTimestamp(),
+                .stop_requested = stop_requested,
+                .kind = if (recovery_cause == .compaction_prepared) .compaction else .request,
+            } }) == .yield and canStopForRestart(deps, &request_recovery, &yield_skip_traced, step_ctx)) {
+                // A stop whose clean record does not land leaves the turn
+                // going on; the next boundary asks again.
+                if (yieldTurn(deps, &request_recovery, step_ctx)) return error.TurnYielded;
             }
 
             disarmCacheWarming(deps);
@@ -11199,8 +11293,9 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         empty_reply_nudged = false;
         if (step_has_content) {
+            // The model's own call, so a toolbox question keeps the break that ends the prose in `fx ask`.
             const first_tool_is_ask = effective_tool_calls.len > 0 and
-                runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
+                tool_dispatch.toolActivityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
             if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
