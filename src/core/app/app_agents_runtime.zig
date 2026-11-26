@@ -1835,11 +1835,33 @@ pub fn Runtime(comptime App: type) type {
             if (turnInFlight(screen)) return 0;
             var count: usize = 0;
             for (app.child_agents.items) |child| {
-                if (child.agent.role != .subagent) continue;
-                if (ownerOf(app, hostOf(app, child)) != screen) continue;
-                if (turnInFlight(&child.agent) or resultPending(app, child)) count += 1;
+                if (ownSubagentWorking(app, screen, child)) count += 1;
             }
             return count;
+        }
+
+        /// Whether `child` is a subagent of `owner` that has a turn going or a
+        /// result waiting for the main loop.
+        fn ownSubagentWorking(app: *App, owner: @TypeOf(agents.screenAgentOf(app)), child: *ChildAgent) bool {
+            return child.agent.role == .subagent and
+                ownerOf(app, hostOf(app, child)) == owner and
+                (turnInFlight(&child.agent) or resultPending(app, child));
+        }
+
+        /// Whether a subagent of the agent on screen works, or a finished
+        /// report waits for the main loop to hand it over. Main loop only.
+        pub fn screenSubagentsWorking(app: *App) bool {
+            const screen = agents.screenAgentOf(app);
+            for (app.child_agents.items) |child| {
+                if (ownSubagentWorking(app, screen, child)) return true;
+            }
+            return deliveriesPending(app);
+        }
+
+        /// Whether the agent on screen still has a turn of its own, or of its
+        /// own subagents, going. Main loop only.
+        pub fn screenWorkGoing(app: *App) bool {
+            return turnInFlight(agents.screenAgentOf(app)) or screenSubagentsWorking(app);
         }
 
         /// The activity row for an agent on screen whose turn ended while its

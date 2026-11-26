@@ -16,6 +16,7 @@ import {
   turnSettled,
   hasEmptyComposer,
 } from "./tmux-helpers";
+import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 // Switching between main and its subagents through the agent list, in one fx
 // process: ↓ on an empty composer or Ctrl+X opens it, moving through it shows
@@ -444,7 +445,7 @@ async function withFx(
   run: (session: TmuxSession, context: Run) => Promise<void>,
   setupHome: (home: string) => void = () => {},
   record = false,
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
   gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
 ) {
   const gateway = startDynamicFakeGateway(respond, gatewayOptions);
@@ -3120,6 +3121,75 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         reviewer.release();
         await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the main agent's turn ending while its subagent works keeps the terminal busy and holds the completion sound until the subagent finishes",
+    async () => {
+      const reviewer = held();
+      const folder = mkdtempSync(join(tmpdir(), "fx-turn-end-sound-"));
+      const tracePath = join(folder, "trace.log");
+      const tapePath = join(folder, "fx.fxtape");
+      const traceText = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "");
+      const traceLines = (trace: string, needle: string) => trace.split("\n").filter((line) => line.includes(needle));
+      const statusReports = (stdout: Buffer) =>
+        [...stdout.toString("latin1").matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)].map((match) => match[1]!.replace(/:msg=.*$/, ""));
+      let childCalls = 0;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            await reviewer.promise;
+            return text("child_answer", "HOLD_CHILD_DONE");
+          }
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+          }
+          return text("main_wait", "HOLD_MAIN_WAITING");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER plan it");
+          await session.waitForPane((pane) => pane.includes("HOLD_MAIN_WAITING") && turnSettled(pane), 30_000);
+          await until("the reviewer's turn", () => childCalls >= 1);
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+
+          // Main's turn has ended while the reviewer still works: no turn-end
+          // sound has played, and the program status still reads working.
+          expect(traceLines(traceText(), "sound play kind=turn_end")).toEqual([]);
+          const reportsWhileWorking = statusReports(
+            Buffer.concat(readTapeFrames(tapePath, { ignoreTruncatedTail: true }).filter((frame) => frame.kind === 1).map((frame) => frame.payload)),
+          );
+          expect(reportsWhileWorking.at(-1)).toBe("state=working:app=fx");
+
+          reviewer.release();
+          await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), TIMEOUT);
+          await until("the turn-end sound", () => traceLines(traceText(), "sound play kind=turn_end").length > 0);
+          await session.waitForPane((pane) => turnSettled(pane) && !pane.includes("subagent working"), TIMEOUT);
+
+          expect(traceLines(traceText(), "sound play kind=turn_end cue=success")).toHaveLength(1);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+          const reports = statusReports(Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)));
+          const cleared = reports.lastIndexOf("state=clear");
+          expect(cleared).toBeGreaterThan(0);
+          expect(reports[cleared - 1]).toBe("state=done:app=fx");
+          const lastWorking = reports.lastIndexOf("state=working:app=fx");
+          expect(lastWorking).toBeGreaterThan(-1);
+          expect(reports.slice(0, lastWorking)).not.toContain("state=done:app=fx");
+        }, (home) => {
+          writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", sound: { turn_end: true, attention_required: true } }));
+        }, false, {
+          FX_SOUND: undefined,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "notifications,program_status",
+          FX_RECORD: tapePath,
+        });
+      } finally {
+        reviewer.release();
+        rmSync(folder, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );

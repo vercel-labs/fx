@@ -976,6 +976,11 @@ pub fn Runtime(comptime App: type) type {
             return app.subagentIdOf(agent);
         }
 
+        fn screenSubagentsWorking(app: *App) bool {
+            if (comptime !@hasDecl(App, "screenSubagentsWorking")) return false;
+            return app.screenSubagentsWorking();
+        }
+
         /// True when `agent` is a subagent's, on screen or not.
         fn isSubagent(_: *const App, agent: *const AppAgent) bool {
             if (comptime !@hasField(App, "screen_owner")) return false;
@@ -1002,7 +1007,7 @@ pub fn Runtime(comptime App: type) type {
                 } }
             else if (agent.question_prompt.isActive())
                 .{ .blocked = .{ .kind = .question, .message = activeQuestionText(app, agent) } }
-            else if (busy)
+            else if (busy or screenSubagentsWorking(app))
                 .working
             else
                 .settled;

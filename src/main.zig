@@ -902,7 +902,8 @@ const App = struct {
         NotificationAppRuntime.queue(self, notification);
     }
 
-    pub fn notificationPresentationFinished(self: *App) void {
+    /// Plays turn-end cues once the reply is shown and the work on screen is done.
+    pub fn releaseHeldNotifications(self: *App) void {
         NotificationAppRuntime.presentationFinished(self);
     }
 
@@ -964,6 +965,14 @@ const App = struct {
 
     pub fn anySubagentWorking(self: *App) bool {
         return AgentsAppRuntime.anySubagentWorking(self);
+    }
+
+    pub fn screenSubagentsWorking(self: *App) bool {
+        return AgentsAppRuntime.screenSubagentsWorking(self);
+    }
+
+    pub fn screenWorkGoing(self: *App) bool {
+        return AgentsAppRuntime.screenWorkGoing(self);
     }
 
     /// Logs the queued work fx drops as it exits for an upgrade's restart.
@@ -3118,7 +3127,7 @@ const App = struct {
     pub fn pacerFinish(ctx: *anyopaque, finished: types.FinishedPrompt) anyerror!assistant_pacer.FinishResult {
         const self: *App = @ptrCast(@alignCast(ctx));
         const result = try app_callbacks.Bindings(App).finishPromptPresentation(self, self.screenAgent(), finished);
-        if (result == .committed) self.notificationPresentationFinished();
+        if (result == .committed) self.releaseHeldNotifications();
         return result;
     }
 
@@ -3586,6 +3595,7 @@ const App = struct {
         // its own context.
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
         AgentsAppRuntime.noteFinishedTurns(self);
+        self.releaseHeldNotifications();
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);

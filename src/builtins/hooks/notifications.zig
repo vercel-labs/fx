@@ -104,8 +104,8 @@ pub const State = struct {
         presentation_pending: bool,
     ) ReadyNotifications {
         const ready = ReadyNotifications{
-            .turn_end_success = if (presentation_pending) 0 else self.pending_turn_end_success,
-            .turn_end_error = if (presentation_pending) 0 else self.pending_turn_end_error,
+            .turn_end_success = if (presentation_pending) 0 else @min(self.pending_turn_end_success, 1),
+            .turn_end_error = if (presentation_pending) 0 else @min(self.pending_turn_end_error, 1),
             .attention_required = self.pending_attention_required,
         };
         if (!presentation_pending) {
@@ -154,8 +154,16 @@ fn Runtime(comptime App: type) type {
             return app.notifications.maxEnabled();
         }
 
+        /// A run of turns, and the subagents they started, ends with one cue
+        /// once the work on screen is done.
+        fn turnEndHeld(app: *App) bool {
+            if (app.pacer.hasPending()) return true;
+            if (comptime !@hasDecl(App, "screenWorkGoing")) return false;
+            return app.screenWorkGoing();
+        }
+
         pub fn queue(app: *App, notification: Notification) void {
-            if (app.notifications.queue(notification, app.pacer.hasPending())) {
+            if (app.notifications.queue(notification, turnEndHeld(app))) {
                 app.shell.render_requests.request(.notification);
             }
         }
@@ -178,13 +186,13 @@ fn Runtime(comptime App: type) type {
         }
 
         pub fn presentationFinished(app: *App) void {
-            if (app.notifications.presentationFinished()) {
+            if (app.notifications.presentationFinished() and !turnEndHeld(app)) {
                 app.shell.render_requests.request(.notification);
             }
         }
 
         pub fn flush(app: *App) void {
-            const ready = app.notifications.takeReady(app.pacer.hasPending());
+            const ready = app.notifications.takeReady(turnEndHeld(app));
             const count = ready.attention_required +| ready.turn_end_success +| ready.turn_end_error;
             if (count == 0) return;
 
@@ -398,6 +406,21 @@ test "turn-end delivery waits for paced presentation while attention remains imm
     try std.testing.expectEqual(@as(usize, 0), ready.turn_end_success);
     try std.testing.expectEqual(@as(usize, 0), ready.attention_required);
     try std.testing.expect(!state.presentationFinished());
+}
+
+test "turn-end cues held across several turns play once" {
+    var state = State{};
+    state.setPreferences(.{
+        .turn_end = true,
+        .attention_required = true,
+    });
+
+    try std.testing.expect(!state.queue(.{ .kind = .turn_end, .cue = .success }, true));
+    try std.testing.expect(!state.queue(.{ .kind = .turn_end, .cue = .success }, true));
+
+    try std.testing.expectEqual(@as(usize, 0), state.takeReady(true).turn_end_success);
+    try std.testing.expectEqual(@as(usize, 1), state.takeReady(false).turn_end_success);
+    try std.testing.expectEqual(@as(usize, 0), state.takeReady(false).turn_end_success);
 }
 
 test "max gate requires both sound on and max selected" {
