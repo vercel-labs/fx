@@ -1599,11 +1599,17 @@ fn assignmentValueSpan(
 ) ?AssignmentValueSpan {
     if (value_start >= text.len) return null;
 
-    if (text[value_start] == '"' or text[value_start] == '\'') {
-        const quote = text[value_start];
-        const content_start = value_start + 1;
+    // A JSON string (a tool's arguments or result) writes a quote as `\"`, so
+    // the value sits between two of those. Read as an unquoted value it is
+    // just the backslash, and the secret after it stays.
+    const escaped = text[value_start] == '\\' and value_start + 1 < text.len;
+    const quote_at = value_start + @intFromBool(escaped);
+    if (text[quote_at] == '"' or text[quote_at] == '\'') {
+        const quote = text[quote_at];
+        const content_start = quote_at + 1;
         var end = content_start;
         while (end < text.len and text[end] != '\n' and text[end] != '\r' and text[end] != quote) : (end += 1) {}
+        if (escaped and end < text.len and text[end] == quote and text[end - 1] == '\\') end -= 1;
         const value_len = end - content_start;
         if (value_len >= 1) return .{ .prefix_end = content_start, .value_len = value_len };
         return null;
@@ -1850,6 +1856,25 @@ test "maskSecrets masks compound or literal sensitive assignments" {
             "GITHUB_TOKEN=\"[redacted]\"<(literal-suffix)\n" ++
             "ACCESS_TOKEN=\"[redacted]\">(literal-suffix)\n" ++
             "SECRET_KEY=\"[redacted]",
+        masked,
+    );
+}
+
+test "maskSecrets masks a double-quoted assignment inside a JSON string" {
+    const alloc = std.testing.allocator;
+    // A tool call's arguments and result reach /trace as JSON, where `"` is `\"`.
+    const input =
+        "{\"command\":\"export API_KEY=\\\"S1abcdefghijklmnop\\\" ; echo ok\"}\n" ++
+        "{\"output_delta\":\"TOKEN=\\\"S2abcdefghijklmnop\\\"\\n\"}";
+
+    const masked = try maskSecrets(alloc, input);
+    defer if (masked.ptr != input.ptr) alloc.free(masked);
+
+    try std.testing.expect(std.mem.find(u8, masked, "S1abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, masked, "S2abcdefghijklmnop") == null);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"export API_KEY=\\\"[redacted]\\\" ; echo ok\"}\n" ++
+            "{\"output_delta\":\"TOKEN=\\\"[redacted]\\\"\\n\"}",
         masked,
     );
 }
