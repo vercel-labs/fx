@@ -12152,24 +12152,6 @@ function drainScrollbackFacts(scrollback: string, lines: number) {
   };
 }
 
-/// The history in `scrollback` once and in order, except for a few rows
-/// right at its end: when the transcript grows in the frame after the history
-/// is handed off, the rows at the old screen top can be painted over before
-/// they reach scrollback. That loss is not this test's subject.
-function expectHistoryNearlyOnceInOrder(scrollback: string, lines: number) {
-  const numbers = scrollback.split("\n").flatMap((row) => {
-    const match = DRAIN_HISTORY.exec(row);
-    return match ? [Number(match[1])] : [];
-  });
-  const seen = new Set(numbers);
-  const missing: number[] = [];
-  for (let n = 1; n <= lines; n++) if (!seen.has(n)) missing.push(n);
-  expect(numbers.length - seen.size).toBe(0);
-  expect(numbers.every((n, i) => i === 0 || n > numbers[i - 1]!)).toBe(true);
-  expect(missing.length).toBeLessThanOrEqual(8);
-  for (const n of missing) expect(n).toBeGreaterThan(lines - 40);
-}
-
 /// The publication frames in the trace: the rows each one planned before the
 /// footer grew, the rows the frame that saw the taller footer planned, and
 /// how many frames after it still left part of the history unwritten.
@@ -12290,7 +12272,7 @@ async function resumeLongHistory(options: DrainCase) {
     const frames = drainFrames(trace());
     expect(readFileSync(stderrPath, "utf8")).toBe("");
     passed = true;
-    return { scrollback: drainScrollbackFacts(scrollback, options.lines), scrollbackText: scrollback, pastedScrollback, frames };
+    return { scrollback: drainScrollbackFacts(scrollback, options.lines), pastedScrollback, frames };
   } finally {
     if (!passed) console.error(`resume drain evidence kept: ${root}; steps=${steps} held=${held}`);
     hold.dispose();
@@ -12332,8 +12314,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expect(result.frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
     expect(result.frames.partial_frames_after).toBe(0);
     for (const rows of result.frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
-    expectHistoryNearlyOnceInOrder(result.scrollbackText, 6000);
-    expect(result.scrollback).toMatchObject({ prompt_rows: 1, prompt_below_history: true });
+    expect(result.scrollback).toEqual({
+      history_rows: 6000, repeats: 0, out_of_order: 0, first_missing: [], prompt_rows: 1, prompt_below_history: true,
+    });
   }, TIMEOUT * 4);
 
   test("fx --resume with a prompt, 18000 lines: the history lands once, in order, and keys typed during the long frame reach the composer", async () => {
@@ -12376,13 +12359,14 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
     expectFinishedDrain(result, 6000);
   }, TIMEOUT * 4);
 
-  test("a request sent again at resume writes the history at once, and a restored prompt comes back once", async () => {
+  for (const lines of [40, 6000]) test(`a request sent again at resume writes the history at once, and a restored prompt comes back once, ${lines} lines`, async () => {
     // A prompt that waited in the queue when fx was killed comes back in the
     // composer once the resumed history is written. The killed turn's request
     // goes out again at resume, and its activity row makes the footer taller,
     // so the history is written in one frame while that request waits. The
     // prompt waits behind a stalled MCP call, as in the restore tests above.
-    const lines = 6000;
+    // 40 lines fit in the first frame, so no batches run; the notices that
+    // land right after it must not paint over its last rows either.
     const root = mkdtempSync(join(tmpdir(), "fx-resume-drain-restore-"));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -12465,9 +12449,9 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       await terminal.waitForPane((pane) => composerText(pane) === queuedPrompt, TIMEOUT);
       expect(resumedRequests).toBe(1);
       const frames = drainFrames(trace());
-      expect(frames.finished).toBe(true);
       expect(frames.committed).toBe(true);
-      expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
+      expect(frames.finished).toBe(lines > 40);
+      if (frames.finished) expect(frames.finish_frame_rows).toBeGreaterThan(DRAIN_ROWS_PER_FRAME);
       expect(frames.partial_frames_after).toBe(0);
       for (const rows of frames.before) expect(rows).toBeLessThanOrEqual(DRAIN_ROWS_PER_FRAME);
 
@@ -12476,7 +12460,7 @@ describe.skipIf(!tmuxAvailable())("tui: a prompt sent while resumed history is w
       expect(composerText(settled)).toBe(queuedPrompt);
       const scrollback = await terminal.captureFullScrollback();
       expect(countOccurrences(scrollback, RESTORE_SINGULAR_NOTICE)).toBe(1);
-      expectHistoryNearlyOnceInOrder(scrollback, lines);
+      expect(drainScrollbackFacts(scrollback, lines)).toMatchObject({ history_rows: lines, repeats: 0, out_of_order: 0, first_missing: [] });
       // The restored prompt waits in the composer; it was never sent.
       expect(gateway.requests.some((request) => request.body.includes(queuedPrompt))).toBe(false);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
