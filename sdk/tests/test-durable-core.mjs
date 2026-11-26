@@ -326,6 +326,23 @@ test("a duration must be one a timer can wait", async () => {
   await agent.close();
 });
 
+if (durabilityKind === "world" || durabilityKind === "queue") {
+  test("a World deadline further off than a timer can wait cuts no step off", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const durability = await durabilityAt(dir);
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    durability.world().getRuntimeDeadline = async () => new Date(Date.now() + thirtyDaysMs);
+    const deadlines = [];
+    const agent = createAgent({ durability, onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); } });
+    const { text, result } = await textOf(agent.session().prompt("nadir", { messageId: "turn-nadir" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "nadir-0 nadir-1 nadir-2");
+    assert.deepEqual(deadlines, [], "a deadline 30 days off cuts no step off");
+    await agent.close();
+  });
+}
+
 test("a step cut off at the deadline continues in the next delivery", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();

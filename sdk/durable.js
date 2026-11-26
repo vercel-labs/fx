@@ -2130,8 +2130,10 @@ class SessionWorker {
     // A turn that started under a claim that then failed stops at once and
     // stores nothing.
     void ready.then((landed) => { if (!landed) turnNow?.cancel({ reason: "handoff" }); });
+    // A World's deadline can lie further off than a timer waits; stopping
+    // sooner is safe, since the next delivery continues the turn.
     const hardStop = stopMargin > 0 && deadline - stopMargin > Date.now()
-      ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
+      ? setTimeout(this.stopNow, Math.min(maxTimerDelayMs, deadline - stopMargin - Date.now()))
       : null;
     let harness = null;
     let harnessRun = runOf(null);
