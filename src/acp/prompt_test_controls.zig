@@ -1,8 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
-
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const hold_marker = @import("../core/shared/hold_marker.zig");
 
 const Controls = struct {
     ready_path: []const u8,
@@ -10,8 +9,8 @@ const Controls = struct {
     release_path: []const u8,
 };
 
-// Only the fx binary's ACP tests set these controls
-// (`tests/e2e/acp.test.ts`), so the libfx artifacts leave them out.
+// Only tests set these controls, such as `tests/e2e/acp.test.ts`, so the
+// libfx artifacts leave them out.
 pub fn pauseAfterTerminalWrite() void {
     pauseAt(terminalControls(), "terminal_response_written");
 }
@@ -23,13 +22,15 @@ pub fn pauseBeforePermissionInsert() void {
 pub fn noteReapBeforeJoin() void {
     if (comptime build_options.libfx) return;
     const control = terminalControls() orelse permissionControls() orelse return;
-    writeMarker(control.reap_ready_path, "reap_before_join") catch {};
+    // The marker only tells a test that the reap came first, and nothing
+    // waits here, so fx goes on when it cannot be written.
+    hold_marker.write(control.reap_ready_path, "reap_before_join") catch {};
 }
 
 fn pauseAt(maybe_control: ?Controls, marker: []const u8) void {
     if (comptime build_options.libfx) return;
     const control = maybe_control orelse return;
-    writeMarker(control.ready_path, marker) catch return;
+    hold_marker.write(control.ready_path, marker) catch return;
     while (!pathExists(control.release_path)) {
         io_mod.sleep(std.time.ns_per_ms);
     }
@@ -61,16 +62,6 @@ fn controlsFromPaths(
         .reap_ready_path = reap_ready_path orelse return null,
         .release_path = release_path orelse return null,
     };
-}
-
-fn writeMarker(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
-        .truncate = true,
-        .permissions = private_file_permissions,
-    });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), contents);
-    try file.sync(io_mod.getIo());
 }
 
 fn pathExists(path: []const u8) bool {

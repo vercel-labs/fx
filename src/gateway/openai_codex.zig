@@ -1095,3 +1095,34 @@ test "a Codex event that is not JSON resends, and a duplicate key still ends the
     try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
     try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
 }
+
+test "eb03: ChatMessage.input_id leaves Codex request body byte-identical" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const without_id = [_]types.ChatMessage{
+        .{ .role = .user, .content = "initial prompt" },
+        .{ .role = .assistant, .content = "working" },
+        .{ .role = .user, .content = "follow up steer", .restored_steering = true },
+    };
+    var with_id = without_id;
+    with_id[0].input_id = 42;
+    with_id[2].input_id = 43;
+
+    const body_without = try buildRequest(alloc, .{
+        .model = "gpt-5",
+        .instructions = &instructions,
+        .messages = &without_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_without);
+    const body_with = try buildRequest(alloc, .{
+        .model = "gpt-5",
+        .instructions = &instructions,
+        .messages = &with_id,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer alloc.free(body_with);
+    try std.testing.expectEqualStrings(body_without, body_with);
+}

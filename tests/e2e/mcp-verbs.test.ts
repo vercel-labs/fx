@@ -321,6 +321,40 @@ describe("fx mcp", () => {
     expect(shown).toMatchObject({ status: "ready", tools_error: null, tools: [] });
   }, 30_000);
 
+  // What fx leaves out of a list is told beside the status, not only traced: how many, and the one reason they share.
+  test("show says how many tools fx left out of a list and why, in text and in --json", async () => {
+    let deepSchema: unknown = { type: "string" };
+    for (let level = 0; level < 70; level += 1) deepSchema = { type: "object", properties: { a: deepSchema } };
+    const good = '{"name":"good","inputSchema":{"type":"object"}}';
+    const twice = '{"name":"twice","name":"again","inputSchema":{"type":"object"}}';
+    const sameName = '{"name":"good","description":"the second","inputSchema":{"type":"object"}}';
+    const tooDeep = JSON.stringify({ name: "deep", inputSchema: deepSchema });
+    // `odd` has a `description` that is no text: the engine keeps it, and the host's reading refuses it. The others the engine
+    // skips itself.
+    const odd = '{"name":"odd","description":7,"inputSchema":{"type":"object"}}';
+    const cases: { tools: string[]; listed: number; text: string | null; json: { count: number; reason: string } | null }[] = [
+      { tools: [good], listed: 1, text: null, json: null },
+      { tools: [good, twice], listed: 1, text: "1 tool: a field is written twice", json: { count: 1, reason: "a field is written twice" } },
+      { tools: [good, sameName], listed: 1, text: "1 tool: a name is used by two tools", json: { count: 1, reason: "a name is used by two tools" } },
+      { tools: [good, tooDeep], listed: 1, text: "1 tool: a limit on size or nesting is passed", json: { count: 1, reason: "a limit on size or nesting is passed" } },
+      { tools: [good, odd], listed: 2, text: "1 tool: a definition can't be used", json: { count: 1, reason: "a definition can't be used" } },
+      { tools: [good, twice, sameName, tooDeep, odd], listed: 2, text: "4 tools: more than one reason", json: { count: 4, reason: "more than one reason" } },
+    ];
+    for (const one of cases) {
+      const reply = `"result":{"resultType":"complete","tools":[${one.tools.join(",")}]}`;
+      const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_LIST_REPLY: reply } }) } });
+      const text = await mcp(root, "show", "fixture");
+      expect(text.stderr).toBe("");
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain(`  status     ready, ${one.listed} tool${one.listed === 1 ? "" : "s"}\n`);
+      if (one.text === null) expect(text.stdout).not.toContain("left out");
+      else expect(text.stdout).toContain(`  left out   ${one.text}\n`);
+      const shown = JSON.parse((await mcp(root, "show", "fixture", "--json")).stdout);
+      expect(shown).toMatchObject({ status: "ready", tools_error: null, tools_left_out: one.json });
+      expect(JSON.parse((await mcp(root, "list", "--json")).stdout).servers[0]).toHaveProperty("tools_left_out");
+    }
+  }, 120_000);
+
   test("show says when fx refused the tool list of an HTTP server too", async () => {
     const upstream = startModernMcpHttpFixture("list_refused");
     try {

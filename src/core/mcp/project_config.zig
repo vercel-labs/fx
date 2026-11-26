@@ -315,7 +315,6 @@ pub const ProfileDiagnostic = mcp_contract.ProfileConfigWarning;
 pub const ProfileParseResult = struct {
     configs: std.ArrayList(McpServerConfig) = .empty,
     diagnostic: ?ProfileDiagnostic = null,
-    mutation_allowed: bool = true,
 
     pub fn deinit(self: *ProfileParseResult, alloc: Allocator) void {
         deinitConfigs(alloc, &self.configs);
@@ -451,7 +450,6 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
                     found.key,
                     found.additional_matches,
                 );
-                result.mutation_allowed = false;
                 if (skipped) |notes| try noteMisspelledKey(alloc, notes, found.key, real_is_mcp);
             },
             .indeterminate => {
@@ -460,7 +458,6 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
                     null,
                     0,
                 );
-                result.mutation_allowed = false;
             },
         }
         return result;
@@ -476,7 +473,6 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
                     found.key,
                     found.additional_matches,
                 ),
-                .mutation_allowed = false,
             };
         },
         .indeterminate => .{
@@ -485,7 +481,6 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*
                 null,
                 0,
             ),
-            .mutation_allowed = false,
         },
     };
 }
@@ -1361,9 +1356,12 @@ test "misspelledKey reads every key and entry, and the load scan gives the same 
         "~/.fx/mcp.json: the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\".",
         said,
     );
+    // Without notes the load still flags the key, and the edit check finds the same one.
     var strict = try parseProfileDocument(alloc, typo, null);
     defer strict.deinit(alloc);
-    try std.testing.expect(!strict.mutation_allowed);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, strict.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("mcp_servers", strict.diagnostic.?.key().?);
+    try std.testing.expectEqualStrings("mcp_servers", (try foundKey(alloc, typo)).key());
 }
 
 /// The misspelled key of `text`, or a failed test when the scan finds none, so a scan
@@ -1853,7 +1851,9 @@ fn containsName(values: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
+/// Whether a server of `configs` has this name: the one rule for which of two servers keeps a name, in `mergeNative`,
+/// `appendWorkspaceAfterAcpPrimary`, and the host's compose (`builtins/mcp.zig`).
+pub fn configNamePresent(configs: []const McpServerConfig, name: []const u8) bool {
     for (configs) |config| if (std.mem.eql(u8, config.name, name)) return true;
     return false;
 }
@@ -1931,33 +1931,29 @@ test "a server that sets required or a non-default restart_limit gets a note nam
 
 test "profile document accepts mcpServers alias and preserves strict entry parsing" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
-        null,
-    );
+    const text = "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     try std.testing.expectEqualStrings("local", result.configs.items[0].name);
     try std.testing.expectEqualStrings("node", result.configs.items[0].command.?);
     try std.testing.expect(result.diagnostic == null);
-    try std.testing.expect(result.mutation_allowed);
+    // The edit check flags nothing in a document that has only the real keys.
+    try std.testing.expect(try misspelledKey(alloc, text) == null);
 }
 
 test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
-        null,
-    );
+    const text = "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
     try std.testing.expectEqual(ProfileDiagnosticCause.ignored_mcp_servers_alias, result.diagnostic.?.cause);
-    try std.testing.expect(result.mutation_allowed);
+    // Both keys are real ones, so the edit check flags neither.
+    try std.testing.expect(try misspelledKey(alloc, text) == null);
 }
 
 test "profile servers note each one ignored under mcpServers beside mcp" {
@@ -1989,11 +1985,8 @@ test "profile servers note each one ignored under mcpServers beside mcp" {
 
 test "profile document blocks suspicious sibling keys beside canonical mcp" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
-        null,
-    );
+    const text = "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
@@ -2001,23 +1994,22 @@ test "profile document blocks suspicious sibling keys beside canonical mcp" {
     try std.testing.expect(result.diagnostic != null);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
     try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
-    try std.testing.expect(!result.mutation_allowed);
+    // The edit check finds the same key, so a write is refused.
+    try std.testing.expectEqualStrings("MCP-Servers", (try foundKey(alloc, text)).key());
 }
 
 test "profile document reports the first exact server-like unsupported key" {
     const alloc = std.testing.allocator;
-    var result = try parseProfileDocument(
-        alloc,
-        "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
-        null,
-    );
+    const text = "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}";
+    var result = try parseProfileDocument(alloc, text, null);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
     try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostic.?.additional_matches);
-    try std.testing.expect(!result.mutation_allowed);
+    // The edit check names the same first key.
+    try std.testing.expectEqualStrings("MCP-Servers", (try foundKey(alloc, text)).key());
 }
 
 test "profile document bounds suspicious-key scans" {
@@ -2036,7 +2028,8 @@ test "profile document bounds suspicious-key scans" {
     var result = try parseProfileDocument(alloc, json, null);
     defer result.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
-    try std.testing.expect(!result.mutation_allowed);
+    // The load scan gives up on a big file, but the edit check reads every key, so it decides: none here is a misspelling.
+    try std.testing.expect(try misspelledKey(alloc, json) == null);
 }
 
 test "profile parser preserves validation precedence for multiply invalid entries" {

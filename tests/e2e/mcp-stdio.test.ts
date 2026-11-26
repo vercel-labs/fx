@@ -3604,6 +3604,60 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     );
   }
 
+  // A form fx refuses (here a field that looks like a secret) is declined, and the user is told why, in fx's
+  // words alone: the form's own fields and values stay out of the notice.
+  for (const surface of ["TUI", "Ask"] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `${surface} tells the user that fx declined a form it refuses, and declines it`,
+      async () => {
+        const sentinel = "S10_SECRET_SENTINEL_7f3c";
+        const declined = "MCP server 'fixture' asked for input, and fx declined it: fx can't show the form: it is invalid, has a field type fx doesn't support, or asks for a secret.";
+        const root = createRoot(`${surface.toLowerCase()}-secret-form`, MODERN_FIXTURE, {
+          mode: "mrtr_secret_required",
+          expectedElicitation: "both",
+        });
+        const activeGateway = startToolGateway(`${surface} declined form complete.`);
+        gateway = activeGateway;
+        const stderrPath = join(root.root, "stderr.log");
+        const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+        tui = await TmuxSession.create({
+          isolated: true,
+          ...(surface === "Ask"
+            ? {
+                cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the secret form fixture.")}`,
+                remainOnExit: true,
+              }
+            : { stderrPath }),
+          cwd: root.workspace,
+          width: 200,
+          height: 38,
+          env: fixtureEnv(root, activeGateway),
+        });
+        if (surface === "TUI") {
+          await tui.waitForComposer(15_000);
+          await tui.sendText("Call the secret form fixture.");
+        }
+        await tui.waitForText(`${surface} declined form complete.`, 30_000);
+        const screen = await tui.captureFullScrollback();
+        const told = screen.split(declined).length - 1;
+        expect(told, screen).toBe(1);
+        expect(screen).not.toContain(sentinel);
+        expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain(sentinel);
+        // The form was declined: the call did not go on, and the server never saw the secret.
+        expect(activeGateway.requests.map((entry) => entry.body).join("\n")).not.toContain("continued after elicitation");
+        const wire = readWire(root.wireLogPath);
+        expect(JSON.stringify(wire)).not.toContain(sentinel);
+        expect(readFileSync(root.traceLogPath, "utf8")).toContain("MCP question not answered server=fixture");
+        if (surface === "TUI") expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await tui.kill();
+        tui = null;
+        await expectFixtureProcessesExited(wire);
+      },
+      40_000,
+    );
+  }
+
   for (const surface of ["TUI", "Ask"] as const) {
     test.skipIf(!tmuxAvailable())(
       `${surface} preserves exact form values across local label collisions`,
@@ -5633,6 +5687,47 @@ describe("fx mcp call", () => {
     expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
   }, 90_000);
 
+  test("a command still running after its run call returns is told its fx mcp calls stop, and a later call says why", async () => {
+    const root = bridgeRoot("bridge-run-returned");
+    const call = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}'`;
+    // The command waits for the file go, which the test creates only after
+    // the run call has returned, so the second call runs after that return.
+    const command = `${call} > first.json; while [ ! -f go ]; do sleep 0.1; done; ${call} > second.json 2> second.err; echo "second_exit=$?"`;
+    let runResult: Record<string, unknown> = {};
+    let interactOutput = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command, yield_time_ms: 1000 }),
+      (body: string) => {
+        runResult = JSON.parse(toolResultText(body, "run_call"));
+        writeFileSync(join(root.workspace, "go"), "");
+        return fakeGatewayToolCall("interact_call", "shell", {
+          action: "interact",
+          session_id: runResult.session_id,
+          yield_time_ms: 30_000,
+        });
+      },
+      (body: string) => {
+        interactOutput = shellOutput(toolResultText(body, "interact_call"));
+        return fakeGatewayFinalText("DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 60_000,
+    });
+    expect(typeof runResult.mcp_call_notice).toBe("string");
+    expect(String(runResult.mcp_call_notice)).toContain("exit 3");
+    expect(interactOutput).toContain("second_exit=3");
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("DONE");
+    // The first call ran while the run call was still running.
+    expect(readFileSync(join(root.workspace, "first.json"), "utf8").length).toBeGreaterThan(0);
+    expect(readFileSync(join(root.workspace, "second.err"), "utf8")).toContain("has returned");
+  }, 90_000);
+
   test("a structured result that is only one result string saves as that text", async () => {
     const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
     const seen = await runBridgeCommand(root, `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"docs"}' > docs.md; echo "exit=$?"`);
@@ -5796,7 +5891,7 @@ describe("fx mcp call", () => {
       tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 140, height: 40, stderrPath, env });
       await tui.waitForComposer(15_000);
       await tui.sendText("Page through the list.");
-      await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_ROWS_SAVED") && turnSettled(pane), 30_000);
       await tui.waitForComposer(10_000);
       expect(await tui.captureFullScrollback()).toContain(`└ Used ${TOOL_ROW} ×3`);
       await tui.sendText("/quit");
@@ -5896,7 +5991,7 @@ describe("fx mcp call", () => {
 
       // The session goes on.
       await tui.sendText("Go on.");
-      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      await tui.waitForPane((pane) => pane.includes("BRIDGE_AFTER_CANCEL") && turnSettled(pane), 10_000);
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
