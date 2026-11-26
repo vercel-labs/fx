@@ -384,7 +384,7 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
                 .tools = try rawField(object, "tools"),
                 // Absent from an owner that ran before fx reported a refusal.
                 .list_refusal = try optionalText(object, "list_refusal"),
-                .dropped = try droppedFields(object),
+                .dropped = droppedFields(object),
             },
         },
         .called => .{
@@ -502,10 +502,15 @@ fn text(object: std.json.ObjectMap, key: []const u8) DecodeError![]const u8 {
 }
 
 /// The counts of left-out tools by reason; each is absent from an owner that ran before fx reported them, or that left
-/// none out.
-fn droppedFields(object: std.json.ObjectMap) DecodeError!mcp.tools.Dropped {
+/// none out. The counts only say what `fx mcp show` and the `/mcp` screen print, so one that is not a count (negative,
+/// not a number, past 32 bits) is read as none, and a `dropped_` field of a reason this fx does not know is not read:
+/// neither makes the frame, and the list in it, unreadable.
+fn droppedFields(object: std.json.ObjectMap) mcp.tools.Dropped {
     var out: mcp.tools.Dropped = .{};
-    inline for (std.enums.values(mcp.tools.Drop)) |why| out.add(why, try u32FieldDefault(object, "dropped_" ++ @tagName(why), 0));
+    inline for (std.enums.values(mcp.tools.Drop)) |why| {
+        const value = object.get("dropped_" ++ @tagName(why)) orelse .null;
+        if (value == .integer and value.integer >= 0 and value.integer <= std.math.maxInt(u32)) out.add(why, @intCast(value.integer));
+    }
     return out;
 }
 
@@ -784,6 +789,41 @@ test "what the owner's engine left out of a list crosses with it, by reason, and
     try testing.expect(std.mem.find(u8, frame, "dropped_") == null);
     const none = try expectOwner(a, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false } });
     try testing.expectEqual(@as(u32, 0), none.tools.dropped.total());
+}
+
+test "a count of left-out tools that is not a count, and a reason this fx does not know, are ignored and the frame still reads" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: share_key.Key = "ffeeddccbbaa99887766554433221100".*;
+    var kept: mcp.tools.Dropped = .{};
+    kept.add(.repeated_field, 2);
+    const frame = try encode(a, @as(OwnerMessage, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .tools = "[{\"name\":\"x\"}]", .dropped = kept } }));
+    const json = frame[header_bytes..];
+    try testing.expectEqual(@as(u8, '}'), json[json.len - 1]);
+    const cases = [_]struct { name: []const u8, extra: []const u8 }{
+        .{ .name = "a reason from a newer owner", .extra = ",\"dropped_from_a_newer_owner\":5" },
+        .{ .name = "negative", .extra = ",\"dropped_over_limit\":-1" },
+        .{ .name = "not a number", .extra = ",\"dropped_over_limit\":\"many\"" },
+        .{ .name = "a fraction", .extra = ",\"dropped_over_limit\":1.5" },
+        .{ .name = "past 32 bits", .extra = ",\"dropped_over_limit\":4294967296" },
+        .{ .name = "null", .extra = ",\"dropped_over_limit\":null" },
+        .{ .name = "every one at once", .extra = ",\"dropped_from_a_newer_owner\":5,\"dropped_unusable\":-7,\"dropped_over_limit\":[1],\"dropped_bad_header\":true,\"dropped_unnamed\":99999999999" },
+    };
+    for (cases) |case| {
+        const spliced = try std.mem.concat(a, u8, &.{ json[0 .. json.len - 1], case.extra, "}" });
+        const read = (try decode(a, spliced)).owner.tools;
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        // The frame reads whole: the list and the count that is a count are as sent, and the bad one counts as none.
+        try testing.expectEqualStrings("[{\"name\":\"x\"}]", read.tools);
+        try testing.expectEqual(kept, read.dropped);
+    }
+    // A good count beside an ignored one is still read.
+    const mixed = try std.mem.concat(a, u8, &.{ json[0 .. json.len - 1], ",\"dropped_over_limit\":3,\"dropped_unusable\":-1}" });
+    const got = (try decode(a, mixed)).owner.tools.dropped;
+    try testing.expectEqual(@as(u32, 3), got.counts[@backingInt(mcp.tools.Drop.over_limit)]);
+    try testing.expectEqual(@as(u32, 0), got.counts[@backingInt(mcp.tools.Drop.unusable)]);
+    try testing.expectEqual(@as(u32, 2), got.counts[@backingInt(mcp.tools.Drop.repeated_field)]);
 }
 
 test "server JSON nested 3000 levels deep crosses the wire as text" {

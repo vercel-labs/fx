@@ -154,7 +154,7 @@ pub const Event = union(enum) {
     failed: Failure,
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
-    tools: struct { ok: bool, fresh: bool, dropped: tools.Dropped = .{}, needs_auth: bool = false },
+    tools: struct { ok: bool, fresh: bool, needs_auth: bool = false },
     /// The tool list may have changed: `list_changed`, a call answer that
     /// suggests so, a new process, or a fresh list's TTL ran out. A host
     /// that keeps its own copy lists again before its next call (CAT-05).
@@ -2370,7 +2370,7 @@ pub const Server = struct {
             .discard_pages => r.discardStore(),
             .publish => |fresh| {
                 r.publishStore();
-                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh, .dropped = r.dropped } });
+                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh } });
                 try r.relisted(true);
             },
             .fail => {

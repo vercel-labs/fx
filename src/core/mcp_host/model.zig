@@ -22,6 +22,7 @@ const tool_names = @import("../mcp/tool_names.zig");
 const tool_result = @import("../mcp/tool_result.zig");
 const tool_search = @import("../mcp/tool_search.zig");
 const tools_feature = @import("../mcp/features/tools.zig");
+const dropped_tools = @import("dropped_tools.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 
@@ -742,10 +743,10 @@ pub const Catalog = struct {
     fn build(c: *Catalog, a: Allocator, server_name: []const u8, listed: []const runtime_mod.Tool) Allocator.Error![]McpTool {
         var out: std.ArrayList(McpTool) = .empty;
         for (listed) |item| {
-            const parsed = tools_feature.parseToolJson(a, item.raw, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ server_name, item.name, @errorName(err) });
+            const parsed = switch (try dropped_tools.read(a, item.raw)) {
+                .tool => |tool| tool,
+                .left_out => |left_out| {
+                    debug_trace.logf("mcp", "MCP tool left out server={s} tool={s} err={s}", .{ server_name, item.name, @errorName(left_out.err) });
                     continue;
                 },
             };
@@ -1869,6 +1870,38 @@ test "a name the registry bound to a server a reload dropped belongs to no serve
         const held = (try c.toolSchema(a, "mcp_linear_list", .{}, .{}, .unrestricted, null)).?;
         try testing.expectEqualStrings("MCP server 'linear' needs FX_MCP_HOST_TEST_UNSET set before fx starts.", held.rejected.model_output);
     }
+}
+
+test "what the catalog leaves out of a server's tools is what the count says was left out, from one decision" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wide_schema = try dropped_tools.wide(gpa, 5000);
+    defer gpa.free(wide_schema);
+    const too_big = try gpa.print("{{\"name\":\"big\",\"inputSchema\":{s}}}", .{wide_schema});
+    defer gpa.free(too_big);
+    var list = try dropped_tools.listOf(gpa, &.{
+        "{\"name\":\"good\",\"inputSchema\":{\"type\":\"object\"}}",
+        too_big,
+        "{\"name\":\"odd\",\"description\":7,\"inputSchema\":{\"type\":\"object\"}}",
+        "{\"name\":\"fine\",\"description\":\"Says it\",\"inputSchema\":{\"type\":\"object\"}}",
+    });
+    defer list.deinit(gpa);
+    var listed: [4]runtime_mod.Tool = undefined;
+    for (&listed, 0..) |*item, k| item.* = .{ .name = list.get(k).name, .raw = list.get(k).raw };
+    var c: Catalog = undefined;
+    c.names = .init(gpa);
+    defer c.names.deinit();
+    c.builtins = .{};
+    const built = try c.build(a, "srv", &listed);
+    const counted = try dropped_tools.count(gpa, &list);
+    // Every listed tool is in the catalog or in the count, and no tool is in both.
+    try testing.expectEqual(listed.len, built.len + counted.total());
+    try testing.expectEqual(@as(usize, 2), built.len);
+    try testing.expectEqualStrings("good", built[0].original_name);
+    try testing.expectEqualStrings("fine", built[1].original_name);
+    try testing.expectEqual(@as(u32, 2), counted.total());
 }
 
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
