@@ -319,24 +319,31 @@ pub const Store = struct {
     fn copyFiles(store: *Store, from: []const u8, to: []const u8) bool {
         var complete = true;
         for (outside_folders) |root_name| {
-            var root = (store.openProfileFolder(root_name) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            }) orelse continue;
-            defer root.close();
-            var source = (io_mod.openVerifiedPrivateDirIfPresent(&root, from) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            }) orelse continue;
-            defer source.close();
-            var target = io_mod.openOrCreateVerifiedPrivateDir(&root, to) catch |err| {
-                complete = copyFailed(from, err);
-                continue;
-            };
-            defer target.close();
-            if (!copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0)) complete = false;
+            if (!store.copyRootFolder(root_name, from, to)) complete = false;
         }
         return complete;
+    }
+
+    /// Copies `from`'s bash tool result files (`results/{from}`) to `to`.
+    fn copyResultFiles(store: *Store, from: []const u8, to: []const u8) bool {
+        return store.copyRootFolder(results_dir_name, from, to);
+    }
+
+    /// Copies `from` to `to` inside a single outside folder root `root_name`.
+    fn copyRootFolder(store: *Store, root_name: []const u8, from: []const u8, to: []const u8) bool {
+        var root = (store.openProfileFolder(root_name) catch |err| {
+            return copyFailed(from, err);
+        }) orelse return true;
+        defer root.close();
+        var source = (io_mod.openVerifiedPrivateDirIfPresent(&root, from) catch |err| {
+            return copyFailed(from, err);
+        }) orelse return true;
+        defer source.close();
+        var target = io_mod.openOrCreateVerifiedPrivateDir(&root, to) catch |err| {
+            return copyFailed(from, err);
+        };
+        defer target.close();
+        return copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0);
     }
 
     /// Finds folders outside the manager whose session is gone, except young
@@ -3859,6 +3866,9 @@ pub const Session = struct {
         const copy = try init(alloc, self.store, handle, false);
         errdefer copy.destroyInner();
         try copy.openMoved();
+        if (!self.store.copyResultFiles(self.id(), copy.id())) {
+            debug_trace.logf("session", "event=sessions_v2_fork_results_incomplete source={s} fork={s}", .{ self.id(), copy.id() });
+        }
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const state = try handle.state(arena.allocator());
@@ -14774,6 +14784,49 @@ test "forkSession copies side folders, never a link, and reports when one is ski
     defer testing.allocator.free(top);
     try testing.expectEqualStrings("top", top);
     try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+}
+
+test "Session.fork copies results/ only (skipping links) and leaves terminal/ and session-files/ untouched" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const source = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer source.close();
+    try source.commitTurn(assistantTurn("q1", "a1"), types.ConversationLanguage.default());
+    try source.commitTurn(assistantTurn("q2", "a2"), types.ConversationLanguage.default());
+    {
+        var folder = try source.openResultFolder(testing.allocator);
+        defer folder.deinit();
+        var r1: std.Io.Reader = .fixed("out-1\n");
+        _ = try folder.save(1, &r1);
+        var r2: std.Io.Reader = .fixed("out-2\n");
+        _ = try folder.save(2, &r2);
+        try folder.appendIndex(.{ .n = 1, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 1" });
+        try folder.appendIndex(.{ .n = 2, .exit = .{ .code = 0 }, .bytes = 6, .lines = 1, .command = "echo 2" });
+        try folder.dir.dir.symLink(io, "/etc/hosts", "link", .{});
+    }
+    {
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(t.tmp.dir, ".fx");
+        defer fx.close();
+        for ([_][]const u8{ terminal_dir_name, files_dir_name }) |root_name| {
+            var root = try io_mod.openOrCreateVerifiedPrivateDir(&fx, root_name);
+            defer root.close();
+            var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, source.id());
+            defer owner.close();
+            try owner.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "src", .flags = .{ .permissions = .fromMode(0o600) } });
+        }
+    }
+
+    const forked = try source.fork(testing.allocator, .{ .before_turn = 2, .workspace = "/w", .host = .app });
+    defer forked.close();
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "1.txt" }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "2.txt" }));
+    try testing.expect(pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), result_files.index_file_name }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", results_dir_name, forked.id(), "link" }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", terminal_dir_name, forked.id() }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", files_dir_name, forked.id() }));
 }
 
 test "the bash results folder is kept once per session and differs between sessions" {

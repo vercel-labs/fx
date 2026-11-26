@@ -2575,3 +2575,414 @@ describe("fx tool and fx mcp call without MCP servers", () => {
     expect(readFileSync(join(root.workspace, "app.py"), "utf8")).toBe("print('a')\n");
   }, TIMEOUT);
 });
+
+describe("slice 4 break-it: results as files", () => {
+  const BASH_SETTING = ["--config", "experimental.bash_tool=true"];
+
+  test("4a: 50 MB output cuts file to first and last 8 MiB with one cut line, bounded preview, and header", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b50", "bash", { command: "yes | head -c 50000000" }),
+      fakeGatewayToolCall("b50w", "bash", { command: "wait_more" }),
+      fakeGatewayFinalText("Large done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const startedAt = Date.now();
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Print 50 MB."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: 120_000,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.code).toBe(0);
+    expect(elapsedMs).toBeLessThan(90_000);
+    const firstOut = bashResultText(gateway.requests[1]!.body, "b50");
+    const finalOut = firstOut.includes("still running")
+      ? bashResultText(gateway.requests[2]!.body, "b50w")
+      : firstOut;
+    const header = finalOut.split("\n")[0]!;
+    expect(header).toBe("[exit 0, 25000000 lines, 47 MB, $FX_OUT/1.txt, the file keeps the first and last 8 MiB]");
+    expect(finalOut.length).toBeLessThan(2500);
+    expect(finalOut).toMatch(/\[\.\.\. \d+ lines not shown; the full output is \$FX_OUT\/1\.txt \.\.\.\]/);
+
+    const results = sessionResults(root.home);
+    const saved = readFileSync(join(results, "1.txt"));
+    const keepEach = 8 * 1024 * 1024;
+    const expectedCut = 50_000_000 - 2 * keepEach;
+    const marker = Buffer.from(`[... ${expectedCut} bytes cut ...]\n`, "utf8");
+    expect(saved.byteLength).toBe(2 * keepEach + marker.byteLength);
+    expect(saved.subarray(0, keepEach).toString("utf8")).toBe("y\n".repeat(keepEach / 2));
+    expect(saved.subarray(keepEach, keepEach + marker.byteLength).equals(marker)).toBe(true);
+    expect(saved.subarray(keepEach + marker.byteLength).toString("utf8")).toBe("y\n".repeat(keepEach / 2));
+    expect(readFileSync(join(results, "index.tsv"), "utf8")).toBe(
+      "n\texit\tbytes\tlines\tcommand\n1\t0\t50000000\t25000000\tyes | head -c 50000000\n",
+    );
+  }, 120_000);
+
+  test("4b: binary and odd text keeps header and $FX_OUT/N.txt on NUL/invalid UTF-8 and keeps preview when stray byte is only hidden", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("b_utf8", "bash", {
+        command:
+          'printf "\\x1b[31mred\\x1b[0m\\n"; for i in 1 2 3; do printf "prog %d\\r" $i; done; printf "done\\n"; python3 -c "print(\\"🔥\\"*400 + \\"a\\"*1048576)"',
+      }),
+      fakeGatewayToolCall("b_nul", "bash", { command: 'printf "before\\x00after\\n"' }),
+      fakeGatewayToolCall("b_cont", "bash", { command: 'printf "before\\x80after\\n"' }),
+      fakeGatewayToolCall("b_ff", "bash", { command: 'printf "before\\xffafter\\n"' }),
+      fakeGatewayToolCall("b_10k_nul", "bash", {
+        command: 'python3 -c \'import sys; sys.stdout.buffer.write(b"\\x00" + b"a"*10240 + b"\\n")\'',
+      }),
+      fakeGatewayToolCall("b_mid_stray", "bash", {
+        command:
+          'python3 -c \'import sys; sys.stdout.buffer.write(b"h1\\nh2\\n" + b"mid\\n"*2000 + b"bad\\x80byte\\n" + b"mid\\n"*2000 + b"t1\\nt2\\n")\'',
+      }),
+      fakeGatewayFinalText("Odd text done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Odd text."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const results = sessionResults(root.home);
+
+    const out1 = bashResultText(gateway.requests[1]!.body, "b_utf8");
+    expect(out1.split("\n")[0]).toBe("[exit 0, 3 lines, 1 MB, $FX_OUT/1.txt]");
+    expect(out1).toContain("\x1b[31mred\x1b[0m");
+    expect(out1).toContain("prog 1\rprog 2\rprog 3\rdone");
+    expect(out1).toContain("🔥");
+    expect(out1).not.toContain("\uFFFD");
+    expect(out1).toMatch(/\[\.\.\. \d+ characters not shown; the full output is \$FX_OUT\/1\.txt \.\.\.\]/);
+    const saved1 = readFileSync(join(results, "1.txt"), "utf8");
+    expect(saved1.endsWith("a".repeat(1048576) + "\n")).toBe(true);
+
+    const out2 = bashResultText(gateway.requests[2]!.body, "b_nul");
+    expect(out2).toBe(
+      "[exit 0, 1 line, 13 B, $FX_OUT/2.txt]\n[binary output, not shown; read $FX_OUT/2.txt with xxd, strings, or cat -v]",
+    );
+    expect(readFileSync(join(results, "2.txt")).equals(Buffer.from("before\x00after\n"))).toBe(true);
+
+    const out3 = bashResultText(gateway.requests[3]!.body, "b_cont");
+    expect(out3).toBe(
+      "[exit 0, 1 line, 13 B, $FX_OUT/3.txt]\n[binary output, not shown; read $FX_OUT/3.txt with xxd, strings, or cat -v]",
+    );
+    expect(readFileSync(join(results, "3.txt")).equals(Buffer.from("before\x80after\n", "latin1"))).toBe(true);
+
+    const out4 = bashResultText(gateway.requests[4]!.body, "b_ff");
+    expect(out4).toBe(
+      "[exit 0, 1 line, 13 B, $FX_OUT/4.txt]\n[binary output, not shown; read $FX_OUT/4.txt with xxd, strings, or cat -v]",
+    );
+    expect(readFileSync(join(results, "4.txt")).equals(Buffer.from("before\xffafter\n", "latin1"))).toBe(true);
+
+    const out5 = bashResultText(gateway.requests[5]!.body, "b_10k_nul");
+    expect(out5).toBe(
+      "[exit 0, 1 line, 10 KB, $FX_OUT/5.txt]\n[binary output, not shown; read $FX_OUT/5.txt with xxd, strings, or cat -v]",
+    );
+    expect(readFileSync(join(results, "5.txt")).byteLength).toBe(10242);
+
+    const out6 = bashResultText(gateway.requests[6]!.body, "b_mid_stray");
+    expect(out6.split("\n")[0]).toBe("[exit 0, 4005 lines, 15 KB, $FX_OUT/6.txt]");
+    expect(out6).toContain("h1\nh2\n");
+    expect(out6).toMatch(/\[\.\.\. \d+ lines not shown; the full output is \$FX_OUT\/6\.txt \.\.\.\]/);
+    expect(out6).toContain("t1\nt2\n");
+    expect(out6).not.toContain("binary output, not shown");
+    expect(readFileSync(join(results, "6.txt")).includes(0x80)).toBe(true);
+  }, TIMEOUT);
+
+  test("4c: tampering with $FX_OUT (99.txt, corrupt index, rm -rf, symlink index.tsv, symlink $FX_OUT, chmod 0500) writes nothing outside", async () => {
+    const root = createRoot();
+    const outsideFile = join(root.root, "outside-index-target.txt");
+    const outsideDir = join(root.root, "outside-dir-target");
+    writeFileSync(outsideFile, "OUTSIDE_KEEP\n");
+    mkdirSync(outsideDir);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("c1", "bash", { command: 'echo user-99 > "$FX_OUT/99.txt"; echo ok1' }),
+      fakeGatewayToolCall("c2", "bash", { command: 'printf "1\\t0\\t" > "$FX_OUT/index.tsv"; echo ok2' }),
+      fakeGatewayToolCall("c3", "bash", { command: 'rm -rf "$FX_OUT"; echo ok3' }),
+      fakeGatewayToolCall("c4", "bash", { command: `ln -sf "${outsideFile}" "$FX_OUT/index.tsv"; echo ok4` }),
+      fakeGatewayToolCall("c5", "bash", { command: `rm -rf "$FX_OUT" && ln -s "${outsideDir}" "$FX_OUT"; echo ok5` }),
+      fakeGatewayToolCall("c6", "bash", { command: 'rm -f "$FX_OUT"; mkdir -p "$FX_OUT" && chmod 0500 "$FX_OUT"; echo ok6' }),
+      fakeGatewayFinalText("Tamper done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Tamper folder."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(bashResultText(gateway.requests[1]!.body, "c1")).toBe("[exit 0, 1 line, 4 B, $FX_OUT/100.txt]\nok1\n");
+    expect(bashResultText(gateway.requests[2]!.body, "c2")).toBe("[exit 0, 1 line, 4 B, $FX_OUT/101.txt]\nok2\n");
+    expect(bashResultText(gateway.requests[3]!.body, "c3")).toBe("[exit 0, 1 line, 4 B, $FX_OUT/1.txt]\nok3\n");
+    expect(bashResultText(gateway.requests[4]!.body, "c4")).toBe(
+      "[exit 0, 1 line, 4 B, not saved: the results folder could not be read]\nok4\n",
+    );
+    expect(bashResultText(gateway.requests[5]!.body, "c5")).toBe(
+      "[exit 0, 1 line, 4 B, not saved: the results folder could not be opened]\nok5\n",
+    );
+    expect(bashResultText(gateway.requests[6]!.body, "c6")).toBe("[exit 0, 1 line, 4 B, $FX_OUT/1.txt]\nok6\n");
+    expect(readFileSync(outsideFile, "utf8")).toBe("OUTSIDE_KEEP\n");
+    expect(readdirSync(outsideDir)).toEqual([]);
+    const results = sessionResults(root.home);
+    // Intended: fx heals its private folder back to 0700 rather than failing read-only.
+    expect(statSync(results).mode & 0o777).toBe(0o700);
+    expect(readFileSync(join(results, "1.txt"), "utf8")).toBe("ok6\n");
+  }, TIMEOUT);
+
+  test("4d: resumed saved session keeps FX_OUT folder, continues numbering, and excludes FX_OUT from saved bash state", async () => {
+    const root = createRoot();
+    const tmp = join(root.root, "tmp");
+    mkdirSync(tmp);
+    const firstGw = startFakeGateway([
+      fakeGatewayToolCall("d1", "bash", { command: 'echo "OUT1=$FX_OUT"' }),
+      fakeGatewayToolCall("d2", "bash", { command: 'grep -c FX_OUT "$TMPDIR"/fx-bash-*/state.sh || echo CLEAN' }),
+      fakeGatewayFinalText("First.\n"),
+    ]);
+    gateways.push(firstGw);
+    const first = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "First turn."], {
+      cwd: root.workspace,
+      env: { ...gatewayEnv(root.home, firstGw), TMPDIR: tmp },
+      timeoutMs: TIMEOUT,
+    });
+    expect(first.code).toBe(0);
+    const results = sessionResults(root.home);
+    expect(bashResultText(firstGw.requests[1]!.body, "d1")).toBe(`[exit 0, 1 line, ${`OUT1=${results}\n`.length} B, $FX_OUT/1.txt]\nOUT1=${results}\n`);
+    expect(bashResultText(firstGw.requests[2]!.body, "d2")).toBe("[exit 0, 2 lines, 8 B, $FX_OUT/2.txt]\n0\nCLEAN\n");
+
+    const secondGw = startFakeGateway([
+      fakeGatewayToolCall("d3", "bash", { command: 'echo "OUT2=$FX_OUT"; cat "$FX_OUT/1.txt"' }),
+      fakeGatewayFinalText("Second.\n"),
+    ]);
+    gateways.push(secondGw);
+    const second = await runFx(["ask", "--json", "--yolo", "--resume", "last", ...BASH_SETTING, "Second turn."], {
+      cwd: root.workspace,
+      env: { ...gatewayEnv(root.home, secondGw), TMPDIR: tmp },
+      timeoutMs: TIMEOUT,
+    });
+    expect(second.code).toBe(0);
+    expect(bashResultText(secondGw.requests[1]!.body, "d3")).toBe(
+      `[exit 0, 2 lines, ${`OUT2=${results}\nOUT1=${results}\n`.length} B, $FX_OUT/3.txt]\nOUT2=${results}\nOUT1=${results}\n`,
+    );
+  }, TIMEOUT);
+
+  test("4e: fx session fork copies results/ and forked resume numbers after copied files without changing source", async () => {
+    const root = createRoot();
+    const srcGw = startFakeGateway([
+      fakeGatewayToolCall("s1", "bash", { command: "echo src-file-1" }),
+      fakeGatewayFinalText("Source.\n"),
+    ]);
+    gateways.push(srcGw);
+    const srcRun = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Source."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, srcGw),
+      timeoutMs: TIMEOUT,
+    });
+    expect(srcRun.code).toBe(0);
+    const [srcId] = readdirSync(join(root.home, ".fx", "results"));
+
+    const forked = await runFx(["session", "fork", srcId!, "--json"], {
+      cwd: root.workspace,
+      env: { HOME: root.home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(forked.code).toBe(0);
+    const forkId = (JSON.parse(forked.stdout) as { fork_id: string }).fork_id;
+    expect(forkId).not.toBe(srcId);
+    expect(readFileSync(join(root.home, ".fx", "results", forkId, "1.txt"), "utf8")).toBe("src-file-1\n");
+
+    const forkGw = startFakeGateway([
+      fakeGatewayToolCall("f1", "bash", { command: 'echo fork-file-2; cat "$FX_OUT/1.txt"' }),
+      fakeGatewayFinalText("Forked.\n"),
+    ]);
+    gateways.push(forkGw);
+    const forkRun = await runFx(["ask", "--json", "--yolo", "--resume", forkId, ...BASH_SETTING, "Fork."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, forkGw),
+      timeoutMs: TIMEOUT,
+    });
+    expect(forkRun.code).toBe(0);
+    expect(bashResultText(forkGw.requests[1]!.body, "f1")).toBe(
+      "[exit 0, 2 lines, 23 B, $FX_OUT/2.txt]\nfork-file-2\nsrc-file-1\n",
+    );
+    expect(readdirSync(join(root.home, ".fx", "results", srcId!)).sort()).toEqual(["1.txt", "index.tsv"]);
+    expect(readdirSync(join(root.home, ".fx", "results", forkId)).sort()).toEqual(["1.txt", "2.txt", "index.tsv"]);
+  }, TIMEOUT);
+
+  test("4f: wait_more on a program running past yield names no file while running and saves full output when ended", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("f_run", "bash", { command: "echo part1; sleep 32; echo part2" }),
+      fakeGatewayToolCall("f_wait", "bash", { command: "wait_more" }),
+      fakeGatewayFinalText("Wait done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Slow command."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: 90_000,
+    });
+
+    expect(result.code).toBe(0);
+    const runningOut = bashResultText(gateway.requests[1]!.body, "f_run");
+    expect(runningOut).toContain("part1");
+    expect(runningOut).toContain("still running after 30 s");
+    expect(runningOut).not.toContain("$FX_OUT/");
+    const finalOut = bashResultText(gateway.requests[2]!.body, "f_wait");
+    expect(finalOut).toBe("[exit 0, 2 lines, 12 B, $FX_OUT/1.txt]\npart1\npart2\n");
+    expect(readFileSync(join(sessionResults(root.home), "1.txt"), "utf8")).toBe("part1\npart2\n");
+  }, 90_000);
+
+  test("4g: killed program (kill -9 $$) saves output and names signal 9 in header and index.tsv", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("g_kill", "bash", { command: "echo before-kill; kill -9 $$" }),
+      fakeGatewayFinalText("Killed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Kill self."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = bashResultText(gateway.requests[1]!.body, "g_kill");
+    expect(out.split("\n")[0]).toBe("[killed by signal 9, 1 line, 12 B, $FX_OUT/1.txt]");
+    expect(out).toContain("before-kill\n");
+    const results = sessionResults(root.home);
+    expect(readFileSync(join(results, "1.txt"), "utf8")).toBe("before-kill\n");
+    expect(readFileSync(join(results, "index.tsv"), "utf8")).toBe(
+      "n\texit\tbytes\tlines\tcommand\n1\tsignal:9\t12\t1\techo before-kill; kill -9 $$\n",
+    );
+  }, TIMEOUT);
+
+  test("4h: --no-save writes numbered files and index.tsv to temp out/ and creates nothing under ~/.fx/results", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("h1", "bash", { command: "echo nosave-1" }),
+      fakeGatewayToolCall("h2", "bash", { command: 'echo "$FX_OUT"; cat "$FX_OUT/1.txt"; cat "$FX_OUT/index.tsv"' }),
+      fakeGatewayFinalText("No-save done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "No save."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out2 = bashResultText(gateway.requests[2]!.body, "h2");
+    expect(out2.split("\n")[0]).toMatch(/^\[exit 0, 4 lines, \d+ B, \$FX_OUT\/2\.txt\]$/);
+    expect(out2).toMatch(/\/fx-bash-\d+-[0-9a-f]{16}\/out\n/);
+    expect(out2).toContain("nosave-1\n");
+    expect(out2).toContain("1\t0\t9\t1\techo nosave-1\n");
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("4i: folder full at 256 MiB writes no file or index row, notices full, and saves again after rm $FX_OUT/1.txt", async () => {
+    const root = createRoot();
+    const calls = [];
+    for (let i = 1; i <= 16; i += 1) {
+      calls.push(fakeGatewayToolCall(`fill_${i}`, "bash", { command: 'head -c 16777216 /dev/zero | tr "\\0" "a"' }));
+    }
+    calls.push(fakeGatewayToolCall("over", "bash", { command: "echo over-limit" }));
+    calls.push(fakeGatewayToolCall("rm1", "bash", { command: 'rm "$FX_OUT/1.txt"; echo freed' }));
+    calls.push(fakeGatewayToolCall("after_rm", "bash", { command: "echo after-rm" }));
+    calls.push(fakeGatewayFinalText("Folder cap done.\n"));
+    const gateway = startFakeGateway(calls);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Fill results."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: 180_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(bashResultText(gateway.requests[17]!.body, "over")).toBe(
+      "[exit 0, 1 line, 11 B, not saved: the results folder is full]\nover-limit\n",
+    );
+    expect(bashResultText(gateway.requests[18]!.body, "rm1")).toBe("[exit 0, 1 line, 6 B, $FX_OUT/17.txt]\nfreed\n");
+    expect(bashResultText(gateway.requests[19]!.body, "after_rm")).toBe("[exit 0, 1 line, 9 B, $FX_OUT/18.txt]\nafter-rm\n");
+
+    const results = sessionResults(root.home);
+    const files = readdirSync(results);
+    expect(files).not.toContain("1.txt");
+    expect(files).toContain("17.txt");
+    expect(files).toContain("18.txt");
+    expect(files).not.toContain("19.txt");
+    const indexLines = readFileSync(join(results, "index.tsv"), "utf8").trimEnd().split("\n");
+    expect(indexLines).toHaveLength(19);
+    expect(indexLines.some((line) => line.includes("over-limit"))).toBe(false);
+    expect(indexLines.at(-2)).toContain("17\t0\t6\t1\t");
+    expect(indexLines.at(-1)).toBe("18\t0\t9\t1\techo after-rm");
+  }, 180_000);
+
+  test("4j: setting off leaves shell tool without FX_OUT and creates no results folder", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_off", "shell", {
+        action: "run",
+        command: 'echo "FX_OUT=[$FX_OUT]"',
+      }),
+      fakeGatewayFinalText("Setting off done.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "Run with setting off."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const out = toolResultText(gateway.requests[1]!.body, "shell_off");
+    expect(out).toContain("FX_OUT=[]");
+    expect(out).not.toContain("$FX_OUT/");
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("4k: subagent bash program writes to its own child results folder, not the parent's", async () => {
+    const root = createRoot();
+    mkdirSync(join(root.home, ".fx", "agents", "helper"), { recursive: true });
+    writeFileSync(join(root.home, ".fx", "agents", "helper", "profile.json"), JSON.stringify({ description: "Helper agent" }));
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        if (body.includes('"toolCallId":"child_bash"')) return fakeGatewayFinalText("CHILD_DONE");
+        return fakeGatewayToolCall("child_bash", "bash", { command: 'echo child-out; echo "CHILD_FX_OUT=$FX_OUT"' });
+      }
+      step += 1;
+      if (step === 1) return fakeGatewayToolCall("parent_bash", "bash", { command: 'echo parent-out; echo "PARENT_FX_OUT=$FX_OUT"' });
+      if (step === 2) return fakeGatewayToolCall("spawn", "subagent", { action: "message", agent: "helper", message: "run bash" });
+      if (step === 3) return fakeGatewayToolCall("wait_sub", "subagent", { action: "wait" });
+      return fakeGatewayFinalText("Subagent done.\n");
+    });
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Run parent and child."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const resultsRoot = join(root.home, ".fx", "results");
+    const dirs = readdirSync(resultsRoot);
+    expect(dirs).toHaveLength(2);
+    const contents = dirs.map((id) => readFileSync(join(resultsRoot, id, "1.txt"), "utf8")).sort();
+    expect(contents[0]).toContain("child-out\nCHILD_FX_OUT=");
+    expect(contents[1]).toContain("parent-out\nPARENT_FX_OUT=");
+  }, TIMEOUT);
+});
+

@@ -2010,3 +2010,105 @@ test.skipIf(!tmuxAvailable())(
   },
   60_000,
 );
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash interrupt saves partial output to $FX_OUT/1.txt with signal:15 in index.tsv",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-interrupt-", {
+      permission_mode: "full-access",
+      experimental: { bash_tool: true },
+    });
+    const tmp = join(fixture.root, "tmp");
+    mkdirSync(tmp);
+    const started = join(fixture.root, "started");
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_slow", "bash", {
+        command: `echo before-stop; touch "${started}"; sleep 30`,
+      }),
+      fakeGatewayFinalText("AFTER_INTERRUPT"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, {
+      FX_PERMISSION_MODE: "full-access",
+      TMPDIR: tmp,
+    });
+
+    await active.sendText("Run slow command.");
+    await active.waitForPane(() => existsSync(started), TIMEOUT);
+    await active.sendInterruptEscapePair(TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("Cancelled"), TIMEOUT);
+
+    const resultsRoot = join(fixture.home, ".fx", "results");
+    const [sessionId] = readdirSync(resultsRoot);
+    const resultsDir = join(resultsRoot, sessionId!);
+    expect(readFileSync(join(resultsDir, "1.txt"), "utf8")).toBe("before-stop\n");
+    expect(readFileSync(join(resultsDir, "index.tsv"), "utf8")).toBe(
+      `n\texit\tbytes\tlines\tcommand\n1\tsignal:15\t12\t1\techo before-stop; touch "${started}"; sleep 30\n`,
+    );
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI bash /fork copies $FX_OUT files from source, reads $FX_OUT/1.txt, and numbers next file 3.txt",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-fork-", {
+      permission_mode: "full-access",
+      experimental: { bash_tool: true },
+    });
+    const tmp = join(fixture.root, "tmp");
+    mkdirSync(tmp);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("fork_src_1", "bash", { command: "echo src-1" }),
+      fakeGatewayFinalText("SRC_1_DONE"),
+      fakeGatewayToolCall("fork_src_2", "bash", { command: "echo src-2" }),
+      fakeGatewayFinalText("SRC_2_DONE"),
+      fakeGatewayToolCall("fork_next", "bash", { command: 'echo fork-3; cat "$FX_OUT/1.txt"' }),
+      fakeGatewayFinalText("FORK_NEXT_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, {
+      FX_PERMISSION_MODE: "full-access",
+      TMPDIR: tmp,
+    });
+
+    await active.sendText("First source turn.");
+    await active.waitForText("SRC_1_DONE", TIMEOUT);
+    await active.sendText("Second source turn.");
+    await active.waitForText("SRC_2_DONE", TIMEOUT);
+
+    const resultsRoot = join(fixture.home, ".fx", "results");
+    const [sourceId] = readdirSync(resultsRoot);
+    expect(sourceId).toBeDefined();
+
+    await active.sendText("/fork");
+    await active.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await active.sendKeys("Enter");
+    await active.waitForPane((pane) => !pane.includes("enter fork") && pane.includes("fork"), TIMEOUT);
+    await active.sendKeys("C-u");
+    await active.sendText("Forked turn.");
+    await active.waitForText("FORK_NEXT_DONE", TIMEOUT);
+
+    const dirs = readdirSync(resultsRoot);
+    expect(dirs).toHaveLength(2);
+    const forkId = dirs.find((id) => id !== sourceId)!;
+    const forkOut = gateway.requests
+      .map((req) => toolResultText(req.body, "fork_next"))
+      .find((out) => out !== "") ?? "";
+    const parsedForkOut = (JSON.parse(forkOut) as { value: string }).value;
+    expect(parsedForkOut).toBe("[exit 0, 2 lines, 13 B, $FX_OUT/3.txt]\nfork-3\nsrc-1\n");
+    expect(readdirSync(join(resultsRoot, sourceId!)).sort()).toEqual(["1.txt", "2.txt", "index.tsv"]);
+    expect(readdirSync(join(resultsRoot, forkId)).sort()).toEqual(["1.txt", "2.txt", "3.txt", "index.tsv"]);
+    expect(readFileSync(join(resultsRoot, forkId, "1.txt"), "utf8")).toBe("src-1\n");
+    expect(readFileSync(join(resultsRoot, forkId, "3.txt"), "utf8")).toBe("fork-3\nsrc-1\n");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);

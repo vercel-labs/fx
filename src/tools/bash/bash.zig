@@ -19,6 +19,7 @@ const managed_delivery = @import("../../core/tooling/managed_delivery.zig");
 const tool_bridge = @import("../../core/tool_bridge/tool_bridge.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -735,7 +736,7 @@ fn appendHeader(alloc: Allocator, out: *std.ArrayList(u8), state: bash_results.S
 }
 
 /// Appends the output as bash_results plans it: the shape line when it is a
-/// preview, then the text, on a line of its own when there is any.
+/// preview, then the text when model-safe, or the binary notice otherwise.
 fn appendBody(
     alloc: Allocator,
     out: *std.ArrayList(u8),
@@ -746,10 +747,18 @@ fn appendBody(
     notice: bash_results.Notice,
 ) !void {
     const planned = bash_results.plan(head, tail, stats, limits);
+    const safe = switch (planned) {
+        .whole => |text| text_utils.isModelSafeText(text),
+        .preview => |preview| text_utils.isModelSafeText(preview.head) and text_utils.isModelSafeText(preview.tail),
+    };
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
     if (std.meta.activeTag(planned) == .preview) try bash_results.writeShape(&body.writer, stats, notice);
-    try bash_results.writePreview(&body.writer, planned, notice);
+    if (safe) {
+        try bash_results.writePreview(&body.writer, planned, notice);
+    } else {
+        try bash_results.writeBinaryNotice(&body.writer, notice);
+    }
     if (body.written().len > 0) try appendLine(alloc, out, &.{body.written()});
 }
 
@@ -1174,6 +1183,69 @@ test "formatResult puts a preview's shape line before its text" {
     const shape = std.mem.find(u8, got, "\n3000 lines match error|fail|traceback|exception\n") orelse return error.TestExpectedShapeLine;
     const first_line = std.mem.find(u8, got, "line 0 error\n") orelse return error.TestExpectedText;
     try std.testing.expect(shape < first_line);
+}
+
+test "formatResult keeps the header, shape, and notices on binary output and leaves safe previews intact" {
+    const alloc = std.testing.allocator;
+
+    // Saved binary output: header + binary notice naming the file + trailing notices.
+    const bin_out = testOutput("a\x00\xffb", .{ .file = 7 });
+    const saved_bin = try formatResult(alloc, testSnapshot("a\x00\xffb", .{ .completed = .{ .exit_code = 0 } }), 4096, &bin_out, &.{"state notice"});
+    defer alloc.free(saved_bin);
+    try std.testing.expect(text_utils.isModelSafeText(saved_bin));
+    try std.testing.expectEqualStrings(
+        "[exit 0, 1 line, 4 B, $FX_OUT/7.txt]\n[binary output, not shown; read $FX_OUT/7.txt with xxd, strings, or cat -v]\nstate notice",
+        saved_bin,
+    );
+
+    // Not-saved binary output.
+    const unsaved_out = testOutput("a\x80b", .not_saved_full);
+    const unsaved_bin = try formatResult(alloc, testSnapshot("a\x80b", .{ .completed = .{ .exit_code = 0 } }), 4096, &unsaved_out, &.{});
+    defer alloc.free(unsaved_bin);
+    try std.testing.expect(text_utils.isModelSafeText(unsaved_bin));
+    try std.testing.expectEqualStrings(
+        "[exit 0, 1 line, 3 B, not saved: the results folder is full]\n[binary output, not shown; the output was not saved]",
+        unsaved_bin,
+    );
+
+    // Running binary delta.
+    const running_bin = try formatResult(alloc, testSnapshot("a\xffb", .running), 4096, null, &.{});
+    defer alloc.free(running_bin);
+    try std.testing.expect(text_utils.isModelSafeText(running_bin));
+    try std.testing.expectEqualStrings(
+        "[binary output, not shown yet]\n[still running. Send wait_more as the whole program to wait for it.]",
+        running_bin,
+    );
+
+    // Long binary output with error shape keeps the shape line before the binary notice.
+    var long_bin: std.ArrayList(u8) = .empty;
+    defer long_bin.deinit(alloc);
+    try long_bin.appendSlice(alloc, "error\x00\n");
+    for (0..3000) |_| try long_bin.appendSlice(alloc, "line\n");
+    const long_out = testOutput(long_bin.items, .{ .file = 8 });
+    const long_got = try formatResult(alloc, testSnapshot(long_bin.items, .{ .completed = .{ .exit_code = 1 } }), 4096, &long_out, &.{});
+    defer alloc.free(long_got);
+    try std.testing.expect(text_utils.isModelSafeText(long_got));
+    try std.testing.expectEqualStrings(
+        "[exit 1, 3001 lines, 14 KB, $FX_OUT/8.txt]\n1 line matches error|fail|traceback|exception\n[binary output, not shown; read $FX_OUT/8.txt with xxd, strings, or cat -v]",
+        long_got,
+    );
+
+    // Stray non-UTF-8 byte only in the hidden middle still shows the safe preview.
+    var mid_bin: std.ArrayList(u8) = .empty;
+    defer mid_bin.deinit(alloc);
+    try mid_bin.appendSlice(alloc, "h1\nh2\n");
+    for (0..2000) |_| try mid_bin.appendSlice(alloc, "mid\n");
+    try mid_bin.appendSlice(alloc, "bad\x80byte\n");
+    for (0..2000) |_| try mid_bin.appendSlice(alloc, "mid\n");
+    try mid_bin.appendSlice(alloc, "t1\nt2\n");
+    const mid_out = testOutput(mid_bin.items, .{ .file = 9 });
+    const mid_got = try formatResult(alloc, testSnapshot(mid_bin.items, .{ .completed = .{ .exit_code = 0 } }), 4096, &mid_out, &.{});
+    defer alloc.free(mid_got);
+    try std.testing.expect(text_utils.isModelSafeText(mid_got));
+    try std.testing.expect(std.mem.find(u8, mid_got, "h1\nh2\n") != null);
+    try std.testing.expect(std.mem.find(u8, mid_got, "t1\nt2\n") != null);
+    try std.testing.expect(std.mem.find(u8, mid_got, "binary output, not shown") == null);
 }
 
 test "formatResult refuses a budget too small for its reserves" {

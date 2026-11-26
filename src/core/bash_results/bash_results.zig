@@ -366,6 +366,15 @@ pub fn writeIndexMissing(w: *Writer, saved: Saved) Writer.Error!void {
     }
 }
 
+/// Writes the notice shown in place of binary or invalid-UTF-8 output (`bash.zig`).
+pub fn writeBinaryNotice(w: *Writer, notice: Notice) Writer.Error!void {
+    switch (notice) {
+        .file => |number| try w.print("[binary output, not shown; read {s}/{d}.txt with xxd, strings, or cat -v]", .{ shown_folder, number }),
+        .not_saved => try w.writeAll("[binary output, not shown; the output was not saved]"),
+        .running => try w.writeAll("[binary output, not shown yet]"),
+    }
+}
+
 /// Writes the output: the whole text for `.whole`, otherwise the head, a note
 /// with the hidden count, and the tail.
 pub fn writePreview(w: *Writer, the_plan: Plan, notice: Notice) Writer.Error!void {
@@ -981,4 +990,20 @@ test "the bash results keep their laws on fuzzed output, split however it arrive
     try std.testing.fuzz({}, fuzzBashResults, .{
         .corpus = &(@import("fuzz_corpus").bash_results.*),
     });
+}
+
+test "writeBinaryNotice names the file, not-saved, or running notice" {
+    var out: Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeBinaryNotice(&out.writer, .{ .file = 7 });
+    try std.testing.expectEqualStrings("[binary output, not shown; read $FX_OUT/7.txt with xxd, strings, or cat -v]", out.written());
+
+    out.clearRetainingCapacity();
+    try writeBinaryNotice(&out.writer, .not_saved);
+    try std.testing.expectEqualStrings("[binary output, not shown; the output was not saved]", out.written());
+
+    out.clearRetainingCapacity();
+    try writeBinaryNotice(&out.writer, .running);
+    try std.testing.expectEqualStrings("[binary output, not shown yet]", out.written());
 }
