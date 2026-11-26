@@ -21,6 +21,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
 const model_provider = @import("../config/model_provider.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -103,6 +104,16 @@ pub const MessageAuthor = types.MessageAuthor;
 pub const SteeringMessage = struct {
     text: []u8,
     author: MessageAuthor = .user,
+    input_id: ?u64 = null,
+};
+
+/// Host persistence callbacks for crash-safe accepted user inputs.
+/// `record_accepted` runs outside `worker_mutex` because the host does I/O; it
+/// returns null on failure so admission fails open (E8).
+pub const AcceptedInputHooks = struct {
+    ctx: *anyopaque,
+    record_accepted: *const fn (ctx: *anyopaque, text: []const u8, images: []const types.ImageAttachment) ?u64,
+    record_withdrawn: *const fn (ctx: *anyopaque, input_id: u64) void,
 };
 
 /// Frees boundary messages and the slice, all from `alloc`.
@@ -124,6 +135,7 @@ pub const SteeringBoundaryResult = union(enum) {
 
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
+    input_id: ?u64 = null,
     /// The work id of main's message this prompt brings to a subagent. Its
     /// turn is saved with it, and main finds the answer by it. Owned.
     work_id: ?[]u8 = null,
@@ -173,6 +185,11 @@ pub const QueuedPrompt = struct {
     /// The request a previous fx process left unfinished, which this turn's
     /// first model request resumes.
     recovery_resume: ?types.RecoveryResume = null,
+    /// Continues a turn that yielded for an upgrade's restart, from
+    /// `recovery_checkpoint`. `recovery_resume` still decides whether the
+    /// first request goes at once or asks first; this keeps the user's own
+    /// message and the turn's pieces, with no resume note.
+    continues_yielded_turn: bool = false,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -537,6 +554,10 @@ pub const WorkerEvent = union(enum) {
     /// A turn that resumes a request a previous fx process left unfinished.
     /// Its prompt is fx's note to the model, so no user card is written.
     begin_resumed_prompt: u64,
+    /// A turn that continues one which stopped between steps for an
+    /// upgrade's restart. Its prompt is the user's own, which the replayed
+    /// transcript already shows, so no user card is written.
+    begin_continued_prompt: u64,
     append_user_feedback: []u8,
     /// A subagent's report or message a boundary took into the running
     /// turn. The screen shows it as the subagent's card, never as the user's.
@@ -615,6 +636,12 @@ pub const WorkerRuntime = struct {
     /// iteration without waiting; read once. Guarded by `worker_mutex`.
     drain_continuation_due: bool = false,
     worker_processing: bool = false,
+    /// Set when a turn begins, or goes on after the user answers its
+    /// question, its approval, or a request that waits for them;
+    /// `takeBeganWork` clears it. A turn can begin
+    /// and end between two looks at its state, as one that ends at once
+    /// after an answer does. Guarded by `worker_mutex`.
+    began_work: bool = false,
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
     /// Allocator used for active call IDs. Allocator handles are capabilities,
@@ -705,6 +732,12 @@ pub const WorkerRuntime = struct {
     /// Independent of a pending submission's turn-start hold; protects queued
     /// work until a fresh-session scrollback handoff succeeds or is cancelled.
     session_transition_held: bool = false,
+    accepted_input_hooks: ?AcceptedInputHooks = null,
+    /// Set on the main loop when an upgrade's restart waits for this agent
+    /// (Ctrl+G). The running turn reads it at each step boundary and stops
+    /// there (`Config.yield_flag`), and no other work starts while it is set,
+    /// since fx exits once every turn has stopped.
+    yield_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -1024,17 +1057,34 @@ pub const WorkerRuntime = struct {
     }
 
     /// The user answered a request that waits for them, for example with
-    /// Enter. A request that is not waiting ignores it.
+    /// Enter. A request that is not waiting ignores it. Each caller asks only
+    /// while one waits, so the turn goes on (`began_work`).
     pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_continue_requested.store(true, .seq_cst);
     }
 
     /// The sign-in fx opened for a request that waits for one closed without
     /// a new login, for example because its code expired. The request tries
     /// its saved login once more; a request that does not wait for a sign-in
-    /// ignores it.
+    /// ignores it. Its caller asks only while one waits, so the turn goes on
+    /// (`began_work`).
     pub fn requestRecoverySignInClosed(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
         self.recovery_sign_in_closed.store(true, .seq_cst);
+    }
+
+    /// A request that waited for the user goes on without a call above, as
+    /// after the out-of-credits picker's retry, or a sign-in another fx
+    /// process stored (`began_work`).
+    pub fn markBeganWork(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.began_work = true;
     }
 
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
@@ -1269,6 +1319,11 @@ pub const WorkerRuntime = struct {
         if (reserved and self.reserved_agent_messages > 0) self.reserved_agent_messages -= 1;
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
+        // An agent that stops its turn for fx's restart takes no message
+        // before fx exits, and nothing saves a message across the restart
+        // (a report stays owed in its child's log), so the caller tells
+        // the user what was dropped.
+        if (queued.mail == .message and self.yield_requested.load(.seq_cst)) return error.ReceiverRestarting;
         if (!reserved and queued.mail == .message and self.agentMessageCountLocked() >= agent_frame.queue_cap) {
             return error.QueueFull;
         }
@@ -1399,6 +1454,12 @@ pub const WorkerRuntime = struct {
                 index += 1;
                 continue;
             }
+            if (comptime runtime_profile.host.durable_sessions) {
+                if (self.queued_prompts.items[index].input_id) |input_id| {
+                    // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                    if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+                }
+            }
             const prompt = self.queued_prompts.orderedRemove(index);
             debug_trace.eventf("worker", "queued_prompt_discarded", .{ .turn_id = prompt.turn_id }, "worker={x} mail={s} remaining={d}", .{ @intFromPtr(self), @tagName(prompt.mail), self.queued_prompts.items.len });
             discardQueuedPrompt(alloc, prompt, &.{});
@@ -1430,6 +1491,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -1630,15 +1692,83 @@ pub const WorkerRuntime = struct {
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
-        if (self.worker_stop_requested) return error.WorkerStopped;
+        if (self.finalization_failure != null) {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return error.TurnFinalizationDeliveryFailed;
+        }
+        if (self.worker_stop_requested) {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return error.WorkerStopped;
+        }
         if (queued.recovery_checkpoint != null and
             !recoveryContinuationAdmission(
                 self.worker_processing,
                 self.queuedWorkCountLocked(),
             ))
         {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return error.RecoveryBusy;
+        }
+        const accepted_hooks: ?AcceptedInputHooks = if (comptime runtime_profile.host.durable_sessions) self.accepted_input_hooks else null;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        // Record accepted input outside worker_mutex because the host writes to
+        // storage and must not stall UI snapshots (R2.1).
+        if (comptime runtime_profile.host.durable_sessions) {
+            if (queued.input_id == null and
+                queued.author == .user and
+                queued.work_id == null and
+                queued.recovery_checkpoint == null and
+                queued.recovery_resume == null)
+            {
+                if (accepted_hooks) |hooks| {
+                    if (hooks.record_accepted(hooks.ctx, queued.prompt, queued.images)) |input_id| {
+                        queued.input_id = input_id;
+                    } else {
+                        debug_trace.eventf(
+                            "worker",
+                            "accepted_input_unrecorded",
+                            .{ .turn_id = queued.turn_id },
+                            "kind={s} bytes={d} reason=record_failed",
+                            .{ @tagName(queued.author), queued.prompt.len },
+                        );
+                    }
+                } else {
+                    debug_trace.eventf(
+                        "worker",
+                        "accepted_input_unrecorded",
+                        .{ .turn_id = queued.turn_id },
+                        "kind={s} bytes={d} reason=no_hook",
+                        .{ @tagName(queued.author), queued.prompt.len },
+                    );
+                }
+            }
+        }
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        var locked = true;
+        defer if (locked) self.worker_mutex.unlock(io_mod.getIo());
+        if (self.finalization_failure != null) {
+            self.worker_mutex.unlock(io_mod.getIo());
+            locked = false;
+            withdrawUnadmittedInput(accepted_hooks, queued.input_id);
+            return error.TurnFinalizationDeliveryFailed;
+        }
+        if (self.worker_stop_requested) {
+            self.worker_mutex.unlock(io_mod.getIo());
+            locked = false;
+            withdrawUnadmittedInput(accepted_hooks, queued.input_id);
+            return error.WorkerStopped;
+        }
+        if (queued.recovery_checkpoint != null and
+            !recoveryContinuationAdmission(
+                self.worker_processing,
+                self.queuedWorkCountLocked(),
+            ))
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            locked = false;
+            withdrawUnadmittedInput(accepted_hooks, queued.input_id);
             return error.RecoveryBusy;
         }
         queued.agent_settings = self.agent_turn_settings;
@@ -1656,7 +1786,12 @@ pub const WorkerRuntime = struct {
             queued.delivery = .continuation;
             debug_trace.eventf("worker", "steering_behind_waiting", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} queue_depth={d}", .{ queued.turn_id, self.queuedWorkCountLocked() });
         }
-        try self.enqueuePromptLocked(alloc, queued);
+        self.enqueuePromptLocked(alloc, queued) catch |err| {
+            self.worker_mutex.unlock(io_mod.getIo());
+            locked = false;
+            withdrawUnadmittedInput(accepted_hooks, queued.input_id);
+            return err;
+        };
         if (steer_if_active and self.worker_processing) {
             debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} compaction_active={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), self.compactionInFlightLocked(), interrupt_after_admission });
         }
@@ -1667,6 +1802,13 @@ pub const WorkerRuntime = struct {
             if (!joins) self.handed_off_turn_id = self.active_turn_id;
             self.worker_cancel_requested.store(true, .seq_cst);
         }
+    }
+
+    fn withdrawUnadmittedInput(accepted_hooks: ?AcceptedInputHooks, maybe_id: ?u64) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        const input_id = maybe_id orelse return;
+        const hooks = accepted_hooks orelse return;
+        hooks.record_withdrawn(hooks.ctx, input_id);
     }
 
     /// Whether the steering preview shows `prompt` while it waits for the
@@ -1900,7 +2042,7 @@ pub const WorkerRuntime = struct {
         }
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
-            messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author };
+            messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author, .input_id = prompt.input_id };
             copied += 1;
             // Every steer the turn takes gets its card, a parent's too, so the screen shows what the model read.
             const text = try alloc.dupe(u8, prompt.prompt);
@@ -2167,6 +2309,20 @@ pub const WorkerRuntime = struct {
         return true;
     }
 
+    /// Asks the running turn to stop at its next step boundary and holds
+    /// every queued work, for an upgrade's restart. There is no release: the
+    /// process exits once every turn has stopped.
+    pub fn requestYield(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.yield_requested.store(true, .seq_cst);
+        // A turn blocked in the subagent `wait` tool returns, so it reaches
+        // its step boundary without waiting for the subagent's report.
+        self.mail_nudged = true;
+        self.worker_cond.broadcast(io_mod.getIo());
+        debug_trace.logf("worker", "event=yield_requested processing={} queued={d}", .{ self.worker_processing, self.queuedWorkCountLocked() });
+    }
+
     /// Whether the queued prompt for `turn_id` carries the stale shell
     /// handles note, so a caller that removes it can give the note back.
     pub fn queuedPromptCarriesStaleShellHandles(self: *WorkerRuntime, turn_id: u64) bool {
@@ -2337,6 +2493,12 @@ pub const WorkerRuntime = struct {
         var removed: ?QueuedPrompt = null;
         for (self.queued_prompts.items, 0..) |queued, index| {
             if (queued.turn_id != turn_id) continue;
+            if (comptime runtime_profile.host.durable_sessions) {
+                if (queued.input_id) |input_id| {
+                    // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                    if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+                }
+            }
             removed = self.queued_prompts.orderedRemove(index);
             break;
         }
@@ -2389,6 +2551,13 @@ pub const WorkerRuntime = struct {
         const remove_index = retractable orelse return null;
 
         const text = try alloc.dupe(u8, self.queued_prompts.items[remove_index].prompt);
+        errdefer alloc.free(text);
+        if (comptime runtime_profile.host.durable_sessions) {
+            if (self.queued_prompts.items[remove_index].input_id) |input_id| {
+                // Lock order: worker_mutex before write_mutex; session teardown clears hooks before locking write_mutex.
+                if (self.accepted_input_hooks) |hooks| hooks.record_withdrawn(hooks.ctx, input_id);
+            }
+        }
         const prompt = self.queued_prompts.orderedRemove(remove_index);
         if (self.queued_prompts.items.len == 0) {
             types.freeHistoryTurnSlice(alloc, self.queued_history);
@@ -2421,7 +2590,8 @@ pub const WorkerRuntime = struct {
             // Leftover steering is not work: with only that queued, wait on.
             if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
             const gate_ms = self.commitGateRemainingMsLocked();
-            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or gate_ms != null) and
+            if (!((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held or
+                gate_ms != null or self.yield_requested.load(.seq_cst)) and
                 !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -2445,7 +2615,8 @@ pub const WorkerRuntime = struct {
             const gate_ms = self.commitGateRemainingMsLocked();
             if (!(((self.queued_prompts.items.len == 0 and
                 self.queued_context_compaction == null) or self.turn_start_held or
-                self.session_transition_held or gate_ms != null) and !self.worker_stop_requested)) break;
+                self.session_transition_held or gate_ms != null or self.yield_requested.load(.seq_cst)) and
+                !self.worker_stop_requested)) break;
             self.worker_processing = false;
             self.active_turn_id = 0;
             self.tool_phase_step_id = null;
@@ -2501,7 +2672,8 @@ pub const WorkerRuntime = struct {
         if (self.hands_back_leftover_feedback) self.handBackLeftoverFeedbackLocked(alloc);
         if (self.queued_prompts.items.len == 0 or
             self.turn_start_held or self.session_transition_held or
-            self.worker_stop_requested or self.commitGateRemainingMsLocked() != null)
+            self.worker_stop_requested or self.commitGateRemainingMsLocked() != null or
+            self.yield_requested.load(.seq_cst))
         {
             return null;
         }
@@ -2515,7 +2687,7 @@ pub const WorkerRuntime = struct {
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
             self.session_transition_held or self.worker_stop_requested or
-            self.commitGateRemainingMsLocked() != null)
+            self.commitGateRemainingMsLocked() != null or self.yield_requested.load(.seq_cst))
         {
             return null;
         }
@@ -2529,6 +2701,7 @@ pub const WorkerRuntime = struct {
             self.turn_cancel_requested.store(false, .seq_cst);
             self.worker_cancel_requested.store(false, .seq_cst);
             self.worker_processing = true;
+            self.began_work = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
             self.clearToolYieldLocked();
@@ -2564,7 +2737,11 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_resume != null) {
+        if (queued.continues_yielded_turn) {
+            try self.worker_events.append(alloc, .{
+                .begin_continued_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_resume != null) {
             try self.worker_events.append(alloc, .{
                 .begin_resumed_prompt = queued.turn_id,
             });
@@ -2573,7 +2750,7 @@ pub const WorkerRuntime = struct {
                 .begin_presented_prompt = queued.turn_id,
             });
         } else if (queued.recovery_checkpoint == null) {
-            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .work_id = queued.work_id, .author = queued.author });
+            const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images, .work_id = queued.work_id, .author = queued.author, .input_id = queued.input_id });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
@@ -2599,6 +2776,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -2669,6 +2847,7 @@ pub const WorkerRuntime = struct {
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_processing = true;
+        self.began_work = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
         self.clearToolYieldLocked();
@@ -2804,6 +2983,15 @@ pub const WorkerRuntime = struct {
         return self.worker_processing;
     }
 
+    /// Whether a turn began or went on since the last call (`began_work`).
+    /// The main loop's Herdr reconcile is its one reader.
+    pub fn takeBeganWork(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        defer self.began_work = false;
+        return self.began_work;
+    }
+
     pub fn snapshotState(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -2889,6 +3077,24 @@ pub const WorkerRuntime = struct {
         }
         snapshot.messages = messages;
         return snapshot;
+    }
+
+    pub fn setAcceptedInputHooks(self: *WorkerRuntime, hooks: ?AcceptedInputHooks) void {
+        if (comptime !runtime_profile.host.durable_sessions) return;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.accepted_input_hooks = hooks;
+    }
+
+    pub fn countPendingAcceptedUserPrompts(self: *WorkerRuntime) usize {
+        if (comptime !runtime_profile.host.durable_sessions) return 0;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.queued_prompts.items) |queued| {
+            if (queued.author == .user and queued.input_id != null) count += 1;
+        }
+        return count;
     }
 
     pub fn queuedPromptCount(self: *WorkerRuntime) usize {
@@ -3504,6 +3710,7 @@ pub const WorkerRuntime = struct {
             return blocked;
         }
         std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.began_work = true;
         return .accepted;
     }
 
@@ -3539,6 +3746,7 @@ pub const WorkerRuntime = struct {
             return err;
         };
         std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.began_work = true;
         return .accepted;
     }
 
@@ -3702,6 +3910,9 @@ pub const WorkerRuntime = struct {
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = new_response;
         if (answers != null) {
+            // A route-recovery picker's answer can end the turn; its asker
+            // marks the one that goes on (`markBeganWork`).
+            if (self.pending_question_shared.?.source != .route_recovery) self.began_work = true;
             if (on_resume) |observer| observer.run(observer.ctx);
         }
         self.worker_cond.broadcast(io_mod.getIo());
@@ -5150,6 +5361,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
+        .begin_continued_prompt => |turn_id| .{ .begin_continued_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .append_agent_message => |text| .{ .append_agent_message = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
@@ -5245,7 +5457,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt, .begin_resumed_prompt => {},
+        .begin_presented_prompt, .begin_resumed_prompt, .begin_continued_prompt => {},
         .append_user_feedback, .append_agent_message => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -5958,6 +6170,22 @@ test "interactive prompt after explicit cancellation starts a new visible turn" 
         }
         runtime.finishProcessing();
     }
+}
+
+test "a turn that continues a yielded one begins as continued, not resumed" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var prompt = try makePrompt(alloc, "ok", "model");
+    prompt.turn_id = 42;
+    prompt.recovery_resume = .{};
+    prompt.continues_yielded_turn = true;
+    try runtime.enqueuePrompt(alloc, prompt);
+    const next = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, next);
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expectEqual(@as(u64, 42), runtime.worker_events.items[0].begin_continued_prompt);
+    runtime.finishProcessing();
 }
 
 test "sequential tool lifecycle does not inspect compatible allocator context identities" {
@@ -7108,6 +7336,30 @@ test "another agent's messages past the cap are refused, and reports never are" 
     runtime.releaseAgentMessage();
     try std.testing.expect(runtime.reserveAgentMessage());
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a message to an agent that stops for fx's restart is refused, and a report still waits" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    runtime.requestYield();
+    // The message's place was held before the yield.
+    try std.testing.expect(runtime.reserveAgentMessage());
+    var message = try makePrompt(alloc, "a message", "model");
+    message.mail = .message;
+    try std.testing.expectError(error.ReceiverRestarting, runtime.postReservedMail(alloc, message));
+    freeQueuedPrompt(alloc, message);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.testing.expectEqual(@as(usize, 0), runtime.reserved_agent_messages);
+
+    // A report still queues: it stays owed in its child's log and comes again after the restart.
+    var report = try makePrompt(alloc, "a report", "model");
+    report.mail = .report;
+    try runtime.postMail(alloc, report);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "a user's stop drops other agents' messages waiting in the queue, and keeps reports and the user's prompts" {
@@ -9594,6 +9846,64 @@ test "question resume observer runs only for accepted answers before releasing t
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
+test "a turn's start, an accepted answer or approval, and a continued request mark began work until it is taken" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(!runtime.takeBeganWork());
+
+    try std.testing.expect(runtime.beginDirectProcessing(1));
+    try std.testing.expect(runtime.takeBeganWork());
+    try std.testing.expect(!runtime.takeBeganWork());
+
+    runtime.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    try std.testing.expect(runtime.takeBeganWork());
+
+    var state = PermissionThreadState{};
+    const thread = try std.Thread.spawn(.{}, runPermissionRequest, .{ &state, &runtime, "Allow?" });
+    const request_id = try waitForPermissionLabel(&runtime, "Allow?");
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.accepted,
+        submitPermissionDecisionForTest(&runtime, request_id, .once),
+    );
+    thread.join();
+    try std.testing.expect(runtime.takeBeganWork());
+
+    // Enter, a sign-in, or the parent's message continues a request that
+    // waits for the user.
+    runtime.requestRecoveryContinue();
+    try std.testing.expect(runtime.recovery_continue_requested.load(.seq_cst));
+    try std.testing.expect(runtime.takeBeganWork());
+
+    // A sign-in that closed without a login tries the saved one again.
+    runtime.requestRecoverySignInClosed();
+    try std.testing.expect(runtime.recovery_sign_in_closed.load(.seq_cst));
+    try std.testing.expect(runtime.takeBeganWork());
+
+    runtime.finishProcessing();
+
+    // An answer to a route-recovery picker marks nothing by itself: only the
+    // choice that goes on does.
+    var picker = WorkerRuntime{};
+    defer picker.deinit(alloc);
+    picker.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .route_recovery);
+    try picker.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
+    try std.testing.expect(picker.pending_question_response == .answered);
+    try std.testing.expect(!picker.takeBeganWork());
+    picker.markBeganWork();
+    try std.testing.expect(picker.takeBeganWork());
+
+    // A cancelled question ends its turn: no work goes on.
+    var cancelled = WorkerRuntime{};
+    defer cancelled.deinit(alloc);
+    cancelled.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+    try cancelled.submitQuestionBatchAnswer(alloc, null, null);
+    try std.testing.expect(!cancelled.takeBeganWork());
+}
+
 test "question batch source distinguishes route recovery from agent questions" {
     const alloc = std.testing.allocator;
     const options = [_]types.QuestionOption{.{ .label = "Try again later", .description = null }};
@@ -9740,6 +10050,26 @@ test "session transition hold keeps an existing queued prompt until released" {
     defer freeQueuedPrompt(alloc, prompt);
     try std.testing.expectEqualStrings("queued", prompt.prompt);
     try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+}
+
+test "a yield request holds queued work and stays held" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "test/model"));
+    runtime.requestYield();
+    try std.testing.expect(runtime.yield_requested.load(.seq_cst));
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+    // The held prompt stays queued for the process to drop when it exits.
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "a yield request ends a wait for subagent mail" {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.requestYield();
+    try std.testing.expectEqual(WorkerRuntime.PostWake.nudged, runtime.waitForPostOrNudge());
 }
 
 test "a time-bounded put-back hands its segment scan to the next take only" {
@@ -11135,4 +11465,352 @@ test "the commit gate logs a finish the app dropped, with its reason" {
     try std.testing.expect(std.mem.find(u8, trace, "event=commit_gate_finish_dropped") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=cancel") != null);
     try std.testing.expect(std.mem.find(u8, trace, "reason=events_discarded") != null);
+}
+
+test "eb03: record_accepted runs unlocked before prompt enters queue snapshot and carries input_id" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        alloc: std.mem.Allocator,
+        runtime: *WorkerRuntime,
+        next_id: u64 = 100,
+        accept_calls: usize = 0,
+        saw_unlocked: bool = false,
+        saw_absent_from_snapshot: bool = false,
+
+        fn recordAccepted(raw: *anyopaque, text: []const u8, _: []const types.ImageAttachment) ?u64 {
+            _ = text;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.accept_calls += 1;
+            if (self.runtime.worker_mutex.tryLock()) {
+                self.saw_unlocked = true;
+                self.runtime.worker_mutex.unlock(io_mod.getIo());
+            }
+            var snap = self.runtime.snapshotSteeringPresentation(self.alloc) catch return null;
+            defer snap.deinit(self.alloc);
+            self.saw_absent_from_snapshot = snap.messages.len == 0;
+            self.next_id += 1;
+            return self.next_id;
+        }
+
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = HookState{ .alloc = alloc, .runtime = &runtime };
+    runtime.accepted_input_hooks = .{
+        .ctx = &state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 7,
+        .phase = .running,
+    } });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer now", "model"));
+    try std.testing.expectEqual(@as(usize, 1), state.accept_calls);
+    try std.testing.expect(state.saw_unlocked);
+    try std.testing.expect(state.saw_absent_from_snapshot);
+
+    var snap = try runtime.snapshotSteeringPresentation(alloc);
+    defer snap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snap.messages.len);
+    try std.testing.expectEqualStrings("steer now", snap.messages[0]);
+
+    const boundary = try runtime.takeSteeringBoundary(alloc, 41, .model);
+    const messages = switch (boundary) {
+        .continue_turn => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer freeSteeringMessages(alloc, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(?u64, 101), messages[0].input_id);
+
+    runtime.finishProcessing();
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "next turn prompt", "model"));
+    try std.testing.expectEqual(@as(usize, 2), state.accept_calls);
+    const work = (try runtime.tryTakeNextWork(alloc)) orelse return error.TestUnexpectedResult;
+    defer freeWorkItem(alloc, work);
+    try std.testing.expectEqual(@as(?u64, 102), work.prompt.input_id);
+}
+
+test "eb03: record_accepted fail-open on null return or unset hook traces kind and size without text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "eb03-failopen.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "worker");
+
+    const FailingHook = struct {
+        calls: usize = 0,
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return null;
+        }
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+
+    const secret_one = "secret-prompt-alpha";
+    const secret_two = "secret-prompt-beta";
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var failing_hook = FailingHook{};
+    runtime.accepted_input_hooks = .{
+        .ctx = &failing_hook,
+        .record_accepted = FailingHook.recordAccepted,
+        .record_withdrawn = FailingHook.recordWithdrawn,
+    };
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, secret_one, "model"));
+    try std.testing.expectEqual(@as(usize, 1), failing_hook.calls);
+    const first = (try runtime.tryTakeNextWork(alloc)) orelse return error.TestUnexpectedResult;
+    defer freeWorkItem(alloc, first);
+    try std.testing.expectEqual(@as(?u64, null), first.prompt.input_id);
+    runtime.finishProcessing();
+
+    runtime.accepted_input_hooks = null;
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, secret_two, "model"));
+    const second = (try runtime.tryTakeNextWork(alloc)) orelse return error.TestUnexpectedResult;
+    defer freeWorkItem(alloc, second);
+    try std.testing.expectEqual(@as(?u64, null), second.prompt.input_id);
+
+    debug_trace.shutdown();
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event=accepted_input_unrecorded") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "kind=user") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "bytes=19") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "bytes=18") != null);
+    try std.testing.expect(std.mem.find(u8, trace, secret_one) == null);
+    try std.testing.expect(std.mem.find(u8, trace, secret_two) == null);
+}
+
+test "eb03: child mail, parent steering, work_id task, and recovery resume never call record_accepted" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        calls: usize = 0,
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 999;
+        }
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = HookState{};
+    runtime.accepted_input_hooks = .{
+        .ctx = &state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    var child_prompt = try makePrompt(alloc, "child report", "model");
+    child_prompt.author = .child;
+    child_prompt.mail = .report;
+    try runtime.admitInteractivePrompt(alloc, child_prompt);
+
+    var parent_prompt = try makePrompt(alloc, "parent steer", "model");
+    parent_prompt.author = .parent;
+    try runtime.admitInteractivePrompt(alloc, parent_prompt);
+
+    var work_prompt = try makePrompt(alloc, "subagent task", "model");
+    work_prompt.author = .user;
+    work_prompt.work_id = try alloc.dupe(u8, "work-1");
+    try runtime.enqueuePrompt(alloc, work_prompt);
+
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    for (runtime.queued_prompts.items) |queued| {
+        try std.testing.expectEqual(@as(?u64, null), queued.input_id);
+    }
+}
+
+test "eb03: recovery_resume prompt never calls record_accepted and gets no input_id" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        calls: usize = 0,
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 999;
+        }
+        fn recordWithdrawn(_: *anyopaque, _: u64) void {}
+    };
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = HookState{};
+    runtime.accepted_input_hooks = .{
+        .ctx = &state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    var resume_prompt = try makePrompt(alloc, "Resuming the interrupted request.", "model");
+    resume_prompt.author = .user;
+    resume_prompt.recovery_resume = .{};
+    try runtime.enqueuePrompt(alloc, resume_prompt);
+
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+    try std.testing.expectEqual(@as(?u64, null), runtime.queued_prompts.items[0].input_id);
+}
+
+test "eb03: record_withdrawn runs before removal on retract and discard paths, and not on session transition or demotion" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        runtime: *WorkerRuntime,
+        next_id: u64 = 0,
+        withdrawn_ids: [8]u64 = @splat(0),
+        withdrawn_count: usize = 0,
+        still_present_at_withdraw: [8]bool = @splat(false),
+
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.next_id += 1;
+            return self.next_id;
+        }
+
+        fn recordWithdrawn(raw: *anyopaque, input_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const idx = self.withdrawn_count;
+            if (idx < self.withdrawn_ids.len) {
+                self.withdrawn_ids[idx] = input_id;
+                var present = false;
+                for (self.runtime.queued_prompts.items) |p| {
+                    if (p.input_id == input_id) present = true;
+                }
+                self.still_present_at_withdraw[idx] = present;
+            }
+            self.withdrawn_count += 1;
+        }
+    };
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = HookState{ .runtime = &runtime };
+    runtime.accepted_input_hooks = .{
+        .ctx = &state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    // 1. Retract via popQueuedSteerForEdit: record_withdrawn runs before removal.
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{ .turn_id = 41, .step_id = 7, .phase = .running } });
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "retract me", "model"));
+    const retracted = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    alloc.free(retracted);
+    try std.testing.expectEqual(@as(usize, 1), state.withdrawn_count);
+    try std.testing.expectEqual(@as(u64, 1), state.withdrawn_ids[0]);
+    try std.testing.expect(state.still_present_at_withdraw[0]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+
+    // 2. Cancel via removeQueuedPrompt: record_withdrawn runs before removal.
+    runtime.finishProcessing();
+    var cancel_prompt = try makePrompt(alloc, "cancel me", "model");
+    cancel_prompt.turn_id = 55;
+    try runtime.enqueuePrompt(alloc, cancel_prompt);
+    try std.testing.expect(runtime.removeQueuedPrompt(alloc, 55, &.{}));
+    try std.testing.expectEqual(@as(usize, 2), state.withdrawn_count);
+    try std.testing.expectEqual(@as(u64, 2), state.withdrawn_ids[1]);
+    try std.testing.expect(state.still_present_at_withdraw[1]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+
+    // 3. Discard via discardQueuedWhere: record_withdrawn runs before removal.
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "discard me", "model"));
+    const DropAll = struct {
+        fn decide(_: void, _: usize, _: *const QueuedPrompt) bool {
+            return true;
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1), runtime.discardQueuedWhere(alloc, {}, DropAll.decide));
+    try std.testing.expectEqual(@as(usize, 3), state.withdrawn_count);
+    try std.testing.expectEqual(@as(u64, 3), state.withdrawn_ids[2]);
+    try std.testing.expect(state.still_present_at_withdraw[2]);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+
+    // 4. Demotion on finishProcessing keeps prompt in queue and calls nothing.
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 42;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{ .turn_id = 42, .step_id = 1, .phase = .running } });
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "demoted prompt", "model"));
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(usize, 3), state.withdrawn_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    try std.testing.expectEqual(@as(?u64, 4), runtime.queued_prompts.items[0].input_id);
+
+    // 5. Session transition clear and clearQueuedPrompts keep records (E13): no withdraw.
+    runtime.clearQueuedPromptsForSessionTransition(alloc, 42, &.{});
+    try std.testing.expectEqual(@as(usize, 3), state.withdrawn_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "switch during idle", "model"));
+    runtime.clearQueuedPrompts(alloc, &.{});
+    try std.testing.expectEqual(@as(usize, 3), state.withdrawn_count);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "eb03: admitPrompt OOM rolls back accepted input and popQueuedSteerForEdit OOM does not withdraw" {
+    const alloc = std.testing.allocator;
+    const HookState = struct {
+        next_id: u64 = 200,
+        withdrawn_count: usize = 0,
+        last_withdrawn: u64 = 0,
+
+        fn recordAccepted(raw: *anyopaque, _: []const u8, _: []const types.ImageAttachment) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.next_id += 1;
+            return self.next_id;
+        }
+        fn recordWithdrawn(raw: *anyopaque, input_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.withdrawn_count += 1;
+            self.last_withdrawn = input_id;
+        }
+    };
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var state = HookState{};
+    runtime.accepted_input_hooks = .{
+        .ctx = &state,
+        .record_accepted = HookState.recordAccepted,
+        .record_withdrawn = HookState.recordWithdrawn,
+    };
+
+    // 1. Failing enqueuePrompt rolls back the accepted id via record_withdrawn.
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    const prompt = try makePrompt(alloc, "oom prompt", "model");
+    defer freeQueuedPrompt(alloc, prompt);
+    try std.testing.expectError(error.OutOfMemory, runtime.enqueuePrompt(failing.allocator(), prompt));
+    try std.testing.expectEqual(@as(usize, 1), state.withdrawn_count);
+    try std.testing.expectEqual(@as(u64, 201), state.last_withdrawn);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+
+    // 2. Failing popQueuedSteerForEdit does not withdraw and leaves prompt queued.
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{ .turn_id = 41, .step_id = 7, .phase = .running } });
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "stay queued", "model"));
+    var retract_fail = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runtime.popQueuedSteerForEdit(retract_fail.allocator()));
+    try std.testing.expectEqual(@as(usize, 1), state.withdrawn_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    try std.testing.expectEqual(@as(?u64, 202), runtime.queued_prompts.items[0].input_id);
 }

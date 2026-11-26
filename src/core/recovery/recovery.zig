@@ -70,6 +70,12 @@ pub const Start = struct {
     /// dated in the future, with or without a record. fx reads the wall
     /// clock, which the module never does.
     stale: bool = false,
+    /// The request continues a turn that fx stopped between steps for its
+    /// host's restart, at the save before this send, so nothing went out for
+    /// it. The record's questions and death count still apply; then the
+    /// planned send goes out with no new attempt and nothing on the status
+    /// line (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
+    continues: bool = false,
 };
 
 pub const Failure = struct {
@@ -293,6 +299,7 @@ fn resumeFrom(state: *State, saved: State, start: Start, now_ms: u64) Plan {
         // decode guarantees a need for need_user; resending is the safe fallback.
         if (saved.need) |need| return askUser(state, need, now_ms);
     }
+    if (start.continues) return sendPlanned(state, now_ms);
     state.retry_label = .resuming;
     return sendNow(state, now_ms, .{});
 }
@@ -455,6 +462,16 @@ fn sendNow(state: *State, now_ms: u64, extra: Send) Plan {
         .send = send,
         .status = show(state, retryingStatus(state)),
     };
+}
+
+/// Sends the request a host's restart stopped before it went out: its
+/// attempt stays, and the status line shows nothing, as for a new
+/// request (`tests/tla/recovery/Recovery.tla` NoFalseAlarm).
+fn sendPlanned(state: *State, now_ms: u64) Plan {
+    state.phase = .sending;
+    state.flowing = false;
+    state.sent_ms = now_ms;
+    return .{ .save = encode(state, now_ms), .send = .{ .no_fast = state.flags.no_fast } };
 }
 
 /// A transient failure always waits before the next send
@@ -1386,6 +1403,65 @@ test "a closed window resumes without a question" {
         try testing.expect(startsWith(resumed.status.?.text.slice(), "Resuming the interrupted request · attempt "));
         try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
     }
+}
+
+test "a request that continues a turn stopped for a restart shows nothing and keeps its attempt" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    // fx stops the turn at the save before this send, for its restart.
+    const record = step(&state, .closing, 100).save.?;
+    state = .{};
+    const continued = step(&state, .{ .start = .{ .resume_from = record, .continues = true } }, 5_000);
+    try testing.expect(continued.save != null);
+    try testing.expect(continued.send != null);
+    try testing.expect(continued.status == null);
+    try testing.expectEqual(@as(u8, 1), state.attempt);
+    try testing.expectEqual(@as(u8, 0), state.abrupt_deaths);
+
+    // A paused retry's resend that a restart stopped keeps its attempt too.
+    state = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .dropped, 1_000);
+    _ = tickUntilSend(&state, 1_000);
+    const attempt = state.attempt;
+    const resend = step(&state, .closing, 5_000).save.?;
+    state = .{};
+    const again = step(&state, .{ .start = .{ .resume_from = resend, .continues = true } }, 9_000);
+    try testing.expect(again.send != null);
+    try testing.expect(again.status == null);
+    try testing.expectEqual(attempt, state.attempt);
+}
+
+test "a continued request still asks first when its record is a day old" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    const record = step(&state, .closing, 100).save.?;
+    state = .{};
+    const asked = step(&state, .{ .start = .{ .resume_from = record, .stale = true, .continues = true } }, 50);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Need.stale, asked.status.?.need.?);
+}
+
+test "a continued request keeps its death count, so the next abrupt death asks" {
+    var state: State = .{};
+    var record = startNew(&state, 0, false).save.?;
+    // One abrupt death with the send in flight.
+    state = .{};
+    const first = step(&state, .{ .start = .{ .resume_from = record } }, 50);
+    try testing.expect(first.send != null);
+    try testing.expectEqual(@as(u8, 1), state.abrupt_deaths);
+    // fx stops the resent request for a restart and continues it.
+    record = step(&state, .closing, 60).save.?;
+    state = .{};
+    const continued = step(&state, .{ .start = .{ .resume_from = record, .continues = true } }, 70);
+    try testing.expect(continued.send != null);
+    try testing.expectEqual(@as(u8, 1), state.abrupt_deaths);
+    // A second abrupt death with that send in flight asks once.
+    record = continued.save.?;
+    state = .{};
+    const asked = step(&state, .{ .start = .{ .resume_from = record } }, 80);
+    try testing.expect(asked.send == null);
+    try testing.expectEqual(Status.Need.crash_loop, asked.status.?.need.?);
 }
 
 test "a record more than a day old asks before resending" {
