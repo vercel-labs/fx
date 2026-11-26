@@ -5117,9 +5117,10 @@ fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: Que
 const UserAnswer = enum { resend, cancelled, switch_model };
 
 /// Reads the provider, model and capabilities a subagent's continued request
-/// runs with: the copy its worker holds, handed over by the view's picker
-/// (`tests/tla/subagent/ViewWaits.tla` ModelChosen). A root request keeps the
-/// copy it started with, so only a non-root origin calls this.
+/// runs with: the pick its worker holds for this one wait, taken so no later
+/// request can use it (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly).
+/// A root request keeps the copy it started with, so only a non-root origin
+/// calls this.
 fn applyContinuedSelection(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,

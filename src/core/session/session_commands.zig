@@ -1172,8 +1172,7 @@ pub fn Commands(comptime App: type) type {
                 // (`tests/tla/subagent/ViewWaits.tla` ModelChosen).
                 const waits_for_user = if (comptime @hasDecl(App, "requestWaitsForUser")) app.requestWaitsForUser(target) else false;
                 if (waits_for_user) {
-                    target.worker.setContinueSelection(std.heap.c_allocator, provider_runtime.providerOf(app, target), model) catch |err|
-                        debug_trace.logf("host", "continue selection not handed over err={s}", .{@errorName(err)});
+                    target.worker.setContinueSelection(provider_runtime.providerOf(app, target), model);
                     if (comptime @hasDecl(@TypeOf(target.worker), "requestRecoveryContinue")) target.worker.requestRecoveryContinue();
                 }
             }

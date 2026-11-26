@@ -592,11 +592,20 @@ pub const HeadSegmentScan = union(enum) {
     pub const fresh: HeadSegmentScan = .{ .turn = null };
 };
 
+/// The longest model id a wait's pick keeps; a longer one is dropped with a
+/// trace, because a cut model id would name another model.
+pub const continue_model_max_bytes: usize = 256;
+
 /// The provider and model a waiting request continues with, owned by the
 /// worker that received it.
 pub const ContinueSelection = struct {
-    provider: model_provider.ProviderId,
-    model: []u8,
+    provider: model_provider.ProviderId = .gateway,
+    model_len: usize = 0,
+    model: [continue_model_max_bytes]u8 = undefined,
+
+    pub fn modelText(self: *const ContinueSelection) []const u8 {
+        return self.model[0..self.model_len];
+    }
 };
 
 pub const WorkerRuntime = struct {
@@ -647,9 +656,10 @@ pub const WorkerRuntime = struct {
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// The provider and model a view's picker chose for a waiting request,
+    /// The provider and model a view's picker chose for one waiting request,
     /// handed over under `worker_mutex` so the worker thread never reads the
-    /// view's strings (`tests/tla/subagent/ViewWaits.tla` ModelChosen).
+    /// view's strings, and taken by that wait's continue only
+    /// (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly).
     continue_selection: ?ContinueSelection = null,
     /// Set when the sign-in fx opened for a waiting request closes without
     /// a new login; the request's recovery reads and clears it
@@ -880,10 +890,7 @@ pub const WorkerRuntime = struct {
         if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
         self.clearActiveToolCallsLocked();
-        if (self.continue_selection) |selection| {
-            alloc.free(selection.model);
-            self.continue_selection = null;
-        }
+        self.continue_selection = null;
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
@@ -2581,6 +2588,7 @@ pub const WorkerRuntime = struct {
         self.steering_cancel_turn_id = null;
         self.turn_cancel_requested.store(false, .seq_cst);
         self.worker_cancel_requested.store(false, .seq_cst);
+        self.dropContinueSelectionLocked();
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
@@ -2974,22 +2982,38 @@ pub const WorkerRuntime = struct {
     /// Hands this worker the provider and model its waiting request continues
     /// with, as the view's picker chose them, so the worker thread reads its
     /// own copy rather than the view's strings (`ViewWaits.tla` ModelChosen).
-    pub fn setContinueSelection(self: *WorkerRuntime, alloc: std.mem.Allocator, provider: model_provider.ProviderId, model: []const u8) !void {
-        const model_copy = try alloc.dupe(u8, model);
-        errdefer alloc.free(model_copy);
+    pub fn setContinueSelection(self: *WorkerRuntime, provider: model_provider.ProviderId, model: []const u8) void {
+        if (model.len > continue_model_max_bytes) {
+            debug_trace.logf("worker", "continue selection dropped reason=model_too_long bytes={d}", .{model.len});
+            return;
+        }
+        var selection: ContinueSelection = .{ .provider = provider, .model_len = model.len };
+        @memcpy(selection.model[0..model.len], model);
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.continue_selection) |old| alloc.free(old.model);
-        self.continue_selection = .{ .provider = provider, .model = model_copy };
+        self.continue_selection = selection;
     }
 
-    /// A copy of the selection set above, allocated from `alloc` so it
-    /// outlives the lock. Null when the view chose none.
-    pub fn continueSelection(self: *WorkerRuntime, alloc: std.mem.Allocator) !?ContinueSelection {
+    /// Takes the selection set above, for one continue: the worker forgets it,
+    /// so no later request can use it, and gives the caller a copy from
+    /// `alloc` (`tests/tla/subagent/ViewWaits.tla` PickForItsWaitOnly). Null
+    /// when the view chose none.
+    pub fn takeContinueSelection(self: *WorkerRuntime) ?ContinueSelection {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         const selection = self.continue_selection orelse return null;
-        return .{ .provider = selection.provider, .model = try alloc.dupe(u8, selection.model) };
+        self.continue_selection = null;
+        return selection;
+    }
+
+    /// Drops a selection no continue took, so it can never decide a later
+    /// request. Called as a turn starts: every path that ends a wait without a
+    /// continue, such as a stop, a close or a cancel, ends or leaves the turn,
+    /// and a closed worker is deinit'd (`ViewWaits.tla` PickForItsWaitOnly).
+    fn dropContinueSelectionLocked(self: *WorkerRuntime) void {
+        if (self.continue_selection == null) return;
+        self.continue_selection = null;
+        debug_trace.logf("worker", "continue selection dropped reason=turn_started", .{});
     }
 
     /// Whether a request that waits for the person asked to continue and has
@@ -4129,6 +4153,31 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "wait card: the continue selection is taken once, then gone" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.setContinueSelection(.gateway, "openai/gpt-5-mini");
+
+    const taken = runtime.takeContinueSelection() orelse return error.TestExpectedSelection;
+    try std.testing.expectEqualStrings("openai/gpt-5-mini", taken.modelText());
+    // The pick was for one wait's continue: the next take finds none.
+    try std.testing.expect(runtime.takeContinueSelection() == null);
+}
+
+test "wait card: a continue selection left untaken does not survive into the next turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "next task", "openai/gpt-5"));
+    runtime.setContinueSelection(.gateway, "openai/gpt-5-mini");
+
+    // A new turn starts: a choice made for an older wait is gone.
+    const job = (try runtime.tryTakeNextPrompt(alloc)) orelse return error.TestExpectedPrompt;
+    freeQueuedPrompt(alloc, job);
+    try std.testing.expect(runtime.takeContinueSelection() == null);
 }
 
 test "a reader never sees the summary's count fall while the worker writes it" {

@@ -361,9 +361,9 @@ pub const AgentRuntimeDeps = struct {
     /// Asks the user what to do when the account is out of credits, and
     /// blocks until they answer. Only the TUI sets it.
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
-    /// The provider and model a waiting request continues with, read from
-    /// the worker's own copy so the worker thread never touches the view's
-    /// strings. Null: the request keeps the job's model.
+    /// The provider and model a waiting request continues with, taken once
+    /// from the worker's own copy so the worker thread never touches the
+    /// view's strings. Null: the request keeps the job's model.
     continue_selection: ?*const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?CurrentSelection = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,

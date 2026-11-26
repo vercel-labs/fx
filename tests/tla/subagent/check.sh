@@ -316,6 +316,7 @@ ViewWaits view-waits-mutant-main-answers MainOnlyTellsOrStops
 ViewWaits view-waits-mutant-view-only OwnScreenActable
 ViewWaits view-waits-mutant-row-as-wait ShownOnlyWhileWaiting
 ViewWaits view-waits-mutant-lend-under-picker CardYieldsToPicker
+ViewWaits view-waits-mutant-stale-pick OnceForTheWait
 ViewWaits view-waits-simulate-ideal simulate -simulate num=20000 -depth 20 -seed 1
 ViewWaits view-waits-simulate-nonideal simulate -simulate num=20000 -depth 20 -seed 1
 VERDICTS

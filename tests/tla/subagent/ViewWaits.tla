@@ -131,7 +131,7 @@ ASSUME Design \in {"a", "b", "current"}
 ASSUME Mutant \in {"none", "no-wait-card", "footer-blind", "picker-to-screen",
                    "no-settle", "lend-under-alt", "two-shown", "cross-tree",
                    "note-content", "main-answers", "view-only", "row-as-wait",
-                   "lend-under-picker"}
+                   "lend-under-picker", "stale-pick"}
 ASSUME Hazards \in {"none", "all"}
 
 VARIABLES
@@ -150,6 +150,11 @@ VARIABLES
   main_did,    \* main's last action on a note
   note_text,   \* what the child's note carried
   own_blocked, \* the child's own screen cannot act on its item
+  pick,        \* each child: 0, or the asked stamp of the wait a view's
+               \* picker chose a model for; that wait's continue takes it
+  used,        \* each child: the model its last continue ran on: "none",
+               \* "picked" (the wait's pick) or "own" (the person's own choice)
+  own_seen,    \* each child: an own-screen choice came after the current pick
   clock,       \* passes and ticks
   last_change  \* the clock of the last change to the items
 
@@ -159,8 +164,8 @@ PickerHolds(k) == \E v \in Views : picker[v] = k
 HeldByPicker(k) == PickerHolds(k) /\ Mutant # "lend-under-picker"
 
 vars == <<kind, row, asked, alive, screen, alt, own_prompt, shown, picker,
-          picker_open, served, main_did, note_text, own_blocked, clock,
-          last_change>>
+          picker_open, served, main_did, note_text, own_blocked, pick, used,
+          own_seen, clock, last_change>>
 
 Live(k) == kind[k] # "none" /\ alive[k] = "open"
 LiveCount == Cardinality({k \in Kids : Live(k)})
@@ -245,6 +250,9 @@ Init ==
   /\ main_did = "none"
   /\ note_text = "none"
   /\ own_blocked = FALSE
+  /\ pick = [k \in Kids |-> 0]
+  /\ used = [k \in Kids |-> "none"]
+  /\ own_seen = [k \in Kids |-> FALSE]
   /\ clock = 0
   /\ last_change = 0
 
@@ -264,9 +272,13 @@ Raise(k, item) ==
      returns the view's copy of the old one, so the next pass lends the new
      item (design A). Design B stores nothing. *)
   /\ shown' = [v \in Views |-> shown[v] \ {k}]
+  (* A new wait is a new turn: an untaken pick from an older one goes, as the
+     worker drops it when the turn starts. *)
+  /\ pick' = [pick EXCEPT ![k] = 0]
+  /\ own_seen' = [own_seen EXCEPT ![k] = FALSE]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<alive, screen, alt, own_prompt, served, main_did, picker, picker_open>>
+  /\ UNCHANGED <<alive, screen, alt, own_prompt, served, main_did, picker, picker_open, used>>
 
 \* One pass of the main loop: settle a stale copy and lend the oldest.
 Sync ==
@@ -274,7 +286,7 @@ Sync ==
   /\ shown' = [v \in Views |-> LentAfter(v)]
   /\ clock' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, served,
-                 main_did, note_text, own_blocked, last_change, picker, picker_open>>
+                 main_did, note_text, own_blocked, last_change, picker, picker_open, pick, used, own_seen>>
 
 \* The person switches screens. A lent copy goes back to its child.
 SwitchScreen(to) ==
@@ -286,7 +298,7 @@ SwitchScreen(to) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, alt, own_prompt, served, main_did,
-                 note_text, own_blocked, picker, picker_open>>
+                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 \* The view gets its own prompt, which returns the lent one.
 OwnPrompt ==
@@ -300,7 +312,7 @@ OwnPrompt ==
   /\ shown' = [v \in Views |-> IF Design = "b" THEN shown[v] ELSE {}]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<kind, row, asked, alive, screen, alt, served, main_did, note_text, own_blocked, picker, picker_open>>
+  /\ UNCHANGED <<kind, row, asked, alive, screen, alt, served, main_did, note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 OwnPromptDone ==
   /\ clock < MaxClock
@@ -310,7 +322,7 @@ OwnPromptDone ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, shown, served, main_did,
-                 note_text, own_blocked, picker, picker_open>>
+                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 \* The child's wait ends by itself: its answer went in, its turn ended, or its
 \* MCP deadline passed. `finish_prompt` resets the stream without clearing the
@@ -327,7 +339,7 @@ ChildEnds(k) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, main_did,
-                 note_text, own_blocked, picker, picker_open>>
+                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 Deadline(k) == ChildEnds(k)
 
@@ -346,7 +358,7 @@ Resend(k) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, main_did,
-                 note_text, own_blocked, picker, picker_open>>
+                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 \* The recovery module's own clear of a row whose wait is gone
 \* (request_recovery.zig:348-360 for a success, :419-425 for a cancel).
@@ -356,7 +368,7 @@ RowClears(k) ==
   /\ row[k] # "none"
   /\ row' = [row EXCEPT ![k] = "none"]
   /\ UNCHANGED <<kind, asked, alive, screen, alt, own_prompt, shown, served,
-                 main_did, note_text, own_blocked, clock, last_change, picker, picker_open>>
+                 main_did, note_text, own_blocked, clock, last_change, picker, picker_open, pick, used, own_seen>>
 
 \* Main stops or closes the child: the lend returns in the same step
 \* (`stopSet`).
@@ -376,7 +388,7 @@ StopOrClose(k, how) ==
   /\ main_did' = how
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked>>
+  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, pick, used, own_seen>>
 
 \* The alternate screen takes and gives back the terminal.
 AltOpen ==
@@ -388,7 +400,7 @@ AltOpen ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, own_prompt, served, main_did,
-                 note_text, own_blocked, picker, picker_open>>
+                 note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 AltClose ==
   /\ clock < MaxClock
@@ -398,14 +410,14 @@ AltClose ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, own_prompt, shown, served,
-                 main_did, note_text, own_blocked, picker, picker_open>>
+                 main_did, note_text, own_blocked, picker, picker_open, pick, used, own_seen>>
 
 \* The person presses an action on what is shown. It must reach the child.
 Act(k) ==
   /\ Showable(k)
   /\ served' = IF Mutant = "picker-to-screen" /\ screen \in Views THEN "screen_agent" ELSE "owner"
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown,
-                 main_did, note_text, own_blocked, clock, last_change, picker, picker_open>>
+                 main_did, note_text, own_blocked, clock, last_change, picker, picker_open, pick, used, own_seen>>
 
 \* Main acts on the child's note: tell the person, stop, or close. It never
 \* answers the item.
@@ -415,7 +427,7 @@ MainTells(k) ==
   /\ Live(k)
   /\ main_did' = "tell"
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown,
-                 served, note_text, own_blocked, clock, last_change, picker, picker_open>>
+                 served, note_text, own_blocked, clock, last_change, picker, picker_open, pick, used, own_seen>>
 
 MainStops(k) ==
   /\ clock < MaxClock
@@ -431,7 +443,7 @@ MainStops(k) ==
   /\ main_did' = "stop"
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
-  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked>>
+  /\ UNCHANGED <<screen, alt, own_prompt, served, note_text, own_blocked, pick, used, own_seen>>
 
 \* A defect: main answers the item itself.
 MainAnswers(k) ==
@@ -445,7 +457,7 @@ MainAnswers(k) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<alive, screen, alt, own_prompt, shown, served, note_text,
-                 own_blocked, picker, picker_open>>
+                 own_blocked, picker, picker_open, pick, used, own_seen>>
 
 \* The person's answer on the item (the card's Change model, or the
 \* out-of-credits picker's "Switch to another model") returns the card and
@@ -464,7 +476,7 @@ PickerQueued(k) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, served,
-                 main_did, note_text, own_blocked>>
+                 main_did, note_text, own_blocked, pick, used, own_seen>>
 
 \* The main loop drains that event: the picker opens, and the card stays back
 \* (`modelPickerOpenFor` in `childWaitsForCard` and `viewShows`).
@@ -477,7 +489,7 @@ PickerOpens(v) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown,
-                 picker, served, main_did, note_text, own_blocked>>
+                 picker, served, main_did, note_text, own_blocked, pick, used, own_seen>>
 
 \* The person leaves the picker without a choice: its target is cleared and
 \* the next pass lends the card again (`settleModelChoiceTarget`, then
@@ -492,7 +504,7 @@ PickerCloses(v) ==
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, served,
-                 main_did, note_text, own_blocked>>
+                 main_did, note_text, own_blocked, pick, used, own_seen>>
 
 \* The person picks a model for the child the picker holds: the wait keeps its
 \* kind, row and order, and the choice reaches the child, which sends the
@@ -508,10 +520,43 @@ ModelChosen(v) ==
   /\ picker' = [w \in Views |-> IF w = v THEN "none" ELSE picker[w]]
   /\ picker_open' = [w \in Views |-> IF w = v THEN FALSE ELSE picker_open[w]]
   /\ shown' = [w \in Views |-> IF w = v THEN {} ELSE shown[w]]
+  (* The pick is for this wait, and no own-screen choice is newer than it. *)
+  /\ pick' = [pick EXCEPT ![picker[v]] = asked[picker[v]]]
+  /\ own_seen' = [own_seen EXCEPT ![picker[v]] = FALSE]
   /\ clock' = clock + 1
   /\ last_change' = clock + 1
   /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt,
-                 main_did, note_text, own_blocked>>
+                 main_did, note_text, own_blocked, used>>
+
+\* The person sets the child's own model on its own screen, as `/model` there
+\* does. Their latest choice wins, so a pick still waiting for an older wait
+\* goes with it. A `stale-pick` keeps the pick, as the code did before a
+\* continue took it and a new turn dropped the rest.
+OwnModel(k) ==
+  /\ clock < MaxClock
+  /\ Hazards = "all"
+  /\ alive[k] = "open"
+  /\ own_seen' = [own_seen EXCEPT ![k] = TRUE]
+  /\ pick' = [pick EXCEPT ![k] = IF Mutant = "stale-pick" THEN pick[k] ELSE 0]
+  /\ clock' = clock + 1
+  /\ last_change' = clock + 1
+  /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown, served,
+                 main_did, note_text, own_blocked, picker, picker_open, used>>
+
+\* The wait's request runs again with what the person last chose: the pick made
+\* for this wait, else the child's own model. Taking the pick clears it, so no
+\* later request can use it (`stale-pick` keeps it).
+Continue(k) ==
+  /\ clock < MaxClock
+  /\ Hazards = "all"
+  /\ Live(k)
+  /\ row[k] = "live"
+  /\ used' = [used EXCEPT ![k] = IF pick[k] # 0 THEN "picked" ELSE "own"]
+  /\ pick' = [pick EXCEPT ![k] = IF Mutant = "stale-pick" THEN pick[k] ELSE 0]
+  /\ clock' = clock + 1
+  /\ last_change' = clock + 1
+  /\ UNCHANGED <<kind, row, asked, alive, screen, alt, own_prompt, shown, served,
+                 main_did, note_text, own_blocked, picker, picker_open, own_seen>>
 
 Finished ==
   /\ clock = MaxClock
@@ -525,6 +570,7 @@ Next ==
   \/ \E to \in Screen : SwitchScreen(to)
   \/ \E k \in Kids : PickerQueued(k)
   \/ \E v \in Views : PickerOpens(v) \/ PickerCloses(v) \/ ModelChosen(v)
+  \/ \E k \in Kids : Continue(k) \/ OwnModel(k)
   \/ Sync
   \/ OwnPrompt
   \/ OwnPromptDone
@@ -550,6 +596,9 @@ TypeOK ==
   /\ main_did \in {"none", "tell", "stop", "close", "answer"}
   /\ note_text \in {"none", "reason", "content"}
   /\ own_blocked \in BOOLEAN
+  /\ pick \in [Kids -> 0..MaxClock]
+  /\ used \in [Kids -> {"none", "picked", "own"}]
+  /\ own_seen \in [Kids -> BOOLEAN]
   /\ clock \in 0..MaxClock
   /\ last_change \in 0..MaxClock
 
@@ -613,5 +662,20 @@ MainOnlyTellsOrStops == main_did # "answer"
 
 \* On the child's own screen the person can always act on its item.
 OwnScreenActable == \A k \in Kids : (screen = k /\ Live(k)) => ~own_blocked
+
+\* A pick belongs to one wait: it is never left behind for a later request, and
+\* an own-screen choice clears it (`stale-pick` breaks both).
+PickForItsWaitOnly ==
+  \A k \in Kids : pick[k] = 0 \/ pick[k] = asked[k]
+
+\* A continue that ran on a pick is the only one: the pick went with it, so a
+\* later continue runs on the person's own choice.
+OnceForTheWait ==
+  \A k \in Kids : used[k] = "picked" => pick[k] = 0
+
+\* The person's latest choice wins: a continue after their own-screen choice
+\* never runs on an older pick.
+LatestChoiceWins ==
+  \A k \in Kids : used[k] = "picked" => ~own_seen[k]
 
 =============================================================================

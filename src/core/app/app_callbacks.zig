@@ -974,14 +974,14 @@ pub fn Bindings(comptime App: type) type {
             return model_capabilities.capabilitiesForModel(model);
         }
 
-        /// The provider and model a continuing request uses, as the worker
-        /// holds its own copy of them (`ViewWaits.tla` ModelChosen).
+        /// The provider and model a continuing request uses, taken from the
+        /// worker's own copy once (`ViewWaits.tla` PickForItsWaitOnly).
         fn agentContinueSelection(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?agent_runtime.CurrentSelection {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            // A test fake may keep no worker copy: it has none to read.
-            if (comptime !@hasDecl(@TypeOf(agent.worker), "continueSelection")) return null;
-            const selection = (try agent.worker.continueSelection(alloc)) orelse return null;
-            return .{ .provider = selection.provider, .model = selection.model };
+            // A test fake may keep no worker copy: it has none to take.
+            if (comptime !@hasDecl(@TypeOf(agent.worker), "takeContinueSelection")) return null;
+            const selection = agent.worker.takeContinueSelection() orelse return null;
+            return .{ .provider = selection.provider, .model = try alloc.dupe(u8, selection.modelText()) };
         }
 
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {

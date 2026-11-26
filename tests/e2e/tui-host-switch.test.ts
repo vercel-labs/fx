@@ -5771,6 +5771,78 @@ describe("a subagent's wait shows in the view the person is on", () => {
   );
 
   test(
+    "S2c: a model picked for one wait does not decide a later request, and the subagent's latest choice wins",
+    async () => {
+      const picked = "openai/gpt-5-mini";
+      const latest = FAKE_GATEWAY_MODEL;
+      let firstTaskRefused = false;
+      let secondTaskRefused = false;
+      let retriedModel = "";
+      await withFx(
+        async (body) => {
+          if (!isMainRequest(body)) {
+            // Each task's first request is refused; each wait's continue runs
+            // on the model the person last chose.
+            const secondTask = latestUserText(body).includes("WAIT_S2C_CHILD2");
+            if (!secondTask && !firstTaskRefused) {
+              firstTaskRefused = true;
+              return refused();
+            }
+            if (secondTask && !secondTaskRefused) {
+              secondTaskRefused = true;
+              return refused();
+            }
+            return text("child_done", "WAIT_S2C_CHILD_DONE");
+          }
+          if (!body.includes('"main_s2c1"')) {
+            return toolCall("main_s2c1", "subagent", { request: { action: "message", agent: "reviewer", message: "WAIT_S2C_CHILD" } });
+          }
+          return text("main_s2c_done", "WAIT_S2C_MAIN_DONE");
+        },
+        async (session, context) => {
+          const childRequests = (marker: string) =>
+            context.requests.filter((request) => request.body.includes(marker) && !isMainRequest(request.body));
+          await session.sendText("SWITCH_USER WAIT_S2C_TASK");
+          await session.waitForText("WAIT_S2C_MAIN_DONE", 30_000);
+          // The first task is refused, so its card offers Change model.
+          const first = await session.waitForPane(
+            (pane) => pane.includes("reviewer: The provider rejected this request") && pane.includes("Change model"),
+            30_000,
+          );
+          await session.sendKeys(cardDigit(first, "Change model"));
+          await session.waitForPane((pane) => pane.includes("/model"), 15_000);
+          await session.sendKeys("Down");
+          await session.sendKeys("Enter");
+          await session.waitForPane((pane) => pane.includes(`reviewer continues with ${picked} (effort: default, speed: normal)`), 25_000);
+          await until("the picked model on the wait's continue", () => childRequests("WAIT_S2C_CHILD").at(-1)?.headers.get("ai-language-model-id") === picked, 30_000);
+          // The person picks a model on the subagent's own screen, then starts
+          // its next task there; that request is refused and Enter retries it.
+          await showAgent(session, "reviewer");
+          await session.sendText(`/model ${latest}`);
+          await session.waitForPane((pane) => pane.includes(`Switched to ${latest}`), 25_000);
+          await session.sendText("WAIT_S2C_CHILD2");
+          await session.waitForPane((pane) => pane.includes("The provider rejected this request"), 30_000);
+          const before = childRequests("WAIT_S2C_CHILD2").length;
+          await session.sendKeys("Enter");
+          await until("the retried request", () => childRequests("WAIT_S2C_CHILD2").length > before, 30_000);
+          retriedModel = childRequests("WAIT_S2C_CHILD2").at(-1)?.headers.get("ai-language-model-id") ?? "";
+        },
+        undefined,
+        false,
+        {},
+        {
+          models: [
+            { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+            { id: picked, type: "language", tags: ["tool-use"] },
+          ],
+        },
+      );
+      expect(retriedModel).toBe(latest);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "S3: a sign-in card signs in for that subagent, and main's composer is not submitted",
     async () => {
       const issuer = startFakeIssuer({ refresh: () => Response.json({ error: "invalid_grant" }, { status: 400 }) });
