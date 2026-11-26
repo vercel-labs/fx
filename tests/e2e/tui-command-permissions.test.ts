@@ -305,6 +305,18 @@ function currentUserText(body: string): string {
   );
 }
 
+// Every user message at the end of the prompt, in order. Joined subagent
+// reports arrive as several consecutive user messages.
+function trailingUserTexts(body: string): string[] {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ role?: string; content?: unknown }>;
+  };
+  const prompt = request.prompt ?? [];
+  let first = prompt.length;
+  while (first > 0 && prompt[first - 1].role === "user") first -= 1;
+  return prompt.slice(first).map((message) => contentText(message.content));
+}
+
 function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -1906,12 +1918,14 @@ describe("effect-aware command permissions", () => {
         }
         return finalText("unexpected request");
       }
-      // A failed ship tells main that its request waits; that message stays
-      // in main's history, so only the report itself names who reported.
-      const current = currentUserText(body);
-      if (current.startsWith("Subagent report")) {
-        for (const name of ["cards", "ship"]) {
-          if (current.includes(`"agent":"${name}"`)) reported.add(name);
+      // A failed ship tells main that its request waits. That message can
+      // trail a report in the same request, so only report texts name who reported.
+      const reports = trailingUserTexts(body).filter((text) => text.startsWith("Subagent report"));
+      if (reports.length > 0) {
+        for (const text of reports) {
+          for (const name of ["cards", "ship"]) {
+            if (text.includes(`"agent":"${name}"`)) reported.add(name);
+          }
         }
         return finalText(`report noted ${reported.size}`);
       }
