@@ -634,6 +634,92 @@ describe("fx ask presentation", () => {
     TIMEOUT * 2,
   );
 
+  // tmux's "Pane is dead" row is not fx's output. tmux draws it only once
+  // it has the command's exit status, which can come after it marks the
+  // pane dead, and on CI it can still be missing when the capture runs.
+  // So the rows leave it out, with the blank rows after fx's output. Only
+  // the exact row goes, so another row that starts with the same words stays.
+  const tmuxDeadPaneRow = /^Pane is dead \(status \d+, [^)]*\)$/;
+  // tmux's default `remain-on-exit-format`, the same in tmux 3.4, 3.6 and
+  // 3.6a. It draws the rows that `tmuxDeadPaneRow` matches.
+  const tmuxDeadPaneFormat =
+    "Pane is dead (#{?#{!=:#{pane_dead_status},},status #{pane_dead_status},}" +
+    "#{?#{!=:#{pane_dead_signal},},signal #{pane_dead_signal},}, #{t:pane_dead_time})";
+  const rowsOf = (text: string) => {
+    const rows = text
+      .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
+      .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
+      .split("\n")
+      .map((row) => row.trimEnd())
+      .filter((row) => !tmuxDeadPaneRow.test(row));
+    while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+    return rows;
+  };
+  // A run is over once the shell prints its exit marker and tmux marks
+  // the pane dead, which it does after it reads the last output. A
+  // session that is gone can show no marker, so the wait fails at once
+  // then, and it gives up well before the test's own timeout, so a
+  // failure shows the pane.
+  const waitForExit = async (target: TmuxSession) => {
+    await target.waitForPane((pane) => {
+      if (pane.includes("__FX_EXIT_0__")) return true;
+      if (!target.isAlive()) throw new Error(`${target.name} ended before it showed its exit marker`);
+      return false;
+    }, 10_000);
+    await target.waitForPane(() => target.paneStatus().dead, 10_000);
+  };
+
+  test("screen rows leave out only tmux's own Pane is dead row", () => {
+    const ownRow = "Pane is dead is a row at column 0 that tmux did not draw.";
+    // The rows tmux 3.4 and 3.6a draw when the pane's command exits.
+    expect(rowsOf(`${ownRow}\n__FX_EXIT_0__\n\nPane is dead (status 0, Wed Nov 25 21:27:52 2026)\n\n`))
+      .toEqual([ownRow, "__FX_EXIT_0__"]);
+    expect(rowsOf(`${ownRow}\n__FX_EXIT_3__\n\nPane is dead (status 3, Thu Nov  5 09:07:02 2026)\n`))
+      .toEqual([ownRow, "__FX_EXIT_3__"]);
+    expect(rowsOf("")).toEqual([]);
+    // A row for a pane that a signal ended stays. Each run in these tests
+    // exits with status 0 after its exit marker, so a signal row means the run
+    // did not end cleanly, and the comparison shows it instead of hiding it.
+    const signalRow = "Pane is dead (signal 15, Wed Nov 25 21:27:52 2026)";
+    expect(rowsOf(`${ownRow}\n\n${signalRow}\n`)).toEqual([ownRow, "", signalRow]);
+  });
+
+  test.skipIf(!tmuxAvailable())(
+    "ask in a terminal keeps its own Pane is dead row and drops tmux's in the screen rows",
+    async () => {
+      const root = createRoot();
+      const reply = "Pane is dead is a row fx wrote.";
+      const gateway = startFakeGateway([fakeGatewayFinalText(`First row.\n\n${reply}\n`)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--auto", "--no-save", "Write the row."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+      await waitForExit(session);
+      const rows = rowsOf(await session.captureFullScrollback());
+
+      // fx indents its reply rows by two columns.
+      expect(rows).toContain(`  ${reply}`);
+      // tmux may not have drawn its row yet, so the format is checked as text.
+      // Its expansion would not help: tmux fills in the status and time at the
+      // same moment it draws the row.
+      expect(session.remainOnExitFormat()).toBe(tmuxDeadPaneFormat);
+      // A row tmux did draw matches the pattern, so it is not left.
+      expect(rows.filter((row) => row.startsWith("Pane is dead ("))).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "ask in a terminal shows streamed words formatted before their line ends",
     async () => {
@@ -647,20 +733,6 @@ describe("fx ask presentation", () => {
       const boldSgr = /\x1b\[(?:[0-9;]*;)?1(?:;[0-9;]*)?m/;
       const sgrBeforeBold = (row: string) =>
         row.slice(0, row.indexOf("bold")).match(/(?:\x1b\[[0-9;]*m)+$/)?.[0] ?? "";
-      // tmux's "Pane is dead" row is not fx's output. tmux draws it only once
-      // it has the command's exit status, which can come after it marks the
-      // pane dead, and on CI it can still be missing when the capture runs.
-      // So the rows leave it out, with the blank rows after fx's output.
-      const rowsOf = (text: string) => {
-        const rows = text
-          .replace(/\b\d+(?:h\d+m\d+s|m\d+s|s)\b/g, "Ns")
-          .replace(/↑\d+(?:\.\d+)?k? ↓\d+(?:\.\d+)?k?/g, "↑N ↓N")
-          .split("\n")
-          .map((row) => row.trimEnd())
-          .filter((row) => !row.startsWith("Pane is dead"));
-        while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
-        return rows;
-      };
       const startAsk = async (
         gateway: ReturnType<typeof startFakeGateway>,
         label: string,
@@ -679,19 +751,6 @@ describe("fx ask presentation", () => {
         });
         sessions.push(session);
         return { session, stderrPath };
-      };
-      // A run is over once the shell prints its exit marker and tmux marks
-      // the pane dead, which it does after it reads the last output. A
-      // session that is gone can show no marker, so the wait fails at once
-      // then, and it gives up well before the test's own timeout, so a
-      // failure shows the pane.
-      const waitForExit = async (target: TmuxSession) => {
-        await target.waitForPane((pane) => {
-          if (pane.includes("__FX_EXIT_0__")) return true;
-          if (!target.isAlive()) throw new Error(`${target.name} ended before it showed its exit marker`);
-          return false;
-        }, 10_000);
-        await target.waitForPane(() => target.paneStatus().dead, 10_000);
       };
 
       const held = heldFakeGatewayFinalText();

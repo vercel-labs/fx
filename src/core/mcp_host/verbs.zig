@@ -624,7 +624,8 @@ fn list(c: Context, arena: Allocator, json: bool) !u8 {
     return 0;
 }
 
-/// The status in words, as `list`, `show`, and the menu say it.
+/// The status in words, as `list` and `show` say it. An idle server that holds a saved login says "saved login":
+/// nothing has asked its server to take that login, so it is not "signed in".
 pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
     return switch (s.state) {
         .disabled => "disabled",
@@ -643,10 +644,18 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
-            .idle => if (s.signed_in) "signed in" else "not started",
+            .idle => if (s.signed_in) "saved login" else "not started",
             else => unreachable,
         },
     };
+}
+
+/// The status as the `/mcp` menu and its completions say it: how a server runs. A saved login is no part of that,
+/// so an idle server says "not started" whether or not it holds one. `statusText` is what `list` and `show` say.
+pub fn runStatusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
+    var running = s;
+    running.signed_in = false;
+    return statusText(arena, running);
 }
 
 /// What a server's status says when fx refused its tool list and has none, and when it refused its newest one
@@ -694,7 +703,7 @@ fn statusToken(s: Status) []const u8 {
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
-            .idle => if (s.signed_in) "signed_in" else "not_started",
+            .idle => if (s.signed_in) "saved_login" else "not_started",
             else => unreachable,
         },
     };
@@ -1480,7 +1489,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     try testing.expectEqualStrings("'nope' isn't a /mcp command.", (try parse(a, .shell, &.{"nope"})).usage.message);
 }
 
-test "status words follow commands.md, held states first" {
+test "status words: an idle server says a saved login only when it holds one, held states first" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1488,7 +1497,7 @@ test "status words follow commands.md, held states first" {
     var s = base;
     try testing.expectEqualStrings("not started", try statusText(a, s));
     s.signed_in = true;
-    try testing.expectEqualStrings("signed in", try statusText(a, s));
+    try testing.expectEqualStrings("saved login", try statusText(a, s));
     s = base;
     s.state = .ready;
     s.tools = 1;
@@ -1680,6 +1689,65 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
     try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
     try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
+}
+
+test "a saved login is said by an idle server only, in words and in JSON, and a connected one says it is ready" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const base: Status = .{ .name = "x", .source = .profile, .transport = .http, .state = .idle };
+    try testing.expectEqualStrings("not started", try statusText(a, base));
+    try testing.expectEqualStrings("not_started", statusToken(base));
+    var saved = base;
+    saved.signed_in = true;
+    try testing.expectEqualStrings("saved login", try statusText(a, saved));
+    try testing.expectEqualStrings("saved_login", statusToken(saved));
+    // A server fx connected and that accepted the login is ready; it is not "saved login".
+    var connected = saved;
+    connected.state = .ready;
+    connected.tools = 2;
+    try testing.expectEqualStrings("ready, 2 tools", try statusText(a, connected));
+    try testing.expectEqualStrings("ready", statusToken(connected));
+    // Every other state keeps its own words with a login kept.
+    const others = [_]struct { state: runtime_mod.State, text: []const u8, token: []const u8 }{
+        .{ .state = .connecting, .text = "connecting", .token = "connecting" },
+        .{ .state = .retrying, .text = "retrying", .token = "retrying" },
+        .{ .state = .failed, .text = "failed", .token = "failed" },
+    };
+    for (others) |o| {
+        var s = saved;
+        s.state = o.state;
+        try testing.expectEqualStrings(o.text, try statusText(a, s));
+        try testing.expectEqualStrings(o.token, statusToken(s));
+    }
+    // A login the server refused is not a saved one, whatever the flag says.
+    var refused = saved;
+    refused.needs_login = true;
+    try testing.expectEqualStrings("needs login", try statusText(a, refused));
+    try testing.expectEqualStrings("needs_login", statusToken(refused));
+}
+
+test "the menu's words for a status are the list's, except that an idle server never says it holds a login" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var s: Status = .{ .name = "x", .source = .profile, .transport = .http, .state = .idle, .signed_in = true };
+    try testing.expectEqualStrings("saved login", try statusText(a, s));
+    try testing.expectEqualStrings("not started", try runStatusText(a, s));
+    const states = [_]runtime_mod.State{ .idle, .connecting, .ready, .retrying, .failed, .disabled, .waiting_for_approval, .rejected, .unsupported };
+    for (states) |state| {
+        for ([_]bool{ false, true }) |held| {
+            s.state = state;
+            s.signed_in = held;
+            s.tools = 2;
+            const menu_words = try runStatusText(a, s);
+            if (state == .idle) {
+                try testing.expectEqualStrings("not started", menu_words);
+            } else {
+                try testing.expectEqualStrings(try statusText(a, s), menu_words);
+            }
+        }
+    }
 }
 
 test "tools fx left out are said once, in the same words, by show's line and the JSON, and kept tools say nothing" {

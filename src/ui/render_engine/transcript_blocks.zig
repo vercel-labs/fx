@@ -393,6 +393,10 @@ pub const TranscriptEntry = union(enum) {
         id: u32,
         created_at_ms: i64 = 0,
         inline_hidden: bool = false,
+        /// Holds a line fx wrote between steps, such as the empty-reply
+        /// nudge. It draws as any other text; the main screen draws the
+        /// turn's later calls below it (`breaksPresentationGroup`).
+        operational: bool = false,
         segments: AssistantTurnSegments,
     };
 

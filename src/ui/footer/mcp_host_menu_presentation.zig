@@ -248,7 +248,7 @@ fn statusWidth(arena: Allocator, rows: []const menu.Row, width: u16) !usize {
     var want: usize = 22;
     for (rows) |r| {
         if (r.status.tools_error == null) continue;
-        want = @max(want, (try verbs.statusText(arena, runState(r.status))).len);
+        want = @max(want, (try verbs.runStatusText(arena, r.status)).len);
     }
     // The source column keeps its 7 columns and the 2 before them.
     const room = @as(usize, width) -| start -| (2 + 7);
@@ -276,7 +276,7 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
     // A refused tool list says so whole where the row has room, and in its short words where it has not, so the
     // cut never takes the word that says it.
-    const text = try verbs.statusText(arena, runState(r.status));
+    const text = try verbs.runStatusText(arena, r.status);
     const shown = if (r.status.tools_error != null and text.len > status_width) verbs.refusedShort(r.status) else text;
     try row_text.appendTerminalSafeSingleLine(alloc, &row, shown, status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -289,19 +289,11 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     return row;
 }
 
-/// The status without its saved login: the menu says how a server runs, and
-/// its screen puts the login beside that.
-fn runState(s: anytype) @TypeOf(s) {
-    var out = s;
-    out.signed_in = false;
-    return out;
-}
-
 /// The status fact on a server's screen. Its tool count is beside its
 /// tools' heading and its login is in its choices, so neither repeats here.
 fn statusFact(arena: Allocator, s: menu.Row) ![]const u8 {
     if (s.status.state == .ready and !s.status.needs_login and s.status.tools_error == null) return "ready";
-    return verbs.statusText(arena, runState(s.status));
+    return verbs.runStatusText(arena, s.status);
 }
 
 /// Line `line` of a server's screen below its title.
@@ -714,6 +706,26 @@ test "the list says how a server runs; its login shows on its screen" {
     try testing.expectEqualStrings("ready, 3 tools, newer list refused", try statusFact(arena.allocator(), .{ .status = ready }));
     ready.tools = 0;
     try testing.expectEqualStrings("ready, tool list refused", try statusFact(arena.allocator(), .{ .status = ready }));
+}
+
+test "the list and the screen of a server say its status in the words of verbs.runStatusText, for every state" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]host_runtime.State{ .idle, .connecting, .ready, .retrying, .failed }) |state| {
+        for ([_]bool{ false, true }) |held| {
+            var s = testStatus("any", state);
+            s.signed_in = held;
+            const row: menu.Row = .{ .status = s };
+            const want = try verbs.runStatusText(arena.allocator(), s);
+            const rows = [_]menu.Row{row};
+            var p: Projection = .{ .rows = &rows };
+            menu.open(&p.state);
+            const shown = try render(p, 88);
+            defer testing.allocator.free(shown);
+            try testing.expect(std.mem.find(u8, shown, want) != null);
+            if (state != .ready) try testing.expectEqualStrings(want, try statusFact(arena.allocator(), row));
+        }
+    }
 }
 
 test "a refused tool list shows whole in the list where the row has room, and in short words where it has not" {
