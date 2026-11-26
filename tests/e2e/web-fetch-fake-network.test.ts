@@ -678,15 +678,12 @@ describe("web_fetch Gateway fixture", () => {
         outerText("unexpected completion after SIGINT"),
       ]);
       const env = Object.fromEntries(
-        Object.entries({
-          ...process.env,
-          ...fakeGatewayEnv(root, gateway, {
-            FX_SOUND: "0",
-            FX_AUTO_UPGRADE: "0",
-            FX_DISABLE_KEYCHAIN: "1",
-            ...boundary.env,
-          }),
-        }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+        Object.entries(fxChildEnv(fakeGatewayEnv(root, gateway, {
+          FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          ...boundary.env,
+        }))).filter((entry): entry is [string, string] => entry[1] !== undefined),
       );
       const proc = Bun.spawn([FX_BIN, "ask", "--auto", "--json", "--no-save", "Fetch docs."], {
         cwd: root.workspace,
