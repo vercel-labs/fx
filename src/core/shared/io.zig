@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
 const net_connect = @import("net_connect.zig");
+const os_errors = @import("os_errors.zig");
 const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
@@ -25,9 +26,10 @@ pub fn setIo(zio: std.Io) void {
     real_io = processIo(zio);
 }
 
-/// `zio` with fx's process spawn on Darwin and fx's TCP connect.
+/// `zio` with fx's process spawn on Darwin and fx's TCP connect, and with the
+/// errno behind every `error.Unexpected` from the network kept for `/trace`.
 fn processIo(zio: std.Io) std.Io {
-    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
+    return os_errors.wrap(net_connect.wrap(process_io_for(builtin.target.os.tag, zio)));
 }
 
 /// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
@@ -146,20 +148,54 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
-test "process I/O connects TCP through net_connect and keeps every other entry" {
+test "process I/O connects TCP through net_connect, checks network errors, and keeps every other entry" {
     const original = std.testing.io;
     const selected = processIo(original);
     const spawn_selected = process_io_for(builtin.target.os.tag, original);
 
     try std.testing.expect(selected.userdata == original.userdata);
     try std.testing.expect(selected.vtable == processIo(original).vtable);
+    const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
     inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
-        if (comptime std.mem.eql(u8, field_name, "netConnectIp")) {
-            const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+        if (comptime std.mem.eql(u8, field_name, "netConnectIp") or
+            std.mem.eql(u8, field_name, "operate") or
+            std.mem.eql(u8, field_name, "netLookup"))
+        {
             try std.testing.expectEqual(replaced, @field(selected.vtable, field_name) != @field(original.vtable, field_name));
         } else {
             try std.testing.expectEqual(@field(spawn_selected.vtable, field_name), @field(selected.vtable, field_name));
         }
+    }
+}
+
+test "process I/O keeps the errno behind a network read that std reports as Unexpected" {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const io = processIo(std.testing.io);
+    os_errors.reset(io);
+    defer os_errors.reset(io);
+
+    // recvmsg on a pipe fails with ENOTSOCK, which std's socket read has no
+    // name for, so it returns error.Unexpected.
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.c.pipe(&fds)));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = .{ .ip4 = .loopback(0) } } };
+    var buffer: [16]u8 = undefined;
+    var data = [_][]u8{&buffer};
+    // Zig 0.17's `Stream.read` does not compile, so this reads through
+    // `readWithControl`, which issues the same `net_read`.
+    try std.testing.expectError(error.Unexpected, stream.readWithControl(io, &data, &.{}));
+
+    var notes: [os_errors.capacity]os_errors.Note = undefined;
+    try std.testing.expectEqual(@as(usize, 1), os_errors.snapshot(io, &notes));
+    try std.testing.expectEqual(os_errors.Call.read, notes[0].call);
+    if (std.options.unexpected_error_tracing) {
+        // std printed the code itself, and its stack trace may change errno.
+        try std.testing.expectEqual(@as(u16, 0), notes[0].errno);
+    } else {
+        try std.testing.expectEqualStrings("NOTSOCK", notes[0].errnoName().?);
     }
 }
 

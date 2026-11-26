@@ -59,7 +59,8 @@
 //!   taken during a turn, so it may be partial; `interrupted_turn`
 //!   {`in_flight_tool`, `completed_tools`, a count}; `session_title`
 //!   {`status`, `reason`, `detail`}; `network_call`, for the newest 3 failed
-//!   calls, with `call` holding the `network_call` fields; `tool_call`, for
+//!   calls, with `call` holding the `network_call` fields; `os_error`, for
+//!   the newest 3, with the `os_error` fields; `tool_call`, for
 //!   the newest 5 calls that did not succeed, with `call` {`at`, `name`,
 //!   `outcome`, `duration_ms`, `source`, `cause`, `call_id`}, from the kept
 //!   failures that later successful calls do not remove; `compaction` {`event`,
@@ -147,6 +148,13 @@
 //!   push out (0 when none failed); `session.errors` counts every failed
 //!   call. Then a `failed_network_call` per kept failure, oldest first, with
 //!   the `network_call` fields; the `network_call` problems come from these.
+//!   The `network` record also has `os_errors`, the network calls this
+//!   session that failed with an OS error code that Zig has no name for and
+//!   reports as `Unexpected`. Then an `os_error` per kept one, at most 16,
+//!   oldest first: `at`, `call` (`lookup`, `connect`, `read`, `write`,
+//!   `receive`, or `send`), and the code as `errno` and `errno_name`, such as
+//!   `EINVAL`, when the call left one. A call that failed with the error
+//!   `Unexpected` from the network has an `os_error` near the time it ended.
 //! - `model_catalog`: `cache` {`state`, `entries`, `last_attempt_age_ms`, and
 //!   after a failure `failure`, `retryable`, `http_status`,
 //!   `anonymous_fallback`}; `selected_model` {`model`, `image_input`,
@@ -342,6 +350,7 @@ const tool_args_max_bytes: usize = 1200;
 const result_preview_max_bytes: usize = 180;
 const pending_items_shown: usize = 3;
 const network_problems_shown: usize = 3;
+const os_error_problems_shown: usize = 3;
 const tool_problems_shown: usize = 5;
 const compaction_problems_shown: usize = 3;
 const model_catalog_problems_shown: usize = 3;
@@ -887,6 +896,7 @@ noinline fn writeProblems(r: *Records, app: anytype) !void {
     try writeInterruptedTurnProblem(p, agents.screenAgentOf(app).session.agent.history.items);
     try writeSessionTitleProblem(p, app);
     try writeNetworkProblems(p);
+    try writeOsErrorProblems(p);
     try writeToolProblems(p);
     try writeCompactionProblems(p);
     try writeMcpHostProblems(p, app);
@@ -956,6 +966,26 @@ fn writeNetworkProblems(p: *Records) !void {
         try p.endObject();
         try p.end();
     }
+}
+
+/// The newest OS errors behind network calls that failed as `Unexpected`.
+fn writeOsErrorProblems(p: *Records) !void {
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    const count = diagnostics.snapshotOsErrors(&notes);
+    var index = count;
+    while (index > count -| os_error_problems_shown) {
+        index -= 1;
+        try beginProblem(p, "os_error");
+        try writeOsErrorFields(p, notes[index]);
+        try p.end();
+    }
+}
+
+fn writeOsErrorFields(r: *Records, note: diagnostics.OsError) !void {
+    try r.time("at", note.at_ms);
+    try r.text("call", @tagName(note.call));
+    if (note.errno != 0) try r.number("errno", note.errno);
+    if (note.errnoName()) |name| try r.text("errno_name", try r.arena.print("E{s}", .{name}));
 }
 
 /// The newest failed calls come from the kept failures, not the window, so
@@ -1641,6 +1671,7 @@ noinline fn writeNetwork(r: *Records) !void {
     try r.number("turns_retained", rollup_count);
     try r.number("turns_evicted", lifetime.evicted_turns);
     try r.number("kept_failures", kept_count);
+    try r.number("os_errors", diagnostics.osErrorCount());
     try r.end();
 
     for (rollups[0..rollup_count]) |*rollup| {
@@ -1661,6 +1692,12 @@ noinline fn writeNetwork(r: *Records) !void {
     for (kept[0..kept_count]) |*call| {
         try r.begin("failed_network_call");
         try writeNetworkCallFields(r, call);
+        try r.end();
+    }
+    var notes: [diagnostics.os_error_capacity]diagnostics.OsError = undefined;
+    for (notes[0..diagnostics.snapshotOsErrors(&notes)]) |note| {
+        try r.begin("os_error");
+        try writeOsErrorFields(r, note);
         try r.end();
     }
 }
@@ -5392,6 +5429,44 @@ test "trace network calls keep web search counts, stop reasons, and schema diagn
     try std.testing.expectEqual(@as(i64, 400), try testInt(problem_call, "status"));
     try std.testing.expectEqualStrings("zai/glm-5.2-fast", try testString(problem_call, "model"));
     try std.testing.expectEqualStrings("gateway", try testString(problem_call, "kind"));
+}
+
+test "trace network names the OS error behind a call that failed as Unexpected" {
+    const os_errors = @import("../shared/os_errors.zig");
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var failed: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .duration_ms = 20, .turn_id = 2, .step_id = 73 };
+    failed.setModel("provider/model-a");
+    failed.setError("Unexpected");
+    diagnostics.recordNetworkCall(failed);
+    os_errors.note(io_mod.getIo(), .read, @backingInt(std.posix.E.INVAL));
+    os_errors.note(io_mod.getIo(), .lookup, 0);
+
+    const w = try TestWriter.create();
+    defer w.destroy();
+    try writeNetwork(&w.records);
+    try writeOsErrorProblems(&w.records);
+    var trace = try w.trace();
+    defer trace.deinit();
+
+    try std.testing.expectEqual(@as(i64, 2), try testInt(try trace.one("network"), "os_errors"));
+    try std.testing.expectEqual(@as(usize, 2), trace.count("os_error"));
+    const read = try trace.nth("os_error", 0);
+    try std.testing.expectEqualStrings("read", try testString(read, "call"));
+    try std.testing.expectEqual(@as(i64, @backingInt(std.posix.E.INVAL)), try testInt(read, "errno"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(read, "errno_name"));
+    const lookup = try trace.nth("os_error", 1);
+    try std.testing.expectEqualStrings("lookup", try testString(lookup, "call"));
+    try expectAbsent(lookup, "errno");
+    try expectAbsent(lookup, "errno_name");
+
+    // Newest first, like the other problems.
+    try std.testing.expectEqual(@as(usize, 2), trace.count("problem"));
+    const newest = try trace.nth("problem", 0);
+    try std.testing.expectEqualStrings("os_error", try testString(newest, "kind"));
+    try std.testing.expectEqualStrings("lookup", try testString(newest, "call"));
+    try std.testing.expectEqualStrings("EINVAL", try testString(try trace.nth("problem", 1), "errno_name"));
 }
 
 test "trace network keeps a failed call after later calls fill the window" {

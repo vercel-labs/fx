@@ -40,6 +40,10 @@ pub fn networkFailureEvidence(
         .connectivity_lost
     else if (isUnreadableReply(err))
         .unreadable_reply
+    else if (err == error.Unexpected)
+        // A socket or resolver call returns it for an errno that Zig has no
+        // name for.
+        .unnamed_os_error
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
@@ -82,6 +86,8 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.WouldBlock or
         err == error.WriteFailed or
         err == error.ReadFailed or
+        // ENOTCONN or EPIPE: the connection closed under the request.
+        err == error.SocketUnconnected or
         isRetryableGatewayError(err);
 }
 
@@ -158,6 +164,8 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
         .{ .err = error.LocalAddressGone },
+        .{ .err = error.SocketUnconnected },
+        .{ .err = error.Unexpected, .cause = .unnamed_os_error },
     };
 
     for (cases) |case| {
