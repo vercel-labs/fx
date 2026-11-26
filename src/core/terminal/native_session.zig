@@ -913,6 +913,7 @@ const SupportedRegistry = struct {
             return self.failure(.inspect, .session_not_found, request.session_id);
         };
         defer self.profile.release_terminal(durable);
+        reachedGap(.copy_held, request.session_id);
         const authorization = durable.authorize(
             request.authority.?,
             .inspect,
@@ -998,6 +999,11 @@ const SupportedRegistry = struct {
         const session_id = try session_layout.generateTerminalSessionId(self.alloc);
         var session_id_owned = true;
         defer if (session_id_owned) self.alloc.free(session_id);
+        // The record is on disk before the registry can find the session, so
+        // no other call of this process may see the id until this call returns.
+        const in_flight = try self.profile.begin_start(session_id);
+        var mark_handed_over = false;
+        defer if (!mark_handed_over) self.profile.end_start(in_flight);
         const session = try self.alloc.create(Session);
         var session_owned = true;
         defer if (session_owned) self.alloc.destroy(session);
@@ -1030,10 +1036,18 @@ const SupportedRegistry = struct {
             );
         };
         session_id_owned = false;
-        self.profile.register_resident(&session.durable) catch {
+        reachedGap(.record_saved, session.id);
+        self.profile.register_resident(&session.durable) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "resident registration failed id={s} err={s}",
+                .{ session.id, @errorName(err) },
+            );
             session.deinitUnlaunched();
-            return error.OutOfMemory;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.failure(.start, .startup_failed, null);
         };
+        reachedGap(.resident_registered, session.id);
 
         const slot = self.reserve(session) orelse {
             session.deinitUnlaunched();
@@ -1077,6 +1091,7 @@ const SupportedRegistry = struct {
             _ = session.hangUpForExit();
             session.killForExit();
         }
+        reachedGap(.launched, session.id);
 
         const condition = request.return_when orelse .started;
         const ceiling = request.wait_ceiling_ms orelse 5_000;
@@ -1086,10 +1101,12 @@ const SupportedRegistry = struct {
             return self.failure(.start, code, session.id);
         };
         if (returnOutcomeIsTerminal(outcome)) session.finalizeBackend();
-        return session.startResult(outcome, .{
+        const result = try session.startResult(outcome, .{
             .actor = persistence.grant.actor,
             .controls = persistence.grant.controls,
         });
+        mark_handed_over = request.retain_in_flight;
+        return result;
     }
 
     fn write(
@@ -3840,6 +3857,16 @@ test "terminal output drain reads final bytes after peer close" {
     );
 }
 
+/// The places where a test holds a call to run another while a start has not returned: the record is saved, the resident is registered, the command runs and the start waits for it, and an `inspect` holds the copy that `open_terminal` made.
+pub const GapPoint = enum { record_saved, resident_registered, launched, copy_held };
+
+/// Test builds only, as `test_after_listing` in `doctor_probes.zig`: a test sets it to hold a call at a `GapPoint`.
+pub var test_gap: if (builtin.is_test) ?*const fn (point: GapPoint, session_id: []const u8) void else void = if (builtin.is_test) null else {};
+
+fn reachedGap(point: GapPoint, session_id: []const u8) void {
+    if (builtin.is_test) if (test_gap) |hook| hook(point, session_id);
+}
+
 fn maybeDelayForTest(name: []const u8) void {
     const value = io_mod.getenv(name) orelse return;
     const delay_ms = std.fmt.parseInt(u64, value, 10) catch return;
@@ -5073,4 +5100,78 @@ test "a referenced slot is never recycled out from under its holder" {
     const reservation = registry.reserve(&incoming) orelse
         return error.TestExpectedRecycle;
     try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
+}
+
+/// Reads whether a start's id is in flight at each point of `start`.
+const InFlightProbe = struct {
+    var profile: ?*terminal_store.ProfileStore = null;
+    var id_buf: [128]u8 = undefined;
+    var id_len: usize = 0;
+    var saved_in_flight = false;
+    var registered_in_flight = false;
+
+    fn arm(armed: *terminal_store.ProfileStore) void {
+        profile = armed;
+        id_len = 0;
+        saved_in_flight = false;
+        registered_in_flight = false;
+        test_gap = &hook;
+    }
+
+    fn disarm() void {
+        test_gap = null;
+        profile = null;
+    }
+
+    fn id() []const u8 {
+        return id_buf[0..id_len];
+    }
+
+    fn hook(point: GapPoint, session_id: []const u8) void {
+        const armed = profile orelse return;
+        switch (point) {
+            .record_saved => {
+                id_len = @min(session_id.len, id_buf.len);
+                @memcpy(id_buf[0..id_len], session_id[0..id_len]);
+                saved_in_flight = armed.is_starting(session_id);
+            },
+            .resident_registered => registered_in_flight = armed.is_starting(session_id),
+            .launched, .copy_held => {},
+        }
+    }
+};
+
+test "start in flight: a start that cannot reserve a slot leaves nothing in flight" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    var probe: WorkProbe = .{};
+    var registry = SupportedRegistry.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+    );
+    // A registry that is exiting refuses the slot after the record is saved
+    // and the resident is registered.
+    registry.exiting = true;
+    InFlightProbe.arm(&fixture.profile);
+    defer InFlightProbe.disarm();
+
+    const cancelled: std.atomic.Value(bool) = .init(false);
+    var result = try registry.start(.{
+        .cwd = "/workspace",
+        .command = "true",
+        .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        .return_when = .started,
+        .persistence = testPersistence("/workspace"),
+    }, &cancelled);
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.view() == .failure);
+    try std.testing.expect(InFlightProbe.id_len != 0);
+    try std.testing.expect(InFlightProbe.saved_in_flight);
+    try std.testing.expect(InFlightProbe.registered_in_flight);
+    try std.testing.expect(!fixture.profile.is_starting(InFlightProbe.id()));
 }

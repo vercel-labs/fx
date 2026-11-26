@@ -415,6 +415,18 @@ pub const Runtime = struct {
         return self.projection.clear(alloc);
     }
 
+    /// Ends the in-flight mark that a start with `retain_in_flight` left on
+    /// `session_id`, once its caller has indexed the terminal or given up.
+    /// The backend mutex is held only to read the backend, which `deinit`
+    /// alone frees, so no lock is held while the store takes its own.
+    pub fn endStart(self: *Runtime, session_id: []const u8) void {
+        const zio = io_mod.getIo();
+        self.backend_mutex.lockUncancelable(zio);
+        const backend = self.backend;
+        self.backend_mutex.unlock(zio);
+        if (backend) |value| value.store.end_start(session_id);
+    }
+
     /// Ends every terminal this runtime started, with no prompt, and refuses
     /// later requests. Running requests are cancelled. For process-exit paths
     /// that skip `deinit`; idempotent, and bounded by the registry's exit
@@ -793,6 +805,8 @@ fn closeCancelledStart(
         },
         .failure => return,
     };
+    // The caller only learns `.cancelled`, so nobody else ends the mark.
+    defer if (start.retain_in_flight) backend.store.end_start(session_id);
     var close_request: contracts.ActionRequest = .{ .close = .{
         .session_id = session_id,
         .policy = .force,
@@ -1601,6 +1615,115 @@ test "cancelling a start after its terminal launched closes that terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(session_id),
     );
+}
+
+/// The command of a terminal that stays idle until the fixture ends it. It
+/// writes its byte to the launch signal once it runs, and `exec` leaves no
+/// child behind.
+const idle_signalling_command = "printf x > ./" ++ LaunchSignal.name ++ "; exec sleep 30";
+
+/// A start request for a terminal that stays idle until the fixture ends it.
+/// A test that ends with the fixture waits for the launch signal first: an
+/// exit close that comes while the shell is still starting can leave the
+/// launcher alive (see "What this does not fix" in the PR).
+fn idleStart(fixture: *LiveTerminalFixture, retain_in_flight: bool) contracts.ActionRequest {
+    return .{ .start = .{
+        .cwd = fixture.home,
+        .command = idle_signalling_command,
+        .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+        .backend = .native,
+        .return_when = .started,
+        .wait_ceiling_ms = 15_000,
+        .persistence = fixture.persistence.?.view(),
+        .retain_in_flight = retain_in_flight,
+    } };
+}
+
+test "start in flight: a start keeps its mark for a caller that asks, until the caller ends it" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    for ([_]bool{ false, true }) |retain| {
+        try fixture.preparePersistence();
+        var started = try fixture.run(idleStart(&fixture, retain));
+        defer started.deinit(alloc);
+        try launched.wait(15_000);
+        const session_id = switch (started.view()) {
+            .success => |success| switch (success) {
+                .start => |value| value.session.session_id,
+                else => return error.TestUnexpectedResult,
+            },
+            .failure => return error.TestTerminalStartFailed,
+        };
+        const store = &fixture.runtime.backend.?.store;
+        // A caller that did not ask finds the id already visible.
+        try std.testing.expectEqual(retain, store.is_starting(session_id));
+        fixture.runtime.endStart(session_id);
+        try std.testing.expect(!store.is_starting(session_id));
+    }
+}
+
+test "start in flight: a cancelled start ends the mark it kept" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+
+    try fixture.preparePersistence();
+    const correlation_id = fixture.runtime.nextCorrelationId();
+    try fixture.runtime.admit(alloc, correlation_id, .{ .start = .{
+        .cwd = fixture.home,
+        .command = idle_signalling_command,
+        .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+        .backend = .native,
+        .return_when = .exit,
+        .wait_ceiling_ms = 15_000,
+        .persistence = fixture.persistence.?.view(),
+        .retain_in_flight = true,
+    } });
+    try launched.wait(15_000);
+    const session_id = try fixture.waitForOnlyRecordedSession(15_000);
+    defer alloc.free(session_id);
+    const store = &fixture.runtime.backend.?.store;
+    try std.testing.expect(store.is_starting(session_id));
+
+    try std.testing.expect(fixture.runtime.cancel(correlation_id));
+    var completion = try fixture.awaitCompletion(correlation_id, 15_000);
+    defer completion.deinit();
+    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+    // The caller only learned `.cancelled`, so nobody else can end the mark.
+    try std.testing.expect(!store.is_starting(session_id));
+}
+
+test "start in flight: a start result the executor cannot copy ends the mark it kept" {
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    var launched: LaunchSignal = undefined;
+    try launched.init(fixture.home);
+    defer launched.deinit();
+    try fixture.preparePersistence();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, LiveTerminalFixture.action_executor.execute(.{
+        .alloc = failing.allocator(),
+        .lifecycle_allocator = alloc,
+        .runtime = &fixture.runtime,
+    }, idleStart(&fixture, true)));
+    try launched.wait(15_000);
+    const session_id = try fixture.waitForOnlyRecordedSession(15_000);
+    defer alloc.free(session_id);
+    try std.testing.expect(!fixture.runtime.backend.?.store.is_starting(session_id));
 }
 
 test "zsh terminal commands keep words that start with = literal" {
