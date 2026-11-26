@@ -8391,7 +8391,7 @@ test "a subagent's always approval reaches its instance's list at once, for main
     const arena = arena_state.allocator();
 
     // The grants a file change's approval offers: the workspace tree.
-    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(file_grants.len > 0);
 
     // They are in the list when the call returns, before the event that

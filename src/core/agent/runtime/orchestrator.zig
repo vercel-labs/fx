@@ -11485,7 +11485,7 @@ fn processQueuedPromptLoop(
 
                     if (decision == .always) {
                         const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
-                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path);
+                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path, permission_outcome.human_approval.shell_epoch);
                     }
 
                     if (!parallel_status_started[group_index]) {
@@ -12807,6 +12807,7 @@ fn processQueuedPromptLoop(
                         deps,
                         &local_grants,
                         offer.grants,
+                        permission_outcome.human_approval.shell_epoch,
                     );
                 } else if (execution_authority == .vision_paths) {
                     for (execution_authority.vision_paths.targets) |target| {
@@ -12817,11 +12818,12 @@ fn processQueuedPromptLoop(
                             config.workspace_root,
                             tool_call,
                             target.canonical_path,
+                            permission_outcome.human_approval.shell_epoch,
                         );
                     }
                 } else {
                     const target_path = try deps.permission_target_for_call(deps.ctx, arena, tool_call, advertised_dynamic_tool_names);
-                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path);
+                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path, permission_outcome.human_approval.shell_epoch);
                 }
             }
 

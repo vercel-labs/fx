@@ -1196,9 +1196,8 @@ const path_always_permissions = [_][]const u8{
     "grep",
 };
 
-pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) ![]types.PermissionGrant {
+pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind, shell_epoch: u64) ![]types.PermissionGrant {
     const permission = permissionNameForTool(tool_name);
-    const shell_epoch = shell_snapshot.processOwner().approvalEpoch();
     var grants: std.ArrayList(types.PermissionGrant) = .empty;
     errdefer {
         clearAllowedTools(alloc, &grants);
@@ -1265,6 +1264,7 @@ pub fn structuredFileGrantOffer(
             tool_name,
             targets.permissionPath(target),
             .path_existing,
+            shell_snapshot.processOwner().approvalEpoch(),
         ) catch return error.OutOfMemory;
         defer types.freePermissionGrantSlice(alloc, suggestions);
         for (suggestions) |grant| {
@@ -1999,10 +1999,10 @@ fn checkAllowToolForSessionAllocFailures(alloc: std.mem.Allocator) !void {
 }
 
 fn checkSuggestedSessionGrantsAllocFailures(alloc: std.mem.Allocator) !void {
-    const command_grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd);
+    const command_grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd, shell_snapshot.processOwner().approvalEpoch());
     defer freeGrants(alloc, command_grants);
 
-    const path_grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent);
+    const path_grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     defer freeGrants(alloc, path_grants);
 }
 
@@ -2907,7 +2907,7 @@ test "directory tree permission patterns match directory and descendants only" {
 test "suggestedSessionGrants returns exact command suggestions with stripped cwd" {
     const alloc = std.testing.allocator;
 
-    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd);
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "run_command", "/tmp/workspace::git status --short", .command_cwd, shell_snapshot.processOwner().approvalEpoch());
     defer freeGrants(alloc, grants);
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
@@ -2917,7 +2917,7 @@ test "suggestedSessionGrants returns exact command suggestions with stripped cwd
 test "suggestedSessionGrants returns exact broad workspace path suggestions" {
     const alloc = std.testing.allocator;
 
-    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent);
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "write_file", "/tmp/workspace/src/main.zig", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     defer freeGrants(alloc, grants);
 
     try std.testing.expectEqual(@as(usize, path_always_permissions.len), grants.len);
@@ -2934,6 +2934,7 @@ test "suggestedSessionGrants uses registered path metadata for provider tools" {
         "provider_list",
         "/tmp/workspace/src",
         .path_optional_existing,
+        shell_snapshot.processOwner().approvalEpoch(),
     );
     defer freeGrants(alloc, grants);
 
@@ -2948,6 +2949,7 @@ test "suggestedSessionGrants uses registered path metadata for provider tools" {
         "unknown_tool",
         "/tmp/workspace/src",
         .none,
+        shell_snapshot.processOwner().approvalEpoch(),
     );
     defer freeGrants(alloc, unknown);
     try std.testing.expectEqual(@as(usize, 1), unknown.len);
@@ -2957,7 +2959,7 @@ test "suggestedSessionGrants uses registered path metadata for provider tools" {
 test "suggestedSessionGrants returns external directory tree read grant" {
     const alloc = std.testing.allocator;
 
-    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "read_file", "/tmp/external/hosts", .path_existing);
+    const grants = try suggestedSessionGrants(alloc, "/tmp/workspace", "read_file", "/tmp/external/hosts", .path_existing, shell_snapshot.processOwner().approvalEpoch());
     defer freeGrants(alloc, grants);
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);

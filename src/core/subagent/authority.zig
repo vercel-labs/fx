@@ -899,7 +899,7 @@ test "a session approval lets an asked action run, and never a tool the child la
     const arena = arena_state.allocator();
     const target = "/tmp/workspace/app/page.tsx";
     // The grants a file change's approval offers: the workspace tree.
-    const approved = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", target, .path_create_parent);
+    const approved = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", target, .path_create_parent, 0);
     const asking = LiveAuthority{
         .generation = 1,
         .root_id = "root",

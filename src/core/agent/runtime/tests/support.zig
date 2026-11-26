@@ -520,6 +520,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_permission_mode: ?PermissionMode = null,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
+    /// Makes the shell approval epoch advance once, after the first answer and
+    /// before the grant that answer keeps is recorded.
+    refresh_before_record: bool = false,
+    refresh_count: usize = 0,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
     last_live_authority_generation: ?u64 = null,
     last_live_authority_tool_count: usize = 0,
@@ -1525,8 +1529,16 @@ pub const FakeAgentRuntimeDeps = struct {
         return arena.print("{s} {s}", .{ label, call.name });
     }
 
+    fn refreshBeforeRecord(self: *FakeAgentRuntimeDeps) void {
+        if (!self.refresh_before_record or self.permission_index == 0) return;
+        self.refresh_before_record = false;
+        shell_snapshot.processOwner().markDirty(.user_reload);
+        self.refresh_count += 1;
+    }
+
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.refreshBeforeRecord();
         if (self.resolve_permission_target) {
             return permissions.permissionTargetForCall(
                 arena,

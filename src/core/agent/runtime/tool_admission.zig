@@ -1086,6 +1086,8 @@ fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), g
     try grants.append(arena, grant);
 }
 
+/// The grants keep `shell_epoch`, the epoch the answer was given in, not the
+/// epoch current when they are recorded.
 pub fn applyInitialSessionGrants(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -1093,6 +1095,7 @@ pub fn applyInitialSessionGrants(
     workspace_root: []const u8,
     call: ToolCall,
     target_path: []const u8,
+    shell_epoch: u64,
 ) !void {
     const command_call = try tooling_tool_admission.callUsesCommandAuthority(
         hooks.tool_registry,
@@ -1112,6 +1115,7 @@ pub fn applyInitialSessionGrants(
         permission_name,
         target_path,
         target_kind,
+        shell_epoch,
     );
     for (grants) |grant| {
         try appendLocalGrant(arena, local_grants, grant);
@@ -1124,8 +1128,11 @@ pub fn applyFrozenFileMutationSessionGrants(
     hooks: *const AgentRuntimeDeps,
     local_grants: *std.ArrayList(PermissionGrant),
     frozen_grants: []const PermissionGrant,
+    shell_epoch: u64,
 ) !void {
-    for (frozen_grants) |grant| {
+    for (frozen_grants) |frozen| {
+        var grant = frozen;
+        grant.shell_epoch = shell_epoch;
         const existed = permissions.sessionGrantAllowed(
             local_grants.items,
             grant.tool_name,

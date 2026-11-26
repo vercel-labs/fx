@@ -5855,6 +5855,7 @@ test "initial session grants follow active registry metadata" {
         "/tmp/workspace",
         .{ .id = "provider-glob", .name = "provider_glob", .arguments_json = "{\"pattern\":\"*\"}" },
         "/tmp/workspace/src",
+        shell_snapshot.processOwner().approvalEpoch(),
     );
 
     try std.testing.expectEqual(@as(usize, 4), local_grants.items.len);
@@ -7859,6 +7860,34 @@ test "a subagent's always approval of a file change stores the session grant" {
 
 test "a subagent's always approval of a command stores the session grant" {
     try expectChildAlwaysStoresGrant(.command);
+}
+
+test "an always answer to a shell command stores the epoch it was answered in when a refresh lands first" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_always", "shell", "{\"command\":\"zig fmt\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.always};
+    hooks.refresh_before_record = true;
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.propagated_grants.items.len);
+    const stored = hooks.propagated_grants.items[0];
+    try std.testing.expectEqual(@as(u64, 0), stored.shell_epoch);
+    try std.testing.expect(!permissions.sessionGrantAllowed(hooks.propagated_grants.items, "run_command", stored.target_path));
 }
 
 /// What a subagent's approval of a call that reads an image kept, as the turn

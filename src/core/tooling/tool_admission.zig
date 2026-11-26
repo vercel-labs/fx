@@ -3046,6 +3046,7 @@ test "terminal exec timeout and profile omission share user grants while clean s
         "run_command",
         clean,
         .command_cwd,
+        shell_snapshot.processOwner().approvalEpoch(),
     );
     try std.testing.expect(permissions.sessionGrantAllowed(grants, "run_command", clean));
     try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", user));
@@ -6056,6 +6057,7 @@ test "TTY admission fingerprints route and explicit shell startup" {
         "run_command",
         captured_target,
         .command_cwd,
+        shell_snapshot.processOwner().approvalEpoch(),
     );
     try std.testing.expect(permissions.sessionGrantAllowed(
         captured_grants,
@@ -6384,7 +6386,7 @@ test "a session approval merged into a turn's list lets its command run with no 
     const target = try permissionTargetForCall(input, arena, call);
     // What a subagent's answer adds to the instance's list, as it reaches the
     // list a turn of main checks against.
-    const grants = try permissions.suggestedSessionGrants(arena, input.workspace_root, "run_command", target, .command_cwd);
+    const grants = try permissions.suggestedSessionGrants(arena, input.workspace_root, "run_command", target, .command_cwd, shell_snapshot.processOwner().approvalEpoch());
 
     // Without it the command asks.
     _ = try requestPermissionOutcome(input, arena, call, .ask, &.{});
@@ -6409,7 +6411,7 @@ test "a session approval merged into a turn's list lets its command run with no 
 
     // The approval of a file change covers the tree it was given in, and no
     // other root.
-    const tree = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
+    const tree = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent, shell_snapshot.processOwner().approvalEpoch());
     try std.testing.expect(permissions.sessionGrantAllowed(tree, "write_file", "/tmp/workspace/other/file.txt"));
     try std.testing.expect(!permissions.sessionGrantAllowed(tree, "write_file", "/tmp/elsewhere/file.txt"));
 
