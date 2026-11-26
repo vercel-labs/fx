@@ -738,7 +738,7 @@ export interface Durability {
 
 /** Options for `memory()`. */
 export interface MemoryOptions {
-  /** Each delivery runs as if its function stopped after this long. No limit by default. */
+  /** Each delivery runs as if its function stopped after this long, at most 2147483647. No limit by default. */
   maxDurationMs?: number;
   /** How long before the deadline each delivery stops. Default 30000. */
   reserveMs?: number;

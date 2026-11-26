@@ -308,6 +308,24 @@ test("a turn longer than the time limit continues in the next delivery, each ste
   await agent.close();
 });
 
+test("a duration must be one a timer can wait", async () => {
+  // setTimeout and setInterval run a longer delay at once: each step would be
+  // cut off as it starts, and a worker would poll or renew without pause.
+  const longest = 2 ** 31 - 1;
+  assert.throws(() => memory({ maxDurationMs: longest + 1 }), { name: "TypeError", message: `memory() maxDurationMs must be at most ${longest}` });
+  for (const key of ["maxDurationMs", "pollMs", "leaseMs"]) {
+    assert.throws(() => world(() => ({}), { [key]: longest + 1 }), { name: "TypeError", message: `world() ${key} must be at most ${longest}` }, key);
+    assert.doesNotThrow(() => world(() => ({}), { [key]: longest }), key);
+  }
+  const deadlines = [];
+  const agent = createAgent({ durability: await durabilityFor({ maxDurationMs: longest }), onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); } });
+  const { text, result } = await textOf(agent.session().prompt("zenith", { messageId: "turn-zenith" }));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "zenith-0 zenith-1 zenith-2");
+  assert.deepEqual(deadlines, [], "the longest time limit cuts no step off");
+  await agent.close();
+});
+
 test("a step cut off at the deadline continues in the next delivery", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();

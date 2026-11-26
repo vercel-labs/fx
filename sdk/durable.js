@@ -211,10 +211,14 @@ export function memory({ maxDurationMs, reserveMs } = {}) {
   return { [durabilityTag]: true, name: "memory", create: () => (backend ??= createMemoryBackend({ maxDurationMs, reserveMs })) };
 }
 
+// setTimeout runs a longer delay at once, which would cut off each step as it starts.
+const maxTimerDelayMs = 2 ** 31 - 1;
+
 function checkDurations(name, { maxDurationMs, reserveMs }) {
   for (const [key, value] of Object.entries({ maxDurationMs, reserveMs })) {
     if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) throw new TypeError(`${name}() ${key} must be a non-negative integer`);
   }
+  if (maxDurationMs > maxTimerDelayMs) throw new TypeError(`${name}() maxDurationMs must be at most ${maxTimerDelayMs}`);
 }
 
 // A durability is `memory()`, or a World one from `libfx/durable-world` (and
