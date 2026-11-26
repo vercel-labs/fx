@@ -1715,6 +1715,14 @@ const hardStopMs = 2000;
 
 const durableInternals = Symbol.for("libfx.durableInternals");
 
+// Asks a harness turn to stop at its next safe point. A turn without
+// `yield()` is cut off at the hand-off's bound instead.
+const askToYield = (turn) => {
+  if (typeof turn?.yield !== "function") return Promise.resolve();
+  // A turn that ended meanwhile, or whose engine exited, says so in its result.
+  return Promise.resolve().then(() => turn.yield()).catch(() => {});
+};
+
 // The shortest wait before a message that found its session running in this
 // process is delivered again, as a backstop for the running worker.
 const runningBackstopSeconds = 2;
@@ -2116,11 +2124,13 @@ class SessionWorker {
     // hardStopMs; a reserve of zero never stops a step.
     const stopMargin = deadline === null ? 0 : Math.min(hardStopMs, Math.floor(this.backend.reserveMs / 2));
     this.stopping = false;
-    this.stopNow = () => {
+    this.handingOff = false;
+    this.yielding = null;
+    this.stopNow = (reason = "deadline") => {
       if (this.stopping) return;
       this.stopping = true;
       // Which cut-off in a row of the same step this is.
-      agent.emit("session.deadline", { sessionId: this.sessionId, epoch: lease.epoch, cutoffs: afterCutoff(cut).cutoffs });
+      agent.emit(reason === "handoff" ? "session.handoff" : "session.deadline", { sessionId: this.sessionId, epoch: lease.epoch, cutoffs: afterCutoff(cut).cutoffs });
       turnNow?.cancel({ reason: "handoff" });
     };
     // A turn that started under a claim that then failed stops at once and
@@ -2129,6 +2139,18 @@ class SessionWorker {
     const hardStop = stopMargin > 0 && deadline - stopMargin > Date.now()
       ? setTimeout(this.stopNow, deadline - stopMargin - Date.now())
       : null;
+    // A host handing this process off (agent.handOff()) stops the turn at its
+    // next safe point and starts no other; at `withinMs` it cuts the turn off
+    // as the deadline does (tests/tla/sdk/DurableHandOff.tla Yield, HDeadline).
+    let handOffStop = null;
+    this.handOff = (withinMs) => {
+      if (this.handingOff) return;
+      this.handingOff = true;
+      this.yielding = askToYield(turnNow);
+      if (withinMs !== undefined) handOffStop = setTimeout(() => this.stopNow("handoff"), withinMs);
+    };
+    const handOffAsked = agent.handOffRequest();
+    if (handOffAsked) this.handOff(handOffAsked.within);
     let harness = null;
     let harnessRun = runOf(null);
     this.settled = () => (harness ? harness.settled() : Promise.resolve());
@@ -2197,7 +2219,7 @@ class SessionWorker {
       const yieldAt = deadline === null ? undefined : Math.max(1, deadline - this.backend.reserveMs);
       for (;;) {
         if (failed) return broken();
-        if (this.stopping) {
+        if (this.stopping || this.handingOff) {
           await harness.close();
           harness = null;
           await release();
@@ -2285,6 +2307,7 @@ class SessionWorker {
         turnNow = turn;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
+        else if (this.handingOff) this.yielding = askToYield(turn);
         // A new turn takes the steers sent while it waited to start.
         const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
         const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
@@ -2356,7 +2379,9 @@ class SessionWorker {
       return failed ? broken() : "done";
     } finally {
       if (hardStop) clearTimeout(hardStop);
+      if (handOffStop) clearTimeout(handOffStop);
       this.stopNow = null;
+      this.handOff = null;
       this.settled = null;
       if (renew) clearInterval(renew);
       if (harness) await harness.close().catch(() => {});
@@ -2756,6 +2781,8 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * steer that cannot join it; without it, such a steer waits for the turn to
  * end. Either way the steer runs as the next turn. A turn stops before a
  * model request once `yieldAt` has passed, with the stop reason `yielded`.
+ * A turn may have `yield()`, which stops it at its next safe point; the turn
+ * then ends `yielded`.
  *
  * An input the harness refuses only once a turn runs it is a turn that ends
  * with an error.
@@ -2791,6 +2818,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     const agent = {
       name: agentName,
       emit,
+      handOffRequest: () => handOffRequest,
       // Work that outlives the delivery that started it, which close() waits
       // for: an engine that shuts down after its worker let go.
       track(work) {
@@ -2811,6 +2839,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     let chosenDurability = null;
     let unlisten = null;
     let closed = false;
+    // Set once agent.handOff() runs: this process then takes no new work.
+    let handOffRequest = null;
     const workers = new Map();
     const active = new Set();
     // Session ids this process minted whose first prompt has not yet tried
@@ -2884,7 +2914,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // `inRequest` from the request that took the prompt.
     const receive = (created, message, delivery, { inRequest = false, handoff = null, backstop = null } = {}) => {
       const worker = hold(created, message.sessionId);
-      let work = worker.consume(message, delivery, handoff, backstop);
+      // A process handing off takes no new work: the queue delivers the message
+      // again, to another process (tests/tla/sdk/DurableHandOff.tla HStart).
+      if (handOffRequest) void backstop?.catch(() => {});
+      let work = handOffRequest ? Promise.resolve({ timeoutSeconds: runningBackstopSeconds }) : worker.consume(message, delivery, handoff, backstop);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
         // that must go on later continues in a fresh message. One whose
@@ -3335,6 +3368,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         stopAtDeadline: (sessionId) => workers.get(sessionId)?.stopNow?.(),
         // Waits for what a session's running turn has written so far.
         settled: async (sessionId) => { await workers.get(sessionId)?.settled?.(); },
+        // Waits until a session's running turn has its hand-off's request to
+        // stop at its next safe point.
+        yielding: async (sessionId) => { await workers.get(sessionId)?.yielding; },
         // Delivers a queue message to this agent as its queue would.
         deliver: async (delivered, delivery) => {
           const created = await backend();
@@ -3396,6 +3432,20 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           if (typeof created.queueHandler !== "function") return new Response("this durability delivers in process", { status: 404 });
           return created.queueHandler(request);
         };
+      },
+      /**
+       * Stops every turn this process runs at its next safe point, so another
+       * delivery continues it, and sends new deliveries back to the queue. A
+       * turn that reaches no safe point within `within` milliseconds is cut
+       * off as at its deadline. Resolves once this process let its sessions go.
+       */
+      async handOff({ within } = {}) {
+        if (within !== undefined && !(Number.isFinite(within) && within >= 0)) {
+          throw new TypeError("handOff() within must be a number of milliseconds, 0 or more");
+        }
+        handOffRequest ??= { within };
+        for (const worker of workers.values()) worker.handOff?.(handOffRequest.within);
+        while (active.size > 0) await Promise.allSettled([...active]);
       },
       /** Waits for the work this process is running, then lets go. */
       async close() {

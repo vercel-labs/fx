@@ -2128,6 +2128,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
         return rawTurn.steer(normalizeSteeringInput(input), id);
       },
       withdraw(id) { return rawTurn.withdraw(id); },
+      yield() { return rawTurn.yield(); },
       [engineInternals]: rawTurn[engineInternals],
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
@@ -2260,6 +2261,15 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
+    let yieldSent = null;
+    const sendYield = () => {
+      if (finished || cancelled || activeTurn !== turn || closing) return undefined;
+      if (typeof runtime.requestYield === "function") {
+        runtime.requestYield();
+        return undefined;
+      }
+      return request("libfx/yield", { sessionId }).then(() => undefined);
+    };
     const turn = {
       // The host's id: the one it gave, or for a resumed turn, the one the
       // turn started with.
@@ -2319,6 +2329,15 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           if (journal) await waitForInput(`withdrawn:${id}`);
           return "withdrawn";
         });
+      },
+      // Stops the turn at its next safe point: it ends "yielded", and resume()
+      // or the next agent continues it. Resolves once the core has the request.
+      yield() {
+        if (!journal) throw new TypeError("a yield needs persistence to keep the turn in");
+        yieldSent ??= (promptStarted && resolvePromptStart
+          ? promptStarted.then((started) => (started === true ? sendYield() : undefined))
+          : Promise.resolve().then(sendYield));
+        return yieldSent;
       },
       // For libfx's session worker: a steer that cannot join the turn, such
       // as one with images, ends the turn at its next safe point, at once

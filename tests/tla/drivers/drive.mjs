@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|handoff] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
@@ -35,16 +35,25 @@
 // `tests/tla/sdk/check.sh` model-checks the spec and writes its
 // graphs/<graph>.dot; the cutoff
 // graph runs lookup with more claims and no freezes, so a step can be cut off
-// at the deadline until the bound stops running it. Each walk
-// starts two agents, A and B, on one World directory, each in a server of its
-// own: a worker thread, session-process.mjs, with its own registry of agents,
-// as another server has, so the two are copies of one agent. Every model
-// request and tool call waits until the driver releases it, and so does each
-// worker's claim on the session, so the driver decides the interleaving: it
-// performs the step the walk chose, waits for the code to settle, reads back
-// each worker's position, the tool runs, and the epoch of every UI line, and
-// moves to the successor state that matches. A step the model has no
-// matching successor for is a conformance failure.
+// at the deadline until the bound stops running it.
+//
+// The handoff graph, from DurableHandOff.tla, is the cutoff graph with a host
+// that hands one worker's process off (agent.handOff()): the asked worker
+// takes no new work, its turn yields at the save before its next model
+// request, or the bound cuts it off as the deadline does, and the other
+// worker continues the turn.
+// CI runs 100 walks of it: a walk reaches Yield only when the host asks the
+// worker that runs the tool, before the tool ends.
+//
+// Each walk starts two agents, A and B, on one World directory, each in a
+// server of its own: a worker thread, session-process.mjs, with its own
+// registry of agents, as another server has, so the two are copies of one
+// agent. Every model request and tool call waits until the driver releases
+// it, and so does each worker's claim on the session, so the driver decides
+// the interleaving: it performs the step the walk chose, waits for the code
+// to settle, reads back each worker's position, the tool runs, and the epoch
+// of every UI line, and moves to the successor state that matches. A step
+// the model has no matching successor for is a conformance failure.
 import { strict as assert } from "node:assert";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -59,8 +68,8 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue", "handoff"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" || graphName === "handoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";
@@ -210,6 +219,8 @@ async function harness() {
   const holders = { A: [], B: [] };
   const claimed = { A: null, B: null };
   const frozen = { A: false, B: false };
+  // Whether the host asked each worker's process to hand off.
+  const asked = { A: false, B: false };
   // Each worker's held writes: its claims on the session, a call's first
   // intent, and a frozen leased worker's renewals.
   const held = { A: [], B: [] };
@@ -410,6 +421,27 @@ async function harness() {
         const head = await leaseHolder(w);
         if (claimed[w] && !holders[w].includes(head)) await until(() => stopped());
       }
+    } else if (name === "AskHandOff") {
+      // The host asks w's process to stop; once w's turn has the request, it
+      // stops at its next safe point.
+      asked[w] = true;
+      await call(w, "handOff", { sessionId });
+    } else if (name === "Yield") {
+      // w's tool returns, and the turn stops at the save before its next model
+      // request: turn_yield, then a release that names no cut-off.
+      const entry = calls.find((item) => item.w === w);
+      assert.ok(entry, `${w} has a tool call to end`);
+      end(entry);
+      await until(async () => !(await call(w, "leaseStands", { sessionId })) &&
+        (await streamLines()).some((line) => line.type === "turn_yield" && line.epoch === claimed[w].epoch));
+      claimed[w] = null;
+    } else if (name === "Deadline" && asked[w]) {
+      // The hand-off's bound cuts w's turn off. An asked worker never takes
+      // the session back: it lets the session go, or, replaced, stops.
+      const fencedBefore = fenced[w];
+      await call(w, "stopAtDeadline", { sessionId });
+      await until(async () => fenced[w] > fencedBefore || !(await call(w, "leaseStands", { sessionId })));
+      if (fenced[w] === fencedBefore) claimed[w] = null;
     } else if (name === "Deadline") {
       // w's timer fires: it stops, and the same message comes back to it.
       const before = new Set(liveHolders);
@@ -491,8 +523,9 @@ for (let walk = 1; walk <= walks; walk += 1) {
           if (act.name === "Announce") continue;
           // local() hands a message that comes back at the deadline to the
           // same worker, so a Deadline that only releases the session is a
-          // path the code cannot take.
-          if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none") continue;
+          // path the code cannot take. An asked worker is the exception: it
+          // sends the message back and lets the session go.
+          if (act.name === "Deadline" && graph.states.get(to).pc[act.w] === "none" && !graph.states.get(to).asked?.[act.w]) continue;
           let option = options.find((item) => sameAct(item.act, act));
           if (!option) options.push(option = { act, fresh: false });
           if (!covered.has(`${from}>${to}`)) option.fresh = true;

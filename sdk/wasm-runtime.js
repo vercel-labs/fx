@@ -160,6 +160,7 @@ function createRuntime(options) {
   let steeringOpen = false;
   // A steer that cannot join the running turn waits to run next.
   let steeringHandoff = false;
+  let yieldRequested = false;
   // Raw payloads beside ACP frames: the core copies inbound bytes into its
   // own memory and publishes outbound bytes for the agent to take.
   const inboundAttachments = new Map();
@@ -440,6 +441,7 @@ function createRuntime(options) {
     steering.length = 0;
     steeringBytes = 0;
     steeringHandoff = false;
+    yieldRequested = false;
   }
 
   function queueSteering(text, id = "") {
@@ -952,6 +954,8 @@ function createRuntime(options) {
     // -1 once the turn takes no more steering, else twice how many steers
     // wait, plus one when a handoff does.
     fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : -1; },
+    // 1 once the host asked the running turn to stop at its next safe point.
+    fx_steering_yield() { return steeringOpen && yieldRequested ? 1 : 0; },
     fx_attachment_size: attachmentSize,
     fx_attachment_take: attachmentTake,
     fx_attachment_put: attachmentPut,
@@ -997,6 +1001,12 @@ function createRuntime(options) {
     handOffSteering() {
       if (!steeringOpen) return false;
       steeringHandoff = true;
+      return true;
+    },
+    // Stops the running turn at its next safe point; false when none runs.
+    requestYield() {
+      if (!steeringOpen) return false;
+      yieldRequested = true;
       return true;
     },
     closeSteering() { steeringOpen = false; clearSteering(); },

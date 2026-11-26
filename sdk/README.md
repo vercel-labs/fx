@@ -108,6 +108,8 @@ Each line is one JSON object with a `type`: the model's events, such as `text_de
 
 libfx stores a prompt before `turn.accepted` resolves, and stores each step of a turn while the turn runs. If the process running a turn dies, the next process that gets work for the session continues the turn from its last stored step. The model is told the turn was interrupted, so it can check what happened before going on.
 
+A process that is about to stop can hand its turns off instead: `await agent.handOff()` stops each turn the process runs at its next safe point, the moment before a model request after the turn's first, sends new work to other processes, and resolves once the process has let go of its sessions. The next process continues each turn without telling the model, because nothing was interrupted. With `{ within }`, a turn that reaches no safe point in that many milliseconds is cut off as at a function's time limit. On `local()`, whose queue lives in its process, a handed-off turn continues at the session's next prompt or `resume()`. On Node.js, `createFxAgent()` hands off on `SIGTERM` by itself, as [On Vercel](#on-vercel) describes.
+
 Where sessions live depends on where your code runs. libfx picks for you:
 
 | Where | Durability | Sessions live in |
@@ -180,6 +182,7 @@ The trigger makes the route private: it has no public URL, and only Vercel Queue
 That's all. When no other invocation holds the session, `prompt()` runs the turn in the request that called it, so the first model request goes out without a queue hop, and the function stays alive for the turn after the route responds. Vercel Queues keeps the prompt until after that request's time limit, and if the request dies mid-turn, that delivery continues the turn. Other turns go through Vercel Queues to this route:
 
 - When a turn gets within 30 seconds of the function's time limit, libfx stops it, and the next invocation continues it. `vercel({ reserveMs })` from `libfx/durable-vercel` changes that margin.
+- When the function gets `SIGTERM`, as Vercel sends before it stops an instance, libfx hands the process's turns off with `agent.handOff({ within: 250 })`, and the next invocation continues them. Vercel gives a function 500 milliseconds after `SIGTERM`, so a turn that reaches no safe point in the first 250 is cut off, leaving time to store that. Then libfx raises `SIGTERM` again, so the process ends as it would have without libfx: Node.js exits by the signal when nothing else listens, and a `SIGTERM` listener of your app's own runs a second time. For a listener that must run once, set `handOffOnSigterm: false`, then call `await agent.handOff({ within })` from that listener and end the process there. A container or daemon gets a longer grace period, which `createFxAgent({ handOffOnSigterm: { within: 25_000 } })` puts to use.
 - A function holds its session for as long as Vercel Queues keeps the turn's message for it, so nothing is written while a turn runs to show the function is alive. If the function's process exits mid-turn, Vercel runs the same delivery again about a second later, and that invocation continues the turn.
 - A function that stops without its process exiting holds the message until the queue's hold on it runs out, up to five minutes. A prompt sent to the session meanwhile continues the turn at that function's time limit, if that comes sooner. `vercel({ leaseMs: 15_000 })` bounds that case: the function renews a 15-second lease on its session every 5 seconds, and the session frees about 15 seconds after the last renewal. With it, every prompt goes through the queue instead of running in the request.
 - A function that only stalled and wakes up after that is refused at its next write, so two processes never write one session.
@@ -418,7 +421,7 @@ A session stores each prompt as JSON before it runs, so a session prompt takes i
 
 ## Diagnostics
 
-`onEvent` receives diagnostics apart from the model's output: request timing and retries, and session events such as `session.deadline` when a turn stops for a function's time limit. The `FxAgentEvent` type lists them all.
+`onEvent` receives diagnostics apart from the model's output: request timing and retries, and session events such as `session.deadline` when a turn stops for a function's time limit, and `session.handoff` when `handOff()` cuts one off at its bound. The `FxAgentEvent` type lists them all.
 
 ## Instrumentation hooks
 
@@ -509,7 +512,7 @@ Reject an `append()` whose `expected` isn't the last stored cursor with `FxFence
 
 The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when something waits for the record, such as a tool call with effects, or a turn's `result`, which resolves only once the record that ends the turn is stored and rejects if that record can't be stored. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
 
-`prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
+`prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted. `turn.yield()` stops a running turn the same way at any time: at its next safe point, before a model request after the turn's first, with the stop reason `yielded`. It needs `persistence`.
 
 A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
 

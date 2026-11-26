@@ -95,6 +95,7 @@ const AcpMethod = enum {
     libfx_steer,
     libfx_withdraw,
     libfx_handoff,
+    libfx_yield,
     libfx_follow_up,
     libfx_snapshot,
     libfx_journal_open,
@@ -121,6 +122,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
         if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
+        if (std.mem.eql(u8, method, "libfx/yield")) return .libfx_yield;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
@@ -143,6 +145,7 @@ const AcpMethod = enum {
             .libfx_steer,
             .libfx_withdraw,
             .libfx_handoff,
+            .libfx_yield,
             .libfx_follow_up,
             => false,
             .session_list,
@@ -162,7 +165,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open, .libfx_journal_images => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_yield, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open, .libfx_journal_images => true,
             else => false,
         };
     }
@@ -285,6 +288,9 @@ pub const ActiveSessionState = struct {
     /// so the turn's workspace captures, which watch this, keep running (D98).
     /// Cleared as each prompt starts.
     turn_cancel: std.atomic.Value(bool) = .init(false),
+    /// The host asked the running libfx turn to stop at its next safe point
+    /// (`libfx/yield`). Cleared when a prompt starts.
+    yield_requested: std.atomic.Value(bool) = .init(false),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
     /// Set when the host passed a journal; every state change is sent to it.
@@ -1710,6 +1716,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_steer => handleKernelSteer(state, alloc, msg),
             .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
             .libfx_handoff => handleKernelHandoff(state, alloc, msg),
+            .libfx_yield => handleKernelYield(state, alloc, msg),
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
             .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1736,6 +1743,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_steer => handleKernelSteer(state, alloc, msg),
         .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
         .libfx_handoff => handleKernelHandoff(state, alloc, msg),
+        .libfx_yield => handleKernelYield(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1931,6 +1939,39 @@ fn handleKernelHandoff(
     if (active.steering.requestHandoff(&active.cancel_flag)) {
         debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
     }
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+/// A host asks the running libfx turn to stop at its next safe point, the save
+/// before a model request after the turn's first, so a later process continues
+/// it (`tests/tla/sdk/DurableHandOff.tla` Yield). Only a journal can keep the
+/// turn, so a session without one cannot yield.
+fn handleKernelYield(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx yield params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const journaled = journaled: {
+        active.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer active.session_write_mutex.unlock(io_mod.getIo());
+        break :journaled active.journal != null;
+    };
+    if (!journaled) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "libfx/yield needs a journal to keep the turn in",
+    });
+    active.yield_requested.store(true, .seq_cst);
+    debug_trace.logf("acp", "libfx yield requested", .{});
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -2719,6 +2760,7 @@ fn startPromptWithInputId(
 
     session.turn_cancel.store(false, .seq_cst);
     session.cancel_flag.store(false, .seq_cst);
+    session.yield_requested.store(false, .seq_cst);
     session.steering.open(state.alloc);
     if (comptime host_target.is_wasm) {
         unused_v2_input_id = null;
@@ -4832,6 +4874,7 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
     try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
+    try std.testing.expectEqual(AcpMethod.libfx_yield, AcpMethod.parse("libfx/yield"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
@@ -4839,6 +4882,8 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
     try std.testing.expect(AcpMethod.libfx_handoff.isLibfx());
     try std.testing.expect(!AcpMethod.libfx_handoff.waitsForActivePrompt());
+    try std.testing.expect(AcpMethod.libfx_yield.isLibfx());
+    try std.testing.expect(!AcpMethod.libfx_yield.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 

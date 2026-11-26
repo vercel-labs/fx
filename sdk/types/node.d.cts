@@ -132,7 +132,10 @@ export type {
 } from "./libfx.cjs";
 
 /** Options for `createFxAgent()` on Node.js. */
-export type FxNodeAgentOptions = FxAgentOptions & FxNodeBackendOptions;
+export type FxNodeAgentOptions = FxAgentOptions & FxNodeBackendOptions & {
+  /** On SIGTERM, hand off this agent's turns (`agent.handOff()`) before the process exits. `true`, the default, bounds the wait at 250 ms; `{ within }` sets the bound in milliseconds; `false` turns it off. */
+  handOffOnSigterm?: boolean | { within?: number };
+};
 
 /** Options for `createFxEngine()` on Node.js. */
 export type FxNodeEngineOptions = FxEngineOptions & FxNodeBackendOptions;
