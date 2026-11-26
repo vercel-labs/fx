@@ -2641,7 +2641,9 @@ fn shellErrorFamily(line: []const u8) ?ShellFamily {
     const token = line[0..colon];
     if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return null;
     if (std.mem.eql(u8, token, "(eval)")) return .zsh;
-    const snapshot_source = std.mem.eql(u8, token, "/dev/fd/0") or std.mem.eql(u8, token, "/proc/self/fd/0");
+    const snapshot_source = for (shell_resolver.replay_sources) |source| {
+        if (std.mem.eql(u8, token, source)) break true;
+    } else false;
     if (snapshot_source and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return .line_by_line;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
     if (std.mem.eql(u8, base, "zsh")) return .zsh;
@@ -3993,6 +3995,7 @@ test "bash parse error from a replay sourced through /proc/self/fd gets line-by-
         line_shell_parse_retry_guidance,
         failureRetryGuidance(2, "/proc/self/fd/0: eval: line 1: unexpected EOF while looking for matching `''\n", true),
     );
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "/proc/self/fd/0: line 3: 1 +  : syntax error: operand expected (error token is \" \")\n", true));
 }
 
 test "shell snapshot keeps bounded head tail and control metadata" {

@@ -4,8 +4,10 @@
 # each config's expected verdict.
 #
 # fixed.cfg must pass. head.cfg is the rule before the fix and must fail
-# QuotingErrorAccepted for bash 3.2. mutant-any-line.cfg plants a matcher that
-# accepts any line and must fail CleanLineRejected.
+# QuotingErrorAccepted for bash 3.2. before-proc-fd.cfg is the rule before
+# /proc/self/fd/0 was accepted and must fail QuotingErrorAccepted for bash 5
+# without /dev/fd. mutant-any-line.cfg plants a matcher that accepts any line
+# and must fail CleanLineRejected.
 #
 # Run the real shells through the test's real matcher and have TLC replay them:
 #   bun test ../drivers/shell_eval_error/
@@ -20,5 +22,6 @@ cd "$(dirname "$0")"
 tlc_verdicts "$@" <<EOT
 ShellEvalError fixed -
 ShellEvalError head QuotingErrorAccepted
+ShellEvalError before-proc-fd QuotingErrorAccepted
 ShellEvalError mutant-any-line CleanLineRejected
 EOT

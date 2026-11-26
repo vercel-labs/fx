@@ -261,6 +261,14 @@ pub fn snapshotInvocation(
 
 const stdin_fd_dir = "/dev/fd";
 
+/// The path the snapshot bootstrap sources its replay from when /dev/fd/0
+/// is missing.
+const replay_fallback_source = "/proc/self/fd/0";
+
+/// The paths the snapshot bootstrap can source its replay from. bash names
+/// the one it used in its error lines.
+pub const replay_sources = [_][]const u8{ stdin_fd_dir ++ "/0", replay_fallback_source };
+
 // The directory is a parameter so a test can name one that is missing.
 fn snapshotInvocationFrom(
     alloc: Allocator,
@@ -290,10 +298,11 @@ fn snapshotInvocationFrom(
     };
     // A minimal Linux, such as a container or a VM with its own init, may
     // have no /dev/fd link, so the replay then opens fd 0 through
-    // /proc/self/fd, where that link points. bash names the path it sources
-    // in its error lines, and `shellErrorFamily` in src/tools/shell/shell.zig
-    // matches both.
-    const pick_source = "__fx_snapshot_src=" ++ fd_dir ++ "/0; [[ -d " ++ fd_dir ++ " ]] || __fx_snapshot_src=/proc/self/fd/0; ";
+    // /proc/self/fd, where that link points. The check tests the directory
+    // as well as the entry: a bash built for a system without /dev/fd answers
+    // a test of /dev/fd/0 from descriptor 0 itself ("Bash Conditional
+    // Expressions" in the bash manual).
+    const pick_source = "__fx_snapshot_src=" ++ fd_dir ++ "/0; [[ -d " ++ fd_dir ++ " && -e " ++ fd_dir ++ "/0 ]] || __fx_snapshot_src=" ++ replay_fallback_source ++ "; ";
     // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes it
     // holds at that moment, about 64 KB, so a larger replay would lose its
     // end. That bash reads the whole script with a command substitution and
@@ -750,7 +759,7 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
 
     const zsh = try snapshotInvocation(arena, "/bin/zsh", "marker");
     try std.testing.expectEqualStrings(
-        "\\builtin exec 9>&2 2>/dev/null; __fx_snapshot_src=/dev/fd/0; [[ -d /dev/fd ]] || __fx_snapshot_src=/proc/self/fd/0; " ++
+        "\\builtin exec 9>&2 2>/dev/null; __fx_snapshot_src=/dev/fd/0; [[ -d /dev/fd && -e /dev/fd/0 ]] || __fx_snapshot_src=/proc/self/fd/0; " ++
             "\\builtin source \"$__fx_snapshot_src\"; __fx_snapshot_status=$?; " ++
             "\\builtin exec 2>&9 9>&-; " ++ tail,
         zsh.argv()[zsh.argv().len - 1],
@@ -758,7 +767,7 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
 
     const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
     try std.testing.expectEqualStrings(
-        "exec 9>&2 2>/dev/null; __fx_snapshot_src=/dev/fd/0; [[ -d /dev/fd ]] || __fx_snapshot_src=/proc/self/fd/0; " ++
+        "exec 9>&2 2>/dev/null; __fx_snapshot_src=/dev/fd/0; [[ -d /dev/fd && -e /dev/fd/0 ]] || __fx_snapshot_src=/proc/self/fd/0; " ++
             "if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< \"$__fx_snapshot_src\")\"; " ++
             "else \\builtin source \"$__fx_snapshot_src\"; fi; __fx_snapshot_status=$?; " ++
             "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
@@ -796,7 +805,7 @@ fn expectSnapshotReplayRestores(
     try std.testing.expectEqual(@as(?usize, null), std.mem.find(u8, result.stderr, marker));
 }
 
-test "snapshot bootstrap restores its replay when the fd directory is missing" {
+test "snapshot bootstrap restores a bash replay when the fd directory or its entry is missing" {
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     std.Io.Dir.accessAbsolute(std.testing.io, "/bin/bash", .{}) catch return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -805,12 +814,20 @@ test "snapshot bootstrap restores its replay when the fd directory is missing" {
 
     try expectSnapshotReplayRestores(arena, "/bin/bash", .bash, "/dev/fd");
     try expectSnapshotReplayRestores(arena, "/bin/bash", .bash, "/nonexistent-fx-fd");
-    std.Io.Dir.accessAbsolute(std.testing.io, "/bin/zsh", .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
+    // /proc exists, and /proc/0 never does: Linux lists no process 0 there.
+    try expectSnapshotReplayRestores(arena, "/bin/bash", .bash, "/proc");
+}
+
+test "snapshot bootstrap restores a zsh replay when the fd directory or its entry is missing" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    std.Io.Dir.accessAbsolute(std.testing.io, "/bin/zsh", .{}) catch return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     try expectSnapshotReplayRestores(arena, "/bin/zsh", .zsh, "/dev/fd");
     try expectSnapshotReplayRestores(arena, "/bin/zsh", .zsh, "/nonexistent-fx-fd");
+    try expectSnapshotReplayRestores(arena, "/bin/zsh", .zsh, "/proc");
 }
 
 test "profile normalization defaults captured and persistent execution to user" {

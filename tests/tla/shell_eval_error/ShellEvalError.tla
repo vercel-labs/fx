@@ -11,12 +11,14 @@
 (*                                                                         *)
 (*   zsh      (eval):1: unmatched "                    evalLine1           *)
 (*   bash 5   /dev/fd/0: eval: line 2: unexpected EOF  devFd0Eval          *)
+(*   bash 5, no /dev/fd  /proc/self/fd/0: eval: line 2: ...  procFd0Eval   *)
 (*   bash 3.2 /bin/bash: eval: line 7: unexpected EOF  bashEvalLine        *)
 (*                                                                         *)
-(* bash 5 sources the script from /dev/fd/0. bash 3.2 reads it with        *)
-(* `eval "$(< /dev/fd/0)"`, so it names itself. The bash line number is    *)
-(* abstracted away: tests/tla/drivers/shell_eval_error/ runs real shells   *)
-(* with one-digit and two-digit numbers.                                   *)
+(* bash 5 sources the script from /dev/fd/0, or from /proc/self/fd/0 where *)
+(* /dev/fd is missing. bash 3.2 reads it with `eval "$(< /dev/fd/0)"`, so  *)
+(* it names itself. The bash line number is abstracted away:               *)
+(* tests/tla/drivers/shell_eval_error/ runs real shells with one-digit and *)
+(* two-digit numbers.                                                      *)
 (*                                                                         *)
 (* A run is one login shell and one command: one with the quoting error,   *)
 (* or a clean one. The test passes when its matcher                        *)
@@ -28,6 +30,8 @@
 (*   CleanLineRejected     a run without the error is not.                 *)
 (*                                                                         *)
 (* HeadAccepted is the rule before the fix: bash 3.2's line is rejected.   *)
+(* BeforeProcFdAccepted is the rule before /proc/self/fd/0 was accepted,   *)
+(* so the quoting error of a system without /dev/fd is rejected.           *)
 (* AnyLineAccepted is a planted wrong rule: a clean run is accepted.       *)
 (*                                                                         *)
 (* TraceSpec replays runs the driver observed in real shells. A run        *)
@@ -42,15 +46,16 @@ CONSTANTS
     Accepted,   \* the line classes the test's matcher accepts
     Observed    \* runs the driver saw, as [shell, kind, line, verdict]; NoRuns for a plain check
 
-Shells == {"zsh", "bash32", "bash5"}
+Shells == {"zsh", "bash32", "bash5", "bash5NoDevFd"}
 Kinds == {"error", "clean"}
-Classes == {"evalLine1", "devFd0Eval", "bashEvalLine", "none"}
+Classes == {"evalLine1", "devFd0Eval", "bashEvalLine", "procFd0Eval", "none"}
 
 \* The class of the quoting-error line each shell prints.
-Prefix == [zsh |-> "evalLine1", bash32 |-> "bashEvalLine", bash5 |-> "devFd0Eval"]
+Prefix == [zsh |-> "evalLine1", bash32 |-> "bashEvalLine", bash5 |-> "devFd0Eval", bash5NoDevFd |-> "procFd0Eval"]
 
-FixedAccepted == {"evalLine1", "devFd0Eval", "bashEvalLine"}
+FixedAccepted == {"evalLine1", "devFd0Eval", "bashEvalLine", "procFd0Eval"}
 HeadAccepted == {"evalLine1", "devFd0Eval"}
+BeforeProcFdAccepted == {"evalLine1", "devFd0Eval", "bashEvalLine"}  \* the rule before /proc/self/fd/0 was accepted
 AnyLineAccepted == Classes
 
 NoRuns == << >>
