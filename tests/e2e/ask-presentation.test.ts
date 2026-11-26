@@ -1477,6 +1477,17 @@ describe("fx ask shell startup files", () => {
   );
 });
 
+/** The text of a bash result: the `value` of the tool output fx sends the model. */
+function bashResultText(body: string, callId: string): string {
+  return (JSON.parse(toolResultText(body, callId)) as { value: string }).value;
+}
+
+/** The one saved session's results folder: `~/.fx/results/{session id}`. */
+function sessionResults(home: string): string {
+  const [session] = readdirSync(join(home, ".fx", "results"));
+  return join(home, ".fx", "results", session!);
+}
+
 describe("fx ask with experimental.bash_tool", () => {
   // Fx's built-in tools that the bash tool set replaces. None may reach the model.
   const REPLACED_TOOLS = [
@@ -1582,6 +1593,122 @@ describe("fx ask with experimental.bash_tool", () => {
     expect(text).toMatch(/\/fx-bash-\d+-[0-9a-f]{16}\/out/);
     expect(text).toContain("isdir");
     expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("a finished bash program's result starts with its header, and its output is saved as N.txt with an index row", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-hello", "bash", { command: "echo hello" }),
+      fakeGatewayFinalText("Printed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Say hello."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(bashResultText(gateway.requests[1]!.body, "bash-hello")).toBe("[exit 0, 1 line, 6 B, $FX_OUT/1.txt]\nhello\n");
+    const results = sessionResults(root.home);
+    expect(readFileSync(join(results, "1.txt"), "utf8")).toBe("hello\n");
+    expect(readFileSync(join(results, "index.tsv"), "utf8")).toBe("n\texit\tbytes\tlines\tcommand\n1\t0\t6\t1\techo hello\n");
+  }, TIMEOUT);
+
+  test("a long bash result is a preview that names its hidden lines and its file, and a later program reads that file whole", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-seq", "bash", { command: "seq 1 200000" }),
+      fakeGatewayToolCall("bash-second", "bash", { command: "echo second" }),
+      fakeGatewayToolCall("bash-count", "bash", { command: 'wc -l < "$FX_OUT/1.txt"; cat "$FX_OUT/index.tsv"' }),
+      fakeGatewayFinalText("Read.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Count the numbers."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    const preview = bashResultText(gateway.requests[1]!.body, "bash-seq");
+    expect(preview.split("\n").slice(0, 6)).toEqual(["[exit 0, 200000 lines, 1 MB, $FX_OUT/1.txt]", "1", "2", "3", "4", "5"]);
+    expect(preview).toMatch(/\n\[\.\.\. \d+ lines not shown; the full output is \$FX_OUT\/1\.txt \.\.\.\]\n/);
+    expect(preview.endsWith("\n200000\n")).toBe(true);
+    const counted = bashResultText(gateway.requests[3]!.body, "bash-count");
+    expect(counted).toContain("200000\n");
+    expect(counted).toContain("n\texit\tbytes\tlines\tcommand\n1\t0\t1288895\t200000\tseq 1 200000\n2\t0\t7\t1\techo second\n");
+  }, TIMEOUT);
+
+  test("a failed bash program's header gives its exit code, and an empty program is saved as an empty file", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-fail", "bash", { command: "echo oops; exit 3" }),
+      fakeGatewayToolCall("bash-empty", "bash", { command: "true" }),
+      fakeGatewayFinalText("Checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Check two programs."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(bashResultText(gateway.requests[1]!.body, "bash-fail")).toBe("[exit 3, 1 line, 5 B, $FX_OUT/1.txt]\noops\n");
+    expect(bashResultText(gateway.requests[2]!.body, "bash-empty")).toBe("[exit 0, 0 lines, 0 B, $FX_OUT/2.txt]");
+    expect(readFileSync(join(sessionResults(root.home), "2.txt"), "utf8")).toBe("");
+  }, TIMEOUT);
+
+  test("with --no-save, a bash result still has its header, and no results folder is made", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash-hello", "bash", { command: "echo hello" }),
+      fakeGatewayFinalText("Printed.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(["ask", "--json", "--yolo", "--no-save", ...BASH_SETTING, "Say hello."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code).toBe(0);
+    expect(bashResultText(gateway.requests[1]!.body, "bash-hello")).toBe("[exit 0, 1 line, 6 B, $FX_OUT/1.txt]\nhello\n");
+    expect(existsSync(join(root.home, ".fx", "results"))).toBe(false);
+  }, TIMEOUT);
+
+  test("a resumed saved ask numbers its next result after the last one, not from 1", async () => {
+    const root = createRoot();
+    const first = startFakeGateway([
+      fakeGatewayToolCall("bash-first", "bash", { command: "echo first" }),
+      fakeGatewayFinalText("First.\n"),
+    ]);
+    gateways.push(first);
+    const firstRun = await runFx(["ask", "--json", "--yolo", ...BASH_SETTING, "Print first."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, first),
+      timeoutMs: TIMEOUT,
+    });
+    expect(firstRun.code).toBe(0);
+
+    const second = startFakeGateway([
+      fakeGatewayToolCall("bash-second", "bash", { command: "echo second" }),
+      fakeGatewayFinalText("Second.\n"),
+    ]);
+    gateways.push(second);
+    const secondRun = await runFx(["ask", "--json", "--yolo", "--resume", "last", ...BASH_SETTING, "Print second."], {
+      cwd: root.workspace,
+      env: gatewayEnv(root.home, second),
+      timeoutMs: TIMEOUT,
+    });
+    expect(secondRun.code).toBe(0);
+    expect(bashResultText(second.requests[1]!.body, "bash-second")).toBe("[exit 0, 1 line, 7 B, $FX_OUT/2.txt]\nsecond\n");
+    expect(readFileSync(join(sessionResults(root.home), "2.txt"), "utf8")).toBe("second\n");
   }, TIMEOUT);
 
   test("a saved ask that runs no bash program makes no results folder", async () => {

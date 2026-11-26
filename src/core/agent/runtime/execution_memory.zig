@@ -1078,6 +1078,20 @@ pub fn prepareCapturedToolModelOutput(
             .memory = memory,
         };
     }
+    if (std.mem.eql(u8, tool_call.name, "bash")) {
+        // The bash tool bounds its own text, with its header and preview, and saves the
+        // whole output as a file in $FX_OUT (src/tools/bash/bash.zig, finish). So no
+        // store and no second cut apply: the model reads the text the tool wrote.
+        const sanitized_output = try tool_result_limits.prepareSanitizedOutput(arena, raw_output);
+        return .{
+            .model_output = sanitized_output,
+            .memory = .{
+                .output_bytes = raw_output.len,
+                .stored_output_bytes = sanitized_output.len,
+                .truncated = false,
+            },
+        };
+    }
     const required_command_replay = if (capture) |candidate|
         candidate.policy() == .required
     else
@@ -3098,4 +3112,38 @@ test "transcript does not mark native web_search as provider resource placeholde
 
     try std.testing.expect(!records[0].provider_native);
     try std.testing.expectEqualStrings("bounded search output", records[0].output);
+}
+
+test "a bash result is neither stored nor cut a second time: the model reads the text the bash tool wrote" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const body = try arena.alloc(u8, 4096);
+    @memset(body, 'x');
+    const raw = try arena.print("[exit 0, 1 line, 4 KB, $FX_OUT/1.txt]\n{s}\n", .{body});
+
+    const prepared = try prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .max_tool_result_bytes = 1024,
+            .cancel_flag = &cancel,
+            .tool_result_dir = result_dir,
+        },
+        toolCall("bash_long", "bash", "{}"),
+        raw,
+    );
+
+    try std.testing.expectEqualStrings(raw, prepared.model_output);
+    try std.testing.expect(!prepared.memory.truncated);
+    try std.testing.expect(prepared.memory.output_handle == null);
 }

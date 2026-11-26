@@ -1595,6 +1595,42 @@ test.skipIf(!tmuxAvailable())(
   60_000,
 );
 
+test(
+  "TUI bash result shows its header line in the bash call",
+  async () => {
+    const fixture = createFixture("fx-tui-bash-header-", { experimental: { bash_tool: true } });
+    const tmp = join(fixture.root, "tmp");
+    mkdirSync(tmp);
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("bash_header", "bash", { command: "echo header-check" }),
+      fakeGatewayFinalText("BASH_HEADER_DONE"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway, FX_BIN, { TMPDIR: tmp });
+
+    await active.sendText("Print a header.");
+    await active.sendKeys("Enter");
+    await active.waitForText("BASH_HEADER_DONE", TIMEOUT);
+    await active.sendKeys("C-o");
+    await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
+    const detail = await active.capturePane();
+    expect(detail).toContain("header-check");
+    expect(detail).not.toContain("$FX_OUT/");
+    await active.sendKeys("C-o");
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).not.toContain("$FX_OUT/");
+
+    const sent = toolResultText(gateway.requests[1]!.body, "bash_header");
+    expect(sent).toContain("[exit 0, 1 line, 13 B, $FX_OUT/1.txt]");
+    expect(sent).toContain("header-check");
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 async function waitForEditApproval(
   session: TmuxSession,
   required: string[] = [],

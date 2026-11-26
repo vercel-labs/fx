@@ -264,6 +264,8 @@ pub const State = union(enum) {
     exit: u8,
     signal: u8,
     stopped,
+    /// fx lost track of the program, so its end is not known.
+    lost,
     unknown,
 };
 
@@ -295,6 +297,7 @@ pub fn writeHeader(w: *Writer, header: Header) Writer.Error!void {
         .exit => |code| try w.print("exit {d}", .{code}),
         .signal => |signal| try w.print("killed by signal {d}", .{signal}),
         .stopped => try w.writeAll("stopped"),
+        .lost => try w.writeAll("fx lost this program"),
         .unknown => try w.writeAll("ended; exit status unknown"),
     }
     try w.writeAll(", ");
@@ -350,6 +353,16 @@ pub fn writeShape(w: *Writer, stats: Stats, notice: Notice) Writer.Error!void {
             if (count == 1) "line" else "lines",
             if (count == 1) "matches" else "match",
         });
+    }
+}
+
+/// The line that says a saved result's index line was not written. The file it
+/// names is still there. A result that was not saved has no index line to miss.
+pub fn writeIndexMissing(w: *Writer, saved: Saved) Writer.Error!void {
+    switch (saved) {
+        .file => |number| try w.print("[the index line for this result was not written; the file is still {s}/{d}.txt]", .{ shown_folder, number }),
+        .file_cut => |cut| try w.print("[the index line for this result was not written; the file is still {s}/{d}.txt]", .{ shown_folder, cut.number }),
+        .not_saved_full, .not_saved_error => {},
     }
 }
 
@@ -714,6 +727,19 @@ test "the header words for a killed, stopped, and unknown program are the bash t
     const unknown = try headerText(std.testing.allocator, .{ .state = .unknown, .bytes = 0, .lines = 0, .saved = .{ .file = 4 } });
     defer std.testing.allocator.free(unknown);
     try std.testing.expectEqualStrings("[ended; exit status unknown, 0 lines, 0 B, $FX_OUT/4.txt]", unknown);
+}
+
+test "the index line notice names the file that is still there" {
+    var out: Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeIndexMissing(&out.writer, .{ .file = 7 });
+    try std.testing.expectEqualStrings("[the index line for this result was not written; the file is still $FX_OUT/7.txt]", out.written());
+}
+
+test "the header word for a program fx lost says so" {
+    const lost = try headerText(std.testing.allocator, .{ .state = .lost, .bytes = 0, .lines = 0, .saved = .{ .file = 3 } });
+    defer std.testing.allocator.free(lost);
+    try std.testing.expectEqualStrings("[fx lost this program, 0 lines, 0 B, $FX_OUT/3.txt]", lost);
 }
 
 test "header sizes are bytes, KB, or MB with no decimals" {

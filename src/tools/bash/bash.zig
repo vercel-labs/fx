@@ -4,9 +4,11 @@
 const std = @import("std");
 const bash_session = @import("../../core/bash_session/bash_session.zig");
 const bash_results = @import("../../core/bash_results/bash_results.zig");
+const command_replay_store = @import("../../core/session/command_replay_store.zig");
+const result_files = @import("../../core/session/result_files.zig");
+const program_output = @import("program_output.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
-const text_utils = @import("../../core/shared/text_utils.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -21,13 +23,9 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// The output is kept whole only while it plus this many bytes fits in
-/// `max_bytes`. The reserve holds the status line, the flags, and their line ends.
+/// A result's text shows at most its `max_bytes` less this many bytes of output.
+/// The reserve holds the header line, the shape line, and their line ends.
 const result_reserve_bytes = 512;
-
-/// Room for the cut marker and its line ends: "[... N bytes cut ...]", with a
-/// count of up to 20 digits, plus two line ends.
-const cut_marker_reserve_bytes = 64;
 
 /// The smallest `max_bytes` that leaves room for the reserves and a cut.
 const min_result_bytes = 1024;
@@ -219,6 +217,16 @@ fn callRun(
     command: []const u8,
     yield_ms: u32,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return callRunLimited(ctx, command, yield_ms, .{});
+}
+
+/// `callRun` with the limits of the files it saves. Tests pass small limits to reach a cut or a full folder.
+fn callRunLimited(
+    ctx: tool_dispatch.DispatchContext,
+    command: []const u8,
+    yield_ms: u32,
+    limits: result_files.Limits,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailableResult(ctx);
     const session = ctx.bash_session orelse return unavailableResult(ctx);
     if (tool_dispatch.bashProgramRunning(session, runtime)) return failureText(ctx, still_running_text);
@@ -330,7 +338,7 @@ fn callRun(
         return startFailure(ctx, err, leftover, notes);
     };
     defer prepared.deinit(ctx.allocator);
-    const outcome = finish(ctx, runtime, &prepared, leftover, notes);
+    const outcome = finish(ctx, runtime, &prepared, leftover, notes, .{ .folder = results_folder, .limits = limits });
     // The program started and its result, with the state-lost notice, was delivered, so the loss has been reported.
     if (outcome) |_| {
         if (notes.state != null) session.clearLossPending();
@@ -359,7 +367,15 @@ fn callWait(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finish(ctx, runtime, &prepared, null, .{});
+    // The folder the ended program's `$FX_OUT` named. The host returns the same
+    // folder again, so this is the folder the program's file goes in.
+    var folder_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer mem_utils.deinit_arena(folder_arena_state);
+    const folder: ?[]const u8 = bashResultsFolder(ctx, session, folder_arena_state.allocator()) catch |err| blk: {
+        traceError("bash results folder not found for a wait", err);
+        break :blk null;
+    };
+    return finish(ctx, runtime, &prepared, null, .{}, .{ .folder = folder });
 }
 
 /// Which program a save notice is about: `own` is the program whose result carries
@@ -533,18 +549,27 @@ fn cancelDelivery(runtime: *managed_execution.Runtime, prepared: *const managed_
     };
 }
 
+/// Where a program's output is saved: the results folder `$FX_OUT` named, or null
+/// when the host gives none, and the limits its files keep.
+const SaveTarget = struct {
+    folder: ?[]const u8,
+    limits: result_files.Limits = .{},
+};
+
 /// Turns a program's snapshot into the result the model reads, then hands the
 /// delivery to the runtime. `leftover` is a notice from a program that ended
 /// before this one started, and it is freed here. `notes` are this call's notices,
 /// borrowed. A program that has ended also reports its own save record, which is
-/// taken here. A failed hand-off cancels the reservation, so none is left behind,
-/// and frees the body.
+/// taken here. A program that has ended is saved before its text is built, so the
+/// header names the file that holds it. A failed hand-off cancels the reservation,
+/// so none is left behind, and frees the body.
 fn finish(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     prepared: *managed_execution.PreparedSnapshot,
     leftover: ?[]u8,
     notes: CallNotes,
+    target: SaveTarget,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     defer if (leftover) |text| ctx.allocator.free(text);
     const own: ?[]u8 = if (ctx.bash_session) |session| blk: {
@@ -559,7 +584,28 @@ fn finish(
     defer if (own) |text| ctx.allocator.free(text);
     const notices = [_]?[]const u8{ leftover, own, notes.folder, notes.state };
     const budget = @max(ctx.max_tool_result_bytes, min_result_bytes);
-    const body = formatResult(ctx.allocator, prepared.snapshot, budget, &notices) catch |err| {
+    var replay_reader: ?command_replay_store.Reader = null;
+    defer if (replay_reader) |*reader| reader.deinit();
+    var output: ?program_output.Output = null;
+    defer if (output) |*saved| saved.deinit();
+    if (std.meta.activeTag(prepared.snapshot.state) != .running) {
+        output = program_output.save(.{
+            .alloc = ctx.allocator,
+            .folder_path = target.folder,
+            .limits = target.limits,
+            .keep_bytes = @max(program_output.keep_min_bytes, budget - result_reserve_bytes),
+            .command = prepared.snapshot.command,
+            .exit = indexExit(prepared.snapshot.state),
+            .replay = openReplay(ctx, runtime, &prepared.snapshot, &replay_reader),
+            .delta = prepared.snapshot.output_delta,
+        }) catch |err| {
+            cancelDelivery(runtime, prepared, "a save error");
+            if (own != null or leftover != null or notes.present()) logDroppedNotice(err);
+            return err;
+        };
+    }
+    const shown: ?*const program_output.Output = if (output) |*saved| saved else null;
+    const body = formatResult(ctx.allocator, prepared.snapshot, budget, shown, &notices) catch |err| {
         cancelDelivery(runtime, prepared, "a format error");
         return undeliveredResult(ctx, "bash result is unavailable", &notices, err);
     };
@@ -642,22 +688,32 @@ test "tmpRoot uses an absolute TMPDIR without trailing slashes, and /tmp otherwi
     try std.testing.expectEqualStrings("/tmp", tmpRootFor("/bad\\dir"));
 }
 
-/// The text the model sees for one snapshot of a bash program: its output, cut
-/// to `max_bytes` when needed, then at most one status line, then the flags, then
-/// `notices`, each on its own line. The caller frees the result.
-fn formatResult(alloc: Allocator, snapshot: managed_execution.Snapshot, max_bytes: usize, notices: []const ?[]const u8) ![]u8 {
+/// The text the model sees for one snapshot of a bash program, then `notices`, each
+/// on its own line. An ended program (`output` set) gets its header, then its output
+/// as bash_results plans it. A running program gets its undelivered output, then
+/// its still-running line. The caller frees the result.
+fn formatResult(
+    alloc: Allocator,
+    snapshot: managed_execution.Snapshot,
+    max_bytes: usize,
+    output: ?*const program_output.Output,
+    notices: []const ?[]const u8,
+) ![]u8 {
     if (max_bytes < min_result_bytes) return error.ResultBudgetTooSmall;
+    const limits: bash_results.Limits = .{ .inline_bytes = max_bytes - result_reserve_bytes };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    const output = snapshot.output_delta;
-    if (output.len + result_reserve_bytes > max_bytes) {
-        const keep = max_bytes - result_reserve_bytes - cut_marker_reserve_bytes;
-        try appendCutOutput(alloc, &out, output, keep);
+    if (output) |ended| {
+        try appendHeader(alloc, &out, headerState(snapshot.state), ended);
+        try appendBody(alloc, &out, ended.stats, ended.head, ended.tail, limits, noticeOf(ended.saved));
+        if (ended.index_missing) try appendIndexMissing(alloc, &out, ended.saved);
     } else {
-        try out.appendSlice(alloc, output);
+        var stats: bash_results.Stats = .{};
+        stats.feed(snapshot.output_delta);
+        try appendBody(alloc, &out, stats, snapshot.output_delta, snapshot.output_delta, limits, .running);
+        try appendRunningLine(alloc, &out, snapshot.running_ms);
+        if (snapshot.output_truncated) try appendLine(alloc, &out, &.{"[some output was cut]"});
     }
-    try appendStatusLine(alloc, &out, snapshot);
-    if (snapshot.output_truncated) try appendLine(alloc, &out, &.{"[some output was cut]"});
     if (snapshot.output_incomplete) try appendLine(alloc, &out, &.{"[some output could not be read]"});
     for (notices) |notice| {
         if (notice) |text| try appendLine(alloc, &out, &.{text});
@@ -665,18 +721,113 @@ fn formatResult(alloc: Allocator, snapshot: managed_execution.Snapshot, max_byte
     return out.toOwnedSlice(alloc);
 }
 
-/// Appends the head and the tail of `text`, with a line between them that says
-/// how many bytes were cut. The head and tail together keep at most `keep`
-/// bytes, and each cut lands on a character boundary.
-fn appendCutOutput(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, keep: usize) !void {
-    const head_budget = keep / 2;
-    const tail_budget = keep - head_budget;
-    const head_end = text_utils.utf8BackwardBoundary(text, head_budget);
-    const tail_start = text_utils.utf8ForwardBoundary(text, text.len - tail_budget);
-    var digits: [max_decimal_bytes]u8 = undefined;
-    try out.appendSlice(alloc, text[0..head_end]);
-    try appendLine(alloc, out, &.{ "[... ", decimal(&digits, @intCast(tail_start - head_end)), " bytes cut ...]" });
-    try appendLine(alloc, out, &.{text[tail_start..]});
+/// Appends the header of an ended program: how it ended, its size, and its file.
+fn appendHeader(alloc: Allocator, out: *std.ArrayList(u8), state: bash_results.State, output: *const program_output.Output) !void {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try bash_results.writeHeader(&text.writer, .{
+        .state = state,
+        .bytes = output.stats.bytes,
+        .lines = output.stats.lines(),
+        .saved = output.saved,
+    });
+    try appendLine(alloc, out, &.{text.written()});
+}
+
+/// Appends the output as bash_results plans it: the shape line when it is a
+/// preview, then the text, on a line of its own when there is any.
+fn appendBody(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    stats: bash_results.Stats,
+    head: []const u8,
+    tail: []const u8,
+    limits: bash_results.Limits,
+    notice: bash_results.Notice,
+) !void {
+    const planned = bash_results.plan(head, tail, stats, limits);
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    if (std.meta.activeTag(planned) == .preview) try bash_results.writeShape(&body.writer, stats, notice);
+    try bash_results.writePreview(&body.writer, planned, notice);
+    if (body.written().len > 0) try appendLine(alloc, out, &.{body.written()});
+}
+
+/// Appends the line that says a saved result's index line was not written.
+fn appendIndexMissing(alloc: Allocator, out: *std.ArrayList(u8), saved: bash_results.Saved) !void {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try bash_results.writeIndexMissing(&text.writer, saved);
+    try appendLine(alloc, out, &.{text.written()});
+}
+
+/// The header's word for how an ended program ended.
+fn headerState(state: managed_execution.SnapshotState) bash_results.State {
+    return switch (state) {
+        // Only an ended program has a header, and `finish` saves only those.
+        .running => unreachable,
+        .completed => |status| switch (status) {
+            .exit_code => |code| if (std.math.cast(u8, code)) |exit_status| .{ .exit = exit_status } else .unknown,
+            .signal => |sig| if (std.math.cast(u8, sig)) |signal| .{ .signal = signal } else .unknown,
+            .finished, .indeterminate => .unknown,
+        },
+        .stopped => .stopped,
+        .lost => .lost,
+    };
+}
+
+/// How an ended program ended, for its index row. It names the same end as `headerState`.
+fn indexExit(state: managed_execution.SnapshotState) result_files.Exit {
+    return switch (state) {
+        // Only an ended program has an index row, and `finish` saves only those.
+        .running => unreachable,
+        .completed => |status| switch (status) {
+            .exit_code => |code| if (std.math.cast(i32, code)) |exit_status| .{ .code = exit_status } else .unknown,
+            .signal => |sig| if (std.math.cast(i32, sig)) |signal| .{ .signal = signal } else .unknown,
+            .finished, .indeterminate => .unknown,
+        },
+        .stopped => .stopped,
+        .lost => .lost,
+    };
+}
+
+/// The notice a preview carries about its file, from the saved state.
+fn noticeOf(saved: bash_results.Saved) bash_results.Notice {
+    return switch (saved) {
+        .file => |number| .{ .file = number },
+        .file_cut => |cut| .{ .file = cut.number },
+        .not_saved_full, .not_saved_error => .not_saved,
+    };
+}
+
+/// Whether an ended program printed nothing, so its runtime kept no capture.
+fn isEmptyOutput(snapshot: *const managed_execution.Snapshot) bool {
+    if (snapshot.output_delta.len != 0 or snapshot.stdout_bytes +| snapshot.stderr_bytes != 0) return false;
+    return switch (snapshot.state) {
+        .completed, .stopped => true,
+        .running, .lost => false,
+    };
+}
+
+/// The replay of an ended program's output, read from the store `startCaptured`
+/// wrote it to: the session's store when the host gives one, else the runtime's
+/// ephemeral store. `slot` keeps the opened reader, which the caller frees.
+fn openReplay(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    snapshot: *const managed_execution.Snapshot,
+    slot: *?command_replay_store.Reader,
+) program_output.Replay {
+    const handle = snapshot.output_file orelse return if (isEmptyOutput(snapshot)) .empty else .missing;
+    const opened: anyerror!command_replay_store.Reader = if (ctx.session_child_capability) |capability|
+        command_replay_store.Reader.openHandle(ctx.allocator, capability, handle)
+    else
+        command_replay_store.Reader.openEphemeralHandle(ctx.allocator, runtime.replayStore(), handle);
+    slot.* = opened catch |err| {
+        traceError("bash result output could not be opened", err);
+        return .unreadable;
+    };
+    return .{ .reader = &slot.*.? };
 }
 
 /// Appends `parts` on their own line, first adding a line end when `out` does not
@@ -686,28 +837,13 @@ fn appendLine(alloc: Allocator, out: *std.ArrayList(u8), parts: []const []const 
     for (parts) |part| try out.appendSlice(alloc, part);
 }
 
-/// Appends the one status line for `snapshot`, when its state needs one.
-fn appendStatusLine(alloc: Allocator, out: *std.ArrayList(u8), snapshot: managed_execution.Snapshot) Allocator.Error!void {
+/// Appends the still-running line of a program that has not ended.
+fn appendRunningLine(alloc: Allocator, out: *std.ArrayList(u8), running_ms: ?u64) Allocator.Error!void {
     var digits: [max_decimal_bytes]u8 = undefined;
-    const no_output = snapshot.output_delta.len == 0;
-    switch (snapshot.state) {
-        .running => if (snapshot.running_ms) |ms| {
-            try appendLine(alloc, out, &.{ "[still running after ", decimal(&digits, @intCast(ms / 1000)), " s. ", wait_hint, "]" });
-        } else {
-            try appendLine(alloc, out, &.{"[still running. " ++ wait_hint ++ "]"});
-        },
-        .completed => |status| switch (status) {
-            .exit_code => |code| if (code != 0) {
-                try appendLine(alloc, out, &.{ "[exit ", decimal(&digits, code), "]" });
-            } else if (no_output) {
-                try appendLine(alloc, out, &.{"[done, no output]"});
-            },
-            .finished => if (no_output) try appendLine(alloc, out, &.{"[done, no output]"}),
-            .signal => |signal| try appendLine(alloc, out, &.{ "[killed by signal ", decimal(&digits, @intCast(signal)), "]" }),
-            .indeterminate => try appendLine(alloc, out, &.{"[ended; exit status unknown]"}),
-        },
-        .stopped => try appendLine(alloc, out, &.{"[stopped]"}),
-        .lost => try appendLine(alloc, out, &.{"[fx lost this program]"}),
+    if (running_ms) |ms| {
+        try appendLine(alloc, out, &.{ "[still running after ", decimal(&digits, @intCast(ms / 1000)), " s. ", wait_hint, "]" });
+    } else {
+        try appendLine(alloc, out, &.{"[still running. " ++ wait_hint ++ "]"});
     }
 }
 
@@ -941,70 +1077,158 @@ test "bash predicates follow the action" {
     try std.testing.expect(readsOnly(wait));
 }
 
-test "formatResult shows one status line for each state" {
+test "formatResult writes a running program's output, then its still-running line" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         output: []const u8,
-        state: managed_execution.SnapshotState,
         running_ms: ?u64 = null,
         want: []const u8,
     }{
-        .{ .output = "", .state = .running, .running_ms = 3500, .want = "[still running after 3 s. Send wait_more as the whole program to wait for it.]" },
-        .{ .output = "x\n", .state = .running, .want = "x\n[still running. Send wait_more as the whole program to wait for it.]" },
-        .{ .output = "", .state = .{ .completed = .{ .exit_code = 0 } }, .want = "[done, no output]" },
-        .{ .output = "ok\n", .state = .{ .completed = .{ .exit_code = 0 } }, .want = "ok\n" },
-        .{ .output = "ok\n", .state = .{ .completed = .{ .exit_code = 2 } }, .want = "ok\n[exit 2]" },
-        .{ .output = "", .state = .{ .completed = .{ .exit_code = 2 } }, .want = "[exit 2]" },
-        .{ .output = "", .state = .{ .completed = .{ .signal = 9 } }, .want = "[killed by signal 9]" },
-        .{ .output = "", .state = .{ .completed = .indeterminate }, .want = "[ended; exit status unknown]" },
-        .{ .output = "", .state = .{ .completed = .finished }, .want = "[done, no output]" },
-        .{ .output = "half\n", .state = .{ .stopped = null }, .want = "half\n[stopped]" },
-        .{ .output = "", .state = .lost, .want = "[fx lost this program]" },
+        .{ .output = "", .running_ms = 3500, .want = "[still running after 3 s. Send wait_more as the whole program to wait for it.]" },
+        .{ .output = "x\n", .want = "x\n[still running. Send wait_more as the whole program to wait for it.]" },
     };
     for (cases) |case| {
-        var snapshot = testSnapshot(case.output, case.state);
+        var snapshot = testSnapshot(case.output, .running);
         snapshot.running_ms = case.running_ms;
-        const got = try formatResult(alloc, snapshot, 4096, &.{});
+        const got = try formatResult(alloc, snapshot, 4096, null, &.{});
         defer alloc.free(got);
         try std.testing.expectEqualStrings(case.want, got);
     }
 }
 
-test "formatResult adds the cut and read flags on their own lines" {
+test "formatResult writes an ended program's header, then its output, for each way a program ends" {
     const alloc = std.testing.allocator;
-    var snapshot = testSnapshot("ok\n", .{ .completed = .finished });
-    snapshot.output_truncated = true;
-    snapshot.output_incomplete = true;
-    const got = try formatResult(alloc, snapshot, 4096, &.{});
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings("ok\n[some output was cut]\n[some output could not be read]", got);
+    const cases = [_]struct {
+        output: []const u8,
+        state: managed_execution.SnapshotState,
+        saved: bash_results.Saved = .{ .file = 5 },
+        want: []const u8,
+    }{
+        .{ .output = "ok\n", .state = .{ .completed = .{ .exit_code = 2 } }, .want = "[exit 2, 1 line, 3 B, $FX_OUT/5.txt]\nok\n" },
+        .{ .output = "", .state = .{ .completed = .{ .exit_code = 0 } }, .want = "[exit 0, 0 lines, 0 B, $FX_OUT/5.txt]" },
+        .{ .output = "", .state = .{ .completed = .{ .signal = 9 } }, .want = "[killed by signal 9, 0 lines, 0 B, $FX_OUT/5.txt]" },
+        .{ .output = "", .state = .{ .completed = .indeterminate }, .want = "[ended; exit status unknown, 0 lines, 0 B, $FX_OUT/5.txt]" },
+        .{ .output = "", .state = .{ .completed = .finished }, .want = "[ended; exit status unknown, 0 lines, 0 B, $FX_OUT/5.txt]" },
+        .{ .output = "half\n", .state = .{ .stopped = null }, .want = "[stopped, 1 line, 5 B, $FX_OUT/5.txt]\nhalf\n" },
+        .{ .output = "", .state = .lost, .want = "[fx lost this program, 0 lines, 0 B, $FX_OUT/5.txt]" },
+        .{ .output = "ok\n", .state = .{ .completed = .{ .exit_code = 0 } }, .saved = .not_saved_full, .want = "[exit 0, 1 line, 3 B, not saved: the results folder is full]\nok\n" },
+    };
+    for (cases) |case| {
+        const snapshot = testSnapshot(case.output, case.state);
+        const output = testOutput(case.output, case.saved);
+        const got = try formatResult(alloc, snapshot, 4096, &output, &.{});
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
 }
 
-test "formatResult keeps the head and tail of a long output within max_bytes, on whole characters" {
+test "formatResult adds a running program's cut and read flags on their own lines" {
+    const alloc = std.testing.allocator;
+    var snapshot = testSnapshot("ok\n", .running);
+    snapshot.output_truncated = true;
+    snapshot.output_incomplete = true;
+    const got = try formatResult(alloc, snapshot, 4096, null, &.{});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(
+        "ok\n[still running. Send wait_more as the whole program to wait for it.]\n[some output was cut]\n[some output could not be read]",
+        got,
+    );
+}
+
+test "formatResult adds an ended program's read flag after its output" {
+    const alloc = std.testing.allocator;
+    var snapshot = testSnapshot("ok\n", .{ .completed = .{ .exit_code = 0 } });
+    snapshot.output_incomplete = true;
+    const output = testOutput("ok\n", .{ .file = 5 });
+    const got = try formatResult(alloc, snapshot, 4096, &output, &.{});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("[exit 0, 1 line, 3 B, $FX_OUT/5.txt]\nok\n[some output could not be read]", got);
+}
+
+test "formatResult keeps a long output's preview within max_bytes, on whole characters, after its header" {
     const alloc = std.testing.allocator;
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(alloc);
-    // 735 ASCII bytes, then three-byte characters. The head cut at half the
-    // kept bytes lands inside the first character, and the tail cut lands
-    // inside one too.
+    // 735 ASCII bytes, then three-byte characters. The head ends inside the ASCII,
+    // and the tail starts on a character boundary inside the characters.
     for (0..735) |_| try output.append(alloc, 'a');
     for (0..1000) |_| try output.appendSlice(alloc, "€");
-    const snapshot = testSnapshot(output.items, .{ .completed = .{ .exit_code = 0 } });
-    const got = try formatResult(alloc, snapshot, 2048, &.{});
+    const ended = testOutput(output.items, .{ .file = 4 });
+    const got = try formatResult(alloc, testSnapshot(output.items, .{ .completed = .{ .exit_code = 0 } }), 2048, &ended, &.{});
     defer alloc.free(got);
     try std.testing.expect(got.len <= 2048);
     try std.testing.expect(std.unicode.utf8ValidateSlice(got));
-    try std.testing.expectEqualSlices(u8, output.items[0..735], got[0..735]);
-    try std.testing.expectEqual(@as(u8, '\n'), got[735]);
-    try std.testing.expect(std.mem.find(u8, got, "[... 2265 bytes cut ...]") != null);
+    try std.testing.expect(std.mem.startsWith(u8, got, "[exit 0, 1 line, 3 KB, $FX_OUT/4.txt]\naaaa"));
+    try std.testing.expect(std.mem.find(u8, got, "characters not shown; the full output is $FX_OUT/4.txt ...]") != null);
     try std.testing.expect(std.mem.endsWith(u8, got, "€"));
+}
+
+test "formatResult puts a preview's shape line before its text" {
+    const alloc = std.testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    for (0..3000) |number| try text.writer.print("line {d} error\n", .{number});
+    const output = testOutput(text.written(), .{ .file = 4 });
+    const got = try formatResult(alloc, testSnapshot(text.written(), .{ .completed = .{ .exit_code = 0 } }), 4096, &output, &.{});
+    defer alloc.free(got);
+    const shape = std.mem.find(u8, got, "\n3000 lines match error|fail|traceback|exception\n") orelse return error.TestExpectedShapeLine;
+    const first_line = std.mem.find(u8, got, "line 0 error\n") orelse return error.TestExpectedText;
+    try std.testing.expect(shape < first_line);
 }
 
 test "formatResult refuses a budget too small for its reserves" {
     try std.testing.expectError(
         error.ResultBudgetTooSmall,
-        formatResult(std.testing.allocator, testSnapshot("x", .{ .completed = .finished }), 100, &.{}),
+        formatResult(std.testing.allocator, testSnapshot("x", .{ .completed = .finished }), 100, null, &.{}),
     );
+}
+
+test "an ended program's header state and index exit name its end the same way" {
+    const exit_two: managed_execution.SnapshotState = .{ .completed = .{ .exit_code = 2 } };
+    try std.testing.expectEqual(@as(u8, 2), headerState(exit_two).exit);
+    try std.testing.expectEqual(@as(i32, 2), indexExit(exit_two).code);
+    const killed: managed_execution.SnapshotState = .{ .completed = .{ .signal = 9 } };
+    try std.testing.expectEqual(@as(u8, 9), headerState(killed).signal);
+    try std.testing.expectEqual(@as(i32, 9), indexExit(killed).signal);
+    const stopped: managed_execution.SnapshotState = .{ .stopped = null };
+    try std.testing.expect(std.meta.activeTag(headerState(stopped)) == .stopped);
+    try std.testing.expect(std.meta.activeTag(indexExit(stopped)) == .stopped);
+    const lost: managed_execution.SnapshotState = .lost;
+    try std.testing.expect(std.meta.activeTag(headerState(lost)) == .lost);
+    try std.testing.expect(std.meta.activeTag(indexExit(lost)) == .lost);
+    const unknown: managed_execution.SnapshotState = .{ .completed = .indeterminate };
+    try std.testing.expect(std.meta.activeTag(headerState(unknown)) == .unknown);
+    try std.testing.expect(std.meta.activeTag(indexExit(unknown)) == .unknown);
+}
+
+/// The output of `text` as an ended program's result shows it, saved as `saved`.
+fn testOutput(text: []const u8, saved: bash_results.Saved) program_output.Output {
+    var stats: bash_results.Stats = .{};
+    stats.feed(text);
+    return .{ .saved = saved, .stats = stats, .head = text, .tail = text };
+}
+
+/// The text of a program that printed nothing and exited 0: its header names the file it was saved as.
+fn expectEmptyDone(text: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, text, "[exit 0, 0 lines, 0 B, $FX_OUT/"));
+    try std.testing.expect(std.mem.find(u8, text, ".txt]") != null);
+}
+
+/// The output a result shows after its header line, for a program that has ended.
+/// A result without one is its own output.
+fn bodyOf(text: []const u8) []const u8 {
+    const headers = [_][]const u8{ "[exit ", "[killed by signal ", "[stopped, ", "[ended; exit status unknown, ", "[fx lost this program, " };
+    for (headers) |prefix| {
+        if (!std.mem.startsWith(u8, text, prefix)) continue;
+        const line_end = std.mem.findScalar(u8, text, '\n') orelse return "";
+        return text[line_end + 1 ..];
+    }
+    return text;
+}
+
+/// The output of `result` after its header line.
+fn bodyText(result: tool_dispatch.ToolResult, success: bool) ![]const u8 {
+    return bodyOf(try outcomeText(result, success));
 }
 
 /// How long the tests' calls wait before they report a running program.
@@ -1167,12 +1391,12 @@ test "bash state carries from one program to the next" {
     try bash.authorize(&ctx, "x=41");
     const first = try callRun(ctx, "x=41", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     try bash.authorize(&ctx, "echo $((x+1))");
     const second = try callRun(ctx, "echo $((x+1))", program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(second, true), "42"));
 }
 
 test "an over-cap program says so in its result, and the next program keeps the last saved state" {
@@ -1184,7 +1408,7 @@ test "an over-cap program says so in its result, and the next program keeps the 
     try bash.authorize(&ctx, "x=41");
     const first = try callRun(ctx, "x=41", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // The program ends with `exit 0`, so its own end is the only place its save can run.
     const big_command = "big=$(head -c 1100000 /dev/zero | tr '\\0' a); exit 0";
@@ -1196,7 +1420,7 @@ test "an over-cap program says so in its result, and the next program keeps the 
     try bash.authorize(&ctx, "echo $((x+1))");
     const second = try callRun(ctx, "echo $((x+1))", program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "42"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(second, true), "42"));
 }
 
 test "an over-cap program logs why its state was not saved" {
@@ -1231,12 +1455,12 @@ test "a program that sets IFS to a tab keeps its state, and its result has no no
     try bash.authorize(&ctx, first_command);
     const first = try callRun(ctx, first_command, program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const second = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(second, true), "x=1"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(second, true), "x=1"));
 }
 
 test "a save record a program left unseen is reported with the next program's result" {
@@ -1255,7 +1479,7 @@ test "a save record a program left unseen is reported with the next program's re
     const next = try callRun(ctx, "echo next", program_yield_ms);
     defer next.deinit(alloc);
     const text = try outcomeText(next, true);
-    try std.testing.expect(std.mem.startsWith(u8, text, "next\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(text), "next\n"));
     try std.testing.expect(std.mem.find(u8, text, "fx: the previous program's bash state was 2000000 bytes, over the 1048576-byte limit, so it was not saved; the last saved state stays.") != null);
 
     // A record left after the program that followed is reported by the call after it.
@@ -1296,7 +1520,7 @@ test "a program that runs trap - EXIT says so in its result, and the next progra
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer third.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(third, true), "x=41"));
 }
 
 test "a program that runs exec says so in its result, and the next program keeps the last saved state" {
@@ -1318,7 +1542,7 @@ test "a program that runs exec says so in its result, and the next program keeps
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer third.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(third, true), "x=41"));
 }
 
 test "a program killed with SIGKILL says so in its result, and the next program keeps the last saved state" {
@@ -1336,13 +1560,13 @@ test "a program killed with SIGKILL says so in its result, and the next program 
     const second = try callRun(ctx, killed, program_yield_ms);
     defer second.deinit(alloc);
     const second_text = try outcomeText(second, false);
-    try std.testing.expect(std.mem.find(u8, second_text, "[killed by signal 9]") != null);
+    try std.testing.expect(std.mem.find(u8, second_text, "[killed by signal 9, ") != null);
     try std.testing.expect(std.mem.find(u8, second_text, not_saved_notice) != null);
 
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer third.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(third, true), "x=41"));
 }
 
 test "a program that fx stops at its timeout says so in its result, and the next program keeps the last saved state" {
@@ -1372,7 +1596,7 @@ test "a program that fx stops at its timeout says so in its result, and the next
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const third = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer third.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(third, true), "x=41"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(third, true), "x=41"));
 }
 
 test "a program that sets xtrace shows its own lines and no line from the save" {
@@ -1396,7 +1620,7 @@ test "a program that sets xtrace shows its own lines and no line from the save" 
     try bash.authorize(&ctx, "echo \"y=$y\"");
     const next = try callRun(ctx, "echo \"y=$y\"", program_yield_ms);
     defer next.deinit(alloc);
-    try std.testing.expectEqualStrings("y=1\n", try outcomeText(next, true));
+    try std.testing.expectEqualStrings("y=1\n", try bodyText(next, true));
 }
 
 test "a notice a previous program left goes into the result of a call that fails to start, and the trace says so" {
@@ -1433,7 +1657,7 @@ test "a notice a previous program left goes into the result of a call that fails
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const next = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer next.deinit(alloc);
-    try std.testing.expect(std.mem.startsWith(u8, try outcomeText(next, true), "x=41"));
+    try std.testing.expect(std.mem.startsWith(u8, try bodyText(next, true), "x=41"));
 }
 
 test "a saved folder that a program removed after its save is dropped: the next program starts in the workspace root, with a notice and a trace line" {
@@ -1456,7 +1680,7 @@ test "a saved folder that a program removed after its save is dropped: the next 
     try bash.authorize(&ctx, program);
     const ended = try callRun(ctx, program, program_yield_ms);
     defer ended.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(ended, true));
+    try expectEmptyDone(try outcomeText(ended, true));
 
     // The next program starts in the workspace root, its result says so, and the trace names the reason, never the path.
     try bash.authorize(&ctx, "pwd");
@@ -1465,7 +1689,7 @@ test "a saved folder that a program removed after its save is dropped: the next 
     const next_text = try outcomeText(next, true);
     const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
     defer alloc.free(workspace_line);
-    try std.testing.expect(std.mem.startsWith(u8, next_text, workspace_line));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(next_text), workspace_line));
     try std.testing.expect(std.mem.find(u8, next_text, start_folder_notice) != null);
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
@@ -1493,7 +1717,7 @@ test "a saved folder that is not an absolute path is a bad record: the next prog
     const text = try outcomeText(result, true);
     const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
     defer alloc.free(workspace_line);
-    try std.testing.expect(std.mem.startsWith(u8, text, workspace_line));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(text), workspace_line));
     try std.testing.expect(std.mem.find(u8, text, start_folder_notice) != null);
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
@@ -1519,7 +1743,7 @@ test "a fresh session with no saved folder gives no notice and no trace line" {
     const text = try outcomeText(result, true);
     const workspace_line = try alloc.print("{s}\n", .{bash.workspace});
     defer alloc.free(workspace_line);
-    try std.testing.expect(std.mem.startsWith(u8, text, workspace_line));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(text), workspace_line));
     try std.testing.expect(std.mem.find(u8, text, start_folder_notice) == null);
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
@@ -1542,14 +1766,14 @@ test "a startup record that is a FIFO is replaced before the next program, which
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // A FIFO where the functions record is. The next program's shell writes that record with `>|`, which would wait on it.
     try bash.makeSessionFifo("startup-functions");
     try bash.authorize(&ctx, "echo \"x=$x\"");
     const second = try callRun(ctx, "echo \"x=$x\"", program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(second, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -1571,14 +1795,18 @@ test "a session folder a program removes is made again: the next call says the s
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // The program removes its own session folder by path, as in review r30.
     const remove = "rm -rf -- \"${__fx_state%/*}\"";
     try bash.authorize(&ctx, remove);
     const removed = try callRun(ctx, remove, program_yield_ms);
     defer removed.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(removed, true));
+    // The program removed the session folder that holds `out/`, where `$FX_OUT` is, so its output is not saved.
+    try std.testing.expectEqualStrings(
+        "[exit 0, 0 lines, 0 B, not saved: the results folder could not be opened]",
+        try outcomeText(removed, true),
+    );
 
     // The next program finds no saved state, and its result says so, in the exact wording.
     const read = "echo \"x=${x-unset}\"";
@@ -1586,7 +1814,7 @@ test "a session folder a program removes is made again: the next call says the s
     const fresh = try callRun(ctx, read, program_yield_ms);
     defer fresh.deinit(alloc);
     const fresh_text = try outcomeText(fresh, true);
-    try std.testing.expect(std.mem.startsWith(u8, fresh_text, "x=unset\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(fresh_text), "x=unset\n"));
     try std.testing.expect(std.mem.find(u8, fresh_text, "fx: the bash session's saved state was lost because its files were removed or replaced, so programs start from a fresh state.") != null);
 
     // The program after that saves a state, and the one after keeps it.
@@ -1597,7 +1825,7 @@ test "a session folder a program removes is made again: the next call says the s
     try bash.authorize(&ctx, again);
     const kept = try callRun(ctx, again, program_yield_ms);
     defer kept.deinit(alloc);
-    try std.testing.expectEqualStrings("x=2\n", try outcomeText(kept, true));
+    try std.testing.expectEqualStrings("x=2\n", try bodyText(kept, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -1619,7 +1847,7 @@ test "a state file that is a FIFO is removed before the next program, which star
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // A FIFO where the saved state was. The next program's shell would wait on it.
     try bash.makeSessionFifo("state.sh");
@@ -1628,7 +1856,7 @@ test "a state file that is a FIFO is removed before the next program, which star
     const fresh = try callRun(ctx, read, program_yield_ms);
     defer fresh.deinit(alloc);
     const fresh_text = try outcomeText(fresh, true);
-    try std.testing.expect(std.mem.startsWith(u8, fresh_text, "x=unset\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(fresh_text), "x=unset\n"));
     try std.testing.expect(std.mem.find(u8, fresh_text, state_lost_notice) != null);
 
     // The program after that saves a state, which the one after it keeps with no notice.
@@ -1639,7 +1867,7 @@ test "a state file that is a FIFO is removed before the next program, which star
     try bash.authorize(&ctx, again);
     const kept = try callRun(ctx, again, program_yield_ms);
     defer kept.deinit(alloc);
-    try std.testing.expectEqualStrings("x=3\n", try outcomeText(kept, true));
+    try std.testing.expectEqualStrings("x=3\n", try bodyText(kept, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -1661,7 +1889,7 @@ test "an env file that is a FIFO is written again before the next program, which
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // A FIFO where env.sh is. The next program's shell sources it, which would wait on it.
     try bash.makeSessionFifo("env.sh");
@@ -1669,7 +1897,7 @@ test "an env file that is a FIFO is written again before the next program, which
     try bash.authorize(&ctx, read);
     const second = try callRun(ctx, read, program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(second, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -1688,21 +1916,21 @@ test "a program's EXIT trap that puts a FIFO at the folder file gives the next c
     try bash.authorize(&ctx, replace);
     const first = try callRun(ctx, replace, program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // The call after the drop carries the folder notice, once.
     try bash.authorize(&ctx, "echo hi");
     const second = try callRun(ctx, "echo hi", program_yield_ms);
     defer second.deinit(alloc);
     const second_text = try outcomeText(second, true);
-    try std.testing.expect(std.mem.startsWith(u8, second_text, "hi\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(second_text), "hi\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second_text, start_folder_notice));
 
     // The call after that has no folder file to report.
     try bash.authorize(&ctx, "echo hi");
     const third = try callRun(ctx, "echo hi", program_yield_ms);
     defer third.deinit(alloc);
-    try std.testing.expectEqualStrings("hi\n", try outcomeText(third, true));
+    try std.testing.expectEqualStrings("hi\n", try bodyText(third, true));
 }
 
 test "a directory at the save record, made after the program's save, is replaced before the next program, which keeps its state and gets no save notice" {
@@ -1729,7 +1957,7 @@ test "a directory at the save record, made after the program's save, is replaced
     try bash.authorize(&ctx, read);
     const next = try callRun(ctx, read, program_yield_ms);
     defer next.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(next, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(next, true));
 
     // The record is an empty owner-only regular file again, and the trace names it.
     var dir = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{});
@@ -1754,14 +1982,14 @@ test "a program that leaves a directory at its save record gets no save notice, 
     try bash.authorize(&ctx, leave);
     const left = try callRun(ctx, leave, program_yield_ms);
     defer left.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(left, true));
+    try expectEmptyDone(try outcomeText(left, true));
 
     // The next program sees x=1, and its result has no save notice either.
     const read = "echo \"x=$x\"";
     try bash.authorize(&ctx, read);
     const next = try callRun(ctx, read, program_yield_ms);
     defer next.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(next, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(next, true));
 }
 
 test "a directory at a startup record is replaced before the next program, which keeps its state" {
@@ -1779,7 +2007,7 @@ test "a directory at a startup record is replaced before the next program, which
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // A directory where the functions record is, as a stray program can leave one.
     try bash.makeSessionDir("startup-functions");
@@ -1787,7 +2015,7 @@ test "a directory at a startup record is replaced before the next program, which
     try bash.authorize(&ctx, read);
     const second = try callRun(ctx, read, program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(second, true));
 
     var dir = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{});
     defer dir.close(bash.io);
@@ -1810,13 +2038,13 @@ test "a program that puts a FIFO where its save record is returns its own result
     try bash.authorize(&ctx, replace);
     const first = try callRun(ctx, replace, program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     const read = "echo \"x=$x\"";
     try bash.authorize(&ctx, read);
     const second = try callRun(ctx, read, program_yield_ms);
     defer second.deinit(alloc);
-    try std.testing.expectEqualStrings("x=1\n", try outcomeText(second, true));
+    try std.testing.expectEqualStrings("x=1\n", try bodyText(second, true));
 }
 
 test "a repair that cannot complete starts a fresh session: the next program has the state-lost notice and the trace, and the one after keeps its state" {
@@ -1834,7 +2062,7 @@ test "a repair that cannot complete starts a fresh session: the next program has
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // env.sh is removed, and the folder is read-only, so the repair cannot write env.sh.
     var old = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{ .iterate = true });
@@ -1854,7 +2082,7 @@ test "a repair that cannot complete starts a fresh session: the next program has
     const fresh = try callRun(ctx, read, program_yield_ms);
     defer fresh.deinit(alloc);
     const fresh_text = try outcomeText(fresh, true);
-    try std.testing.expect(std.mem.startsWith(u8, fresh_text, "x=unset\n"));
+    try std.testing.expect(std.mem.startsWith(u8, bodyOf(fresh_text), "x=unset\n"));
     try std.testing.expect(std.mem.find(u8, fresh_text, state_lost_notice) != null);
 
     // The program after it saves a state, and the one after that keeps it.
@@ -1865,7 +2093,7 @@ test "a repair that cannot complete starts a fresh session: the next program has
     try bash.authorize(&ctx, again);
     const kept = try callRun(ctx, again, program_yield_ms);
     defer kept.deinit(alloc);
-    try std.testing.expectEqualStrings("x=3\n", try outcomeText(kept, true));
+    try std.testing.expectEqualStrings("x=3\n", try bodyText(kept, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -1888,7 +2116,7 @@ test "a repair that cannot complete, with no new folder either, fails the call w
     try bash.authorize(&ctx, "x=1");
     const first = try callRun(ctx, "x=1", program_yield_ms);
     defer first.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(first, true));
+    try expectEmptyDone(try outcomeText(first, true));
 
     // The old folder is read-only without env.sh, and the workspace is read-only, so no folder can be made.
     var old = try std.Io.Dir.cwd().openDir(bash.io, bash.session.dir.?, .{ .iterate = true });
@@ -1931,7 +2159,7 @@ test "a repair that cannot complete, with no new folder either, fails the call w
     try bash.authorize(&ctx, read_again);
     const kept = try callRun(ctx, read_again, program_yield_ms);
     defer kept.deinit(alloc);
-    try std.testing.expectEqualStrings("x=2\n", try outcomeText(kept, true));
+    try std.testing.expectEqualStrings("x=2\n", try bodyText(kept, true));
 
     const trace = try std.Io.Dir.cwd().readFileAlloc(bash.io, trace_path, alloc, .limited(1 << 16));
     defer alloc.free(trace);
@@ -2019,12 +2247,12 @@ test "bash working folder carries from one program to the next" {
     try bash.authorize(&ctx, "cd /");
     const moved = try callRun(ctx, "cd /", program_yield_ms);
     defer moved.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(moved, true));
+    try expectEmptyDone(try outcomeText(moved, true));
 
     try bash.authorize(&ctx, "pwd");
     const pwd = try callRun(ctx, "pwd", program_yield_ms);
     defer pwd.deinit(alloc);
-    try std.testing.expectEqualStrings("/\n", try outcomeText(pwd, true));
+    try std.testing.expectEqualStrings("/\n", try bodyText(pwd, true));
 }
 
 test "bash reports a failing program with its exit status" {
@@ -2036,7 +2264,7 @@ test "bash reports a failing program with its exit status" {
     try bash.authorize(&ctx, "false");
     const failed = try callRun(ctx, "false", program_yield_ms);
     defer failed.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, try outcomeText(failed, false), "[exit 1]") != null);
+    try std.testing.expect(std.mem.find(u8, try outcomeText(failed, false), "[exit 1, ") != null);
 }
 
 test "bash waits with nothing running and says so" {
@@ -2139,7 +2367,7 @@ test "a program starts in the folder the session holds, not one the saved state 
     try bash.authorize(&ctx, "cd /");
     const moved = try callRun(ctx, "cd /", program_yield_ms);
     defer moved.deinit(alloc);
-    try std.testing.expectEqualStrings("[done, no output]", try outcomeText(moved, true));
+    try expectEmptyDone(try outcomeText(moved, true));
 
     // fx moves the start folder back to the workspace, as a program's end would.
     try bash.writeSessionFolder(bash.workspace);
@@ -2149,7 +2377,7 @@ test "a program starts in the folder the session holds, not one the saved state 
     defer pwd.deinit(alloc);
     const expected = try alloc.print("{s}\n", .{bash.workspace});
     defer alloc.free(expected);
-    try std.testing.expectEqualStrings(expected, try outcomeText(pwd, true));
+    try std.testing.expectEqualStrings(expected, try bodyText(pwd, true));
 }
 
 /// A host's results folder for a test: a path the test made, or an error the host reports.
@@ -2245,4 +2473,277 @@ test "a host folder that cannot be made refuses the call before any program star
     const text = try outcomeText(refused, false);
     try std.testing.expect(std.mem.startsWith(u8, text, "bash could not run the program: AccessDenied."));
     try std.testing.expect(bash.session.program() == null);
+}
+
+/// Reads `name` from `folder`, a path the test made.
+fn readInFolder(alloc: Allocator, folder: []const u8, name: []const u8) ![]u8 {
+    const path = try alloc.print("{s}/{s}", .{ folder, name });
+    defer alloc.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(4 << 20));
+}
+
+/// Whether `name` exists in `folder`.
+fn folderHas(alloc: Allocator, folder: []const u8, name: []const u8) !bool {
+    const path = try alloc.print("{s}/{s}", .{ folder, name });
+    defer alloc.free(path);
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// The path of a results folder in the test's workspace, made now as the host would make it.
+fn makeFolder(alloc: Allocator, bash: *TestBash, name: []const u8) ![]u8 {
+    const folder = try alloc.print("{s}/{s}", .{ bash.workspace, name });
+    errdefer alloc.free(folder);
+    try std.Io.Dir.cwd().createDir(bash.io, folder, .fromMode(0o700));
+    return folder;
+}
+
+test "a finished program's result names its file, and the file holds its whole output" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo hello";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("[exit 0, 1 line, 6 B, $FX_OUT/1.txt]\nhello\n", try outcomeText(result, true));
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("hello\n", file);
+    const index = try readInFolder(alloc, folder, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n1\t0\t6\t1\techo hello\n", index);
+}
+
+test "an empty program is saved as an empty file, and its header says so" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "true";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("[exit 0, 0 lines, 0 B, $FX_OUT/1.txt]", try outcomeText(result, true));
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("", file);
+}
+
+test "a failing program's header names its exit code and its file" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo oops; exit 3";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("[exit 3, 1 line, 5 B, $FX_OUT/1.txt]\noops\n", try outcomeText(result, false));
+}
+
+test "a yielded program's file holds its whole output, both halves, and its running result names no file" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try alloc.print("{s}/results", .{bash.workspace});
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo a; sleep 1; echo b";
+    try bash.authorize(&ctx, command);
+    const running = try callRun(ctx, command, test_yield_ms);
+    defer running.deinit(alloc);
+    const running_text = try outcomeText(running, true);
+    try std.testing.expect(std.mem.find(u8, running_text, "$FX_OUT") == null);
+    try std.testing.expect(std.mem.find(u8, running_text, "[still running") != null);
+    try std.testing.expect(!try folderHas(alloc, folder, "1.txt"));
+    const ended = try callWait(ctx, program_yield_ms);
+    defer ended.deinit(alloc);
+    try std.testing.expectEqualStrings("[exit 0, 2 lines, 4 B, $FX_OUT/1.txt]\na\nb\n", try outcomeText(ended, true));
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("a\nb\n", file);
+}
+
+test "a result the results folder has no room for is not saved: no file and no index row, and the header says so" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo hello";
+    try bash.authorize(&ctx, command);
+    const result = try callRunLimited(ctx, command, program_yield_ms, .{ .max_folder_bytes = 4 });
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "[exit 0, 1 line, 6 B, not saved: the results folder is full]\nhello\n",
+        try outcomeText(result, true),
+    );
+    const has_file = try folderHas(alloc, folder, "1.txt");
+    try std.testing.expect(!has_file);
+    const has_index = try folderHas(alloc, folder, "index.tsv");
+    try std.testing.expect(!has_index);
+}
+
+test "a results folder that cannot be opened is not saved, and the program's output is still shown" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    try bash.tmp.dir.writeFile(bash.io, .{ .sub_path = "results", .data = "not a folder\n" });
+    const folder = try alloc.print("{s}/results", .{bash.workspace});
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo hello";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "[exit 0, 1 line, 6 B, not saved: the results folder could not be opened]\nhello\n",
+        try outcomeText(result, true),
+    );
+}
+
+test "the results folder is made private, 0700, when the first result is saved" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try alloc.print("{s}/results", .{bash.workspace});
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo hello";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    _ = try outcomeText(result, true);
+    var dir = try std.Io.Dir.cwd().openDir(bash.io, folder, .{});
+    defer dir.close(bash.io);
+    const stat = try dir.stat(bash.io);
+    try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    const has_file = try folderHas(alloc, folder, "1.txt");
+    try std.testing.expect(has_file);
+}
+
+test "a result takes the number after the last file or index row in its folder" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    {
+        var dir = try std.Io.Dir.cwd().openDir(bash.io, folder, .{});
+        defer dir.close(bash.io);
+        try dir.writeFile(bash.io, .{ .sub_path = "5.txt", .data = "old\n" });
+        try dir.writeFile(bash.io, .{ .sub_path = "index.tsv", .data = "n\texit\tbytes\tlines\tcommand\n7\t0\t4\t1\told\n" });
+    }
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo new";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("[exit 0, 1 line, 4 B, $FX_OUT/8.txt]\nnew\n", try outcomeText(result, true));
+    const file = try readInFolder(alloc, folder, "8.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("new\n", file);
+    const index = try readInFolder(alloc, folder, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n7\t0\t4\t1\told\n8\t0\t4\t1\techo new\n", index);
+}
+
+test "a file over its cap keeps its first and last parts, and the header says what it keeps" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "yes abcdefgh | head -c 2621440";
+    try bash.authorize(&ctx, command);
+    const result = try callRunLimited(ctx, command, program_yield_ms, .{ .max_file_bytes = 2 * 1024 * 1024 });
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        try outcomeText(result, true),
+        "[exit 0, 291272 lines, 2 MB, $FX_OUT/1.txt, the file keeps the first and last 1 MiB]\n",
+    ));
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    try std.testing.expect(file.len > 2 * 1024 * 1024);
+    try std.testing.expect(file.len < 2 * 1024 * 1024 + 100);
+    try std.testing.expect(std.mem.find(u8, file, " bytes cut ...]\n") != null);
+}
+
+test "a result whose index line cannot be written still names its file, and says so" {
+    const alloc = std.testing.allocator;
+    var bash = try TestBash.init(alloc);
+    defer bash.deinit();
+    var ctx = bash.context();
+    _ = try bash.session.prepare(bash.io, bash.workspace, &fx_variables, test_fx_binary);
+    const folder = try makeFolder(alloc, &bash, "results");
+    defer alloc.free(folder);
+    {
+        var dir = try std.Io.Dir.cwd().openDir(bash.io, folder, .{});
+        defer dir.close(bash.io);
+        try dir.writeFile(bash.io, .{ .sub_path = "index.tsv", .data = "n\texit\tbytes\tlines\tcommand\n" });
+        // A second name for index.tsv gives it two links. The folder refuses to rewrite such a file,
+        // after the result's file is saved, so the index line is the one that is not written.
+        try std.Io.Dir.hardLink(dir, "index.tsv", dir, "index-link", bash.io, .{});
+    }
+    var results: FakeResults = .{ .path = folder };
+    ctx.bash_results_folder = results.source();
+    const command = "echo hello";
+    try bash.authorize(&ctx, command);
+    const result = try callRun(ctx, command, program_yield_ms);
+    defer result.deinit(alloc);
+    const text = switch (result) {
+        .success, .failure => |body| body,
+        .rich => return error.TestUnexpectedRich,
+    };
+    try std.testing.expectEqualStrings(
+        "[exit 0, 1 line, 6 B, $FX_OUT/1.txt]\nhello\n[the index line for this result was not written; the file is still $FX_OUT/1.txt]",
+        text,
+    );
+    const file = try readInFolder(alloc, folder, "1.txt");
+    defer alloc.free(file);
+    try std.testing.expectEqualStrings("hello\n", file);
+    const index = try readInFolder(alloc, folder, "index.tsv");
+    defer alloc.free(index);
+    try std.testing.expectEqualStrings("n\texit\tbytes\tlines\tcommand\n", index);
 }
