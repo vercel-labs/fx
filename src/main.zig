@@ -5729,6 +5729,8 @@ test {
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("core/gateway/gateway_provider.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/configured_transport.zig");
+    _ = @import("gateway/catalog_fetch_failure.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
