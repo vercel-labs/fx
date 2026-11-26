@@ -5477,7 +5477,7 @@ fn publishResumedHistory(
     while (lines.next()) |line| {
         const label = "HISTORY_ROW_";
         if (!std.mem.startsWith(u8, line, label)) continue;
-        errdefer std.debug.print("expected HISTORY_ROW_{d:0>3}, got {s}\n", .{ next_row, line });
+        // A gap or a repeat shows as the expected and the found row number.
         try std.testing.expectEqual(next_row, try std.fmt.parseInt(usize, line[label.len..], 10));
         next_row += 1;
         last_row_end = lines.index orelse text.len;
