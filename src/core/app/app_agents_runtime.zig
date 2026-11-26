@@ -1766,6 +1766,18 @@ pub fn Runtime(comptime App: type) type {
             return app.child_handoffs.posts.items.len > 0 or app.child_handoffs.reports.items.len > 0;
         }
 
+        /// Whether a report for `host`, or any post, waits for the main loop to
+        /// take it. A post does not name its host, so every post counts.
+        fn deliveriesPendingFor(app: *App, host: *subagent_tool_host.Runtime) bool {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.posts.items.len > 0) return true;
+            for (app.child_handoffs.reports.items) |report| {
+                if (report.host == host) return true;
+            }
+            return false;
+        }
+
         /// Logs the work each agent still holds as fx exits for an upgrade's
         /// restart. After Ctrl+G's checks only reports can be here: queued
         /// work refuses Ctrl+G (`queuedWorkElsewhere`), a prompt sent during
@@ -1846,14 +1858,17 @@ pub fn Runtime(comptime App: type) type {
                 (turnInFlight(&child.agent) or resultPending(app, child));
         }
 
-        /// Whether a subagent of the agent on screen works, or a finished
-        /// report waits for the main loop to hand it over. Main loop only.
+        /// Whether the agent on screen waits on its subagents: one works or
+        /// holds an unapplied result, its host stays busy until the report is
+        /// posted, or the report is not handed over yet. Main loop only.
         pub fn screenSubagentsWorking(app: *App) bool {
             const screen = agents.screenAgentOf(app);
             for (app.child_agents.items) |child| {
                 if (ownSubagentWorking(app, screen, child)) return true;
             }
-            return deliveriesPending(app);
+            const host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) screen.session_persistence.subagent_host else null;
+            const own_host = host orelse return deliveriesPending(app);
+            return !own_host.quiet() or deliveriesPendingFor(app, own_host);
         }
 
         /// Main loop only.

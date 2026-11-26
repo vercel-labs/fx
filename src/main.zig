@@ -5870,6 +5870,32 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.main_agent.worker.worker_processing = false;
 }
 
+test "the screen's subagents count as working until their host is quiet" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+
+    // Only the fields `quiet` reads are set: a busy child keeps the host open.
+    var busy_host: subagent_tool_host.Runtime = undefined;
+    busy_host.admission_mutex = .init;
+    busy_host.pending = .empty;
+    busy_host.busy = .empty;
+    defer {
+        for (busy_host.busy.items) |id| alloc.free(id);
+        busy_host.busy.deinit(alloc);
+    }
+    try busy_host.busy.append(alloc, try alloc.dupe(u8, "reviewer"));
+    app.main_agent.session_persistence.subagent_host = &busy_host;
+    defer app.main_agent.session_persistence.subagent_host = null;
+
+    try std.testing.expect(app.screenSubagentsWorking());
+    alloc.free(busy_host.busy.swapRemove(0));
+    try std.testing.expect(!app.screenSubagentsWorking());
+}
+
 test "an upgrade waits for agents that need the user, stops instances between steps, and lets subagents finish" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
