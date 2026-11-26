@@ -93,7 +93,7 @@ pub const OwnerMessage = union(enum) {
     phase: struct { key: share_key.Key, phase: mcp.engine.Phase },
     /// The key's tool list as the engine holds it: a JSON array of raw tool
     /// objects, carried as text.
-    tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]", list_refusal: ?[]const u8 = null },
+    tools: struct { key: share_key.Key, ok: bool, fresh: bool, needs_auth: bool, tools: []const u8 = "[]", list_refusal: ?[]const u8 = null, dropped: mcp.tools.Dropped = .{} },
     /// How one of this client's calls ended; `answer` is the `tools.Call`
     /// JSON text, or null when the call ended without one. `lost_why` says
     /// why a lost call was lost, so the session logs the reason it would log
@@ -244,6 +244,12 @@ fn writeOwnerFields(writer: *std.Io.Writer, comptime tag: std.meta.Tag(OwnerMess
             // Why fx refused the list, when it did: the words the owner's
             // status has, for a session that only reads its own slot.
             if (m.list_refusal) |words| try textField(writer, "list_refusal", words);
+            // How many tools of the list the owner's engine left out, which it dropped before this frame: one field
+            // for each reason that left any, so a reader that doesn't know a reason skips it.
+            inline for (std.enums.values(mcp.tools.Drop)) |why| {
+                const n = m.dropped.counts[@backingInt(why)];
+                if (n > 0) try uint(writer, "dropped_" ++ @tagName(why), n);
+            }
             try raw(writer, "tools", m.tools);
         },
         .called => {
@@ -378,6 +384,7 @@ fn ownerMessage(object: std.json.ObjectMap, tag: std.meta.Tag(OwnerMessage)) Dec
                 .tools = try rawField(object, "tools"),
                 // Absent from an owner that ran before fx reported a refusal.
                 .list_refusal = try optionalText(object, "list_refusal"),
+                .dropped = try droppedFields(object),
             },
         },
         .called => .{
@@ -492,6 +499,14 @@ fn text(object: std.json.ObjectMap, key: []const u8) DecodeError![]const u8 {
     const value = object.get(key) orelse return error.Malformed;
     if (value != .string) return error.Malformed;
     return value.string;
+}
+
+/// The counts of left-out tools by reason; each is absent from an owner that ran before fx reported them, or that left
+/// none out.
+fn droppedFields(object: std.json.ObjectMap) DecodeError!mcp.tools.Dropped {
+    var out: mcp.tools.Dropped = .{};
+    inline for (std.enums.values(mcp.tools.Drop)) |why| out.add(why, try u32FieldDefault(object, "dropped_" ++ @tagName(why), 0));
+    return out;
 }
 
 fn optionalText(object: std.json.ObjectMap, key: []const u8) DecodeError!?[]const u8 {
@@ -752,6 +767,23 @@ test "every owner message round-trips" {
     try testing.expectEqual(mcp.server.LostWhy.link_down, lost_call.called.lost_why.?);
     const answered = try expectOwner(a, .{ .called = .{ .id = 6, .outcome = .result, .maybe_ran = false, .timed_out = false } });
     try testing.expectEqual(@as(?mcp.server.LostWhy, null), answered.called.lost_why);
+}
+
+test "what the owner's engine left out of a list crosses with it, by reason, and a list that left none out sends none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: share_key.Key = "ffeeddccbbaa99887766554433221100".*;
+    var dropped: mcp.tools.Dropped = .{};
+    dropped.add(.repeated_field, 2);
+    dropped.add(.over_limit, 1);
+    const sent = try expectOwner(a, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false, .dropped = dropped } });
+    try testing.expectEqual(dropped, sent.tools.dropped);
+    // Only the reasons that left tools out are written, so a frame that left none out is the frame an older owner sends.
+    const frame = try encode(a, @as(OwnerMessage, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false } }));
+    try testing.expect(std.mem.find(u8, frame, "dropped_") == null);
+    const none = try expectOwner(a, .{ .tools = .{ .key = key, .ok = true, .fresh = true, .needs_auth = false } });
+    try testing.expectEqual(@as(u32, 0), none.tools.dropped.total());
 }
 
 test "server JSON nested 3000 levels deep crosses the wire as text" {

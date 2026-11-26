@@ -154,7 +154,7 @@ pub const Event = union(enum) {
     failed: Failure,
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
-    tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
+    tools: struct { ok: bool, fresh: bool, dropped: tools.Dropped = .{}, needs_auth: bool = false },
     /// The tool list may have changed: `list_changed`, a call answer that
     /// suggests so, a new process, or a fresh list's TTL ran out. A host
     /// that keeps its own copy lists again before its next call (CAT-05).
@@ -360,8 +360,10 @@ pub const Server = struct {
     stray_len: u8 = 0,
     /// The message of the last progress event, until the next `next`.
     note: [note_max + 3]u8 = undefined,
-    /// What the last page added, for the warning about dropped tools.
-    last_added: tools.Added = .{},
+    /// What the pages of the listing in progress left out, by reason. A listing that ends without publishing drops it.
+    gathering_dropped: tools.Dropped = .{},
+    /// What the published list left out, by reason (`droppedTools`).
+    dropped: tools.Dropped = .{},
     /// The words of why the last page fx refused was refused, written when it was refused (`refuse`). They mean
     /// something only while `catalog.refused` holds.
     list_refusal_buf: [tools.text_max]u8 = undefined,
@@ -466,6 +468,12 @@ pub const Server = struct {
 
     pub fn toolList(r: *const Server) *const tools.List {
         return &r.store.current;
+    }
+
+    /// How many tools of the list `toolList` returns fx left out, by reason; empty for a list that kept every tool and
+    /// for a server that listed none. A refused newer list leaves it as it was, like the list it describes.
+    pub fn droppedTools(r: *const Server) tools.Dropped {
+        return r.dropped;
     }
 
     /// Why fx refused the last list the server answered, in the words of `tools.Refusal` (with the HTTP status
@@ -1486,7 +1494,7 @@ pub const Server = struct {
                         return .page_refused;
                     },
                 };
-                r.last_added = added;
+                r.gatherDropped(added);
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
         }
@@ -2325,6 +2333,25 @@ pub const Server = struct {
         };
     }
 
+    /// A page was read: what it left out joins the count of the listing in progress.
+    fn gatherDropped(r: *Server, added: tools.Added) void {
+        r.gathering_dropped.merge(added.dropped());
+    }
+
+    /// The listing ended with a list: the gathered tools and what the pages left out become the published ones.
+    fn publishStore(r: *Server) void {
+        r.store.publish();
+        r.dropped = r.gathering_dropped;
+        r.gathering_dropped = .{};
+    }
+
+    /// The listing ended with no list, or restarts: the pages gathered so far, and their count, go. The published list
+    /// and its count stay.
+    fn discardStore(r: *Server) void {
+        r.store.discard();
+        r.gathering_dropped = .{};
+    }
+
     fn stepCatalog(r: *Server, event: catalog.Event) Error!void {
         var out: catalog.Output = .{};
         const generation = r.catalog.generation;
@@ -2340,14 +2367,14 @@ pub const Server = struct {
                 const l = try r.newLogical(.list, .idempotent);
                 try r.start(l);
             },
-            .discard_pages => r.store.discard(),
+            .discard_pages => r.discardStore(),
             .publish => |fresh| {
-                r.store.publish();
-                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh, .dropped = r.last_added } });
+                r.publishStore();
+                r.emit(.{ .tools = .{ .ok = true, .fresh = fresh, .dropped = r.dropped } });
                 try r.relisted(true);
             },
             .fail => {
-                r.store.discard();
+                r.discardStore();
                 r.emit(.{ .tools = .{ .ok = false, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
@@ -2355,7 +2382,7 @@ pub const Server = struct {
             // The last list goes out unless the page needs a sign-in, which
             // every call from that list would need too.
             .serve_last => {
-                r.store.discard();
+                r.discardStore();
                 r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
@@ -2906,4 +2933,56 @@ test "a tool list that ends with an HTTP answer is refused with the status in it
         try std.testing.expect(!r.catalog.refused);
         try std.testing.expect(r.listRefusal() == null);
     }
+}
+
+test "what a listing leaves out is counted over every page, and a listing that is discarded leaves the published count" {
+    var r: Server = undefined;
+    try pageTestServer(&r);
+    defer r.deinit();
+    const gpa = std.testing.allocator;
+    const first = "{\"tools\":[{\"name\":\"a\",\"inputSchema\":{}},{\"name\":\"a\",\"inputSchema\":{}},{\"inputSchema\":{}}],\"nextCursor\":\"c\"}";
+    const last = "{\"tools\":[{\"name\":\"b\",\"inputSchema\":{}},{\"name\":\"b\",\"inputSchema\":{}}]}";
+
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(first)));
+    // Nothing is published until the listing ends, so the first page's count is not the list's yet.
+    try std.testing.expectEqual(@as(u32, 0), r.droppedTools().total());
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(last)));
+    r.publishStore();
+    // Two pages, each leaving tools out: the count is of the whole list, not of the last page.
+    try std.testing.expectEqual(@as(usize, 2), r.toolList().len());
+    const got = r.droppedTools();
+    try std.testing.expectEqual(@as(u32, 3), got.total());
+    try std.testing.expectEqual(@as(u32, 2), got.counts[@backingInt(tools.Drop.repeated_name)]);
+    try std.testing.expectEqual(@as(u32, 1), got.counts[@backingInt(tools.Drop.unnamed)]);
+
+    // A later listing that ends with no list leaves the older list served, and the count that describes it.
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage(first)));
+    r.discardStore();
+    try std.testing.expectEqual(@as(usize, 2), r.toolList().len());
+    try std.testing.expectEqual(@as(u32, 3), r.droppedTools().total());
+
+    // What the discarded listing counted is gone: the next list that keeps every tool says nothing is left out.
+    _ = try r.store.addPage(gpa, try tools.parsePage("{\"tools\":[{\"name\":\"c\",\"inputSchema\":{}}]}"));
+    r.publishStore();
+    try std.testing.expectEqual(@as(usize, 1), r.toolList().len());
+    try std.testing.expectEqual(@as(u32, 0), r.droppedTools().total());
+}
+
+test "a listing that fails drops what its pages left out, and the published count stays" {
+    var r: Server = undefined;
+    try stdioTestServer(&r);
+    defer r.deinit();
+    const gpa = std.testing.allocator;
+    // A list is published with two tools left out.
+    r.gatherDropped(try r.store.addPage(gpa, try tools.parsePage("{\"tools\":[{\"name\":\"a\",\"inputSchema\":{}},{\"name\":\"a\",\"inputSchema\":{}},{\"inputSchema\":{}}]}")));
+    r.publishStore();
+    try std.testing.expectEqual(@as(u32, 2), r.droppedTools().total());
+
+    // The next listing counts five more on its first page, and then its process is lost: no list comes of it.
+    const id = try listInFlight(&r);
+    r.gatherDropped(.{ .duplicate = 5 });
+    try r.stepRequest(.{ .transport_lost = id });
+    try std.testing.expectEqual(@as(u32, 0), r.gathering_dropped.total());
+    try std.testing.expectEqual(@as(u32, 2), r.droppedTools().total());
+    try std.testing.expectEqual(@as(usize, 1), r.toolList().len());
 }

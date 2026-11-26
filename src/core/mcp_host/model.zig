@@ -1826,6 +1826,51 @@ test "a name no list holds refreshes each server whose name could own it, and a 
     }
 }
 
+test "a name the registry bound to a server a reload dropped belongs to no server: nothing is loaded or blamed for it" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        // `linear` loads, and its name prefixes `mcp_linear_dev_echo`, which the registry binds to `linear_dev`. A reload
+        // drops `linear_dev`, so the name is no tool of any server now. Looking for it must not load `linear`'s list.
+        const linear: mcp_contract.McpServerConfig = .{ .name = "linear", .command = f.server };
+        const linear_dev: mcp_contract.McpServerConfig = .{ .name = "linear_dev", .command = f.server };
+        var r: Runtime = undefined;
+        try r.start(testing.allocator, testing.io, &.{ linear, linear_dev }, &f.inherited, f.options());
+        defer r.deinit();
+        var c: Catalog = undefined;
+        try c.init(testing.allocator, testing.io, &r, .{});
+        defer c.deinit();
+        _ = try c.names.name(a, .{}, "linear_dev", "echo");
+        try c.reload(try r.reload(&.{linear}, &f.inherited));
+        try testing.expect(c.lists[0].state != .loaded);
+        try testing.expect((try c.toolSchema(a, "mcp_linear_dev_echo", .{}, .{}, .unrestricted, null)) == null);
+        try testing.expect(c.lists[0].state != .loaded);
+        try testing.expect(!c.known("mcp_linear_dev_echo"));
+    }
+    {
+        // The same with `linear` held for a variable that is not set: it has a reason, and the name is not blamed on it.
+        const unset = @constCast("FX_MCP_HOST_TEST_UNSET");
+        const linear: mcp_contract.McpServerConfig = .{ .name = "linear", .transport = .http, .url = "https://example.invalid/mcp", .bearer_token_env = unset };
+        const linear_dev: mcp_contract.McpServerConfig = .{ .name = "linear_dev", .command = f.server };
+        var r: Runtime = undefined;
+        try r.start(testing.allocator, testing.io, &.{ linear, linear_dev }, &f.inherited, f.options());
+        defer r.deinit();
+        var c: Catalog = undefined;
+        try c.init(testing.allocator, testing.io, &r, .{});
+        defer c.deinit();
+        _ = try c.names.name(a, .{}, "linear_dev", "echo");
+        try c.reload(try r.reload(&.{linear}, &f.inherited));
+        try testing.expect((try c.toolSchema(a, "mcp_linear_dev_echo", .{}, .{}, .unrestricted, null)) == null);
+        // A name only `linear` could own still hears why it is held.
+        const held = (try c.toolSchema(a, "mcp_linear_list", .{}, .{}, .unrestricted, null)).?;
+        try testing.expectEqualStrings("MCP server 'linear' needs FX_MCP_HOST_TEST_UNSET set before fx starts.", held.rejected.model_output);
+    }
+}
+
 test "a call the server answers with a 401 tells the model it refused the login, in the server's quoted words" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

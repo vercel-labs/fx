@@ -309,11 +309,19 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (line < l.lead) {
         const facts = l.lead - 1;
         if (line >= facts) return .empty;
-        const protocol_lines: usize = @intFromBool(r.status.version != null);
         if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
         if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
         if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
-        if (line == 3 and protocol_lines == 1) return row_text.composeFactRow(alloc, "protocol", r.status.version.?, width, fact_col, "");
+        // Then the facts a server has only sometimes, in the order `fx mcp show` prints them: the tools fx left out, its
+        // protocol, its error.
+        var later = line - 3;
+        if (try verbs.droppedText(arena, r.status)) |left_out| {
+            if (later == 0) return row_text.composeFactRow(alloc, "left out", left_out, width, fact_col, "");
+            later -= 1;
+        }
+        if (r.status.version) |version| {
+            if (later == 0) return row_text.composeFactRow(alloc, "protocol", version, width, fact_col, "");
+        }
         return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
     }
     var buf: [menu.max_choices]menu.Choice = undefined;
@@ -788,6 +796,43 @@ test "a server's screen: facts, choices with their commands, then tools" {
     // On a tool, Enter does nothing, so the hint doesn't offer it.
     p.state.cursor = 2;
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p)[0]);
+}
+
+test "a server's screen says what fx left out of its tool list, between its status and its protocol" {
+    var gh = testStatus("github", .ready);
+    gh.tools = 2;
+    gh.version = "2025-11-25";
+    gh.dropped.add(.repeated_field, 1);
+    const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
+    const tools = [_]menu.Tool{ .{ .name = "create_issue", .description = "Create a new issue." }, .{ .name = "search_code", .description = "Search for code." } };
+    var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    // The fact is one more line before the blank that ends the facts.
+    try testing.expectEqual(@as(usize, 6), p.layout(rows[0]).lead);
+    const text = try render(p, 88);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.startsWith(u8, text,
+        \\  github
+        \\  http      https://h/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    ready
+        \\  left out  1 tool: a field is written twice
+        \\  protocol  2025-11-25
+        \\
+        \\
+    ));
+    // A server that left nothing out has no such line, and its facts are where they were.
+    var quiet = gh;
+    quiet.dropped = .{};
+    const quiet_rows = [_]menu.Row{.{ .status = quiet, .target = "https://h/mcp" }};
+    var q: Projection = .{ .rows = &quiet_rows, .tools = .{ .ready = &tools } };
+    menu.open(&q.state);
+    _ = menu.press(&q.state, .{ .rows = &quiet_rows }, .enter);
+    try testing.expectEqual(@as(usize, 5), q.layout(quiet_rows[0]).lead);
+    const quiet_text = try render(q, 88);
+    defer testing.allocator.free(quiet_text);
+    try testing.expect(std.mem.find(u8, quiet_text, "left out") == null);
 }
 
 test "a long tool list scrolls with the selection and counts what's below" {
