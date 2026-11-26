@@ -11849,6 +11849,15 @@ pub const TranscriptRuntime = struct {
                     presentation_valid = true;
                     transition.presentation_resume_bytes = &.{};
                     transition.presentation_valid = false;
+                } else switch (previous_state) {
+                    .recovering => |receipt| if (receipt.presentation_valid) {
+                        debug_trace.logf(
+                            "scroll",
+                            "transcript_presentation_resume_dropped bytes={d} reason=applied_append_without_presentation",
+                            .{receipt.presentation_resume_bytes.len},
+                        );
+                    },
+                    .invalid, .stable => {},
                 }
             } else switch (previous_state) {
                 .recovering => |*receipt| {

@@ -104,7 +104,9 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   // must leave the next ordinary request below the automatic pressure threshold.
   const seedTurns = trigger === "manual" && outcome !== "success" ? 3 : 1;
   const lines = seedTurns > 1 ? 400 : trigger === "ordinary" ? 2 : trigger === "auto" || longResume ? 18_000 : 1600;
-  const seedReply = (turn: number) => `${turn === 1 ? HEAD : `HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(lines)}SEED_DONE_${turn}${turn === seedTurns ? `\n${TAIL}` : ""}`;
+  const historyRows = (count: number) => Array.from({ length: count }, (_, index) =>
+    `history alpha beta gamma delta sample line ${String(index + 1).padStart(5, "0")}\n`).join("");
+  const seedReply = (turn: number) => `${turn === 1 ? HEAD : `HISTORY_MIDDLE_${turn}`}\n${historyRows(lines)}SEED_DONE_${turn}${turn === seedTurns ? `\n${TAIL}` : ""}`;
   const summaryHold = heldFakeGatewayFinalText();
   const ordinaryHold = heldFakeGatewayFinalText();
   let phase: "seed" | "attempt" | "followup" | "reopen" = "seed";
@@ -196,9 +198,12 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       startupWaitMs: 0,
     });
     // A composer can be painted while resume history is still being restored.
-    // Wait for a stable frame, then acknowledge input without submitting a turn
-    // or retiring the retained resume transcript before the tested /compact.
-    await terminal.waitForStableComposer(20_000);
+    // Wait for the composer, not a stable frame: the numbered history rows
+    // change on every frame of the drain, so a stable frame would wait for the
+    // drain to end, and the prompt below would no longer arrive during it.
+    // Then acknowledge input without submitting a turn or retiring the
+    // retained resume transcript before the tested /compact.
+    await terminal.waitForComposer(20_000);
     await terminal.sendLiteral("startup-input-handshake");
     await terminal.waitForText("startup-input-handshake", 5000);
     await terminal.sendKeys("C-u");
@@ -293,7 +298,10 @@ async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>,
   await terminal.waitForComposer(5000);
 }
 
-async function assertResumeScrollbackIntact(terminal: InstanceType<typeof TmuxSession>, expectedRows: number, exact = false) {
+const HISTORY_ROW = /^\s*history alpha beta gamma delta sample line (\d{5})$/;
+
+async function assertResumeScrollbackIntact(terminal: InstanceType<typeof TmuxSession>, expectedRows: number) {
+  const paneRows = terminal.paneSize().rows;
   const scrollback = await terminal.captureFullScrollback();
   const scrollbackLines = scrollback.split("\n");
   const headIndices = scrollbackLines.flatMap((line, index) => (line.includes(HEAD) ? [index] : []));
@@ -303,16 +311,23 @@ async function assertResumeScrollbackIntact(terminal: InstanceType<typeof TmuxSe
   expect(seedIndices).toHaveLength(1);
   expect(tailIndices).toHaveLength(1);
   const body = scrollbackLines.slice(headIndices[0]! + 1, seedIndices[0]!);
-  if (exact) {
-    expect(body.length).toBe(expectedRows);
-  } else {
-    // Compaction invalidates the transcript anchor and redraws the 28-row
-    // active screen (`source_state=invalid`), overwriting the 4-10 on-screen
-    // suffix lines (`17983..17992`) even when no deferral occurred.
-    expect(body.length).toBeGreaterThanOrEqual(expectedRows - 20);
-    expect(body.length).toBeLessThanOrEqual(expectedRows);
+  // Compaction invalidates the transcript anchor and redraws the active
+  // screen (`source_state=invalid`), which can drop the top on-screen rows
+  // above the new viewport (`k+1..18000` suffix start) even with no deferral.
+  const numbers = body.map((line) => {
+    const match = HISTORY_ROW.exec(line);
+    expect(match).not.toBeNull();
+    return Number(match![1]);
+  });
+  let k = 0;
+  while (k < numbers.length && numbers[k] === k + 1) k++;
+  expect(k).toBeGreaterThanOrEqual(expectedRows - paneRows);
+  expect(k).toBeLessThanOrEqual(expectedRows);
+  for (let i = k; i < numbers.length; i++) {
+    expect(numbers[i]).toBeGreaterThan(numbers[i - 1]!);
+    if (i > k) expect(numbers[i]).toBe(numbers[i - 1]! + 1);
   }
-  expect(body.every((line) => line.includes("history alpha beta gamma delta sample line"))).toBe(true);
+  if (numbers.length > 0) expect(numbers.at(-1)!).toBeLessThanOrEqual(expectedRows);
 }
 
 async function assertLive(terminal: InstanceType<typeof TmuxSession>) {
@@ -565,7 +580,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         f.summaryHold.release(HANDOFF);
         await until(() => f.durable() > 0, "acknowledged checkpoint");
         await f.waitForResumeHandoff();
-        if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000, true);
+        if (trigger === "auto") await assertResumeScrollbackIntact(terminal, 18_000);
         await until(() => f.requestsContaining(steer).length > 0, "steer request after compaction");
         expect(f.requestsContaining(steer)[0]).toContain("INTERNAL_HANDOFF_4e12");
         await terminal.waitForPane((pane) => pane.includes(FOLLOWUP) && hasEmptyComposer(pane), 20_000);
@@ -1049,7 +1064,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (!raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
         seeded++;
         const head = seeded === 1 ? HEAD : `HISTORY_MIDDLE_${seeded}`;
-        return fakeGatewayFinalText(`${head}\n${"history alpha beta gamma delta sample line\n".repeat(400)}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
+        const rows = Array.from({ length: 400 }, (_, index) =>
+          `history alpha beta gamma delta sample line ${String(index + 1).padStart(5, "0")}\n`).join("");
+        return fakeGatewayFinalText(`${head}\n${rows}SEED_DONE_${seeded}${seeded === seedTurns ? `\n${TAIL}` : ""}`);
       }
       return fakeGatewayFinalText(FOLLOWUP);
     }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
