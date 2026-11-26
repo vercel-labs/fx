@@ -1,15 +1,16 @@
 // Walks fx's quiet notice (src/core/execution/quiet_notice.zig) along its
 // model, tests/tla/managed_execution/QuietWait.tla.
 //
-// TLC writes the model's state graph. Two of its variables, under and
-// outDuring, and the last result are history the code does not keep. Edges
-// that look the same to the code, the same action from the same visible
-// state to the same visible state, are walked once: the driver walks to each
-// such edge along a shortest path, so every transition the code can tell
+// TLC writes the model's state graph. Three of its variables (`under`,
+// `outDuring`, `spellCrosses`) and the last result are history the code does not
+// keep. Edges that look the same to the code, the same action from the same
+// visible state to the same visible state, are walked once: the driver walks to
+// each such edge along a shortest path, so every transition the code can tell
 // apart is checked at least once, and then follows seeded random paths. Each
 // model step becomes operations for lab.zig, which runs the real module at
 // the times the driver's clock gives. After every step the lab's state, and
-// the end, arm, and notice of every wait that ends, must match the model.
+// the end, crossing, arm, and notice of every wait that ends, must match the
+// model.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/managed_execution/walk.ts
@@ -34,6 +35,7 @@ type Result = {
   armed: boolean;
   quiet_ms: number;
   end: string | null;
+  crossed: boolean | null;
   ended_armed: boolean | null;
   times: Times | null;
   error: string | null;
@@ -278,6 +280,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean):
       const ended = s.waiting && !t.waiting;
       expect("wait ended", ended ? t.result.end : null, real.end);
       if (!ended) return;
+      expect("crossed", t.result.crossed, real.crossed);
       expect("arm at the end", t.result.armed, real.ended_armed);
       expect("time fields", t.result.running, real.times !== null);
       const notice = tamper ? t.result.running && t.quiet >= Limit - 1 : t.result.notice;
@@ -321,15 +324,16 @@ if (options.selfCheck) {
   const mutants = [
     { name: "never arms a wait on new output", target: "if (!due) next.armed = true;", planted: "if (!due) next.armed = wait.armed;" },
     {
-      name: "ends a wait that began past the limit",
-      target: "if (next.armed and due) return .{ .wait = next, .end = .quiet };",
-      planted: "if (due) return .{ .wait = next, .end = .quiet };",
+      name: "reports a crossing for an unarmed wait",
+      target: "return wait.armed and noticeDue(quietMs(now_ms, last_output_ms), limit_ms);",
+      planted: "return (wait.armed or true) and noticeDue(quietMs(now_ms, last_output_ms), limit_ms);",
     },
+    { name: "never reports a crossing", target: ".crossed = crossedAt(next, now_ms, last_output_ms, limit_ms),", planted: ".crossed = false," },
     { name: "asks for a check one tick late", target: "return quiet_ms >= limit_ms;", planted: "return quiet_ms > limit_ms;" },
     {
       name: "runs a wait past its ceiling",
-      target: "if (elapsedMs(wait.started_ms, now_ms) >= wait.ceiling_ms)",
-      planted: "if (elapsedMs(wait.started_ms, now_ms) > wait.ceiling_ms)",
+      target: "if (elapsedMs(wait.started_ms, now_ms) >= wait.ceiling_ms) {",
+      planted: "if (elapsedMs(wait.started_ms, now_ms) > wait.ceiling_ms) {",
     },
   ];
   let mutantsCaught = true;

@@ -6,12 +6,13 @@
 # quiet-wait-mutation-*.cfg plants one defect, and the rule it names must
 # catch it:
 #
-#   notice-any-quiet  the notice shows for any quiet time                 NoticeRule
-#   notice-when-done  the notice shows on a finished command              NoticeRule
-#   end-unarmed       a wait that began past the limit ends for quiet     QuietEndNeedsCrossing
-#   no-crossing-end   a wait never ends at the crossing                   CrossingEnds
-#   no-rearm          output during a wait does not arm it                CrossingEnds
-#   ceiling-late      a wait runs one tick past its ceiling               WaitBounded
+#   notice-any-quiet  the notice shows for any quiet time     NoticeRule
+#   notice-when-done  the notice shows on a finished command  NoticeRule
+#   end-at-crossing   a wait ends early at the quiet crossing NoEarlyEnd
+#   cross-unarmed     an unarmed wait reports a crossing      CrossingNeedsUnder
+#   never-cross       a wait never reports a crossing         CrossingReported
+#   no-rearm          output during a wait does not arm it    CrossingReported
+#   ceiling-late      a wait runs one tick past its ceiling   WaitBounded
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #
@@ -29,8 +30,9 @@ QuietWait quiet-wait -
 QuietWait quiet-wait-deep -
 QuietWait quiet-wait-mutation-notice-any-quiet NoticeRule
 QuietWait quiet-wait-mutation-notice-when-done NoticeRule
-QuietWait quiet-wait-mutation-end-unarmed QuietEndNeedsCrossing
-QuietWait quiet-wait-mutation-no-crossing-end CrossingEnds
-QuietWait quiet-wait-mutation-no-rearm CrossingEnds
+QuietWait quiet-wait-mutation-end-at-crossing NoEarlyEnd
+QuietWait quiet-wait-mutation-cross-unarmed CrossingNeedsUnder
+QuietWait quiet-wait-mutation-never-cross CrossingReported
+QuietWait quiet-wait-mutation-no-rearm CrossingReported
 QuietWait quiet-wait-mutation-ceiling-late WaitBounded
 VERDICTS
