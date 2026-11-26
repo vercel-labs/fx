@@ -95,8 +95,9 @@ jobs:
       - name: Model-check the compaction row's number
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/compaction_progress/check.sh
 
-      - name: Model-check the bash tool's session
-        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/bash_tool/check.sh
+      # The Bun driver that runs the real result store along this model is not in CI yet.
+      - name: Model-check the bash tool's session and result store (TLC only)
+        run: FX_TLA_BASH_TOOL_TLC_ONLY=1 TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/bash_tool/check.sh
 
       # The Bun driver that walks the real file path along this model runs in
       # tla-tool-bridge.yml.

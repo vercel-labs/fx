@@ -1,6 +1,7 @@
 #!/bin/sh
-# Model-check the one bash tool's session and result store with TLC, and
-# require each config's expected verdict.
+# Model-check the one bash tool's session and result store with TLC, require
+# each config's expected verdict, then run the Bun driver that runs the real
+# result store along this model.
 #
 # result-store.cfg is the design and must pass. Each mutation config plants
 # one defect, and the rule it names must catch it:
@@ -23,9 +24,21 @@
 # no room (FullWitness), and a later result shown above such a file
 # (ResumeWitness).
 #
-# No Bun driver runs the built fx along this model yet; the bash tool's unit
-# and e2e tests cover the code.
-# Needs Java 11+ and tla2tools.jar, as ../README.md describes.
+# result-store-small-room2 and result-store-small-room1 are the design with two
+# programs (room for two files, and for one). Their graphs are small enough for
+# the driver to walk every distinct step on the real result store.
+#
+# Then the driver, tests/tla/drivers/bash_tool/verify.ts, walks those two graphs
+# on the real result store (src/core/session/result_files.zig,
+# src/core/bash_results/, src/tools/bash/program_output.zig), checks recorded
+# runs of the three-program store against TraceResultStore.tla, and builds each
+# planted bug in mutations.json into its own copy of src/, which its named rule
+# must catch. It runs only when no config is named. FX_TLA_BASH_TOOL_TLC_ONLY=1
+# skips it (CI runs that way, see .github/workflows/ci.yml).
+# FX_TLA_BASH_TOOL_QUICK=1 runs its quick settings.
+#
+# Needs Java 11+ and tla2tools.jar, as ../README.md describes, and Zig and Bun
+# for the driver.
 #
 # Usage:
 #   sh check.sh
@@ -38,6 +51,8 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'VERDICTS'
 ResultStore result-store -
+ResultStore result-store-small-room2 -
+ResultStore result-store-small-room1 -
 ResultStore result-store-mutation-show-before-save SavedBeforeShown
 ResultStore result-store-mutation-skip-index SavedBeforeShown
 ResultStore result-store-mutation-rerun-on-wait RunOnce
@@ -54,3 +69,7 @@ ResultStore result-store-witness-orphan OrphanWitness
 ResultStore result-store-witness-full FullWitness
 ResultStore result-store-witness-resume ResumeWitness
 VERDICTS
+
+if [ "$#" -eq 0 ] && [ "${FX_TLA_BASH_TOOL_TLC_ONLY:-0}" != "1" ]; then
+    bun ../drivers/bash_tool/verify.ts
+fi
