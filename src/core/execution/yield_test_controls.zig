@@ -31,6 +31,8 @@ pub fn holdTimedYield() void {
     // A marker that cannot be written skips the hold; the test that set the
     // controls then fails on the missing marker.
     writeMarker(held) catch return;
+    // The release file is the only signal a test can send this process, so
+    // the hold polls for it, as the other test holds do.
     const deadline = io_mod.milliTimestamp() + max_hold_ms;
     while (!pathExists(release) and io_mod.milliTimestamp() < deadline) {
         io_mod.sleep(std.time.ns_per_ms);

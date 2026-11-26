@@ -2362,11 +2362,11 @@ test "a command that ends inside the steering grace returns its result" {
 }
 
 var timed_yield_holds: u32 = 0;
-const timed_yield_hold_ms = 300;
+var timed_yield_held_at_ms: i64 = 0;
 
 fn holdTimedYieldForTest() void {
     timed_yield_holds += 1;
-    io_mod.sleep(timed_yield_hold_ms * std.time.ns_per_ms);
+    timed_yield_held_at_ms = io_mod.milliTimestamp();
 }
 
 test "a timed yield returns its command running only after the test hold lets it go" {
@@ -2391,10 +2391,12 @@ test "a timed yield returns its command running only after the test hold lets it
     input.authority = testAuthority(input);
     const started_ms = io_mod.milliTimestamp();
     var started = try runtime.startCaptured(alloc, input);
+    const returned_ms = io_mod.milliTimestamp();
     defer started.deinit(alloc);
     try std.testing.expectEqual(SnapshotState.running, started.snapshot.state);
     try std.testing.expectEqual(@as(u32, 1), timed_yield_holds);
-    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= input.yield_time_ms + timed_yield_hold_ms);
+    try std.testing.expect(timed_yield_held_at_ms - started_ms >= input.yield_time_ms);
+    try std.testing.expect(returned_ms >= timed_yield_held_at_ms);
     try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
 
     var completed = try runtime.wait(alloc, input.execution_id, 10_000, null);
