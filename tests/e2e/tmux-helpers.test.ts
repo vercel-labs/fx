@@ -33,11 +33,13 @@ import {
   isVolatileTokenStatusRow,
   localCreditsEnv,
   paneExitMatches,
+  paneStatusFromTmux,
   parseSingleChildPid,
   startDynamicFakeGateway,
   TMUX_NO_CONFIG,
   TmuxSession,
   tmuxAvailable,
+  tmuxReportsServerGone,
 } from "./tmux-helpers";
 
 const tmuxTest = test.skipIf(!tmuxAvailable());
@@ -90,6 +92,51 @@ test("pane exit matching requires the expected observed status", () => {
   expect(paneExitMatches({ dead: true, status: 0 }, 0)).toBe(true);
   expect(paneExitMatches({ dead: true, status: 1 }, 0)).toBe(false);
   expect(paneExitMatches({ dead: true, status: 37 }, 37)).toBe(true);
+});
+
+test("only tmux's errors for a server that does not run count as a gone pane", () => {
+  // The messages tmux prints when the server was killed and when its socket
+  // was never made.
+  expect(tmuxReportsServerGone("no server running on /tmp/tmux-1000/fx-e2e")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (No such file or directory)")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (Connection refused)")).toBe(true);
+  expect(tmuxReportsServerGone("error connecting to /tmp/tmux-1000/fx-e2e (Permission denied)")).toBe(false);
+  expect(tmuxReportsServerGone("directory /tmp/fx-e2e/tmux-1000 has unsafe permissions")).toBe(false);
+  expect(tmuxReportsServerGone("protocol version mismatch (client 8, server 7)")).toBe(false);
+  expect(tmuxReportsServerGone("")).toBe(false);
+});
+
+test("a pane's status reads tmux's answer, and a tmux error that is not a gone server throws", () => {
+  const target = "fx-test-1:0.0";
+  const recorded = () => 7;
+  expect(paneStatusFromTmux(target, { output: "%3:0:\n" }, recorded)).toEqual({ dead: false, status: null });
+  expect(paneStatusFromTmux(target, { output: "%3:1:0\n" }, recorded)).toEqual({ dead: true, status: 0 });
+  // tmux marks the pane dead before it has the exit status.
+  expect(paneStatusFromTmux(target, { output: "%3:1:\n" }, recorded)).toEqual({ dead: true, status: 7 });
+  // The session is gone and the server still runs.
+  expect(paneStatusFromTmux(target, { output: "::\n" }, recorded)).toEqual({ dead: true, status: 7 });
+  expect(paneStatusFromTmux(target, { error: "no server running on /tmp/tmux-1000/fx" }, recorded))
+    .toEqual({ dead: true, status: 7 });
+  expect(() => paneStatusFromTmux(target, { error: "directory /tmp/fx/tmux-1000 has unsafe permissions" }, recorded))
+    .toThrow(`tmux could not report pane ${target}: directory /tmp/fx/tmux-1000 has unsafe permissions`);
+  expect(() => paneStatusFromTmux(target, { error: "spawnSync tmux ENOENT" }, recorded)).toThrow("spawnSync tmux ENOENT");
+});
+
+tmuxTest("a session that ended while its server still runs reads as dead with its exit status", async () => {
+  const socketName = `fx-pane-gone-${process.pid}-${Date.now().toString(36)}`;
+  const keeper = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 0, socketName });
+  const ended = await TmuxSession.create({ cmd: "sh -c 'exit 3'", startupWaitMs: 0, socketName });
+  try {
+    expect(await ended.waitForSessionEnd()).toBe(true);
+    expect(keeper.isAlive()).toBe(true);
+    expect(ended.paneStatus()).toEqual({ dead: true, status: 3 });
+  } finally {
+    await ended.kill();
+    await keeper.kill();
+    try {
+      execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" });
+    } catch {}
+  }
 });
 
 test("launched process PID parsing requires one direct child", () => {

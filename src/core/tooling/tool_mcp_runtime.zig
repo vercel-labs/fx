@@ -387,12 +387,6 @@ const AvailabilityInput = struct {
     runtime: RuntimeCapabilities,
 };
 
-const CallInput = struct {
-    advertised_dynamic_tool_names: []const []const u8,
-    runtime: RuntimeCapabilities,
-    max_tool_result_bytes: usize,
-    options: CallOptions = .{},
-};
 pub fn isAdvertisedDynamicToolName(
     advertised_dynamic_tool_names: []const []const u8,
     name: []const u8,
@@ -411,24 +405,6 @@ pub fn isAvailableDynamicTool(input: AvailabilityInput, name: []const u8) bool {
     return has_tool(context, name, input.runtime.access);
 }
 
-fn callAdvertisedDynamicTool(
-    input: CallInput,
-    arena: Allocator,
-    name: []const u8,
-    arguments_json: []const u8,
-) !?CallResult {
-    if (!isAdvertisedDynamicToolName(input.advertised_dynamic_tool_names, name)) return null;
-    const context = input.runtime.context orelse return null;
-    const call_tool = input.runtime.call_tool orelse return null;
-    return try call_tool(
-        context,
-        arena,
-        name,
-        arguments_json,
-        input.max_tool_result_bytes,
-        input.options,
-    );
-}
 /// The result of a direct call of an MCP tool the request didn't send. The
 /// name is the model's, so it is written as visible text.
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
@@ -446,45 +422,3 @@ test "a direct call of a tool the request didn't send names it as visible text" 
     try std.testing.expect(std.mem.find(u8, text, "mcp_x&#x00;y is not one of the tools") != null);
     for (text) |byte| try std.testing.expect(byte >= 0x20);
 }
-test "MCP advertised dynamic tool executes only through its supplied capability" {
-    var fixture = Fixture.CountingContext{};
-    const advertised = [_][]const u8{"mcp_fs_read"};
-    const input = CallInput{
-        .advertised_dynamic_tool_names = &advertised,
-        .runtime = .{
-            .context = @ptrCast(&fixture),
-            .call_tool = Fixture.callCounting,
-        },
-        .max_tool_result_bytes = 1024,
-    };
-
-    const result = (try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_fs_read",
-        "{}",
-    )).?;
-    defer std.testing.allocator.free(result.model_output);
-
-    try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect((try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_other",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-const Fixture = struct {
-    const CountingContext = struct {
-        calls: usize = 0,
-    };
-
-    fn callCounting(raw_context: *anyopaque, arena: Allocator, _: []const u8, _: []const u8, _: usize, _: CallOptions) anyerror!?CallResult {
-        const context: *CountingContext = @ptrCast(@alignCast(raw_context));
-        context.calls += 1;
-        return .{ .model_output = try arena.dupe(u8, "mcp ok") };
-    }
-};
